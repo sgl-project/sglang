@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe im
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
     CompressedTensorsW8A8Fp8,
+    CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
@@ -85,7 +86,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         sparsity_ignore_list: List[str],
         kv_cache_scheme: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None,
-        packed_modules_mapping: Dict[str, List[str]] = {},
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ):
         super().__init__()
         self.ignore = ignore
@@ -96,7 +97,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_scheme_map = sparsity_scheme_map
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
-        self.packed_modules_mapping = packed_modules_mapping
+        self.packed_modules_mapping = packed_modules_mapping or {}
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)

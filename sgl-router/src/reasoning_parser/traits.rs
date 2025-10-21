@@ -3,7 +3,7 @@ use std::fmt;
 /// Result of parsing text for reasoning content.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParserResult {
-    /// The normal text outside of reasoning blocks.
+    /// The normal text outside reasoning blocks.
     pub normal_text: String,
 
     /// The extracted reasoning text from within reasoning blocks.
@@ -69,6 +69,11 @@ pub trait ReasoningParser: Send + Sync {
 
     /// Get the model type this parser is designed for.
     fn model_type(&self) -> &str;
+
+    /// Check if the parser is currently in reasoning mode.
+    ///
+    /// Returns true if the parser is currently parsing reasoning content.
+    fn is_in_reasoning(&self) -> bool;
 }
 
 /// Error types for reasoning parsing operations.
@@ -96,14 +101,14 @@ pub struct ParserConfig {
     /// The token that marks the end of reasoning content.
     pub think_end_token: String,
 
-    /// Whether to force all text to be treated as reasoning.
-    pub force_reasoning: bool,
-
     /// Whether to stream reasoning content as it arrives.
     pub stream_reasoning: bool,
 
     /// Maximum buffer size in bytes.
     pub max_buffer_size: usize,
+
+    /// Initial state for in_reasoning flag (fixed per parser type).
+    pub initial_in_reasoning: bool,
 }
 
 impl Default for ParserConfig {
@@ -111,9 +116,9 @@ impl Default for ParserConfig {
         Self {
             think_start_token: "<think>".to_string(),
             think_end_token: "</think>".to_string(),
-            force_reasoning: false,
             stream_reasoning: true,
-            max_buffer_size: 65536, // 64KB default
+            max_buffer_size: 65536,      // 64KB default
+            initial_in_reasoning: false, // Default to false (explicit reasoning)
         }
     }
 }

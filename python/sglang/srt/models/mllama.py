@@ -901,7 +901,7 @@ class MllamaForConditionalGeneration(nn.Module):
                     img = pixel_values[0, j]
                     num_tiles = img.shape[0]
                     batched_images[i, j, :num_tiles] = img
-                    batched_ar_ids[i, j] = mm_input.mm_items[0].aspect_ratio_id[0, j]
+                    batched_ar_ids[i, j] = mm_input.mm_items[0].aspect_ratio_ids[0, j]
 
                     batched_ar_mask[i, j, :num_tiles] = mm_input.mm_items[
                         0
@@ -966,7 +966,7 @@ class MllamaForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        from sglang.srt.model_executor.graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need = (
             self._batch_image_inputs(forward_batch)

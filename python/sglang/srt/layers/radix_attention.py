@@ -17,7 +17,11 @@ from __future__ import annotations
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
+import torch
 from torch import nn
+
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.utils import direct_register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -52,6 +56,8 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
+        pos_encoding_mode: str = "NONE",
+        logit_capping_method: str = "tanh",
         quant_config: Optional[QuantizationConfig] = None,
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
@@ -81,6 +87,10 @@ class RadixAttention(nn.Module):
             self.quant_method.create_weights(self)
         self.attn_type = attn_type
 
+        self.pos_encoding_mode = pos_encoding_mode
+        self.logit_capping_method = logit_capping_method
+        self.xai_temperature_len = -1
+
     def forward(
         self,
         q,
@@ -99,12 +109,58 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        return forward_batch.attn_backend.forward(
-            q,
-            k,
-            v,
-            self,
-            forward_batch,
-            save_kv_cache,
-            **kwargs,
-        )
+        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+            output = torch.empty_like(q)
+            torch.ops.sglang.unified_attention_with_output(
+                q, k, v, output, save_kv_cache, self.layer_id
+            )
+            return output
+        else:
+            return forward_batch.attn_backend.forward(
+                q,
+                k,
+                v,
+                self,
+                forward_batch,
+                save_kv_cache,
+                **kwargs,
+            )
+
+
+def unified_attention_with_output(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+) -> None:
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+    ret = forward_batch.attn_backend.forward(
+        query, key, value, attention_layer, forward_batch, save_kv_cache
+    )
+    assert output.shape == ret.shape
+    output.copy_(ret)
+    return
+
+
+def unified_attention_with_output_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="unified_attention_with_output",
+    op_func=unified_attention_with_output,
+    mutates_args=["output"],
+    fake_impl=unified_attention_with_output_fake,
+)

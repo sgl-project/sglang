@@ -32,6 +32,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+from sglang.srt.constrained.utils import is_legacy_structural_tag
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,6 @@ class GuidanceGrammar(BaseGrammarObject):
             self.serialized_grammar,
             log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
         )
-        self.finished = False
         self.bitmask = None
 
     def accept_token(self, token: int):
@@ -111,12 +111,14 @@ class GuidanceBackend(BaseGrammarBackend):
     def __init__(
         self,
         tokenizer,
+        any_whitespace: bool = True,
         whitespace_pattern: Optional[str] = None,
         n_vocab: Optional[int] = None,
     ):
         super().__init__()
 
         self.tokenizer = tokenizer
+        self.any_whitespace = any_whitespace
         self.whitespace_pattern = whitespace_pattern
         self.llguidance_tokenizer = from_tokenizer(self.tokenizer, n_vocab)
 
@@ -135,6 +137,7 @@ class GuidanceBackend(BaseGrammarBackend):
             serialized_grammar = LLMatcher.grammar_from_json_schema(
                 key_string,
                 defaults={
+                    "whitespace_flexible": self.any_whitespace,
                     "whitespace_pattern": self.whitespace_pattern,
                 },
             )
@@ -158,6 +161,7 @@ class GuidanceBackend(BaseGrammarBackend):
     def dispatch_structural_tag(self, key_string: str) -> Optional[GuidanceGrammar]:
         try:
             structural_tag = json.loads(key_string)
+            assert is_legacy_structural_tag(structural_tag)
             tags = [
                 StructTag(
                     begin=structure["begin"],
