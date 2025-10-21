@@ -52,11 +52,6 @@ class TestPenaltyB(CustomTestCase):
         """Count how many times a specific word appears in the text."""
         return len(re.findall(r"\b" + re.escape(word) + r"\b", text.lower()))
 
-    def count_unique_words(self, text):
-        """Count unique words in the text."""
-        words = re.findall(r"\b\w+\b", text.lower())
-        return len(set(words))
-
     def _test_penalty_effect(
         self,
         prompt,
@@ -122,46 +117,18 @@ class TestPenaltyB(CustomTestCase):
     def test_combined_penalties_reduce_repetition(self):
         """Test combined penalty effects."""
         prompt = "Write exactly 10 short sentences, each containing the word 'data'. Use the word 'data' as much as possible."
-
-        # Run multiple iterations to get more reliable results
-        no_penalty_counts = []
-        all_penalty_counts = []
-
-        for i in range(5):
-            no_penalty_output = self.run_generate_with_prompt(
-                prompt,
-                {
-                    "frequency_penalty": 0.0,
-                    "presence_penalty": 0.0,
-                    "repetition_penalty": 1.0,
-                },
-                max_tokens=100,
-            )
-            all_penalty_output = self.run_generate_with_prompt(
-                prompt,
-                {
-                    "frequency_penalty": 1.99,
-                    "presence_penalty": 1.99,
-                    "repetition_penalty": 1.99,
-                },
-                max_tokens=100,
-            )
-
-            no_penalty_count = self.count_word_repetitions(no_penalty_output, "data")
-            all_penalty_count = self.count_word_repetitions(all_penalty_output, "data")
-
-            no_penalty_counts.append(no_penalty_count)
-            all_penalty_counts.append(all_penalty_count)
-
-        # Calculate averages
-        avg_no_penalty_count = sum(no_penalty_counts) / len(no_penalty_counts)
-        avg_all_penalty_count = sum(all_penalty_counts) / len(all_penalty_counts)
-
-        # Simple check: combined penalties should reduce word repetition
-        self.assertLess(
-            avg_all_penalty_count,
-            avg_no_penalty_count,
-            f"Combined penalties should reduce word repetition: {avg_no_penalty_count:.1f} → {avg_all_penalty_count:.1f}",
+        baseline_params = {
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+        }
+        penalty_params = {
+            "frequency_penalty": 1.99,
+            "presence_penalty": 1.99,
+            "repetition_penalty": 1.99,
+        }
+        self._test_penalty_effect(
+            prompt, baseline_params, penalty_params, "data", max_tokens=100
         )
 
     def test_penalty_edge_cases_negative_penalty_values(self):
