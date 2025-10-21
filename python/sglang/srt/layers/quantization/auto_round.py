@@ -2,7 +2,6 @@
 
 import logging
 import re
-from collections.abc import Iterable, Mapping
 from fractions import Fraction
 from typing import Any, Optional, Union
 
