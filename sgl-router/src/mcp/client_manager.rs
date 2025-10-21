@@ -180,14 +180,13 @@ impl McpClientManager {
         let backoff = ExponentialBackoffBuilder::new()
             .with_initial_interval(Duration::from_secs(1))
             .with_max_interval(Duration::from_secs(30))
-            .with_max_elapsed_time(Some(Duration::from_secs(30))) // Reduced from 120s to 30s
+            .with_max_elapsed_time(Some(Duration::from_secs(30)))
             .build();
 
         backoff::future::retry(backoff, || async {
             match Self::connect_server_impl(config).await {
                 Ok(client) => Ok(client),
                 Err(e) => {
-                    // Distinguish between permanent and transient errors
                     if Self::is_permanent_error(&e) {
                         tracing::error!(
                             "Permanent error connecting to '{}': {} - not retrying",
@@ -208,17 +207,11 @@ impl McpClientManager {
     /// Determine if an error is permanent (should not retry) or transient (should retry)
     fn is_permanent_error(error: &McpError) -> bool {
         match error {
-            // Configuration errors are permanent
             McpError::Config(_) => true,
-            // Authentication errors are permanent
             McpError::Auth(_) => true,
-            // Server not found is permanent
             McpError::ServerNotFound(_) => true,
-            // Transport setup errors are permanent
             McpError::Transport(_) => true,
-            // Connection failures during initialization are often permanent
             McpError::ConnectionFailed(msg) => {
-                // Protocol handshake failures are permanent (wrong URL, incompatible server)
                 msg.contains("initialize")
                     || msg.contains("connection closed")
                     || msg.contains("connection refused")
