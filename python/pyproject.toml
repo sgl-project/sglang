@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.3.post1"
+version = "0.5.3.post3"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,6 +13,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: Apache Software License",
 ]
+
 dependencies = [
   "IPython",
   "aiohttp",
@@ -21,6 +22,7 @@ dependencies = [
   "build",
   "compressed-tensors",
   "cuda-python",
+  "decord2",
   "datasets",
   "einops",
   "fastapi",
@@ -58,7 +60,7 @@ dependencies = [
   "tiktoken",
   "timm==1.0.16",
   "torch==2.8.0",
-  "torch_memory_saver==0.0.9rc2",
+  "torch_memory_saver==0.0.9",
   "torchao==0.9.0",
   "torchaudio==2.8.0",
   "torchvision",
@@ -73,7 +75,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-decord = ["decord2"]
+tracing = [
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
+]
 test = [
   "accelerate",
   "expecttest",
@@ -86,13 +93,10 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
-tracing = [
-  "opentelemetry-api",
-  "opentelemetry-exporter-otlp",
-  "opentelemetry-exporter-otlp-proto-grpc",
-  "opentelemetry-sdk",
-]
-all = ["sglang[test]", "sglang[decord]"]
+all = []
+dev = ["sglang[test]"]
+
+# Temporary tags
 cu130 = [
   "torch==2.9.0",
   "torchaudio==2.9.0",
@@ -104,13 +108,9 @@ cu130_all = [
   "sglang[cu130]"
 ]
 
-
-# The following will be deprecated in 2 weeks
-dev = ["sglang[test]", "sglang[decord]"]
-all_aarch64 = ["sglang[test]"]
-blackwell = ["sglang[test]", "sglang[decord]"]
-blackwell_aarch64 = ["sglang[test]"]
-
+# To be deprecated in 2 weeks
+blackwell = ["sglang[dev]"]
+blackwell_aarch64 = ["sglang[dev]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

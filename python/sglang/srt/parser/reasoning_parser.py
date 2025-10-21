@@ -1,4 +1,3 @@
-import re
 from typing import Dict, Optional, Tuple, Type
 
 from sglang.srt.parser.harmony_parser import HarmonyParser
