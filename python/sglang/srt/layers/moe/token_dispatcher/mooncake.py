@@ -205,8 +205,14 @@ class _MooncakeEPDispatcherImpl:
             masked_m
         )
 
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        else:
+            hidden_states_scale = None
+
         return MooncakeDispatchOutput(
             hidden_states,
+            hidden_states_scale,
             topk_ids,
             topk_weights,
             masked_m,
