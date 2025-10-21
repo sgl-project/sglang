@@ -3,12 +3,16 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fs};
 
 use anyhow::{anyhow, Result};
 use minijinja::{
     context,
-    machinery::ast::{Expr, Stmt},
+    machinery::{
+        ast::{Expr, Stmt},
+        parse, WhitespaceConfig,
+    },
+    syntax::SyntaxConfig,
     Environment, Value,
 };
 use serde_json;
@@ -323,11 +327,6 @@ impl<'a> Detector<'a> {
 /// AST-based detection using minijinja's unstable machinery
 /// Single-pass detector with scope tracking
 fn detect_format_with_ast(template: &str) -> Option<ChatTemplateContentFormat> {
-    use minijinja::{
-        machinery::{parse, WhitespaceConfig},
-        syntax::SyntaxConfig,
-    };
-
     let ast = match parse(
         template,
         "template",
@@ -382,6 +381,9 @@ impl ChatTemplateProcessor {
         env.add_template("chat", &self.template)
             .map_err(|e| anyhow!("Failed to add template: {}", e))?;
 
+        // Enable Python method compatibility (e.g., str.startswith, str.endswith)
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+
         // Get the template
         let tmpl = env
             .get_template("chat")
@@ -418,8 +420,6 @@ impl ChatTemplateProcessor {
 
 /// Load chat template from tokenizer config JSON
 pub fn load_chat_template_from_config(config_path: &str) -> Result<Option<String>> {
-    use std::fs;
-
     let content = fs::read_to_string(config_path)?;
     let config: serde_json::Value = serde_json::from_str(&content)?;
 
