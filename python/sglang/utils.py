@@ -357,9 +357,33 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
 
 
 def is_in_ci():
-    from sglang.test.test_utils import is_in_ci
+    """Return whether it is in CI runner."""
+    value = os.getenv("SGLANG_IS_IN_CI", "false")
+    return value.lower() in ("true", "1")
 
-    return is_in_ci()
+
+def write_github_step_summary(content: str):
+    """Write content to GitHub Actions step summary.
+
+    This function is used in CI environments to write markdown content
+    to the GitHub Actions step summary, which appears in the workflow run page.
+
+    Args:
+        content: The markdown content to write to the summary.
+    """
+    if not os.environ.get("GITHUB_STEP_SUMMARY"):
+        logger.debug("GITHUB_STEP_SUMMARY environment variable not set")
+        return
+
+    summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_file:
+        logger.debug(
+            "GITHUB_STEP_SUMMARY environment variable not set. Skipping write."
+        )
+        return
+
+    with open(summary_file, "a") as f:
+        f.write(content)
 
 
 def print_highlight(html_content: str):
