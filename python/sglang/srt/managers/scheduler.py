@@ -909,7 +909,7 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
 
     def init_overlap(self):
-        if not self.enable_overlap:
+        if not self.enable_overlap and self.pp_size == 1:
             return
 
         self.forward_stream: CudaStream = torch.get_device_module(self.device).Stream()
@@ -920,6 +920,9 @@ class Scheduler(
         self.copy_stream_ctx: CudaStreamContext = torch.get_device_module(
             self.device
         ).stream(self.copy_stream)
+
+        if not self.enable_overlap:
+            return
 
         self.future_map = FutureMap(
             self.max_running_requests, self.device, self.spec_algorithm

@@ -205,10 +205,12 @@ class SchedulerPPMixin:
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
         self._pp_commit_comm_work(work=send_output_work)
         if mbs[next_mb_id] is not None:
-            batch_result = self._pp_prep_batch_result(
-                mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
-            )
-            # d2h_event = self.process_batch_result_d2h(mbs[next_mb_id], batch_result)
+            with self.forward_stream_ctx:
+                batch_result = self._pp_prep_batch_result(
+                    mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
+                )
+                d2h_event = torch.cuda.Event()
+                d2h_event.record(torch.cuda.current_stream())
 
         return next_pp_outputs, batch_result, d2h_event
 
@@ -216,26 +218,27 @@ class SchedulerPPMixin:
         self: Scheduler,
         mb_id: int,
         pp_proxy_tensors: PPProxyTensors,
-        mb_metadata: PPBatchMetadata,
+        mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
     ):
         with torch.profiler.record_function("run_batch"):
-            result = self.run_batch(self.cur_batch, pp_proxy_tensors)
-            mb_metadata[mb_id] = PPBatchMetadata(
-                can_run_cuda_graph=result.can_run_cuda_graph,
-            )
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream())
-            if self.pp_group.is_last_rank:
-                # (last rank) buffer the outputs for async batch depth
-                last_rank_comm_queue.append(
-                    (
-                        event,
-                        PPProxyTensors(
-                            self._pp_prepare_tensor_dict(result, self.cur_batch)
-                        ),
-                    )
+            with self.forward_stream_ctx:
+                result = self.run_batch(self.cur_batch, pp_proxy_tensors)
+                mb_metadata[mb_id] = PPBatchMetadata(
+                    can_run_cuda_graph=result.can_run_cuda_graph,
                 )
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream())
+                if self.pp_group.is_last_rank:
+                    # (last rank) buffer the outputs for async batch depth
+                    last_rank_comm_queue.append(
+                        (
+                            event,
+                            PPProxyTensors(
+                                self._pp_prepare_tensor_dict(result, self.cur_batch)
+                            ),
+                        )
+                    )
         return result, event
 
     @DynamicGradMode()
@@ -326,7 +329,7 @@ class SchedulerPPMixin:
                         )
                     )
                 if mbs[next_mb_id] is not None:
-                    # d2h_event.synchronize()
+                    d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
                             mbs[next_mb_id],
