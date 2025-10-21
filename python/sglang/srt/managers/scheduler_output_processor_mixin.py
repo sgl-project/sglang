@@ -208,7 +208,7 @@ class SchedulerOutputProcessorMixin:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(accept_lens)
+        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
@@ -244,7 +244,7 @@ class SchedulerOutputProcessorMixin:
             accept_lens_list = result.accept_lens.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
-        if not self.spec_algorithm.is_none():
+        if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
         self.token_to_kv_pool_allocator.free_group_begin()
