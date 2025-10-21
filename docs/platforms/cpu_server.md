@@ -49,7 +49,7 @@ docker run \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     -p 30000:30000 \
     -e "HF_TOKEN=<secret>" \
-    sglang-cpu:main /bin/bash
+    sglang-cpu:latest /bin/bash
 ```
 
 ### Install From Source
