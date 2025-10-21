@@ -2883,16 +2883,17 @@ class DeepseekV2ForCausalLM(nn.Module):
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
-        # Only Deepseek V3/R1 can use shared experts fusion optimization now.
+        # Only Deepseek V3/R1/Kimi-K2 can use shared experts fusion optimization now.
+        allowed_architectures = {architecture, "kimi_k2"}
         disable_reason = None
         if (
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
-            or self.config.architectures[0] != architecture
+            or self.config.architectures[0] not in allowed_architectures
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):
-            disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
+            disable_reason = "Only Deepseek V3/R1/Kimi-K2 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
         elif self.quant_config.get_name() == "w4afp8":

@@ -16,7 +16,6 @@ ENV PATH="${CUDA_HOME}/bin:${PATH}"
 # Safe NCCL defaults and async error handling
 ENV TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
     NCCL_DEBUG=INFO \
-    NCCL_IB_DISABLE=1 \
     NCCL_SHM_DISABLE=0 \
     NCCL_P2P_DISABLE=0
 # Let NCCL auto-tune: do NOT set MIN/MAX_NCHANNELS or BUFFSIZE

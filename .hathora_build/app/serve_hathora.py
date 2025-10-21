@@ -42,6 +42,7 @@ def _build_sglang_argv_from_env() -> list[str]:
         raise RuntimeError("MODEL_PATH is required (or provide model_id in DEPLOYMENT_CONFIG_JSON)")
 
     tp_size = _get_env_or_cfg("TP_SIZE", cfg, ["tp_size"], "1")
+    dp_size = _get_env_or_cfg("DP_SIZE", cfg, ["dp_size"], "1")
     dtype = _get_env_or_cfg("DTYPE", cfg, ["dtype"], "auto")
     kv_cache_dtype = _get_env_or_cfg("KV_CACHE_DTYPE", cfg, ["kv_cache_dtype"], "auto")
     host = os.environ.get("HOST", "0.0.0.0")
@@ -52,6 +53,7 @@ def _build_sglang_argv_from_env() -> list[str]:
     argv += [
         "--model-path", str(model_path),
         "--tp-size", str(tp_size),
+        "--dp-size", str(dp_size),
         "--dtype", str(dtype),
         "--kv-cache-dtype", str(kv_cache_dtype),
         "--host", str(host),
@@ -99,6 +101,10 @@ def _build_sglang_argv_from_env() -> list[str]:
     if chunked_prefill_size:
         argv += ["--chunked-prefill-size", str(chunked_prefill_size)]
 
+    max_prefill_tokens = os.environ.get("MAX_PREFILL_TOKENS")
+    if max_prefill_tokens:
+        argv += ["--max-prefill-tokens", str(max_prefill_tokens)]
+
     chat_template = os.environ.get("CHAT_TEMPLATE")
     if chat_template:
         argv += ["--chat-template", str(chat_template)]
@@ -127,6 +133,27 @@ def _build_sglang_argv_from_env() -> list[str]:
         argv += ["--enable-metrics"]
     if _env_truthy(os.environ.get("TRUST_REMOTE_CODE"), False):
         argv += ["--trust-remote-code"]
+
+    # DP Attention
+    if _env_truthy(os.environ.get("ENABLE_DP_ATTENTION"), False):
+        argv += ["--enable-dp-attention"]
+    if _env_truthy(os.environ.get("ENABLE_DP_LM_HEAD"), False):
+        argv += ["--enable-dp-lm-head"]
+
+    # MoE optimizations
+    moe_runner_backend = os.environ.get("MOE_RUNNER_BACKEND")
+    if moe_runner_backend and moe_runner_backend != "auto":
+        argv += ["--moe-runner-backend", str(moe_runner_backend)]
+    
+    # Expert Load Balancing (EPLB)
+    if _env_truthy(os.environ.get("ENABLE_EPLB"), False):
+        argv += ["--enable-eplb"]
+        eplb_algorithm = os.environ.get("EPLB_ALGORITHM")
+        if eplb_algorithm and eplb_algorithm != "auto":
+            argv += ["--eplb-algorithm", str(eplb_algorithm)]
+        eplb_rebalance_iterations = os.environ.get("EPLB_REBALANCE_NUM_ITERATIONS")
+        if eplb_rebalance_iterations:
+            argv += ["--eplb-rebalance-num-iterations", str(eplb_rebalance_iterations)]
 
     # Memory saver (only if explicitly requested)
     if _env_truthy(os.environ.get("ENABLE_MEMORY_SAVER"), False):
