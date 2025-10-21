@@ -1403,9 +1403,6 @@ fn extract_function_call_from_chat(
                 .clone()
                 .unwrap_or_else(|| "{}".to_string());
 
-            debug!("Raw arguments from scheduler: {:?}", args);
-            debug!("Raw arguments first 100 chars: {}", &args.chars().take(100).collect::<String>());
-
             return Some((
                 tool_call.id.clone(),
                 tool_call.function.name.clone(),
@@ -1423,53 +1420,32 @@ async fn execute_mcp_call(
     tool_name: &str,
     args_json_str: &str,
 ) -> Result<String, String> {
-    debug!("MCP call raw args_json_str: {}", args_json_str);
-    debug!("MCP call args_json_str debug: {:?}", args_json_str);
-
-    // Handle potential double-encoding: if the string is JSON-encoded JSON, parse twice
-    let mut args_value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(args_json_str) {
-        Ok(val) => {
-            debug!("First parse result type: {}", match &val {
-                serde_json::Value::Null => "null",
-                serde_json::Value::Bool(_) => "bool",
-                serde_json::Value::Number(_) => "number",
-                serde_json::Value::String(_) => "string (double-encoded!)",
-                serde_json::Value::Array(_) => "array",
-                serde_json::Value::Object(_) => "object (correct)",
-            });
-
-            // Check if we got a string (double-encoded)
-            if let Some(inner_str) = val.as_str() {
-                debug!("Double-encoded JSON detected! Inner string: {}", inner_str);
-                serde_json::from_str::<serde_json::Value>(inner_str)
-                    .map_err(|e| format!("parse inner tool args: {}", e))?
-            } else {
-                val
-            }
-        }
-        Err(e) => return Err(format!("parse tool args: {}", e)),
-    };
+    // Parse arguments JSON string to Value
+    let mut args_value: serde_json::Value = serde_json::from_str::<serde_json::Value>(args_json_str)
+        .map_err(|e| format!("parse tool args: {}", e))?;
 
     // Get tool info to access schema for type coercion
     let tool_info = mcp_mgr
         .get_tool(tool_name)
         .ok_or_else(|| format!("tool not found: {}", tool_name))?;
 
-    // Coerce argument types based on schema (LLMs often output numbers as strings)
-    if let Some(params) = tool_info.parameters {
-        if let Some(properties) = params.get("properties").and_then(|p| p.as_object()) {
-            if let Some(args_obj) = args_value.as_object_mut() {
-                for (key, value) in args_obj.iter_mut() {
-                    if let Some(schema) = properties.get(key) {
-                        if let Some(type_str) = schema.get("type").and_then(|t| t.as_str()) {
-                            // Coerce string numbers to actual numbers
-                            if type_str == "number" || type_str == "integer" {
-                                if let Some(s) = value.as_str() {
-                                    if let Ok(num) = s.parse::<f64>() {
-                                        *value = json!(num);
-                                    }
-                                }
-                            }
+    // Coerce string numbers to actual numbers based on schema (LLMs often output numbers as strings)
+    if let Some(params) = &tool_info.parameters {
+        let properties = params.get("properties").and_then(|p| p.as_object());
+        let args_obj = args_value.as_object_mut();
+
+        if let (Some(props), Some(args)) = (properties, args_obj) {
+            for (key, val) in args.iter_mut() {
+                let should_be_number = props
+                    .get(key)
+                    .and_then(|s| s.get("type"))
+                    .and_then(|t| t.as_str())
+                    .map_or(false, |t| matches!(t, "number" | "integer"));
+
+                if should_be_number {
+                    if let Some(s) = val.as_str() {
+                        if let Ok(num) = s.parse::<f64>() {
+                            *val = json!(num);
                         }
                     }
                 }
@@ -1479,11 +1455,7 @@ async fn execute_mcp_call(
 
     let args_obj = args_value.as_object().cloned();
 
-    debug!(
-        "Calling MCP tool '{}' with coerced args: {}",
-        tool_name,
-        serde_json::to_string(&args_obj).unwrap_or_else(|_| "N/A".to_string())
-    );
+    debug!("Calling MCP tool '{}' with args: {}", tool_name, args_json_str);
 
     let result = mcp_mgr
         .call_tool(tool_name, args_obj)
@@ -1680,7 +1652,7 @@ async fn execute_tool_loop(
     let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
 
     // Configuration: max iterations as safety limit
-    const MAX_ITERATIONS: usize = 20;
+    const MAX_ITERATIONS: usize = 10;
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     debug!(
@@ -1766,7 +1738,7 @@ async fn execute_tool_loop(
                     }
                 };
 
-            // Record the call in state (includes MCP metadata)
+            // Record the call in state
             state.record_call(
                 call_id,
                 tool_name,
@@ -1970,7 +1942,7 @@ async fn execute_tool_loop_streaming_internal(
     _conversation_item_storage: SharedConversationItemStorage,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
-    const MAX_ITERATIONS: usize = 20;
+    const MAX_ITERATIONS: usize = 10;
     let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
