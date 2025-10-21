@@ -306,6 +306,9 @@ class Scheduler(
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.abort_on_priority_when_disabled = (
+            server_args.abort_on_priority_when_disabled
+        )
         self.schedule_low_priority_values_first = (
             server_args.schedule_low_priority_values_first
         )
@@ -1560,7 +1563,11 @@ class Scheduler(
                 req.priority = sys.maxsize
             else:
                 req.priority = -sys.maxsize - 1
-        elif not self.enable_priority_scheduling and req.priority is not None:
+        elif (
+            not self.enable_priority_scheduling
+            and req.priority is not None
+            and self.abort_on_priority_when_disabled
+        ):
             abort_req = AbortReq(
                 finished_reason={
                     "type": "abort",
