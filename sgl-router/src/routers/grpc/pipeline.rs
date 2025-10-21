@@ -4,6 +4,8 @@
 //! that transform a RequestContext through its lifecycle.
 
 use std::{
+    borrow::Cow,
+    collections::HashMap,
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,12 +18,16 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use super::{context::*, processing, streaming, utils};
+use super::{context::*, processing, responses::BackgroundTaskInfo, streaming, utils};
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     grpc_client::proto,
     policies::PolicyRegistry,
-    protocols::{chat::ChatCompletionRequest, common::InputIds, generate::GenerateRequest},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatCompletionResponse},
+        common::InputIds,
+        generate::GenerateRequest,
+    },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
@@ -132,7 +138,7 @@ impl PreparationStage {
             token_ids,
             processed_messages: Some(processed_messages),
             tool_constraints: tool_call_constraint,
-            filtered_request: if matches!(body_ref, std::borrow::Cow::Owned(_)) {
+            filtered_request: if matches!(body_ref, Cow::Owned(_)) {
                 Some(body_ref.into_owned())
             } else {
                 None
@@ -1103,10 +1109,8 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
         response_id: Option<String>,
-        background_tasks: Option<
-            Arc<RwLock<std::collections::HashMap<String, super::responses::BackgroundTaskInfo>>>,
-        >,
-    ) -> Result<crate::protocols::chat::ChatCompletionResponse, String> {
+        background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
+    ) -> Result<ChatCompletionResponse, String> {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
 
         // Execute each stage in sequence
