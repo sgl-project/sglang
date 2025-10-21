@@ -145,6 +145,50 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
             logger.exception(f"Failed to write perf metrics to file: {e}")
 
 
+class RequestMetricsExporterManager:
+    """Manager class for creating and managing RequestMetricsExporter instances."""
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        obj_skip_names: Optional[set[str]] = None,
+        out_skip_names: Optional[set[str]] = None,
+    ):
+        self.server_args = server_args
+        self.obj_skip_names = obj_skip_names or set()
+        self.out_skip_names = out_skip_names or set()
+        self._exporters: List[RequestMetricsExporter] = []
+        self._create_exporters()
+
+    def _create_exporters(self) -> None:
+        """Create and configure RequestMetricsExporter instances based on server args."""
+        # Create standard exporters
+        self._exporters.extend(
+            create_request_metrics_exporters(
+                self.server_args, self.obj_skip_names, self.out_skip_names
+            )
+        )
+
+        # Import additional RequestMetricsExporter from private fork if available; skip otherwise.
+        try:
+            from sglang.private.managers.request_metrics_exporter_factory import (
+                create_private_request_metrics_exporters,
+            )
+
+            self._exporters.extend(
+                create_private_request_metrics_exporters(
+                    self.server_args, self.obj_skip_names, self.out_skip_names
+                )
+            )
+        except ImportError:
+            pass
+
+    async def write_record(self, obj, out_dict: dict) -> None:
+        """Write a record using all configured exporters."""
+        for exporter in self._exporters:
+            await exporter.write_record(obj, out_dict)
+
+
 def create_request_metrics_exporters(
     server_args: ServerArgs,
     obj_skip_names: Optional[set[str]] = None,
