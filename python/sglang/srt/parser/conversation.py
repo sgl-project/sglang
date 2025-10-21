@@ -848,7 +848,7 @@ register_conv_template(
         roles=("", ""),
         sep="",
         sep_style=SeparatorStyle.NO_COLON_SINGLE,
-        stop_str=[""],
+        stop_str=["<｜end▁of▁sentence｜>"],
         image_token="<image>",
     )
 )
