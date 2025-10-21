@@ -2102,7 +2102,15 @@ class MultiprocessingSerializer:
             # Decode base64 string to bytes
             data = pybase64.b64decode(data, validate=True)
 
-        return ForkingPickler.loads(data)
+        class SafeUnpickler(pickle.Unpickler):
+            @staticmethod
+            def find_class(module, name):
+                raise RuntimeError(
+                    f"Blocked unsafe class loading ({module}.{name}), "
+                    f"to prevent exploitation of CVE-2025-10164"
+                )
+
+        return SafeUnpickler(io.BytesIO(data)).load()
 
 
 def debug_timing(func):
