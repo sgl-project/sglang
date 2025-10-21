@@ -669,6 +669,29 @@ async fn process_and_transform_sse_stream(
         }
     }
 
+    // Emit final response.completed event with accumulated usage
+    let usage_json = accumulator.usage.as_ref().map(|u| {
+        let mut usage_obj = json!({
+            "prompt_tokens": u.prompt_tokens,
+            "completion_tokens": u.completion_tokens,
+            "total_tokens": u.total_tokens
+        });
+
+        // Include reasoning_tokens if present
+        if let Some(details) = &u.completion_tokens_details {
+            if let Some(reasoning_tokens) = details.reasoning_tokens {
+                usage_obj["completion_tokens_details"] = json!({
+                    "reasoning_tokens": reasoning_tokens
+                });
+            }
+        }
+
+        usage_obj
+    });
+
+    let completed_event = event_emitter.emit_completed(usage_json.as_ref());
+    event_emitter.send_event(&completed_event, &tx)?;
+
     // Finalize and persist accumulated response
     if original_request.store.unwrap_or(true) {
         let final_response = accumulator.finalize();

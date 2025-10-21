@@ -9,7 +9,7 @@
 
 use crate::protocols::{
     chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, UserMessageContent},
-    common::{FunctionCallResponse, ToolCall, UsageInfo},
+    common::{FunctionCallResponse, StreamOptions, ToolCall, UsageInfo},
     responses::{
         ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
         ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
@@ -145,12 +145,21 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
     }
 
     // 3. Build ChatCompletionRequest
+    let is_streaming = req.stream.unwrap_or(false);
+
     Ok(ChatCompletionRequest {
         messages,
         model: req.model.clone().unwrap_or_else(|| "default".to_string()),
         temperature: req.temperature,
         max_completion_tokens: req.max_output_tokens,
-        stream: req.stream.unwrap_or(false),
+        stream: is_streaming,
+        stream_options: if is_streaming {
+            Some(StreamOptions {
+                include_usage: Some(true),
+            })
+        } else {
+            None
+        },
         parallel_tool_calls: req.parallel_tool_calls,
         top_logprobs: req.top_logprobs,
         top_p: req.top_p,

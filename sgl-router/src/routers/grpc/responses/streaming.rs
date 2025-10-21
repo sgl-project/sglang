@@ -547,17 +547,6 @@ impl ResponseStreamEventEmitter {
 
                     // Mark item as completed
                     self.complete_output_item(output_index);
-
-                    // Emit completed with usage if available
-                    let usage = chunk.usage.as_ref().map(|u| {
-                        json!({
-                            "prompt_tokens": u.prompt_tokens,
-                            "completion_tokens": u.completion_tokens,
-                            "total_tokens": u.total_tokens
-                        })
-                    });
-                    let event = self.emit_completed(usage.as_ref());
-                    self.send_event(&event, tx)?;
                 }
             }
         }
