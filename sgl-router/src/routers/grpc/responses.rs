@@ -1397,16 +1397,14 @@ fn extract_function_call_from_chat(
     // Look for tool_calls in the message
     if let Some(tool_calls) = &message.tool_calls {
         if let Some(tool_call) = tool_calls.first() {
-            let args = tool_call
-                .function
-                .arguments
-                .clone()
-                .unwrap_or_else(|| "{}".to_string());
-
             return Some((
                 tool_call.id.clone(),
                 tool_call.function.name.clone(),
-                args,
+                tool_call
+                    .function
+                    .arguments
+                    .clone()
+                    .unwrap_or_else(|| "{}".to_string()),
             ));
         }
     }
