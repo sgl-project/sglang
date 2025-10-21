@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
-from fixtures import popen_launch_grpc_router
+from fixtures import popen_launch_workers_and_router
 from util import (
     CustomTestCase,
     DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH,
@@ -46,7 +46,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         cls.api_key = "sk-123456"
 
         # Start the local OpenAI Server with tool calling support
-        cls.cluster = popen_launch_grpc_router(
+        cls.cluster = popen_launch_workers_and_router(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -64,7 +64,7 @@ class TestToolChoiceLlama32(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         # Cleanup router and workers
-        kill_process_tree(cls.cluster["process"].pid)
+        kill_process_tree(cls.cluster["router"].pid)
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
 
@@ -741,7 +741,7 @@ class TestToolChoiceQwen25(TestToolChoiceLlama32):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
-        cls.cluster = popen_launch_grpc_router(
+        cls.cluster = popen_launch_workers_and_router(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -772,7 +772,7 @@ class TestToolChoiceMistral(TestToolChoiceLlama32):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
-        cls.cluster = popen_launch_grpc_router(
+        cls.cluster = popen_launch_workers_and_router(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

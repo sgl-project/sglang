@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
-from fixtures import popen_launch_grpc_router
+from fixtures import popen_launch_workers_and_router
 from util import (
     CustomTestCase,
     DEFAULT_REASONING_MODEL_PATH,
@@ -37,7 +37,7 @@ class TestReasoningContentAPI(CustomTestCase):
         cls.model = DEFAULT_REASONING_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
-        cls.cluster = popen_launch_grpc_router(
+        cls.cluster = popen_launch_workers_and_router(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -54,7 +54,7 @@ class TestReasoningContentAPI(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         # Cleanup router and workers
-        kill_process_tree(cls.cluster["process"].pid)
+        kill_process_tree(cls.cluster["router"].pid)
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
 
@@ -199,7 +199,7 @@ class TestReasoningContentWithoutParser(CustomTestCase):
         cls.model = DEFAULT_REASONING_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
-        cls.cluster = popen_launch_grpc_router(
+        cls.cluster = popen_launch_workers_and_router(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -213,7 +213,7 @@ class TestReasoningContentWithoutParser(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         # Cleanup router and workers
-        kill_process_tree(cls.cluster["process"].pid)
+        kill_process_tree(cls.cluster["router"].pid)
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
 

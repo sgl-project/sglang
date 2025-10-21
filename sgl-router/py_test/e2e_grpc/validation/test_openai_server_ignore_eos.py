@@ -4,7 +4,7 @@ gRPC Router E2E Test - Test Openai Server Ignore Eos
 This test file is REUSED from test/srt/openai_server/validation/test_openai_server_ignore_eos.py
 with minimal changes:
     num_workers=2,
-- Swap popen_launch_server() → popen_launch_grpc_router()
+- Swap popen_launch_server() → popen_launch_workers_and_router()
 - Update teardown to cleanup router + workers
 - All test logic and assertions remain identical
 
@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
-from fixtures import popen_launch_grpc_router
+from fixtures import popen_launch_workers_and_router
 from util import (
     CustomTestCase,
     DEFAULT_MODEL_PATH,
@@ -36,7 +36,7 @@ class TestOpenAIServerIgnoreEOS(CustomTestCase):
         cls.model = DEFAULT_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.cluster = popen_launch_grpc_router(
+        cls.cluster = popen_launch_workers_and_router(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -50,7 +50,7 @@ class TestOpenAIServerIgnoreEOS(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         # Cleanup router and workers
-        kill_process_tree(cls.cluster["process"].pid)
+        kill_process_tree(cls.cluster["router"].pid)
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
 
