@@ -25,8 +25,9 @@ from sglang.srt.model_loader.loader import get_model_loader
 
 def _validate_export(export_dir: str) -> bool:
     """Validate that an exported model directory contains the expected files."""
+    import glob
+
     required_files = ["config.json", "tokenizer_config.json"]
-    model_files = ["model.safetensors", "pytorch_model.bin"]
 
     if not os.path.exists(export_dir):
         return False
@@ -36,10 +37,18 @@ def _validate_export(export_dir: str) -> bool:
         if not os.path.exists(os.path.join(export_dir, file)):
             return False
 
-    # Check for at least one model file
-    has_model_file = any(
-        os.path.exists(os.path.join(export_dir, file)) for file in model_files
-    )
+    # Check for model files using pattern matching to handle sharded models
+    model_patterns = [
+        "model*.safetensors",
+        "pytorch_model*.bin",
+    ]
+
+    has_model_file = False
+    for pattern in model_patterns:
+        matching_files = glob.glob(os.path.join(export_dir, pattern))
+        if matching_files:
+            has_model_file = True
+            break
 
     return has_model_file
 
@@ -83,7 +92,7 @@ def quantize_and_export_model(
         checkpoint_save_path: Optional path to save ModelOpt checkpoint
         device: Device to use for quantization
     """
-    print(f"🚀 Starting ModelOpt quantization and export workflow")
+    print("🚀 Starting ModelOpt quantization and export workflow")
     print(f"📥 Input model: {model_path}")
     print(f"📤 Export directory: {export_dir}")
     print(f"⚙️  Quantization method: {quantization_method}")
@@ -113,12 +122,13 @@ def quantize_and_export_model(
     model_config = ModelConfig(
         model_path=model_path,
         quantization=quantization_method,  # Use unified quantization flag
-        modelopt_checkpoint_save_path=checkpoint_save_path,
-        modelopt_export_path=export_dir,
         trust_remote_code=True,
     )
 
-    load_config = LoadConfig()
+    load_config = LoadConfig(
+        modelopt_checkpoint_save_path=checkpoint_save_path,
+        modelopt_export_path=export_dir,
+    )
     device_config = DeviceConfig(device=device)
 
     # Load and quantize the model (export happens automatically)
@@ -126,7 +136,7 @@ def quantize_and_export_model(
     model_loader = get_model_loader(load_config, model_config)
 
     try:
-        quantized_model = model_loader.load_model(
+        model_loader.load_model(
             model_config=model_config,
             device_config=device_config,
         )
@@ -138,7 +148,7 @@ def quantize_and_export_model(
 
             info = _get_export_info(export_dir)
             if info:
-                print(f"📋 Model info:")
+                print("📋 Model info:")
                 print(f"   - Type: {info['model_type']}")
                 print(f"   - Architecture: {info['architectures']}")
                 print(f"   - Quantization: {info['quantization_config']}")
@@ -150,15 +160,16 @@ def quantize_and_export_model(
         print(f"❌ Quantization failed: {e}")
         return
 
-    print(f"\n🎉 Workflow completed successfully!")
+    print("\n🎉 Workflow completed successfully!")
     print(f"📁 Quantized model exported to: {export_dir}")
-    print(f"\n🚀 To use the exported model:")
+    print("\n🚀 To use the exported model:")
     print(
         f"   python -m sglang.launch_server --model-path {export_dir} --quantization modelopt"
     )
-    print(f"\n   # Or in Python:")
-    print(f"   import sglang as sgl")
+    print("\n   # Or in Python:")
+    print("   import sglang as sgl")
     print(f"   llm = sgl.Engine(model_path='{export_dir}', quantization='modelopt')")
+    print("   # Note: 'modelopt' auto-detects FP4/FP8 from model config")
 
 
 def deploy_exported_model(
@@ -183,6 +194,7 @@ def deploy_exported_model(
 
     try:
         # Launch SGLang engine with the exported model
+        # Using generic "modelopt" for auto-detection of FP4/FP8
         llm = sgl.Engine(
             model_path=export_dir,
             quantization="modelopt",
@@ -190,21 +202,19 @@ def deploy_exported_model(
             port=port,
         )
 
-        print(f"✅ Model deployed successfully!")
+        print("✅ Model deployed successfully!")
         print(f"🌐 Server running at http://{host}:{port}")
 
         # Example inference
         prompts = ["Hello, how are you?", "What is the capital of France?"]
-        sampling_params = sgl.SamplingParams(
-            temperature=0.8, top_p=0.95, max_new_tokens=100
-        )
+        sampling_params = {"temperature": 0.8, "top_p": 0.95, "max_new_tokens": 100}
 
         print("\n🧪 Running example inference...")
         outputs = llm.generate(prompts, sampling_params)
 
         for i, output in enumerate(outputs):
             print(f"Prompt {i+1}: {prompts[i]}")
-            print(f"Output: {output.outputs[0].text}")
+            print(f"Output: {output['text']}")
             print()
 
     except Exception as e:

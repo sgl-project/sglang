@@ -164,12 +164,13 @@ from sglang.srt.model_loader.loader import get_model_loader
 model_config = ModelConfig(
     model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     quantization="modelopt_fp8",  # or "modelopt_fp4"
-    modelopt_export_path="./exported_model",
-    modelopt_checkpoint_save_path="./checkpoint.pth",  # optional, fake quantized checkpoint
     trust_remote_code=True,
 )
 
-load_config = LoadConfig()
+load_config = LoadConfig(
+    modelopt_export_path="./exported_model",
+    modelopt_checkpoint_save_path="./checkpoint.pth",  # optional, fake quantized checkpoint
+)
 device_config = DeviceConfig(device="cuda")
 
 # Load and quantize the model (export happens automatically)
@@ -205,7 +206,7 @@ llm = sgl.Engine(
 
 # Run inference
 prompts = ["Hello, how are you?", "What is the capital of France?"]
-sampling_params = sgl.SamplingParams(temperature=0.8, max_new_tokens=100)
+sampling_params = {"temperature": 0.8, "top_p": 0.95, "max_new_tokens": 100}
 outputs = llm.generate(prompts, sampling_params)
 
 for i, output in enumerate(outputs):
@@ -231,12 +232,25 @@ python examples/usage/modelopt_quantize_and_export.py quantize \
 **Export-only Workflow**: If you have a pre-existing fake quantized ModelOpt checkpoint, you can export it directly:
 
 ```python
+from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.model_loader.loader import get_model_loader
+
 model_config = ModelConfig(
     model_path="meta-llama/Llama-3.2-1B-Instruct",
     quantization="modelopt_fp8",
+    trust_remote_code=True,
+)
+
+load_config = LoadConfig(
     modelopt_checkpoint_restore_path="./my_checkpoint.pth",
     modelopt_export_path="./exported_model",
 )
+
+# Load and export the model
+model_loader = get_model_loader(load_config, model_config)
+model_loader.load_model(model_config=model_config, device_config=DeviceConfig())
 ```
 
 ##### Benefits of ModelOpt
