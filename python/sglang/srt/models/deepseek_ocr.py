@@ -20,17 +20,15 @@ import copy
 import logging
 import math
 from functools import partial
-from typing import Iterable, List, Optional, Tuple, Type, TypeAlias, Union
+from typing import Iterable, List, Optional, Tuple, Type, TypeAlias, Union, Set
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 
 from sglang.srt.configs.deepseek_ocr import (
     PRINT_NUM_VIS_TOKENS,
-    DeepseekV2Config,
     DeepseekVLV2Config,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -44,7 +42,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import (
     DeepseekV2ForCausalLM,
-    DeepseekV2Model,
     DeepseekV3ForCausalLM,
 )
 from sglang.srt.models.transformers import maybe_prefix
@@ -1253,215 +1250,6 @@ def build_clip_l():
     )
 
 
-class DeepseekOCRModel(DeepseekV2Model):
-    def __init__(self, config: DeepseekV2Config):
-        super(DeepseekOCRModel, self).__init__(config)
-
-        self.sam_model = build_sam_vit_b()
-        self.vision_model = build_clip_l()
-        # self.conv_2 = nn.Conv2d(in_channels=1024, out_channels=2048, kernel_size=2, stride=2)
-        n_embed = 1280
-        self.projector = MlpProjector(
-            projector_type="linear",
-            input_dim=2048,
-            n_embed=n_embed,
-        )
-        embed_std = 1 / torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
-        self.image_newline = nn.Parameter(torch.randn(n_embed) * embed_std)
-        self.view_seperator = nn.Parameter(torch.randn(n_embed) * embed_std)
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        images: Optional[torch.FloatTensor] = None,
-        images_seq_mask: Optional[torch.FloatTensor] = None,
-        images_spatial_crop: Optional[torch.FloatTensor] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
-
-        if inputs_embeds is None:
-            # inputs_embeds = self.embed_tokens(input_ids)
-            inputs_embeds = self.get_input_embeddings()(input_ids)
-
-        sam_model = getattr(self, "sam_model", None)
-        # sam_model = self.sam_model
-        vision_model = getattr(self, "vision_model", None)
-
-        if (
-            sam_model is not None
-            and (input_ids.shape[1] != 1 or self.training)
-            and torch.sum(images[0][1]).item() != 0
-        ):
-
-            idx = 0
-
-            # sam_model = torch.jit.script(sam_model)
-
-            # start_time = time.time()
-            for image, crop_shape in zip(images, images_spatial_crop):
-                images_in_this_batch = []
-
-                patches = image[0]
-                image_ori = image[1]
-
-                with torch.no_grad():
-                    # with torch.inference_mode():
-
-                    if torch.sum(patches).item() != 0:
-                        # P, C, H, W = patches.shape
-                        crop_flag = 1
-                        local_features_1 = sam_model(patches)
-
-                        local_features_2 = vision_model(patches, local_features_1)
-                        # vit_time = time.time()
-                        local_features = torch.cat(
-                            (
-                                local_features_2[:, 1:],
-                                local_features_1.flatten(2).permute(0, 2, 1),
-                            ),
-                            dim=-1,
-                        )
-                        local_features = self.projector(local_features)
-
-                        global_features_1 = sam_model(image_ori)
-                        global_features_2 = vision_model(image_ori, global_features_1)
-                        global_features = torch.cat(
-                            (
-                                global_features_2[:, 1:],
-                                global_features_1.flatten(2).permute(0, 2, 1),
-                            ),
-                            dim=-1,
-                        )
-                        global_features = self.projector(global_features)
-
-                        print("=====================")
-                        print("BASE: ", global_features.shape)
-                        print("PATCHES: ", local_features.shape)
-                        print("=====================")
-
-                        _, hw, n_dim = global_features.shape
-                        h = w = int(hw ** 0.5)
-
-                        _2, hw2, n_dim2 = local_features.shape
-                        h2 = w2 = int(hw2 ** 0.5)
-
-                        width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
-
-                        global_features = global_features.view(h, w, n_dim)
-
-                        global_features = torch.cat(
-                            [
-                                global_features,
-                                self.image_newline[None, None, :].expand(h, 1, n_dim),
-                            ],
-                            dim=1,
-                        )
-
-                        global_features = global_features.view(-1, n_dim)
-
-                        local_features = (
-                            local_features.view(
-                                height_crop_num, width_crop_num, h2, w2, n_dim2
-                            )
-                            .permute(0, 2, 1, 3, 4)
-                            .reshape(height_crop_num * h2, width_crop_num * w2, n_dim2)
-                        )
-                        local_features = torch.cat(
-                            [
-                                local_features,
-                                self.image_newline[None, None, :].expand(
-                                    height_crop_num * h2, 1, n_dim2
-                                ),
-                            ],
-                            dim=1,
-                        )
-                        local_features = local_features.view(-1, n_dim2)
-
-                        global_local_features = torch.cat(
-                            [
-                                local_features,
-                                global_features,
-                                self.view_seperator[None, :],
-                            ],
-                            dim=0,
-                        )
-
-                        # end_time = time.time()
-
-                        # print('sam: ', sam_time - start_time)
-                        # print('vit: ', vit_time - sam_time)
-                        # print('all: ', end_time - start_time)
-
-                        # exit()
-
-                    else:
-                        global_features_1 = sam_model(image_ori)
-                        global_features_2 = vision_model(image_ori, global_features_1)
-                        global_features = torch.cat(
-                            (
-                                global_features_2[:, 1:],
-                                global_features_1.flatten(2).permute(0, 2, 1),
-                            ),
-                            dim=-1,
-                        )
-                        global_features = self.projector(global_features)
-                        print("=====================")
-                        print("BASE: ", global_features.shape)
-                        print("NO PATCHES")
-                        print("=====================")
-                        _, hw, n_dim = global_features.shape
-                        h = w = int(hw ** 0.5)
-
-                        global_features = global_features.view(h, w, n_dim)
-
-                        global_features = torch.cat(
-                            [
-                                global_features,
-                                self.image_newline[None, None, :].expand(h, 1, n_dim),
-                            ],
-                            dim=1,
-                        )
-
-                        global_features = global_features.view(-1, n_dim)
-
-                        global_local_features = torch.cat(
-                            [global_features, self.view_seperator[None, :]], dim=0
-                        )
-
-                    images_in_this_batch.append(global_local_features)
-
-                # print(inputs_embeds.shape)
-
-                if images_in_this_batch:
-                    images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
-                    # exit()
-
-                    inputs_embeds[idx].masked_scatter_(
-                        images_seq_mask[idx].unsqueeze(-1).cuda(), images_in_this_batch
-                    )
-
-                idx += 1
-
-        return super(DeepseekOCRModel, self).forward(
-            input_ids=None,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-
 class DeepseekOCRForCausalLM(nn.Module):
     def __init__(
         self,
@@ -1489,7 +1277,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
 
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # self.sam_model = torch.compile(self.sam_model, mode="reduce-overhead")
         # self.vision_model = torch.compile(self.vision_model, mode="reduce-overhead")
@@ -1508,21 +1296,18 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         print(f"{self.text_config.topk_method=}")
         if self.text_config.topk_method == "noaux_tc":
-            architectures = ["DeepseekV3ForCausalLM"]
             self.model = DeepseekV3ForCausalLM(
                 config=config.text_config,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "language"),
             )
         elif not self.text_config.use_mla:
-            architectures = ["DeepseekForCausalLM"]
             self.model = DeepseekForCausalLM(
                 config=config.text_config,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "language"),
             )
         else:
-            architectures = ["DeepseekV2ForCausalLM"]
             self.model = DeepseekV2ForCausalLM(
                 config=config.text_config,
                 quant_config=quant_config,
@@ -1539,11 +1324,9 @@ class DeepseekOCRForCausalLM(nn.Module):
             input_dim=2048,
             n_embed=n_embed,
         )
-        embed_std = 1 / torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
-        self.image_newline = nn.Parameter(torch.randn(n_embed) * embed_std)
-        self.view_seperator = nn.Parameter(torch.randn(n_embed) * embed_std)
-
-        print(f"{architectures=}")
+        # embed_std = 1 / torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
+        # self.image_newline = nn.Parameter(torch.randn(n_embed) * embed_std)
+        # self.view_seperator = nn.Parameter(torch.randn(n_embed) * embed_std)
 
         # self.make_empty_intermediate_tensors = (
         #     self.language_model.make_empty_intermediate_tensors
@@ -1931,6 +1714,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         **kwargs: object,
     ):
         print(f"{input_ids=}")
+        print(f"{positions=}")
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
@@ -1961,11 +1745,14 @@ class DeepseekOCRForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        loaded_params: Set[str] = set()
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-
-            if name.startswith("model."):
+            if name == "lm_head.weight":
+                name = "model.lm_head.weight"
+            elif name.startswith("model."):
                 if (
                     "image_newline" in name
                     or ".projector" in name
@@ -1973,7 +1760,7 @@ class DeepseekOCRForCausalLM(nn.Module):
                     or "sam_model" in name
                     or "view_seperator" in name
                 ):
-                    name = name[6:]
+                    name = name[len("model."):]
                 elif not (
                     ".projector" in name
                     or "vision_model" in name
@@ -2010,6 +1797,12 @@ class DeepseekOCRForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        unloaded_params = params_dict.keys() - loaded_params
+        if unloaded_params:
+            raise RuntimeError(
+                f"Some weights are not initialized from checkpoints: {unloaded_params}"
+            )
 
 
 EntryClass = [DeepseekOCRForCausalLM]

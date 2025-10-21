@@ -264,7 +264,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
             image_shapes,
         ) = self.tokenize_with_images(
             messages,
-            pil_images[image_index: image_index + image_token_cnt],
+            pil_images[image_index : image_index + image_token_cnt],
             bos=True,
             eos=True,
             cropping=len(pil_images) <= 2,
@@ -568,14 +568,14 @@ class DeepseekVLV2Processor(ProcessorMixin):
             )
 
             tokenized_image = (
-                                  [self.image_token_id] * num_queries_base + [self.image_token_id]
-                              ) * num_queries_base
+                [self.image_token_id] * num_queries_base + [self.image_token_id]
+            ) * num_queries_base
             tokenized_image += [self.image_token_id]
             if num_width_tiles > 1 or num_height_tiles > 1:
                 tokenized_image += (
-                                       [self.image_token_id] * (num_queries * num_width_tiles)
-                                       + [self.image_token_id]
-                                   ) * (num_queries * num_height_tiles)
+                    [self.image_token_id] * (num_queries * num_width_tiles)
+                    + [self.image_token_id]
+                ) * (num_queries * num_height_tiles)
             tokenized_str += tokenized_image
             # print(f"{tokenized_image=}")
 
