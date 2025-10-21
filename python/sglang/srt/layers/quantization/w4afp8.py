@@ -19,7 +19,9 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe import MoeRunnerConfig
+    # from sglang.srt.layers.moe import MoeRunnerConfig, MoeRunner
+    # from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+    # from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
     from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -128,6 +130,7 @@ def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
 class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
+        # self.runner: Optional[MoeRunner] = None
 
     def create_weights(
         self,
@@ -287,6 +290,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.CUTLASS, moe_runner_config)
 
     def apply(
         self,
@@ -294,39 +298,34 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
         topk_weights, topk_ids, _ = topk_output
-
-        output = cutlass_w4a8_moe(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
-            topk_weights,
-            topk_ids,
-            self.a_strides1,
-            self.b_strides1,
-            self.c_strides1,
-            self.a_strides2,
-            self.b_strides2,
-            self.c_strides2,
-            self.s_strides13,
-            self.s_strides2,
-            self.expert_offsets,
-            self.problem_sizes1,
-            self.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
-        )
-        if self.moe_runner_config.routed_scaling_factor is not None:
-            output *= self.moe_runner_config.routed_scaling_factor
-        return StandardCombineInput(hidden_states=output)
+        if self.runner.runner_backend.is_cutlass():
+            params = CutlassMoEParams(
+                cutlass_moe_type=CutlassMoEType.BlockscaledFP4,
+                device=layer.w13_weight.device,
+                num_experts=num_experts,
+                intermediate_size_per_partition=intermediate_size,
+                hidden_size=hidden_size,
+            )
+            quant_info = CutlassMoeQuantInfo(
+                moe_type=CutlassMoEType.BlockscaledFP4,
+                w13_weight=w1_fp4,
+                w2_weight=w2_fp4,
+                w1_blockscale=w1_blockscale,
+                w2_blockscale=w2_blockscale,
+                w1_alpha=w1_alpha,
+                w2_alpha=w2_alpha,
+                a1_gscale=a1_gscale,
+                a2_gscale=a2_gscale,
+                expert_offsets=params.expert_offsets,
+                problem_sizes1=params.problem_sizes1,
+                problem_sizes2=params.problem_sizes2,
+                params=params,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
     def apply_deepep_normal(
         self,

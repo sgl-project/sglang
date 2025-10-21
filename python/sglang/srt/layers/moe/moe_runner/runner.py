@@ -9,6 +9,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     PermuteMethodPool,
 )
+from sglang.srt.layers.moe.moe_runner.cutlass import CutlassRunnerCore
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -33,6 +34,8 @@ class MoeRunner:
             self.runner_core = TritonRunnerCore(config)
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
+        elif runner_backend.is_cutlass():
+            self.runner_core = CutlassRunnerCore(config)
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
