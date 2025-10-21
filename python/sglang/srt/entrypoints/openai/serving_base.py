@@ -4,7 +4,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import orjson
 from fastapi import HTTPException, Request
@@ -66,13 +66,11 @@ class OpenAIServingBase(ABC):
                 )
 
             return response
-
         except HTTPException as e:
             http_status = str(e.status_code)
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
-
         except ValueError as e:
             http_status = "400"
             return self.create_error_response(
@@ -80,7 +78,6 @@ class OpenAIServingBase(ABC):
                 err_type="BadRequest",
                 status_code=400,
             )
-
         except Exception as e:
             http_status = "500"
             logger.exception(f"Error in request: {e}")
@@ -89,7 +86,6 @@ class OpenAIServingBase(ABC):
                 err_type="InternalServerError",
                 status_code=500,
             )
-
         finally:
             adapted_for_metrics = (
                 adapted_request
