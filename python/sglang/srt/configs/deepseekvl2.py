@@ -264,7 +264,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
             image_shapes,
         ) = self.tokenize_with_images(
             messages,
-            pil_images[image_index : image_index + image_token_cnt],
+            pil_images[image_index: image_index + image_token_cnt],
             bos=True,
             eos=True,
             cropping=len(pil_images) <= 2,
@@ -465,11 +465,11 @@ class DeepseekVLV2Processor(ProcessorMixin):
     ):
         """Tokenize text with <image> tags."""
 
-        print(f"{conversation=}")
+        # print(f"{conversation=}")
         conversation = conversation
         assert conversation.count(self.image_token) == len(images)
         text_splits = conversation.split(self.image_token)
-        print(f"{text_splits=}")
+        # print(f"{text_splits=}")
         images_list, images_crop_list, images_seq_mask, images_spatial_crop = (
             [],
             [],
@@ -483,6 +483,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
         for text_sep, image in zip(text_splits, images):
             """encode text_sep"""
             tokenized_sep = self.encode(text_sep, bos=False, eos=False)
+            # print(f"{tokenized_sep=}")
+            # print(f"{text_sep=}")
+
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
 
@@ -565,20 +568,24 @@ class DeepseekVLV2Processor(ProcessorMixin):
             )
 
             tokenized_image = (
-                [self.image_token_id] * num_queries_base + [self.image_token_id]
-            ) * num_queries_base
+                                  [self.image_token_id] * num_queries_base + [self.image_token_id]
+                              ) * num_queries_base
             tokenized_image += [self.image_token_id]
             if num_width_tiles > 1 or num_height_tiles > 1:
                 tokenized_image += (
-                    [self.image_token_id] * (num_queries * num_width_tiles)
-                    + [self.image_token_id]
-                ) * (num_queries * num_height_tiles)
+                                       [self.image_token_id] * (num_queries * num_width_tiles)
+                                       + [self.image_token_id]
+                                   ) * (num_queries * num_height_tiles)
             tokenized_str += tokenized_image
+            # print(f"{tokenized_image=}")
+
             images_seq_mask += [True] * len(tokenized_image)
             num_image_tokens.append(len(tokenized_image))
 
         """process the last text split"""
         tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
+        # print(f"{text_splits[-1]=}")
+
         tokenized_str += tokenized_sep
         images_seq_mask += [False] * len(tokenized_sep)
 
@@ -607,7 +614,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
             f"tokenized_str's length {len(tokenized_str)}, input_ids' length {len(masked_tokenized_str)}, "
             f"imags_seq_mask's length {len(images_seq_mask)}, are not equal"
         )
-        print(f"{tokenized_str=}")
         input_ids = torch.LongTensor(tokenized_str)
         target_ids = torch.LongTensor(masked_tokenized_str)
         images_seq_mask = torch.tensor(images_seq_mask, dtype=torch.bool)
@@ -644,7 +650,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
                 ).unsqueeze(0)
 
         input_ids = input_ids.unsqueeze(0)
-        print(f"{input_ids=}")
+        # print(f"{input_ids=}")
         return (
             input_ids,
             pixel_values,
