@@ -209,20 +209,44 @@ impl RouterManager {
     }
 
     pub fn get_router_for_model(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
+        // Use core::ConnectionMode locally to distinguish from config::ConnectionMode
+        use crate::core::ConnectionMode as ConnectionMode;
+
         let workers = self.worker_registry.get_by_model(model_id);
 
-        if !workers.is_empty() {
-            let has_pd_workers = workers.iter().any(|w| {
+        // Separate workers by connection mode
+        let http_workers: Vec<_> = workers
+            .iter()
+            .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
+            .collect();
+
+        let grpc_workers: Vec<_> = workers
+            .iter()
+            .filter(|w| matches!(w.connection_mode(), ConnectionMode::Grpc { .. }))
+            .collect();
+
+        // Prefer gRPC if available; otherwise fall back to HTTP
+        let (selected_workers, connection_mode) = if !grpc_workers.is_empty() {
+            (grpc_workers, ConnectionMode::Grpc { port: None })
+        } else {
+            (http_workers, ConnectionMode::Http)
+        };
+
+        if !selected_workers.is_empty() {
+            // Check if selected workers are PD type
+            let has_pd_workers = selected_workers.iter().any(|w| {
                 matches!(
                     w.worker_type(),
                     WorkerType::Prefill { .. } | WorkerType::Decode
                 )
             });
 
-            let router_id = if has_pd_workers {
-                RouterId::new("http-pd".to_string())
-            } else {
-                RouterId::new("http-regular".to_string())
+            // Construct router ID based on connection mode and worker type
+            let router_id = match (connection_mode, has_pd_workers) {
+                (ConnectionMode::Http, true) => RouterId::new("http-pd".to_string()),
+                (ConnectionMode::Http, false) => RouterId::new("http-regular".to_string()),
+                (ConnectionMode::Grpc { .. }, true) => RouterId::new("grpc-pd".to_string()),
+                (ConnectionMode::Grpc { .. }, false) => RouterId::new("grpc-regular".to_string()),
             };
 
             if let Some(router) = self.routers.get(&router_id) {
