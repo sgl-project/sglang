@@ -6,6 +6,7 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
@@ -61,6 +62,12 @@ class OpenAIServingBase(ABC):
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
+            )
+        except ValueError as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="BadRequest",
+                status_code=400,
             )
         except Exception as e:
             logger.exception(f"Error in request: {e}")
@@ -191,7 +198,7 @@ class OpenAIServingBase(ABC):
         )
         try:
             raw_labels = (
-                json.loads(raw_request.headers.get(header))
+                orjson.loads(raw_request.headers.get(header))
                 if raw_request and raw_request.headers.get(header)
                 else None
             )
