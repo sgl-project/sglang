@@ -150,6 +150,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
         parallel_tool_calls: req.parallel_tool_calls,
         top_logprobs: req.top_logprobs,
         top_p: req.top_p,
+        skip_special_tokens: true, // Always skip special tokens like <|eot_id|>
         // Note: tools and tool_choice will be handled separately for MCP transformation
         tools: None,       // Will be set by caller if needed
         tool_choice: None, // Will be set by caller if needed
