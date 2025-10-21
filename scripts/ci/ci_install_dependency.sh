@@ -34,7 +34,7 @@ else
     export UV_SYSTEM_PYTHON=true
 
     PIP_CMD="uv pip"
-    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --prerelease=allow"
+    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
     # Clean up existing installations
     $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
