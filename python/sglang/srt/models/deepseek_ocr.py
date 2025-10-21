@@ -1047,32 +1047,6 @@ class NoTPFeedForward(nn.Module):
         return output
 
 
-class NoTPTransformerBlock(nn.Module):
-    def __init__(self, cfg, layer_id: int, multiple_of=256):
-        super().__init__()
-
-        self.n_heads = cfg["num_attention_heads"]
-        self.dim = cfg["hidden_size"]
-        self.head_dim = cfg["hidden_size"] // cfg["num_attention_heads"]
-        self.self_attn = NoTPAttention(cfg)
-        self.mlp = NoTPFeedForward(
-            cfg, dim=cfg["hidden_size"], hidden_dim=cfg["ffn_hidden_size"]
-        )
-        self.layer_id = layer_id
-        self.layer_norm1 = torch.nn.LayerNorm(
-            cfg["hidden_size"], eps=cfg["layernorm_epsilon"]
-        )
-        self.layer_norm2 = torch.nn.LayerNorm(
-            cfg["hidden_size"], eps=cfg["layernorm_epsilon"]
-        )
-
-    def forward(self, x: torch.Tensor):
-        residual = self.self_attn.forward(self.layer_norm1(x))
-        h = x + residual
-        out = h + self.mlp.forward(self.layer_norm2(h))
-        return out
-
-
 class LayerNormfp32(torch.nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
 
