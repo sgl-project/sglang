@@ -146,6 +146,13 @@ class _Communicator(Generic[T]):
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
 
+    @staticmethod
+    def merge_results(results):
+        all_success = all([r.success for r in results])
+        all_message = [r.message for r in results]
+        all_message = " | ".join(all_message)
+        return all_success, all_message
+
 
 class TokenizerCommunicatorMixin:
     """Mixin class for TokenizerManager to handle communication with the scheduler."""
@@ -358,10 +365,11 @@ class TokenizerCommunicatorMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for init parameter update group"
-        result = (await self.init_weights_update_group_communicator(obj))[0]
-        return result.success, result.message
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+
+        results = await self.init_weights_update_group_communicator(obj)
+        return _Communicator.merge_results(results)
 
     async def destroy_weights_update_group(
         self,
@@ -370,10 +378,11 @@ class TokenizerCommunicatorMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for destroy parameter update group"
-        result = (await self.destroy_weights_update_group_communicator(obj))[0]
-        return result.success, result.message
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
+
+        results = await self.destroy_weights_update_group_communicator(obj)
+        return _Communicator.merge_results(results)
 
     async def update_weights_from_distributed(
         self: TokenizerManager,
@@ -391,8 +400,8 @@ class TokenizerCommunicatorMixin:
         # This means that weight sync
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
-            result = (await self.update_weights_from_distributed_communicator(obj))[0]
-            return result.success, result.message
+            results = await self.update_weights_from_distributed_communicator(obj)
+            return _Communicator.merge_results(results)
 
     async def init_weights_send_group_for_remote_instance(
         self,
@@ -629,43 +638,27 @@ class TokenizerCommunicatorMixin:
         if self.log_requests:
             if self.log_requests_level == 0:
                 max_length = 1 << 30
-                skip_names = set(
-                    [
-                        "text",
-                        "input_ids",
-                        "input_embeds",
-                        "image_data",
-                        "audio_data",
-                        "lora_path",
-                        "sampling_params",
-                    ]
-                )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                        "embedding",
-                    ]
-                )
+                skip_names = {
+                    "text",
+                    "input_ids",
+                    "input_embeds",
+                    "image_data",
+                    "audio_data",
+                    "lora_path",
+                    "sampling_params",
+                }
+                out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 1:
                 max_length = 1 << 30
-                skip_names = set(
-                    [
-                        "text",
-                        "input_ids",
-                        "input_embeds",
-                        "image_data",
-                        "audio_data",
-                        "lora_path",
-                    ]
-                )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                        "embedding",
-                    ]
-                )
+                skip_names = {
+                    "text",
+                    "input_ids",
+                    "input_embeds",
+                    "image_data",
+                    "audio_data",
+                    "lora_path",
+                }
+                out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 2:
                 max_length = 2048
             elif self.log_requests_level == 3:
