@@ -110,6 +110,7 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
 
     def get_post_hook(self) -> Optional[Callable]:
         """Get the post-processing hook after weight loading."""
+
         def post_hook():
             # Perform post-processing after weight loading similar to DefaultModelLoader
             try:
@@ -120,7 +121,9 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         # Move parameters to device if needed for quantization processing
-                        target_device = torch.device("cuda", torch.cuda.current_device())
+                        target_device = torch.device(
+                            "cuda", torch.cuda.current_device()
+                        )
                         with device_loading_context(module, target_device):
                             quant_method.process_weights_after_loading(module)
                 # Call model-specific post-loading hook if available
