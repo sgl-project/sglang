@@ -1616,9 +1616,7 @@ def get_cpu_memory_capacity():
                 if len(parts) >= 4 and parts[2] == "MemTotal:":
                     numa_mem_list.append(int(parts[3]))
                 else:
-                    raise ValueError(
-                        f"Unexpected format in {file_meminfo}: {line}"
-                    )
+                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
         # Retrieved value in KB, need MB
         numa_mem = float(min(numa_mem_list) // 1024)
         return numa_mem
