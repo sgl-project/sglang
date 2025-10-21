@@ -1,8 +1,9 @@
 import torch
 import time
 import threading
-from typing import List, Tuple, Optional
 from dataclasses import dataclass
+from typing import List, Tuple, Optional, Callable
+from sglang.srt.model_executor.graph_runner import get_global_graph_memory_pool
 
 @dataclass
 class ManagerConfig:
@@ -124,7 +125,34 @@ class RetriveResult:
         self.seq_lens.copy_(seq_lens)
         self.retrived_cache_indices_page.copy_(retrived_cache_indices_page)
         self.updated = True
-
+        
+class RetriveCudaGraphRunner:
+    def __init__(self, config: ManagerConfig, queries: List[RetriveQuery], results: List[RetriveResult], 
+                retrive_function: Callable, stream: torch.cuda.Stream, device: torch.device):
+        self.config = config
+        self.queries = queries
+        self.results = results
+        self.stream = stream
+        self.retrive_function = retrive_function
+        self.graphs = [None for i in range(self.config.num_layers)]
+        self.device_module = torch.get_device_module(device)
+        self.capture_graph()
+        
+    def _capture_one_layer(self, layer_id: int):
+        graph = torch.cuda.CUDAGraph()
+        memory_pool = get_global_graph_memory_pool()
+        with self.device_module.graph(graph, pool=memory_pool, stream=self.stream):
+            self.retrive_function(self.queries[layer_id], self.results[layer_id])
+        return graph
+        
+    def capture_graph(self):
+        for layer_id in range(self.config.num_layers):
+            self.graphs[layer_id] = self._capture_one_layer(layer_id)
+    
+    def replay(self, layer_id: int):
+        with self.stream:
+            self.graphs[layer_id].replay()
+        
 class CacheManager:
     def __init__(self, config: ManagerConfig):
         self.config = config
@@ -137,7 +165,13 @@ class CacheManager:
         self.retrived_query = [RetriveQuery(self.config) for _ in range(self.config.num_layers)]
         
         self.accumlation_step = self.config.page_size
+        self._retrive_cache_indices = None
         
+    def init_cuda_graph(self):
+        self.graph_runner = RetriveCudaGraphRunner(self.config, self.retrived_query, self.retrived_result, 
+                                                   self._retrive_one_layer, self.stream, self.config.device)
+        
+    
     def update_query(self, query: torch.Tensor, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor, 
                     layer_id: int):
 
@@ -146,7 +180,6 @@ class CacheManager:
         self.retrived_query[layer_id].req_pool_indices[:bs] = req_pool_indices
         self.retrived_query[layer_id].seq_lens[:bs] = seq_lens
         self.retrived_query[layer_id].updated = True
-        self.retrived_query[layer_id].bs = bs
         
         self._call_after_update_query(
             key_cache=self.config.keys[layer_id],
@@ -172,27 +205,31 @@ class CacheManager:
             return
         self.loop = threading.Thread(target=self._retrive_loop, daemon=True)
         self.loop.start()
+        
+    def _retrive_one_layer(self, query: RetriveQuery, result: RetriveResult):
+        with self.stream:
+            self._retrive_cache_indices(
+                query=query.query, 
+                proxy_k_tensor=query.proxy_k_tensor, 
+                req_to_token=self.config.req_to_token,
+                req_pool_indices=query.req_pool_indices,
+                seq_lens=query.seq_lens, 
+                top_k=self.config.top_k,
+                score=query.score,
+                selected_page_indices=query.selected_page_indices,
+            )
+            result.copy_from(
+                req_pool_indices=query.req_pool_indices, 
+                seq_lens=query.seq_lens, 
+                retrived_cache_indices_page=query.selected_page_indices,
+            )
     
     def _retrive_loop(self):
-        with self.stream:
-            while True:
-                for layer_id in range(self.config.num_layers):
-                    if self.retrived_query[layer_id].updated:
-                        query = self.retrived_query[layer_id]
-                        self._retrive_cache_indices(
-                            query=query.query, 
-                            proxy_k_tensor=query.proxy_k_tensor, 
-                            req_to_token=self.config.req_to_token,
-                            req_pool_indices=query.req_pool_indices,
-                            seq_lens=query.seq_lens, 
-                            top_k=self.config.top_k,
-                            score=query.score,
-                            selected_page_indices=query.selected_page_indices,
-                        )
-                        self.retrived_result[layer_id].copy_from(
-                            req_pool_indices=query.req_pool_indices, 
-                            seq_lens=query.seq_lens, 
-                            retrived_cache_indices_page=query.selected_page_indices,
-                        )
-                        #self.retrived_query[layer_id].updated = False
-                    time.sleep(0.02)
+        while True:
+            for layer_id in range(self.config.num_layers):
+                if self.retrived_query[layer_id].updated:
+                    if self.config.is_cuda_graph:
+                        self.graph_runner.graphs[layer_id].replay()
+                    else:
+                        self._retrive_one_layer(layer_id)
+                time.sleep(0.01)
