@@ -1654,7 +1654,7 @@ class ServerArgs:
             help="The port for NCCL distributed environment setup. Defaults to a random port.",
         )
         parser.add_argument(
-            "--wait-for-initial-weights",
+            "--checkpoint-engine-wait-weights-before-ready",
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
             "before serving inference requests.",
