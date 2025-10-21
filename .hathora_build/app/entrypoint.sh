@@ -81,6 +81,11 @@ if [[ -n "$NNODES" && "$NNODES" -gt 1 ]]; then
     # Primary node
     MASTER_IP="$HATHORA_PRIVATE_IP"
     export NODE_RANK=0
+    # If configured, create a room for the secondary app (K2-B)
+    if [[ -n "$KIMI_B_APP_ID" && -n "$HATHORA_TOKEN" ]]; then
+      log "Creating secondary room for app $KIMI_B_APP_ID with master_ip=$MASTER_IP"
+      python3 /app/create_hathora_room.py "$MASTER_IP" || log "Secondary room creation failed"
+    fi
   else
     # Secondary node
     MASTER_IP=$(python3 - <<'PY'
