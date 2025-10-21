@@ -36,6 +36,7 @@ from sglang.srt.utils import (
     configure_ipv6,
     get_device,
     get_device_memory_capacity,
+    get_device_sm,
     is_cuda,
     is_flashinfer_available,
     is_hip,
@@ -90,6 +91,7 @@ QUANTIZATION_CHOICES = [
     "qoq",
     "w4afp8",
     "mxfp4",
+    "compressed-tensors",  # for Ktransformers
 ]
 
 ATTENTION_BACKEND_CHOICES = [
@@ -113,6 +115,7 @@ ATTENTION_BACKEND_CHOICES = [
     # Other platforms
     "intel_amx",
     "ascend",
+    "intel_xpu",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv"]
@@ -219,6 +222,7 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
+    abort_on_priority_when_disabled: bool = False
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
@@ -386,6 +390,13 @@ class ServerArgs:
     # LMCache
     enable_lmcache: bool = False
 
+    # Ktransformers
+    kt_amx_weight_path: Optional[str] = None
+    kt_amx_method: Optional[str] = None
+    kt_cpuinfer: Optional[int] = None
+    kt_threadpool_count: Optional[int] = None
+    kt_num_gpu_experts: Optional[int] = None
+
     # Double Sparsity
     enable_double_sparsity: bool = False
     ds_channel_config_path: Optional[str] = None
@@ -541,6 +552,9 @@ class ServerArgs:
         self._handle_amd_specifics()
         self._handle_grammar_backend()
 
+        # Handle Ktransformers specific configs
+        self._handle_ktransformers_configs()
+
         # Handle data parallelism.
         self._handle_data_parallelism()
 
@@ -591,6 +605,22 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+    def _handle_ktransformers_configs(self):
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+            CompressedTensorsWNA16AMXEPMoEMethod,
+            override_config,
+        )
+
+        override_config(
+            CompressedTensorsWNA16AMXEPMoEMethod,
+            self.kt_num_gpu_experts,
+            self.kt_cpuinfer,
+            self.kt_threadpool_count,
+            self.kt_amx_weight_path,
+            self.kt_amx_method,
+            self.chunked_prefill_size,
+        )
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -942,6 +972,31 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+        elif model_arch in ["Olmo2ForCausalLM"]:
+            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
+            logger.warning(
+                f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
+            )
+            self.disable_hybrid_swa_memory = True
+
+            if self.attention_backend is None:
+                if is_cuda() and is_sm100_supported():
+                    self.attention_backend = "trtllm_mha"
+                elif is_cuda() and get_device_sm() >= 80:
+                    self.attention_backend = "fa3"
+                else:
+                    self.attention_backend = "triton"
+
+            # Flashinfer appears to degrade performance when sliding window attention
+            # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
+            # but Olmo3 does.
+            assert (
+                self.attention_backend != "flashinfer"
+            ), "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+
+            logger.info(
+                f"Using {self.attention_backend} as attention backend for {model_arch}."
+            )
 
         if is_deepseek_nsa(hf_config):
             if (
@@ -1070,6 +1125,22 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
+
+        if self.attention_backend == "intel_xpu":
+            if self.page_size not in [32, 64, 128]:
+                logger.warning(
+                    f"Intel XPU attention backend only supports page_size of 32, 64 or 128, changing page_size from {self.page_size} to 128."
+                )
+                self.page_size = 128
+        if self.attention_backend == "fa4" or self.decode_attention_backend == "fa4":
+            raise ValueError(
+                "FA4 backend is only supported for prefill. Please use `--prefill-attention-backend fa4` instead."
+            )
+        if self.prefill_attention_backend == "fa4":
+            logger.warning(
+                f"FA4 backend only supports page size 128, changing page_size from {self.page_size} to 128."
+            )
+            self.page_size = 128
 
     def _handle_page_size(self):
         if self.page_size is None:
@@ -1201,6 +1272,9 @@ class ServerArgs:
                 )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding."
+                )
 
             if self.speculative_algorithm == "EAGLE" and self.enable_beta_spec:
                 self.disable_overlap_schedule = False
@@ -1367,6 +1441,26 @@ class ServerArgs:
                 "Please choose one tokenizer batching approach."
             )
 
+        if self.skip_tokenizer_init:
+            if self.tokenizer_worker_num != 1:
+                logger.warning(
+                    "skip_tokenizer_init=True disables tokenizer workers; forcing tokenizer_worker_num=1 "
+                    f"(requested {self.tokenizer_worker_num})."
+                )
+                self.tokenizer_worker_num = 1
+
+            if self.enable_tokenizer_batch_encode:
+                logger.warning(
+                    "skip_tokenizer_init=True ignores --enable-tokenizer-batch-encode; disabling it."
+                )
+                self.enable_tokenizer_batch_encode = False
+
+            if self.enable_dynamic_batch_tokenizer:
+                logger.warning(
+                    "skip_tokenizer_init=True ignores --enable-dynamic-batch-tokenizer; disabling it."
+                )
+                self.enable_dynamic_batch_tokenizer = False
+
     def _handle_environment_variables(self):
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
@@ -1431,8 +1525,8 @@ class ServerArgs:
                     f"but you explicitly specified '{self.attention_backend}'."
                 )
 
-            # Currently, only FA3 supports radix cache. Support for other backends is in progress
-            if self.attention_backend != "fa3":
+            # Currently, only FA3 and Triton supports radix cache. Support for other backends is in progress
+            if self.attention_backend not in ["fa3", "triton"]:
                 self.disable_radix_cache = True
                 logger.warning(
                     f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
@@ -1451,6 +1545,7 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+
         # Model and tokenizer
         parser.add_argument(
             "--model-path",
@@ -1652,8 +1747,8 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+.',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
@@ -1711,6 +1806,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_priority_scheduling,
             help="Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
+        )
+        parser.add_argument(
+            "--abort-on-priority-when-disabled",
+            action="store_true",
+            default=ServerArgs.abort_on_priority_when_disabled,
+            help="If set, abort requests that specify a priority when priority scheduling is disabled.",
         )
         parser.add_argument(
             "--schedule-low-priority-values-first",
@@ -2602,6 +2703,35 @@ class ServerArgs:
             help="Using LMCache as an alternative hierarchical cache solution",
         )
 
+        # Ktransformer server args
+        parser.add_argument(
+            "--kt-amx-weight-path",
+            type=str,
+            help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
+        )
+        parser.add_argument(
+            "--kt-amx-method",
+            type=str,
+            default="AMXINT4",
+            help="[ktransformers parameter] Quantization formats for CPU execution.",
+        )
+        parser.add_argument(
+            "--kt-cpuinfer",
+            type=int,
+            help="[ktransformers parameter] The number of CPUInfer threads.",
+        )
+        parser.add_argument(
+            "--kt-threadpool-count",
+            type=int,
+            default=2,
+            help="[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
+        )
+        parser.add_argument(
+            "--kt-num-gpu-experts",
+            type=int,
+            help="[ktransformers parameter] The number of GPU experts.",
+        )
+
         # Double Sparsity
         parser.add_argument(
             "--enable-double-sparsity",
@@ -3240,7 +3370,6 @@ class ServerArgs:
                     "  Please manually install torch 2.6.x."
                 )
 
-        # Check multi tokenizer
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets

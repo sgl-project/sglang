@@ -10,7 +10,11 @@ import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
-from sglang.srt.mem_cache.common import alloc_token_slots
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+    get_last_loc,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -82,9 +86,31 @@ class EagleDraftInputV2Mixin:
         # Now seq_lens and allocate_lens are correct
         batch.maybe_wait_verify_done()
 
-        new_allocate_lens = batch.seq_lens + self.ALLOC_LEN_PER_DECODE
-        num_needed_tokens = (new_allocate_lens - self.allocate_lens).sum().item()
-        out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
+        page_size = batch.token_to_kv_pool_allocator.page_size
+
+        if page_size == 1:
+            new_allocate_lens = batch.seq_lens + self.ALLOC_LEN_PER_DECODE
+            num_needed_tokens = (new_allocate_lens - self.allocate_lens).sum().item()
+            out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
+        else:
+            last_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                self.allocate_lens,
+            )
+            new_allocate_lens = batch.seq_lens + self.ALLOC_LEN_PER_DECODE
+            new_allocate_lens_cpu = new_allocate_lens.cpu()
+            allocate_lens_cpu = self.allocate_lens.cpu()
+            extend_num_tokens = sum(new_allocate_lens_cpu - allocate_lens_cpu).item()
+            out_cache_loc = alloc_paged_token_slots_extend(
+                batch.tree_cache,
+                self.allocate_lens,
+                allocate_lens_cpu,
+                new_allocate_lens,
+                new_allocate_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+            )
 
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,

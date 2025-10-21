@@ -8,7 +8,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures;
 use serde_json;
 use tokio::{sync::RwLock, time};
 
@@ -908,89 +907,6 @@ impl HealthChecker {
         self.shutdown.store(true, Ordering::Release);
         let _ = self.handle.await;
     }
-}
-
-/// Start an async background health checker for a collection of workers
-pub fn start_health_checker(
-    workers: Arc<std::sync::RwLock<Vec<Arc<dyn Worker>>>>,
-    check_interval_secs: u64,
-) -> HealthChecker {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-
-    let handle = tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(check_interval_secs));
-
-        // Counter for periodic load reset (every 10 health check cycles)
-        let mut check_count = 0u64;
-        const LOAD_RESET_INTERVAL: u64 = 10;
-
-        loop {
-            interval.tick().await;
-
-            // Check for shutdown signal
-            if shutdown_clone.load(Ordering::Acquire) {
-                tracing::debug!("Health checker shutting down");
-                break;
-            }
-
-            check_count += 1;
-
-            // Check health of all workers
-            let workers_to_check = match workers.read() {
-                Ok(guard) => guard.clone(),
-                Err(poisoned) => {
-                    tracing::error!("Worker lock poisoned: {}", poisoned);
-                    continue;
-                }
-            };
-
-            // Periodically reset load counters to prevent drift
-            // Only do this when we believe all workers should be idle
-            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
-                // Only reset if load appears to be very low (likely drift)
-                if max_load <= 2 {
-                    tracing::debug!(
-                        "Resetting load counters to prevent drift (max_load: {})",
-                        max_load
-                    );
-                    for worker in &workers_to_check {
-                        worker.reset_load();
-                    }
-                }
-            }
-
-            // Perform health checks concurrently
-            let health_checks = workers_to_check.iter().map(|worker| {
-                let worker_url = worker.url().to_string();
-                let was_healthy = worker.is_healthy();
-
-                async move {
-                    match worker.check_health_async().await {
-                        Ok(_) => {
-                            if !was_healthy {
-                                tracing::info!("Worker {} is now healthy", worker_url);
-                            }
-                        }
-                        Err(e) => {
-                            if was_healthy {
-                                tracing::warn!("Worker {} health check failed: {}", worker_url, e);
-                            } else {
-                                // Worker was already unhealthy, log at debug level
-                                tracing::debug!("Worker {} remains unhealthy: {}", worker_url, e);
-                            }
-                        }
-                    }
-                }
-            });
-
-            // Execute all health checks concurrently
-            futures::future::join_all(health_checks).await;
-        }
-    });
-
-    HealthChecker { handle, shutdown }
 }
 
 /// Helper to convert Worker trait object to WorkerInfo struct

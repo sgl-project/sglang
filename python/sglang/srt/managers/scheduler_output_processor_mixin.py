@@ -14,6 +14,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
 )
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -207,7 +208,7 @@ class SchedulerOutputProcessorMixin:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(accept_lens)
+        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
@@ -243,7 +244,7 @@ class SchedulerOutputProcessorMixin:
             accept_lens_list = result.accept_lens.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
-        if not self.spec_algorithm.is_none():
+        if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
         self.token_to_kv_pool_allocator.free_group_begin()
@@ -258,22 +259,22 @@ class SchedulerOutputProcessorMixin:
 
             if self.enable_overlap and req.finished():
                 indices_to_free = None
-                if self.page_size == 1:
-                    if batch.spec_algorithm.is_eagle():
-                        from sglang.srt.speculative.eagle_info import EagleDraftInput
+                if batch.spec_algorithm.is_eagle():
+                    from sglang.srt.speculative.eagle_info import EagleDraftInput
 
-                        end_p = allocate_lens_list[i]
-                        start_p = end_p - EagleDraftInput.ALLOC_LEN_PER_DECODE
-                        indices_to_free = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx
-                        ][start_p:end_p]
-                    else:
+                    end_p = allocate_lens_list[i]
+                    start_p = end_p - EagleDraftInput.ALLOC_LEN_PER_DECODE
+                    if self.page_size > 1:
+                        start_p = ceil_div(start_p, self.page_size) * self.page_size
+
+                    indices_to_free = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx
+                    ][start_p:end_p]
+
+                else:
+                    if self.page_size == 1:
                         # Free the one extra delayed token
                         indices_to_free = batch.out_cache_loc[i : i + 1]
-                else:
-                    if batch.spec_algorithm.is_eagle():
-                        # TODO(spec-v2): support eagle with page_size > 1
-                        raise NotImplementedError()
                     else:
                         if (
                             len(req.origin_input_ids) + len(req.output_ids) - 1
@@ -285,13 +286,16 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(indices_to_free)
                 continue
 
+            new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_v2_eagle:
                 # Only v2 eagle's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
+                new_accepted_len = len(next_token_id)
 
-            req.check_finished()
+            req.check_finished(new_accepted_len)
+
             if req.finished():
                 if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
                     # FIXME(lsyin): fix the messy logic here
@@ -299,6 +303,10 @@ class SchedulerOutputProcessorMixin:
                     # 2) overlap eagle and the current batch is prefill. This seq will not run extra iteration.
                     start_p = batch.seq_lens_cpu[i] + accept_lens_list[i]
                     end_p = allocate_lens_list[i]
+
+                    if self.page_size > 1:
+                        start_p = ceil_div(start_p, self.page_size) * self.page_size
+
                     indices_to_free = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx
                     ][start_p:end_p]
@@ -674,6 +682,7 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
     ):
         rids = []
+        http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
 
         decoded_texts = []
@@ -729,6 +738,8 @@ class SchedulerOutputProcessorMixin:
                     # because of the one additional delayed token. This "continue" prevented the dummy output.
                     continue
                 req.finished_output = True
+                if req.finished_len is None:
+                    req.finished_len = len(req.output_ids)
                 should_output = True
             else:
                 if req.stream:
@@ -760,6 +771,7 @@ class SchedulerOutputProcessorMixin:
                     req.send_output_token_logprobs_offset
                 )
                 rids.append(req.rid)
+                http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
@@ -771,17 +783,20 @@ class SchedulerOutputProcessorMixin:
                 else:
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
 
+                # Exclude the tokens after stop condition
+                output_ids_ = req.output_ids_through_stop
+
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
-                output_ids.append(req.output_ids[send_token_offset:])
-                req.send_token_offset = len(req.output_ids)
+                output_ids.append(output_ids_[send_token_offset:])
+                req.send_token_offset = len(output_ids_)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
                     req.sampling_params.spaces_between_special_tokens
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
-                completion_tokens.append(len(req.output_ids))
+                completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
 
                 if not self.spec_algorithm.is_none():
@@ -873,7 +888,7 @@ class SchedulerOutputProcessorMixin:
             if self.model_config.is_multimodal_gen:
                 return
 
-            self.send_to_detokenizer.send_pyobj(
+            self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     finished_reasons,
                     decoded_texts,
@@ -903,6 +918,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     rids=rids,
+                    http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                 )
@@ -910,6 +926,7 @@ class SchedulerOutputProcessorMixin:
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):
         rids = []
+        http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
 
         embeddings = []
@@ -918,17 +935,19 @@ class SchedulerOutputProcessorMixin:
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
+                http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
-        self.send_to_detokenizer.send_pyobj(
+        self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 finished_reasons,
                 embeddings,
                 prompt_tokens,
                 cached_tokens,
                 rids=rids,
+                http_worker_ipcs=http_worker_ipcs,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
             )
