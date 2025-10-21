@@ -133,52 +133,50 @@ class TestPenaltyB(CustomTestCase):
 
     def test_penalty_edge_cases_negative_penalty_values(self):
         """Test edge cases with negative penalty values."""
-        prompt = "Use the word 'test' repeatedly."
-
-        negative_freq_output = self.run_generate_with_prompt(
+        prompt = "Write the word 'test' exactly 15 times in a row, separated by spaces."
+        baseline_params = {
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+        }
+        negative_penalty_params = {
+            "frequency_penalty": -0.5,
+            "presence_penalty": -0.25,
+            "repetition_penalty": 1.0,
+        }
+        # Negative penalties should increase repetition (expected_reduction=False)
+        self._test_penalty_effect(
             prompt,
-            {
-                "frequency_penalty": -0.5,
-                "presence_penalty": -0.25,
-                "repetition_penalty": 1.0,
-            },
-            max_tokens=40,
-        )
-        normal_output = self.run_generate_with_prompt(
-            prompt,
-            {
-                "frequency_penalty": 0.0,
-                "presence_penalty": 0.0,
-                "repetition_penalty": 1.0,
-            },
-            max_tokens=40,
-        )
-
-        self.assertIsInstance(
-            negative_freq_output,
-            str,
-            "Negative frequency penalty should produce output",
-        )
-        self.assertIsInstance(
-            normal_output, str, "Normal penalties should produce output"
+            baseline_params,
+            negative_penalty_params,
+            "test",
+            expected_reduction=False,
+            max_tokens=60,
         )
 
     def test_penalty_edge_cases_extreme_penalty_values(self):
         """Test edge cases with extreme penalty values."""
-        prompt = "Write a brief response."
-
-        high_penalty_output = self.run_generate_with_prompt(
-            prompt,
-            {
-                "frequency_penalty": 2.0,
-                "presence_penalty": 2.0,
-                "repetition_penalty": 2.0,
-            },
-            max_tokens=40,
+        prompt = (
+            "Write the word 'extreme' exactly 20 times in a row, separated by spaces."
         )
-
-        self.assertIsInstance(
-            high_penalty_output, str, "High penalties should still produce output"
+        baseline_params = {
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+        }
+        extreme_penalty_params = {
+            "frequency_penalty": 2.0,
+            "presence_penalty": 2.0,
+            "repetition_penalty": 2.0,
+        }
+        # Extreme penalties should strongly reduce repetition
+        self._test_penalty_effect(
+            prompt,
+            baseline_params,
+            extreme_penalty_params,
+            "extreme",
+            expected_reduction=True,
+            max_tokens=80,
         )
 
 
