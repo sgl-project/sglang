@@ -1263,6 +1263,178 @@ class TestTRTLLMMLA(CustomTestCase):
                     f"Max diff: {(out_trtllm - out_reference).abs().max().item()}",
                 )
 
+    def test_draft_extend_padding_unpadding_kernels(self):
+        """Test TRTLLM MLA Triton kernels: pad_draft_extend_query_kernel and unpad_draft_extend_output_kernel."""
+
+        # Import the kernels
+        from sglang.srt.layers.attention.trtllm_mla_backend import (
+            pad_draft_extend_query_kernel,
+            unpad_draft_extend_output_kernel,
+        )
+
+        def _create_test_data(
+            self, batch_size, max_seq_len, num_heads, head_dim, dtype=torch.float32
+        ):
+            """Create test data for kernel testing."""
+            device = torch.device("cuda")
+
+            # Create sequence lengths (varying lengths for each batch)
+            seq_lens = torch.randint(
+                1, max_seq_len + 1, (batch_size,), device=device, dtype=torch.int32
+            )
+
+            # Create cumulative sequence lengths
+            cum_seq_lens = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
+            cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
+
+            # Create input query tensor (flattened format)
+            total_tokens = cum_seq_lens[-1].item()
+            q_input = torch.randn(
+                total_tokens, num_heads, head_dim, device=device, dtype=dtype
+            )
+
+            # Create padded query tensor (batch format)
+            padded_q = torch.zeros(
+                batch_size, max_seq_len, num_heads, head_dim, device=device, dtype=dtype
+            )
+
+            return q_input, padded_q, seq_lens, cum_seq_lens
+
+        def _create_test_output_data(
+            self,
+            batch_size,
+            token_per_batch,
+            tp_q_head_num,
+            v_head_dim,
+            dtype=torch.float32,
+        ):
+            """Create test data for unpad kernel testing."""
+            device = torch.device("cuda")
+
+            # Create accept lengths (varying lengths for each batch)
+            accept_lengths = torch.randint(
+                1, token_per_batch + 1, (batch_size,), device=device, dtype=torch.int32
+            )
+
+            # Create cumulative accept lengths
+            cum_accept_lengths = torch.zeros(
+                batch_size + 1, device=device, dtype=torch.int32
+            )
+            cum_accept_lengths[1:] = torch.cumsum(accept_lengths, dim=0)
+
+            # Create raw output tensor (batch format)
+            raw_out = torch.randn(
+                batch_size,
+                token_per_batch,
+                tp_q_head_num,
+                v_head_dim,
+                device=device,
+                dtype=dtype,
+            )
+
+            # Create output tensor (flattened format)
+            total_tokens = cum_accept_lengths[-1].item()
+            output = torch.empty(
+                total_tokens, tp_q_head_num, v_head_dim, device=device, dtype=dtype
+            )
+
+            return raw_out, output, accept_lengths, cum_accept_lengths
+
+        # Test 1: pad_draft_extend_query_kernel basic functionality
+        with self.subTest(test="pad_kernel_basic"):
+            batch_size = 4
+            max_seq_len = 8
+            num_heads = 16
+            head_dim = 64
+
+            q_input, padded_q, seq_lens, cum_seq_lens = _create_test_data(
+                self, batch_size, max_seq_len, num_heads, head_dim
+            )
+
+            # Launch kernel
+            BLOCK_SIZE = 64
+            grid = (batch_size * max_seq_len,)
+
+            pad_draft_extend_query_kernel[grid](
+                q_ptr=q_input,
+                padded_q_ptr=padded_q,
+                seq_lens_q_ptr=seq_lens,
+                cumsum_ptr=cum_seq_lens,
+                batch_size=batch_size,
+                max_seq_len=max_seq_len,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+
+            # Verify the padding worked correctly
+            for i in range(batch_size):
+                seq_len = seq_lens[i].item()
+
+                # Check that valid positions are copied correctly
+                for pos in range(seq_len):
+                    input_start = cum_seq_lens[i].item()
+                    input_pos = input_start + pos
+
+                    # Compare input and output for valid positions
+                    input_data = q_input[input_pos]
+                    output_data = padded_q[i, pos]
+
+                    torch.testing.assert_close(
+                        input_data, output_data, rtol=1e-5, atol=1e-6
+                    )
+
+                # Check that invalid positions are zero
+                for pos in range(seq_len, max_seq_len):
+                    output_data = padded_q[i, pos]
+                    self.assertTrue(
+                        torch.allclose(output_data, torch.zeros_like(output_data)),
+                        f"Position {pos} in batch {i} should be zero",
+                    )
+
+        # Test 2: unpad_draft_extend_output_kernel basic functionality
+        with self.subTest(test="unpad_kernel_basic"):
+            batch_size = 4
+            token_per_batch = 8
+            tp_q_head_num = 16
+            v_head_dim = 64
+
+            raw_out, output, accept_lengths, cum_accept_lengths = (
+                _create_test_output_data(
+                    self, batch_size, token_per_batch, tp_q_head_num, v_head_dim
+                )
+            )
+
+            # Launch kernel
+            BLOCK_SIZE = 64
+            grid = (batch_size * token_per_batch,)
+
+            unpad_draft_extend_output_kernel[grid](
+                raw_out_ptr=raw_out,
+                output_ptr=output,
+                accept_length_ptr=accept_lengths,
+                cumsum_ptr=cum_accept_lengths,
+                batch_size=batch_size,
+                token_per_batch=token_per_batch,
+                tp_q_head_num=tp_q_head_num,
+                v_head_dim=v_head_dim,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+
+            # Verify the unpadding worked correctly
+            for i in range(batch_size):
+                accept_len = accept_lengths[i].item()
+                output_start = cum_accept_lengths[i].item()
+
+                # Check that valid positions are copied correctly
+                for pos in range(accept_len):
+                    input_data = raw_out[i, pos]
+                    output_data = output[output_start + pos]
+
+                    torch.testing.assert_close(
+                        input_data, output_data, rtol=1e-5, atol=1e-6
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
