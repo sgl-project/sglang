@@ -53,10 +53,12 @@ def _get_plan_stream(
         or phase == "draft_extend"
         and envs.SGLANG_ENABLE_DRAFT_EXTEND_PLAN_STREAM.get()
     ):
+        logger.info(f"[Overlap Spec]: Enable {str.upper(phase)} plan stream.")
         plan_stream: CudaStream = torch.get_device_module(device).Stream()
         plan_stream_ctx = torch.cuda.stream(plan_stream)
         return plan_stream, plan_stream_ctx
     else:
+        logger.info(f"[Overlap Spec]: Disable {str.upper(phase)} plan stream.")
         return None, contextlib.nullcontext()
 
 
