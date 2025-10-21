@@ -142,6 +142,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     set_cuda_arch,
     slow_rank_detector,
+    xpu_has_xmx_support,
 )
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
@@ -195,6 +196,7 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_xpu_xmx_available = xpu_has_xmx_support()
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -504,6 +506,16 @@ class ModelRunner:
                 "The current platform does not support Intel AMX, will fallback to torch_native backend."
             )
             server_args.attention_backend = "torch_native"
+
+        if (
+            server_args.attention_backend == "intel_xpu"
+            and server_args.device == "xpu"
+            and not _is_xpu_xmx_available
+        ):
+            logger.info(
+                "The current platform does not support Intel XMX, will fallback to triton backend."
+            )
+            server_args.attention_backend = "triton"
 
         if server_args.prefill_attention_backend is not None and (
             server_args.prefill_attention_backend
@@ -980,6 +992,10 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
+
+        # Recapture device graph after model weight update.
+        if not self.server_args.disable_cuda_graph and self.device == "cuda":
+            self.init_device_graphs()
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
@@ -1567,6 +1583,8 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
+            self.kv_cache_dtype = torch.bfloat16
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."

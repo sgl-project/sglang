@@ -34,7 +34,7 @@ else
     export UV_SYSTEM_PYTHON=true
 
     PIP_CMD="uv pip"
-    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
+    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --prerelease=allow"
 
     # Clean up existing installations
     $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
@@ -66,7 +66,7 @@ $PIP_CMD install mooncake-transfer-engine==0.3.6.post1 nvidia-cuda-nvrtc-cu12 py
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
-    git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 
     # Install xformers
