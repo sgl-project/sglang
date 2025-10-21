@@ -128,29 +128,24 @@ class SGLangPerfAnalyzer:
         rcParams["grid.alpha"] = 0.3
 
     def get_recent_runs(
-        self,
-        limit: int = 100,
-        start_date: str = None,
-        end_date: str = None,
-        branch: str = None,
+        self, limit: int = 100, start_date: str = None, end_date: str = None
     ) -> List[Dict]:
         """Get recent CI run data with multiple collection strategies"""
 
         # If date range is specified, get all data in that range
         if start_date or end_date:
-            return self._get_date_range_runs(start_date, end_date, branch)
+            return self._get_date_range_runs(start_date, end_date)
 
-        branch_info = f" from branch '{branch}'" if branch else ""
-        print(f"Getting PR Test runs{branch_info} (limit: {limit})...")
+        print(f"Getting PR Test runs (limit: {limit})...")
 
         # Use sampling strategy if limit >= 500, otherwise use sequential
         if limit >= 500:
             print(f"Using uniform sampling for {limit} runs to cover ~30 days...")
-            return self._get_sampled_runs(limit, branch)
+            return self._get_sampled_runs(limit)
         else:
-            return self._get_sequential_runs(limit, branch)
+            return self._get_sequential_runs(limit)
 
-    def _get_sequential_runs(self, limit: int, branch: str = None) -> List[Dict]:
+    def _get_sequential_runs(self, limit: int) -> List[Dict]:
         """Original sequential method for smaller limits"""
         print(f"Using sequential sampling for {limit} runs...")
 
@@ -161,8 +156,6 @@ class SGLangPerfAnalyzer:
         while len(pr_test_runs) < limit:
             url = f"{self.base_url}/repos/{self.repo}/actions/runs"
             params = {"per_page": per_page, "page": page}
-            if branch:
-                params["branch"] = branch
 
             try:
                 response = self.session.get(url, params=params)
@@ -199,14 +192,12 @@ class SGLangPerfAnalyzer:
 
         return pr_test_runs
 
-    def _get_sampled_runs(self, limit: int, branch: str = None) -> List[Dict]:
+    def _get_sampled_runs(self, limit: int) -> List[Dict]:
         """Uniform sampling method for 30-day coverage"""
         from datetime import datetime, timedelta
 
         # Uniform sampling across 30 days
-        sampled_runs = self._sample_time_period(
-            limit, days_back=30, uniform=True, branch=branch
-        )
+        sampled_runs = self._sample_time_period(limit, days_back=30, uniform=True)
 
         print(
             f"Sampled {len(sampled_runs)} runs from 30-day period (requested: {limit})"
@@ -219,7 +210,6 @@ class SGLangPerfAnalyzer:
         days_back: int,
         skip_recent_days: int = 0,
         uniform: bool = False,
-        branch: str = None,
     ) -> List[Dict]:
         """Sample runs from a specific time period"""
         from datetime import datetime, timedelta
@@ -241,8 +231,6 @@ class SGLangPerfAnalyzer:
         while True:
             url = f"{self.base_url}/repos/{self.repo}/actions/runs"
             params = {"per_page": per_page, "page": page}
-            if branch:
-                params["branch"] = branch
 
             try:
                 response = self.session.get(url, params=params)
@@ -370,7 +358,7 @@ class SGLangPerfAnalyzer:
         return sampled_runs
 
     def _get_date_range_runs(
-        self, start_date: str = None, end_date: str = None, branch: str = None
+        self, start_date: str = None, end_date: str = None
     ) -> List[Dict]:
         """Get all CI runs within specified date range"""
         from datetime import datetime, timedelta
@@ -406,9 +394,8 @@ class SGLangPerfAnalyzer:
                 f"start_date ({start_date}) must be before end_date ({end_date})"
             )
 
-        branch_info = f" from branch '{branch}'" if branch else ""
         print(
-            f"Getting ALL CI runs{branch_info} from {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}"
+            f"Getting ALL CI runs from {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}"
         )
 
         collected_runs = []
@@ -419,8 +406,6 @@ class SGLangPerfAnalyzer:
         while True:
             url = f"{self.base_url}/repos/{self.repo}/actions/runs"
             params = {"per_page": per_page, "page": page}
-            if branch:
-                params["branch"] = branch
 
             try:
                 response = self.session.get(url, params=params)
@@ -1346,11 +1331,6 @@ def main():
         type=str,
         help="End date for date range query (YYYY-MM-DD format). When specified with --start-date, gets ALL runs in range.",
     )
-    parser.add_argument(
-        "--branch",
-        default="main",
-        help="Filter runs by branch (default: 'main'). Set to empty string '' to analyze all branches.",
-    )
 
     args = parser.parse_args()
 
@@ -1359,11 +1339,7 @@ def main():
 
     try:
         # Get CI run data
-        # Use None for branch if empty string is provided (to scan all branches)
-        branch = args.branch if args.branch else None
-        runs = analyzer.get_recent_runs(
-            args.limit, args.start_date, args.end_date, branch
-        )
+        runs = analyzer.get_recent_runs(args.limit, args.start_date, args.end_date)
 
         if not runs:
             print("No CI run data found")
