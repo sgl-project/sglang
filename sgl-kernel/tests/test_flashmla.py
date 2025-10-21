@@ -6,7 +6,6 @@ import pytest
 import torch
 import triton
 from sgl_kernel.flash_mla import (
-    flash_attn_varlen_forward,
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
     get_mla_metadata,
