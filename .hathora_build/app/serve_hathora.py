@@ -66,6 +66,13 @@ def _build_sglang_argv_from_env() -> list[str]:
     if quantization:
         argv += ["--quantization", str(quantization)]
 
+    # Context length (K2 and long-context models)
+    context_length = _get_env_or_cfg(
+        "CONTEXT_LENGTH", cfg, ["context_length", "max_context_length"], None
+    )
+    if context_length:
+        argv += ["--context-length", str(context_length)]
+
     max_total_tokens = _get_env_or_cfg("MAX_TOTAL_TOKENS", cfg, ["max_total_tokens"], None)
     if max_total_tokens:
         argv += ["--max-total-tokens", str(max_total_tokens)]
@@ -138,6 +145,17 @@ def _build_sglang_argv_from_env() -> list[str]:
     disagg_prefill_pp = os.environ.get("DISAGGREGATION_PREFILL_PP")
     if disagg_prefill_pp:
         argv += ["--disaggregation-prefill-pp", str(disagg_prefill_pp)]
+
+    # Multi-node distributed serving (K2 capability)
+    dist_init_addr = os.environ.get("DIST_INIT_ADDR")
+    nnodes = os.environ.get("NNODES")
+    node_rank = os.environ.get("NODE_RANK")
+    if dist_init_addr:
+        argv += ["--dist-init-addr", str(dist_init_addr)]
+    if nnodes:
+        argv += ["--nnodes", str(nnodes)]
+    if node_rank:
+        argv += ["--node-rank", str(node_rank)]
 
     # Custom all-reduce disabled (parity with native entrypoint)
     argv += ["--disable-custom-all-reduce"]

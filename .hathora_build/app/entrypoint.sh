@@ -74,4 +74,24 @@ export DISAGGREGATION_PREFILL_PP="${DISAGGREGATION_PREFILL_PP:-}"
 export HF_TOKEN="${HF_TOKEN:-}"
 
 log "Launching Hathora SGLang"
+# Optional multi-node (K2) support
+if [[ -n "$NNODES" && "$NNODES" -gt 1 ]]; then
+  # Determine master IP and node rank via Hathora room config
+  if [[ -z "$HATHORA_INITIAL_ROOM_CONFIG" ]]; then
+    # Primary node
+    MASTER_IP="$HATHORA_PRIVATE_IP"
+    export NODE_RANK=0
+  else
+    # Secondary node
+    MASTER_IP=$(python3 - <<'PY'
+import json, os
+cfg = json.loads(os.environ.get('HATHORA_INITIAL_ROOM_CONFIG','{}'))
+print(cfg.get('master_ip',''))
+PY
+)
+    export NODE_RANK=${NODE_RANK:-1}
+  fi
+  export DIST_INIT_ADDR="${DIST_INIT_ADDR:-${MASTER_IP:-127.0.0.1}:20000}"
+fi
+
 exec python /app/serve_hathora.py
