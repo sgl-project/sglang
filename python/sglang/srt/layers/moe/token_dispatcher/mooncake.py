@@ -36,7 +36,7 @@ class MooncakeDispatchOutput(NamedTuple):
     """Mooncake EP dispatch output."""
 
     hidden_states: torch.Tensor
-    hidden_states_scale: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
