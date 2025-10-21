@@ -351,6 +351,75 @@ void causal_conv1d_fwd_varlen_kernel_impl(
   });
 }
 
+template <typename scalar_t>
+void causal_conv1d_update_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ conv_states,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    const int32_t* __restrict__ conv_indices,
+    bool silu_activation,
+    int64_t batch,
+    int64_t dim,
+    int64_t seqlen,
+    int64_t width) {
+  std::cout << "### causal_conv1d_update_kernel_impl: batch = " << batch << "; dim = " << dim;
+  std::cout << "; seqlen = " << seqlen << "; width = " << width << std::endl;
+
+  // handle 32 x 64 per block
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n() * 2;
+  const int64_t NB = div_up(dim, BLOCK_N);
+
+  const bool has_conv_states = conv_states != nullptr;
+
+  // parallel on [batch, NB]
+  AT_DISPATCH_BOOL2(bias != nullptr, has_bias, silu_activation, has_silu, [&] {
+    at::parallel_for(0, batch * NB, 0, [&](int64_t begin, int64_t end) {
+      int64_t bs{0}, nb{0};
+      data_index_init(begin, bs, batch, nb, NB);
+
+      for (int64_t i = begin; i < end; ++i) {
+        int64_t mb_start = 0;
+        int64_t mb_size = 1;
+        int64_t nb_start = nb * BLOCK_N;
+        int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
+
+        const bool has_initial_states_value = true;
+
+        switch (width << 4 | nb_size >> 4) {
+          case 0x42:
+            LAUNCH_TINYGEMM_KERNEL(4, 32);
+            break;
+          case 0x44:
+            LAUNCH_TINYGEMM_KERNEL(4, 64);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected block size, ", width, " x ", nb_size);
+        }
+
+        // move to the next index
+        data_index_step(bs, batch, nb, NB);
+      }
+    });
+  });
+
+#define CONV_STATE_INDEXR(w) conv_states + bs*(width - 1) * dim + (w) * dim
+
+  // update conv_states
+  at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t bs = begin; bs < end; ++bs) {
+      // update old states, range [1, width - 1)
+      for (int64_t w = 1; w < width - 1; ++w) {
+        std::memcpy(CONV_STATE_INDEXR(w - 1), CONV_STATE_INDEXR(w), dim * sizeof(scalar_t));
+      }
+      // copy new states
+      std::memcpy(CONV_STATE_INDEXR(width - 2), input + bs * dim, dim * sizeof(scalar_t));
+    }
+  });
+}
+
 }  // anonymous namespace
 
 // from [dim, width] or [N, K]
@@ -537,6 +606,77 @@ at::Tensor causal_conv1d_fwd_cpu(
           width,
           num_seq_blocks);
     }
+  });
+  return out;
+}
+
+// API aligned with GPUs
+//
+//   x: (batch, dim) or (batch, dim, seqlen)
+//   conv_state: (..., dim, state_len), where state_len >= width - 1
+//   weight: (dim, width)
+//   bias: (dim,)
+//   cache_seqlens: (batch,), dtype int32.
+//   conv_state_indices: (batch,), dtype int32
+//   pad_slot_id: int
+//   out: (batch, dim) or (batch, dim, seqlen)
+//
+at::Tensor causal_conv1d_update_cpu(
+    const at::Tensor& x,
+    const at::Tensor& conv_states,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens,
+    const std::optional<at::Tensor>& conv_state_indices,
+    int64_t pad_slot_id,
+    bool is_vnni) {
+  RECORD_FUNCTION("sgl-kernel::causal_conv1d_update_cpu", std::vector<c10::IValue>({x, weight, bias}));
+
+  CHECK_CONTIGUOUS(x);
+  CHECK_CONTIGUOUS(weight);
+  auto packed_w = is_vnni ? weight : causal_conv1d_weight_pack(weight);
+
+  // TODO: add multi-token prediction support
+  TORCH_CHECK(x.dim() == 2, "causal_conv1d_update_cpu: expect x to be 2D tensor.");
+  TORCH_CHECK(!cache_seqlens.has_value(), "causal_conv1d_update_cpu: don't support cache_seqlens.");
+
+  int64_t batch = x.size(0);
+  int64_t dim = x.size(1);
+  int64_t seqlen = 1;
+  int64_t width = weight.size(-1);
+
+  const auto scalar_type = x.scalar_type();
+  CHECK_EQ(weight.scalar_type(), scalar_type);
+  CHECK_OPTIONAL_SHAPE_DTYPE(bias, dim, scalar_type);
+  CHECK_OPTIONAL_SHAPE_DTYPE(conv_state_indices, batch, at::kInt);
+
+  CHECK_EQ(conv_states.scalar_type(), scalar_type);
+  CHECK_EQ(conv_states.size(1), dim);
+  CHECK_EQ(conv_states.size(2), width - 1);
+
+  // adjust `conv_states` to be contiguous on `dim`
+  if (conv_states.stride(-2) != 1) {
+    int64_t num_cache_lines = conv_states.size(0);
+    auto conv_states_copy = conv_states.clone();
+    conv_states.as_strided_({num_cache_lines, dim, width - 1}, {(width - 1) * dim, 1, dim});
+    conv_states.copy_(conv_states_copy);
+  }
+
+  at::Tensor out = at::empty_like(x);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "causal_conv1d_update_kernel_impl", [&] {
+    causal_conv1d_update_kernel_impl<scalar_t>(
+        out.data_ptr<scalar_t>(),
+        x.data_ptr<scalar_t>(),
+        conv_states.data_ptr<scalar_t>(),
+        packed_w.data_ptr<scalar_t>(),
+        conditional_data_ptr<scalar_t>(bias),
+        conditional_data_ptr<int32_t>(conv_state_indices),
+        silu_activation,
+        batch,
+        dim,
+        seqlen,
+        width);
   });
   return out;
 }
