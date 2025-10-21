@@ -139,7 +139,7 @@ impl JobQueue {
     pub fn new(config: JobQueueConfig, context: Weak<AppContext>) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(config.queue_capacity);
 
-        info!(
+        debug!(
             "Initializing worker job queue: capacity={}, workers={}",
             config.queue_capacity, config.worker_count
         );
@@ -194,7 +194,7 @@ impl JobQueue {
             Ok(_) => {
                 let queue_depth = self.tx.max_capacity() - self.tx.capacity();
                 RouterMetrics::set_job_queue_depth(queue_depth);
-                info!(
+                debug!(
                     "Job submitted: type={}, worker={}, queue_depth={}",
                     job_type, worker_url, queue_depth
                 );
@@ -225,7 +225,7 @@ impl JobQueue {
         context: Weak<AppContext>,
         status_map: Arc<DashMap<String, JobStatus>>,
     ) {
-        info!("Worker job queue worker {} started", worker_id);
+        debug!("Worker job queue worker {} started", worker_id);
 
         loop {
             // Lock the receiver and try to receive a job
@@ -246,7 +246,7 @@ impl JobQueue {
                         JobStatus::processing(&job_type, &worker_url),
                     );
 
-                    info!(
+                    debug!(
                         "Worker {} processing job: type={}, worker={}",
                         worker_id, job_type, worker_url
                     );
@@ -289,7 +289,7 @@ impl JobQueue {
             }
         }
 
-        warn!("Worker job queue worker {} stopped", worker_id);
+        debug!("Worker job queue worker {} stopped", worker_id);
     }
 
     /// Execute a specific job
@@ -303,7 +303,7 @@ impl JobQueue {
 
                 let instance_id = Self::start_worker_workflow(engine, config, context).await?;
 
-                info!(
+                debug!(
                     "Started worker registration workflow for {} (instance: {})",
                     config.url, instance_id
                 );
@@ -357,7 +357,7 @@ impl JobQueue {
                     }
                 };
 
-                info!(
+                debug!(
                     "Creating AddWorker jobs for {} workers from config",
                     workers.len()
                 );
@@ -501,7 +501,7 @@ impl JobQueue {
             Ok(message) => {
                 RouterMetrics::record_job_success(job_type);
                 status_map.remove(worker_url);
-                info!(
+                debug!(
                     "Worker {} completed job: type={}, worker={}, duration={:.3}s, result={}",
                     worker_id,
                     job_type,
