@@ -306,17 +306,14 @@ impl RouterTrait for GrpcRouter {
         response_id: &str,
         _params: &ResponsesGetParams,
     ) -> Response {
-        // Convert response_id string to ResponseId
         let resp_id = ResponseId::from(response_id);
 
         // Retrieve response from storage
         match self.response_storage.get_response(&resp_id).await {
             Ok(Some(stored_response)) => {
-                // Return the stored response JSON directly
                 axum::Json(stored_response.raw_response).into_response()
             }
             Ok(None) => {
-                // Response not found
                 (
                     StatusCode::NOT_FOUND,
                     axum::Json(json!({
@@ -330,7 +327,6 @@ impl RouterTrait for GrpcRouter {
                     .into_response()
             }
             Err(e) => {
-                // Storage error
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(json!({
@@ -346,7 +342,6 @@ impl RouterTrait for GrpcRouter {
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        // Convert response_id string to ResponseId
         let resp_id = ResponseId::from(response_id);
 
         // Retrieve response from storage to check if it exists and get current status
@@ -415,7 +410,6 @@ impl RouterTrait for GrpcRouter {
                         }
                     }
                     "completed" => {
-                        // Already completed, can't cancel
                         (
                             StatusCode::BAD_REQUEST,
                             axum::Json(json!({
@@ -429,7 +423,6 @@ impl RouterTrait for GrpcRouter {
                             .into_response()
                     }
                     "failed" => {
-                        // Already failed, can't cancel
                         (
                             StatusCode::BAD_REQUEST,
                             axum::Json(json!({
@@ -443,7 +436,6 @@ impl RouterTrait for GrpcRouter {
                             .into_response()
                     }
                     "cancelled" => {
-                        // Already cancelled
                         (
                             StatusCode::OK,
                             axum::Json(json!({
@@ -470,7 +462,6 @@ impl RouterTrait for GrpcRouter {
                 }
             }
             Ok(None) => {
-                // Response not found
                 (
                     StatusCode::NOT_FOUND,
                     axum::Json(json!({
@@ -484,7 +475,6 @@ impl RouterTrait for GrpcRouter {
                     .into_response()
             }
             Err(e) => {
-                // Storage error
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(json!({
