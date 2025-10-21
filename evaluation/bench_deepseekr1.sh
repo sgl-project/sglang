@@ -8,6 +8,13 @@ num_prompts=128
 # for profiling
 #export SGLANG_TORCH_PROFILER_DIR=./
 #export SGLANG_PROFILE_WITH_STACK=1
+#add --profile as argument
+
+echo "bench model: ${model}"
+echo "input tokens: ${input_tokens}"
+echo "output tokens: ${output_tokens}"
+echo "max concurrency: ${max_concurrency}"
+echo "num prompts: ${num_prompts}"
 
 python3 -m sglang.bench_serving \
     --host localhost \
