@@ -5,6 +5,45 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >&2
 }
 
+# Detect active Infiniband (IB) network interfaces and set NCCL/GLOO ifnames
+detect_ib_ifaces() {
+  local ifaces=""
+  if command -v ibstat >/dev/null 2>&1; then
+    # Parse active IB CAs and map to net device names
+    for d in $(ibstat | grep -i "Active" -B 8 | grep -E "^CA" | awk '{ print $2 }' | sed "s/'//g"); do
+      if [[ -d "/sys/class/infiniband/$d/device/net" ]]; then
+        for n in $(ls "/sys/class/infiniband/$d/device/net"); do
+          ifaces+="${ifaces:+,}$n"
+        done
+      fi
+    done
+  fi
+
+  # Fallback: enumerate IB net interfaces directly
+  if [[ -z "$ifaces" && -d /sys/class/infiniband ]]; then
+    for d in /sys/class/infiniband/*; do
+      [[ -e "$d" ]] || continue
+      if [[ -d "$d/device/net" ]]; then
+        for n in $(ls "$d/device/net"); do
+          ifaces+="${ifaces:+,}$n"
+        done
+      fi
+    done
+  fi
+
+  echo "$ifaces"
+}
+
+# Configure NCCL/GLOO socket interfaces if not preset
+IB_IFACES="$(detect_ib_ifaces)"
+if [[ -n "$IB_IFACES" ]]; then
+  export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-$IB_IFACES}"
+  export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$IB_IFACES}"
+  log "Using IB ifaces: $IB_IFACES"
+else
+  log "No active IB interfaces detected; falling back to defaults"
+fi
+
 # Minimal envs aligned with entrypoint_sglang_native.sh
 export MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
 export TP_SIZE="${TP_SIZE:-1}"
