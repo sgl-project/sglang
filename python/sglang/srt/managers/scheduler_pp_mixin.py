@@ -131,9 +131,8 @@ class SchedulerPPMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
-    # PP
     @DynamicGradMode()
-    def event_loop_pp_disagg_prefill(self: Scheduler):
+    def event_loop_pp_disagg_prefill(self):
         """
         An event loop for the prefill server in pipeline parallelism.
 
