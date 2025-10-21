@@ -1236,9 +1236,25 @@ async fn load_conversation_history(
     if let Some(ref conv_id_str) = request.conversation {
         let conv_id = ConversationId::from(conv_id_str.as_str());
 
-        // Verify conversation exists
+        // Auto-create conversation if it doesn't exist (OpenAI behavior)
         if let Ok(None) = conversation_storage.get_conversation(&conv_id).await {
-            return Err("Conversation not found".to_string());
+            debug!("Creating new conversation with user-provided ID: {}", conv_id_str);
+
+            // Convert HashMap to JsonMap for metadata
+            let metadata = request.metadata.as_ref().map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<serde_json::Map<String, serde_json::Value>>()
+            });
+
+            let new_conv = crate::data_connector::conversations::NewConversation {
+                id: Some(conv_id.clone()), // Use user-provided conversation ID
+                metadata,
+            };
+            conversation_storage
+                .create_conversation(new_conv)
+                .await
+                .map_err(|e| format!("Failed to create conversation: {}", e))?;
         }
 
         // Load conversation history
@@ -1402,14 +1418,37 @@ async fn execute_mcp_call(
     tool_name: &str,
     args_json_str: &str,
 ) -> Result<String, String> {
-    let args_value: serde_json::Value =
+    let mut args_value: serde_json::Value =
         serde_json::from_str(args_json_str).map_err(|e| format!("parse tool args: {}", e))?;
-    let args_obj = args_value.as_object().cloned();
 
-    let _server_name = mcp_mgr
+    // Get tool info to access schema for type coercion
+    let tool_info = mcp_mgr
         .get_tool(tool_name)
-        .map(|t| t.server)
         .ok_or_else(|| format!("tool not found: {}", tool_name))?;
+
+    // Coerce argument types based on schema (LLMs often output numbers as strings)
+    if let Some(params) = tool_info.parameters {
+        if let Some(properties) = params.get("properties").and_then(|p| p.as_object()) {
+            if let Some(args_obj) = args_value.as_object_mut() {
+                for (key, value) in args_obj.iter_mut() {
+                    if let Some(schema) = properties.get(key) {
+                        if let Some(type_str) = schema.get("type").and_then(|t| t.as_str()) {
+                            // Coerce string numbers to actual numbers
+                            if type_str == "number" || type_str == "integer" {
+                                if let Some(s) = value.as_str() {
+                                    if let Ok(num) = s.parse::<f64>() {
+                                        *value = json!(num);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let args_obj = args_value.as_object().cloned();
 
     let result = mcp_mgr
         .call_tool(tool_name, args_obj)
@@ -1606,7 +1645,7 @@ async fn execute_tool_loop(
     let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
 
     // Configuration: max iterations as safety limit
-    const MAX_ITERATIONS: usize = 10;
+    const MAX_ITERATIONS: usize = 20;
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     debug!(
@@ -1646,20 +1685,19 @@ async fn execute_tool_loop(
             extract_function_call_from_chat(&chat_response)
         {
             state.iteration += 1;
-            state.total_calls += 1;
 
             debug!(
-                "Tool loop iteration {}: calling {} (call_id: {})",
+                "Tool loop iteration {}: found call to {} (call_id: {})",
                 state.iteration, tool_name, call_id
             );
 
-            // Check combined limit
+            // Check combined limit BEFORE executing
             let effective_limit = match max_tool_calls {
                 Some(user_max) => user_max.min(MAX_ITERATIONS),
                 None => MAX_ITERATIONS,
             };
 
-            if state.total_calls > effective_limit {
+            if state.total_calls >= effective_limit {
                 warn!(
                     "Reached tool call limit: {} (max_tool_calls={:?}, safety_limit={})",
                     state.total_calls, max_tool_calls, MAX_ITERATIONS
@@ -1676,6 +1714,9 @@ async fn execute_tool_loop(
 
                 return Ok(responses_response);
             }
+
+            // Increment after check
+            state.total_calls += 1;
 
             // Execute the MCP tool
             let (output_str, success, error) =
