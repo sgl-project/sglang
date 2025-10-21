@@ -485,7 +485,10 @@ pub struct ResponsesRequest {
     pub stream: Option<bool>,
 
     /// Temperature for sampling
-    #[serde(default = "default_temperature", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "default_temperature",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub temperature: Option<f32>,
 
     /// Tool choice behavior
