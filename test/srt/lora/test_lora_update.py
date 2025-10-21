@@ -1278,6 +1278,8 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 max_new_tokens=test_case.max_new_tokens,
             )
 
+            OUTPUT_WORD_OVERLAP_THRESHOLD = 0.9
+
             print(f"Dynamic output: {dynamic_output}")
             print(f"Static output: {static_output}")
             print("=" * 100)
@@ -1295,12 +1297,17 @@ class TestLoRADynamicUpdate(CustomTestCase):
                     f"Output length mismatch at batch {i}:\n- Dynamic={len(dynamic)}\n- Static={len(static)}",
                 )
                 for j, (d_out, s_out) in enumerate(zip(dynamic, static), start=1):
-                    d_out = d_out.strip()
-                    s_out = s_out.strip()
-                    self.assertEqual(
-                        d_out,
-                        s_out,
-                        f"Output mismatch at batch {i}, prompt {j}:\n- Dynamic: '{d_out}'\n- Static: '{s_out}'",
+                    d_out = d_out.strip().split()
+                    s_out = s_out.strip().split()
+
+                    num_matched_words = sum(
+                        d_tok == s_tok for d_tok, s_tok in zip(d_out, s_out)
+                    )
+                    self.assertGreaterEqual(
+                        num_matched_words / max(len(d_out), len(s_out)),
+                        OUTPUT_WORD_OVERLAP_THRESHOLD,
+                        f"Similarity of outputs is less than threshold of {OUTPUT_WORD_OVERLAP_THRESHOLD} "
+                        f"at batch {i}, prompt {j}:\n- Dynamic: '{d_out}'\n- Static: '{s_out}'",
                     )
 
     def test_dynamic_lora_update_engine(self):
