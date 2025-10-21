@@ -8,7 +8,7 @@
 //! - SSE (Server-Sent Events) streaming
 
 pub mod conversations;
-mod mcp;
+pub mod mcp;
 mod responses;
 mod router;
 mod streaming;

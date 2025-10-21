@@ -1104,7 +1104,7 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         response_id: Option<String>,
         background_tasks: Option<
-            Arc<RwLock<std::collections::HashMap<String, super::router::BackgroundTaskInfo>>>,
+            Arc<RwLock<std::collections::HashMap<String, super::responses::BackgroundTaskInfo>>>,
         >,
     ) -> Result<crate::protocols::chat::ChatCompletionResponse, String> {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
