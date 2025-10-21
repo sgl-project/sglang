@@ -9,6 +9,7 @@
 //! - Response persistence
 
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -882,6 +883,44 @@ impl StreamingResponseAccumulator {
     }
 }
 
+// ============================================================================
+// Output Item Tracking Types
+// ============================================================================
+
+/// Output item type tracking for proper event emission
+#[derive(Debug, Clone)]
+enum OutputItemType {
+    Message {
+        content_index: usize,
+    },
+    McpListTools,
+    McpCall {
+        name: String,
+    },
+    Reasoning,
+}
+
+/// Status of an output item
+#[derive(Debug, Clone, PartialEq)]
+enum ItemStatus {
+    InProgress,
+    Completed,
+    Failed,
+}
+
+/// State tracking for a single output item
+#[derive(Debug, Clone)]
+struct OutputItemState {
+    id: String,
+    item_type: OutputItemType,
+    output_index: usize,
+    status: ItemStatus,
+}
+
+// ============================================================================
+// Streaming Event Emitter
+// ============================================================================
+
 /// OpenAI-compatible event emitter for /v1/responses streaming
 ///
 /// Manages state and sequence numbers to emit proper event types:
@@ -894,6 +933,13 @@ impl StreamingResponseAccumulator {
 /// - response.content_part.done
 /// - response.output_item.done
 /// - response.completed
+/// - response.mcp_list_tools.in_progress
+/// - response.mcp_list_tools.completed
+/// - response.mcp_call.in_progress
+/// - response.mcp_call_arguments.delta
+/// - response.mcp_call_arguments.done
+/// - response.mcp_call.completed
+/// - response.mcp_call.failed
 struct ResponseStreamEventEmitter {
     sequence_number: u64,
     response_id: String,
@@ -906,6 +952,13 @@ struct ResponseStreamEventEmitter {
     has_emitted_in_progress: bool,
     has_emitted_output_item_added: bool,
     has_emitted_content_part_added: bool,
+    // MCP call tracking
+    mcp_call_accumulated_args: HashMap<String, String>,
+    // Output item tracking (NEW)
+    output_items: Vec<OutputItemState>,
+    next_output_index: usize,
+    current_message_output_index: Option<usize>,  // Tracks output_index of current message
+    current_item_id: Option<String>,               // Tracks item_id of current item
 }
 
 impl ResponseStreamEventEmitter {
@@ -925,6 +978,11 @@ impl ResponseStreamEventEmitter {
             has_emitted_in_progress: false,
             has_emitted_output_item_added: false,
             has_emitted_content_part_added: false,
+            mcp_call_accumulated_args: HashMap::new(),
+            output_items: Vec::new(),
+            next_output_index: 0,
+            current_message_output_index: None,
+            current_item_id: None,
         }
     }
 
@@ -963,79 +1021,59 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    fn emit_output_item_added(&mut self) -> serde_json::Value {
-        self.has_emitted_output_item_added = true;
-        json!({
-            "type": "response.output_item.added",
-            "sequence_number": self.next_sequence(),
-            "item": {
-                "id": self.message_id.clone(),
-                "type": "message",
-                "role": "assistant",
-                "content": []
-            }
-        })
-    }
 
-    fn emit_content_part_added(&mut self) -> serde_json::Value {
+    fn emit_content_part_added(&mut self, output_index: usize, item_id: &str, content_index: usize) -> serde_json::Value {
         self.has_emitted_content_part_added = true;
         json!({
             "type": "response.content_part.added",
             "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "content_index": content_index,
             "part": {
-                "id": self.content_part_id.clone(),
                 "type": "text",
                 "text": ""
             }
         })
     }
 
-    fn emit_text_delta(&mut self, delta: &str) -> serde_json::Value {
+    fn emit_text_delta(&mut self, delta: &str, output_index: usize, item_id: &str, content_index: usize) -> serde_json::Value {
         self.accumulated_text.push_str(delta);
         json!({
             "type": "response.output_text.delta",
             "sequence_number": self.next_sequence(),
-            "delta": delta,
-            "content_part_id": self.content_part_id.clone()
+            "output_index": output_index,
+            "item_id": item_id,
+            "content_index": content_index,
+            "delta": delta
         })
     }
 
-    fn emit_text_done(&mut self) -> serde_json::Value {
+    fn emit_text_done(&mut self, output_index: usize, item_id: &str, content_index: usize) -> serde_json::Value {
         json!({
             "type": "response.output_text.done",
             "sequence_number": self.next_sequence(),
-            "content_part_id": self.content_part_id.clone(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "content_index": content_index,
             "text": self.accumulated_text.clone()
         })
     }
 
-    fn emit_content_part_done(&mut self) -> serde_json::Value {
+    fn emit_content_part_done(&mut self, output_index: usize, item_id: &str, content_index: usize) -> serde_json::Value {
         json!({
             "type": "response.content_part.done",
             "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "content_index": content_index,
             "part": {
-                "id": self.content_part_id.clone(),
                 "type": "text",
                 "text": self.accumulated_text.clone()
             }
         })
     }
 
-    fn emit_output_item_done(&mut self) -> serde_json::Value {
-        json!({
-            "type": "response.output_item.done",
-            "sequence_number": self.next_sequence(),
-            "item": {
-                "id": self.message_id.clone(),
-                "type": "message",
-                "role": "assistant",
-                "content": [{
-                    "type": "text",
-                    "text": self.accumulated_text.clone()
-                }]
-            }
-        })
-    }
 
     fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
         let mut response = json!({
@@ -1066,39 +1104,239 @@ impl ResponseStreamEventEmitter {
         response
     }
 
+    // ========================================================================
+    // MCP Event Emission Methods
+    // ========================================================================
+
+    fn emit_mcp_list_tools_in_progress(&mut self, output_index: usize) -> serde_json::Value {
+        json!({
+            "type": "response.mcp_list_tools.in_progress",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index
+        })
+    }
+
+    fn emit_mcp_list_tools_completed(&mut self, output_index: usize, tools: &[crate::mcp::ToolInfo]) -> serde_json::Value {
+        let tool_items: Vec<_> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters.clone().unwrap_or_else(|| json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }))
+                })
+            })
+            .collect();
+
+        json!({
+            "type": "response.mcp_list_tools.completed",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "tools": tool_items
+        })
+    }
+
+    fn emit_mcp_call_in_progress(&mut self, output_index: usize, item_id: &str) -> serde_json::Value {
+        json!({
+            "type": "response.mcp_call.in_progress",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id
+        })
+    }
+
+    fn emit_mcp_call_arguments_delta(&mut self, output_index: usize, item_id: &str, delta: &str) -> serde_json::Value {
+        // Accumulate arguments for this call
+        self.mcp_call_accumulated_args
+            .entry(item_id.to_string())
+            .or_default()
+            .push_str(delta);
+
+        json!({
+            "type": "response.mcp_call_arguments.delta",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "delta": delta
+        })
+    }
+
+    fn emit_mcp_call_arguments_done(&mut self, output_index: usize, item_id: &str, arguments: &str) -> serde_json::Value {
+        json!({
+            "type": "response.mcp_call_arguments.done",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "arguments": arguments
+        })
+    }
+
+    fn emit_mcp_call_completed(&mut self, output_index: usize, item_id: &str) -> serde_json::Value {
+        json!({
+            "type": "response.mcp_call.completed",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id
+        })
+    }
+
+    fn emit_mcp_call_failed(&mut self, output_index: usize, item_id: &str, error: &str) -> serde_json::Value {
+        json!({
+            "type": "response.mcp_call.failed",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "error": error
+        })
+    }
+
+    // ========================================================================
+    // Output Item Wrapper Events
+    // ========================================================================
+
+    /// Emit response.output_item.added event
+    fn emit_output_item_added(&mut self, output_index: usize, item: &serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "response.output_item.added",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item": item
+        })
+    }
+
+    /// Emit response.output_item.done event
+    fn emit_output_item_done(&mut self, output_index: usize, item: &serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "response.output_item.done",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item": item
+        })
+    }
+
+    /// Generate unique ID for item type
+    fn generate_item_id(prefix: &str) -> String {
+        format!("{}_{}", prefix, Uuid::new_v4().to_string().replace("-", ""))
+    }
+
+    /// Allocate next output index and track item
+    fn allocate_output_index(&mut self, item_type: OutputItemType) -> (usize, String) {
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+
+        let id_prefix = match &item_type {
+            OutputItemType::McpListTools => "mcpl",
+            OutputItemType::McpCall { .. } => "mcp",
+            OutputItemType::Message { .. } => "msg",
+            OutputItemType::Reasoning => "rs",
+        };
+
+        let id = Self::generate_item_id(id_prefix);
+
+        self.output_items.push(OutputItemState {
+            id: id.clone(),
+            item_type,
+            output_index: index,
+            status: ItemStatus::InProgress,
+        });
+
+        (index, id)
+    }
+
+    /// Mark output item as completed
+    fn complete_output_item(&mut self, output_index: usize) {
+        if let Some(item) = self.output_items.iter_mut().find(|i| i.output_index == output_index) {
+            item.status = ItemStatus::Completed;
+        }
+    }
+
+    /// Emit reasoning item wrapper events (added + done)
+    ///
+    /// Reasoning items in OpenAI format are simple placeholders emitted between tool iterations.
+    /// They don't have streaming content - just wrapper events with empty/null content.
+    fn emit_reasoning_item(
+        &mut self,
+        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        reasoning_content: Option<String>,
+    ) -> Result<(), String> {
+        // Allocate output index and generate ID
+        let (output_index, item_id) = self.allocate_output_index(OutputItemType::Reasoning);
+
+        // Build reasoning item structure
+        let item = json!({
+            "id": item_id,
+            "type": "reasoning",
+            "summary": [],
+            "content": reasoning_content,
+            "encrypted_content": null,
+            "status": null
+        });
+
+        // Emit output_item.added
+        let added_event = self.emit_output_item_added(output_index, &item);
+        self.send_event(&added_event, tx)?;
+
+        // Immediately emit output_item.done (no streaming for reasoning)
+        let done_event = self.emit_output_item_done(output_index, &item);
+        self.send_event(&done_event, tx)?;
+
+        // Mark as completed
+        self.complete_output_item(output_index);
+
+        Ok(())
+    }
+
     /// Process a chunk and emit appropriate events
     fn process_chunk(
         &mut self,
         chunk: &ChatCompletionStreamResponse,
         tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
     ) -> Result<(), String> {
-        // Emit initial events if not yet done
-        if !self.has_emitted_created {
-            let event = self.emit_created();
-            self.send_event(&event, tx)?;
-        }
-
-        if !self.has_emitted_in_progress {
-            let event = self.emit_in_progress();
-            self.send_event(&event, tx)?;
-        }
-
         // Process content if present
         if let Some(choice) = chunk.choices.first() {
             if let Some(content) = &choice.delta.content {
                 if !content.is_empty() {
-                    // Emit structure events before first content
-                    if !self.has_emitted_output_item_added {
-                        let event = self.emit_output_item_added();
+                    // Allocate output_index and item_id for this message item (once per message)
+                    if self.current_item_id.is_none() {
+                        let (output_index, item_id) = self.allocate_output_index(
+                            OutputItemType::Message { content_index: 0 }
+                        );
+
+                        // Build message item structure
+                        let item = json!({
+                            "id": item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": []
+                        });
+
+                        // Emit output_item.added
+                        let event = self.emit_output_item_added(output_index, &item);
                         self.send_event(&event, tx)?;
+                        self.has_emitted_output_item_added = true;
+
+                        // Store for subsequent events
+                        self.current_item_id = Some(item_id);
+                        self.current_message_output_index = Some(output_index);
                     }
+
+                    let output_index = self.current_message_output_index.unwrap();
+                    let item_id = self.current_item_id.clone().unwrap();  // Clone to avoid borrow checker issues
+                    let content_index = 0; // Single content part for now
+
+                    // Emit content_part.added before first delta
                     if !self.has_emitted_content_part_added {
-                        let event = self.emit_content_part_added();
+                        let event = self.emit_content_part_added(output_index, &item_id, content_index);
                         self.send_event(&event, tx)?;
+                        self.has_emitted_content_part_added = true;
                     }
 
                     // Emit text delta
-                    let event = self.emit_text_delta(content);
+                    let event = self.emit_text_delta(content, output_index, &item_id, content_index);
                     self.send_event(&event, tx)?;
                 }
             }
@@ -1106,17 +1344,35 @@ impl ResponseStreamEventEmitter {
             // Check for finish_reason to emit completion events
             if let Some(reason) = &choice.finish_reason {
                 if reason == "stop" || reason == "length" {
+                    let output_index = self.current_message_output_index.unwrap();
+                    let item_id = self.current_item_id.clone().unwrap();  // Clone to avoid borrow checker issues
+                    let content_index = 0;
+
                     // Emit closing events
                     if self.has_emitted_content_part_added {
-                        let event = self.emit_text_done();
+                        let event = self.emit_text_done(output_index, &item_id, content_index);
                         self.send_event(&event, tx)?;
-                        let event = self.emit_content_part_done();
+                        let event = self.emit_content_part_done(output_index, &item_id, content_index);
                         self.send_event(&event, tx)?;
                     }
+
                     if self.has_emitted_output_item_added {
-                        let event = self.emit_output_item_done();
+                        // Build complete message item for output_item.done
+                        let item = json!({
+                            "id": item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "text",
+                                "text": self.accumulated_text.clone()
+                            }]
+                        });
+                        let event = self.emit_output_item_done(output_index, &item);
                         self.send_event(&event, tx)?;
                     }
+
+                    // Mark item as completed
+                    self.complete_output_item(output_index);
 
                     // Emit completed with usage if available
                     let usage = chunk.usage.as_ref().map(|u| {
@@ -1410,6 +1666,37 @@ fn extract_function_call_from_chat(
     }
 
     None
+}
+
+/// Extract all tool calls from chat response (for parallel tool call support)
+fn extract_all_tool_calls_from_chat(
+    response: &ChatCompletionResponse,
+) -> Vec<(String, String, String)> {
+    // Check if response has choices with tool calls
+    let Some(choice) = response.choices.first() else {
+        return Vec::new();
+    };
+    let message = &choice.message;
+
+    // Look for tool_calls in the message
+    if let Some(tool_calls) = &message.tool_calls {
+        tool_calls
+            .iter()
+            .map(|tool_call| {
+                (
+                    tool_call.id.clone(),
+                    tool_call.function.name.clone(),
+                    tool_call
+                        .function
+                        .arguments
+                        .clone()
+                        .unwrap_or_else(|| "{}".to_string()),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Execute an MCP tool call
@@ -1944,10 +2231,28 @@ async fn execute_tool_loop_streaming_internal(
     let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
+    // Create response event emitter
+    let response_id = format!("resp_{}", Uuid::new_v4());
+    let model = current_request.model.clone().unwrap_or_else(|| "default".to_string());
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
+
+    // Emit initial response.created and response.in_progress events
+    let event = emitter.emit_created();
+    emitter.send_event(&event, &tx)?;
+    let event = emitter.emit_in_progress();
+    emitter.send_event(&event, &tx)?;
+
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_tools = mcp_manager.list_tools();
     let chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
     debug!("Streaming: Converted {} MCP tools to chat format", chat_tools.len());
+
+    // Flag to track if mcp_list_tools has been emitted
+    let mut mcp_list_tools_emitted = false;
 
     loop {
         state.iteration += 1;
@@ -1959,6 +2264,64 @@ async fn execute_tool_loop_streaming_internal(
         }
 
         debug!("Streaming MCP tool loop iteration {}", state.iteration);
+
+        // Emit mcp_list_tools as first output item (only once, on first iteration)
+        if !mcp_list_tools_emitted {
+            let (output_index, item_id) = emitter.allocate_output_index(OutputItemType::McpListTools);
+
+            // Build tools list for item structure
+            let tool_items: Vec<_> = mcp_tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.parameters.clone().unwrap_or_else(|| json!({
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }))
+                    })
+                })
+                .collect();
+
+            // Build mcp_list_tools item
+            let item = json!({
+                "id": item_id,
+                "type": "mcp_list_tools",
+                "server_label": state.server_label,
+                "status": "in_progress",
+                "tools": []
+            });
+
+            // Emit output_item.added
+            let event = emitter.emit_output_item_added(output_index, &item);
+            emitter.send_event(&event, &tx)?;
+
+            // Emit mcp_list_tools.in_progress
+            let event = emitter.emit_mcp_list_tools_in_progress(output_index);
+            emitter.send_event(&event, &tx)?;
+
+            // Emit mcp_list_tools.completed
+            let event = emitter.emit_mcp_list_tools_completed(output_index, &mcp_tools);
+            emitter.send_event(&event, &tx)?;
+
+            // Build complete item with tools
+            let item_done = json!({
+                "id": item_id,
+                "type": "mcp_list_tools",
+                "server_label": state.server_label,
+                "status": "completed",
+                "tools": tool_items
+            });
+
+            // Emit output_item.done
+            let event = emitter.emit_output_item_done(output_index, &item_done);
+            emitter.send_event(&event, &tx)?;
+
+            emitter.complete_output_item(output_index);
+            mcp_list_tools_emitted = true;
+        }
 
         // Convert to chat request
         let mut chat_request = conversions::responses_to_chat(&current_request)
@@ -1978,19 +2341,19 @@ async fn execute_tool_loop_streaming_internal(
             )
             .await;
 
-        // Forward stream to client while accumulating for tool call detection
+        // Convert chat stream to Responses API events while accumulating for tool call detection
+        // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
         let accumulated_response =
-            forward_and_accumulate_stream(response.into_body(), tx.clone()).await?;
+            convert_and_accumulate_stream(response.into_body(), &mut emitter, &tx).await?;
 
-        // Check for tool calls
-        if let Some((call_id, tool_name, args_json_str)) =
-            extract_function_call_from_chat(&accumulated_response)
-        {
-            state.total_calls += 1;
+        // Check for tool calls (extract all of them for parallel execution)
+        let tool_calls = extract_all_tool_calls_from_chat(&accumulated_response);
 
+        if !tool_calls.is_empty() {
             debug!(
-                "Tool loop iteration {}: calling {} (call_id: {})",
-                state.iteration, tool_name, call_id
+                "Tool loop iteration {}: found {} tool call(s)",
+                state.iteration,
+                tool_calls.len()
             );
 
             // Check combined limit
@@ -1999,35 +2362,118 @@ async fn execute_tool_loop_streaming_internal(
                 None => MAX_ITERATIONS,
             };
 
-            if state.total_calls > effective_limit {
+            if state.total_calls + tool_calls.len() > effective_limit {
                 warn!(
-                    "Reached tool call limit: {} (max_tool_calls={:?}, safety_limit={})",
-                    state.total_calls, max_tool_calls, MAX_ITERATIONS
+                    "Reached tool call limit: {} + {} > {} (max_tool_calls={:?}, safety_limit={})",
+                    state.total_calls, tool_calls.len(), effective_limit, max_tool_calls, MAX_ITERATIONS
                 );
                 break;
             }
 
-            // Execute the MCP tool
-            let (output_str, success, error) =
-                match execute_mcp_call(&mcp_manager, &tool_name, &args_json_str).await {
-                    Ok(output) => (output, true, None),
-                    Err(err) => {
-                        warn!("Tool execution failed: {}", err);
-                        let error_msg = err.clone();
-                        let error_json = json!({ "error": err }).to_string();
-                        (error_json, false, Some(error_msg))
-                    }
-                };
+            // Process each tool call
+            for (call_id, tool_name, args_json_str) in tool_calls {
+                state.total_calls += 1;
 
-            // Record the call in state
-            state.record_call(
-                call_id,
-                tool_name,
-                args_json_str,
-                output_str,
-                success,
-                error,
-            );
+                debug!(
+                    "Executing tool call {}/{}: {} (call_id: {})",
+                    state.total_calls, state.total_calls, tool_name, call_id
+                );
+
+                // Allocate output_index for this mcp_call item
+                let (output_index, item_id) = emitter.allocate_output_index(
+                    OutputItemType::McpCall { name: tool_name.clone() }
+                );
+
+                // Build initial mcp_call item
+                let item = json!({
+                    "id": item_id,
+                    "type": "mcp_call",
+                    "name": tool_name,
+                    "server_label": state.server_label,
+                    "status": "in_progress",
+                    "arguments": ""
+                });
+
+                // Emit output_item.added
+                let event = emitter.emit_output_item_added(output_index, &item);
+                emitter.send_event(&event, &tx)?;
+
+                // Emit mcp_call.in_progress
+                let event = emitter.emit_mcp_call_in_progress(output_index, &item_id);
+                emitter.send_event(&event, &tx)?;
+
+                // Emit mcp_call_arguments.delta (simulate streaming by sending full arguments)
+                let event = emitter.emit_mcp_call_arguments_delta(output_index, &item_id, &args_json_str);
+                emitter.send_event(&event, &tx)?;
+
+                // Emit mcp_call_arguments.done
+                let event = emitter.emit_mcp_call_arguments_done(output_index, &item_id, &args_json_str);
+                emitter.send_event(&event, &tx)?;
+
+                // Execute the MCP tool
+                let (output_str, success, error) =
+                    match execute_mcp_call(&mcp_manager, &tool_name, &args_json_str).await {
+                        Ok(output) => {
+                            // Emit mcp_call.completed
+                            let event = emitter.emit_mcp_call_completed(output_index, &item_id);
+                            emitter.send_event(&event, &tx)?;
+
+                            // Build complete item with output
+                            let item_done = json!({
+                                "id": item_id,
+                                "type": "mcp_call",
+                                "name": tool_name,
+                                "server_label": state.server_label,
+                                "status": "completed",
+                                "arguments": args_json_str,
+                                "output": output
+                            });
+
+                            // Emit output_item.done
+                            let event = emitter.emit_output_item_done(output_index, &item_done);
+                            emitter.send_event(&event, &tx)?;
+
+                            emitter.complete_output_item(output_index);
+                            (output, true, None)
+                        }
+                        Err(err) => {
+                            warn!("Tool execution failed: {}", err);
+                            // Emit mcp_call.failed
+                            let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err);
+                            emitter.send_event(&event, &tx)?;
+
+                            // Build failed item
+                            let item_done = json!({
+                                "id": item_id,
+                                "type": "mcp_call",
+                                "name": tool_name,
+                                "server_label": state.server_label,
+                                "status": "failed",
+                                "arguments": args_json_str,
+                                "error": err
+                            });
+
+                            // Emit output_item.done
+                            let event = emitter.emit_output_item_done(output_index, &item_done);
+                            emitter.send_event(&event, &tx)?;
+
+                            emitter.complete_output_item(output_index);
+                            let error_msg = err.clone();
+                            let error_json = json!({ "error": err }).to_string();
+                            (error_json, false, Some(error_msg))
+                        }
+                    };
+
+                // Record the call in state
+                state.record_call(
+                    call_id,
+                    tool_name,
+                    args_json_str,
+                    output_str,
+                    success,
+                    error,
+                );
+            }
 
             // Build next request with conversation history
             let mut input_items = match &state.original_input {
@@ -2080,29 +2526,35 @@ async fn execute_tool_loop_streaming_internal(
             continue;
         }
 
-        // No tool calls, emit MCP metadata and finish
+        // No tool calls, this is the final response
         debug!("No tool calls found, ending streaming MCP loop");
 
-        // Emit MCP metadata as SSE events
-        if state.total_calls > 0 {
-            // Emit mcp_list_tools event
-            let list_tools_item = build_mcp_list_tools_item(&mcp_manager, &server_label);
-            let event_json = serde_json::to_string(&list_tools_item)
-                .map_err(|e| format!("Failed to serialize mcp_list_tools: {}", e))?;
-            let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", event_json))));
+        // Check for reasoning content
+        let reasoning_content = accumulated_response
+            .choices
+            .first()
+            .and_then(|c| c.message.reasoning_content.clone());
 
-            // Emit mcp_call events
-            for call_item in &state.mcp_call_items {
-                let event_json = serde_json::to_string(&call_item)
-                    .map_err(|e| format!("Failed to serialize mcp_call: {}", e))?;
-                let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", event_json))));
+        // Emit reasoning item if present
+        if let Some(reasoning) = reasoning_content {
+            if !reasoning.is_empty() {
+                emitter.emit_reasoning_item(&tx, Some(reasoning))?;
             }
-
-            debug!(
-                "Injected MCP metadata: 1 mcp_list_tools + {} mcp_call items",
-                state.total_calls
-            );
         }
+
+        // Text message events already emitted naturally by process_chunk during stream processing
+        // (OpenAI router approach - text only appears on final iteration when no tool calls)
+
+        // Emit final response.completed event
+        let usage_json = accumulated_response.usage.as_ref().map(|u| {
+            json!({
+                "prompt_tokens": u.prompt_tokens,
+                "completion_tokens": u.completion_tokens,
+                "total_tokens": u.total_tokens
+            })
+        });
+        let event = emitter.emit_completed(usage_json.as_ref());
+        emitter.send_event(&event, &tx)?;
 
         break;
     }
@@ -2110,10 +2562,11 @@ async fn execute_tool_loop_streaming_internal(
     Ok(())
 }
 
-/// Forward SSE stream to client while accumulating for tool call detection
-async fn forward_and_accumulate_stream(
+/// Convert chat stream to Responses API events while accumulating for tool call detection
+async fn convert_and_accumulate_stream(
     body: Body,
-    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    emitter: &mut ResponseStreamEventEmitter,
+    tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<ChatCompletionResponse, String> {
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
@@ -2121,11 +2574,7 @@ async fn forward_and_accumulate_stream(
     while let Some(chunk_result) = futures_util::StreamExt::next(&mut stream).await {
         let chunk = chunk_result.map_err(|e| format!("Stream read error: {}", e))?;
 
-        // Forward chunk to client
-        tx.send(Ok(chunk.clone()))
-            .map_err(|e| format!("Failed to forward chunk: {}", e))?;
-
-        // Parse and accumulate
+        // Parse chunk
         let event_str = String::from_utf8_lossy(&chunk);
         let event = event_str.trim();
 
@@ -2136,6 +2585,10 @@ async fn forward_and_accumulate_stream(
         if let Some(json_str) = event.strip_prefix("data: ") {
             let json_str = json_str.trim();
             if let Ok(chat_chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
+                // Convert chat chunk to Responses API events and emit
+                emitter.process_chunk(&chat_chunk, tx)?;
+
+                // Accumulate for tool call detection
                 accumulator.process_chunk(&chat_chunk);
             }
         }
