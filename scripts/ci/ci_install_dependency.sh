@@ -62,7 +62,10 @@ fi
 $PIP_CMD list
 
 # Install additional dependencies
-$PIP_CMD install apache-tvm-ffi==0.1.0b15 mooncake-transfer-engine==0.3.6.post1 nvidia-cuda-nvrtc-cu12 py-spy scipy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.6.post1 nvidia-cuda-nvrtc-cu12 py-spy scipy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
+
+# Install flashinfer-python 0.4.0 dependency that requires prerelease (This should be removed when flashinfer fixes this issue)
+$PIP_CMD install apache-tvm-ffi==0.1.0b15 --prerelease=allow $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
