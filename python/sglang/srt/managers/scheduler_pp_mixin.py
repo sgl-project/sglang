@@ -11,11 +11,8 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import GenerationBatchResult
-
 from sglang.srt.managers.utils import (
+    GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
