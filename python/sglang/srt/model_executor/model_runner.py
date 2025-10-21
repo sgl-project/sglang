@@ -2076,9 +2076,6 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        if not skip_attn_backend_init:
-            self.attn_backend.init_forward_metadata(forward_batch)
-
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2090,6 +2087,9 @@ class ModelRunner:
         if self.piecewise_cuda_graph_runner is not None:
             if self.piecewise_cuda_graph_runner.can_run(forward_batch):
                 return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+        else:
+            if not skip_attn_backend_init:
+                self.attn_backend.init_forward_metadata(forward_batch)
 
         return self.model.forward(
             forward_batch.input_ids,

@@ -305,14 +305,16 @@ def _is_extend_without_speculative(forward_batch):
 def _handle_attention_backend(
     attn: DeepseekV2AttentionMLA, forward_batch, backend_name
 ):
+    if is_in_piecewise_cuda_graph():
+        return AttnForwardMethod.MLA
+
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
     disable_ragged = (
         backend_name in ["flashinfer", "flashmla"]
     ) and attn.flashinfer_mla_disable_ragged
 
     if (
-        not is_in_piecewise_cuda_graph()
-        and not disable_ragged
+        not disable_ragged
         and _is_extend_without_speculative(forward_batch)
         and (
             (
@@ -376,9 +378,11 @@ def handle_attention_nsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
+    if is_in_piecewise_cuda_graph():
+        return AttnForwardMethod.MLA
+
     if (
-        not is_in_piecewise_cuda_graph()
-        and _is_extend_without_speculative(forward_batch)
+        _is_extend_without_speculative(forward_batch)
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
     ):
         return AttnForwardMethod.MHA

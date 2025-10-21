@@ -234,7 +234,9 @@ class PiecewiseCudaGraphRunner:
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
-                out_cache_loc=torch.randint(0, 100, (num_tokens,), device=self.device),
+                out_cache_loc=torch.zeros(
+                    (num_tokens,), device=self.device, dtype=self._cache_loc_dtype()
+                ),
                 seq_lens_sum=num_tokens,
                 encoder_lens=None,
                 return_logprob=False,
@@ -353,7 +355,9 @@ class PiecewiseCudaGraphRunner:
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
-                out_cache_loc=out_cache_loc,
+                out_cache_loc=torch.zeros(
+                    (num_tokens,), device=self.device, dtype=self._cache_loc_dtype()
+                ),
                 seq_lens_sum=num_tokens,
                 encoder_lens=None,
                 return_logprob=False,
@@ -482,9 +486,10 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
         # Replay
         with enable_piecewise_cuda_graph():
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             with set_forward_context(static_forward_batch, self.attention_layers):
                 with set_compiled(True):
                     output = self.model_runner.model.forward(
