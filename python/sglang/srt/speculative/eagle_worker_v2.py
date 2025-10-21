@@ -640,6 +640,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done = torch.cuda.Event()
         verify_done.record()
 
+        # Debug
+        torch.cuda._sleep(int(1e9))
+
         all_verified_id = predict[accept_index]
         verified_id = torch.empty_like(accept_length, dtype=torch.int32)
         fill_new_verified_id[(bs,)](
