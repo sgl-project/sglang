@@ -229,6 +229,14 @@ class Envs:
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
 
+    # Ktransformers
+    SGLANG_KT_MOE_NUM_GPU_EXPERTS = EnvInt(None)
+    SGLANG_KT_MOE_CPUINFER = EnvInt(None)
+    SGLANG_KT_THREADPOOL_COUNT = EnvInt(None)
+    SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
+    SGLANG_KT_AMX_METHOD = EnvStr(None)
+    SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
+
     # fmt: on
 
 
