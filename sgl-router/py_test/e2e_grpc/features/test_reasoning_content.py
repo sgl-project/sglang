@@ -10,22 +10,23 @@ python3 -m unittest openai_server.features.test_reasoning_content.TestReasoningC
 """
 
 import json
+
+# CHANGE: Import router launcher instead of server launcher
+import sys
 import unittest
+from pathlib import Path
 
 import openai
 import requests
 
-# CHANGE: Import router launcher instead of server launcher
-import sys
-from pathlib import Path
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_workers_and_router
 from util import (
-    CustomTestCase,
     DEFAULT_REASONING_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     kill_process_tree,
 )
 

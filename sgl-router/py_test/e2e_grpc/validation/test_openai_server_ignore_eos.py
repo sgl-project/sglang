@@ -12,22 +12,24 @@ Run with:
     pytest py_test/e2e_grpc/e2e_grpc/validation/test_openai_server_ignore_eos.py -v
 """
 
-import openai
-
 # CHANGE: Import router launcher instead of server launcher
 import sys
 from pathlib import Path
+
+import openai
+
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_workers_and_router
 from util import (
-    CustomTestCase,
     DEFAULT_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     get_tokenizer,
     kill_process_tree,
 )
+
 
 class TestOpenAIServerIgnoreEOS(CustomTestCase):
     @classmethod

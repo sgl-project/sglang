@@ -13,22 +13,23 @@ Run with:
 """
 
 import json
+
+# CHANGE: Import router launcher instead of server launcher
+import sys
 import unittest
+from pathlib import Path
 
 import openai
 import requests
 
-# CHANGE: Import router launcher instead of server launcher
-import sys
-from pathlib import Path
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_workers_and_router
 from util import (
-    CustomTestCase,
     DEFAULT_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     get_tokenizer,
     kill_process_tree,
 )
@@ -276,13 +277,14 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             .message.content.strip()
             .startswith('"name": "SmartHome Mini",')
         )
+
     def test_model_list(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        # TODO: Update the logic here when router /v1/models response foramt matching the openai api standard  
+        # TODO: Update the logic here when router /v1/models response format matching the openai api standard
         models = list(client.models.list().models)
         assert len(models) == 1
         # assert isinstance(getattr(models[0], "max_model_len", None), int)
-        
+
     @unittest.skip("Skipping retrieve model test as it is not supported by the router")
     def test_retrieve_model(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)

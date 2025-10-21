@@ -13,26 +13,28 @@ Run with:
 """
 
 import json
-import time
-import unittest
-
-import openai
 
 # CHANGE: Import router launcher instead of server launcher
 import sys
+import time
+import unittest
 from pathlib import Path
+
+import openai
+
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_workers_and_router
 from util import (
-    CustomTestCase,
     DEFAULT_MODEL_PATH,
     DEFAULT_SMALL_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     get_tokenizer,
     kill_process_tree,
 )
+
 
 class TestOpenAIServerFunctionCalling(CustomTestCase):
     # NOTE: this system_message is for Llama3.2 system prompt. Without this,
@@ -382,7 +384,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         self.assertEqual(str(args_obj["a"]), "5", "Parameter a should be 5")
         self.assertEqual(str(args_obj["b"]), "7", "Parameter b should be 7")
 
-    @unittest.skip("Skipping function call strict test as it is not supported by the router")
+    @unittest.skip(
+        "Skipping function call strict test as it is not supported by the router"
+    )
     def test_function_call_strict(self):
         """
         Test: Whether the strict mode of function calling works as expected.
@@ -802,6 +806,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                 f"Expected finish_reason 'stop' or 'length' for index {index}, got {reasons[-1]}",
             )
 
+
 class TestOpenAIPythonicFunctionCalling(CustomTestCase):
     PYTHONIC_TOOLS = [
         {
@@ -942,6 +947,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             "get_weather" in found_names or "get_tourist_attractions" in found_names,
             f"Function name '{found_names}' should container either 'get_weather' or 'get_tourist_attractions'",
         )
+
 
 if __name__ == "__main__":
     unittest.main()

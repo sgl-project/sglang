@@ -49,6 +49,7 @@ STDERR_FILENAME = "/tmp/sglang_test_stderr.txt"
 # Set ROUTER_LOCAL_MODEL_PATH to use local models (e.g., "/home/ubuntu/models")
 ROUTER_LOCAL_MODEL_PATH = os.environ.get("ROUTER_LOCAL_MODEL_PATH", "")
 
+
 # Helper function to build model paths
 def _get_model_path(model_identifier: str) -> str:
     """
@@ -61,6 +62,7 @@ def _get_model_path(model_identifier: str) -> str:
         return os.path.join(ROUTER_LOCAL_MODEL_PATH, model_identifier)
     return model_identifier
 
+
 # Model paths used in e2e_grpc tests
 # These can be either HuggingFace identifiers or local paths (depending on ROUTER_LOCAL_MODEL_PATH)
 
@@ -71,14 +73,18 @@ DEFAULT_MODEL_PATH = _get_model_path("meta-llama/Llama-3.1-8B-Instruct")
 DEFAULT_SMALL_MODEL_PATH = _get_model_path("meta-llama/Llama-3.2-1B-Instruct")
 
 # Reasoning models
-DEFAULT_REASONING_MODEL_PATH = _get_model_path("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
+DEFAULT_REASONING_MODEL_PATH = _get_model_path(
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+)
 
 # Thinking-enabled models
 DEFAULT_ENABLE_THINKING_MODEL_PATH = _get_model_path("Qwen/Qwen3-30B-A3B")
 
 # Function calling models
 DEFAULT_QWEN_FUNCTION_CALLING_MODEL_PATH = _get_model_path("Qwen/Qwen2.5-7B-Instruct")
-DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH = _get_model_path("mistralai/Mistral-7B-Instruct-v0.3")
+DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH = _get_model_path(
+    "mistralai/Mistral-7B-Instruct-v0.3"
+)
 
 
 # ============================================================================

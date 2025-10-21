@@ -23,7 +23,12 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def wait_for_workers_ready(router_url: str, expected_workers: int, timeout: int = 300, api_key: Optional[str] = None) -> None:
+def wait_for_workers_ready(
+    router_url: str,
+    expected_workers: int,
+    timeout: int = 300,
+    api_key: Optional[str] = None,
+) -> None:
     """
     Wait for router to have all workers connected.
 
@@ -56,13 +61,17 @@ def wait_for_workers_ready(router_url: str, expected_workers: int, timeout: int 
                 print(f"  Still waiting for workers... ({elapsed}/{timeout}s elapsed)")
 
             try:
-                response = session.get(f"{router_url}/workers", headers=headers, timeout=5)
+                response = session.get(
+                    f"{router_url}/workers", headers=headers, timeout=5
+                )
                 if response.status_code == 200:
                     data = response.json()
                     total_workers = data.get("total", 0)
 
                     if total_workers == expected_workers:
-                        print(f"  All {expected_workers} workers connected after {elapsed}s")
+                        print(
+                            f"  All {expected_workers} workers connected after {elapsed}s"
+                        )
                         return
                     else:
                         last_error = f"Workers: {total_workers}/{expected_workers}"
@@ -84,8 +93,6 @@ def wait_for_workers_ready(router_url: str, expected_workers: int, timeout: int 
         f"Last status: {last_error}\n"
         f"Hint: Run with SHOW_ROUTER_LOGS=1 to see startup logs"
     )
-
-
 
 
 def popen_launch_workers_and_router(
@@ -143,6 +150,7 @@ def popen_launch_workers_and_router(
         >>> kill_process_tree(cluster['router'].pid)
     """
     import os
+
     show_output = os.environ.get("SHOW_ROUTER_LOGS", "0") == "1"
 
     # Note: timeout parameter is used for router health check below
@@ -187,10 +195,10 @@ def popen_launch_workers_and_router(
             "--port",
             str(worker_port),
             "--grpc-mode",  # Enable gRPC for this worker
-            "--mem-fraction-static", 
+            "--mem-fraction-static",
             "0.8",
-            "--attention-backend", 
-            "fa3"
+            "--attention-backend",
+            "fa3",
         ]
 
         # Add TP size
@@ -293,7 +301,9 @@ def popen_launch_workers_and_router(
     print(f"\nWaiting for router to start at {router_url}...")
 
     try:
-        wait_for_workers_ready(router_url, expected_workers=num_workers, timeout=180, api_key=api_key)
+        wait_for_workers_ready(
+            router_url, expected_workers=num_workers, timeout=180, api_key=api_key
+        )
         print(f"✓ Router ready at {router_url}")
     except TimeoutError:
         print(f"✗ Router failed to start")

@@ -3,28 +3,30 @@ python3 -m unittest openai_server.validation.test_large_max_new_tokens.TestLarge
 """
 
 import os
-import time
-import unittest
-from concurrent.futures import ThreadPoolExecutor
-
-import openai
 
 # CHANGE: Import router launcher instead of server launcher
 import sys
+import time
+import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import openai
+
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_workers_and_router
 from util import (
-    CustomTestCase,
     DEFAULT_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     STDERR_FILENAME,
     STDOUT_FILENAME,
+    CustomTestCase,
     get_tokenizer,
     kill_process_tree,
 )
+
 
 class TestLargeMaxNewTokens(CustomTestCase):
     @classmethod
@@ -110,6 +112,7 @@ class TestLargeMaxNewTokens(CustomTestCase):
                     pt += 1
 
         assert all_requests_running
+
 
 if __name__ == "__main__":
     unittest.main()
