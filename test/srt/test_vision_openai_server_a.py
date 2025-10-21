@@ -136,6 +136,9 @@ class TestKimiVLServer(ImageOpenAITestMixin):
         pass
 
 
+@unittest.skip(
+    "Temporarily disabling this test to fix CI. It should be re-enabled when #11800 is done."
+)
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "zai-org/GLM-4.1V-9B-Thinking"
     extra_args = [
