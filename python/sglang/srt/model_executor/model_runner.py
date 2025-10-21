@@ -2331,63 +2331,12 @@ class ModelRunner:
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         try:
-            from sglang.srt.checkpoint_engine_worker import (
-                SGLangCheckpointEngineWorkerExtension,
+            from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
+                SGLangCheckpointEngineWorkerExtensionImpl,
             )
 
             # Create a worker extension that integrates with SGLang's model
-            class SGLangWorkerImpl(SGLangCheckpointEngineWorkerExtension):
-                def __init__(self, model_runner):
-                    super().__init__()
-                    self.model_runner = model_runner
-
-                def get_device_uuid(self) -> str:
-                    # Get device UUID for current device
-                    device_id = torch.cuda.current_device()
-                    try:
-                        return (
-                            f"GPU-{torch.cuda.get_device_properties(device_id).uuid!s}"
-                        )
-                    except AssertionError as e:
-                        raise ValueError(
-                            f"Failed to get GPU UUID for device {device_id}"
-                        ) from e
-
-                def get_device_id(self) -> int:
-                    return torch.cuda.current_device()
-
-                def get_model_loader(self):
-                    return self.model_runner.model.load_weights
-
-                def get_post_hook(self):
-                    def post_hook():
-                        # Perform post-processing after weight loading similar to DefaultModelLoader
-                        try:
-                            from sglang.srt.model_loader.loader import (
-                                device_loading_context,
-                            )
-
-                            # Process quantization methods after loading weights
-                            for _, module in self.model_runner.model.named_modules():
-                                quant_method = getattr(module, "quant_method", None)
-                                if quant_method is not None:
-                                    # Move parameters to device if needed for quantization processing
-                                    target_device = torch.device(
-                                        "cuda", torch.cuda.current_device()
-                                    )
-                                    with device_loading_context(module, target_device):
-                                        quant_method.process_weights_after_loading(
-                                            module
-                                        )
-                            # Call model-specific post-loading hook if available
-                            if hasattr(self.model_runner.model, "post_load_weights"):
-                                self.model_runner.model.post_load_weights()
-                        except Exception as e:
-                            logger.warning(f"Post-hook processing failed: {e}")
-
-                    return post_hook  # Create worker instance and perform IPC weight update
-
-            worker = SGLangWorkerImpl(self)
+            worker = SGLangCheckpointEngineWorkerExtensionImpl(self)
             worker.update_weights_from_ipc(recv_req.zmq_handles)
             return True, "IPC weight update completed successfully"
         except ImportError:
