@@ -128,7 +128,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
-NSA_CHOICES = ["flashmla_prefill", "flashmla_decode", "fa3", "tilelang", "aiter"]
+NSA_CHOICES = ["flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "aiter"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
@@ -324,8 +324,8 @@ class ServerArgs:
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
-    nsa_prefill: str = "flashmla_prefill"
-    nsa_decode: str = "fa3"
+    nsa_prefill_backend: str = "flashmla_sparse"
+    nsa_decode_backend: str = "fa3"
 
     # Speculative decoding
     enable_beta_spec: bool = False
@@ -1024,10 +1024,10 @@ class ServerArgs:
                     logger.warning("Setting KV cache dtype to fp8.")
 
                 if self.kv_cache_dtype == "fp8_e4m3":
-                    self.nsa_prefill = "flashmla_decode"
-                    self.nsa_decode = "flashmla_decode"
+                    self.nsa_prefill_backend = "flashmla_kv"
+                    self.nsa_decode_backend = "flashmla_kv"
                     logger.warning(
-                        "Setting NSA backend to flashmla_decode for FP8 KV Cache."
+                        "Setting NSA backend to flashmla_kv for FP8 KV Cache."
                     )
 
                 # Logging env vars for NSA
@@ -2356,14 +2356,14 @@ class ServerArgs:
             help="Set multimodal attention backend.",
         )
         parser.add_argument(
-            "--nsa-prefill",
-            default=ServerArgs.nsa_prefill,
+            "--nsa-prefill-backend",
+            default=ServerArgs.nsa_prefill_backend,
             type=str,
             choices=NSA_CHOICES,
         )
         parser.add_argument(
-            "--nsa-decode",
-            default=ServerArgs.nsa_decode,
+            "--nsa-decode-backend",
+            default=ServerArgs.nsa_decode_backend,
             type=str,
             choices=NSA_CHOICES,
         )
