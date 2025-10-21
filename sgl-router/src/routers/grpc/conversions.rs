@@ -9,7 +9,7 @@
 
 use crate::protocols::{
     chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, UserMessageContent},
-    common::UsageInfo,
+    common::{FunctionCallResponse, ToolCall, UsageInfo},
     responses::{
         ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
         ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
@@ -83,6 +83,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                         }
                     }
                     ResponseInputOutputItem::FunctionToolCall {
+                        id,
                         name,
                         arguments,
                         output,
@@ -91,23 +92,26 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                         // Tool call from history - add as assistant message with tool call
                         // followed by tool response if output exists
 
-                        // For now, represent as assistant message with text
-                        // TODO: Properly convert to ToolCall format when implementing MCP
+                        // Add assistant message with tool_calls (the LLM's decision)
+                        messages.push(ChatMessage::Assistant {
+                            content: None,
+                            name: None,
+                            tool_calls: Some(vec![ToolCall {
+                                id: id.clone(),
+                                tool_type: "function".to_string(),
+                                function: FunctionCallResponse {
+                                    name: name.clone(),
+                                    arguments: Some(arguments.clone()),
+                                },
+                            }]),
+                            reasoning_content: None,
+                        });
+
+                        // Add tool result message if output exists
                         if let Some(output_text) = output {
                             messages.push(ChatMessage::Tool {
                                 content: output_text.clone(),
-                                tool_call_id: name.clone(),
-                            });
-                        } else {
-                            // Tool call without output yet - format as assistant message
-                            messages.push(ChatMessage::Assistant {
-                                content: Some(format!(
-                                    "Calling function {} with arguments: {}",
-                                    name, arguments
-                                )),
-                                name: None,
-                                tool_calls: None,
-                                reasoning_content: None,
+                                tool_call_id: id.clone(),
                             });
                         }
                     }
