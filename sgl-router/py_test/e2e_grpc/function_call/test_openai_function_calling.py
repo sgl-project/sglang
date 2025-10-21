@@ -53,7 +53,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
     def setUpClass(cls):
         # CHANGE: Launch gRPC router with integrated workers (single command)
         # Replace with the model name needed for testing; if not required, reuse "/home/ubuntu/models/llama-3.1-8b-instruct"
-        cls.model = "/home/ubuntu/models/llama-3.1-8b-instruct"
+        cls.model = "/home/ubuntu/models/meta-llama/Llama-3.2-1B-Instruct/"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
@@ -66,7 +66,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             router_args=[
                 # If your server needs extra parameters to test function calling, please add them here.
                 "--tool-call-parser",
-                "llama3",
+                "llama",
             ],
             num_workers=1,
             tp_size=2,

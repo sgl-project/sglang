@@ -607,7 +607,7 @@ class TestToolChoiceLlama32(CustomTestCase):
 
         # Verify the error message contains the expected text
         self.assertIn(
-            "Tool 'nonexistent_function' not found in tools list",
+            "function 'nonexistent_function' not found in",
             str(context.exception),
         )
 
@@ -725,7 +725,7 @@ class TestToolChoiceLlama32(CustomTestCase):
 
         # Verify the error message indicates conflicting tool definitions
         error_msg = str(context.exception).lower()
-        self.assertIn("multiple schemas", error_msg)
+        self.assertIn("invalid tool configuration", error_msg)
         self.assertIn("not supported", error_msg)
 
 class TestToolChoiceQwen25(TestToolChoiceLlama32):

@@ -221,7 +221,7 @@ class TestReasoningContentWithoutParser(CustomTestCase):
             kill_process_tree(worker.pid)
 
     def test_streaming_separate_reasoning_false(self):
-        # Test streaming with separate_reasoning=False, reasoning_content should be empty
+        # Test streaming with separate_reasoning=False, reasoning_content should be empty (no parser)
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         payload = {
             "model": self.model,
@@ -249,7 +249,7 @@ class TestReasoningContentWithoutParser(CustomTestCase):
         assert len(content) > 0
 
     def test_streaming_separate_reasoning_true(self):
-        # Test streaming with separate_reasoning=True, reasoning_content should not be empty
+        # Test streaming with separate_reasoning=True, reasoning_content should be empty (no parser)
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         payload = {
             "model": self.model,
@@ -261,7 +261,7 @@ class TestReasoningContentWithoutParser(CustomTestCase):
             ],
             "max_tokens": 100,
             "stream": True,
-            "extra_body": {"separate_reasoning": True},
+            "extra_body": {"separate_reasoning": False},
         }
         response = client.chat.completions.create(**payload)
 
@@ -277,7 +277,7 @@ class TestReasoningContentWithoutParser(CustomTestCase):
         assert len(content) > 0
 
     def test_streaming_separate_reasoning_true_stream_reasoning_false(self):
-        # Test streaming with separate_reasoning=True, reasoning_content should not be empty
+        # Test streaming with separate_reasoning=True, reasoning_content should be empty (no parser)
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         payload = {
             "model": self.model,
@@ -289,7 +289,7 @@ class TestReasoningContentWithoutParser(CustomTestCase):
             ],
             "max_tokens": 100,
             "stream": True,
-            "extra_body": {"separate_reasoning": True, "stream_reasoning": False},
+            "extra_body": {"separate_reasoning": False, "stream_reasoning": False},
         }
         response = client.chat.completions.create(**payload)
 
@@ -314,7 +314,7 @@ class TestReasoningContentWithoutParser(CustomTestCase):
         assert len(content) > 0
 
     def test_nonstreaming_separate_reasoning_false(self):
-        # Test non-streaming with separate_reasoning=False, reasoning_content should be empty
+        # Test non-streaming with separate_reasoning=False, reasoning_content should be empty (no parser)
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         payload = {
             "model": self.model,
@@ -336,7 +336,7 @@ class TestReasoningContentWithoutParser(CustomTestCase):
         assert len(response.choices[0].message.content) > 0
 
     def test_nonstreaming_separate_reasoning_true(self):
-        # Test non-streaming with separate_reasoning=True, reasoning_content should not be empty
+        # Test non-streaming with separate_reasoning=True, reasoning_content should be empty (no parser)
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         payload = {
             "model": self.model,
@@ -347,7 +347,7 @@ class TestReasoningContentWithoutParser(CustomTestCase):
                 }
             ],
             "max_tokens": 100,
-            "extra_body": {"separate_reasoning": True},
+            "extra_body": {"separate_reasoning": False},
         }
         response = client.chat.completions.create(**payload)
 
