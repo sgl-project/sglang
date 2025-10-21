@@ -224,7 +224,7 @@ class Envs:
 
     # Overlap Spec V2
     SGLANG_ENABLE_VERIFY_PLAN_STREAM = EnvBool(True)
-    SGLANG_ENABLE_DRAFT_EXTEND_PLAN_STREAM= EnvBool(False)
+    SGLANG_ENABLE_DRAFT_EXTEND_PLAN_STREAM = EnvBool(False)
 
     # VLM
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
