@@ -36,7 +36,7 @@ use crate::{
     mcp::McpClientManager,
     protocols::{
         chat::{ChatCompletionResponse, ChatCompletionStreamResponse},
-        common::{FunctionCallResponse, ToolCall},
+        common::{Function, FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
         responses::{
             ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
             ResponseStatus, ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse,
@@ -1158,6 +1158,28 @@ impl ResponseStreamEventEmitter {
 // Helper Functions
 // ============================================================================
 
+/// Convert MCP tools to Chat API tool format
+fn convert_mcp_tools_to_chat_tools(mcp_tools: &[crate::mcp::ToolInfo]) -> Vec<Tool> {
+    mcp_tools
+        .iter()
+        .map(|tool_info| Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: tool_info.name.clone(),
+                description: Some(tool_info.description.clone()),
+                parameters: tool_info.parameters.clone().unwrap_or_else(|| {
+                    json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    })
+                }),
+                strict: None,
+            },
+        })
+        .collect()
+}
+
 /// Load conversation history and response chains, returning modified request
 async fn load_conversation_history(
     request: &ResponsesRequest,
@@ -1592,10 +1614,19 @@ async fn execute_tool_loop(
         server_label, max_tool_calls, MAX_ITERATIONS
     );
 
+    // Get MCP tools and convert to chat format (do this once before loop)
+    let mcp_tools = mcp_manager.list_tools();
+    let chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
+    debug!("Converted {} MCP tools to chat format", chat_tools.len());
+
     loop {
         // Convert to chat request
-        let chat_request = conversions::responses_to_chat(&current_request)
+        let mut chat_request = conversions::responses_to_chat(&current_request)
             .map_err(|e| format!("Failed to convert request: {}", e))?;
+
+        // Add MCP tools to chat request so LLM knows about them
+        chat_request.tools = Some(chat_tools.clone());
+        chat_request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
 
         // Execute chat pipeline
         let chat_response = pipeline
@@ -1867,6 +1898,11 @@ async fn execute_tool_loop_streaming_internal(
     let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
+    // Get MCP tools and convert to chat format (do this once before loop)
+    let mcp_tools = mcp_manager.list_tools();
+    let chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
+    debug!("Streaming: Converted {} MCP tools to chat format", chat_tools.len());
+
     loop {
         state.iteration += 1;
         if state.iteration > MAX_ITERATIONS {
@@ -1879,8 +1915,12 @@ async fn execute_tool_loop_streaming_internal(
         debug!("Streaming MCP tool loop iteration {}", state.iteration);
 
         // Convert to chat request
-        let chat_request = conversions::responses_to_chat(&current_request)
+        let mut chat_request = conversions::responses_to_chat(&current_request)
             .map_err(|e| format!("Failed to convert request: {}", e))?;
+
+        // Add MCP tools to chat request so LLM knows about them
+        chat_request.tools = Some(chat_tools.clone());
+        chat_request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
 
         // Execute chat streaming
         let response = pipeline
