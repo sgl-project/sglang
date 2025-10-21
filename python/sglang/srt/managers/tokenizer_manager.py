@@ -104,6 +104,15 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 logger = logging.getLogger(__name__)
 
 
+def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+    is_cross_node = server_args.dist_init_addr
+
+    if is_cross_node:
+        # Fallback to default CPU transport for multi-node
+        return "default"
+    else:
+        return "cuda_ipc"
+
 @dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
@@ -400,7 +409,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
-
+        
         async with self.model_update_lock.reader_lock:
             if self.server_args.enable_lora and obj.lora_path:
                 # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
@@ -408,7 +417,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
-                state = self._send_one_request(obj, tokenized_obj, created_time)
+                state = self._send_one_request(obj, tokenized_obj, created_time)                
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
@@ -876,7 +885,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         self.send_to_scheduler.send_pyobj(batch_req)
-
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
             tmp_obj = obj[i]
@@ -2111,15 +2119,6 @@ class ServerStatus(Enum):
     Starting = "Starting"
     UnHealthy = "UnHealthy"
 
-
-def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
-    is_cross_node = server_args.dist_init_addr
-
-    if is_cross_node:
-        # Fallback to default CPU transport for multi-node
-        return "default"
-    else:
-        return "cuda_ipc"
 
 
 async def print_exception_wrapper(func):

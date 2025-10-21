@@ -18,6 +18,9 @@ from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTok
 
 ImageWithPatches = tuple[Image.Image, list[Image.Image], list[int] | None]
 
+from sglang.srt.utils import get_bool_env_var
+
+SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 class GPUToTensor(torch.nn.Module):
 
@@ -505,10 +508,15 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
             video_data=request_obj.video_data,
             multimodal_tokens=self.mm_tokens,
         )
-
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
-        )
+        if SGL_USE_CUDA_IPC:
+            async with self._cache_lock:
+                mm_items, input_ids, _ = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens
+                )
+        else:
+            mm_items, input_ids, _ = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens
+            )
 
         return {
             "input_ids": input_ids.tolist(),

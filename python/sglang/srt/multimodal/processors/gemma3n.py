@@ -20,6 +20,9 @@ from sglang.srt.managers.multimodal_processor import (
 from sglang.srt.models.gemma3n_mm import Gemma3nForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
+from sglang.srt.utils import get_bool_env_var
+
+SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 class Gemma3nSGLangProcessor(SGLangBaseProcessor):
     """Multimodal processor for Gemma3n supporting image and audio inputs."""
@@ -57,10 +60,17 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
             audio_data=audio_data,
             multimodal_tokens=self.mm_tokens,
         )
-
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
-        )
+        
+        if SGL_USE_CUDA_IPC:
+            async with self._cache_lock: 
+                mm_items, input_ids, _ = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens
+                )
+        else:
+            mm_items, input_ids, _ = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens
+                )
+            
 
         return {
             "input_ids": input_ids.tolist(),

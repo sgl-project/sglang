@@ -86,6 +86,95 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 logger = logging.getLogger(__name__)
 
+MM_ITEM_VERIFY_BYTES = 8
+MM_FEATURE_CACHE_SIZE = 2 * 1024 * 1024 * 1024 
+
+class MmItemMemoryPool:
+    def __init__(self, memory_size):
+        self.memory_pool = torch.empty(memory_size + MM_ITEM_VERIFY_BYTES, dtype = torch.int8, device= "cuda").contiguous()
+        
+        self.available_chunks = [(0, memory_size + MM_ITEM_VERIFY_BYTES)]
+        self.occupied_chunks = []
+        self.verify_tensor = torch.zeros(MM_ITEM_VERIFY_BYTES, dtype=torch.int8, device="cuda")
+  
+    def get_available_chunk(self, src_tensor: torch.Tensor):
+        # find currently available_chunks contain a available chunk or not
+        # if not, return None
+        src_tensor_size = src_tensor.numel() * src_tensor.element_size() + MM_ITEM_VERIFY_BYTES
+        min_size = self.memory_pool.numel() * self.memory_pool.element_size() + 1
+        selected_chunk = None
+        for chunk in self.available_chunks:
+            if chunk[1] >= src_tensor_size:
+                if chunk[1] < min_size:
+                    min_size =  chunk[1]
+                    selected_chunk = chunk
+        
+        if selected_chunk:
+            self.available_chunks.remove(selected_chunk)
+            occupied_chunk = (selected_chunk[0], selected_chunk[0] + src_tensor_size)
+            available_chunk = (occupied_chunk[1], selected_chunk[1])
+            if available_chunk[0] != available_chunk[1]:
+                self.available_chunks.append(available_chunk)
+            self.occupied_chunks.append(occupied_chunk)
+            self.memory_pool[occupied_chunk[0] : occupied_chunk[1]][-MM_ITEM_VERIFY_BYTES:] = 1
+            return occupied_chunk
+        
+        return None
+        
+        
+  
+    def return_a_slice_tensor(self, src_tensor : torch.Tensor):
+        self.recyle_chunks()
+        self.merge_chunks()
+        available_chunk =  self.get_available_chunk(src_tensor)
+        # logger.info("src tensor shape {}. src tensor dtype {}  available_chunk {}".format(src_tensor.shape, src_tensor.dtype, available_chunk))
+        if available_chunk:
+            return self.memory_pool[available_chunk[0]: available_chunk[1]]
+        
+        return None
+  
+    def recyle_chunks(self):
+        # traverse all occupid_chunks and check it is a reuseable one or not 
+        # if it's a reuseable one, add it to available_chunks
+        for chunk in self.occupied_chunks:
+            accessed_tensor = self.memory_pool[chunk[0] : chunk[1]]
+            if  torch.equal(accessed_tensor[-MM_ITEM_VERIFY_BYTES:], self.verify_tensor):
+                self.occupied_chunks.remove(chunk)
+                self.available_chunks.append(chunk)
+            # else:
+            #     logger.info("can not recyle")
+            #     logger.info(accessed_tensor[-MM_ITEM_VERIFY_BYTES:])
+      
+                
+                
+    def merge_chunks(self):
+        #merge_all_available_chunks
+        merged_chunks = []
+        for chunk in sorted(self.available_chunks, key = lambda x : x[0]):
+            if len(merged_chunks) == 0:
+                merged_chunks.append(chunk)
+            else:
+                if chunk[0] == (merged_chunks[-1][1]):
+                    to_merge_chunk = merged_chunks.pop()
+                    merged_chunk = (to_merge_chunk[0], chunk[1])
+                    merged_chunks.append(merged_chunk)
+                else:
+                    merged_chunks.append(chunk)
+        
+        self.available_chunks = merged_chunks
+        
+    def print_available_chunk(self, des : str = ""):
+        logger.info("check available chunks @ {}:----->".format(des))
+        for chunk in self.available_chunks:
+            logger.info("[{}, {}]".format(chunk[0], chunk[1]))
+        
+        logger.info("-----------check finish------------")
+    
+    def print_occupied_chunk(self, des: str = ""):
+        logger.info("occupied chunks @ {}:----->".format(des))
+        for chunk in self.occupied_chunks:
+            logger.info("[{}, {}]".format(chunk[0], chunk[1]))
+        logger.info("-----------check finish------------")
 
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
@@ -157,6 +246,92 @@ class FINISH_ABORT(BaseFinishReason):
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
+
+class CudaIpcTensorTransportProxy:
+    """
+    A convenient torch.Tensor subclass that carries extra metadata and supports
+    efficient inter-process communications
+    """
+
+    def __init__(self, 
+        data: torch.Tensor, 
+        info_data :torch.Tensor,
+    ):
+
+        if (not isinstance(data, torch.Tensor)) or (not isinstance(info_data, torch.Tensor)):
+            raise TypeError(
+                f"Input 'data' must be a torch.Tensor, but got {type(data)}"
+            )
+        
+        self.proxy_state = self.get_proxy(data, info_data)
+        self.reconstruct_tensor = None
+
+    def get_proxy(self, data, info_data):
+        # acquire all serialize metadata from _metadata
+        state = {}
+        
+        try:
+            storage = data.untyped_storage()
+            handle = storage._share_cuda_()
+
+            state["ipc_extra"] = {
+                "handle": handle,
+                "shape": data.shape,
+                "dtype": data.dtype,
+                "stride": data.stride(),
+                "device_index": data.device.index,
+                "storage_offset": data.storage_offset(),
+                "recons_shape" : info_data.shape,
+                "reocons_dtype" : info_data.dtype
+            }
+            state["tensor_data"] = None
+        except Exception as e:
+            # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
+            state["ipc_extra"] = None
+            state["tensor_data"] = data
+
+        return state
+
+    def reconstruct_on_target_device(self, rebuild_device):
+        if isinstance(self.reconstruct_tensor, torch.Tensor) and self.reconstruct_tensor.device == rebuild_device:
+            return self.reconstruct_tensor
+
+        if self.proxy_state["ipc_extra"]:
+            ipc_extra = self.proxy_state["ipc_extra"]
+            handle, shape, dtype, stride, source_device_index, s_offset, recons_shape, recons_dtype  = (
+                ipc_extra["handle"],
+                ipc_extra["shape"],
+                ipc_extra["dtype"],
+                ipc_extra["stride"],
+                ipc_extra["device_index"],
+                ipc_extra["storage_offset"],
+                ipc_extra["recons_shape"],
+                ipc_extra["reocons_dtype"]
+            )
+
+            try:
+                target_device = torch.device(f"cuda:{source_device_index}")
+                with torch.cuda.device(target_device):
+                    storage = torch.UntypedStorage._new_shared_cuda(*handle)
+                    slice_tensor = torch.empty(
+                        0, dtype=dtype, device=target_device
+                    ).set_(storage, storage_offset=s_offset, size=shape, stride=stride)
+                    
+                    reconstructed_tensor = torch.empty(recons_shape, dtype = recons_dtype, device = rebuild_device).contiguous()
+                    reconstructed_tensor.view(torch.int8).view(-1).copy_(slice_tensor[:-MM_ITEM_VERIFY_BYTES])
+                    # set as releaseable
+                    slice_tensor[-MM_ITEM_VERIFY_BYTES:]*=0 
+                    
+            except Exception as e:
+                logger.info(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
+                raise e
+        elif isinstance(self.proxy_state["tensor_data"], torch.Tensor):
+            reconstructed_tensor = self.proxy_state["tensor_data"].to(rebuild_device, non_blocking= True)
+        else:
+            raise TypeError("invalid proxy_state")
+        
+        self.reconstruct_tensor = reconstructed_tensor
+        return self.reconstruct_tensor
 
 
 class Modality(Enum):
@@ -1333,8 +1508,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 continue
             for mm_item in mm_input.mm_items:
                 pixel_values = getattr(mm_item, "feature", None)
+                # logger.info("pixel_value.device :{} vs self.device {}".format(pixel_values.device, torch.cuda.current_device()))
                 if isinstance(pixel_values, torch.Tensor):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
+                elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
+                    mm_item.feature = pixel_values.reconstruct_on_target_device(self.device)
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
