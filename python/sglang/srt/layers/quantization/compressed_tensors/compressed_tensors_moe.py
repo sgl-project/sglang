@@ -34,7 +34,7 @@ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
-from sglang.srt.layers.quantization.utils import (
+from sglang.srt.layers.quantization.utils.utils import (
     all_close_1d,
     per_tensor_dequantize,
     replace_parameter,

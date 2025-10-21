@@ -23,14 +23,13 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
-    #BlockQuantScaleParameter,
+    BlockQuantScaleParameter,
     PackedColumnParameter,
     PackedvLLMParameter,
     PerTensorScaleParameter,
     RowvLLMParameter,
     _ColumnvLLMParameter,
 )
-from vllm.model_executor.parameter import BlockQuantScaleParameter 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import is_cpu, is_npu, set_weight_attrs

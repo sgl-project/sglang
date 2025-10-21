@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.petit_utils import (
     prepare_nvfp4_layer_for_petit,
     verify_petit_nvfp4_supported,
 )
-from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.quantization.utils.utils import is_layer_skipped
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
