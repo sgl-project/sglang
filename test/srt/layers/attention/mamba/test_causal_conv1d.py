@@ -1,7 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/tests/kernels/mamba/test_causal_conv1d.py
 
 
-import unittest
 from typing import Optional
 
 import pytest
@@ -377,4 +376,4 @@ def test_causal_conv1d_varlen(
 
 
 if __name__ == "__main__":
-    unittest.main()
+    pytest.main([__file__])

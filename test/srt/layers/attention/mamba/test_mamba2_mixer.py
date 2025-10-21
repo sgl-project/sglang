@@ -1,6 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/tests/kernels/mamba/test_mamba_mixer2.py
 
-import unittest
+
 from unittest.mock import patch
 
 import pytest
@@ -140,4 +140,4 @@ def mixer2_gated_norm_tensor_parallel(
 
 
 if __name__ == "__main__":
-    unittest.main()
+    pytest.main([__file__])

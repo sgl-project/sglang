@@ -1,6 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
-import unittest
 
 import pytest
 import torch
@@ -294,4 +293,4 @@ def test_selective_state_update_with_heads_with_batch_indices(
 
 
 if __name__ == "__main__":
-    unittest.main()
+    pytest.main([__file__])
