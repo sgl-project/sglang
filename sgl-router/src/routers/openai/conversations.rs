@@ -62,7 +62,10 @@ pub(super) async fn create_conversation(
         None => None,
     };
 
-    let new_conv = NewConversation { metadata };
+    let new_conv = NewConversation {
+        id: None, // Generate random ID (OpenAI behavior for POST /v1/conversations)
+        metadata,
+    };
 
     match conversation_storage.create_conversation(new_conv).await {
         Ok(conversation) => {
