@@ -52,6 +52,7 @@ use crate::{
 /// Main handler for POST /v1/responses
 ///
 /// Validates request, determines execution mode (sync/async/streaming), and delegates
+#[allow(clippy::too_many_arguments)]
 pub async fn route_responses(
     pipeline: &RequestPipeline,
     request: Arc<ResponsesRequest>,
@@ -153,6 +154,7 @@ pub async fn route_responses(
 /// 3. Executes chat pipeline
 /// 4. Converts back to ResponsesResponse
 /// 5. Persists to storage
+#[allow(clippy::too_many_arguments)]
 async fn route_responses_sync(
     pipeline: &RequestPipeline,
     request: Arc<ResponsesRequest>,
@@ -194,6 +196,7 @@ async fn route_responses_sync(
 }
 
 /// Internal implementation that returns Result for background task compatibility
+#[allow(clippy::too_many_arguments)]
 async fn route_responses_internal(
     pipeline: &RequestPipeline,
     request: Arc<ResponsesRequest>,
@@ -287,6 +290,7 @@ async fn route_responses_internal(
 // ============================================================================
 
 /// Execute responses request in background mode
+#[allow(clippy::too_many_arguments)]
 async fn route_responses_background(
     pipeline: &RequestPipeline,
     request: Arc<ResponsesRequest>,
@@ -420,6 +424,7 @@ async fn route_responses_background(
 // ============================================================================
 
 /// Execute streaming responses request
+#[allow(clippy::too_many_arguments)]
 async fn route_responses_streaming(
     pipeline: &RequestPipeline,
     request: Arc<ResponsesRequest>,
@@ -515,6 +520,7 @@ async fn route_responses_streaming(
 /// 3. Converts ChatCompletionStreamResponse → ResponsesResponse delta
 /// 4. Accumulates response state for final persistence
 /// 5. Emits transformed SSE events in responses format
+#[allow(clippy::too_many_arguments)]
 async fn convert_chat_stream_to_responses_stream(
     pipeline: &RequestPipeline,
     chat_request: Arc<crate::protocols::chat::ChatCompletionRequest>,
@@ -606,7 +612,7 @@ async fn process_and_transform_sse_stream(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
-    tx: tokio::sync::mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     // Create accumulator for final response
     let mut accumulator = StreamingResponseAccumulator::new(&original_request);
@@ -632,9 +638,7 @@ async fn process_and_transform_sse_stream(
             let json_str = json_str.trim();
 
             // Try to parse as ChatCompletionStreamResponse
-            match serde_json::from_str::<crate::protocols::chat::ChatCompletionStreamResponse>(
-                json_str,
-            ) {
+            match serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
                 Ok(chat_chunk) => {
                     // Update accumulator
                     accumulator.process_chunk(&chat_chunk);
@@ -723,7 +727,7 @@ impl StreamingResponseAccumulator {
         }
     }
 
-    fn process_chunk(&mut self, chunk: &crate::protocols::chat::ChatCompletionStreamResponse) {
+    fn process_chunk(&mut self, chunk: &ChatCompletionStreamResponse) {
         // Initialize metadata on first chunk
         if self.response_id.is_empty() {
             self.response_id = chunk.id.clone();
@@ -882,7 +886,7 @@ impl StreamingResponseAccumulator {
 
 /// Convert ChatCompletionStreamResponse to ResponsesResponse delta format
 fn convert_chat_chunk_to_responses_delta(
-    chunk: &crate::protocols::chat::ChatCompletionStreamResponse,
+    chunk: &ChatCompletionStreamResponse,
 ) -> serde_json::Value {
     let mut delta = json!({
         "id": chunk.id,
@@ -1335,6 +1339,7 @@ fn build_mcp_call_item(
 }
 
 /// Execute request without MCP tool loop (simple pipeline execution)
+#[allow(clippy::too_many_arguments)]
 async fn execute_without_mcp(
     pipeline: &RequestPipeline,
     modified_request: &ResponsesRequest,
@@ -1374,6 +1379,7 @@ async fn execute_without_mcp(
 /// 2. Checks if response has tool calls
 /// 3. If yes, executes MCP tools and builds resume request
 /// 4. Repeats until no more tool calls or limit reached
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_loop(
     pipeline: &RequestPipeline,
     mut current_request: ResponsesRequest,
@@ -1573,6 +1579,7 @@ async fn execute_tool_loop(
 /// This streams each iteration's response to the client while accumulating
 /// to check for tool calls. If tool calls are found, executes them and
 /// continues with the next streaming iteration.
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_loop_streaming(
     pipeline: &RequestPipeline,
     current_request: ResponsesRequest,
@@ -1663,6 +1670,7 @@ async fn execute_tool_loop_streaming(
 }
 
 /// Internal streaming tool loop implementation
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_loop_streaming_internal(
     pipeline: &RequestPipeline,
     mut current_request: ResponsesRequest,
@@ -1675,7 +1683,7 @@ async fn execute_tool_loop_streaming_internal(
     _response_storage: SharedResponseStorage,
     _conversation_storage: SharedConversationStorage,
     _conversation_item_storage: SharedConversationItemStorage,
-    tx: tokio::sync::mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     const MAX_ITERATIONS: usize = 20;
     let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
@@ -1841,8 +1849,8 @@ async fn execute_tool_loop_streaming_internal(
 /// Forward SSE stream to client while accumulating for tool call detection
 async fn forward_and_accumulate_stream(
     body: Body,
-    tx: tokio::sync::mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
-) -> Result<crate::protocols::chat::ChatCompletionResponse, String> {
+    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+) -> Result<ChatCompletionResponse, String> {
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
 
@@ -1942,12 +1950,12 @@ impl ChatResponseAccumulator {
         }
     }
 
-    fn finalize(self) -> crate::protocols::chat::ChatCompletionResponse {
+    fn finalize(self) -> ChatCompletionResponse {
         let mut tool_calls_vec: Vec<_> = self.tool_calls.into_iter().collect();
         tool_calls_vec.sort_by_key(|(index, _)| *index);
         let tool_calls: Vec<_> = tool_calls_vec.into_iter().map(|(_, call)| call).collect();
 
-        crate::protocols::chat::ChatCompletionResponse {
+        ChatCompletionResponse {
             id: self.id,
             object: "chat.completion".to_string(),
             created: chrono::Utc::now().timestamp() as u64,

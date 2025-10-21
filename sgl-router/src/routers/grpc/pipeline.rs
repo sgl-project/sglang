@@ -1120,48 +1120,32 @@ impl RequestPipeline {
                     let stage_name = stage.name();
 
                     // After ClientAcquisitionStage, store client for background task cancellation
-                    if stage_name == "ClientAcquisition"
-                        && response_id.is_some()
-                        && background_tasks.is_some()
-                    {
-                        if let Some(ref clients) = ctx.state.clients {
+                    if stage_name == "ClientAcquisition" {
+                        if let (Some(ref clients), Some(ref resp_id), Some(ref tasks)) =
+                            (&ctx.state.clients, &response_id, &background_tasks)
+                        {
                             let client_to_store = match clients {
                                 ClientSelection::Single { client } => client.clone(),
                                 ClientSelection::Dual { decode, .. } => decode.clone(),
                             };
 
-                            if let Some(ref tasks) = background_tasks {
-                                if let Some(task_info) =
-                                    tasks.write().await.get_mut(response_id.as_ref().unwrap())
-                                {
-                                    *task_info.client.write().await = Some(client_to_store);
-                                    debug!(
-                                        "Stored client for response_id: {}",
-                                        response_id.as_ref().unwrap()
-                                    );
-                                }
+                            if let Some(task_info) = tasks.write().await.get_mut(resp_id.as_str()) {
+                                *task_info.client.write().await = Some(client_to_store);
+                                debug!("Stored client for response_id: {}", resp_id);
                             }
                         }
                     }
 
                     // After DispatchMetadataStage, store grpc_request_id for background task cancellation
-                    if stage_name == "DispatchMetadata"
-                        && response_id.is_some()
-                        && background_tasks.is_some()
-                    {
-                        if let Some(ref dispatch) = ctx.state.dispatch {
+                    if stage_name == "DispatchMetadata" {
+                        if let (Some(ref dispatch), Some(ref resp_id), Some(ref tasks)) =
+                            (&ctx.state.dispatch, &response_id, &background_tasks)
+                        {
                             let grpc_request_id = dispatch.request_id.clone();
 
-                            if let Some(ref tasks) = background_tasks {
-                                if let Some(task_info) =
-                                    tasks.write().await.get_mut(response_id.as_ref().unwrap())
-                                {
-                                    task_info.grpc_request_id = grpc_request_id.clone();
-                                    debug!(
-                                        "Stored grpc_request_id for response_id: {}",
-                                        response_id.as_ref().unwrap()
-                                    );
-                                }
+                            if let Some(task_info) = tasks.write().await.get_mut(resp_id.as_str()) {
+                                task_info.grpc_request_id = grpc_request_id.clone();
+                                debug!("Stored grpc_request_id for response_id: {}", resp_id);
                             }
                         }
                     }

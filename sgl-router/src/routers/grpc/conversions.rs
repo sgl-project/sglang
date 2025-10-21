@@ -115,9 +115,9 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                         // Reasoning content - add as assistant message with reasoning_content
                         let reasoning_text = content
                             .iter()
-                            .filter_map(|c| match c {
+                            .map(|c| match c {
                                 crate::protocols::responses::ResponseReasoningContent::ReasoningText { text } => {
-                                    Some(text.as_str())
+                                    text.as_str()
                                 }
                             })
                             .collect::<Vec<_>>()
