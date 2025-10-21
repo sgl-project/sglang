@@ -286,6 +286,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
 
+        video_metadata = None
         if base_output.videos:
             video_results = await asyncio.gather(
                 *[preprocess_video(video) for video in base_output.videos]
@@ -297,7 +298,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
                 base_output,
                 self.mm_tokens,
-                video_metadata=video_metadata if base_output.videos else None,
+                video_metadata=video_metadata,
                 do_sample_frames=False,
             )
         else:
