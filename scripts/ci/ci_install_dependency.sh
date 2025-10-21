@@ -41,7 +41,7 @@ else
 fi
 
 # Install flashinfer-python 0.4.0 dependency that requires prerelease (This should be removed when flashinfer fixes this issue)
-$PIP_CMD install apache-tvm-ffi==0.1.0b15 --prerelease=allow $PIP_INSTALL_SUFFIX
+$PIP_CMD install flashinfer-python --prerelease=allow $PIP_INSTALL_SUFFIX --force-reinstall
 
 # Install the main package
 $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
