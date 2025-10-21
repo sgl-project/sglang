@@ -998,20 +998,19 @@ def _execute_grpc_server_warmup(
         max_new_tokens = 8 if is_generation else 1
 
         if is_generation:
-            # Create tokenized input for warmup
             warmup_request_kwargs = {
                 "request_id": f"WARMUP_{time.time()}",
                 "tokenized": sglang_scheduler_pb2.TokenizedInput(
                     input_ids=[
-                        954,
-                        15541,
-                        2181,
-                        23496,
-                        1476,
-                        64710,
-                        280,
-                    ],  # Simple token sequence
-                    original_text="The capital city of France is",
+                        123,
+                        456,
+                        789,
+                        234,
+                        567,
+                        890,
+                        345,
+                    ],  # Random-looking but safe token IDs
+                    original_text="warmup request",
                 ),
                 "sampling_params": sglang_scheduler_pb2.SamplingParams(
                     temperature=0.0,
