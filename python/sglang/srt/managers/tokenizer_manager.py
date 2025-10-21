@@ -43,7 +43,7 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.lora.lora_registry import LoRARegistry
+from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
@@ -313,8 +313,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # point to their latest LoRARef objects, so that they can be
         # dynamically loaded if needed for inference
         self.lora_ref_cache: Dict[str, LoRARef] = {}
-        for lora_ref in self.server_args.lora_paths:
-            self.lora_ref_cache[lora_ref.lora_name] = lora_ref
+        if self.server_args.lora_paths is not None:
+            for lora_ref in self.server_args.lora_paths:
+                self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
