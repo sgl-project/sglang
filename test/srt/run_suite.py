@@ -133,7 +133,7 @@ suites = {
         TestFile("test_triton_sliding_window.py", 250),
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 175),
-        TestFile("test_vision_openai_server_a.py", 608),
+        TestFile("test_vision_openai_server_a.py", 918),
         TestFile("test_vlm_input_format.py", 300),
     ],
     "per-commit-2-gpu": [
