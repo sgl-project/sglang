@@ -26,6 +26,7 @@ sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_grpc_router
 from util import (
     CustomTestCase,
+    DEFAULT_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     get_tokenizer,
@@ -45,7 +46,7 @@ class TestOpenAIServer(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "/home/ubuntu/models/llama-3.1-8b-instruct"
+        cls.model = DEFAULT_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 

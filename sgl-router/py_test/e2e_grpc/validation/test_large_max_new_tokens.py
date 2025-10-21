@@ -17,20 +17,19 @@ sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_grpc_router
 from util import (
     CustomTestCase,
+    DEFAULT_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    STDERR_FILENAME,
+    STDOUT_FILENAME,
     get_tokenizer,
     kill_process_tree,
 )
 
-# File name constants (originally from sglang.test.test_utils)
-STDOUT_FILENAME = "/tmp/sglang_test_stdout.txt"
-STDERR_FILENAME = "/tmp/sglang_test_stderr.txt"
-
 class TestLargeMaxNewTokens(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "/home/ubuntu/models/llama-3.1-8b-instruct"
+        cls.model = DEFAULT_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
@@ -57,7 +56,7 @@ class TestLargeMaxNewTokens(CustomTestCase):
             stderr=cls.stderr,
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer("/home/ubuntu/models/llama-3.1-8b-instruct")
+        cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
     def tearDownClass(cls):

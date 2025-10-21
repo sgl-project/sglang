@@ -23,21 +23,19 @@ sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_grpc_router
 from util import (
     CustomTestCase,
+    DEFAULT_ENABLE_THINKING_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     get_tokenizer,
     kill_process_tree,
 )
 
-# Model constant (originally from sglang.test.test_utils)
-DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
-
 
 class TestEnableThinking(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # CHANGE: Launch gRPC router with integrated workers (single command)
-        cls.model = "/home/ubuntu/models/Qwen/Qwen3-30B-A3B"
+        cls.model = DEFAULT_ENABLE_THINKING_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
         cls.cluster = popen_launch_grpc_router(

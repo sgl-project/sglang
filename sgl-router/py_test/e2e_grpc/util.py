@@ -35,9 +35,50 @@ except ImportError:
 # Constants
 # ============================================================================
 
+# Server and timeout constants
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 20000
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
+
+# File name constants for test output
+STDOUT_FILENAME = "/tmp/sglang_test_stdout.txt"
+STDERR_FILENAME = "/tmp/sglang_test_stderr.txt"
+
+# Model base path - can be overridden via environment variable
+# By default, use HuggingFace model identifiers (no local path prefix)
+# Set ROUTER_LOCAL_MODEL_PATH to use local models (e.g., "/home/ubuntu/models")
+ROUTER_LOCAL_MODEL_PATH = os.environ.get("ROUTER_LOCAL_MODEL_PATH", "")
+
+# Helper function to build model paths
+def _get_model_path(model_identifier: str) -> str:
+    """
+    Build model path from base path and model identifier.
+
+    If ROUTER_LOCAL_MODEL_PATH is set, prepend it to the identifier.
+    Otherwise, return the identifier as-is (for HuggingFace download).
+    """
+    if ROUTER_LOCAL_MODEL_PATH:
+        return os.path.join(ROUTER_LOCAL_MODEL_PATH, model_identifier)
+    return model_identifier
+
+# Model paths used in e2e_grpc tests
+# These can be either HuggingFace identifiers or local paths (depending on ROUTER_LOCAL_MODEL_PATH)
+
+# Main test model - Llama 3.1 8B Instruct
+DEFAULT_MODEL_PATH = _get_model_path("meta-llama/Llama-3.1-8B-Instruct")
+
+# Small models for function calling tests
+DEFAULT_SMALL_MODEL_PATH = _get_model_path("meta-llama/Llama-3.2-1B-Instruct")
+
+# Reasoning models
+DEFAULT_REASONING_MODEL_PATH = _get_model_path("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
+
+# Thinking-enabled models
+DEFAULT_ENABLE_THINKING_MODEL_PATH = _get_model_path("Qwen/Qwen3-30B-A3B")
+
+# Function calling models
+DEFAULT_QWEN_FUNCTION_CALLING_MODEL_PATH = _get_model_path("Qwen/Qwen2.5-7B-Instruct")
+DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH = _get_model_path("mistralai/Mistral-7B-Instruct-v0.3")
 
 
 # ============================================================================
@@ -193,23 +234,18 @@ class CustomTestCase(unittest.TestCase):
             return super(CustomTestCase, self)._callTestMethod(method)
 
         # Retry logic
-        last_exception = None
         for attempt in range(max_retry + 1):
             try:
                 return super(CustomTestCase, self)._callTestMethod(method)
             except Exception as e:
-                last_exception = e
                 if attempt < max_retry:
                     print(
                         f"Test failed on attempt {attempt + 1}/{max_retry + 1}, retrying..."
                     )
                     continue
                 else:
+                    # Last attempt, re-raise the exception
                     raise
-
-        # If we get here, all retries failed
-        if last_exception:
-            raise last_exception
 
     def setUp(self):
         """Print test method name at the start of each test."""

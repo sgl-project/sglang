@@ -23,20 +23,18 @@ sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_grpc_router
 from util import (
     CustomTestCase,
+    DEFAULT_REASONING_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     kill_process_tree,
 )
-
-# Model constant (originally from sglang.test.test_utils)
-DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 
 
 class TestReasoningContentAPI(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # CHANGE: Launch gRPC router with integrated workers (single command)
-        cls.model = "/home/ubuntu/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+        cls.model = DEFAULT_REASONING_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
         cls.cluster = popen_launch_grpc_router(
@@ -198,7 +196,7 @@ class TestReasoningContentAPI(CustomTestCase):
 class TestReasoningContentWithoutParser(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "/home/ubuntu/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+        cls.model = DEFAULT_REASONING_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
         cls.cluster = popen_launch_grpc_router(

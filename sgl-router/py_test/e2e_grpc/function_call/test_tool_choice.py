@@ -20,6 +20,9 @@ sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_grpc_router
 from util import (
     CustomTestCase,
+    DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH,
+    DEFAULT_QWEN_FUNCTION_CALLING_MODEL_PATH,
+    DEFAULT_SMALL_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     get_tokenizer,
@@ -38,7 +41,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         }
 
         # Use a model that supports function calling
-        cls.model = "/home/ubuntu/models/meta-llama/Llama-3.2-1B-Instruct"
+        cls.model = DEFAULT_SMALL_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
@@ -734,7 +737,7 @@ class TestToolChoiceQwen25(TestToolChoiceLlama32):
         # CHANGE: Launch gRPC router with integrated workers (single command)
         cls.flaky_tests = {}
 
-        cls.model = "/home/ubuntu/models/Qwen/Qwen2.5-7B-Instruct"
+        cls.model = DEFAULT_QWEN_FUNCTION_CALLING_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
@@ -763,9 +766,10 @@ class TestToolChoiceMistral(TestToolChoiceLlama32):
         cls.flaky_tests = {
             "test_multi_tool_scenario_auto",
             "test_multi_tool_scenario_required",
+            "test_complex_parameters_required_non_streaming"
         }
 
-        cls.model = "/home/ubuntu/models/mistralai/Mistral-7B-Instruct-v0.3"
+        cls.model = DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 

@@ -26,6 +26,8 @@ sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_grpc_router
 from util import (
     CustomTestCase,
+    DEFAULT_MODEL_PATH,
+    DEFAULT_SMALL_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     get_tokenizer,
@@ -50,8 +52,8 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # CHANGE: Launch gRPC router with integrated workers (single command)
-        # Replace with the model name needed for testing; if not required, reuse "/home/ubuntu/models/llama-3.1-8b-instruct"
-        cls.model = "/home/ubuntu/models/meta-llama/Llama-3.2-1B-Instruct/"
+        # Using small model for function calling tests
+        cls.model = DEFAULT_SMALL_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
@@ -862,7 +864,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # CHANGE: Launch gRPC router with integrated workers (single command)
-        cls.model = "/home/ubuntu/models/llama-3.1-8b-instruct"
+        cls.model = DEFAULT_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.cluster = popen_launch_grpc_router(
