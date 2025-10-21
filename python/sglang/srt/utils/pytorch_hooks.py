@@ -29,11 +29,8 @@ class PytHooks(object):
         my_hook.register_hooks(my_network_model)
     """
 
-    def __init__(self, debug=False):
+    def __init__(self):
         """Initialize module variables
-
-        Args:
-            debug: Enable debug logging
 
         Returns:
             None:
@@ -43,7 +40,6 @@ class PytHooks(object):
         """
         super().__init__()
         self.module_to_name_map = {}
-        self.debug = debug
 
     @staticmethod
     def print_tensor(tensor_obj, prefix, tensor_list=None):
@@ -105,7 +101,6 @@ class PytHooks(object):
             conv_params["output_padding"] = module_obj.output_padding
             conv_params["groups"] = module_obj.groups
             conv_params["padding_mode"] = module_obj.padding_mode
-            ## @@@ Add these to the nvtx marker
             param_info = conv_params
         elif (
             isinstance(module_obj, torch.nn.ConvTranspose1d)
@@ -123,7 +118,6 @@ class PytHooks(object):
             convtranspose_params["output_padding"] = module_obj.output_padding
             convtranspose_params["groups"] = module_obj.groups
             convtranspose_params["padding_mode"] = module_obj.padding_mode
-            ## @@@ Add these to the nvtx marker
             param_info = convtranspose_params
         elif (
             isinstance(module_obj, torch.nn.MaxPool1d)
@@ -204,8 +198,6 @@ class PytHooks(object):
         elif isinstance(module_obj, torch.nn.LSTM):
             param_info = self.process_lstm_layer_params(module_obj)
 
-        if self.debug:
-            print(f"Module: {type(module_obj).__name__} Params: {param_info}")
         return param_info
 
     def process_lstm_layer_params(self, module_obj):
@@ -216,8 +208,6 @@ class PytHooks(object):
         param_info["bidirectional"] = module_obj.bidirectional
         param_info["input_size"] = module_obj.input_size
         param_info["num_layers"] = module_obj.num_layers
-        if self.debug:
-            print(f"Module: LSTM Params: {param_info}")
         return param_info
 
     def module_fwd_hook(self, module_obj, in_tensor, out_tensor):
@@ -238,12 +228,6 @@ class PytHooks(object):
             None:
         """
         nvtx.range_pop()
-
-        if self.debug:
-            module_name = self.module_to_name_map.get(module_obj, "unknown")
-            print(f"FWD hook module {module_name}")
-            out_tensor_list = PytHooks.print_tensor(out_tensor, "Output")
-
         return
 
     def module_fwd_pre_hook(self, module_obj, in_tensor):
@@ -263,9 +247,6 @@ class PytHooks(object):
         """
         marker_dict = {}
         module_name = self.module_to_name_map.get(module_obj, "unknown")
-
-        if self.debug:
-            print(f"FWD Pre hook module:{module_name}")
         marker_dict["Module"] = module_name
 
         ## Get trainable parameters like weights and bias
@@ -274,14 +255,10 @@ class PytHooks(object):
             if idx == 0:
                 marker_dict["TrainableParams"] = {}
             marker_dict["TrainableParams"][param_name] = list(param_obj.size())
-            if self.debug:
-                print(f"Param {param_name} value {list(param_obj.size())}")
 
         in_tensor_list = PytHooks.print_tensor(in_tensor, "Input")
         if in_tensor_list:
             marker_dict["Inputs"] = in_tensor_list
-            if self.debug:
-                print("Input Tensor List-> {in_tensor_list}")
 
         param_info = self.process_layer_params(module_obj)
         if param_info:
@@ -321,9 +298,6 @@ class PytHooks(object):
             # Skip certain module types to reduce profiling overhead
             if isinstance(module, skip_types):
                 continue
-
-            if self.debug:
-                print(f"Module Name:{name} addr:{hex(id(module))}")
 
             module.register_forward_pre_hook(self.module_fwd_pre_hook)
             module.register_forward_hook(self.module_fwd_hook)
