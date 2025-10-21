@@ -121,6 +121,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             custom_labels=custom_labels,
+            custom_logit_processor=request.custom_logit_processor,
         )
 
         return adapted_request, request
@@ -149,6 +150,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "ignore_eos": request.ignore_eos,
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
+            "custom_params": request.custom_params,
         }
 
         # Handle response_format constraints

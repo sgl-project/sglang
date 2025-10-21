@@ -31,7 +31,6 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     FreezeGCReq,
-    MultiTokenizerRegisterReq,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -104,7 +103,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
-                (MultiTokenizerRegisterReq, lambda x: x),
                 (FreezeGCReq, self.handle_freeze_gc_req),
             ]
         )
@@ -227,6 +225,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return BatchStrOutput(
             rids=recv_obj.rids,
+            http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
             output_ids=recv_obj.decode_ids,
@@ -258,6 +257,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         outputs = self.tokenizer.detokenize(recv_obj)
         return BatchMultimodalOutput(
             rids=recv_obj.rids,
+            http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             outputs=outputs,
             prompt_tokens=recv_obj.prompt_tokens,
