@@ -1,5 +1,5 @@
 use serde_json::json;
-use sglang_router_rs::protocols::spec::{ChatMessage, UserMessageContent};
+use sglang_router_rs::protocols::chat::{ChatMessage, UserMessageContent};
 
 #[test]
 fn test_chat_message_tagged_by_role_system() {

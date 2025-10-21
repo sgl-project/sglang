@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -8,13 +10,14 @@ use axum::{
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+use sglang_router_rs::{
+    config::{
+        CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    },
+    core::WorkerManager,
+    routers::{RouterFactory, RouterTrait},
+    server::AppContext,
 };
-use sglang_router_rs::core::WorkerManager;
-use sglang_router_rs::routers::{RouterFactory, RouterTrait};
-use sglang_router_rs::server::AppContext;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 /// Test context that manages mock workers
@@ -66,6 +69,7 @@ impl TestContext {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -972,7 +976,7 @@ mod router_policy_tests {
     #[tokio::test]
     async fn test_worker_selection() {
         let ctx = TestContext::new(vec![MockWorkerConfig {
-            port: 18203,
+            port: 18207,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
@@ -995,8 +999,9 @@ mod router_policy_tests {
 
 #[cfg(test)]
 mod responses_endpoint_tests {
-    use super::*;
     use reqwest::Client as HttpClient;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_v1_responses_non_streaming() {
@@ -1402,6 +1407,7 @@ mod error_tests {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(
@@ -1731,6 +1737,7 @@ mod pd_mode_tests {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         // Create app context
@@ -1894,6 +1901,7 @@ mod request_id_tests {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(
