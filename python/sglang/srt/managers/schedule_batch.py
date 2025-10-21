@@ -650,7 +650,7 @@ class Req:
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
-        self.metadata_buffer_index: int = -1
+        self.embedding_indices: List[int] = []
 
     @property
     def seqlen(self):

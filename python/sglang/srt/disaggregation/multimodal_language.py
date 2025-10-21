@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import re
 import threading
 from collections import deque
@@ -59,7 +60,7 @@ class MultimodalLanguageRequest:
     req: Req
     embedding_receiver: BaseKVReceiver
     waiting_for_input: bool = False
-    metadata_buffer_index: int = -1
+    embedding_indices: List[int] = None
 
 
 class MultimodalLanguagePreallocQueue:
@@ -84,6 +85,16 @@ class MultimodalLanguagePreallocQueue:
         self.bootstrap_port = bootstrap_port
         self.queue: List[MultimodalLanguageRequest] = []
         self.gloo_group = gloo_group
+
+        # Get default buffer size from environment variable
+        # Language side only sees text, not the full embedding length from encode side
+        # So we use a default buffer size (can be configured via env var)
+        self.default_allocate_tokens = int(
+            os.getenv(
+                "SGLANG_EMBEDDING_DEFAULT_ALLOCATE_BUFFER_SIZE",
+                "8192",
+            )
+        )
 
     def _init_data_manager(self):
         kv_args = KVArgs()
@@ -180,16 +191,22 @@ class MultimodalLanguagePreallocQueue:
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
-            language_req.metadata_buffer_index = (
+            # Language side: allocate blocks based on default buffer size
+            # Since we only have text here, not the full embedding from encode side
+            language_req.embedding_indices = (
                 self.req_to_metadata_buffer_idx_allocator.alloc(
-                    fake=isinstance(language_req.embedding_receiver, FakeKVReceiver)
+                    num_tokens=self.default_allocate_tokens,
+                    req_id=language_req.req.rid,
+                    fake=isinstance(language_req.embedding_receiver, FakeKVReceiver),
                 )
             )
 
-            assert language_req.metadata_buffer_index is not None
+            if language_req.embedding_indices is None:
+                break
 
+            # Initialize receiver with block_indices
             language_req.embedding_receiver.init(
-                embedding_index=language_req.metadata_buffer_index
+                embedding_indices=language_req.embedding_indices
             )
             preallocated_reqs.append(language_req)
             indices_to_remove.add(i)
@@ -240,7 +257,8 @@ class MultimodalLanguageTransferQueue:
         )
         # unlock the kv cache or it will have memory leak
         self.req_to_metadata_buffer_idx_allocator.free(
-            language_req.metadata_buffer_index,
+            block_indices=language_req.embedding_indices,
+            req_id=language_req.req.rid,
             fake=isinstance(language_req.embedding_receiver, FakeKVReceiver),
         )
         if self.scheduler.enable_metrics:
@@ -264,22 +282,19 @@ class MultimodalLanguageTransferQueue:
                 indices_to_remove.add(i)
                 continue
             elif poll == KVPoll.Success:
-                idx = language_req.metadata_buffer_index
+                # Use block_indices instead of single index
+                block_indices = language_req.embedding_indices
                 if not isinstance(language_req.embedding_receiver, FakeKVReceiver):
                     embedding_data, fill_ids, mrope_positions, aux_datas = (
-                        self.metadata_buffers.get_buf(idx)
+                        self.metadata_buffers.get_buf(block_indices=block_indices)
                     )
                     embedding_length = aux_datas[0]
                     mrope_position_delta = aux_datas[1]
-                    language_req.req.input_embeds = embedding_data[:embedding_length, :]
-                    mrope_positions = mrope_positions[: 3 * embedding_length].reshape(
-                        3, embedding_length
-                    )
-                    ori_input_length = len(language_req.req.origin_input_ids)
-                    language_req.req.origin_input_ids = fill_ids[
-                        :embedding_length
-                    ].tolist()
+                    language_req.req.input_embeds = embedding_data
+                    language_req.req.origin_input_ids = fill_ids.tolist()
                     mm_inputs = None
+                    ori_input_length = len(language_req.req.origin_input_ids)
+
                     if ori_input_length == embedding_length:
                         mm_inputs = None
                     elif ori_input_length < embedding_length:
@@ -302,14 +317,13 @@ class MultimodalLanguageTransferQueue:
                         indices_to_remove.add(i)
                         continue
                     language_req.req.multimodal_inputs = mm_inputs
-                    # NOTE: we need to set the metadata buffer index to the request
-                    # because the metadata buffer index will be freed after the request is done
-                    # to avoid embedding buffer is freed before the request is done
-                    language_req.req.metadata_buffer_index = (
-                        language_req.metadata_buffer_index
-                    )
+                    # NOTE: we need to set the metadata block indices to the request
+                    # because the metadata buffer should be freed after the request prefill forward finished
+                    language_req.req.embedding_indices = language_req.embedding_indices
                 else:
-                    self.req_to_metadata_buffer_idx_allocator.free(idx, fake=True)
+                    self.req_to_metadata_buffer_idx_allocator.free(
+                        block_indices=block_indices, fake=True
+                    )
 
                 transferred_reqs.append(language_req.req)
                 indices_to_remove.add(i)
@@ -323,8 +337,8 @@ class MultimodalLanguageTransferQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
-            idx = self.queue[i].metadata_buffer_index
-            assert idx != -1
+            block_indices = self.queue[i].embedding_indices
+            assert block_indices is not None and len(block_indices) > 0
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove

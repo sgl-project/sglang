@@ -66,6 +66,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     MetadataBuffers,
     MultimodalDataBuffers,
+    ReqToMetadataBlockAllocator,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     prepare_abort,
@@ -997,11 +998,15 @@ class Scheduler(
             buffer_size = int(
                 os.environ.get("SGLANG_EMBEDDING_CACHE_BUFFER_SIZE", "64")
             )
-            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
+            block_size = int(
+                os.environ.get("SGLANG_EMBEDDING_CACHE_BLOCK_SIZE", "8192")
+            )
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataBlockAllocator(
+                buffer_size,
+                block_size=block_size,
             )
             self.disagg_metadata_buffers = MultimodalDataBuffers(
-                buffer_size, self.max_req_len, self.model_config.hidden_size
+                buffer_size, block_size, self.model_config.hidden_size
             )
             self.disagg_embedding_bootstrap_queue = MultimodalEmbeddingBootstrapQueue(
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
@@ -1018,11 +1023,15 @@ class Scheduler(
             buffer_size = int(
                 os.environ.get("SGLANG_EMBEDDING_CACHE_BUFFER_SIZE", "64")
             )
-            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
+            block_size = int(
+                os.environ.get("SGLANG_EMBEDDING_CACHE_BLOCK_SIZE", "8192")
+            )
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataBlockAllocator(
+                buffer_size,
+                block_size=block_size,
             )
             self.disagg_metadata_buffers = MultimodalDataBuffers(
-                buffer_size, self.max_req_len, self.model_config.hidden_size
+                buffer_size, block_size, self.model_config.hidden_size
             )
             self.disagg_language_transfer_queue = MultimodalLanguageTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,

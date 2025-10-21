@@ -39,10 +39,10 @@ class FakeKVSender(BaseKVSender):
         self,
         kv_indices: Optional[list[int]] = None,
         aux_index: Optional[int] = None,
-        embedding_index: Optional[int] = None,
+        embedding_indices: Optional[int] = None,
     ):
         logger.debug(
-            f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}"
+            f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}, embedding_indices: {embedding_indices}"
         )
         pass
 
@@ -55,11 +55,15 @@ class FakeKVSender(BaseKVSender):
         logger.debug(f"FakeKVSender send with kv_indices: {kv_indices}")
 
     def send_embedding(
-        self, embedding_index: int, last_chunk: bool, chunk_info: List[Tuple[int, int]]
+        self,
+        embedding_indices: List[int] = None,
+        total_tokens: int = None,
+        block_size: int = None,
+        last_chunk: bool = False,
     ):
         self.has_sent = True
         logger.debug(
-            f"FakeKVSender send_embedding with embedding_index: {embedding_index}, last_chunk: {last_chunk}, chunk_info: {chunk_info}"
+            f"FakeKVSender send_embedding with embedding_indices: {embedding_indices}, total_tokens: {total_tokens}, block_size: {block_size}, last_chunk: {last_chunk}"
         )
 
     def failure_exception(self):
@@ -89,11 +93,11 @@ class FakeKVReceiver(BaseKVReceiver):
         self,
         kv_indices: Optional[list[int]] = None,
         aux_index: Optional[int] = None,
-        embedding_index: Optional[int] = None,
+        embedding_indices: Optional[list[int]] = None,
     ):
         self.has_init = True
         logger.debug(
-            f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}"
+            f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}, embedding_indices: {embedding_indices}"
         )
 
     def failure_exception(self):

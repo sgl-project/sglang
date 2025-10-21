@@ -52,9 +52,9 @@ class EmbeddingTransferError(Exception):
 @dataclasses.dataclass
 class TransferEmbeddingChunk:
     room: int
-    embedding_index: int
+    embedding_indices: List[int]  # Source embedding indices
     is_last: bool
-    chunk_info: List[Tuple[int, int]]
+    total_tokens: int  # Total number of tokens to transfer
 
 
 @dataclasses.dataclass
@@ -63,17 +63,27 @@ class TransferEmbeddingInfo:
     endpoint: str
     dst_port: int
     mooncake_session_id: str
-    dst_embedding_index: int
+    dst_embedding_indices: List[int]
     required_dst_info_num: int
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        # Parse embedding_indices from message
+        # Format: comma-separated list of embedding indices
+        dst_embedding_indices_str = msg[4].decode("ascii")
+        if dst_embedding_indices_str:
+            dst_embedding_indices = [
+                int(x) for x in dst_embedding_indices_str.split(",")
+            ]
+        else:
+            dst_embedding_indices = []
+
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
-            dst_embedding_index=int(msg[4].decode("ascii")),
+            dst_embedding_indices=dst_embedding_indices,
             required_dst_info_num=int(msg[5].decode("ascii")),
         )
 
@@ -200,37 +210,92 @@ class MooncakeEmbeddingManager(BaseKVManager):
     def send_embedding(
         self,
         mooncake_session_id: str,
-        embedding_index: int,
+        embedding_indices: List[int],
         dst_embedding_ptrs: list[int],
-        dst_embedding_index: int,
-        chunk_info: List[Tuple[int, int]],
+        dst_embedding_indices: List[int],
+        total_tokens: int,
+        block_size: int,
     ):
+        """Send embedding data using block-based transfer.
 
-        status_list = []
+        Args:
+            mooncake_session_id: Session ID for transfer
+            embedding_indices: Source embedding indices
+            dst_embedding_ptrs: Destination buffer pointers
+            dst_embedding_indices: Destination embedding indices
+            total_tokens: Total number of tokens to transfer
+            block_size: Number of tokens per block
 
-        for i in range(len(self.data_args.aux_item_lens)):
-            chunk_offset, chunk_size = chunk_info[i]
-            embedding_item_len = self.data_args.aux_item_lens[i]
-            embedding_addr = (
-                self.data_args.aux_data_ptrs[i]
-                + embedding_index * embedding_item_len
-                + chunk_offset
+        Returns:
+            0 if all transfers succeed, 1 otherwise
+        """
+        # Validate: source blocks must <= destination blocks
+        if len(embedding_indices) > len(dst_embedding_indices):
+            raise ValueError(
+                f"Source blocks ({len(embedding_indices)}) cannot be greater than "
+                f"destination blocks ({len(dst_embedding_indices)}). "
+                f"Language side allocated insufficient buffer."
             )
-            dst_embedding_addr = (
-                dst_embedding_ptrs[i]
-                + dst_embedding_index * embedding_item_len
-                + chunk_offset
-            )
 
-            status = self.engine.transfer_sync(
-                mooncake_session_id,
-                embedding_addr,
-                dst_embedding_addr,
-                chunk_size,
+        if len(embedding_indices) < len(dst_embedding_indices):
+            logger.warning(
+                f"Source blocks ({len(embedding_indices)}) is less than "
+                f"destination blocks ({len(dst_embedding_indices)}). "
+                f"Some destination buffers will not be used."
             )
-            status_list.append(status)
+            dst_embedding_indices = dst_embedding_indices[: len(embedding_indices)]
 
-        return 0 if sum(status_list) == 0 else 1
+        src_addrs = []
+        dst_addrs = []
+        lengths = []
+
+        for block_idx, (src_block_idx, dst_block_idx) in enumerate(
+            zip(embedding_indices, dst_embedding_indices)
+        ):
+            # Calculate how many tokens in this block
+            start_pos = block_idx * block_size
+            end_pos = min(start_pos + block_size, total_tokens)
+            tokens_in_block = end_pos - start_pos
+
+            if tokens_in_block <= 0:
+                break
+
+            # Transfer each buffer type within the block
+            for buffer_type_idx in range(len(self.data_args.aux_item_lens)):
+                embedding_item_len = self.data_args.aux_item_lens[buffer_type_idx]
+
+                # Calculate chunk size based on buffer type and tokens_in_block
+                # For aux_datas, only transfer in first block
+                if buffer_type_idx == 3:  # aux_datas
+                    if block_idx == 0:
+                        chunk_size = embedding_item_len  # Transfer full aux_datas
+                    else:
+                        continue  # Skip aux_datas for other blocks
+                else:
+                    # For embeddings, fill_ids, mrope_positions: scale by tokens_in_block
+                    # embedding_item_len already contains the full block size
+                    # We need to transfer only tokens_in_block portion
+                    chunk_size = (embedding_item_len * tokens_in_block) // block_size
+
+                # Calculate source address: base_ptr + block_idx * item_len
+                embedding_addr = (
+                    self.data_args.aux_data_ptrs[buffer_type_idx]
+                    + src_block_idx * embedding_item_len
+                )
+
+                # Calculate destination address: base_ptr + block_idx * item_len
+                dst_embedding_addr = (
+                    dst_embedding_ptrs[buffer_type_idx]
+                    + dst_block_idx * embedding_item_len
+                )
+
+                src_addrs.append(embedding_addr)
+                dst_addrs.append(dst_embedding_addr)
+                lengths.append(chunk_size)
+
+        return self.engine.batch_transfer_sync(
+            mooncake_session_id, src_addrs, dst_addrs, lengths
+        )
 
     def sync_status_to_language_endpoint(
         self, remote: str, dst_port: int, room: int, status: int
@@ -275,14 +340,23 @@ class MooncakeEmbeddingManager(BaseKVManager):
                             )
                             break
 
+                    # Block-based transfer
+                    # Calculate block_size from aux_item_lens
+                    # aux_item_lens[0] is for embeddings per block
+                    # aux_item_lens[1] is for fill_ids per block
+                    # block_size = aux_item_lens[1] / fill_ids.itemsize
+                    # Assuming fill_ids is int32 (4 bytes)
+                    block_size = self.data_args.aux_item_lens[1] // 4
+
                     ret = self.send_embedding(
                         req.mooncake_session_id,
-                        embedding_chunk.embedding_index,
+                        embedding_chunk.embedding_indices,
                         self.language_args_table[
                             req.mooncake_session_id
                         ].dst_embedding_ptrs,
-                        req.dst_embedding_index,
-                        embedding_chunk.chunk_info,
+                        req.dst_embedding_indices,
+                        embedding_chunk.total_tokens,
+                        block_size,
                     )
                     if ret != 0:
                         with self.session_lock:
@@ -442,10 +516,20 @@ class MooncakeEmbeddingManager(BaseKVManager):
     def add_transfer_request(
         self,
         bootstrap_room: int,
-        embedding_index: int,
+        embedding_indices: List[int],
         is_last: bool,
-        chunk_info: List[Tuple[int, int]],
+        total_tokens: int,
+        block_size: int,
     ):
+        """Add block-based transfer request to queue.
+
+        Args:
+            bootstrap_room: Room ID for the request
+            embedding_indices: List of source embedding indices
+            is_last: Whether this is the last chunk
+            total_tokens: Total number of tokens to transfer
+            block_size: Number of tokens per block
+        """
         assert self.disaggregation_mode == DisaggregationMode.ENCODE
         assert is_last  # For embedding data, we only send once at the end
 
@@ -453,7 +537,6 @@ class MooncakeEmbeddingManager(BaseKVManager):
             bootstrap_room not in self.request_status
             or self.check_status(bootstrap_room) == KVPoll.Failed
         ):
-
             return
 
         if bootstrap_room not in self.transfer_infos:
@@ -472,9 +555,9 @@ class MooncakeEmbeddingManager(BaseKVManager):
         self.transfer_queues[shard_idx].put(
             TransferEmbeddingChunk(
                 room=bootstrap_room,
-                embedding_index=embedding_index,
+                embedding_indices=embedding_indices,
                 is_last=is_last,
-                chunk_info=chunk_info,
+                total_tokens=total_tokens,
             )
         )
 
@@ -572,16 +655,23 @@ class MooncakeEmbeddingSender(BaseKVSender):
         self.embedding_mgr = mgr
         self.bootstrap_room = bootstrap_room
         self.embedding_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
-        self.embedding_index = None
+        self.embedding_indices = None
         self.bootstrap_server_url = bootstrap_addr
         self.conclude_state = None
         self.init_time = None
         self.dest_tp_ranks = dest_tp_ranks
         self.pp_rank = pp_rank
 
-    def init(self, embedding_index: Optional[int] = None):
-        # For embedding data, we don't need num_kv_indices, but we keep the interface consistent
-        self.embedding_index = embedding_index
+    def init(
+        self,
+        embedding_indices: Optional[List[int]] = None,
+    ):
+        """Initialize sender with embedding indices.
+
+        Args:
+            embedding_indices: List of embedding indices for block-based allocation
+        """
+        self.embedding_indices = embedding_indices
         self.init_time = time.time()
 
     def send(
@@ -593,11 +683,22 @@ class MooncakeEmbeddingSender(BaseKVSender):
         pass
 
     def send_embedding(
-        self, embedding_index: int, last_chunk: bool, chunk_info: List[Tuple[int, int]]
+        self,
+        embedding_indices: List[int] = None,
+        last_chunk: bool = True,
+        total_tokens: int = None,
+        block_size: int = None,
     ):
-        """Send embedding data to language instances"""
+        """Send embedding data to language instances using block-based transfer.
+
+        Args:
+            embedding_indices: List of source embedding indices
+            last_chunk: Whether this is the last chunk
+            total_tokens: Total number of tokens to transfer
+            block_size: Number of tokens per block
+        """
         self.embedding_mgr.add_transfer_request(
-            self.bootstrap_room, embedding_index, last_chunk, chunk_info
+            self.bootstrap_room, embedding_indices, last_chunk, total_tokens, block_size
         )
 
     def poll(self) -> KVPoll:
@@ -816,7 +917,20 @@ class MooncakeEmbeddingReceiver(BaseKVReceiver):
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
-    def init(self, embedding_index: Optional[int] = None):
+    def init(
+        self,
+        embedding_indices: Optional[List[int]] = None,
+    ):
+        """Initialize receiver with embedding indices.
+
+        Args:
+            embedding_indices: List of embedding indices for block-based allocation
+        """
+        if embedding_indices is not None:
+            embedding_indices_str = ",".join(str(idx) for idx in embedding_indices)
+        else:
+            embedding_indices_str = ""
+
         for bootstrap_info in self.bootstrap_infos:
             self.embedding_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
@@ -830,7 +944,9 @@ class MooncakeEmbeddingReceiver(BaseKVReceiver):
                         get_local_ip_by_remote().encode("ascii"),
                         str(self.embedding_mgr.rank_port).encode("ascii"),
                         self.session_id.encode("ascii"),
-                        str(embedding_index).encode("ascii"),
+                        embedding_indices_str.encode(
+                            "ascii"
+                        ),  # Send comma-separated embedding indices
                         str(self.required_dst_info_num).encode("ascii"),
                     ]
                 )

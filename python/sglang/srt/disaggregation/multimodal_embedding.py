@@ -141,15 +141,25 @@ class MultimodalEmbeddingBootstrapQueue:
                 indices_to_remove.add(i)
                 continue
 
-            if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
-                break
-
-            req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc(
-                fake=isinstance(req.disagg_embedding_sender, FakeKVSender)
+            # Calculate actual sequence length from origin_input_ids
+            actual_seq_len = (
+                len(req.origin_input_ids) if hasattr(req, "origin_input_ids") else None
             )
 
-            assert req.metadata_buffer_index is not None
-            req.disagg_embedding_sender.init(embedding_index=req.metadata_buffer_index)
+            # Allocate blocks based on actual length
+            allocated_indices = self.req_to_metadata_buffer_idx_allocator.alloc(
+                num_tokens=actual_seq_len,
+                req_id=req.rid,
+                fake=isinstance(req.disagg_embedding_sender, FakeKVSender),
+            )
+
+            if allocated_indices is None:
+                # Not enough blocks available
+                continue
+            req.embedding_indices = allocated_indices
+
+            # Initialize sender with block_indices
+            req.disagg_embedding_sender.init(embedding_indices=req.embedding_indices)
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
 
@@ -280,10 +290,11 @@ class SchedulerDisaggregationMultimodalEmbeddingMixin:
 
         for req in done_reqs:
             self.req_to_metadata_buffer_idx_allocator.free(
-                req.metadata_buffer_index,
+                block_indices=req.embedding_indices,
+                req_id=req.rid,
                 fake=isinstance(req.disagg_embedding_sender, FakeKVSender),
             )
-            req.metadata_buffer_index = -1
+            req.embedding_indices = None
         self.disagg_embedding_inflight_queue = undone_reqs
 
         return done_reqs
@@ -307,9 +318,13 @@ class SchedulerDisaggregationMultimodalEmbeddingMixin:
         assert last_chunk == True
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
-            chunk_info = self.disagg_metadata_buffers.get_buf_chunk_info(req)
+
+        # Send using block_indices
         req.disagg_embedding_sender.send_embedding(
-            req.metadata_buffer_index, last_chunk, chunk_info
+            embedding_indices=req.embedding_indices,
+            last_chunk=last_chunk,
+            total_tokens=len(req.fill_ids),
+            block_size=self.disagg_metadata_buffers.block_size,
         )
 
     def get_num_allocatable_reqs(self: Scheduler, running_bs: int):
