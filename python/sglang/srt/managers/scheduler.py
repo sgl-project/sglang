@@ -29,6 +29,7 @@ from typing import Deque, Dict, List, Optional, Tuple, Union
 import psutil
 import setproctitle
 import torch
+import torch.distributed
 import zmq
 from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
@@ -1152,6 +1153,23 @@ class Scheduler(
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
+    def _is_entry_rank(self) -> bool:
+        # With DP attention enabled, the entry rank is attn_tp_rank==0;
+        # otherwise the entry rank is TP group local rank 0.
+        if self.server_args.enable_dp_attention:
+            return self.attn_tp_rank == 0
+        else:
+            return self.tp_group.rank == 0
+
+    def _cpu_group(self):
+        # Use the CPU communication group to broadcast Python objects,
+        # avoiding any coupling with CUDA streams/devices.
+        return (
+            self.attn_tp_cpu_group
+            if self.server_args.enable_dp_attention
+            else self.tp_cpu_group
+        )
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1233,8 +1251,50 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings
+
+            # Perform deserialization of multimodal mm_inputs (from_dict + validation + set_pad_value)
+            # only once on the entry Scheduler (rank 0 within the TP group / Attn-TP0).
+            # The entry rank (rank 0) then broadcasts the materialized MultimodalInputs to the other TP
+            # ranks via the CPU communication group using broadcast_object_list.
+            # The other ranks no longer call from_dict; they only do local pad_input_ids and
+            # extend_image_inputs.
+            # This reduces Scheduler CPU utilization and avoids contending with request scheduling.
+            is_entry = self._is_entry_rank()
+            cpu_group = self._cpu_group()
+            group_world_size = 1
+            try:
+                if torch.dist.is_available() and torch.dist.is_initialized():
+                    group_world_size = torch.dist.get_world_size(group=cpu_group)
+            except Exception:
+                group_world_size = 1
+            if is_entry:
+                # Only the entry rank materializes once from dict.
+                image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+                # Perform validation/pad-value setup only once to avoid repeating on every rank.
+                if hasattr(image_inputs, "mm_items") and isinstance(
+                    image_inputs.mm_items, list
+                ):
+                    image_inputs.mm_items = [
+                        it for it in image_inputs.mm_items if it.is_valid()
+                    ]
+                    for it in image_inputs.mm_items:
+                        it.set_pad_value()
+                # Broadcast to other TP ranks (use src=0 within the group).
+                if group_world_size > 1:
+                    obj_list = [image_inputs]
+                    torch.dist.broadcast_object_list(obj_list, src=0, group=cpu_group)
+                    image_inputs = obj_list[0]
+            else:
+                # Non-entry ranks: if group size > 1, receive the object;
+                # otherwise (size == 1) we shouldn't reach here in practice.
+                if group_world_size > 1:
+                    obj_list = [None]
+                    torch.dist.broadcast_object_list(obj_list, src=0, group=cpu_group)
+                    image_inputs = obj_list[0]
+                else:
+                    # Fallback for single-card or no-group scenarios: materialize locally.
+                    image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+            # These two steps are already fast (<~3ms); execute locally on each rank.
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
             )
