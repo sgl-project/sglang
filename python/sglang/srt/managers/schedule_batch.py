@@ -36,7 +36,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
-import threading
+import re
 import time
 from enum import Enum, auto
 from http import HTTPStatus
@@ -46,7 +46,6 @@ from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 import numpy as np
 import torch
 
-from sglang.global_config import global_config
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -54,13 +53,19 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-from sglang.srt.mem_cache.common import alloc_for_decode, alloc_for_extend
+from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
+from sglang.srt.mem_cache.common import (
+    alloc_for_decode,
+    alloc_for_extend,
+    evict_from_tree_cache,
+)
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -68,56 +73,16 @@ from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
-GLOBAL_SERVER_ARGS_KEYS = [
-    "attention_backend",
-    "mm_attention_backend",
-    "debug_tensor_dump_inject",
-    "debug_tensor_dump_output_folder",
-    "chunked_prefill_size",
-    "device",
-    "disable_chunked_prefix_cache",
-    "disable_flashinfer_cutlass_moe_fp4_allgather",
-    "disable_radix_cache",
-    "enable_dp_lm_head",
-    "enable_fp32_lm_head",
-    "flashinfer_mxfp4_moe_precision",
-    "enable_flashinfer_allreduce_fusion",
-    "moe_dense_tp_size",
-    "ep_dispatch_algorithm",
-    "ep_num_redundant_experts",
-    "enable_nan_detection",
-    "flashinfer_mla_disable_ragged",
-    "pp_max_micro_batch_size",
-    "disable_shared_experts_fusion",
-    "sampling_backend",
-    "speculative_accept_threshold_single",
-    "speculative_accept_threshold_acc",
-    "speculative_attention_mode",
-    "torchao_config",
-    "triton_attention_reduce_in_fp32",
-    "num_reserved_decode_tokens",
-    "weight_loader_disable_mmap",
-    "enable_multimodal",
-    "enable_symm_mem",
-    "enable_custom_logit_processor",
-    "disaggregation_mode",
-    "enable_deterministic_inference",
-    "nsa_prefill",
-    "nsa_decode",
-    "multi_item_scoring_delimiter",
-]
-
-# Put some global args for easy access
-global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +197,18 @@ class FINISH_MATCHED_TOKEN(BaseFinishReason):
 
 
 class FINISH_MATCHED_STR(BaseFinishReason):
+    def __init__(self, matched: str):
+        super().__init__()
+        self.matched = matched
+
+    def to_json(self):
+        return {
+            "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
+
+
+class FINISHED_MATCHED_REGEX(BaseFinishReason):
     def __init__(self, matched: str):
         super().__init__()
         self.matched = matched
@@ -680,10 +657,13 @@ class Req:
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
+        self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
 
         # Check finish
         self.tokenizer = None
         self.finished_reason = None
+        # finished position (in output_ids), used when checking stop conditions with speculative decoding
+        self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
         # If we want to abort the request in the middle of the event loop, set this to true
@@ -805,6 +785,10 @@ class Req:
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
 
+        # The number of accepted tokens in speculative decoding for this request.
+        # This is used to compute the acceptance rate and average acceptance length per request.
+        self.spec_accepted_tokens = 0
+
         # For metrics
         self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
@@ -841,12 +825,16 @@ class Req:
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        spec_alg = global_server_args_dict["speculative_algorithm"]
-        return self.sampling_params.max_new_tokens == 0 and (
-            spec_alg is None or spec_alg == SpeculativeAlgorithm.NONE
-        )
+        spec_alg = get_global_server_args().speculative_algorithm
+        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
+
+    @property
+    def output_ids_through_stop(self) -> List[int]:
+        """Get the output ids through the stop condition. Stop position is included."""
+        if self.finished_len is not None:
+            return self.output_ids[: self.finished_len]
+        return self.output_ids
 
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:
@@ -885,7 +873,12 @@ class Req:
                 self.last_host_node,
                 self.host_hit_length,
             ) = tree_cache.match_prefix(
-                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key)
+                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                **(
+                    {"req": self, "cow_mamba": True}
+                    if isinstance(tree_cache, MambaRadixCache)
+                    else {}
+                ),
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
@@ -894,22 +887,132 @@ class Req:
     def init_incremental_detokenize(self):
         first_iter = self.surr_offset is None or self.read_offset is None
 
+        output_ids = self.output_ids_through_stop
+
         if first_iter:
             self.read_offset = len(self.origin_input_ids_unpadded)
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
             self.surr_and_decode_ids = (
-                self.origin_input_ids_unpadded[self.surr_offset :] + self.output_ids
+                self.origin_input_ids_unpadded[self.surr_offset :] + output_ids
             )
-            self.cur_decode_ids_len = len(self.output_ids)
+            self.cur_decode_ids_len = len(output_ids)
         else:
-            self.surr_and_decode_ids.extend(self.output_ids[self.cur_decode_ids_len :])
-            self.cur_decode_ids_len = len(self.output_ids)
+            self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])
+            self.cur_decode_ids_len = len(output_ids)
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
-    def check_finished(self):
+    def tail_str(self) -> str:
+        # Check stop strings and stop regex patterns together
+        if (
+            len(self.sampling_params.stop_strs) > 0
+            or len(self.sampling_params.stop_regex_strs) > 0
+        ):
+            max_len_tail_str = max(
+                self.sampling_params.stop_str_max_len + 1,
+                self.sampling_params.stop_regex_max_len + 1,
+            )
+
+        tail_len = min((max_len_tail_str + 1), len(self.output_ids))
+        return self.tokenizer.decode(self.output_ids[-tail_len:])
+
+    def check_match_stop_str_prefix(self) -> bool:
+        """
+        Check if the suffix of tail_str overlaps with any stop_str prefix
+        """
+        if not self.sampling_params.stop_strs:
+            return False
+
+        tail_str = self.tail_str()
+
+        # Early return if tail_str is empty
+        if not tail_str:
+            return False
+
+        for stop_str in self.sampling_params.stop_strs:
+            if not stop_str:
+                continue
+            # Check if stop_str is contained in tail_str (fastest check first)
+            if stop_str in tail_str:
+                return True
+
+            # Check if tail_str suffix matches stop_str prefix
+            # Only check if stop_str is not empty, it's for stream output
+            min_len = min(len(tail_str), len(stop_str))
+            for i in range(1, min_len + 1):
+                if tail_str[-i:] == stop_str[:i]:
+                    return True
+
+        return False
+
+    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+        if self.sampling_params.ignore_eos:
+            return False
+
+        # Check stop token ids
+        matched_eos = False
+
+        for i, token_id in enumerate(new_accepted_tokens):
+            if self.sampling_params.stop_token_ids:
+                matched_eos |= token_id in self.sampling_params.stop_token_ids
+            if self.eos_token_ids:
+                matched_eos |= token_id in self.eos_token_ids
+            if self.tokenizer is not None:
+                matched_eos |= token_id == self.tokenizer.eos_token_id
+                if self.tokenizer.additional_stop_token_ids:
+                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
+            if matched_eos:
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
+                matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
+                self.finished_len = matched_pos + 1
+                return True
+
+        return False
+
+    def _check_str_based_finish(self):
+        if (
+            len(self.sampling_params.stop_strs) > 0
+            or len(self.sampling_params.stop_regex_strs) > 0
+        ):
+            tail_str = self.tail_str()
+
+            # Check stop strings
+            if len(self.sampling_params.stop_strs) > 0:
+                for stop_str in self.sampling_params.stop_strs:
+                    if stop_str in tail_str or stop_str in self.decoded_text:
+                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                        return True
+
+            # Check stop regex
+            if len(self.sampling_params.stop_regex_strs) > 0:
+                for stop_regex_str in self.sampling_params.stop_regex_strs:
+                    if re.search(stop_regex_str, tail_str):
+                        self.finished_reason = FINISHED_MATCHED_REGEX(
+                            matched=stop_regex_str
+                        )
+                        return True
+
+        return False
+
+    def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int] = None):
+        for i, token_id in enumerate(new_accepted_tokens):
+            if token_id > self.vocab_size or token_id < 0:
+                offset = len(self.output_ids) - len(new_accepted_tokens) + i
+                if self.sampling_params.stop_token_ids:
+                    self.output_ids[offset] = next(
+                        iter(self.sampling_params.stop_token_ids)
+                    )
+                if self.eos_token_ids:
+                    self.output_ids[offset] = next(iter(self.eos_token_ids))
+                self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+                self.finished_len = offset + 1
+                return True
+
+        return False
+
+    def check_finished(self, new_accepted_len: int = 1):
         if self.finished():
             return
 
@@ -923,6 +1026,7 @@ class Req:
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
             )
+            self.finished_len = self.sampling_params.max_new_tokens
             return
 
         if self.grammar is not None:
@@ -930,44 +1034,16 @@ class Req:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
                 return
 
-        last_token_id = self.output_ids[-1]
+        new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
-        if not self.sampling_params.ignore_eos:
-            matched_eos = False
-
-            # Check stop token ids
-            if self.sampling_params.stop_token_ids:
-                matched_eos = last_token_id in self.sampling_params.stop_token_ids
-            if self.eos_token_ids:
-                matched_eos |= last_token_id in self.eos_token_ids
-            if self.tokenizer is not None:
-                matched_eos |= last_token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= (
-                        last_token_id in self.tokenizer.additional_stop_token_ids
-                    )
-            if matched_eos:
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
-                return
-
-        if last_token_id > self.vocab_size or last_token_id < 0:
-            if self.sampling_params.stop_token_ids:
-                self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
-            if self.eos_token_ids:
-                self.output_ids[-1] = next(iter(self.eos_token_ids))
-            self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+        if self._check_token_based_finish(new_accepted_tokens):
             return
 
-        # Check stop strings
-        if len(self.sampling_params.stop_strs) > 0:
-            tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
-            )
+        if self._check_vocab_boundary_finish(new_accepted_tokens):
+            return
 
-            for stop_str in self.sampling_params.stop_strs:
-                if stop_str in tail_str or stop_str in self.decoded_text:
-                    self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                    return
+        if self._check_str_based_finish():
+            return
 
     def reset_for_retract(self):
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
@@ -981,6 +1057,7 @@ class Req:
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
         self.req_pool_idx = None
+        self.mamba_pool_idx = None
         self.already_computed = 0
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
@@ -1174,6 +1251,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
+
+    def alloc_req_slots(self, num_reqs: int, reqs: Optional[List[Req]] = None):
+        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
+            if mamba_available_size < num_reqs:
+                if self.tree_cache is not None and isinstance(
+                    self.tree_cache, MambaRadixCache
+                ):
+                    mamba_num = max(0, num_reqs - mamba_available_size)
+                    self.tree_cache.evict_mamba(mamba_num)
+            req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
+        else:
+            req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
+        if req_pool_indices is None:
+            raise RuntimeError(
+                "alloc_req_slots runs out of memory. "
+                "Please set a smaller number for `--max-running-requests`. "
+                f"{self.req_to_token_pool.available_size()=}, "
+                f"{num_reqs=}, "
+            )
+        return req_pool_indices
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
@@ -1492,7 +1590,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             * self.token_to_kv_pool_allocator.page_size
         )
 
-        self._evict_tree_cache_if_needed(num_tokens)
+        evict_from_tree_cache(self.tree_cache, num_tokens)
         return self._is_available_size_sufficient(num_tokens)
 
     def retract_decode(self, server_args: ServerArgs):
@@ -1540,6 +1638,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
+            # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
             if len(retracted_reqs) == 0:
@@ -1555,7 +1654,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
 
         new_estimate_ratio = (
-            total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
+            total_decoded_tokens
+            + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(self.reqs)
         ) / total_max_new_tokens
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
@@ -1563,39 +1663,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
-        seq_lens_cpu = self.seq_lens_cpu.numpy()
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
-        if isinstance(self.tree_cache, ChunkCache):
-            # ChunkCache does not have eviction
-            token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : seq_lens_cpu[idx]
-            ]
-            self.token_to_kv_pool_allocator.free(token_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
-        else:
-            # TODO: apply more fine-grained retraction
-            last_uncached_pos = (
-                len(req.prefix_indices) // server_args.page_size
-            ) * server_args.page_size
-            token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
-            ]
-            self.token_to_kv_pool_allocator.free(token_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
-
-            # release the last node
-            if self.is_hybrid:
-                self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
-            else:
-                self.tree_cache.dec_lock_ref(req.last_node)
-
-            # NOTE(lsyin): we should use the newly evictable memory instantly.
-            num_tokens = remaing_req_count * global_config.retract_decode_steps
-            self._evict_tree_cache_if_needed(num_tokens)
+        # TODO (csy): for preempted requests, we may want to insert into the tree
+        self.tree_cache.cache_finished_req(req, is_insert=False)
+        # NOTE(lsyin): we should use the newly evictable memory instantly.
+        num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+        evict_from_tree_cache(self.tree_cache, num_tokens)
 
         req.reset_for_retract()
 
@@ -1618,15 +1695,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    @property
+    def is_v2_eagle(self):
+        # FIXME: finally deprecate is_v2_eagle
+        return self.enable_overlap and self.spec_algorithm.is_eagle()
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if (
-            self.spec_algorithm.is_eagle()
-            or self.spec_algorithm.is_standalone()
-            or self.spec_algorithm.is_ngram()
-        ):
+        if self.is_v2_eagle:
+            # TODO(spec-v2): all v2 spec should go through this path
+            draft_input: EagleDraftInput = self.spec_info
+            draft_input.prepare_for_decode(self)
+
+        if not self.spec_algorithm.is_none():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return
@@ -1677,11 +1760,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
 
+    def maybe_wait_verify_done(self):
+        if self.is_v2_eagle:
+            draft_input: EagleDraftInput = self.spec_info
+            if draft_input.verify_done is not None:
+                draft_input.verify_done.synchronize()
+
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        # FIXME(lsyin): used here to get the correct seq_lens
+        # The batch has been launched but we need it verified to get correct next batch info
+        self.maybe_wait_verify_done()
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -1744,6 +1837,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
+        # NOTE: in v2 eagle mode, we do not need wait verify here because
+        # 1) current batch is always prefill, whose seq_lens and allocate_lens are not a future
+        # 2) other batch is always decode, which is finished in previous step
+
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -1868,25 +1965,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
+            seq_lens_cpu=self.seq_lens_cpu,
+            enable_overlap=self.enable_overlap,
         )
-
-    def _evict_tree_cache_if_needed(self, num_tokens: int):
-        if isinstance(self.tree_cache, (SWAChunkCache, ChunkCache)):
-            return
-
-        if self.is_hybrid:
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-
-            if full_available_size < num_tokens or swa_available_size < num_tokens:
-                if self.tree_cache is not None:
-                    full_num_tokens = max(0, num_tokens - full_available_size)
-                    swa_num_tokens = max(0, num_tokens - swa_available_size)
-                    self.tree_cache.evict(full_num_tokens, swa_num_tokens)
-        else:
-            if self.token_to_kv_pool_allocator.available_size() < num_tokens:
-                if self.tree_cache is not None:
-                    self.tree_cache.evict(num_tokens)
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
         if self.is_hybrid:
@@ -1972,9 +2053,6 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
-
-    # Overlap scheduler related
-    delay_sample_launch: bool = False
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
