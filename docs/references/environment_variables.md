@@ -74,6 +74,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_BLOCK_NONZERO_RANK_CHILDREN` | Control blocking of non-zero rank children processes | `1` |
 | `SGL_IS_FIRST_RANK_ON_NODE` | Indicates if the current process is the first rank on its node | `"true"` |
 | `SGLANG_PP_LAYER_PARTITION` | Pipeline parallel layer partition specification | Not set |
+| `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` | Set one visible device per process for distributed computing | `false` |
 
 ## Testing & Debugging (Internal/CI)
 
@@ -82,7 +83,7 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_IS_IN_CI` | Indicates if running in CI environment | `false` |
-| `SGLANG_AMD_CI` | Indicates running in AMD CI environment | `0` |
+| `SGLANG_IS_IN_CI_AMD` | Indicates running in AMD CI environment | `0` |
 | `SGLANG_TEST_RETRACT` | Enable retract decode testing | `false` |
 | `SGLANG_RECORD_STEP_TIME` | Record step time for profiling | `false` |
 | `SGLANG_TEST_REQUEST_TIME_STATS` | Test request time statistics | `false` |

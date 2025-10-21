@@ -532,9 +532,20 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         bootstrap_port = None
         bootstrap_room = None
         if grpc_req.HasField("disaggregated_params"):
-            bootstrap_host = grpc_req.disaggregated_params.bootstrap_host or None
-            bootstrap_port = grpc_req.disaggregated_params.bootstrap_port or None
-            bootstrap_room = grpc_req.disaggregated_params.bootstrap_room or None
+            # Don't use 'or None' as it treats 0 as falsy
+            bootstrap_host = (
+                grpc_req.disaggregated_params.bootstrap_host
+                if grpc_req.disaggregated_params.bootstrap_host
+                else None
+            )
+            bootstrap_port = (
+                grpc_req.disaggregated_params.bootstrap_port
+                if grpc_req.disaggregated_params.bootstrap_port
+                else None
+            )
+            bootstrap_room = (
+                grpc_req.disaggregated_params.bootstrap_room
+            )  # Can be 0, don't use 'or None'
 
         # Create request
         return TokenizedGenerateReqInput(
@@ -987,26 +998,38 @@ def _execute_grpc_server_warmup(
         max_new_tokens = 8 if is_generation else 1
 
         if is_generation:
-            # Create tokenized input for warmup
-            warmup_request = sglang_scheduler_pb2.GenerateRequest(
-                request_id=f"WARMUP_{time.time()}",
-                tokenized=sglang_scheduler_pb2.TokenizedInput(
+            warmup_request_kwargs = {
+                "request_id": f"WARMUP_{time.time()}",
+                "tokenized": sglang_scheduler_pb2.TokenizedInput(
                     input_ids=[
-                        954,
-                        15541,
-                        2181,
-                        23496,
-                        1476,
-                        64710,
-                        280,
-                    ],  # Simple token sequence
-                    original_text="The capital city of France is",
+                        123,
+                        456,
+                        789,
+                        234,
+                        567,
+                        890,
+                        345,
+                    ],  # Random-looking but safe token IDs
+                    original_text="warmup request",
                 ),
-                sampling_params=sglang_scheduler_pb2.SamplingParams(
+                "sampling_params": sglang_scheduler_pb2.SamplingParams(
                     temperature=0.0,
                     max_new_tokens=max_new_tokens,
                 ),
-                stream=False,
+                "stream": False,
+            }
+
+            # Set disaggregation params if needed
+            if server_args.disaggregation_mode != DisaggregationMode.NULL:
+                warmup_request_kwargs["disaggregated_params"] = (
+                    sglang_scheduler_pb2.DisaggregatedParams(
+                        bootstrap_host=FAKE_BOOTSTRAP_HOST,
+                        bootstrap_room=0,
+                    )
+                )
+
+            warmup_request = sglang_scheduler_pb2.GenerateRequest(
+                **warmup_request_kwargs
             )
 
             # Send the warmup request
