@@ -5,6 +5,12 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >&2
 }
 
+# K2 preset redirect
+if [[ "${K2_PRESET:-}" == "1" || "${K2_PRESET:-}" == "true" ]]; then
+  log "K2_PRESET enabled, using K2 preset configuration"
+  exec /app/k2/preset.sh
+fi
+
 # Detect active Infiniband (IB) network interfaces and set NCCL/GLOO ifnames
 detect_ib_ifaces() {
   local ifaces=""
