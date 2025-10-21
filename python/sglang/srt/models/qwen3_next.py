@@ -520,6 +520,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
+                prefix=add_prefix("mlp", prefix),
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -673,6 +674,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
+                prefix=add_prefix("mlp", prefix),
             )
         else:
             self.mlp = Qwen2MoeMLP(

@@ -62,8 +62,9 @@ pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         config.worker_startup_check_interval_secs,
     )));
 
-    // Create empty OnceLock for worker job queue
+    // Create empty OnceLock for worker job queue and workflow engine
     let worker_job_queue = Arc::new(OnceLock::new());
+    let workflow_engine = Arc::new(OnceLock::new());
 
     Arc::new(AppContext::new(
         config,
@@ -79,6 +80,7 @@ pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         conversation_item_storage,
         load_monitor,
         worker_job_queue,
+        workflow_engine,
     ))
 }
 
