@@ -212,7 +212,7 @@ jobs:
   cuda13-kernel-smoke-test:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 4-gpu-l40-cu130
+    runs-on: 4-gpu-l40s-cu13
     steps:
       - uses: actions/checkout@v4
 
