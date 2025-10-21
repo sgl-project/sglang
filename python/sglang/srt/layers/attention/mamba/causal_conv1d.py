@@ -7,6 +7,7 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from sgl_kernel import causal_conv1d_fwd
 from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
 
@@ -127,3 +128,55 @@ def causal_conv1d_update(
     if unsqueeze:
         x = x.squeeze(-1)
     return x
+
+
+def causal_conv1d_ref(
+    x,
+    weight,
+    bias=None,
+    initial_states=None,
+    return_final_states=False,
+    final_states_out=None,
+    activation=None,
+):
+    if activation not in [None, "silu", "swish"]:
+        raise NotImplementedError("activation must be None, silu, or swish")
+    dtype_in = x.dtype
+    x = x.to(weight.dtype)
+    seqlen = x.shape[-1]
+    dim, width = weight.shape
+    if initial_states is None:
+        out = F.conv1d(x, weight.unsqueeze(1), bias, padding=width - 1, groups=dim)
+    else:
+        x = torch.cat([initial_states, x], dim=-1)
+        out = F.conv1d(x, weight.unsqueeze(1), bias, padding=0, groups=dim)
+    out = out[..., :seqlen]
+    if return_final_states:
+        final_states = F.pad(x, (width - 1 - x.shape[-1], 0)).to(
+            dtype_in
+        )  # (batch, dim, width - 1)
+        if final_states_out is not None:
+            final_states_out.copy_(final_states)
+        else:
+            final_states_out = final_states
+    out = (out if activation is None else F.silu(out)).to(dtype=dtype_in)
+    return out if not return_final_states else (out, final_states_out)
+
+
+
+def causal_conv1d_update_ref(
+    hidden_states,
+    conv_state,
+    weight,
+    bias=None,
+    activation=None,
+):
+    _, hidden_size, seq_len = hidden_states.shape
+    state_len = conv_state.shape[-1]
+
+    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
+    out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
+    out = F.silu(out[:, :, -seq_len:])
+    out = out.to(hidden_states.dtype)
+    return out, hidden_states_new[:, :, -state_len:]
+

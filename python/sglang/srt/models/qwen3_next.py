@@ -4,6 +4,7 @@ from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import divide, get_pp_group
@@ -17,7 +18,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.layernorm import GemmaRMSNorm, Qwen3NextRMSNormGated
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -44,6 +45,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_cuda,
+    is_cpu,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -52,6 +54,7 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 import triton
 import triton.language as tl
@@ -234,6 +237,8 @@ def fused_gdn_gating(
     )
     return g
 
+def gdn_gating(A_log, a, dt_bias):
+    return -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 
 class Qwen3GatedDeltaNet(nn.Module):
     def __init__(
@@ -326,15 +331,17 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
-
-        self.norm = RMSNormGated(
-            self.head_v_dim,
-            eps=self.layer_norm_epsilon,
-            group_size=None,
-            norm_before_gate=True,
-            device=torch.get_device_module().current_device(),
-            dtype=config.torch_dtype,
-        )
+        if _is_cpu:
+            self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+        else:
+            self.norm = RMSNormGated(
+                self.head_v_dim,
+                eps=self.layer_norm_epsilon,
+                group_size=None,
+                norm_before_gate=True,
+                device=torch.get_device_module().current_device(),
+                dtype=config.torch_dtype,
+            )
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -394,7 +401,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        DUAL_STREAM_TOKEN_THRESHOLD = 1024 if not _is_npu else 0
+        DUAL_STREAM_TOKEN_THRESHOLD = 1024 if not _is_npu and not _is_cpu else 0
         seq_len, _ = hidden_states.shape
         if seq_len < DUAL_STREAM_TOKEN_THRESHOLD:
             current_stream = torch.cuda.current_stream()
@@ -420,7 +427,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and is_cuda_graph:
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and is_cuda_graph and not _is_cpu:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -900,7 +907,7 @@ class Qwen3NextForCausalLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
-        self.lm_head = self.lm_head.float()
+        # self.lm_head = self.lm_head.float()
         self.logits_processor = LogitsProcessor(config)
 
         self._routed_experts_weights_of_layer = LazyValue(

@@ -19,7 +19,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from packaging.version import Version
-
+import torch.nn.functional as F
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -365,6 +365,23 @@ class Gemma3RMSNorm(CustomOp):
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
+
+class Qwen3NextRMSNormGated(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states, gate=None):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # Norm before gate
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+
+        return hidden_states.to(input_dtype)
 
 if not (
     _is_cuda or _is_hip or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_xpu
