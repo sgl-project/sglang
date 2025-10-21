@@ -8,7 +8,7 @@
 //! without requiring Python backend changes.
 
 use crate::protocols::{
-    chat::{ChatCompletionRequest, ChatMessage, UserMessageContent, ChatCompletionResponse},
+    chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, UserMessageContent},
     common::UsageInfo,
     responses::{
         ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
@@ -151,7 +151,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
         top_logprobs: req.top_logprobs,
         top_p: req.top_p,
         // Note: tools and tool_choice will be handled separately for MCP transformation
-        tools: None, // Will be set by caller if needed
+        tools: None,       // Will be set by caller if needed
         tool_choice: None, // Will be set by caller if needed
         ..Default::default()
     })
@@ -213,9 +213,11 @@ pub fn chat_to_responses(
             output.push(ResponseOutputItem::Reasoning {
                 id: format!("reasoning_{}", chat_resp.id),
                 summary: vec![],
-                content: vec![crate::protocols::responses::ResponseReasoningContent::ReasoningText {
-                    text: reasoning.clone(),
-                }],
+                content: vec![
+                    crate::protocols::responses::ResponseReasoningContent::ReasoningText {
+                        text: reasoning.clone(),
+                    },
+                ],
                 status: Some("completed".to_string()),
             });
         }
@@ -248,7 +250,8 @@ pub fn chat_to_responses(
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,
-            reasoning_tokens: u.completion_tokens_details
+            reasoning_tokens: u
+                .completion_tokens_details
                 .as_ref()
                 .and_then(|d| d.reasoning_tokens),
             prompt_tokens_details: None, // Chat response doesn't have this

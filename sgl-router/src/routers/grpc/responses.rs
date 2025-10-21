@@ -20,16 +20,13 @@ use axum::{
 };
 use bytes::Bytes;
 use serde_json::json;
-use tokio::sync::RwLock;
-use tokio_stream::StreamExt;
+use tokio::sync::{mpsc, RwLock};
+use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
-    context::SharedComponents,
-    conversions,
-    pipeline::RequestPipeline,
-    router::BackgroundTaskInfo,
+    context::SharedComponents, conversions, pipeline::RequestPipeline, router::BackgroundTaskInfo,
 };
 use crate::{
     data_connector::{
@@ -529,9 +526,6 @@ async fn convert_chat_stream_to_responses_stream(
     _conversation_storage: SharedConversationStorage,
     _conversation_item_storage: SharedConversationItemStorage,
 ) -> Response {
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::UnboundedReceiverStream;
-
     debug!("Converting chat SSE stream to responses SSE format");
 
     // Get chat streaming response
@@ -582,10 +576,7 @@ async fn convert_chat_stream_to_responses_stream(
     let stream = UnboundedReceiverStream::new(rx);
     let body = Body::from_stream(stream);
 
-    let mut response = Response::builder()
-        .status(parts.status)
-        .body(body)
-        .unwrap();
+    let mut response = Response::builder().status(parts.status).body(body).unwrap();
 
     // Copy headers from original chat response
     *response.headers_mut() = parts.headers;
@@ -1078,9 +1069,7 @@ async fn load_conversation_history(
                         items.push(ResponseInputOutputItem::Message {
                             id: format!("msg_u_{}", conv_id.0),
                             role: "user".to_string(),
-                            content: vec![ResponseContentPart::InputText {
-                                text: text.clone(),
-                            }],
+                            content: vec![ResponseContentPart::InputText { text: text.clone() }],
                             status: Some("completed".to_string()),
                         });
                     }
@@ -1111,9 +1100,7 @@ async fn load_conversation_history(
                             .unwrap_or(&"new".to_string())
                     ),
                     role: "user".to_string(),
-                    content: vec![ResponseContentPart::InputText {
-                        text: text.clone(),
-                    }],
+                    content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 });
             }
@@ -1133,16 +1120,17 @@ async fn load_conversation_history(
 // ============================================================================
 
 /// Build a request-scoped MCP manager from request tools, if present
-async fn create_mcp_manager_from_request(
-    tools: &[ResponseTool],
-) -> Option<Arc<McpClientManager>> {
+async fn create_mcp_manager_from_request(tools: &[ResponseTool]) -> Option<Arc<McpClientManager>> {
     let tool = tools
         .iter()
         .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
 
     let server_url = tool.server_url.as_ref()?.trim().to_string();
     if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
-        warn!("Ignoring MCP server_url with unsupported scheme: {}", server_url);
+        warn!(
+            "Ignoring MCP server_url with unsupported scheme: {}",
+            server_url
+        );
         return None;
     }
 
@@ -1179,7 +1167,9 @@ async fn create_mcp_manager_from_request(
 
 /// Extract function call from a chat completion response
 /// Returns (call_id, tool_name, arguments_json_str) if found
-fn extract_function_call_from_chat(response: &ChatCompletionResponse) -> Option<(String, String, String)> {
+fn extract_function_call_from_chat(
+    response: &ChatCompletionResponse,
+) -> Option<(String, String, String)> {
     // Check if response has choices with tool calls
     let choice = response.choices.first()?;
     let message = &choice.message;
@@ -1190,7 +1180,11 @@ fn extract_function_call_from_chat(response: &ChatCompletionResponse) -> Option<
             return Some((
                 tool_call.id.clone(),
                 tool_call.function.name.clone(),
-                tool_call.function.arguments.clone().unwrap_or_else(|| "{}".to_string()),
+                tool_call
+                    .function
+                    .arguments
+                    .clone()
+                    .unwrap_or_else(|| "{}".to_string()),
             ));
         }
     }
@@ -1255,13 +1249,14 @@ impl ToolLoopState {
         error: Option<String>,
     ) {
         // Add function_tool_call item with both arguments and output
-        self.conversation_history.push(ResponseInputOutputItem::FunctionToolCall {
-            id: call_id.clone(),
-            name: tool_name.clone(),
-            arguments: args_json_str.clone(),
-            output: Some(output_str.clone()),
-            status: Some("completed".to_string()),
-        });
+        self.conversation_history
+            .push(ResponseInputOutputItem::FunctionToolCall {
+                id: call_id.clone(),
+                name: tool_name.clone(),
+                arguments: args_json_str.clone(),
+                output: Some(output_str.clone()),
+                status: Some("completed".to_string()),
+            });
 
         // Add mcp_call output item for metadata
         let mcp_call = build_mcp_call_item(
@@ -1432,7 +1427,9 @@ async fn execute_tool_loop(
             .map_err(|e| format!("Pipeline execution failed: {}", e))?;
 
         // Check for function calls
-        if let Some((call_id, tool_name, args_json_str)) = extract_function_call_from_chat(&chat_response) {
+        if let Some((call_id, tool_name, args_json_str)) =
+            extract_function_call_from_chat(&chat_response)
+        {
             state.iteration += 1;
             state.total_calls += 1;
 
@@ -1454,8 +1451,9 @@ async fn execute_tool_loop(
                 );
 
                 // Convert chat response to responses format and mark as incomplete
-                let mut responses_response = conversions::chat_to_responses(&chat_response, original_request)
-                    .map_err(|e| format!("Failed to convert to responses format: {}", e))?;
+                let mut responses_response =
+                    conversions::chat_to_responses(&chat_response, original_request)
+                        .map_err(|e| format!("Failed to convert to responses format: {}", e))?;
 
                 // Mark as completed but with incomplete details
                 responses_response.status = ResponseStatus::Completed;
@@ -1465,19 +1463,27 @@ async fn execute_tool_loop(
             }
 
             // Execute the MCP tool
-            let (output_str, success, error) = match execute_mcp_call(&mcp_manager, &tool_name, &args_json_str).await {
-                Ok(output) => (output, true, None),
-                Err(err) => {
-                    warn!("Tool execution failed: {}", err);
-                    let error_msg = err.clone();
-                    // Return error as output, let model decide how to proceed
-                    let error_json = json!({ "error": err }).to_string();
-                    (error_json, false, Some(error_msg))
-                }
-            };
+            let (output_str, success, error) =
+                match execute_mcp_call(&mcp_manager, &tool_name, &args_json_str).await {
+                    Ok(output) => (output, true, None),
+                    Err(err) => {
+                        warn!("Tool execution failed: {}", err);
+                        let error_msg = err.clone();
+                        // Return error as output, let model decide how to proceed
+                        let error_json = json!({ "error": err }).to_string();
+                        (error_json, false, Some(error_msg))
+                    }
+                };
 
             // Record the call in state (includes MCP metadata)
-            state.record_call(call_id, tool_name, args_json_str, output_str, success, error);
+            state.record_call(
+                call_id,
+                tool_name,
+                args_json_str,
+                output_str,
+                success,
+                error,
+            );
 
             // Build resume request with conversation history
             // Start with original input
@@ -1538,8 +1544,9 @@ async fn execute_tool_loop(
             );
 
             // Convert final chat response to responses format
-            let mut responses_response = conversions::chat_to_responses(&chat_response, original_request)
-                .map_err(|e| format!("Failed to convert to responses format: {}", e))?;
+            let mut responses_response =
+                conversions::chat_to_responses(&chat_response, original_request)
+                    .map_err(|e| format!("Failed to convert to responses format: {}", e))?;
 
             // Inject MCP metadata into output
             if state.total_calls > 0 {
@@ -1578,9 +1585,6 @@ async fn execute_tool_loop_streaming(
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
 ) -> Response {
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::UnboundedReceiverStream;
-
     // Get server label
     let server_label = original_request
         .tools
@@ -1680,7 +1684,10 @@ async fn execute_tool_loop_streaming_internal(
     loop {
         state.iteration += 1;
         if state.iteration > MAX_ITERATIONS {
-            return Err(format!("Tool loop exceeded maximum iterations ({})", MAX_ITERATIONS));
+            return Err(format!(
+                "Tool loop exceeded maximum iterations ({})",
+                MAX_ITERATIONS
+            ));
         }
 
         debug!("Streaming MCP tool loop iteration {}", state.iteration);
@@ -1691,18 +1698,22 @@ async fn execute_tool_loop_streaming_internal(
 
         // Execute chat streaming
         let response = pipeline
-            .execute_chat(Arc::new(chat_request), headers.clone(), model_id.clone(), components.clone())
+            .execute_chat(
+                Arc::new(chat_request),
+                headers.clone(),
+                model_id.clone(),
+                components.clone(),
+            )
             .await;
 
         // Forward stream to client while accumulating for tool call detection
-        let accumulated_response = forward_and_accumulate_stream(
-            response.into_body(),
-            tx.clone(),
-        )
-        .await?;
+        let accumulated_response =
+            forward_and_accumulate_stream(response.into_body(), tx.clone()).await?;
 
         // Check for tool calls
-        if let Some((call_id, tool_name, args_json_str)) = extract_function_call_from_chat(&accumulated_response) {
+        if let Some((call_id, tool_name, args_json_str)) =
+            extract_function_call_from_chat(&accumulated_response)
+        {
             state.total_calls += 1;
 
             debug!(
@@ -1725,18 +1736,26 @@ async fn execute_tool_loop_streaming_internal(
             }
 
             // Execute the MCP tool
-            let (output_str, success, error) = match execute_mcp_call(&mcp_manager, &tool_name, &args_json_str).await {
-                Ok(output) => (output, true, None),
-                Err(err) => {
-                    warn!("Tool execution failed: {}", err);
-                    let error_msg = err.clone();
-                    let error_json = json!({ "error": err }).to_string();
-                    (error_json, false, Some(error_msg))
-                }
-            };
+            let (output_str, success, error) =
+                match execute_mcp_call(&mcp_manager, &tool_name, &args_json_str).await {
+                    Ok(output) => (output, true, None),
+                    Err(err) => {
+                        warn!("Tool execution failed: {}", err);
+                        let error_msg = err.clone();
+                        let error_json = json!({ "error": err }).to_string();
+                        (error_json, false, Some(error_msg))
+                    }
+                };
 
             // Record the call in state
-            state.record_call(call_id, tool_name, args_json_str, output_str, success, error);
+            state.record_call(
+                call_id,
+                tool_name,
+                args_json_str,
+                output_str,
+                success,
+                error,
+            );
 
             // Build next request with conversation history
             let mut input_items = match &state.original_input {
@@ -1891,15 +1910,13 @@ impl ChatResponseAccumulator {
             if let Some(tool_call_deltas) = &choice.delta.tool_calls {
                 for delta in tool_call_deltas {
                     let index = delta.index as usize;
-                    let entry = self.tool_calls.entry(index).or_insert_with(|| {
-                        ToolCall {
-                            id: String::new(),
-                            tool_type: "function".to_string(),
-                            function: FunctionCallResponse {
-                                name: String::new(),
-                                arguments: Some(String::new()),
-                            },
-                        }
+                    let entry = self.tool_calls.entry(index).or_insert_with(|| ToolCall {
+                        id: String::new(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCallResponse {
+                            name: String::new(),
+                            arguments: Some(String::new()),
+                        },
                     });
 
                     if let Some(id) = &delta.id {
@@ -1939,8 +1956,16 @@ impl ChatResponseAccumulator {
                 index: 0,
                 message: crate::protocols::chat::ChatCompletionMessage {
                     role: "assistant".to_string(),
-                    content: if self.content.is_empty() { None } else { Some(self.content) },
-                    tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                    content: if self.content.is_empty() {
+                        None
+                    } else {
+                        Some(self.content)
+                    },
+                    tool_calls: if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(tool_calls)
+                    },
                     reasoning_content: None,
                 },
                 finish_reason: self.finish_reason,

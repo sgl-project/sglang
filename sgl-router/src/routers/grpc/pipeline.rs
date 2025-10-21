@@ -8,12 +8,11 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use tokio::sync::RwLock;
-
 use async_trait::async_trait;
 use axum::response::{IntoResponse, Response};
 use proto::DisaggregatedParams;
 use rand::Rng;
+use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -22,11 +21,7 @@ use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     grpc_client::proto,
     policies::PolicyRegistry,
-    protocols::{
-        chat::ChatCompletionRequest,
-        common::InputIds,
-        generate::GenerateRequest,
-    },
+    protocols::{chat::ChatCompletionRequest, common::InputIds, generate::GenerateRequest},
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
@@ -492,7 +487,9 @@ impl PipelineStage for RequestBuildingStage {
                     })?
             }
             RequestType::Generate(request) => {
-                let request_id = request.rid.clone()
+                let request_id = request
+                    .rid
+                    .clone()
                     .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
 
                 builder_client
@@ -1106,7 +1103,9 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
         response_id: Option<String>,
-        background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, super::router::BackgroundTaskInfo>>>>,
+        background_tasks: Option<
+            Arc<RwLock<std::collections::HashMap<String, super::router::BackgroundTaskInfo>>>,
+        >,
     ) -> Result<crate::protocols::chat::ChatCompletionResponse, String> {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
 
@@ -1121,7 +1120,10 @@ impl RequestPipeline {
                     let stage_name = stage.name();
 
                     // After ClientAcquisitionStage, store client for background task cancellation
-                    if stage_name == "ClientAcquisition" && response_id.is_some() && background_tasks.is_some() {
+                    if stage_name == "ClientAcquisition"
+                        && response_id.is_some()
+                        && background_tasks.is_some()
+                    {
                         if let Some(ref clients) = ctx.state.clients {
                             let client_to_store = match clients {
                                 ClientSelection::Single { client } => client.clone(),
@@ -1133,14 +1135,20 @@ impl RequestPipeline {
                                     tasks.write().await.get_mut(response_id.as_ref().unwrap())
                                 {
                                     *task_info.client.write().await = Some(client_to_store);
-                                    debug!("Stored client for response_id: {}", response_id.as_ref().unwrap());
+                                    debug!(
+                                        "Stored client for response_id: {}",
+                                        response_id.as_ref().unwrap()
+                                    );
                                 }
                             }
                         }
                     }
 
                     // After DispatchMetadataStage, store grpc_request_id for background task cancellation
-                    if stage_name == "DispatchMetadata" && response_id.is_some() && background_tasks.is_some() {
+                    if stage_name == "DispatchMetadata"
+                        && response_id.is_some()
+                        && background_tasks.is_some()
+                    {
                         if let Some(ref dispatch) = ctx.state.dispatch {
                             let grpc_request_id = dispatch.request_id.clone();
 
@@ -1149,7 +1157,10 @@ impl RequestPipeline {
                                     tasks.write().await.get_mut(response_id.as_ref().unwrap())
                                 {
                                     task_info.grpc_request_id = grpc_request_id.clone();
-                                    debug!("Stored grpc_request_id for response_id: {}", response_id.as_ref().unwrap());
+                                    debug!(
+                                        "Stored grpc_request_id for response_id: {}",
+                                        response_id.as_ref().unwrap()
+                                    );
                                 }
                             }
                         }

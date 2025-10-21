@@ -1,7 +1,6 @@
 // gRPC Router Implementation
 
-use std::sync::Arc;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use axum::{
@@ -10,8 +9,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
+use serde_json::json;
+use tokio::{sync::RwLock, task::JoinHandle};
 use tracing::{debug, warn};
 
 /// Information stored for background tasks to enable end-to-end cancellation
@@ -31,7 +30,9 @@ use super::{context::SharedComponents, pipeline::RequestPipeline, responses};
 use crate::{
     config::types::RetryConfig,
     core::WorkerRegistry,
-    data_connector::{SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage},
+    data_connector::{
+        ResponseId, SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
+    },
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
@@ -305,9 +306,6 @@ impl RouterTrait for GrpcRouter {
         response_id: &str,
         _params: &ResponsesGetParams,
     ) -> Response {
-        use crate::data_connector::ResponseId;
-        use serde_json::json;
-
         // Convert response_id string to ResponseId
         let resp_id = ResponseId::from(response_id);
 
@@ -348,9 +346,6 @@ impl RouterTrait for GrpcRouter {
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        use crate::data_connector::ResponseId;
-        use serde_json::json;
-
         // Convert response_id string to ResponseId
         let resp_id = ResponseId::from(response_id);
 
@@ -375,13 +370,22 @@ impl RouterTrait for GrpcRouter {
                             // Abort the Python/scheduler request via gRPC (if client is available)
                             let client_opt = task_info.client.read().await;
                             if let Some(ref client) = *client_opt {
-                                if let Err(e) = client.abort_request(
-                                    task_info.grpc_request_id.clone(),
-                                    "User cancelled via API".to_string()
-                                ).await {
-                                    warn!("Failed to abort Python request {}: {}", task_info.grpc_request_id, e);
+                                if let Err(e) = client
+                                    .abort_request(
+                                        task_info.grpc_request_id.clone(),
+                                        "User cancelled via API".to_string(),
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        "Failed to abort Python request {}: {}",
+                                        task_info.grpc_request_id, e
+                                    );
                                 } else {
-                                    debug!("Successfully aborted Python request: {}", task_info.grpc_request_id);
+                                    debug!(
+                                        "Successfully aborted Python request: {}",
+                                        task_info.grpc_request_id
+                                    );
                                 }
                             } else {
                                 debug!("Client not yet available for abort, request may not have started yet");
