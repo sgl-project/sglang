@@ -1546,7 +1546,7 @@ def _wait_and_warmup(
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
     launch_callback: Optional[Callable[[], None]] = None,
 ):
-    if server_args.wait_for_initial_weights:
+    if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
     if not server_args.skip_server_warmup:
         if not _execute_server_warmup(

@@ -278,7 +278,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         # Initial weights status
         self.initial_weights_loaded = True
-        if server_args.wait_for_initial_weights:
+        if server_args.checkpoint_engine_wait_weights_before_ready:
             self.initial_weights_loaded = False
 
         # Dumping
