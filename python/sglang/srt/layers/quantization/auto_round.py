@@ -221,7 +221,6 @@ class AutoRoundConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.marlin_utils import (
             check_marlin_supported,
-            check_marlin_supports_layer,
             check_moe_marlin_supports_layer,
         )
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
