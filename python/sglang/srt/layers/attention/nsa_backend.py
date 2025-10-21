@@ -47,7 +47,7 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 
 
 @dataclass(frozen=True)
