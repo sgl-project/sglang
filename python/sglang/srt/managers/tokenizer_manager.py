@@ -76,6 +76,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
 from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
@@ -718,6 +719,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+            if hasattr(obj, 'image_data_embedding'):
+                for mm_item in mm_inputs["mm_items"]:
+                    if mm_item.modality == Modality.IMAGE:
+                        mm_item.precomputed_embeddings = obj.image_data_embedding
         else:
             mm_inputs = None
 

@@ -253,6 +253,10 @@ class ServerArgs:
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
+    
+    # Encode prefill disaggregation
+    mm_only: bool = False
+    language_only: bool = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -2236,6 +2240,16 @@ class ServerArgs:
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
             "before serving inference requests.",
+        
+        # Encode prefill disaggregation
+        parser.add_argument(
+            "--mm-only",
+            action='store_true'
+        )
+        
+        parser.add_argument(
+            "--language-only",
+            action='store_true'
         )
 
         # Quantization and data type

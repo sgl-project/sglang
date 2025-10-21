@@ -21,6 +21,7 @@ class RouterArgs:
         default_factory=list
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
+    encode_urls: List[str] = dataclasses.field(default_factory=list)
 
     # Routing policy
     policy: str = "cache_aware"
@@ -180,6 +181,7 @@ class RouterArgs:
             choices=["random", "round_robin", "cache_aware", "power_of_two"],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
+        
 
         # PD-specific arguments
         parser.add_argument(
@@ -206,6 +208,13 @@ class RouterArgs:
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
+        )
+        parser.add_argument(
+            f"--{prefix}encode",
+            nargs=1,
+            action="append",
+            metavar=("URL",),
+            help="Encode server URL. Can be specified multiple times.",
         )
         parser.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
@@ -674,6 +683,9 @@ class RouterArgs:
         args_dict["decode_urls"] = cls._parse_decode_urls(
             cli_args_dict.get(f"{prefix}decode", None)
         )
+        args_dict["encode_urls"] = cls._parse_encode_urls(
+            cli_args_dict.get(f"{prefix}encode", None)
+        )
         args_dict["selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}selector", None)
         )
@@ -780,3 +792,16 @@ class RouterArgs:
 
         # decode_list is a list of single-element lists due to nargs=1
         return [url[0] for url in decode_list]
+    
+    @staticmethod
+    def _parse_encode_urls(encode_list):
+        """Parse encode URLs from --encode arguments.
+
+        Format: --encode URL
+        Example: --encode http://encode1:8081 --encode http://encode2:8081
+        """
+        if not encode_list:
+            return []
+
+        # encode_list is a list of single-element lists due to nargs=1
+        return [url[0] for url in encode_list]
