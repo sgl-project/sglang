@@ -816,7 +816,7 @@ def model_forward_maybe_tbo(
         zero_allocator=zero_allocator,
     )
     def filter_real_layers(layers: nn.ModuleList) -> List[nn.Module]:
-        return [l for l in layers if type(l).__name__ != "PPMissingLayer"]
+        return [l for l in layers if not isinstance(l, PPMissingLayer)]
     real_layers = filter_real_layers(layers)
     if not real_layers:
         return _model_forward_non_tbo(inputs, operations_strategy)
