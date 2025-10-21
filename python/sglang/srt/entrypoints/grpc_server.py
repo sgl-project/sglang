@@ -1001,7 +1001,15 @@ def _execute_grpc_server_warmup(
             warmup_request_kwargs = {
                 "request_id": f"WARMUP_{time.time()}",
                 "tokenized": sglang_scheduler_pb2.TokenizedInput(
-                    input_ids=[123, 456, 789, 234, 567, 890, 345],  # Random-looking but safe token IDs
+                    input_ids=[
+                        123,
+                        456,
+                        789,
+                        234,
+                        567,
+                        890,
+                        345,
+                    ],  # Random-looking but safe token IDs
                     original_text="warmup request",
                 ),
                 "sampling_params": sglang_scheduler_pb2.SamplingParams(
