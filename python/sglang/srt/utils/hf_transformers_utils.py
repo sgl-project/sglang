@@ -192,7 +192,6 @@ def get_config(
         config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-        print(f"{model=}")
         if "deepseek-ai/DeepSeek-OCR" in model:
             config.model_type = "deepseek-ocr"
 

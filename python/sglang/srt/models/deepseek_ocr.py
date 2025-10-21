@@ -852,7 +852,6 @@ def _build_sam(
             {k[30:]: v for k, v in state_dict.items() if "vision_tower_high" in k},
             strict=True,
         )
-        print(checkpoint)
     return image_encoder
 
 
@@ -1294,7 +1293,6 @@ class DeepseekOCRForCausalLM(nn.Module):
                 f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
             )
 
-        print(f"{self.text_config.topk_method=}")
         if self.text_config.topk_method == "noaux_tc":
             self.model = DeepseekV3ForCausalLM(
                 config=config.text_config,
@@ -1415,12 +1413,6 @@ class DeepseekOCRForCausalLM(nn.Module):
                     )
                     global_features = self.projector(global_features)
 
-                    if PRINT_NUM_VIS_TOKENS:
-                        print("=====================")
-                        print("BASE: ", global_features.shape)
-                        print("PATCHES: ", local_features.shape)
-                        print("=====================")
-
                     _, hw, n_dim = global_features.shape
                     h = w = int(hw ** 0.5)
 
@@ -1475,12 +1467,6 @@ class DeepseekOCRForCausalLM(nn.Module):
                         dim=-1,
                     )
                     global_features = self.projector(global_features)
-
-                    if PRINT_NUM_VIS_TOKENS:
-                        print("=====================")
-                        print("BASE: ", global_features.shape)
-                        print("NO PATCHES")
-                        print("=====================")
 
                     _, hw, n_dim = global_features.shape
                     h = w = int(hw ** 0.5)
@@ -1584,7 +1570,6 @@ class DeepseekOCRForCausalLM(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vision_embeddings = self._process_image_input(items)
-        print(f"{vision_embeddings=}")
         return vision_embeddings
         # sam_model = self.model.sam_model
         # input_ids
@@ -1713,9 +1698,6 @@ class DeepseekOCRForCausalLM(nn.Module):
         get_embedding: bool = False,
         **kwargs: object,
     ):
-        print(f"{input_ids=}")
-        print(f"{positions=}")
-
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,

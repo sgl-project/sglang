@@ -175,10 +175,6 @@ class TestDeepseekServer(ImageOpenAITestMixin):
             **(self.get_vision_request_kwargs()),
         )
 
-        print("-" * 30)
-        print(f"Single image response:\n{response.choices[0].message.content}")
-        print("-" * 30)
-
         self.verify_single_image_response(response)
 
 
