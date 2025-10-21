@@ -51,7 +51,7 @@ from sglang.srt.configs import (
     Qwen3NextConfig,
     Step3VLConfig,
 )
-from sglang.srt.configs.deepseek_ocr import DeepseekOCRProcessor, DeepseekVLV2Config
+from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset

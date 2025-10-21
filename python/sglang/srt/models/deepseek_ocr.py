@@ -20,16 +20,14 @@ import copy
 import logging
 import math
 from functools import partial
-from typing import Iterable, List, Optional, Tuple, Type, TypeAlias, Union, Set
+from typing import Iterable, List, Optional, Set, Tuple, Type, TypeAlias, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 
-from sglang.srt.configs.deepseek_ocr import (
-    DeepseekVLV2Config,
-)
+from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -39,10 +37,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
-from sglang.srt.models.deepseek_v2 import (
-    DeepseekV2ForCausalLM,
-    DeepseekV3ForCausalLM,
-)
+from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.transformers import maybe_prefix
 
 NestedTensors: TypeAlias = Union[
@@ -288,7 +283,7 @@ class MlpProjector(nn.Module):
     def forward(self, x):
         if self.token_pooling:
             batch_size, wxh, channels = x.shape
-            w = h = int(wxh ** 0.5)
+            w = h = int(wxh**0.5)
             x = x.view(batch_size, w, h, channels)
             x = x.permute(0, 3, 1, 2)
             patches = x.unfold(2, 2, 2).unfold(3, 2, 2)
@@ -315,7 +310,7 @@ class MlpProjector(nn.Module):
 
         if self.projector_type == "hybrid_split_feature_mlp_gelu":
             high_x = x[..., : self.input_dim[0]]
-            low_x = x[..., self.input_dim[0]:]
+            low_x = x[..., self.input_dim[0] :]
             high_x = self.high_up_proj(high_x)
             low_x = self.low_up_proj(low_x)
             x = torch.concat([high_x, low_x], dim=-1)
@@ -447,7 +442,7 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+        self.scale = head_dim**-0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
@@ -1286,10 +1281,10 @@ class DeepseekOCRForCausalLM(nn.Module):
                     global_features = self.projector(global_features)
 
                     _, hw, n_dim = global_features.shape
-                    h = w = int(hw ** 0.5)
+                    h = w = int(hw**0.5)
 
                     _2, hw2, n_dim2 = local_features.shape
-                    h2 = w2 = int(hw2 ** 0.5)
+                    h2 = w2 = int(hw2**0.5)
 
                     width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
 
@@ -1341,7 +1336,7 @@ class DeepseekOCRForCausalLM(nn.Module):
                     global_features = self.projector(global_features)
 
                     _, hw, n_dim = global_features.shape
-                    h = w = int(hw ** 0.5)
+                    h = w = int(hw**0.5)
 
                     global_features = global_features.view(h, w, n_dim)
 
@@ -1466,7 +1461,7 @@ class DeepseekOCRForCausalLM(nn.Module):
                     or "sam_model" in name
                     or "view_seperator" in name
                 ):
-                    name = name[len("model."):]
+                    name = name[len("model.") :]
                 elif not (
                     ".projector" in name
                     or "vision_model" in name
