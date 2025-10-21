@@ -22,6 +22,29 @@ namespace {
     }                                            \
   }()
 
+#define AT_DISPATCH_BOOL2(BOOL_V1, BOOL_NAME1, BOOL_V2, BOOL_NAME2, ...) \
+  [&] {                                                                  \
+    if (BOOL_V1) {                                                       \
+      constexpr bool BOOL_NAME1 = true;                                  \
+      if (BOOL_V2) {                                                     \
+        constexpr bool BOOL_NAME2 = true;                                \
+        return __VA_ARGS__();                                            \
+      } else {                                                           \
+        constexpr bool BOOL_NAME2 = false;                               \
+        return __VA_ARGS__();                                            \
+      }                                                                  \
+    } else {                                                             \
+      constexpr bool BOOL_NAME1 = false;                                 \
+      if (BOOL_V2) {                                                     \
+        constexpr bool BOOL_NAME2 = true;                                \
+        return __VA_ARGS__();                                            \
+      } else {                                                           \
+        constexpr bool BOOL_NAME2 = false;                               \
+        return __VA_ARGS__();                                            \
+      }                                                                  \
+    }                                                                    \
+  }()
+
 // dispatch: bfloat16, float16, int8_t, fp8_e4m3
 #define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
   [&] {                                                          \
