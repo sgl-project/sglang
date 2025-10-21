@@ -74,7 +74,7 @@ class BaseIndexerMetadata(ABC):
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
-    from fast_hadamard_transform import hadamard_transform
+    from sgl_kernel import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
