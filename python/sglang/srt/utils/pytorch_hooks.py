@@ -126,9 +126,9 @@ class PytHooks(object):
         ):
 
             def _handle_int_or_tuple(parameter):
-                if type(parameter) is tuple:
+                if isinstance(parameter, tuple):
                     return list(parameter)
-                elif type(parameter) is int:
+                elif isinstance(parameter, int):
                     return [parameter, parameter]
 
             pooling_params = {}
@@ -304,5 +304,5 @@ class PytHooks(object):
             if module not in self.module_to_name_map:
                 self.module_to_name_map[module] = name
             else:
-                raise Exception("Module instance {} is not unique ".format(module))
+                raise ValueError("Module instance {} is not unique ".format(module))
         return
