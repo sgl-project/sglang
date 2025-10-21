@@ -1397,14 +1397,19 @@ fn extract_function_call_from_chat(
     // Look for tool_calls in the message
     if let Some(tool_calls) = &message.tool_calls {
         if let Some(tool_call) = tool_calls.first() {
+            let args = tool_call
+                .function
+                .arguments
+                .clone()
+                .unwrap_or_else(|| "{}".to_string());
+
+            debug!("Raw arguments from scheduler: {:?}", args);
+            debug!("Raw arguments first 100 chars: {}", &args.chars().take(100).collect::<String>());
+
             return Some((
                 tool_call.id.clone(),
                 tool_call.function.name.clone(),
-                tool_call
-                    .function
-                    .arguments
-                    .clone()
-                    .unwrap_or_else(|| "{}".to_string()),
+                args,
             ));
         }
     }
@@ -1418,14 +1423,24 @@ async fn execute_mcp_call(
     tool_name: &str,
     args_json_str: &str,
 ) -> Result<String, String> {
-    debug!("MCP call args_json_str: {}", args_json_str);
+    debug!("MCP call raw args_json_str: {}", args_json_str);
+    debug!("MCP call args_json_str debug: {:?}", args_json_str);
 
     // Handle potential double-encoding: if the string is JSON-encoded JSON, parse twice
     let mut args_value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(args_json_str) {
         Ok(val) => {
+            debug!("First parse result type: {}", match &val {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string (double-encoded!)",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object (correct)",
+            });
+
             // Check if we got a string (double-encoded)
             if let Some(inner_str) = val.as_str() {
-                debug!("Double-encoded JSON detected, parsing again");
+                debug!("Double-encoded JSON detected! Inner string: {}", inner_str);
                 serde_json::from_str::<serde_json::Value>(inner_str)
                     .map_err(|e| format!("parse inner tool args: {}", e))?
             } else {
