@@ -350,7 +350,6 @@ fn detect_format_with_ast(template: &str) -> Option<ChatTemplateContentFormat> {
 #[derive(Default)]
 pub struct ChatTemplateParams<'a> {
     pub add_generation_prompt: bool,
-    pub continue_final_message: bool,
     pub tools: Option<&'a [serde_json::Value]>,
     pub documents: Option<&'a [serde_json::Value]>,
     pub template_kwargs: Option<&'a HashMap<String, serde_json::Value>>,
@@ -377,10 +376,6 @@ impl ChatTemplateProcessor {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
-        // Validate incompatible options
-        if params.continue_final_message && params.add_generation_prompt {
-            return Err(anyhow!("continue_final_message and add_generation_prompt are not compatible. Use continue_final_message when you want the model to continue the final message, and add_generation_prompt when you want to add a header that will prompt it to start a new assistant message instead."));
-        }
         let mut env = Environment::new();
 
         // Register the template
