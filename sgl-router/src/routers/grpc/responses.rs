@@ -617,6 +617,15 @@ async fn process_and_transform_sse_stream(
     // Create accumulator for final response
     let mut accumulator = StreamingResponseAccumulator::new(&original_request);
 
+    // Create event emitter for OpenAI-compatible streaming
+    let response_id = format!("resp_{}", Uuid::new_v4());
+    let model = original_request
+        .model
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let created_at = chrono::Utc::now().timestamp() as u64;
+    let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
+
     // Convert body to data stream
     let mut stream = body.into_data_stream();
 
@@ -643,19 +652,8 @@ async fn process_and_transform_sse_stream(
                     // Update accumulator
                     accumulator.process_chunk(&chat_chunk);
 
-                    // Convert to responses delta format
-                    let responses_delta = convert_chat_chunk_to_responses_delta(&chat_chunk);
-
-                    // Emit converted SSE event
-                    let delta_json = serde_json::to_string(&responses_delta)
-                        .map_err(|e| format!("Failed to serialize delta: {}", e))?;
-
-                    if tx
-                        .send(Ok(Bytes::from(format!("data: {}\n\n", delta_json))))
-                        .is_err()
-                    {
-                        return Err("Client disconnected".to_string());
-                    }
+                    // Process chunk through event emitter (emits proper OpenAI events)
+                    event_emitter.process_chunk(&chat_chunk, &tx)?;
                 }
                 Err(_) => {
                     // Not a valid chat chunk - might be error event, pass through
@@ -884,96 +882,276 @@ impl StreamingResponseAccumulator {
     }
 }
 
-/// Convert ChatCompletionStreamResponse to ResponsesResponse delta format
-fn convert_chat_chunk_to_responses_delta(
-    chunk: &ChatCompletionStreamResponse,
-) -> serde_json::Value {
-    let mut delta = json!({
-        "id": chunk.id,
-        "object": "response.delta",
-        "created_at": chunk.created,
-        "model": chunk.model,
-    });
+/// OpenAI-compatible event emitter for /v1/responses streaming
+///
+/// Manages state and sequence numbers to emit proper event types:
+/// - response.created
+/// - response.in_progress
+/// - response.output_item.added
+/// - response.content_part.added
+/// - response.output_text.delta (multiple)
+/// - response.output_text.done
+/// - response.content_part.done
+/// - response.output_item.done
+/// - response.completed
+struct ResponseStreamEventEmitter {
+    sequence_number: u64,
+    response_id: String,
+    model: String,
+    created_at: u64,
+    message_id: String,
+    content_part_id: String,
+    accumulated_text: String,
+    has_emitted_created: bool,
+    has_emitted_in_progress: bool,
+    has_emitted_output_item_added: bool,
+    has_emitted_content_part_added: bool,
+}
 
-    if let Some(choice) = chunk.choices.first() {
-        let mut output_deltas = Vec::new();
+impl ResponseStreamEventEmitter {
+    fn new(response_id: String, model: String, created_at: u64) -> Self {
+        let message_id = format!("msg_{}", Uuid::new_v4());
+        let content_part_id = format!("part_{}", Uuid::new_v4());
 
-        // Content delta
-        if let Some(content) = &choice.delta.content {
-            output_deltas.push(json!({
+        Self {
+            sequence_number: 0,
+            response_id,
+            model,
+            created_at,
+            message_id,
+            content_part_id,
+            accumulated_text: String::new(),
+            has_emitted_created: false,
+            has_emitted_in_progress: false,
+            has_emitted_output_item_added: false,
+            has_emitted_content_part_added: false,
+        }
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        let seq = self.sequence_number;
+        self.sequence_number += 1;
+        seq
+    }
+
+    fn emit_created(&mut self) -> serde_json::Value {
+        self.has_emitted_created = true;
+        json!({
+            "type": "response.created",
+            "sequence_number": self.next_sequence(),
+            "response": {
+                "id": self.response_id,
+                "object": "response",
+                "created_at": self.created_at,
+                "status": "in_progress",
+                "model": self.model,
+                "output": []
+            }
+        })
+    }
+
+    fn emit_in_progress(&mut self) -> serde_json::Value {
+        self.has_emitted_in_progress = true;
+        json!({
+            "type": "response.in_progress",
+            "sequence_number": self.next_sequence(),
+            "response": {
+                "id": self.response_id,
+                "object": "response",
+                "status": "in_progress"
+            }
+        })
+    }
+
+    fn emit_output_item_added(&mut self) -> serde_json::Value {
+        self.has_emitted_output_item_added = true;
+        json!({
+            "type": "response.output_item.added",
+            "sequence_number": self.next_sequence(),
+            "item": {
+                "id": self.message_id.clone(),
                 "type": "message",
-                "delta": {
+                "role": "assistant",
+                "content": []
+            }
+        })
+    }
+
+    fn emit_content_part_added(&mut self) -> serde_json::Value {
+        self.has_emitted_content_part_added = true;
+        json!({
+            "type": "response.content_part.added",
+            "sequence_number": self.next_sequence(),
+            "part": {
+                "id": self.content_part_id.clone(),
+                "type": "text",
+                "text": ""
+            }
+        })
+    }
+
+    fn emit_text_delta(&mut self, delta: &str) -> serde_json::Value {
+        self.accumulated_text.push_str(delta);
+        json!({
+            "type": "response.output_text.delta",
+            "sequence_number": self.next_sequence(),
+            "delta": delta,
+            "content_part_id": self.content_part_id.clone()
+        })
+    }
+
+    fn emit_text_done(&mut self) -> serde_json::Value {
+        json!({
+            "type": "response.output_text.done",
+            "sequence_number": self.next_sequence(),
+            "content_part_id": self.content_part_id.clone(),
+            "text": self.accumulated_text.clone()
+        })
+    }
+
+    fn emit_content_part_done(&mut self) -> serde_json::Value {
+        json!({
+            "type": "response.content_part.done",
+            "sequence_number": self.next_sequence(),
+            "part": {
+                "id": self.content_part_id.clone(),
+                "type": "text",
+                "text": self.accumulated_text.clone()
+            }
+        })
+    }
+
+    fn emit_output_item_done(&mut self) -> serde_json::Value {
+        json!({
+            "type": "response.output_item.done",
+            "sequence_number": self.next_sequence(),
+            "item": {
+                "id": self.message_id.clone(),
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": self.accumulated_text.clone()
+                }]
+            }
+        })
+    }
+
+    fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
+        let mut response = json!({
+            "type": "response.completed",
+            "sequence_number": self.next_sequence(),
+            "response": {
+                "id": self.response_id,
+                "object": "response",
+                "created_at": self.created_at,
+                "status": "completed",
+                "model": self.model,
+                "output": [{
+                    "id": self.message_id.clone(),
+                    "type": "message",
+                    "role": "assistant",
                     "content": [{
                         "type": "text",
-                        "text": content
+                        "text": self.accumulated_text.clone()
                     }]
-                }
-            }));
+                }]
+            }
+        });
+
+        if let Some(usage_val) = usage {
+            response["response"]["usage"] = usage_val.clone();
         }
 
-        // Reasoning delta
-        if let Some(reasoning) = &choice.delta.reasoning_content {
-            output_deltas.push(json!({
-                "type": "reasoning",
-                "delta": {
-                    "content": [{
-                        "type": "text",
-                        "text": reasoning
-                    }]
-                }
-            }));
+        response
+    }
+
+    /// Process a chunk and emit appropriate events
+    fn process_chunk(
+        &mut self,
+        chunk: &ChatCompletionStreamResponse,
+        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    ) -> Result<(), String> {
+        // Emit initial events if not yet done
+        if !self.has_emitted_created {
+            let event = self.emit_created();
+            self.send_event(&event, tx)?;
         }
 
-        // Tool call deltas
-        if let Some(tool_calls) = &choice.delta.tool_calls {
-            for tool_call in tool_calls {
-                let mut tool_delta = json!({
-                    "type": "function_tool_call",
-                    "index": tool_call.index,
-                });
+        if !self.has_emitted_in_progress {
+            let event = self.emit_in_progress();
+            self.send_event(&event, tx)?;
+        }
 
-                let mut delta_fields = serde_json::Map::new();
-                if let Some(id) = &tool_call.id {
-                    delta_fields.insert("id".to_string(), json!(id));
-                }
-                if let Some(function) = &tool_call.function {
-                    if let Some(name) = &function.name {
-                        delta_fields.insert("name".to_string(), json!(name));
+        // Process content if present
+        if let Some(choice) = chunk.choices.first() {
+            if let Some(content) = &choice.delta.content {
+                if !content.is_empty() {
+                    // Emit structure events before first content
+                    if !self.has_emitted_output_item_added {
+                        let event = self.emit_output_item_added();
+                        self.send_event(&event, tx)?;
                     }
-                    if let Some(args) = &function.arguments {
-                        delta_fields.insert("arguments".to_string(), json!(args));
+                    if !self.has_emitted_content_part_added {
+                        let event = self.emit_content_part_added();
+                        self.send_event(&event, tx)?;
                     }
-                }
 
-                tool_delta["delta"] = json!(delta_fields);
-                output_deltas.push(tool_delta);
+                    // Emit text delta
+                    let event = self.emit_text_delta(content);
+                    self.send_event(&event, tx)?;
+                }
+            }
+
+            // Check for finish_reason to emit completion events
+            if let Some(reason) = &choice.finish_reason {
+                if reason == "stop" || reason == "length" {
+                    // Emit closing events
+                    if self.has_emitted_content_part_added {
+                        let event = self.emit_text_done();
+                        self.send_event(&event, tx)?;
+                        let event = self.emit_content_part_done();
+                        self.send_event(&event, tx)?;
+                    }
+                    if self.has_emitted_output_item_added {
+                        let event = self.emit_output_item_done();
+                        self.send_event(&event, tx)?;
+                    }
+
+                    // Emit completed with usage if available
+                    let usage = chunk.usage.as_ref().map(|u| {
+                        json!({
+                            "prompt_tokens": u.prompt_tokens,
+                            "completion_tokens": u.completion_tokens,
+                            "total_tokens": u.total_tokens
+                        })
+                    });
+                    let event = self.emit_completed(usage.as_ref());
+                    self.send_event(&event, tx)?;
+                }
             }
         }
 
-        if !output_deltas.is_empty() {
-            delta["output"] = json!(output_deltas);
-        }
-
-        // Finish reason
-        if let Some(reason) = &choice.finish_reason {
-            delta["status"] = json!(match reason.as_str() {
-                "stop" | "length" => "completed",
-                "tool_calls" => "in_progress",
-                _ => "completed",
-            });
-        }
+        Ok(())
     }
 
-    // Usage delta
-    if let Some(usage) = &chunk.usage {
-        delta["usage"] = json!({
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-        });
-    }
+    fn send_event(
+        &self,
+        event: &serde_json::Value,
+        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    ) -> Result<(), String> {
+        let event_json = serde_json::to_string(event)
+            .map_err(|e| format!("Failed to serialize event: {}", e))?;
 
-    delta
+        if tx
+            .send(Ok(Bytes::from(format!("data: {}\n\n", event_json))))
+            .is_err()
+        {
+            return Err("Client disconnected".to_string());
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================
