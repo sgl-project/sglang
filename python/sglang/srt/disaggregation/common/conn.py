@@ -5,7 +5,7 @@ import logging
 import socket
 import threading
 from functools import cache
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -37,6 +37,9 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     maybe_wrap_ipv6_address,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.disaggregation.mooncake.conn import KVArgsRegisterInfo, TransferInfo
 
 logger = logging.getLogger(__name__)
 
