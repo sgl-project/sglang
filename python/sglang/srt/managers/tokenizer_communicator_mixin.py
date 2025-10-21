@@ -638,43 +638,27 @@ class TokenizerCommunicatorMixin:
         if self.log_requests:
             if self.log_requests_level == 0:
                 max_length = 1 << 30
-                skip_names = set(
-                    [
-                        "text",
-                        "input_ids",
-                        "input_embeds",
-                        "image_data",
-                        "audio_data",
-                        "lora_path",
-                        "sampling_params",
-                    ]
-                )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                        "embedding",
-                    ]
-                )
+                skip_names = {
+                    "text",
+                    "input_ids",
+                    "input_embeds",
+                    "image_data",
+                    "audio_data",
+                    "lora_path",
+                    "sampling_params",
+                }
+                out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 1:
                 max_length = 1 << 30
-                skip_names = set(
-                    [
-                        "text",
-                        "input_ids",
-                        "input_embeds",
-                        "image_data",
-                        "audio_data",
-                        "lora_path",
-                    ]
-                )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                        "embedding",
-                    ]
-                )
+                skip_names = {
+                    "text",
+                    "input_ids",
+                    "input_embeds",
+                    "image_data",
+                    "audio_data",
+                    "lora_path",
+                }
+                out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 2:
                 max_length = 2048
             elif self.log_requests_level == 3:
