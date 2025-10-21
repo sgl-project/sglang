@@ -639,9 +639,6 @@ class TokenizedGenerateReqInput(BaseReq):
     # tracing context
     trace_context: Optional[Dict] = None
 
-    # For custom metric labels
-    custom_labels: Optional[Dict[str, str]] = None
-
     # For custom request attributes (logging only, separate from metrics)
     custom_request_attributes: Optional[Dict[str, str]] = None
 

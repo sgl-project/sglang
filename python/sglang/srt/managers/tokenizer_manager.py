@@ -745,7 +745,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
-                custom_labels=obj.custom_labels,
                 custom_request_attributes=obj.custom_request_attributes,
             )
         elif isinstance(obj, EmbeddingReqInput):
