@@ -382,7 +382,6 @@ pub fn process_chat_messages(
 
         let params = ChatTemplateParams {
             add_generation_prompt: true,
-            continue_final_message: request.continue_final_message,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             ..Default::default()

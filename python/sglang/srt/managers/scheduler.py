@@ -63,7 +63,6 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -114,7 +113,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
-from sglang.srt.managers.overlap_utils import FutureIndices, FutureMap
+from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -143,16 +142,14 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.utils import validate_input_length
+from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
-from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
@@ -200,77 +197,6 @@ GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
 @dataclass
-class GenerationBatchResult:
-    logits_output: Optional[LogitsProcessorOutput] = None
-    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
-    next_token_ids: Optional[torch.Tensor] = None
-    num_accepted_tokens: Optional[int] = None
-    can_run_cuda_graph: bool = False
-
-    # For output processing
-    extend_input_len_per_req: Optional[List[int]] = None
-    extend_logprob_start_len_per_req: Optional[List[int]] = None
-
-    # For overlap scheduling
-    copy_done: Optional[torch.cuda.Event] = None
-    delay_sample_func: Optional[callable] = None
-    future_indices: Optional[FutureIndices] = None
-
-    # FIXME(lsyin): maybe move to a better place?
-    # sync path: forward stream -> output processor
-    accept_lens: Optional[torch.Tensor] = None
-    allocate_lens: Optional[torch.Tensor] = None
-
-    # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
-
-    def copy_to_cpu(self, return_logprob: bool = False):
-        """Copy tensors to CPU in overlap scheduling.
-        Only the tensors which are needed for processing results are copied,
-        e.g., next_token_ids, logits outputs
-        """
-        if return_logprob:
-            if self.logits_output.next_token_logits is not None:
-                self.logits_output.next_token_logits = (
-                    self.logits_output.next_token_logits.to("cpu", non_blocking=True)
-                )
-            if self.logits_output.input_token_logprobs is not None:
-                self.logits_output.input_token_logprobs = (
-                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
-                )
-        if self.logits_output.hidden_states is not None:
-            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
-                "cpu", non_blocking=True
-            )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
-
-        if self.accept_lens is not None:
-            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
-
-        if self.allocate_lens is not None:
-            self.allocate_lens = self.allocate_lens.to("cpu", non_blocking=True)
-
-        self.copy_done.record()
-
-    @classmethod
-    def from_pp_proxy(
-        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
-    ):
-        # TODO(lsyin): refactor PP and avoid using dict
-        proxy_dict = next_pp_outputs.tensors
-        return cls(
-            logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
-            next_token_ids=next_pp_outputs["next_token_ids"],
-            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
-            extend_logprob_start_len_per_req=proxy_dict.get(
-                "extend_logprob_start_len_per_req", None
-            ),
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
-
-
-@dataclass
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
 
@@ -308,6 +234,9 @@ class Scheduler(
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.abort_on_priority_when_disabled = (
+            server_args.abort_on_priority_when_disabled
+        )
         self.schedule_low_priority_values_first = (
             server_args.schedule_low_priority_values_first
         )
@@ -1440,7 +1369,11 @@ class Scheduler(
                 req.priority = sys.maxsize
             else:
                 req.priority = -sys.maxsize - 1
-        elif not self.enable_priority_scheduling and req.priority is not None:
+        elif (
+            not self.enable_priority_scheduling
+            and req.priority is not None
+            and self.abort_on_priority_when_disabled
+        ):
             abort_req = AbortReq(
                 finished_reason={
                     "type": "abort",
