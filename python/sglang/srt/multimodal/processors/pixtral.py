@@ -12,6 +12,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 
+from sglang.srt.utils import get_bool_env_var
+
+SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 class PixtralProcessor(BaseMultimodalProcessor):
     models = [PixtralVisionModel]
@@ -87,10 +90,17 @@ class PixtralProcessor(BaseMultimodalProcessor):
         if mm_data.images:
             resize_tasks = [self._resize(image) for image in mm_data.images]
             mm_data.images = await asyncio.gather(*resize_tasks)
-
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            mm_data, self.mm_tokens
-        )
+        
+        if SGL_USE_CUDA_IPC:
+            async with self._cache_lock:
+                mm_items, input_ids, _ = self.process_and_combine_mm_data(
+                    mm_data, self.mm_tokens
+                )
+        else:
+            mm_items, input_ids, _ = self.process_and_combine_mm_data(
+                mm_data, self.mm_tokens
+            )
+            
 
         return {
             "mm_items": mm_items,

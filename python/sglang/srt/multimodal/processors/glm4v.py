@@ -10,6 +10,9 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
+from sglang.srt.utils import get_bool_env_var
+
+SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
     models = [Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration]
@@ -101,11 +104,17 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # transformer requires the video inputs to be under this format
             base_output.videos = [base_output.videos]
             video_metadata = [video_metadata]
-
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens, video_metadata=video_metadata
-        )
-
+        
+        if SGL_USE_CUDA_IPC:
+            async with self._cache_lock:
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens, video_metadata=video_metadata
+                )
+        else:
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens, video_metadata=video_metadata
+            )
+            
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
             input_ids=input_ids.unsqueeze(0),
