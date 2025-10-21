@@ -63,7 +63,7 @@ pub async fn route_responses(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
-    background_tasks: Arc<RwLock<std::collections::HashMap<String, BackgroundTaskInfo>>>,
+    background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 ) -> Response {
     // 1. Validate mutually exclusive parameters
     if request.previous_response_id.is_some() && request.conversation.is_some() {
@@ -166,7 +166,7 @@ async fn route_responses_sync(
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
     response_id: Option<String>,
-    background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, BackgroundTaskInfo>>>>,
+    background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Response {
     match route_responses_internal(
         pipeline,
@@ -208,7 +208,7 @@ async fn route_responses_internal(
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
     response_id: Option<String>,
-    background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, BackgroundTaskInfo>>>>,
+    background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Result<ResponsesResponse, String> {
     // 1. Load conversation history and build modified request
     let modified_request = load_conversation_history(
@@ -301,7 +301,7 @@ async fn route_responses_background(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
-    background_tasks: Arc<RwLock<std::collections::HashMap<String, BackgroundTaskInfo>>>,
+    background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 ) -> Response {
     // Generate response_id for background tracking
     let response_id = format!("resp_{}", Uuid::new_v4());
@@ -890,9 +890,9 @@ impl StreamingResponseAccumulator {
 /// Output item type tracking for proper event emission
 #[derive(Debug, Clone)]
 enum OutputItemType {
-    Message { content_index: usize },
+    Message,
     McpListTools,
-    McpCall { name: String },
+    McpCall,
     Reasoning,
 }
 
@@ -901,14 +901,11 @@ enum OutputItemType {
 enum ItemStatus {
     InProgress,
     Completed,
-    Failed,
 }
 
 /// State tracking for a single output item
 #[derive(Debug, Clone)]
 struct OutputItemState {
-    id: String,
-    item_type: OutputItemType,
     output_index: usize,
     status: ItemStatus,
 }
@@ -942,7 +939,6 @@ struct ResponseStreamEventEmitter {
     model: String,
     created_at: u64,
     message_id: String,
-    content_part_id: String,
     accumulated_text: String,
     has_emitted_created: bool,
     has_emitted_in_progress: bool,
@@ -960,7 +956,6 @@ struct ResponseStreamEventEmitter {
 impl ResponseStreamEventEmitter {
     fn new(response_id: String, model: String, created_at: u64) -> Self {
         let message_id = format!("msg_{}", Uuid::new_v4());
-        let content_part_id = format!("part_{}", Uuid::new_v4());
 
         Self {
             sequence_number: 0,
@@ -968,7 +963,6 @@ impl ResponseStreamEventEmitter {
             model,
             created_at,
             message_id,
-            content_part_id,
             accumulated_text: String::new(),
             has_emitted_created: false,
             has_emitted_in_progress: false,
@@ -1276,16 +1270,14 @@ impl ResponseStreamEventEmitter {
 
         let id_prefix = match &item_type {
             OutputItemType::McpListTools => "mcpl",
-            OutputItemType::McpCall { .. } => "mcp",
-            OutputItemType::Message { .. } => "msg",
+            OutputItemType::McpCall => "mcp",
+            OutputItemType::Message => "msg",
             OutputItemType::Reasoning => "rs",
         };
 
         let id = Self::generate_item_id(id_prefix);
 
         self.output_items.push(OutputItemState {
-            id: id.clone(),
-            item_type,
             output_index: index,
             status: ItemStatus::InProgress,
         });
@@ -1352,8 +1344,8 @@ impl ResponseStreamEventEmitter {
                 if !content.is_empty() {
                     // Allocate output_index and item_id for this message item (once per message)
                     if self.current_item_id.is_none() {
-                        let (output_index, item_id) = self
-                            .allocate_output_index(OutputItemType::Message { content_index: 0 });
+                        let (output_index, item_id) =
+                            self.allocate_output_index(OutputItemType::Message);
 
                         // Build message item structure
                         let item = json!({
@@ -1781,7 +1773,7 @@ async fn execute_mcp_call(
                     .get(key)
                     .and_then(|s| s.get("type"))
                     .and_then(|t| t.as_str())
-                    .map_or(false, |t| matches!(t, "number" | "integer"));
+                    .is_some_and(|t| matches!(t, "number" | "integer"));
 
                 if should_be_number {
                     if let Some(s) = val.as_str() {
@@ -1938,7 +1930,7 @@ async fn execute_without_mcp(
     model_id: Option<String>,
     components: Arc<SharedComponents>,
     response_id: Option<String>,
-    background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, BackgroundTaskInfo>>>>,
+    background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Result<ResponsesResponse, String> {
     // Convert ResponsesRequest → ChatCompletionRequest
     let chat_request = conversions::responses_to_chat(modified_request)
@@ -1979,7 +1971,7 @@ async fn execute_tool_loop(
     components: Arc<SharedComponents>,
     mcp_manager: Arc<McpClientManager>,
     response_id: Option<String>,
-    background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, BackgroundTaskInfo>>>>,
+    background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Result<ResponsesResponse, String> {
     // Get server label from original request tools
     let server_label = original_request
@@ -2451,9 +2443,7 @@ async fn execute_tool_loop_streaming_internal(
 
                 // Allocate output_index for this mcp_call item
                 let (output_index, item_id) =
-                    emitter.allocate_output_index(OutputItemType::McpCall {
-                        name: tool_name.clone(),
-                    });
+                    emitter.allocate_output_index(OutputItemType::McpCall);
 
                 // Build initial mcp_call item
                 let item = json!({
@@ -2675,7 +2665,7 @@ struct ChatResponseAccumulator {
     id: String,
     model: String,
     content: String,
-    tool_calls: std::collections::HashMap<usize, ToolCall>,
+    tool_calls: HashMap<usize, ToolCall>,
     finish_reason: Option<String>,
 }
 
@@ -2685,7 +2675,7 @@ impl ChatResponseAccumulator {
             id: String::new(),
             model: String::new(),
             content: String::new(),
-            tool_calls: std::collections::HashMap::new(),
+            tool_calls: HashMap::new(),
             finish_reason: None,
         }
     }

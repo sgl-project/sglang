@@ -71,7 +71,7 @@ pub struct Conversation {
 impl Conversation {
     pub fn new(new_conversation: NewConversation) -> Self {
         Self {
-            id: new_conversation.id.unwrap_or_else(|| ConversationId::new()),
+            id: new_conversation.id.unwrap_or_default(),
             created_at: Utc::now(),
             metadata: new_conversation.metadata,
         }
