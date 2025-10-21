@@ -1244,6 +1244,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32), requires_grad=False
         )
 
+        layer.dispatcher.set_quant_config(
+            {"input_global_scale": layer.w13_input_scale_quant}
+        )
+
         # Validate weight scales
         for name, weight_scale in [
             ("w13", layer.w13_weight_scale),
