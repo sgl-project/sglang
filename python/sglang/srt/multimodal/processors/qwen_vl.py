@@ -19,6 +19,9 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.utils import logger
+from sglang.srt.utils import get_bool_env_var
+
+SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
@@ -264,11 +267,16 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             base_output.videos = [
                 await preprocess_video(video) for video in base_output.videos
             ]
-        
-        async with self._cache_lock:
+        if SGL_USE_CUDA_IPC:
+            async with self._cache_lock:
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens
+                )
+        else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
                 base_output, self.mm_tokens
             )
+            
 
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(

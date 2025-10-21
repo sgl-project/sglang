@@ -15,11 +15,11 @@ from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.mm_utils import TransportProxyTensor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem, CudaIpcTensorTransportProxy, MmItemMemoryPool, MM_ITEM_VERIFY_BYTES, MM_FEATURE_CACHE_SIZE
-from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
+from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger, get_bool_env_var
 
 _is_npu = is_npu()
 
-SGL_USE_CUDA_IPC = 1
+SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
@@ -213,7 +213,7 @@ class BaseMultimodalProcessor(ABC):
         
         if SGL_USE_CUDA_IPC:
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(MM_FEATURE_CACHE_SIZE)
-        self._cache_lock = asyncio.Lock()
+            self._cache_lock = asyncio.Lock()
         
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -667,26 +667,9 @@ class BaseMultimodalProcessor(ABC):
                 input_ids=input_ids,
                 mm_token_id=mm_token_id,
             )
-
-        # # post-process
-        # if SGL_USE_CUDA_IPC:
-        #     for item in all_collected_items:
-        #         print("self.transport_mode {}".format(self.transport_mode))
-        #         # replace the feature tensor with a proxy
-        #         if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-        #             item.feature = TransportProxyTensor(
-        #                 transport_mode=self.transport_mode, data=item.feature
-        #             )
-        #         elif (
-        #             isinstance(item.precomputed_embeddings, torch.Tensor)
-        #             and item.precomputed_embeddings.is_cuda
-        #         ):
-        #             item.precomputed_embeddings = TransportProxyTensor(
-        #                 transport_mode=self.transport_mode, data=item.precomputed_embeddings
-        #             )
         
         """
-        total-design:
+        solution for cuda-ipc memory-leak:
         1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
         2. if can not get a slice , transport normal tensor
         3. copy tensor in scheduler and release it (use position mark)
@@ -696,19 +679,11 @@ class BaseMultimodalProcessor(ABC):
         if SGL_USE_CUDA_IPC:
             # post-process
             for item in all_collected_items:
-                # print("self.transport_mode {}".format(self.transport_mode))
-                # replace the feature tensor with a proxy
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                    # print("check_device {}".format(item.feature.device))
-                    # print("check addr {}".format(item.feature.data_ptr()))
-                    # self.addr_set.add(item.feature.data_ptr())
-                    # print("shared ipc ptr nums {}".format(len(self.addr_set)))
                     available_slice = self.cudaipc_mmfeature_pool.return_a_slice_tensor(item.feature)
                     if isinstance(available_slice, torch.Tensor):
-                        # memory_size = item.feature.numel() * item.feature.element_size()
                         available_slice[:-MM_ITEM_VERIFY_BYTES].copy_(item.feature.view(torch.int8).view(-1), non_blocking= True)                        
                         item.feature = CudaIpcTensorTransportProxy(data= available_slice, info_data= item.feature)
-                    # else : can not use cuda-ipc case(for memory is not engugh), can only use raw tensor
                 elif (
                     isinstance(item.precomputed_embeddings, torch.Tensor)
                     and item.precomputed_embeddings.is_cuda
@@ -716,9 +691,7 @@ class BaseMultimodalProcessor(ABC):
                     
                     available_slice = self.cudaipc_mmfeature_pool.return_a_slice_tensor(item.precomputed_embeddings)
                     if isinstance(available_slice, torch.Tensor):
-                        # memory_size = item.feature.numel() * item.feature.element_size()
                         available_slice[:-MM_ITEM_VERIFY_BYTES].copy_(item.precomputed_embeddings.view(torch.int8), non_blocking= True)                        
                         item.precomputed_embeddings = CudaIpcTensorTransportProxy(data= available_slice, info_data= item.precomputed_embeddings)
-                    # else : can not use cuda-ipc case(for memory is not engugh), can only use raw tensor
 
         return all_collected_items, input_ids, ret
