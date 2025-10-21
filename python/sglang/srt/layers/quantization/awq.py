@@ -40,10 +40,11 @@ if TYPE_CHECKING:
         CombineInput,
     )
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_xpu, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _is_npu = is_npu()
 
 if _is_npu:
@@ -64,8 +65,12 @@ elif _is_hip:
     )
 
     warnings.warn(f"HIP does not support fused_marlin_moe currently.")
+elif _is_xpu:
+    from sgl_kernel import awq_dequantize
+
+    warnings.warn(f"XPU does not support fused_marlin_moe currently.")
 else:
-    warnings.warn(f"Only CUDA and HIP support AWQ currently.")
+    warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
 
 logger = logging.getLogger(__name__)
 

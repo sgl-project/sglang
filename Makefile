@@ -24,7 +24,9 @@ FILES_TO_UPDATE = docker/Dockerfile.rocm \
                  docs/get_started/install.md \
                  docs/platforms/amd_gpu.md \
                  docs/platforms/ascend_npu.md \
-                 benchmark/deepseek_v3/README.md
+				 docs/platforms/cpu_server.md \
+				 docs/platforms/xpu.md \
+				 benchmark/deepseek_v3/README.md
 
 update: ## Update version numbers across project files. Usage: make update <new_version>
 	@if [ -z "$(filter-out $@,$(MAKECMDGOALS))" ]; then \
