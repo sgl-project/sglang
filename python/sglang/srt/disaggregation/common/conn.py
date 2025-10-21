@@ -39,7 +39,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.mooncake.conn import KVArgsRegisterInfo, TransferInfo
+    from sglang.srt.disaggregation.mooncake.conn import TransferInfo
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ class CommonKVManager(BaseKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._register_to_bootstrap()
             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
-            self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
+            self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
