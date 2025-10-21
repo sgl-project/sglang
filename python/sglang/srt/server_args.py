@@ -91,6 +91,7 @@ QUANTIZATION_CHOICES = [
     "qoq",
     "w4afp8",
     "mxfp4",
+    "compressed-tensors",  # for Ktransformers
 ]
 
 ATTENTION_BACKEND_CHOICES = [
@@ -389,6 +390,13 @@ class ServerArgs:
     # LMCache
     enable_lmcache: bool = False
 
+    # Ktransformers
+    kt_amx_weight_path: Optional[str] = None
+    kt_amx_method: Optional[str] = None
+    kt_cpuinfer: Optional[int] = None
+    kt_threadpool_count: Optional[int] = None
+    kt_num_gpu_experts: Optional[int] = None
+
     # Double Sparsity
     enable_double_sparsity: bool = False
     ds_channel_config_path: Optional[str] = None
@@ -544,6 +552,9 @@ class ServerArgs:
         self._handle_amd_specifics()
         self._handle_grammar_backend()
 
+        # Handle Ktransformers specific configs
+        self._handle_ktransformers_configs()
+
         # Handle data parallelism.
         self._handle_data_parallelism()
 
@@ -594,6 +605,22 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+    def _handle_ktransformers_configs(self):
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+            CompressedTensorsWNA16AMXEPMoEMethod,
+            override_config,
+        )
+
+        override_config(
+            CompressedTensorsWNA16AMXEPMoEMethod,
+            self.kt_num_gpu_experts,
+            self.kt_cpuinfer,
+            self.kt_threadpool_count,
+            self.kt_amx_weight_path,
+            self.kt_amx_method,
+            self.chunked_prefill_size,
+        )
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -1518,6 +1545,7 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+
         # Model and tokenizer
         parser.add_argument(
             "--model-path",
@@ -2673,6 +2701,35 @@ class ServerArgs:
             "--enable-lmcache",
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
+        )
+
+        # Ktransformer server args
+        parser.add_argument(
+            "--kt-amx-weight-path",
+            type=str,
+            help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
+        )
+        parser.add_argument(
+            "--kt-amx-method",
+            type=str,
+            default="AMXINT4",
+            help="[ktransformers parameter] Quantization formats for CPU execution.",
+        )
+        parser.add_argument(
+            "--kt-cpuinfer",
+            type=int,
+            help="[ktransformers parameter] The number of CPUInfer threads.",
+        )
+        parser.add_argument(
+            "--kt-threadpool-count",
+            type=int,
+            default=2,
+            help="[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
+        )
+        parser.add_argument(
+            "--kt-num-gpu-experts",
+            type=int,
+            help="[ktransformers parameter] The number of GPU experts.",
         )
 
         # Double Sparsity
