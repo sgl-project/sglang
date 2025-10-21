@@ -38,7 +38,8 @@ use crate::{
     },
     mcp::McpClientManager,
     protocols::{
-        chat::ChatCompletionResponse,
+        chat::{ChatCompletionResponse, ChatCompletionStreamResponse},
+        common::{FunctionCallResponse, ToolCall},
         responses::{
             ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
             ResponseStatus, ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse,
@@ -456,7 +457,28 @@ async fn route_responses_streaming(
         }
     };
 
-    // 2. Convert ResponsesRequest → ChatCompletionRequest
+    // 2. Check if request has MCP tools - if so, use streaming tool loop
+    if let Some(tools) = &request.tools {
+        if let Some(mcp_manager) = create_mcp_manager_from_request(tools).await {
+            debug!("MCP tools detected in streaming mode, using streaming tool loop");
+
+            return execute_tool_loop_streaming(
+                pipeline,
+                modified_request,
+                &request,
+                headers,
+                model_id,
+                components,
+                mcp_manager,
+                response_storage,
+                conversation_storage,
+                conversation_item_storage,
+            )
+            .await;
+        }
+    }
+
+    // 3. Convert ResponsesRequest → ChatCompletionRequest
     let chat_request = match conversions::responses_to_chat(&modified_request) {
         Ok(req) => Arc::new(req),
         Err(e) => {
@@ -473,7 +495,7 @@ async fn route_responses_streaming(
         }
     };
 
-    // 3. Execute chat pipeline and convert streaming format
+    // 4. Execute chat pipeline and convert streaming format (no MCP tools)
     convert_chat_stream_to_responses_stream(
         pipeline,
         chat_request,
@@ -1535,6 +1557,399 @@ async fn execute_tool_loop(
             }
 
             return Ok(responses_response);
+        }
+    }
+}
+
+/// Execute MCP tool loop with streaming support
+///
+/// This streams each iteration's response to the client while accumulating
+/// to check for tool calls. If tool calls are found, executes them and
+/// continues with the next streaming iteration.
+async fn execute_tool_loop_streaming(
+    pipeline: &RequestPipeline,
+    current_request: ResponsesRequest,
+    original_request: &ResponsesRequest,
+    headers: Option<http::HeaderMap>,
+    model_id: Option<String>,
+    components: Arc<SharedComponents>,
+    mcp_manager: Arc<McpClientManager>,
+    response_storage: SharedResponseStorage,
+    conversation_storage: SharedConversationStorage,
+    conversation_item_storage: SharedConversationItemStorage,
+) -> Response {
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    // Get server label
+    let server_label = original_request
+        .tools
+        .as_ref()
+        .and_then(|tools| {
+            tools
+                .iter()
+                .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                .and_then(|t| t.server_label.clone())
+        })
+        .unwrap_or_else(|| "request-mcp".to_string());
+
+    // Create SSE channel for client
+    let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+
+    // Clone data for background task
+    let pipeline_clone = pipeline.clone();
+    let original_request_clone = original_request.clone();
+
+    // Spawn background task for tool loop
+    tokio::spawn(async move {
+        let result = execute_tool_loop_streaming_internal(
+            &pipeline_clone,
+            current_request,
+            &original_request_clone,
+            headers,
+            model_id,
+            components,
+            mcp_manager,
+            server_label,
+            response_storage,
+            conversation_storage,
+            conversation_item_storage,
+            tx.clone(),
+        )
+        .await;
+
+        if let Err(e) = result {
+            warn!("Streaming tool loop error: {}", e);
+            let error_event = json!({
+                "error": {
+                    "message": e,
+                    "type": "tool_loop_error"
+                }
+            });
+            let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", error_event))));
+        }
+
+        // Send [DONE]
+        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+    });
+
+    // Build SSE response
+    let stream = UnboundedReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .body(body)
+        .unwrap();
+
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache"),
+    );
+    response.headers_mut().insert(
+        header::CONNECTION,
+        header::HeaderValue::from_static("keep-alive"),
+    );
+
+    response
+}
+
+/// Internal streaming tool loop implementation
+async fn execute_tool_loop_streaming_internal(
+    pipeline: &RequestPipeline,
+    mut current_request: ResponsesRequest,
+    original_request: &ResponsesRequest,
+    headers: Option<http::HeaderMap>,
+    model_id: Option<String>,
+    components: Arc<SharedComponents>,
+    mcp_manager: Arc<McpClientManager>,
+    server_label: String,
+    _response_storage: SharedResponseStorage,
+    _conversation_storage: SharedConversationStorage,
+    _conversation_item_storage: SharedConversationItemStorage,
+    tx: tokio::sync::mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+) -> Result<(), String> {
+    const MAX_ITERATIONS: usize = 20;
+    let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
+    let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
+
+    loop {
+        state.iteration += 1;
+        if state.iteration > MAX_ITERATIONS {
+            return Err(format!("Tool loop exceeded maximum iterations ({})", MAX_ITERATIONS));
+        }
+
+        debug!("Streaming MCP tool loop iteration {}", state.iteration);
+
+        // Convert to chat request
+        let chat_request = conversions::responses_to_chat(&current_request)
+            .map_err(|e| format!("Failed to convert request: {}", e))?;
+
+        // Execute chat streaming
+        let response = pipeline
+            .execute_chat(Arc::new(chat_request), headers.clone(), model_id.clone(), components.clone())
+            .await;
+
+        // Forward stream to client while accumulating for tool call detection
+        let accumulated_response = forward_and_accumulate_stream(
+            response.into_body(),
+            tx.clone(),
+        )
+        .await?;
+
+        // Check for tool calls
+        if let Some((call_id, tool_name, args_json_str)) = extract_function_call_from_chat(&accumulated_response) {
+            state.total_calls += 1;
+
+            debug!(
+                "Tool loop iteration {}: calling {} (call_id: {})",
+                state.iteration, tool_name, call_id
+            );
+
+            // Check combined limit
+            let effective_limit = match max_tool_calls {
+                Some(user_max) => user_max.min(MAX_ITERATIONS),
+                None => MAX_ITERATIONS,
+            };
+
+            if state.total_calls > effective_limit {
+                warn!(
+                    "Reached tool call limit: {} (max_tool_calls={:?}, safety_limit={})",
+                    state.total_calls, max_tool_calls, MAX_ITERATIONS
+                );
+                break;
+            }
+
+            // Execute the MCP tool
+            let (output_str, success, error) = match execute_mcp_call(&mcp_manager, &tool_name, &args_json_str).await {
+                Ok(output) => (output, true, None),
+                Err(err) => {
+                    warn!("Tool execution failed: {}", err);
+                    let error_msg = err.clone();
+                    let error_json = json!({ "error": err }).to_string();
+                    (error_json, false, Some(error_msg))
+                }
+            };
+
+            // Record the call in state
+            state.record_call(call_id, tool_name, args_json_str, output_str, success, error);
+
+            // Build next request with conversation history
+            let mut input_items = match &state.original_input {
+                ResponseInput::Text(text) => vec![ResponseInputOutputItem::Message {
+                    id: format!("msg_u_{}", state.iteration),
+                    role: "user".to_string(),
+                    content: vec![ResponseContentPart::InputText { text: text.clone() }],
+                    status: Some("completed".to_string()),
+                }],
+                ResponseInput::Items(items) => items.clone(),
+            };
+
+            // Append all conversation history
+            input_items.extend_from_slice(&state.conversation_history);
+
+            // Build new request for next iteration
+            current_request = ResponsesRequest {
+                input: ResponseInput::Items(input_items),
+                model: current_request.model.clone(),
+                instructions: current_request.instructions.clone(),
+                tools: current_request.tools.clone(),
+                max_output_tokens: current_request.max_output_tokens,
+                temperature: current_request.temperature,
+                top_p: current_request.top_p,
+                stream: Some(true), // Keep streaming enabled
+                store: Some(false), // Don't store intermediate responses
+                background: Some(false),
+                max_tool_calls: current_request.max_tool_calls,
+                tool_choice: current_request.tool_choice.clone(),
+                parallel_tool_calls: current_request.parallel_tool_calls,
+                previous_response_id: None,
+                conversation: None,
+                user: current_request.user.clone(),
+                metadata: current_request.metadata.clone(),
+                include: current_request.include.clone(),
+                reasoning: current_request.reasoning.clone(),
+                service_tier: current_request.service_tier.clone(),
+                top_logprobs: current_request.top_logprobs,
+                truncation: current_request.truncation.clone(),
+                request_id: None,
+                priority: current_request.priority,
+                frequency_penalty: current_request.frequency_penalty,
+                presence_penalty: current_request.presence_penalty,
+                stop: current_request.stop.clone(),
+                top_k: current_request.top_k,
+                min_p: current_request.min_p,
+                repetition_penalty: current_request.repetition_penalty,
+            };
+
+            continue;
+        }
+
+        // No tool calls, emit MCP metadata and finish
+        debug!("No tool calls found, ending streaming MCP loop");
+
+        // Emit MCP metadata as SSE events
+        if state.total_calls > 0 {
+            // Emit mcp_list_tools event
+            let list_tools_item = build_mcp_list_tools_item(&mcp_manager, &server_label);
+            let event_json = serde_json::to_string(&list_tools_item)
+                .map_err(|e| format!("Failed to serialize mcp_list_tools: {}", e))?;
+            let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", event_json))));
+
+            // Emit mcp_call events
+            for call_item in &state.mcp_call_items {
+                let event_json = serde_json::to_string(&call_item)
+                    .map_err(|e| format!("Failed to serialize mcp_call: {}", e))?;
+                let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", event_json))));
+            }
+
+            debug!(
+                "Injected MCP metadata: 1 mcp_list_tools + {} mcp_call items",
+                state.total_calls
+            );
+        }
+
+        break;
+    }
+
+    Ok(())
+}
+
+/// Forward SSE stream to client while accumulating for tool call detection
+async fn forward_and_accumulate_stream(
+    body: Body,
+    tx: tokio::sync::mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+) -> Result<crate::protocols::chat::ChatCompletionResponse, String> {
+    let mut accumulator = ChatResponseAccumulator::new();
+    let mut stream = body.into_data_stream();
+
+    while let Some(chunk_result) = futures_util::StreamExt::next(&mut stream).await {
+        let chunk = chunk_result.map_err(|e| format!("Stream read error: {}", e))?;
+
+        // Forward chunk to client
+        tx.send(Ok(chunk.clone()))
+            .map_err(|e| format!("Failed to forward chunk: {}", e))?;
+
+        // Parse and accumulate
+        let event_str = String::from_utf8_lossy(&chunk);
+        let event = event_str.trim();
+
+        if event == "data: [DONE]" {
+            break;
+        }
+
+        if let Some(json_str) = event.strip_prefix("data: ") {
+            let json_str = json_str.trim();
+            if let Ok(chat_chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
+                accumulator.process_chunk(&chat_chunk);
+            }
+        }
+    }
+
+    Ok(accumulator.finalize())
+}
+
+/// Accumulates chat streaming chunks into complete ChatCompletionResponse
+struct ChatResponseAccumulator {
+    id: String,
+    model: String,
+    content: String,
+    tool_calls: std::collections::HashMap<usize, ToolCall>,
+    finish_reason: Option<String>,
+}
+
+impl ChatResponseAccumulator {
+    fn new() -> Self {
+        Self {
+            id: String::new(),
+            model: String::new(),
+            content: String::new(),
+            tool_calls: std::collections::HashMap::new(),
+            finish_reason: None,
+        }
+    }
+
+    fn process_chunk(&mut self, chunk: &ChatCompletionStreamResponse) {
+        if !chunk.id.is_empty() {
+            self.id = chunk.id.clone();
+        }
+        if !chunk.model.is_empty() {
+            self.model = chunk.model.clone();
+        }
+
+        if let Some(choice) = chunk.choices.first() {
+            // Accumulate content
+            if let Some(content) = &choice.delta.content {
+                self.content.push_str(content);
+            }
+
+            // Accumulate tool calls
+            if let Some(tool_call_deltas) = &choice.delta.tool_calls {
+                for delta in tool_call_deltas {
+                    let index = delta.index as usize;
+                    let entry = self.tool_calls.entry(index).or_insert_with(|| {
+                        ToolCall {
+                            id: String::new(),
+                            tool_type: "function".to_string(),
+                            function: FunctionCallResponse {
+                                name: String::new(),
+                                arguments: Some(String::new()),
+                            },
+                        }
+                    });
+
+                    if let Some(id) = &delta.id {
+                        entry.id = id.clone();
+                    }
+                    if let Some(function) = &delta.function {
+                        if let Some(name) = &function.name {
+                            entry.function.name = name.clone();
+                        }
+                        if let Some(args) = &function.arguments {
+                            if let Some(ref mut existing_args) = entry.function.arguments {
+                                existing_args.push_str(args);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Capture finish reason
+            if let Some(reason) = &choice.finish_reason {
+                self.finish_reason = Some(reason.clone());
+            }
+        }
+    }
+
+    fn finalize(self) -> crate::protocols::chat::ChatCompletionResponse {
+        let mut tool_calls_vec: Vec<_> = self.tool_calls.into_iter().collect();
+        tool_calls_vec.sort_by_key(|(index, _)| *index);
+        let tool_calls: Vec<_> = tool_calls_vec.into_iter().map(|(_, call)| call).collect();
+
+        crate::protocols::chat::ChatCompletionResponse {
+            id: self.id,
+            object: "chat.completion".to_string(),
+            created: chrono::Utc::now().timestamp() as u64,
+            model: self.model,
+            choices: vec![crate::protocols::chat::ChatChoice {
+                index: 0,
+                message: crate::protocols::chat::ChatCompletionMessage {
+                    role: "assistant".to_string(),
+                    content: if self.content.is_empty() { None } else { Some(self.content) },
+                    tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                    reasoning_content: None,
+                },
+                finish_reason: self.finish_reason,
+                logprobs: None,
+                matched_stop: None,
+                hidden_states: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
         }
     }
 }
