@@ -244,6 +244,17 @@ at::Tensor causal_conv1d_fwd_cpu(
     int64_t pad_slot_id,
     bool is_vnni);
 
+at::Tensor causal_conv1d_update_cpu(
+    const at::Tensor& x,
+    const at::Tensor& conv_states,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens,
+    const std::optional<at::Tensor>& conv_state_indices,
+    int64_t pad_slot_id,
+    bool is_vnni);
+
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
@@ -407,6 +418,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? cache_indices, Tensor? has_initial_state, bool silu_activation, int pad_slot_id, bool is_vnni) -> "
       "Tensor");
   m.impl("causal_conv1d_fwd_cpu", torch::kCPU, &causal_conv1d_fwd_cpu);
+
+  m.def(
+      "causal_conv1d_update_cpu(Tensor x, Tensor conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
+      "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
+  m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
 
   // all reduce
   m.def("initialize(int size, int rank) -> ()");
