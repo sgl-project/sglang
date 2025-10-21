@@ -120,7 +120,6 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
         elif ratio_diff == best_ratio_diff:
             if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
                 best_ratio = ratio
-    # print(f'width: {width}, height: {height}, best_ratio: {best_ratio}')
     return best_ratio
 
 
@@ -138,7 +137,6 @@ def dynamic_preprocess(
         for j in range(1, n + 1)
         if i * j <= max_num and i * j >= min_num
     )
-    # print(target_ratios)
     target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
 
     # find the closest aspect ratio to the target
@@ -146,7 +144,6 @@ def dynamic_preprocess(
         aspect_ratio, target_ratios, orig_width, orig_height, image_size
     )
 
-    # print(target_aspect_ratio)
     # calculate the target width and height
     target_width = image_size * target_aspect_ratio[0]
     target_height = image_size * target_aspect_ratio[1]
@@ -272,27 +269,10 @@ class DeepseekVLV2Processor(ProcessorMixin):
         )
 
         image_index = image_token_cnt
-        # tokenized_data += tokenized_str
-        # if self.mask_prompt:
-        #     masked_tokenized_data += [self.ignore_id] * len(tokenized_str)
-        # else:
-        #     masked_tokenized_data += tokenized_str
         images_list += images
         images_seq_mask += seq_mask
-        # images_spatial_crop += spatial_crop
         images_spatial_crop = spatial_crop
-        # assert len(tokenized_data) == len(
-        #     images_seq_mask
-        # ), f"format_messages_v2: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
 
-        # return (
-        #     tokenized_data,
-        #     masked_tokenized_data,
-        #     images_list,
-        #     images_seq_mask,
-        #     images_spatial_crop,
-        #     images_crop
-        # )
         return (
             input_ids,
             masked_tokenized_data,
@@ -374,36 +354,12 @@ class DeepseekVLV2Processor(ProcessorMixin):
             images_crop,
         ) = self.format_messages_v2(prompt, images, max_req_input_len)
 
-        # assert (
-        #     len(tokenized_str) == len(images_seq_mask) == len(masked_tokenized_str)
-        # ), (
-        #     f"tokenized_str's length {len(tokenized_str)}, input_ids' length {len(masked_tokenized_str)}, "
-        #     f"imags_seq_mask's length {len(images_seq_mask)}, are not equal"
-        # )
-
-        # input_ids = torch.LongTensor(tokenized_str)
         target_ids = torch.LongTensor(masked_tokenized_str)
-        # images_seq_mask = torch.tensor(images_seq_mask, dtype=torch.bool)
 
-        # set input_ids < 0 | input_ids == self.image_token_id as ignore_id
-        # target_ids[(input_ids < 0) | (input_ids == self.image_token_id)] = (
-        #     self.ignore_id
-        # )
-        # input_ids[input_ids < 0] = self.pad_id
-        #
-        # if inference_mode:
-        #     # assert input_ids[-1] == self.eos_id
-        #     input_ids = input_ids[:-1]
-        #     # target_ids = target_ids[:-1]
-        #     images_seq_mask = images_seq_mask[:-1]
-        #
         if len(images_list) == 0:
             images = torch.zeros((1, 3, self.image_size, self.image_size))
-        #     # images_spatial_crop = torch.zeros((1, 2), dtype=torch.long)
-        #
         else:
             images = torch.stack(images_list, dim=0)
-            # images_spatial_crop = torch.tensor(images_spatial_crop, dtype=torch.long)
 
         images_spatial_crop = torch.stack(
             [images_spatial_crop], dim=0
@@ -465,11 +421,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
     ):
         """Tokenize text with <image> tags."""
 
-        # print(f"{conversation=}")
         conversation = conversation
         assert conversation.count(self.image_token) == len(images)
         text_splits = conversation.split(self.image_token)
-        # print(f"{text_splits=}")
         images_list, images_crop_list, images_seq_mask, images_spatial_crop = (
             [],
             [],
@@ -479,21 +433,12 @@ class DeepseekVLV2Processor(ProcessorMixin):
         image_shapes = []
         num_image_tokens = []
         tokenized_str = []
-        # print('image: ', len(images))
         for text_sep, image in zip(text_splits, images):
             """encode text_sep"""
             tokenized_sep = self.encode(text_sep, bos=False, eos=False)
-            # print(f"{tokenized_sep=}")
-            # print(f"{text_sep=}")
 
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
-
-            """select best resolution for anyres"""
-            # if cropping:
-            #     best_width, best_height = self.select_best_resolution(image.size)
-            # else:
-            #     best_width, best_height = self.image_size, self.image_size
 
             image_shapes.append(image.size)
 
@@ -501,25 +446,14 @@ class DeepseekVLV2Processor(ProcessorMixin):
                 crop_ratio = [1, 1]
             else:
                 if cropping:
-                    # print('image-size: ', image.size)
-                    # best_width, best_height = select_best_resolution(image.size, self.candidate_resolutions)
-                    # print('image ', image.size)
-                    # print('open_size:', image.size)
                     images_crop_raw, crop_ratio = dynamic_preprocess(
                         image, image_size=IMAGE_SIZE
                     )
-                    # print('crop_ratio: ', crop_ratio)
                 else:
-                    # best_width, best_height = self.image_size, self.image_size
                     crop_ratio = [1, 1]
-            # print(image.size, (best_width, best_height)) # check the select_best_resolutions func
 
-            # print(crop_ratio)
             """process the global view"""
-
-            # if cropping
             if self.image_size <= 640 and not cropping:
-                # print('directly resize')
                 image = image.resize((self.image_size, self.image_size))
 
             global_view = ImageOps.pad(
@@ -529,36 +463,13 @@ class DeepseekVLV2Processor(ProcessorMixin):
             )
             images_list.append(self.image_transform(global_view))
 
-            """record height / width crop num"""
-            # width_crop_num, height_crop_num = best_width // self.image_size, best_height // self.image_size
             num_width_tiles, num_height_tiles = crop_ratio
             images_spatial_crop.append([num_width_tiles, num_height_tiles])
 
             if num_width_tiles > 1 or num_height_tiles > 1:
-                """process the local views"""
-                # local_view = ImageOps.pad(image, (best_width, best_height),
-                #                         color=tuple(int(x * 255) for x in self.image_transform.mean))
-                # for i in range(0, best_height, self.image_size):
-                #     for j in range(0, best_width, self.image_size):
-                #         images_crop_list.append(
-                #             self.image_transform(local_view.crop((j, i, j + self.image_size, i + self.image_size))))
                 for i in range(len(images_crop_raw)):
                     images_crop_list.append(self.image_transform(images_crop_raw[i]))
 
-            # """process the global view"""
-            # global_view = ImageOps.pad(image, (self.image_size, self.image_size),
-            #                            color=tuple(int(x * 255) for x in self.image_transform.mean))
-            # images_list.append(self.image_transform(global_view))
-
-            # """process the local views"""
-            # local_view = ImageOps.pad(image, (best_width, best_height),
-            #                           color=tuple(int(x * 255) for x in self.image_transform.mean))
-            # for i in range(0, best_height, self.image_size):
-            #     for j in range(0, best_width, self.image_size):
-            #         images_list.append(
-            #             self.image_transform(local_view.crop((j, i, j + self.image_size, i + self.image_size))))
-
-            # """add image tokens"""
             """add image tokens"""
             num_queries = math.ceil(
                 (self.image_size // self.patch_size) / self.downsample_ratio
@@ -577,14 +488,12 @@ class DeepseekVLV2Processor(ProcessorMixin):
                     + [self.image_token_id]
                 ) * (num_queries * num_height_tiles)
             tokenized_str += tokenized_image
-            # print(f"{tokenized_image=}")
 
             images_seq_mask += [True] * len(tokenized_image)
             num_image_tokens.append(len(tokenized_image))
 
         """process the last text split"""
         tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
-        # print(f"{text_splits[-1]=}")
 
         tokenized_str += tokenized_sep
         images_seq_mask += [False] * len(tokenized_sep)
@@ -650,7 +559,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
                 ).unsqueeze(0)
 
         input_ids = input_ids.unsqueeze(0)
-        # print(f"{input_ids=}")
         return (
             input_ids,
             pixel_values,
@@ -660,109 +568,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
             num_image_tokens,
             image_shapes,
         )
-
-    def tokenize_with_images_old(
-        self,
-        conversation: str,
-        images: List[Image.Image],
-        bos: bool = True,
-        eos: bool = True,
-        cropping: bool = True,
-        max_req_input_len: int = -1,
-    ):
-        """Tokenize text with <image> tags."""
-        images_list, images_seq_mask, images_spatial_crop = [], [], []
-        text_splits = conversation.split(self.image_token)
-        tokenized_str = []
-        for text_sep, image in zip(text_splits, images):
-            """encode text_sep"""
-            tokenized_sep = self.encode(text_sep, bos=False, eos=False)
-            tokenized_str += tokenized_sep
-            images_seq_mask += [False] * len(tokenized_sep)
-
-            """select best resolution for anyres"""
-            if cropping:
-                best_width, best_height = select_best_resolution(
-                    image.size, self.candidate_resolutions
-                )
-            else:
-                best_width, best_height = self.image_size, self.image_size
-            # print(image.size, (best_width, best_height)) # check the select_best_resolutions func
-
-            """process the global view"""
-            global_view = ImageOps.pad(
-                image,
-                (self.image_size, self.image_size),
-                color=tuple(int(x * 255) for x in self.image_transform.mean),
-            )
-            images_list.append(self.image_transform(global_view))
-
-            """process the local views"""
-            local_view = ImageOps.pad(
-                image,
-                (best_width, best_height),
-                color=tuple(int(x * 255) for x in self.image_transform.mean),
-            )
-            for i in range(0, best_height, self.image_size):
-                for j in range(0, best_width, self.image_size):
-                    images_list.append(
-                        self.image_transform(
-                            local_view.crop(
-                                (j, i, j + self.image_size, i + self.image_size)
-                            )
-                        )
-                    )
-
-            """record height / width crop num"""
-            num_width_tiles, num_height_tiles = (
-                best_width // self.image_size,
-                best_height // self.image_size,
-            )
-            images_spatial_crop.append([num_width_tiles, num_height_tiles])
-
-            """add image tokens"""
-            h = w = math.ceil(
-                (self.image_size // self.patch_size) / self.downsample_ratio
-            )
-            # global views tokens h * (w + 1), 1 is for line separator
-            tokenized_image = [self.image_token_id] * h * (w + 1)
-            # add a separator between global and local views
-            tokenized_image += [self.image_token_id]
-            # local views tokens, (num_height_tiles * h) * (num_width_tiles * w + 1)
-            tokenized_image += (
-                [self.image_token_id]
-                * (num_height_tiles * h)
-                * (num_width_tiles * w + 1)
-            )
-
-            tokenized_str += tokenized_image
-            images_seq_mask += [True] * len(tokenized_image)
-            # print(width_crop_num, height_crop_num, len(tokenized_image)) # test the correctness of the number of image-related tokens
-
-        """process the last text split"""
-        tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
-        # deal with video, limit with request len
-        if max_req_input_len > -1:
-            if max_req_input_len < len(tokenized_sep) + len(tokenized_str) - 1:
-                rest = max_req_input_len - len(tokenized_sep) - 1 - 1024
-                tokenized_str = tokenized_str[:rest]
-                images_seq_mask = images_seq_mask[:rest]
-        tokenized_str += tokenized_sep
-        images_seq_mask += [False] * len(tokenized_sep)
-
-        """add the bos and eos tokens"""
-        if bos:
-            tokenized_str = [self.bos_id] + tokenized_str
-            images_seq_mask = [False] + images_seq_mask
-        if eos:
-            tokenized_str = tokenized_str + [self.eos_id]
-            images_seq_mask = images_seq_mask + [False]
-
-        assert len(tokenized_str) == len(
-            images_seq_mask
-        ), f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
-
-        return tokenized_str, images_list, images_seq_mask, images_spatial_crop
 
 
 class DeepseekVL2VisionEncoderConfig(PretrainedConfig):

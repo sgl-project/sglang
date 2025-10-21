@@ -438,7 +438,6 @@ class DeepseekForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        print(f"{hidden_states=}")
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )

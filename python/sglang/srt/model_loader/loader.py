@@ -217,9 +217,7 @@ def _initialize_model(
     load_config: LoadConfig,
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
-    print(f"{model_config=}")
     model_class, _ = get_model_architecture(model_config)
-    print(f"{model_class=}")
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     if _is_npu:
         packed_modules_mapping.update(

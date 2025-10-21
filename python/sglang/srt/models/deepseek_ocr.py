@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 
-from sglang.srt.configs.deepseek_ocr import PRINT_NUM_VIS_TOKENS, DeepseekVLV2Config
+from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -97,9 +97,6 @@ def _merge_multimodal_embeddings(
     input_dtype = inputs_embeds.dtype
 
     try:
-        # For debugging
-        # inputs_embeds[is_multimodal] = mm_embeds_flat.to(dtype=input_dtype)
-
         # NOTE: This can avoid D2H sync (#22105), but fails to
         # raise an error if is_multimodal.sum() < len(mm_embeds_flat)
         inputs_embeds.masked_scatter_(
@@ -196,8 +193,6 @@ class MlpProjector(nn.Module):
 
         super().__init__()
 
-        # self.cfg = cfg
-
         if projector_type == "identity":
             modules = nn.Identity()
 
@@ -283,12 +278,6 @@ class MlpProjector(nn.Module):
         else:
             raise ValueError(f"Unknown projector type: {projector_type}")
 
-        token_pooling = None
-        # if get("token_pooling", False):
-        #     self.token_pooling_layer = nn.Linear(input_dim * 4, input_dim)
-
-        # if get("conv_fusion_high_low_features", False):
-        #     self.fusion_layer = nn.Linear(input_dim, input_dim)
         self.layers = modules
 
     def forward(self, x):
@@ -297,15 +286,14 @@ class MlpProjector(nn.Module):
             w = h = int(wxh**0.5)
             x = x.view(batch_size, w, h, channels)
             x = x.permute(0, 3, 1, 2)
-            # import ipdb; ipdb.set_trace()
             patches = x.unfold(2, 2, 2).unfold(3, 2, 2)
             batch_size, channels, h_patches, w_patches, _, _ = patches.size()
-            # 在通道维度上拼接
+            # Concatenate on channel dimension
             patches = patches.contiguous().view(
                 batch_size, channels, h_patches * w_patches, -1
             )
 
-            # 通过线性层
+            # Pass through linear layer
             patches = patches.permute(0, 2, 1, 3).contiguous()
             patches = patches.view(batch_size, h_patches * w_patches, channels * 4)
 
@@ -794,7 +782,6 @@ class ImageEncoderViT(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
         if self.pos_embed is not None:
-            # x = x + self.pos_embed
             x = x + get_abs_pos_sam(self.pos_embed, x.size(1))
 
         for blk in self.blocks:
@@ -817,7 +804,6 @@ def _build_sam(
     prompt_embed_dim = 256
     image_size = 1024
     vit_patch_size = 16
-    image_embedding_size = image_size // vit_patch_size
     image_encoder = ImageEncoderViT(
         depth=encoder_depth,
         embed_dim=encoder_embed_dim,
@@ -834,19 +820,11 @@ def _build_sam(
     )
     image_encoder.eval()
     if checkpoint is not None:
-        # with open(checkpoint, "rb") as f:
         state_dict = torch.load(checkpoint)
-        # print(state_dict.keys())
-        # for key in state_dict:
-        # image_encoder.load_state_dict({k[14:]: v for k, v in state_dict.items() if 'image_encoder' in k}, strict=False)
-        # ocr-anyting
-        # image_encoder.load_state_dict(state_dict, strict=True)
-        # tob
         image_encoder.load_state_dict(
             {k[30:]: v for k, v in state_dict.items() if "vision_tower_high" in k},
             strict=True,
         )
-        print(checkpoint)
     return image_encoder
 
 
@@ -864,12 +842,7 @@ def get_abs_pos(abs_pos, tgt_size):
     # abs_pos: L, C
     # tgt_size: M
     # return: M, C
-
-    # print(tgt_size)
-    # print(abs_pos.shape)
-    # exit()
     dim = abs_pos.size(-1)
-    # print(dim)
     abs_pos_new = abs_pos.squeeze(0)
     cls_token, old_pos_embed = abs_pos_new[:1], abs_pos_new[1:]
 
@@ -926,29 +899,20 @@ class CLIPVisionEmbeddings(nn.Module):
 
     def forward(self, pixel_values, patch_embeds):
         batch_size = pixel_values.shape[0]
-        # patch_embeds = self.patch_embedding(
-        #     pixel_values
-        # )  # shape = [*, width, grid, grid]
 
         if patch_embeds is not None:
             patch_embeds = patch_embeds
-            # print(patch_embeds.shape)
         else:
             patch_embeds = self.patch_embedding(pixel_values)
-            # print(111111)
-        # shape = [*, width, grid, grid]
-        # patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
 
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
 
         class_embeds = self.class_embedding.expand(batch_size, 1, -1)
         embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
 
-        # x = torch.cat([cls_token, x], dim=1)
         embeddings = embeddings + get_abs_pos(
             self.position_embedding(self.position_ids), embeddings.size(1)
         )
-        # embeddings = embeddings + self.position_embedding(self.position_ids)
         return embeddings
 
 
@@ -992,30 +956,23 @@ class NoTPAttention(torch.nn.Module):
             xq = xq.permute(0, 2, 1, 3)
             xk = xk.permute(0, 2, 1, 3)
             xv = xv.permute(0, 2, 1, 3)
-            # with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
             output = torch.nn.functional.scaled_dot_product_attention(
                 xq, xk, xv, attn_mask=None
             )
             output = output.permute(0, 2, 1, 3).reshape(bsz, seqlen, -1)
-            # output = output.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, -1)
         else:
-            # print(22222)
             xq, xk, xv = torch.split(xqkv, 1, dim=2)
             xq = xq.squeeze(2)
             xk = xk.squeeze(2)
             xv = xv.squeeze(2)
-            # xq, xk, xv = xqkv[:, :, 0, ...], xqkv[:, :, 1, ...], xqkv[:, :, 2, ...]
 
-            # （B, num_head, S, head_size)
             xq = xq.permute(0, 2, 1, 3)
             xk = xk.permute(0, 2, 1, 3)
             xv = xv.permute(0, 2, 1, 3)
-            # with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
             output = torch.nn.functional.scaled_dot_product_attention(
                 xq, xk, xv, attn_mask=None
             )
             output = output.permute(0, 2, 1, 3).reshape(bsz, seqlen, -1)
-            # output = output.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, -1)
         output = self.out_proj(output)
         return output
 
@@ -1040,32 +997,6 @@ class NoTPFeedForward(nn.Module):
     def forward(self, x):
         output = self.fc2(quick_gelu(self.fc1(x)))
         return output
-
-
-class NoTPTransformerBlock(nn.Module):
-    def __init__(self, cfg, layer_id: int, multiple_of=256):
-        super().__init__()
-
-        self.n_heads = cfg["num_attention_heads"]
-        self.dim = cfg["hidden_size"]
-        self.head_dim = cfg["hidden_size"] // cfg["num_attention_heads"]
-        self.self_attn = NoTPAttention(cfg)
-        self.mlp = NoTPFeedForward(
-            cfg, dim=cfg["hidden_size"], hidden_dim=cfg["ffn_hidden_size"]
-        )
-        self.layer_id = layer_id
-        self.layer_norm1 = torch.nn.LayerNorm(
-            cfg["hidden_size"], eps=cfg["layernorm_epsilon"]
-        )
-        self.layer_norm2 = torch.nn.LayerNorm(
-            cfg["hidden_size"], eps=cfg["layernorm_epsilon"]
-        )
-
-    def forward(self, x: torch.Tensor):
-        residual = self.self_attn.forward(self.layer_norm1(x))
-        h = x + residual
-        out = h + self.mlp.forward(self.layer_norm2(h))
-        return out
 
 
 class LayerNormfp32(torch.nn.LayerNorm):
@@ -1108,8 +1039,7 @@ class NoTPTransformer(nn.Module):
         super().__init__()
 
         self.cfg = cfg
-        # self.recompute_list = self.cfg["get("recompute_list", [])
-        self.num_layers = cfg["num_layers"]  # _get_num_layers(cfg)
+        self.num_layers = cfg["num_layers"]
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.num_layers):
@@ -1125,24 +1055,7 @@ class NoTPTransformer(nn.Module):
         hidden_states,
     ):
 
-        for lid, layer in enumerate(self.layers):
-            # if lid in self.recompute_list:
-            #     def custom(layer_id):
-            #         def custom_forward(*args, **kwargs):
-            #             x_ = self.layers[layer_id](*args, **kwargs)
-            #             return x_
-
-            #         return custom_forward
-
-            #     assert hidden_states.requires_grad == True, logger.warning(
-            #         "When using recalculation, the input must have grad fn"
-            #     )
-            #     hidden_states = tensor_parallel.checkpoint(
-            #         custom(lid),
-            #         False,
-            #         hidden_states.contiguous()
-            #     )
-            # else:
+        for layer in self.layers:
             hidden_states = layer(hidden_states)
 
         return hidden_states
@@ -1159,7 +1072,7 @@ class VitModel(nn.Module):
         )
 
         if freeze_embed:
-            for name, param in self.embeddings.named_parameters():
+            for _, param in self.embeddings.named_parameters():
                 param.requires_grad = False
 
         self.transformer = NoTPTransformer(cfg=cfg)
@@ -1176,16 +1089,8 @@ class VitModel(nn.Module):
                 eps=cfg.get("pre_layernorm_epsilon", 1e-5),
             )
 
-        # self.pre_layrnorm = RMSNorm(
-        #     cfg["hidden_size,
-        #     eps=cfg["get("pre_layernorm_epsilon", 1e-5),
-        #     sequence_parallel=False,
-        #     use_fp32=True,
-        #     use_optimus=True,
-        # )
-
         if freeze_pre_norm:
-            for name, param in self.pre_layrnorm.named_parameters():
+            for _, param in self.pre_layrnorm.named_parameters():
                 param.requires_grad = False
 
         for p in self.parameters():
@@ -1207,10 +1112,7 @@ class VitModel(nn.Module):
         x = self.embeddings(x, patch_embeds)
         hidden_states = self.pre_layrnorm(x)
 
-        # hidden_states, dis = local_dp_scatter(hidden_states)
         output = self.transformer(hidden_states)
-
-        # output = local_dp_reduce(output, dis)
 
         return output
 
@@ -1254,28 +1156,16 @@ class DeepseekOCRForCausalLM(nn.Module):
     ):
         super().__init__()
 
-        # multimodal_config = config.multimodal_config
-
-        # config.model_type ='deepseek_vl_v2'
-
         self.config = config
-        # self.multimodal_config = multimodal_config
 
         self.vision_config = config.vision_config
         self.projector_config = config.projector_config
         self.text_config = config.text_config
 
         n_embed = 1280
-        downsample_ratio: int = 4
 
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
-
-        # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # self.sam_model = torch.compile(self.sam_model, mode="reduce-overhead")
-        # self.vision_model = torch.compile(self.vision_model, mode="reduce-overhead")
-        # self.projector = torch.compile(self.projector, mode="max-autotune")
 
         # special token for image token sequence format
         embed_std = 1 / torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
@@ -1288,7 +1178,6 @@ class DeepseekOCRForCausalLM(nn.Module):
                 f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
             )
 
-        print(f"{self.text_config.topk_method=}")
         if self.text_config.topk_method == "noaux_tc":
             self.model = DeepseekV3ForCausalLM(
                 config=config.text_config,
@@ -1308,23 +1197,14 @@ class DeepseekOCRForCausalLM(nn.Module):
                 prefix=maybe_prefix(prefix, "language"),
             )
 
-        # self.model = DeepseekOCRModel(config)
         self.sam_model = build_sam_vit_b()
         self.vision_model = build_clip_l()
-        # self.conv_2 = nn.Conv2d(in_channels=1024, out_channels=2048, kernel_size=2, stride=2)
         n_embed = 1280
         self.projector = MlpProjector(
             projector_type="linear",
             input_dim=2048,
             n_embed=n_embed,
         )
-        # embed_std = 1 / torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
-        # self.image_newline = nn.Parameter(torch.randn(n_embed) * embed_std)
-        # self.view_seperator = nn.Parameter(torch.randn(n_embed) * embed_std)
-
-        # self.make_empty_intermediate_tensors = (
-        #     self.language_model.make_empty_intermediate_tensors
-        # )
 
     def _parse_and_validate_image_input(self, **kwargs: object):
 
@@ -1370,23 +1250,14 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         images_in_this_batch = []
 
-        # print(type(images_crop))
-
-        # print(pixel_values.shape)
-
         with torch.no_grad():
             for jdx in range(images_spatial_crop.size(0)):
-                # with torch.set_grad_enabled(False):
-                patches = images_crop[jdx][0].to(torch.bfloat16)  # batch_size = 1
+                patches = images_crop[jdx][0].to(torch.bfloat16)
                 image_ori = pixel_values[jdx]
                 crop_shape = images_spatial_crop[jdx][0]
 
-                if torch.sum(patches).item() != 0:  # if all values = 0, no crop
-                    # P, C, H, W = patches.shape
-                    # crop_flag = 1
+                if torch.sum(patches).item() != 0:
                     local_features_1 = self.sam_model(patches)
-                    # TODO del patches
-                    # torch.compiler.cudagraph_mark_step_begin()
                     local_features_2 = self.vision_model(patches, local_features_1)
 
                     local_features = torch.cat(
@@ -1408,12 +1279,6 @@ class DeepseekOCRForCausalLM(nn.Module):
                         dim=-1,
                     )
                     global_features = self.projector(global_features)
-
-                    if PRINT_NUM_VIS_TOKENS:
-                        print("=====================")
-                        print("BASE: ", global_features.shape)
-                        print("PATCHES: ", local_features.shape)
-                        print("=====================")
 
                     _, hw, n_dim = global_features.shape
                     h = w = int(hw**0.5)
@@ -1470,12 +1335,6 @@ class DeepseekOCRForCausalLM(nn.Module):
                     )
                     global_features = self.projector(global_features)
 
-                    if PRINT_NUM_VIS_TOKENS:
-                        print("=====================")
-                        print("BASE: ", global_features.shape)
-                        print("NO PATCHES")
-                        print("=====================")
-
                     _, hw, n_dim = global_features.shape
                     h = w = int(hw**0.5)
 
@@ -1500,20 +1359,10 @@ class DeepseekOCRForCausalLM(nn.Module):
         return images_in_this_batch
 
     def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
-
-        # image_input: [pixel_values, images_crop, images_spatial_crop]
-
-        # pixel_values = mm_items[0].to(torch.bfloat16)
-        # TODO: should we use cat to avoid mem-copy later?
         pixel_values = torch.stack([item.feature for item in mm_items], dim=0).type(
             self.vision_model.dtype
         )
-        # print(image_input[1][0].shape)
-        # print(type(image_input[1]))
-        # exit()
 
-        # images_crop = image_input[1].to(torch.bfloat16)
-        # images_crop = mm_items[1]
         images_crop = torch.cat([item.images_crop for item in mm_items], dim=0).type(
             self.vision_model.dtype
         )
@@ -1522,10 +1371,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         ).type(self.vision_model.dtype)
 
         assert images_spatial_crop.dim() == 3
-        # images_crop = image_input[1]
-        # images_spatial_crop = mm_items[2].to(dtype=torch.long)
 
-        # local_start = time.time()
         vision_feature_lists = self._pixel_values_to_embedding(
             pixel_values=pixel_values,
             images_crop=images_crop,
@@ -1535,10 +1381,6 @@ class DeepseekOCRForCausalLM(nn.Module):
             self.vision_model.dtype
         )
 
-        # local_total_time = time.time() - local_start
-
-        # print('encoder_time: ', local_total_time)
-        # exit()
         return vision_features
 
     def get_language_model(self) -> torch.nn.Module:
@@ -1565,10 +1407,6 @@ class DeepseekOCRForCausalLM(nn.Module):
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids, inputs_embeds, multimodal_embeddings, self.image_token_id
             )
-            # print(len(multimodal_embeddings))
-            # print(input_ids.shape)
-            # print(type(inputs_embeds))
-            # print(inputs_embeds.shape)
 
         return inputs_embeds
 
@@ -1578,138 +1416,15 @@ class DeepseekOCRForCausalLM(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vision_embeddings = self._process_image_input(items)
-        print(f"{vision_embeddings=}")
         return vision_embeddings
-        # sam_model = self.model.sam_model
-        # input_ids
-        # idx = 0
-        #
-        # # sam_model = torch.jit.script(sam_model)
-        #
-        # # start_time = time.time()
-        # for image, crop_shape in zip(images, images_spatial_crop):
-        #     images_in_this_batch = []
-        #
-        #     patches = image[0]
-        #     image_ori = image[1]
-        #
-        #     with torch.no_grad():
-        #         # with torch.inference_mode():
-        #
-        #         if torch.sum(patches).item() != 0:
-        #             # P, C, H, W = patches.shape
-        #             crop_flag = 1
-        #             local_features_1 = sam_model(patches)
-        #
-        #             local_features_2 = vision_model(patches, local_features_1)
-        #             # vit_time = time.time()
-        #             local_features = torch.cat(
-        #                 (local_features_2[:, 1:], local_features_1.flatten(2).permute(0, 2, 1)), dim=-1)
-        #             local_features = self.projector(local_features)
-        #
-        #             global_features_1 = sam_model(image_ori)
-        #             global_features_2 = vision_model(image_ori, global_features_1)
-        #             global_features = torch.cat(
-        #                 (global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1)
-        #             global_features = self.projector(global_features)
-        #
-        #             print('=====================')
-        #             print('BASE: ', global_features.shape)
-        #             print('PATCHES: ', local_features.shape)
-        #             print('=====================')
-        #
-        #             _, hw, n_dim = global_features.shape
-        #             h = w = int(hw ** 0.5)
-        #
-        #             _2, hw2, n_dim2 = local_features.shape
-        #             h2 = w2 = int(hw2 ** 0.5)
-        #
-        #             width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
-        #
-        #             global_features = global_features.view(h, w, n_dim)
-        #
-        #             global_features = torch.cat(
-        #                 [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
-        #             )
-        #
-        #             global_features = global_features.view(-1, n_dim)
-        #
-        #             local_features = local_features.view(height_crop_num, width_crop_num, h2, w2, n_dim2).permute(0,
-        #                                                                                                           2,
-        #                                                                                                           1,
-        #                                                                                                           3,
-        #                                                                                                           4).reshape(
-        #                 height_crop_num * h2, width_crop_num * w2, n_dim2)
-        #             local_features = torch.cat(
-        #                 [local_features, self.image_newline[None, None, :].expand(height_crop_num * h2, 1, n_dim2)],
-        #                 dim=1
-        #             )
-        #             local_features = local_features.view(-1, n_dim2)
-        #
-        #             global_local_features = torch.cat(
-        #                 [local_features, global_features, self.view_seperator[None, :]], dim=0)
-        #
-        #             # end_time = time.time()
-        #
-        #             # print('sam: ', sam_time - start_time)
-        #             # print('vit: ', vit_time - sam_time)
-        #             # print('all: ', end_time - start_time)
-        #
-        #             # exit()
-        #
-        #         else:
-        #             global_features_1 = sam_model(image_ori)
-        #             global_features_2 = vision_model(image_ori, global_features_1)
-        #             global_features = torch.cat(
-        #                 (global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1)
-        #             global_features = self.projector(global_features)
-        #             print('=====================')
-        #             print('BASE: ', global_features.shape)
-        #             print('NO PATCHES')
-        #             print('=====================')
-        #             _, hw, n_dim = global_features.shape
-        #             h = w = int(hw ** 0.5)
-        #
-        #             global_features = global_features.view(h, w, n_dim)
-        #
-        #             global_features = torch.cat(
-        #                 [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
-        #             )
-        #
-        #             global_features = global_features.view(-1, n_dim)
-        #
-        #             global_local_features = torch.cat([global_features, self.view_seperator[None, :]], dim=0)
-        #
-        #         images_in_this_batch.append(global_local_features)
-        #
-        #     # print(inputs_embeds.shape)
-        #
-        #     if images_in_this_batch:
-        #         images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
-        #         # exit()
-        #
-        #         inputs_embeds[idx].masked_scatter_(images_seq_mask[idx].unsqueeze(-1).cuda(), images_in_this_batch)
-        #
-        #     idx += 1
-        #
-        # return super(DeepseekOCRModel, self).forward(
-        #     input_ids=None, attention_mask=attention_mask, past_key_values=past_key_values,
-        #     inputs_embeds=inputs_embeds, use_cache=use_cache, position_ids=position_ids,
-        #     output_attentions=output_attentions, output_hidden_states=output_hidden_states,
-        #     return_dict=return_dict
-        # )
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        get_embedding: bool = False,
         **kwargs: object,
     ):
-        print(f"{input_ids=}")
-        print(f"{positions=}")
-
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -1719,14 +1434,6 @@ class DeepseekOCRForCausalLM(nn.Module):
         )
 
         return hidden_states
-
-    # def compute_logits(
-    #     self,
-    #     hidden_states: torch.Tensor,
-    #     sampling_metadata: SamplingMetadata,
-    # ) -> Optional[torch.Tensor]:
-    #     return self.language_model.compute_logits(hidden_states,
-    #                                               sampling_metadata)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
