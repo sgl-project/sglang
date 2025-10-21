@@ -44,6 +44,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 
@@ -75,17 +76,24 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
 
+    DRAFT_EXTEND_V2 = auto()
+
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
     def is_prefill(self):
         return self.is_extend()
 
-    def is_extend(self):
+    def is_extend(self, include_draft_extend_v2: bool = False):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
+            or (
+                self == ForwardMode.DRAFT_EXTEND_V2
+                if include_draft_extend_v2
+                else False
+            )
             or self == ForwardMode.TARGET_VERIFY
         )
 
@@ -104,14 +112,23 @@ class ForwardMode(IntEnum):
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
-    def is_draft_extend(self):
+    def is_draft_extend(self, include_v2: bool = False):
+        if include_v2:
+            return (
+                self == ForwardMode.DRAFT_EXTEND_V2 or self == ForwardMode.DRAFT_EXTEND
+            )
         return self == ForwardMode.DRAFT_EXTEND
+
+    def is_draft_extend_v2(self):
+        # For fixed shape logits output in v2 eagle worker
+        return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.MIXED
+            or self == ForwardMode.SPLIT_PREFILL
         )
 
     def is_cuda_graph(self):
@@ -393,10 +410,12 @@ class ForwardBatch:
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode():
+        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
+            assert isinstance(batch.extend_seq_lens, list)
+            assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
@@ -679,6 +698,7 @@ class ForwardBatch:
 
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(buffer_len, num_tokens, global_num_tokens)
+        set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size
 
@@ -727,9 +747,8 @@ class ForwardBatch:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
         self.global_num_tokens_cpu = global_num_tokens
-        self.global_num_tokens_gpu = self.global_num_tokens_gpu.new_tensor(
-            global_num_tokens
-        )
+        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
+        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
