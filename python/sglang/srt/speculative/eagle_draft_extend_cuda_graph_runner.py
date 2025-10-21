@@ -15,6 +15,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     get_global_graph_memory_pool,
     model_capture_mode,
     set_global_graph_memory_pool,
+    set_is_extend_in_batch,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -294,6 +295,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            set_is_extend_in_batch(False)
 
             # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
