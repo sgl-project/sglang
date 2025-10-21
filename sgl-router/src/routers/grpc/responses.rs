@@ -1418,8 +1418,22 @@ async fn execute_mcp_call(
     tool_name: &str,
     args_json_str: &str,
 ) -> Result<String, String> {
-    let mut args_value: serde_json::Value =
-        serde_json::from_str(args_json_str).map_err(|e| format!("parse tool args: {}", e))?;
+    debug!("MCP call args_json_str: {}", args_json_str);
+
+    // Handle potential double-encoding: if the string is JSON-encoded JSON, parse twice
+    let mut args_value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(args_json_str) {
+        Ok(val) => {
+            // Check if we got a string (double-encoded)
+            if let Some(inner_str) = val.as_str() {
+                debug!("Double-encoded JSON detected, parsing again");
+                serde_json::from_str::<serde_json::Value>(inner_str)
+                    .map_err(|e| format!("parse inner tool args: {}", e))?
+            } else {
+                val
+            }
+        }
+        Err(e) => return Err(format!("parse tool args: {}", e)),
+    };
 
     // Get tool info to access schema for type coercion
     let tool_info = mcp_mgr
@@ -1449,6 +1463,12 @@ async fn execute_mcp_call(
     }
 
     let args_obj = args_value.as_object().cloned();
+
+    debug!(
+        "Calling MCP tool '{}' with coerced args: {}",
+        tool_name,
+        serde_json::to_string(&args_obj).unwrap_or_else(|_| "N/A".to_string())
+    );
 
     let result = mcp_mgr
         .call_tool(tool_name, args_obj)
