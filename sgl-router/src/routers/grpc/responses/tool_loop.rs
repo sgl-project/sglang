@@ -23,11 +23,6 @@ use super::{
     streaming::{OutputItemType, ResponseStreamEventEmitter},
     types::BackgroundTaskInfo,
 };
-// ============================================================================
-// MCP Tool Support
-// ============================================================================
-/// Build a request-scoped MCP manager from request tools, if present
-///
 /// This is a re-export of the shared implementation from openai::mcp
 pub(super) use crate::routers::openai::mcp::mcp_manager_from_request_tools as create_mcp_manager_from_request;
 use crate::{
