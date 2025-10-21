@@ -133,13 +133,37 @@ class RouterManager:
                 time.sleep(0.2)
         raise TimeoutError(f"Router at {base_url} did not become healthy")
 
-    def add_worker(self, base_url: str, worker_url: str) -> None:
+    def add_worker(self, base_url: str, worker_url: str, timeout: float = 30.0) -> None:
         r = requests.post(f"{base_url}/workers", json={"url": worker_url})
         assert (
             r.status_code == 202
         ), f"add_worker failed: {r.status_code} {r.text}"  # ACCEPTED status
 
-    def remove_worker(self, base_url: str, worker_url: str) -> None:
+        # Poll until worker is actually added and healthy
+        from urllib.parse import quote
+
+        encoded_url = quote(worker_url, safe="")
+        start = time.time()
+        with requests.Session() as s:
+            while time.time() - start < timeout:
+                try:
+                    r = s.get(f"{base_url}/workers/{encoded_url}", timeout=2)
+                    if r.status_code == 200:
+                        data = r.json()
+                        # Check if worker is healthy and registered (not just in job queue)
+                        if data.get("is_healthy", False):
+                            return
+                    # Worker not ready yet, continue polling
+                except requests.RequestException:
+                    pass
+                time.sleep(0.1)
+        raise TimeoutError(
+            f"Worker {worker_url} was not added and healthy after {timeout}s"
+        )
+
+    def remove_worker(
+        self, base_url: str, worker_url: str, timeout: float = 10.0
+    ) -> None:
         # URL encode the worker_url for path parameter
         from urllib.parse import quote
 
@@ -148,6 +172,21 @@ class RouterManager:
         assert (
             r.status_code == 202
         ), f"remove_worker failed: {r.status_code} {r.text}"  # ACCEPTED status
+
+        # Poll until worker is actually removed (GET returns 404) or timeout
+        start = time.time()
+        with requests.Session() as s:
+            while time.time() - start < timeout:
+                try:
+                    r = s.get(f"{base_url}/workers/{encoded_url}", timeout=2)
+                    if r.status_code == 404:
+                        # Worker successfully removed
+                        return
+                    # Worker still exists or being processed, continue polling
+                except requests.RequestException:
+                    pass
+                time.sleep(0.1)
+        raise TimeoutError(f"Worker {worker_url} was not removed after {timeout}s")
 
     def list_workers(self, base_url: str) -> list[str]:
         r = requests.get(f"{base_url}/workers")

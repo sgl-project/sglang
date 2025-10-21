@@ -126,8 +126,31 @@ impl TestContext {
                 .await
                 .expect("Failed to submit worker initialization job");
 
-            // Wait for async worker initialization to complete
-            tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+            // Poll until all workers are healthy (up to 10 seconds)
+            let expected_count = worker_urls.len();
+            let start = tokio::time::Instant::now();
+            let timeout_duration = tokio::time::Duration::from_secs(10);
+            loop {
+                let healthy_workers = app_context
+                    .worker_registry
+                    .get_all()
+                    .iter()
+                    .filter(|w| w.is_healthy())
+                    .count();
+
+                if healthy_workers >= expected_count {
+                    break;
+                }
+
+                if start.elapsed() > timeout_duration {
+                    panic!(
+                        "Timeout waiting for {} workers to become healthy (only {} ready)",
+                        expected_count, healthy_workers
+                    );
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
         }
 
         // Create router
