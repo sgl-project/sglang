@@ -941,7 +941,7 @@ async fn execute_without_mcp(
 }
 
 /// Load conversation history and response chains, returning modified request
-async fn load_conversation_history(
+pub(crate) async fn load_conversation_history(
     request: &ResponsesRequest,
     response_storage: &SharedResponseStorage,
     conversation_storage: &SharedConversationStorage,

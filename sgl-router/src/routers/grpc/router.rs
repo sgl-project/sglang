@@ -267,27 +267,51 @@ impl RouterTrait for GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Use responses module for ALL requests (streaming and non-streaming)
-        // Responses module handles:
-        // - Request validation (previous_response_id XOR conversation)
-        // - Loading response chain / conversation history from storage
-        // - Conversion: ResponsesRequest → ChatCompletionRequest
-        // - Execution through chat pipeline stages
-        // - Conversion: ChatCompletionResponse → ResponsesResponse
-        // - Response persistence
-        // - MCP tool loop wrapper (future)
-        responses::route_responses(
-            &self.pipeline,
-            Arc::new(body.clone()),
-            headers.cloned(),
-            model_id.map(|s| s.to_string()),
-            self.shared_components.clone(),
-            self.response_storage.clone(),
-            self.conversation_storage.clone(),
-            self.conversation_item_storage.clone(),
-            self.background_tasks.clone(),
-        )
-        .await
+        // Determine model name for Harmony detection
+        let model_name = body.model.as_deref().or(model_id).unwrap_or("default");
+
+        // Branch based on model type
+        if responses::is_harmony_model(model_name) {
+            // Harmony (gpt-oss) path: Direct token processing
+            // - NO conversion to chat format (preserves multi-item structure)
+            // - Uses StreamableParser for token-level parsing
+            // - Routes to separate output items (reasoning, tool calls, messages)
+            debug!("Routing to Harmony path for model: {}", model_name);
+            responses::route_harmony_responses(
+                &self.pipeline,
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                self.shared_components.clone(),
+                self.response_storage.clone(),
+                self.conversation_storage.clone(),
+                self.conversation_item_storage.clone(),
+                self.background_tasks.clone(),
+            )
+            .await
+        } else {
+            // Standard (non-Harmony) path: Chat pipeline with conversions
+            // - Request validation (previous_response_id XOR conversation)
+            // - Loading response chain / conversation history from storage
+            // - Conversion: ResponsesRequest → ChatCompletionRequest
+            // - Execution through chat pipeline stages
+            // - Conversion: ChatCompletionResponse → ResponsesResponse
+            // - Response persistence
+            // - MCP tool loop wrapper
+            debug!("Routing to standard path for model: {}", model_name);
+            responses::route_responses(
+                &self.pipeline,
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                self.shared_components.clone(),
+                self.response_storage.clone(),
+                self.conversation_storage.clone(),
+                self.conversation_item_storage.clone(),
+                self.background_tasks.clone(),
+            )
+            .await
+        }
     }
 
     async fn get_response(

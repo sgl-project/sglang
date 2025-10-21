@@ -507,6 +507,11 @@ impl PipelineStage for RequestBuildingStage {
                     )
                     .map_err(utils::bad_request_error)?
             }
+            RequestType::Responses(_) => {
+                // Responses API is handled separately in harmony.rs or via chat conversion
+                // This path should not be reached in the standard pipeline
+                panic!("Responses requests should be handled via responses::route_responses or responses::route_harmony_responses, not through standard pipeline");
+            }
         };
 
         // Inject PD metadata if needed
@@ -579,6 +584,13 @@ impl PipelineStage for DispatchMetadataStage {
                 ctx.input
                     .model_id
                     .clone()
+                    .unwrap_or_else(|| "default".to_string())
+            }
+            RequestType::Responses(req) => {
+                // Responses requests have optional model field
+                req.model
+                    .clone()
+                    .or_else(|| ctx.input.model_id.clone())
                     .unwrap_or_else(|| "default".to_string())
             }
         };
@@ -764,6 +776,11 @@ impl PipelineStage for ResponseProcessingStage {
         match &ctx.input.request_type {
             RequestType::Chat(_) => return self.process_chat_response(ctx).await,
             RequestType::Generate(_) => return self.process_generate_response(ctx).await,
+            RequestType::Responses(_) => {
+                // Responses API is handled separately in harmony.rs or via chat conversion
+                // This path should not be reached in the standard pipeline
+                panic!("Responses requests should be handled via responses::route_responses or responses::route_harmony_responses, not through standard pipeline");
+            }
         }
     }
 

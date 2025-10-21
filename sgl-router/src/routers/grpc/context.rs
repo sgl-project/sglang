@@ -15,6 +15,7 @@ use crate::{
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         generate::{GenerateRequest, GenerateResponse},
+        responses::{ResponseOutputItem, ResponsesRequest},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer},
@@ -53,6 +54,7 @@ pub struct RequestInput {
 pub enum RequestType {
     Chat(Arc<ChatCompletionRequest>),
     Generate(Arc<GenerateRequest>),
+    Responses(Arc<ResponsesRequest>),
 }
 
 /// Shared components (injected once at creation)
@@ -138,6 +140,35 @@ pub struct DispatchMetadata {
     pub is_streaming: bool,
 }
 
+/// Harmony-specific pipeline state for gpt-oss models
+///
+/// This struct holds the state needed for Harmony token-level parsing.
+/// Unlike non-Harmony models which use separate reasoning/tool parsers,
+/// Harmony uses a single StreamableParser that routes messages to different
+/// channels (analysis, functions.*, final) which we then convert to separate
+/// ResponseOutputItems.
+///
+/// This follows the exact pattern from vLLM/sglang Python implementations:
+/// - NO separate ReasoningParser or ToolParser classes
+/// - Single StreamableParser processes all tokens
+/// - parse_output_message() routes based on recipient field
+pub struct HarmonyState {
+    /// StreamableParser from openai-harmony for token processing
+    /// Processes tokens incrementally and extracts complete messages
+    pub parser: openai_harmony::StreamableParser,
+
+    /// Harmony encoding (loaded once, reused across requests)
+    pub encoding: openai_harmony::HarmonyEncoding,
+
+    /// Accumulated output items (reasoning, tool calls, messages)
+    /// These are built incrementally as the parser completes messages
+    pub output_items: Vec<ResponseOutputItem>,
+
+    /// Track the number of messages processed (for incremental streaming)
+    /// Used to detect when new messages are completed during streaming
+    pub processed_message_count: usize,
+}
+
 /// Response processing state (Step 6)
 #[derive(Default)]
 pub struct ResponseState {
@@ -155,6 +186,10 @@ pub struct ResponseState {
 
     /// Final processed response
     pub final_response: Option<FinalResponse>,
+
+    /// Harmony-specific state (for gpt-oss models only)
+    /// This enables direct token-level processing without chat format conversion
+    pub harmony: Option<HarmonyState>,
 }
 
 /// Streaming state (per-choice tracking)
@@ -217,6 +252,24 @@ impl RequestContext {
         }
     }
 
+    /// Create context for responses request
+    pub fn for_responses(
+        request: Arc<ResponsesRequest>,
+        headers: Option<HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self {
+            input: RequestInput {
+                request_type: RequestType::Responses(request),
+                headers,
+                model_id,
+            },
+            components,
+            state: ProcessingState::default(),
+        }
+    }
+
     /// Get reference to original request (type-safe)
     pub fn request(&self) -> &RequestType {
         &self.input.request_type
@@ -254,11 +307,28 @@ impl RequestContext {
         }
     }
 
+    /// Get responses request (panics if not responses)
+    pub fn responses_request(&self) -> &ResponsesRequest {
+        match &self.input.request_type {
+            RequestType::Responses(req) => req.as_ref(),
+            _ => panic!("Expected responses request"),
+        }
+    }
+
+    /// Get Arc clone of responses request (panics if not responses)
+    pub fn responses_request_arc(&self) -> Arc<ResponsesRequest> {
+        match &self.input.request_type {
+            RequestType::Responses(req) => Arc::clone(req),
+            _ => panic!("Expected responses request"),
+        }
+    }
+
     /// Check if request is streaming
     pub fn is_streaming(&self) -> bool {
         match &self.input.request_type {
             RequestType::Chat(req) => req.stream,
             RequestType::Generate(req) => req.stream,
+            RequestType::Responses(req) => req.stream.unwrap_or(false),
         }
     }
 }

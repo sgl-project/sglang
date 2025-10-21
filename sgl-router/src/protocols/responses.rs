@@ -17,6 +17,15 @@ use super::common::{
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseTool {
     #[serde(rename = "type")]
     pub r#type: ResponseToolType,
@@ -33,6 +42,9 @@ pub struct ResponseTool {
     pub require_approval: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    // Function-specific fields (used when type == "function")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<FunctionDefinition>,
 }
 
 impl Default for ResponseTool {
@@ -45,6 +57,7 @@ impl Default for ResponseTool {
             server_description: None,
             require_approval: None,
             allowed_tools: None,
+            function: None,
         }
     }
 }
@@ -54,7 +67,9 @@ impl Default for ResponseTool {
 pub enum ResponseToolType {
     WebSearchPreview,
     CodeInterpreter,
+    Container,
     Mcp,
+    Function,
 }
 
 // ============================================================================
@@ -228,6 +243,43 @@ pub enum ResponseOutputItem {
         output: String,
         server_label: String,
     },
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        id: String,
+        action: WebSearchAction,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
+    #[serde(rename = "code_interpreter_call")]
+    CodeInterpreterCall {
+        id: String,
+        code: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outputs: Option<Vec<CodeInterpreterOutput>>,
+    },
+}
+
+// ============================================================================
+// Built-in Tool Types
+// ============================================================================
+
+/// Web search action types for browser tool
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WebSearchAction {
+    Search { query: String },
+    OpenPage { url: String },
+    Find { pattern: String, url: String },
+}
+
+/// Code interpreter output for python tool
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CodeInterpreterOutput {
+    Logs { logs: String },
+    Image { image: String }, // Base64 encoded
 }
 
 // ============================================================================
@@ -269,6 +321,7 @@ pub enum ResponseStatus {
     Queued,
     InProgress,
     Completed,
+    Incomplete, // Response hit max tokens or stopped mid-generation
     Failed,
     Cancelled,
 }
@@ -912,4 +965,104 @@ impl ResponseReasoningContent {
     pub fn new_reasoning_text(text: String) -> Self {
         Self::ReasoningText { text }
     }
+}
+
+// ============================================================================
+// SSE Streaming Event Types (Harmony Granular Streaming)
+// ============================================================================
+
+/// SSE event for output item added (new message/reasoning/tool call started)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseOutputItemAddedEvent {
+    #[serde(rename = "type")]
+    pub event_type: String, // "response.output_item.added"
+    pub item: ResponseOutputItem,
+}
+
+/// SSE event for output item completed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseOutputItemDoneEvent {
+    #[serde(rename = "type")]
+    pub event_type: String, // "response.output_item.done"
+    pub item: ResponseOutputItem,
+}
+
+/// SSE event for content part added (new content section started)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseContentPartAddedEvent {
+    #[serde(rename = "type")]
+    pub event_type: String, // "response.content_part.added"
+    pub item_id: String,
+    pub content_index: usize,
+    pub part: ResponseContentPart,
+}
+
+/// SSE event for content part completed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseContentPartDoneEvent {
+    #[serde(rename = "type")]
+    pub event_type: String, // "response.content_part.done"
+    pub item_id: String,
+    pub content_index: usize,
+    pub part: ResponseContentPart,
+}
+
+/// SSE event for reasoning part added (new reasoning section started)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseReasoningPartAddedEvent {
+    #[serde(rename = "type")]
+    pub event_type: String, // "response.reasoning_part.added"
+    pub item_id: String,
+    pub content_index: usize,
+    pub part: ResponseReasoningContent,
+}
+
+/// SSE event for incremental text delta (message content)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseTextDeltaEvent {
+    #[serde(rename = "type")]
+    pub event_type: String, // "response.output_text.delta"
+    pub item_id: String,
+    pub content_index: usize,
+    pub delta: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChatLogProbs>,
+}
+
+/// SSE event for text completion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseTextDoneEvent {
+    #[serde(rename = "type")]
+    pub event_type: String, // "response.output_text.done"
+    pub item_id: String,
+    pub content_index: usize,
+    pub text: String,
+}
+
+/// SSE event for incremental reasoning text delta
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseReasoningTextDeltaEvent {
+    #[serde(rename = "type")]
+    pub event_type: String, // "response.reasoning_text.delta"
+    pub item_id: String,
+    pub content_index: usize,
+    pub delta: String,
+}
+
+/// SSE event for reasoning text completion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseReasoningTextDoneEvent {
+    #[serde(rename = "type")]
+    pub event_type: String, // "response.reasoning_text.done"
+    pub item_id: String,
+    pub text: String,
+}
+
+/// SSE event for code interpreter code delta
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseCodeInterpreterCallCodeDeltaEvent {
+    #[serde(rename = "type")]
+    pub event_type: String, // "response.code_interpreter_call.code.delta"
+    pub item_id: String,
+    pub delta: String,
 }

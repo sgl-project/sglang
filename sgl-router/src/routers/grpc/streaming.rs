@@ -317,6 +317,7 @@ impl StreamingProcessor {
                         let (normal_text, reasoning_chunk, in_reasoning) = self
                             .process_reasoning_stream(
                                 &delta,
+                                &chunk.token_ids,
                                 index,
                                 &mut reasoning_parsers,
                                 request_id,
@@ -1024,6 +1025,7 @@ impl StreamingProcessor {
     async fn process_reasoning_stream(
         &self,
         delta: &str,
+        token_ids: &[u32],
         index: u32,
         reasoning_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
         request_id: &str,
@@ -1045,7 +1047,13 @@ impl StreamingProcessor {
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
             let (parse_result, in_reasoning) = {
                 let mut parser = pooled_parser.lock().await;
-                let result = parser.parse_reasoning_streaming_incremental(delta);
+                let result = if parser.supports_token_parsing() {
+                    // Use token-based parsing for parsers like Harmony
+                    parser.parse_reasoning_streaming_incremental_from_tokens(token_ids)
+                } else {
+                    // Use text-based parsing for traditional parsers
+                    parser.parse_reasoning_streaming_incremental(delta)
+                };
                 let in_reasoning = parser.is_in_reasoning();
                 (result, in_reasoning)
             };
