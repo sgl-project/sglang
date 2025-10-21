@@ -1,23 +1,28 @@
-use crate::core::WorkerManager;
-use crate::protocols::worker_spec::WorkerConfigRequest;
-use crate::server::AppContext;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     api::Api,
-    runtime::watcher::{watcher, Config},
-    runtime::WatchStreamExt,
+    runtime::{
+        watcher::{watcher, Config},
+        WatchStreamExt,
+    },
     Client,
 };
-use std::collections::{HashMap, HashSet};
-
 use rustls;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::task;
-use tokio::time;
+use tokio::{task, time};
 use tracing::{debug, error, info, warn};
+
+use crate::{
+    core::{Job, WorkerManager},
+    protocols::worker_spec::WorkerConfigRequest,
+    server::AppContext,
+};
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
@@ -156,6 +161,7 @@ impl PodInfo {
     }
 
     pub fn worker_url(&self, port: u16) -> String {
+        // Default to http:// prefix; workflow will detect actual protocol (HTTP vs gRPC)
         format!("http://{}:{}", self.ip, port)
     }
 }
@@ -381,10 +387,18 @@ async fn handle_pod_event(
                 tool_parser: None,
                 chat_template: None,
                 api_key: None,
+                health_check_timeout_secs: app_context.router_config.health_check.timeout_secs,
+                health_check_interval_secs: app_context
+                    .router_config
+                    .health_check
+                    .check_interval_secs,
+                health_success_threshold: app_context.router_config.health_check.success_threshold,
+                health_failure_threshold: app_context.router_config.health_check.failure_threshold,
+                max_connection_attempts: app_context.router_config.health_check.success_threshold
+                    * 20,
+                dp_aware: false,
             };
 
-            // Submit job for async worker addition
-            use crate::core::Job;
             let job = Job::AddWorker {
                 config: Box::new(config.clone()),
             };
@@ -452,10 +466,12 @@ async fn handle_pod_deletion(
 
 #[cfg(test)]
 mod tests {
+    use k8s_openapi::{
+        api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
+        apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
+    };
+
     use super::*;
-    use k8s_openapi::api::core::v1::{Pod, PodCondition, PodSpec, PodStatus};
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
     fn create_k8s_pod(
         name: Option<&str>,
@@ -535,8 +551,7 @@ mod tests {
     }
 
     async fn create_test_app_context() -> Arc<AppContext> {
-        use crate::config::RouterConfig;
-        use crate::middleware::TokenBucket;
+        use crate::{config::RouterConfig, middleware::TokenBucket};
 
         let router_config = RouterConfig {
             worker_startup_timeout_secs: 1,
@@ -566,6 +581,7 @@ mod tests {
             configured_reasoning_parser: None,
             configured_tool_parser: None,
             worker_job_queue: Arc::new(std::sync::OnceLock::new()),
+            workflow_engine: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -811,19 +827,6 @@ mod tests {
             bootstrap_port: None,
         };
         assert!(!not_running_pod.is_healthy());
-    }
-
-    #[test]
-    fn test_pod_info_worker_url() {
-        let pod_info = PodInfo {
-            name: "p1".into(),
-            ip: "1.2.3.4".into(),
-            status: "Running".into(),
-            is_ready: true,
-            pod_type: None,
-            bootstrap_port: None,
-        };
-        assert_eq!(pod_info.worker_url(8080), "http://1.2.3.4:8080");
     }
 
     #[test]

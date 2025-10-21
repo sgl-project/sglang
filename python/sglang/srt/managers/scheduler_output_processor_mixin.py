@@ -14,6 +14,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
 )
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -42,22 +43,20 @@ class SchedulerOutputProcessorMixin:
         skip_stream_req = None
 
         if self.is_generation:
+            if result.copy_done is not None:
+                result.copy_done.synchronize()
+
             (
                 logits_output,
                 next_token_ids,
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
-                copy_done,
             ) = (
                 result.logits_output,
                 result.next_token_ids,
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
-                result.copy_done,
             )
-
-            if copy_done is not None:
-                copy_done.synchronize()
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
@@ -199,58 +198,53 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
-    def hacky_process_eagle_overlap_result(
+    def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
-    ):
-        # TODO(lsyin): try use a copy stream to share SMs with forward
-        # FIXME(lsyin): better organize this token free logic in eagle-overlap
-        last_batch_allocate_lens_cpu = result.last_batch_allocate_lens.tolist()
-        accept_lens_cpu = result.accept_lens.tolist()
+    ) -> List[List[int]]:
+        """Resolve the padding next token ids for speculative decoding with overlap."""
+        assert result.next_token_ids.is_cpu
+        assert result.accept_lens.is_cpu
+        assert result.allocate_lens.is_cpu
+
         next_token_ids = result.next_token_ids.tolist()
+        accept_lens = result.accept_lens.tolist()
+        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
 
         predict_tokens = []
-        num_draft_tokens = self.draft_worker.speculative_num_draft_tokens
+        stride = self.draft_worker.speculative_num_draft_tokens
         for i, req in enumerate(batch.reqs):
             predict_tokens.append(
-                next_token_ids[
-                    i * num_draft_tokens : i * num_draft_tokens + accept_lens_cpu[i]
-                ]
+                next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
-            # FIXME(lsyin): move this update elsewhere
             req.spec_verify_ct += 1
 
-        return last_batch_allocate_lens_cpu, accept_lens_cpu, predict_tokens
+        return predict_tokens
 
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        logits_output, next_token_ids, can_run_cuda_graph, copy_done = (
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+
+        logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
             result.can_run_cuda_graph,
-            result.copy_done,
         )
-        self.num_generated_tokens += len(batch.reqs)
-
-        if copy_done is not None:
-            copy_done.synchronize()
 
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_v2_eagle:
-            (
-                last_batch_allocate_lens_cpu,
-                accept_lens_cpu,
-                next_token_ids,
-            ) = self.hacky_process_eagle_overlap_result(result, batch)
-            result.num_accepted_tokens = sum(accept_lens_cpu)
+            next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+            allocate_lens_list = result.allocate_lens.tolist()
+            accept_lens_list = result.accept_lens.tolist()
 
-        # FIXME(lsyin): we suppose we have already got the num_accepted_tokens in result
-        if not self.spec_algorithm.is_none():
+        self.num_generated_tokens += len(batch.reqs)
+        if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
         self.token_to_kv_pool_allocator.free_group_begin()
@@ -264,68 +258,59 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if self.enable_overlap and req.finished():
-                if self.page_size == 1:
-                    if batch.spec_algorithm.is_eagle():
-                        from sglang.srt.speculative.eagle_worker_v2 import (
-                            free_spec_dec_tokens_page_size_1,
-                        )
+                indices_to_free = None
+                if batch.spec_algorithm.is_eagle():
+                    from sglang.srt.speculative.eagle_info import EagleDraftInput
 
-                        free_spec_dec_tokens_page_size_1(
-                            self.req_to_token_pool,
-                            self.token_to_kv_pool_allocator,
-                            req,
-                            last_batch_allocate_lens_cpu[i],
-                            None,
-                        )
-                    else:
-                        # Free the one extra delayed token
-                        self.token_to_kv_pool_allocator.free(
-                            batch.out_cache_loc[i : i + 1]
-                        )
+                    end_p = allocate_lens_list[i]
+                    start_p = end_p - EagleDraftInput.ALLOC_LEN_PER_DECODE
+                    if self.page_size > 1:
+                        start_p = ceil_div(start_p, self.page_size) * self.page_size
+
+                    indices_to_free = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx
+                    ][start_p:end_p]
+
                 else:
-                    if batch.spec_algorithm.is_eagle():
-                        # TODO(lsyin): support eagle with page_size > 1
-                        raise NotImplementedError()
+                    if self.page_size == 1:
+                        # Free the one extra delayed token
+                        indices_to_free = batch.out_cache_loc[i : i + 1]
                     else:
                         if (
                             len(req.origin_input_ids) + len(req.output_ids) - 1
                         ) % self.page_size == 0:
                             # Only free when the extra token is in a new page
-                            self.token_to_kv_pool_allocator.free(
-                                batch.out_cache_loc[i : i + 1]
-                            )
+                            indices_to_free = batch.out_cache_loc[i : i + 1]
+
+                if indices_to_free is not None:
+                    self.token_to_kv_pool_allocator.free(indices_to_free)
                 continue
 
+            new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_v2_eagle:
-                # FIXME(lsyin): non-overlap spec worker will solve the output_ids in speculative decoding
-                #               !!!unify the logic here!!!
+                # Only v2 eagle's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
+                new_accepted_len = len(next_token_id)
 
-            req.check_finished()
+            req.check_finished(new_accepted_len)
+
             if req.finished():
                 if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
                     # FIXME(lsyin): fix the messy logic here
                     # 1) when not overlap (v2 impl), we free the extra tokens in the req
-                    # 2) when overlap and current batch is extend, we free the extra tokens in the req of the previous batch
-                    from sglang.srt.speculative.eagle_worker_v2 import (
-                        free_spec_dec_tokens_page_size_1,
-                    )
+                    # 2) overlap eagle and the current batch is prefill. This seq will not run extra iteration.
+                    start_p = batch.seq_lens_cpu[i] + accept_lens_list[i]
+                    end_p = allocate_lens_list[i]
 
-                    new_seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-                    # FIXME(lsyin): remove this assert
-                    assert new_seq_len == int(
-                        batch.seq_lens_cpu[i] + accept_lens_cpu[i]
-                    ), f"{new_seq_len=} vs {batch.seq_lens_cpu[i] + accept_lens_cpu[i]=}"
+                    if self.page_size > 1:
+                        start_p = ceil_div(start_p, self.page_size) * self.page_size
 
-                    free_spec_dec_tokens_page_size_1(
-                        self.req_to_token_pool,
-                        self.token_to_kv_pool_allocator,
-                        req,
-                        last_batch_allocate_lens_cpu[i],
-                        new_seq_len,
-                    )
+                    indices_to_free = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx
+                    ][start_p:end_p]
+                    self.token_to_kv_pool_allocator.free(indices_to_free)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; cache_finished_req will be called after Device->Host transfer completes
@@ -697,6 +682,7 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
     ):
         rids = []
+        http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
 
         decoded_texts = []
@@ -752,6 +738,8 @@ class SchedulerOutputProcessorMixin:
                     # because of the one additional delayed token. This "continue" prevented the dummy output.
                     continue
                 req.finished_output = True
+                if req.finished_len is None:
+                    req.finished_len = len(req.output_ids)
                 should_output = True
             else:
                 if req.stream:
@@ -783,6 +771,7 @@ class SchedulerOutputProcessorMixin:
                     req.send_output_token_logprobs_offset
                 )
                 rids.append(req.rid)
+                http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
@@ -794,17 +783,20 @@ class SchedulerOutputProcessorMixin:
                 else:
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
 
+                # Exclude the tokens after stop condition
+                output_ids_ = req.output_ids_through_stop
+
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
-                output_ids.append(req.output_ids[send_token_offset:])
-                req.send_token_offset = len(req.output_ids)
+                output_ids.append(output_ids_[send_token_offset:])
+                req.send_token_offset = len(output_ids_)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
                     req.sampling_params.spaces_between_special_tokens
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
-                completion_tokens.append(len(req.output_ids))
+                completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
 
                 if not self.spec_algorithm.is_none():
@@ -896,7 +888,7 @@ class SchedulerOutputProcessorMixin:
             if self.model_config.is_multimodal_gen:
                 return
 
-            self.send_to_detokenizer.send_pyobj(
+            self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     finished_reasons,
                     decoded_texts,
@@ -926,6 +918,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     rids=rids,
+                    http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                 )
@@ -933,6 +926,7 @@ class SchedulerOutputProcessorMixin:
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):
         rids = []
+        http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
 
         embeddings = []
@@ -941,17 +935,19 @@ class SchedulerOutputProcessorMixin:
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
+                http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
-        self.send_to_detokenizer.send_pyobj(
+        self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 finished_reasons,
                 embeddings,
                 prompt_tokens,
                 cached_tokens,
                 rids=rids,
+                http_worker_ipcs=http_worker_ipcs,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
             )
