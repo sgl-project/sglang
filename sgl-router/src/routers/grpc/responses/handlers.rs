@@ -24,10 +24,11 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::types::BackgroundTaskInfo;
-use crate::routers::grpc::{
-    context::SharedComponents,
-    pipeline::RequestPipeline,
+use super::conversions;
+use super::{
+    streaming::ResponseStreamEventEmitter,
+    tool_loop::{create_mcp_manager_from_request, execute_tool_loop, execute_tool_loop_streaming},
+    types::BackgroundTaskInfo,
 };
 use crate::{
     data_connector::{
@@ -41,16 +42,11 @@ use crate::{
             ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
-    routers::openai::conversations::persist_conversation_items,
+    routers::{
+        grpc::{context::SharedComponents, pipeline::RequestPipeline},
+        openai::conversations::persist_conversation_items,
+    },
 };
-
-use super::streaming::ResponseStreamEventEmitter;
-use super::tool_loop::{
-    create_mcp_manager_from_request, execute_tool_loop, execute_tool_loop_streaming,
-};
-
-// Module-internal imports (conversions is not pub)
-use super::conversions;
 
 // ============================================================================
 // Main Request Handler
@@ -1098,9 +1094,7 @@ pub async fn get_response_impl(
 
     // Retrieve response from storage
     match response_storage.get_response(&resp_id).await {
-        Ok(Some(stored_response)) => {
-            axum::Json(stored_response.raw_response).into_response()
-        }
+        Ok(Some(stored_response)) => axum::Json(stored_response.raw_response).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             axum::Json(json!({

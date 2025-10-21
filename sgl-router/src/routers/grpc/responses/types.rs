@@ -1,6 +1,7 @@
 //! Type definitions for /v1/responses endpoint
 
 use std::sync::Arc;
+
 use tokio::{sync::RwLock, task::JoinHandle};
 
 /// Information stored for background tasks to enable end-to-end cancellation

@@ -300,7 +300,8 @@ impl RouterTrait for GrpcRouter {
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        responses::cancel_response_impl(&self.response_storage, &self.background_tasks, response_id).await
+        responses::cancel_response_impl(&self.response_storage, &self.background_tasks, response_id)
+            .await
     }
 
     async fn route_classify(

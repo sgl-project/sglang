@@ -204,7 +204,10 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
+    pub(super) fn emit_completed(
+        &mut self,
+        usage: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
         let mut response = json!({
             "type": "response.completed",
             "sequence_number": self.next_sequence(),
@@ -237,7 +240,10 @@ impl ResponseStreamEventEmitter {
     // MCP Event Emission Methods
     // ========================================================================
 
-    pub(super) fn emit_mcp_list_tools_in_progress(&mut self, output_index: usize) -> serde_json::Value {
+    pub(super) fn emit_mcp_list_tools_in_progress(
+        &mut self,
+        output_index: usize,
+    ) -> serde_json::Value {
         json!({
             "type": "response.mcp_list_tools.in_progress",
             "sequence_number": self.next_sequence(),
@@ -322,7 +328,11 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_completed(&mut self, output_index: usize, item_id: &str) -> serde_json::Value {
+    pub(super) fn emit_mcp_call_completed(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+    ) -> serde_json::Value {
         json!({
             "type": "response.mcp_call.completed",
             "sequence_number": self.next_sequence(),
@@ -573,4 +583,3 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 }
-

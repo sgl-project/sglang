@@ -23,8 +23,17 @@ use super::{
     streaming::{OutputItemType, ResponseStreamEventEmitter},
     types::BackgroundTaskInfo,
 };
+// ============================================================================
+// MCP Tool Support
+// ============================================================================
+/// Build a request-scoped MCP manager from request tools, if present
+///
+/// This is a re-export of the shared implementation from openai::mcp
+pub(super) use crate::routers::openai::mcp::mcp_manager_from_request_tools as create_mcp_manager_from_request;
 use crate::{
-    data_connector::{SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage},
+    data_connector::{
+        SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
+    },
     mcp::McpClientManager,
     protocols::{
         chat::ChatCompletionResponse,
@@ -37,15 +46,6 @@ use crate::{
     },
     routers::grpc::{context::SharedComponents, pipeline::RequestPipeline},
 };
-
-// ============================================================================
-// MCP Tool Support
-// ============================================================================
-
-/// Build a request-scoped MCP manager from request tools, if present
-///
-/// This is a re-export of the shared implementation from openai::mcp
-pub(super) use crate::routers::openai::mcp::mcp_manager_from_request_tools as create_mcp_manager_from_request;
 
 /// Extract function call from a chat completion response
 /// Returns (call_id, tool_name, arguments_json_str) if found
@@ -976,8 +976,9 @@ async fn convert_and_accumulate_stream(
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<ChatCompletionResponse, String> {
-    use crate::protocols::chat::ChatCompletionStreamResponse;
     use futures_util::StreamExt;
+
+    use crate::protocols::chat::ChatCompletionStreamResponse;
 
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
@@ -1046,13 +1047,15 @@ impl ChatResponseAccumulator {
             if let Some(tool_call_deltas) = &choice.delta.tool_calls {
                 for delta in tool_call_deltas {
                     let index = delta.index as usize;
-                    let entry = self.tool_calls.entry(index).or_insert_with(|| crate::protocols::common::ToolCall {
-                        id: String::new(),
-                        tool_type: "function".to_string(),
-                        function: crate::protocols::common::FunctionCallResponse {
-                            name: String::new(),
-                            arguments: Some(String::new()),
-                        },
+                    let entry = self.tool_calls.entry(index).or_insert_with(|| {
+                        crate::protocols::common::ToolCall {
+                            id: String::new(),
+                            tool_type: "function".to_string(),
+                            function: crate::protocols::common::FunctionCallResponse {
+                                name: String::new(),
+                                arguments: Some(String::new()),
+                            },
+                        }
                     });
 
                     if let Some(id) = &delta.id {
