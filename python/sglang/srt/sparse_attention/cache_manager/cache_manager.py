@@ -64,8 +64,8 @@ class RetriveQuery:
         self.score = torch.zeros(
             config.max_bs, # bs
             config.keys[0].shape[1],  # head_num
-            config.keys[0].shape[0] // config.page_size,  # max_num_pages
-            dtype=config.keys[0].dtype, 
+            (config.max_seq_len + config.page_size - 1) // config.page_size,
+            dtype=torch.float32, 
             device=config.device)
 
         self.selected_page_indices = torch.full(
@@ -88,12 +88,6 @@ class RetriveResult:
             config.max_bs,
             config.retrive_budget_per_seq,
             dtype=torch.int32,
-            device=config.device,
-        )
-        self.scores = torch.zeros(
-            config.max_bs,
-            (config.max_seq_len + config.page_size - 1) // config.page_size,
-            dtype=torch.float32,
             device=config.device,
         )
         self.req_pool_indices = torch.full(
@@ -231,5 +225,5 @@ class CacheManager:
                     if self.config.is_cuda_graph:
                         self.graph_runner.graphs[layer_id].replay()
                     else:
-                        self._retrive_one_layer(layer_id)
-                time.sleep(0.01)
+                        self._retrive_one_layer(self.retrived_query[layer_id], self.retrived_result[layer_id])
+                time.sleep(0.001)

@@ -5,7 +5,7 @@ import triton.language as tl
 
 @triton.jit
 def _compute_average_score_kernel(
-    Q, K, Out, kv_pages_per_seq,kv_pages_num_per_seq,kv_pages_per_seq_max,
+    Q, K, Out, kv_pages_per_seq,kv_pages_num_per_seq,
     # Strides
     q_stride_b, q_stride_h,
     k_stride_p, k_stride_h,
@@ -29,8 +29,6 @@ def _compute_average_score_kernel(
     kv_hid = tl.program_id(1)
     pid_block = tl.program_id(2)
 
-    max_page_index = tl.load(kv_pages_per_seq_max + bid)
-    max_page_block = tl.cdiv(max_page_index, BLOCK_SIZE_P)
     num_valid_pages = tl.load(kv_pages_num_per_seq + bid)
     if pid_block >= num_valid_pages:
         page_offsets = pid_block * BLOCK_SIZE_P + tl.arange(0, BLOCK_SIZE_P)
@@ -63,30 +61,14 @@ def _compute_average_score_kernel(
     scores_matrix = tl.dot(q_matrix, tl.trans(k_matrix), out_dtype=tl.float32, allow_tf32=False)
     final_scores = tl.sum(scores_matrix, axis=0)
     
+    is_valid = page_offsets >= num_sink_pages
+    local_bound = num_valid_pages - num_local_pages
+    is_valid = is_valid & (page_offsets < local_bound)
     
-    token_base_ptr = kv_pages_per_seq + bid * MAX_NUM_TOKEN_PAGES
-    token_page_offsets = tl.arange(0, PADDED_MAX_NUM_TOKEN_PAGES)
-    valid_page_ids = tl.load(token_base_ptr + token_page_offsets, 
-                            mask=(token_page_offsets < MAX_NUM_TOKEN_PAGES) & (token_page_offsets < num_valid_pages), other=-1)
+    final_scores_with_inf = tl.where(is_valid, final_scores, -float('inf'))
     
-    is_in_valid_pages_matrix = (page_offsets[:, None] == valid_page_ids[None, :])
-    is_in_valid_pages = tl.sum(is_in_valid_pages_matrix.to(tl.int32), axis=1) > 0
-    is_not_zero = page_offsets != 0
-    is_page_valid = is_in_valid_pages & is_not_zero
-
-    position_indices = tl.argmax(is_in_valid_pages_matrix.to(tl.int32), axis=1)
-    is_sink = (position_indices < num_sink_pages) & is_in_valid_pages
-    is_page_valid = is_page_valid & (~is_sink)
-    
-    local_start_idx = tl.maximum(num_valid_pages - num_local_pages, 0)
-    is_in_local = (position_indices >= local_start_idx) & is_in_valid_pages
-    is_page_valid = is_page_valid & (~is_in_local)
-
-    out_ptrs = (Out + bid * scores_stride_b + 
-                kv_hid * scores_stride_h + 
-                page_offsets)
+    out_ptrs = Out + bid * scores_stride_b + kv_hid * scores_stride_h + page_offsets
     store_mask = (kv_hid < NUM_KV_HEADS) & (page_offsets < num_pages)
-    final_scores_with_inf = tl.where(is_page_valid, final_scores, -float('inf'))
     tl.store(out_ptrs, final_scores_with_inf, mask=store_mask)
 
 
@@ -100,7 +82,7 @@ def compute_average_score(q: torch.Tensor,
                            ):
 
     bs = q.shape[0]
-    num_pages = k.shape[0]  
+    num_pages = k.shape[0]
     NUM_KV_HEADS = k.shape[2]
     HEAD_DIM = k.shape[-1]
     
@@ -115,9 +97,6 @@ def compute_average_score(q: torch.Tensor,
 
     max_num_token_pages = kv_pages_per_seq.shape[1]
     padded_max_num_token_pages = triton.next_power_of_2(max_num_token_pages)
-
-    # NOTE: for early exit
-    kv_pages_per_seq_max = kv_pages_per_seq.max(dim=-1).values
     
     grid = lambda meta: (
         bs, 
@@ -125,7 +104,7 @@ def compute_average_score(q: torch.Tensor,
         triton.cdiv(num_pages, 32)
     )
     _compute_average_score_kernel[grid](
-        q, k, out, kv_pages_per_seq, kv_pages_num_per_seq, kv_pages_per_seq_max,
+        q, k, out, kv_pages_per_seq, kv_pages_num_per_seq,
         # Strides
         q.stride(0), q.stride(1),
         k.stride(0), k.stride(1),

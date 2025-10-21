@@ -15,15 +15,15 @@ def combine_indices_paged_kernel(
     page_table_ptr,
     cur_bs,
     pre_bs,
-    max_bs,
-    num_kv_heads,
-    cache_len,
-    num_sink_pages,
-    num_local_pages,
-    max_seq_len,
-    max_pages,
-    page_size,
-    budget_size,
+    max_bs : tl.constexpr,
+    num_kv_heads : tl.constexpr,
+    cache_len : tl.constexpr,
+    num_sink_pages : tl.constexpr,
+    num_local_pages : tl.constexpr,
+    max_seq_len : tl.constexpr,
+    max_pages : tl.constexpr,
+    page_size : tl.constexpr,
+    budget_size : tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -82,7 +82,6 @@ def combine_indices_paged_kernel(
                 )
         
         num_pages_per_seq = (seq_len + page_size - 1) // page_size
-        stream_len = num_sink_pages + num_local_pages
         
         sink_page_offsets = tl.arange(0, BLOCK_SIZE) * page_size
         sink_mask = tl.arange(0, BLOCK_SIZE) < num_sink_pages

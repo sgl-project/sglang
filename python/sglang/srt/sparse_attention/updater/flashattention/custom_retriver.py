@@ -11,6 +11,7 @@ from sglang.srt.sparse_attention.cache_manager.cache_manager import CacheManager
 from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_average import compute_average_score as compute_score
 from sglang.srt.sparse_attention.kernels.proxy_k_tensor.proxy_k_tensor_average import proxy_k_tensor_decode, proxy_k_tensor_extend
 from sglang.srt.sparse_attention.kernels.combine_indices_paged import combine_indices
+from sglang.srt.sparse_attention.kernels.score_copy import score_copy
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -140,8 +141,10 @@ class NaiveDecodeSparseRetriver:
                       num_sink_pages=self.stream_budget[0] // self.cache_manager.config.page_size,
                       num_local_pages=self.stream_budget[1] // self.cache_manager.config.page_size,
                     )
-        _, topk_indices = torch.topk(score[:query.shape[0], :, :], k=top_k, dim=2, sorted=False)
-        selected_page_indices[:query.shape[0], :, :] = topk_indices
+        bs = query.shape[0]
+        _, topk_indices = torch.topk(score[:bs, :, :], k=top_k, dim=2, sorted=False)
+        score_copy(req_to_token, topk_indices, bs)
+        selected_page_indices[:bs, :, :] = topk_indices
         
     def _call_after_update_query(self,
                                  key_cache: torch.Tensor,
