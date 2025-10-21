@@ -339,7 +339,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         hidden_states, topk_idx, topk_weights = (
             dispatch_output.hidden_states,
-            dispatch_output.topk_idx,
+            dispatch_output.topk_ids,
             dispatch_output.topk_weights,
         )
         if isinstance(hidden_states, tuple):

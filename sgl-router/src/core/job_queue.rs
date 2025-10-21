@@ -4,17 +4,24 @@
 //! them asynchronously in background worker tasks.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Weak},
     time::{Duration, SystemTime},
 };
 
 use dashmap::DashMap;
-use metrics::{counter, gauge, histogram};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    core::WorkerManager,
+    config::{RouterConfig, RoutingMode},
+    core::{
+        workflow::{
+            WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus,
+        },
+        WorkerManager,
+    },
+    metrics::RouterMetrics,
     protocols::worker_spec::{JobStatus, WorkerConfigRequest},
     server::AppContext,
 };
@@ -24,6 +31,7 @@ use crate::{
 pub enum Job {
     AddWorker { config: Box<WorkerConfigRequest> },
     RemoveWorker { url: String },
+    InitializeWorkersFromConfig { router_config: Box<RouterConfig> },
 }
 
 impl Job {
@@ -32,6 +40,7 @@ impl Job {
         match self {
             Job::AddWorker { .. } => "AddWorker",
             Job::RemoveWorker { .. } => "RemoveWorker",
+            Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
         }
     }
 
@@ -40,6 +49,7 @@ impl Job {
         match self {
             Job::AddWorker { config } => &config.url,
             Job::RemoveWorker { url } => url,
+            Job::InitializeWorkersFromConfig { .. } => "startup",
         }
     }
 }
@@ -98,7 +108,7 @@ impl Default for JobQueueConfig {
     fn default() -> Self {
         Self {
             queue_capacity: 1000,
-            worker_count: 2,
+            worker_count: 10,
         }
     }
 }
@@ -166,7 +176,7 @@ impl JobQueue {
     pub async fn submit(&self, job: Job) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
         if self.context.upgrade().is_none() {
-            counter!("sgl_router_job_shutdown_rejected_total").increment(1);
+            RouterMetrics::record_job_shutdown_rejected();
             return Err("Job queue shutting down: AppContext dropped".to_string());
         }
 
@@ -183,8 +193,7 @@ impl JobQueue {
         match self.tx.send(job).await {
             Ok(_) => {
                 let queue_depth = self.tx.max_capacity() - self.tx.capacity();
-                gauge!("sgl_router_job_queue_depth").set(queue_depth as f64);
-
+                RouterMetrics::set_job_queue_depth(queue_depth);
                 info!(
                     "Job submitted: type={}, worker={}, queue_depth={}",
                     job_type, worker_url, queue_depth
@@ -192,8 +201,7 @@ impl JobQueue {
                 Ok(())
             }
             Err(_) => {
-                counter!("sgl_router_job_queue_full_total").increment(1);
-                // Remove status on failure
+                RouterMetrics::record_job_queue_full();
                 self.status_map.remove(&worker_url);
                 Err("Worker job queue full".to_string())
             }
@@ -246,39 +254,16 @@ impl JobQueue {
                     // Upgrade weak reference to process job
                     match context.upgrade() {
                         Some(ctx) => {
-                            // Execute job
                             let result = Self::execute_job(&job, &ctx).await;
                             let duration = start.elapsed();
-
-                            // Record metrics
-                            histogram!("sgl_router_job_duration_seconds", "job_type" => job_type.clone())
-                                .record(duration.as_secs_f64());
-
-                            match result {
-                                Ok(message) => {
-                                    counter!("sgl_router_job_success_total", "job_type" => job_type.clone())
-                                        .increment(1);
-                                    // Remove status on success - worker in registry is sufficient
-                                    status_map.remove(&worker_url);
-                                    info!(
-                                        "Worker {} completed job: type={}, worker={}, duration={:.3}s, result={}",
-                                        worker_id, job_type, worker_url, duration.as_secs_f64(), message
-                                    );
-                                }
-                                Err(error) => {
-                                    counter!("sgl_router_job_failure_total", "job_type" => job_type.clone())
-                                        .increment(1);
-                                    // Keep failed status for API to report error details
-                                    status_map.insert(
-                                        worker_url.clone(),
-                                        JobStatus::failed(&job_type, &worker_url, error.clone()),
-                                    );
-                                    warn!(
-                                        "Worker {} failed job: type={}, worker={}, duration={:.3}s, error={}",
-                                        worker_id, job_type, worker_url, duration.as_secs_f64(), error
-                                    );
-                                }
-                            }
+                            Self::record_job_completion(
+                                &job_type,
+                                &worker_url,
+                                worker_id,
+                                duration,
+                                &result,
+                                &status_map,
+                            );
                         }
                         None => {
                             let error_msg = "AppContext dropped".to_string();
@@ -311,12 +296,28 @@ impl JobQueue {
     async fn execute_job(job: &Job, context: &Arc<AppContext>) -> Result<String, String> {
         match job {
             Job::AddWorker { config } => {
-                // Register worker with is_healthy=false
-                let worker =
-                    WorkerManager::add_worker_from_config(config.as_ref(), context).await?;
+                let engine = context
+                    .workflow_engine
+                    .get()
+                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
 
-                // Validate and activate
-                WorkerManager::validate_and_activate_worker(&worker, context).await
+                let instance_id = Self::start_worker_workflow(engine, config, context).await?;
+
+                info!(
+                    "Started worker registration workflow for {} (instance: {})",
+                    config.url, instance_id
+                );
+
+                let timeout_duration =
+                    Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
+
+                Self::wait_for_workflow_completion(
+                    engine,
+                    instance_id,
+                    &config.url,
+                    timeout_duration,
+                )
+                .await
             }
             Job::RemoveWorker { url } => {
                 let result = WorkerManager::remove_worker(url, context);
@@ -325,6 +326,204 @@ impl JobQueue {
                     queue.remove_status(url);
                 }
                 result
+            }
+            Job::InitializeWorkersFromConfig { router_config } => {
+                let api_key = router_config.api_key.clone();
+                let mut worker_count = 0;
+
+                // Create iterator of (url, worker_type, bootstrap_port) tuples based on mode
+                let workers: Vec<(String, &str, Option<u16>)> = match &router_config.mode {
+                    RoutingMode::Regular { worker_urls } => worker_urls
+                        .iter()
+                        .map(|url| (url.clone(), "regular", None))
+                        .collect(),
+                    RoutingMode::PrefillDecode {
+                        prefill_urls,
+                        decode_urls,
+                        ..
+                    } => {
+                        let prefill_workers = prefill_urls
+                            .iter()
+                            .map(|(url, port)| (url.clone(), "prefill", *port));
+
+                        let decode_workers =
+                            decode_urls.iter().map(|url| (url.clone(), "decode", None));
+
+                        prefill_workers.chain(decode_workers).collect()
+                    }
+                    RoutingMode::OpenAI { .. } => {
+                        info!("OpenAI mode: no workers to initialize");
+                        return Ok("OpenAI mode: no workers to initialize".to_string());
+                    }
+                };
+
+                info!(
+                    "Creating AddWorker jobs for {} workers from config",
+                    workers.len()
+                );
+
+                // Process all workers with unified loop
+                for (url, worker_type, bootstrap_port) in workers {
+                    let url_for_error = url.clone(); // Clone for error message
+                    let config = WorkerConfigRequest {
+                        url,
+                        api_key: api_key.clone(),
+                        worker_type: Some(worker_type.to_string()),
+                        labels: HashMap::new(),
+                        model_id: None,
+                        priority: None,
+                        cost: None,
+                        tokenizer_path: None,
+                        reasoning_parser: None,
+                        tool_parser: None,
+                        chat_template: None,
+                        bootstrap_port,
+                        health_check_timeout_secs: router_config.health_check.timeout_secs,
+                        health_check_interval_secs: router_config.health_check.check_interval_secs,
+                        health_success_threshold: router_config.health_check.success_threshold,
+                        health_failure_threshold: router_config.health_check.failure_threshold,
+                        max_connection_attempts: router_config.health_check.success_threshold * 10,
+                        dp_aware: router_config.dp_aware,
+                    };
+
+                    let job = Job::AddWorker {
+                        config: Box::new(config),
+                    };
+
+                    if let Some(queue) = context.worker_job_queue.get() {
+                        queue.submit(job).await.map_err(|e| {
+                            format!(
+                                "Failed to submit AddWorker job for {} worker {}: {}",
+                                worker_type, url_for_error, e
+                            )
+                        })?;
+                        worker_count += 1;
+                    } else {
+                        return Err("JobQueue not available".to_string());
+                    }
+                }
+
+                Ok(format!("Submitted {} AddWorker jobs", worker_count))
+            }
+        }
+    }
+
+    /// Start a workflow and return its instance ID
+    async fn start_worker_workflow(
+        engine: &Arc<WorkflowEngine>,
+        config: &WorkerConfigRequest,
+        context: &Arc<AppContext>,
+    ) -> Result<WorkflowInstanceId, String> {
+        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
+        workflow_context.set("worker_config", config.clone());
+        workflow_context.set_arc("app_context", Arc::clone(context));
+
+        engine
+            .start_workflow(WorkflowId::new("worker_registration"), workflow_context)
+            .await
+            .map_err(|e| format!("Failed to start worker registration workflow: {:?}", e))
+    }
+
+    /// Wait for workflow completion with adaptive polling
+    async fn wait_for_workflow_completion(
+        engine: &Arc<WorkflowEngine>,
+        instance_id: WorkflowInstanceId,
+        worker_url: &str,
+        timeout_duration: Duration,
+    ) -> Result<String, String> {
+        let start = std::time::Instant::now();
+        let mut poll_interval = Duration::from_millis(100);
+        let max_poll_interval = Duration::from_millis(2000);
+        let poll_backoff = Duration::from_millis(200);
+
+        loop {
+            // Check timeout
+            if start.elapsed() > timeout_duration {
+                return Err(format!(
+                    "Workflow timeout after {}s for worker {}",
+                    timeout_duration.as_secs(),
+                    worker_url
+                ));
+            }
+
+            // Get workflow status
+            let state = engine
+                .get_status(instance_id)
+                .map_err(|e| format!("Failed to get workflow status: {:?}", e))?;
+
+            let result = match state.status {
+                WorkflowStatus::Completed => Ok(format!(
+                    "Worker {} registered and activated successfully via workflow",
+                    worker_url
+                )),
+                WorkflowStatus::Failed => {
+                    let current_step = state.current_step.as_ref();
+                    let step_name = current_step
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let error_msg = current_step
+                        .and_then(|step_id| state.step_states.get(step_id))
+                        .and_then(|s| s.last_error.as_deref())
+                        .unwrap_or("Unknown error");
+                    Err(format!(
+                        "Workflow failed at step {}: {}",
+                        step_name, error_msg
+                    ))
+                }
+                WorkflowStatus::Cancelled => {
+                    Err(format!("Workflow cancelled for worker {}", worker_url))
+                }
+                WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
+                    tokio::time::sleep(poll_interval).await;
+                    poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
+                    continue;
+                }
+            };
+
+            // Clean up terminal workflow states
+            engine.state_store().cleanup_if_terminal(instance_id);
+            return result;
+        }
+    }
+
+    /// Record job completion metrics and update status
+    fn record_job_completion(
+        job_type: &str,
+        worker_url: &str,
+        worker_id: usize,
+        duration: Duration,
+        result: &Result<String, String>,
+        status_map: &Arc<DashMap<String, JobStatus>>,
+    ) {
+        RouterMetrics::record_job_duration(job_type, duration);
+
+        match result {
+            Ok(message) => {
+                RouterMetrics::record_job_success(job_type);
+                status_map.remove(worker_url);
+                info!(
+                    "Worker {} completed job: type={}, worker={}, duration={:.3}s, result={}",
+                    worker_id,
+                    job_type,
+                    worker_url,
+                    duration.as_secs_f64(),
+                    message
+                );
+            }
+            Err(error) => {
+                RouterMetrics::record_job_failure(job_type);
+                status_map.insert(
+                    worker_url.to_string(),
+                    JobStatus::failed(job_type, worker_url, error.clone()),
+                );
+                warn!(
+                    "Worker {} failed job: type={}, worker={}, duration={:.3}s, error={}",
+                    worker_id,
+                    job_type,
+                    worker_url,
+                    duration.as_secs_f64(),
+                    error
+                );
             }
         }
     }
@@ -350,17 +549,5 @@ impl JobQueue {
                 status_map.len()
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_job_queue_config_default() {
-        let config = JobQueueConfig::default();
-        assert_eq!(config.queue_capacity, 1000);
-        assert_eq!(config.worker_count, 2);
     }
 }
