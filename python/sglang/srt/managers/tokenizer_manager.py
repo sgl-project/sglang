@@ -746,6 +746,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 custom_labels=obj.custom_labels,
+                custom_request_attributes=obj.custom_request_attributes,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -1423,13 +1424,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "meta_info": meta_info,
                 }
 
-            # Add custom labels as top-level fields if enabled
+            # Add custom request attributes as top-level fields if enabled
             if (
-                self.server_args.tokenizer_metrics_include_log_requests
-                and hasattr(state.obj, "custom_labels")
-                and state.obj.custom_labels
+                self.server_args.log_requests_custom_attributes
+                and hasattr(state.obj, "custom_request_attributes")
+                and state.obj.custom_request_attributes
             ):
-                out_dict.update(state.obj.custom_labels)
+                out_dict.update(state.obj.custom_request_attributes)
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:

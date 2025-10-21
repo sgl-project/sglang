@@ -90,10 +90,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
         else:
             prompt_kwargs = {"input_ids": prompt}
 
-        # Use custom labels passed from base class (extracted from headers if enabled)
-        # Fallback to extracting from raw request headers for backward compatibility
-        if custom_labels is None:
-            custom_labels = self.extract_custom_labels(raw_request)
+        # Extract custom labels from raw request headers
+        custom_labels = self.extract_custom_labels(raw_request)
+
+        # Extract custom request attributes from raw request headers
+        custom_request_attributes = self.extract_custom_request_attributes(raw_request)
 
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
@@ -123,6 +124,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             custom_labels=custom_labels,
+            custom_request_attributes=custom_request_attributes,
             custom_logit_processor=request.custom_logit_processor,
         )
 
