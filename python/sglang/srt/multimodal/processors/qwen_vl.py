@@ -20,10 +20,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
-from sglang.srt.utils import get_bool_env_var
 from sglang.utils import logger
-
-SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28

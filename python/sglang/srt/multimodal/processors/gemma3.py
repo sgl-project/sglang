@@ -7,10 +7,6 @@ from sglang.srt.managers.multimodal_processor import (
 from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
-from sglang.srt.utils import get_bool_env_var
-
-SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
-
 # Copied from: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/image_processing_gemma3_fast.py
 # will be removed in the future
 
@@ -46,17 +42,10 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
             discard_alpha_channel=True,
         )
-        
-        if SGL_USE_CUDA_IPC:
-            async with self._cache_lock:
-                mm_items, input_ids, _ = self.process_and_combine_mm_data(
-                    base_output, self.mm_tokens
-                )
-        else:
-            mm_items, input_ids, _ = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
-            )
-            
+
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
+        )
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,

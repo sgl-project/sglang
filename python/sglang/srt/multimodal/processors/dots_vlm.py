@@ -12,9 +12,6 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.qwen_vl import resize_image_async
 
-from sglang.srt.utils import get_bool_env_var
-
-SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 class DotsVLMImageProcessor(BaseMultimodalProcessor):
     models = [DotsVLMForCausalLM, DotsOCRForCausalLM]
@@ -85,17 +82,9 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
                 for image in base_output.images
             ]
             base_output.images = await asyncio.gather(*resize_tasks)
-        
-        if SGL_USE_CUDA_IPC:
-            async with self._cache_lock:    
-                combined_mm_item, input_ids, _ = self.process_and_combine_mm_data(
-                    base_output, self.mm_tokens
-                )
-        else:
-            combined_mm_item, input_ids, _ = self.process_and_combine_mm_data(
-                    base_output, self.mm_tokens
-            )
-            
+        combined_mm_item, input_ids, _ = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
+        )
         if combined_mm_item is None:
             return None
 

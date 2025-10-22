@@ -1,3 +1,4 @@
+import asyncio
 import concurrent
 import concurrent.futures
 import dataclasses
@@ -6,20 +7,33 @@ import os
 import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
-import asyncio
 
 import numpy as np
 import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sglang.srt.managers.mm_utils import TransportProxyTensor
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem, CudaIpcTensorTransportProxy, MmItemMemoryPool, MM_ITEM_VERIFY_BYTES, MM_FEATURE_CACHE_SIZE
-from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger, get_bool_env_var
+from sglang.srt.managers.schedule_batch import (
+    MM_FEATURE_CACHE_SIZE,
+    MM_ITEM_VERIFY_BYTES,
+    CudaIpcTensorTransportProxy,
+    MmItemMemoryPool,
+    Modality,
+    MultimodalDataItem,
+)
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_npu,
+    load_audio,
+    load_image,
+    load_video,
+    logger,
+)
 
 _is_npu = is_npu()
 
 SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
+
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
@@ -150,6 +164,17 @@ class MultimodalSpecialTokens:
         return self.combined_regex
 
 
+def lock_if_cuda_ipc(fn):
+    async def wrapper(self, *args, **kwargs):
+        if SGL_USE_CUDA_IPC:
+            async with self._cache_lock:
+                return await fn(self, *args, **kwargs)
+        else:
+            return await fn(self, *args, **kwargs)
+
+    return wrapper
+
+
 class BaseMultimodalProcessor(ABC):
     models = []
 
@@ -210,11 +235,11 @@ class BaseMultimodalProcessor(ABC):
             "audio_features",
             "input_features",
         ]
-        
+
         if SGL_USE_CUDA_IPC:
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(MM_FEATURE_CACHE_SIZE)
             self._cache_lock = asyncio.Lock()
-        
+
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
     ) -> dict:
@@ -260,7 +285,7 @@ class BaseMultimodalProcessor(ABC):
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if SGL_USE_CUDA_IPC:
-                  pass
+                    pass
                 else:
                     if feature_name in result and isinstance(
                         result[feature_name], torch.Tensor
@@ -594,7 +619,8 @@ class BaseMultimodalProcessor(ABC):
 
         return collected_items, input_ids, ret
 
-    def process_and_combine_mm_data(
+    @lock_if_cuda_ipc
+    async def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,
@@ -670,31 +696,44 @@ class BaseMultimodalProcessor(ABC):
                 input_ids=input_ids,
                 mm_token_id=mm_token_id,
             )
-        
+
         """
         solution for cuda-ipc memory-leak:
         1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
         2. if can not get a slice , transport normal tensor
         3. copy tensor in scheduler and release it (use position mark)
-        4. copy 
+        4. copy
         """
-        
+
         if SGL_USE_CUDA_IPC:
             # post-process
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                    available_slice = self.cudaipc_mmfeature_pool.return_a_slice_tensor(item.feature)
+                    available_slice = self.cudaipc_mmfeature_pool.return_a_slice_tensor(
+                        item.feature
+                    )
                     if isinstance(available_slice, torch.Tensor):
-                        available_slice[:-MM_ITEM_VERIFY_BYTES].copy_(item.feature.view(torch.int8).view(-1), non_blocking= True)                        
-                        item.feature = CudaIpcTensorTransportProxy(data= available_slice, info_data= item.feature)
+                        available_slice[:-MM_ITEM_VERIFY_BYTES].copy_(
+                            item.feature.view(torch.int8).view(-1), non_blocking=True
+                        )
+                        item.feature = CudaIpcTensorTransportProxy(
+                            data=available_slice, info_data=item.feature
+                        )
                 elif (
                     isinstance(item.precomputed_embeddings, torch.Tensor)
                     and item.precomputed_embeddings.is_cuda
                 ):
-                    
-                    available_slice = self.cudaipc_mmfeature_pool.return_a_slice_tensor(item.precomputed_embeddings)
+
+                    available_slice = self.cudaipc_mmfeature_pool.return_a_slice_tensor(
+                        item.precomputed_embeddings
+                    )
                     if isinstance(available_slice, torch.Tensor):
-                        available_slice[:-MM_ITEM_VERIFY_BYTES].copy_(item.precomputed_embeddings.view(torch.int8), non_blocking= True)                        
-                        item.precomputed_embeddings = CudaIpcTensorTransportProxy(data= available_slice, info_data= item.precomputed_embeddings)
+                        available_slice[:-MM_ITEM_VERIFY_BYTES].copy_(
+                            item.precomputed_embeddings.view(torch.int8),
+                            non_blocking=True,
+                        )
+                        item.precomputed_embeddings = CudaIpcTensorTransportProxy(
+                            data=available_slice, info_data=item.precomputed_embeddings
+                        )
 
         return all_collected_items, input_ids, ret
