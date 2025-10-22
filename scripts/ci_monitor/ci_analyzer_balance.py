@@ -181,6 +181,10 @@ class SGLangTestBalanceAnalyzer:
 
         total_runs = len(runs)
         for i, run in enumerate(runs, 1):
+            if run is None:
+                print(f"Skipping run {i}/{total_runs}: run data is None")
+                continue
+
             if i % 10 == 0 or i == total_runs:
                 print(f"Processing run {i}/{total_runs}: #{run.get('run_number')}")
 
@@ -202,9 +206,17 @@ class SGLangTestBalanceAnalyzer:
             if pull_requests:
                 run_info["pr_number"] = pull_requests[0].get("number")
 
-            all_jobs = self.get_all_jobs_for_run(run.get("id"))
+            run_id = run.get("id")
+            if run_id is None:
+                print(f"Skipping run {i}/{total_runs}: run ID is None")
+                continue
+
+            all_jobs = self.get_all_jobs_for_run(run_id)
 
             for job in all_jobs:
+                if job is None:
+                    continue
+
                 job_name = job.get("name", "")
                 job_id = job.get("id")
 
