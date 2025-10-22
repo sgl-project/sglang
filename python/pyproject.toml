@@ -75,12 +75,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-tracing = [
-  "opentelemetry-api",
-  "opentelemetry-exporter-otlp",
-  "opentelemetry-exporter-otlp-proto-grpc",
-  "opentelemetry-sdk",
-]
+modelopt = ["nvidia-modelopt"]
 test = [
   "accelerate",
   "expecttest",
@@ -106,6 +101,12 @@ cu130_all = [
   "sglang[test]",
   "sglang[decord]",
   "sglang[cu130]"
+]
+tracing = [
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
 ]
 
 # To be deprecated in 2 weeks
