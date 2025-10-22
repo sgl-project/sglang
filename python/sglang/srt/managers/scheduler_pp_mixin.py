@@ -1,341 +1,757 @@
-from typing import List, Optional
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#     Unless required by applicable law or agreed to in writing, software
+#     distributed under the License is distributed on an "AS IS" BASIS,
+#     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#     See the License for the specific language governing permissions and
+#     limitations under the License.
+# ==============================================================================
+"""Pipeline parallelism mixin for scheduler - contains PP event loop and utilities."""
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.utils import GenerationBatchResult
+from __future__ import annotations
+
+import logging
+import pickle
+from collections import deque
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.distributed as dist
+
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.managers.schedule_batch import GenerationBatchResult, ScheduleBatch
+from sglang.srt.managers.utils import (
+    get_logprob_dict_from_result,
+    get_logprob_from_pp_outputs,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
+from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
+
+
+@dataclass
+class PPBatchMetadata:
+    bid: int
+    can_run_cuda_graph: bool
 
 
 class SchedulerPPMixin:
+    def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
+        for p2p_work in work:
+            p2p_work.work.wait()
+        work.clear()
+
+    def send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+        p2p_work = []
+        if self.attn_tp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            p2p_work = point_to_point_pyobj(
+                data,
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.cpu_group,
+                self.pp_rank * self.tp_size + dp_offset,
+                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+                async_send=async_send,
+            )
+        return p2p_work
+
+    def recv_pyobj_from_prev_stage(self: Scheduler):
+        if self.attn_tp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            data = point_to_point_pyobj(
+                [],
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.cpu_group,
+                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + dp_offset,
+            )
+        else:
+            data = None
+
+        if self.tp_size != 1:
+            data = broadcast_pyobj(
+                data, self.tp_group.rank, self.tp_cpu_group, src=self.tp_group.ranks[0]
+            )
+
+        return data
+
+    def _pp_prepare_tensor_dict(
+        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> Dict[str, torch.Tensor]:
+        tensor_dict = {
+            "next_token_ids": result.next_token_ids,
+        }
+
+        logprob_dict = get_logprob_dict_from_result(result)
+        tensor_dict = {
+            **tensor_dict,
+            **logprob_dict,
+        }
+        return tensor_dict
+
+    def _pp_send_dict_to_next_stage(
+        self: Scheduler,
+        tensor_dict: Dict[str, torch.Tensor],
+        async_send: bool = True,
+    ):
+        p2p_work = []
+
+        p2p_work.extend(
+            self.pp_group.send_tensor_dict(
+                tensor_dict,
+                all_gather_group=self.attn_tp_group,
+                async_send=async_send,
+            )
+        )
+        return p2p_work
+
+    def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
+        pp_proxy_tensors = None
+        if not self.pp_group.is_first_rank:
+            pp_proxy_tensors = PPProxyTensors(
+                self.pp_group.recv_tensor_dict(all_gather_group=self.attn_tp_group)
+            )
+        return pp_proxy_tensors
+
+    def _pp_recv_dict_from_prev_stage(
+        self: Scheduler,
+    ) -> Dict[str, torch.Tensor]:
+        res = self.pp_group.recv_tensor_dict(
+            all_gather_group=self.attn_tp_group,
+        )
+        return res
+
+    def _pp_prep_batch_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        mb_metadata: PPBatchMetadata,
+        pp_outputs: PPProxyTensors,
+    ):
+        logits_output = None
+        extend_input_len_per_req = None
+        extend_logprob_start_len_per_req = None
+
+        (
+            logits_output,
+            extend_input_len_per_req,
+            extend_logprob_start_len_per_req,
+        ) = get_logprob_from_pp_outputs(pp_outputs)
+        batch.output_ids = pp_outputs["next_token_ids"]
+        output_result = GenerationBatchResult(
+            logits_output=logits_output,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=pp_outputs["next_token_ids"],
+            extend_input_len_per_req=extend_input_len_per_req,
+            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            bid=mb_metadata.bid,
+            can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+        )
+        return output_result
+
+    def _pp_process_batch_result(
+        self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
+    ):
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.process_batch_result_disagg_prefill(batch, output_result)
+        else:
+            self.process_batch_result(batch, output_result)
+
+    def _pp_send_output_to_next_stage(
+        self: Scheduler,
+        next_first_rank_mb_id: int,
+        mbs: List[ScheduleBatch],
+        last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
+        pp_outputs: PPProxyTensors | None,
+    ) -> List[P2PWork]:
+        send_output_work = []
+        if self.pp_group.is_last_rank:
+            # send ready PP output to rank 0
+            if mbs[next_first_rank_mb_id] is not None:
+                q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
+                torch.cuda.current_stream().wait_event(q_event)
+                with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                    send_output_work = self._pp_send_dict_to_next_stage(
+                        pp_outputs_to_send.tensors,
+                        async_send=True,
+                    )
+        # send the outputs from the last round to let the next stage worker run post processing
+        if not self.pp_group.is_last_rank:
+            if pp_outputs:
+                with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                    send_output_work = self._pp_send_dict_to_next_stage(
+                        pp_outputs.tensors,
+                        async_send=True,
+                    )
+        return send_output_work
+
+    def _pp_send_recv_and_preprocess_output_tensors(
+        self: Scheduler,
+        next_first_rank_mb_id: int,
+        next_mb_id: int,
+        mbs: List[ScheduleBatch],
+        mb_metadata: List[PPBatchMetadata],
+        last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
+        pp_outputs: PPProxyTensors | None,
+    ) -> Tuple[PPProxyTensors, List[P2PWork], torch.cuda.Event]:
+        next_pp_outputs = None
+        d2h_event = None
+        batch_result = None
+        send_output_work = self._pp_send_output_to_next_stage(
+            next_first_rank_mb_id,
+            mbs,
+            last_rank_comm_queue,
+            pp_outputs,
+        )
+
+        if mbs[next_mb_id] is not None:
+            with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
+                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+        self._pp_commit_comm_work(work=send_output_work)
+        if mbs[next_mb_id] is not None:
+            batch_result = self._pp_prep_batch_result(
+                mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
+            )
+            batch_result.copy_done = torch.get_device_module(self.device).Event()
+            batch_result.copy_to_cpu()
+            d2h_event = batch_result.copy_done
+
+        return next_pp_outputs, batch_result, d2h_event
+
+    def _pp_launch_batch(
+        self: Scheduler,
+        mb_id: int,
+        pp_proxy_tensors: PPProxyTensors,
+        mb_metadata: PPBatchMetadata,
+        last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
+    ):
+        with torch.profiler.record_function("run_batch"):
+            result = self.run_batch(self.cur_batch, pp_proxy_tensors)
+            mb_metadata[mb_id] = PPBatchMetadata(
+                bid=result.bid,
+                can_run_cuda_graph=result.can_run_cuda_graph,
+            )
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+            if self.pp_group.is_last_rank:
+                # (last rank) buffer the outputs for async batch depth
+                last_rank_comm_queue.append(
+                    (
+                        event,
+                        PPProxyTensors(
+                            self._pp_prepare_tensor_dict(result, self.cur_batch)
+                        ),
+                    )
+                )
+        return result, event
 
     @DynamicGradMode()
-    def event_loop_pp(self):
-        """A non-overlap scheduler loop for pipeline parallelism."""
-        mbs = [None] * self.pp_size
-        last_mbs = [None] * self.pp_size
+    def event_loop_pp(self: Scheduler):
+        """
+        A scheduler loop for pipeline parallelism.
+        Notes:
+        1. Each stage runs in the same order and is notified by the previous stage.
+        2. We use async send but sync recv to avoid desynchronization while minimizing the communication overhead.
+        3. We can use async batch depth to buffer the outputs in the last stage for to allow overlapping the GPU computation and CPU processing and avoid last PP rank staggler.
+
+        Unified Schedule:
+        ====================================================================
+        Stage P
+        recv ith req from previous stage
+        recv ith proxy from previous stage
+        run ith batch
+        recv prev (i+1)% mb_size th outputs
+        process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
+        send ith req to next stage
+        send ith proxy to next stage
+        send current stage's outputs to next stage(can be stashed and delayed to send later)
+
+        the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
+
+        ====================================================================
+        """
+        self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
+        mbs = [None] * self.pp_loop_size
+        last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
-            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
+            ScheduleBatch(reqs=[], batch_is_full=False)
+            for _ in range(self.pp_loop_size)
         ]
+        mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         pp_outputs: Optional[PPProxyTensors] = None
+        last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = deque()
+        send_req_work = []
+        send_proxy_work = []
+        event = None
         while True:
             server_is_idle = True
-            for mb_id in range(self.pp_size):
+            for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
-
-                recv_reqs = self.recv_requests()
-                self.process_input_requests(recv_reqs)
-                mbs[mb_id] = self.get_next_batch_to_run()
+                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
+                next_mb_id = (mb_id + 1) % self.pp_loop_size
+                with torch.profiler.record_function("recv_requests"):
+                    recv_reqs = self.recv_requests()
+                    self._pp_commit_comm_work(send_req_work)
+                    self.process_input_requests(recv_reqs)
+                with torch.profiler.record_function("get_next_batch_to_run"):
+                    mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
-
-                self.cur_batch = mbs[mb_id]
+                self.cur_batch: Optional[ScheduleBatch] = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    result = self.run_batch(self.cur_batch)
-
-                # (last rank) send the outputs to the next step
-                if self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        next_token_ids = result.next_token_ids
-                        if self.cur_batch.return_logprob:
-                            pp_outputs = PPProxyTensors(
-                                {
-                                    "next_token_ids": next_token_ids,
-                                    "extend_input_len_per_req": result.extend_input_len_per_req,
-                                    "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
-                                }
-                                | (
-                                    {
-                                        f"logits_output.{k}": v
-                                        for k, v in result.logits_output.__dict__.items()
-                                    }
-                                    if result.logits_output is not None
-                                    else {}
-                                )
-                            )
-                        else:
-                            pp_outputs = PPProxyTensors(
-                                {
-                                    "next_token_ids": next_token_ids,
-                                }
-                            )
-                        # send the output from the last round to let the next stage worker run post processing
-                        self.pp_group.send_tensor_dict(
-                            pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-
-                # receive outputs and post-process (filter finished reqs) the coming microbatch
-                next_mb_id = (mb_id + 1) % self.pp_size
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                self._pp_commit_comm_work(send_proxy_work)
                 next_pp_outputs = None
+                next_batch_result = None
+                d2h_event = None
+                if self.server_args.pp_async_batch_depth > 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_send_recv_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                            mbs,
+                            mb_metadata,
+                            last_rank_comm_queue,
+                            pp_outputs,
+                        )
+                    )
+
+                if self.cur_batch:
+                    result, event = self._pp_launch_batch(
+                        mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
+                    )
+                if self.server_args.pp_async_batch_depth == 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_send_recv_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                            mbs,
+                            mb_metadata,
+                            last_rank_comm_queue,
+                            pp_outputs,
+                        )
+                    )
                 if mbs[next_mb_id] is not None:
-                    next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
-                        self.pp_group.recv_tensor_dict(
-                            all_gather_group=self.attn_tp_group
+                    d2h_event.synchronize()
+                    with torch.profiler.record_function("process_batch_result"):
+                        self._pp_process_batch_result(
+                            mbs[next_mb_id],
+                            next_batch_result,
                         )
-                    )
-                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
-                    logits_output_args = {
-                        k[len("logits_output.") :]: v
-                        for k, v in next_pp_outputs.tensors.items()
-                        if k.startswith("logits_output.")
-                    }
-                    if len(logits_output_args) > 0:
-                        logits_output = LogitsProcessorOutput(**logits_output_args)
-                    else:
-                        logits_output = None
-
-                    output_result = GenerationBatchResult.from_pp_proxy(
-                        logits_output=logits_output,
-                        next_pp_outputs=next_pp_outputs,
-                        can_run_cuda_graph=result.can_run_cuda_graph,
-                    )
-                    self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]
-
-                # (not last rank)
                 if not self.pp_group.is_last_rank:
-                    # carry the outputs to the next stage
-                    # send the outputs from the last round to let the next stage worker run post processing
-                    if pp_outputs:
-                        self.pp_group.send_tensor_dict(
-                            pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-
-                    # send out reqs to the next stage
-                    dp_offset = self.attn_dp_rank * self.attn_tp_size
-                    if self.attn_tp_rank == 0:
-                        point_to_point_pyobj(
+                    with torch.profiler.record_function("send_reqs_to_next_stage"):
+                        send_req_work = self.send_pyobj_to_next_stage(
                             recv_reqs,
-                            self.pp_rank * self.tp_size + dp_offset,
-                            self.world_group.device_group,
-                            self.pp_rank * self.tp_size + dp_offset,
-                            (self.pp_rank + 1) * self.tp_size + dp_offset,
+                            async_send=True,
                         )
-
-                    # send out proxy tensors to the next stage
                     if self.cur_batch:
-                        # FIXME(lsyin): remove this assert
-                        assert result.pp_hidden_states_proxy_tensors.tensors is not None
-                        self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
+                        torch.cuda.current_stream().wait_event(event)
+                        with torch.profiler.record_function(
+                            "send_proxy_dict_to_next_stage"
+                        ):
+                            send_proxy_work = self._pp_send_dict_to_next_stage(
+                                result.pp_hidden_states_proxy_tensors.tensors,
+                                async_send=True,
+                            )
+
+                # if self.delayed_weight_sync_fn:
+                #     self.delayed_weight_sync_fn()
+                #     self.delayed_weight_sync_fn = None
 
                 pp_outputs = next_pp_outputs
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
+                self.check_memory()
+                self.check_tree_cache()
+                self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
+
+    def process_bootstrapped_queue(
+        self: Scheduler, bootstrapped_rids: Optional[List[str]]
+    ):
+        # finished consensus bootstrapped reqs and prepare the waiting queue
+        if bootstrapped_rids is not None:
+            (
+                good_consensus_bootstrapped_rids,
+                bad_consensus_bootstrapped_rids,
+            ) = bootstrapped_rids
+            good_reqs, failed_reqs = (
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                    return_failed_reqs=True,
+                    rids_to_check=good_consensus_bootstrapped_rids,
+                    bad_rids_to_check=bad_consensus_bootstrapped_rids,
+                )
+            )
+            self.waiting_queue.extend(good_reqs)
+            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
+        return None
+
+    def _pp_pd_get_bootstrapped_ids(self: Scheduler):
+        # communicate pre-consensus bootstrapp reqs
+        if self.pp_group.is_first_rank:
+            # First rank, pop the bootstrap reqs from the bootstrap queue
+            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
+                self.disagg_prefill_bootstrap_queue.queue,
+                [KVPoll.WaitingForInput],
+                [KVPoll.Failed],
+            )
+        else:
+            # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
+            prev_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
+            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
+                prev_bootstrapped_rids
+            )
+            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
+                self.disagg_prefill_bootstrap_queue.queue,
+                [KVPoll.WaitingForInput],
+                [KVPoll.Failed],
+            )
+            good_bootstrapped_rids = list(
+                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
+            )
+            bad_bootstrapped_rids = list(
+                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
+            )
+        return [good_bootstrapped_rids, bad_bootstrapped_rids]
+
+    def _pp_pd_get_transferred_ids(self: Scheduler):
+        # get the current stage transfer success
+        if self.pp_group.is_first_rank:
+            transferred_rids = self.get_rids(
+                self.disagg_prefill_inflight_queue,
+                [KVPoll.Success, KVPoll.Failed],
+            )
+        # if other ranks, do intersection with the previous rank's transferred rids
+        else:
+            # 2 (Release): Receive the transferred rids from the previous rank
+            # 1. recv previous stage's transferred reqs info
+            prev_transferred_rids = self.recv_pyobj_from_prev_stage()
+            # 2. get the current stage's transferred reqs info
+            curr_transferred_rids = self.get_rids(
+                self.disagg_prefill_inflight_queue,
+                [KVPoll.Success, KVPoll.Failed],
+            )
+            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
+            transferred_rids = list(
+                set(prev_transferred_rids) & set(curr_transferred_rids)
+            )
+        return transferred_rids
+
+    def _pp_pd_send_consensus_bootstrapped_ids(
+        self: Scheduler,
+        bmbs: List[List[str]],
+        next_first_rank_mb_id: int,
+        consensus_bootstrapped_rids: List[str],
+        bootstrapped_rids: List[str],
+    ):
+        # 3 (Release): send the release rids from last stage to the first stage
+        send_consensus_bootstrapped_work = []
+        if self.pp_group.is_last_rank:
+            if bmbs[next_first_rank_mb_id] is not None:
+                consensus_bootstrapped_rids = bootstrapped_rids
+                send_consensus_bootstrapped_work = self.send_pyobj_to_next_stage(
+                    consensus_bootstrapped_rids, async_send=True
+                )
+        # 4 (Release): send the release rids from non last rank to the next rank
+        else:
+            if consensus_bootstrapped_rids is not None:
+                send_consensus_bootstrapped_work = self.send_pyobj_to_next_stage(
+                    consensus_bootstrapped_rids, async_send=True
+                )
+        return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
+
+    def _pp_pd_send_consensus_release_ids(
+        self: Scheduler,
+        tmbs: List[List[str]],
+        next_first_rank_mb_id: int,
+        release_rids: List[str],
+        transferred_rids: List[str],
+    ):
+        send_release_work = []
+        if self.pp_group.is_last_rank:
+            if tmbs[next_first_rank_mb_id] is not None:
+                release_rids = transferred_rids
+                send_release_work = self.send_pyobj_to_next_stage(
+                    release_rids, async_send=True
+                )
+        # 4 (Release): send the release rids from non last rank to the next rank
+        else:
+            if release_rids is not None:
+                send_release_work = self.send_pyobj_to_next_stage(
+                    release_rids, async_send=True
+                )
+        return send_release_work, release_rids
 
     @DynamicGradMode()
-    def event_loop_pp_disagg_prefill(self):
+    def event_loop_pp_disagg_prefill(self: Scheduler):
         """
-        An event loop for the prefill server in pipeline parallelism.
+        This is the prefill server event loop for pipeline parallelism.
 
-        Rules:
-        1. Each stage runs in the same order and is notified by the previous stage.
-        2. Each send/recv operation is blocking and matched by the neighboring stage.
-
-        Regular Schedule:
-        ====================================================================
-        Stage i                   | Stage i+1
-        send ith req              | recv ith req
-        send ith proxy            | recv ith proxy
-        send prev (i+1)th carry   | recv prev (i+1)th carry
-        ====================================================================
+        Notes:
+        1. Following the same rules as the event_loop_pp.
+        2. Adds extra steps for KV transfer process: bootstrap + release.
 
         Prefill Server Schedule:
         ====================================================================
-        Stage i                        | Stage i+1
-        send ith req                   | recv ith req
-        send ith bootstrap req         | recv ith bootstrap req
-        send ith transferred req       | recv ith transferred req
-        send ith proxy                 | recv ith proxy
-        send prev (i+1)th carry        | recv prev (i+1)th carry
-        send prev (i+1)th release req  | recv prev (i+1)th release req
+        Stage P
+        recv ith req from previous stage
+        recv ith bootstrap req from previous stage
+        recv ith transferred req from previous stage
+        recv ith proxy from previous stage
+        run ith batch
+        recv prev (i+1) % mb_size th consensus bootstrapped req from previous stage
+        local consensus on bootstrapped req
+        recv prev (i+1) % mb_size th release req from previous stage
+        local consensus on release req
+        recv prev (i+1) % mb_size th outputs
+        process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
+        send ith req to next stage
+        send ith bootstrap req to next stage
+        send ith transferred req to next stage
+        send ith proxy to next stage
+        send current stage's outputs to next stage (can be stashed and delayed to send later)
+
+        the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
         ====================================================================
 
         There are two additional elements compared to the regular schedule:
 
-        1. Bootstrap Requests:
-            a. Instead of polling the status on the current workers, we should wait for the previous stage to notify to avoid desynchronization.
-            b. The first stage polls the status and propagates the bootstrapped requests down to all other stages.
-            c. If the first stage polls successfully, by nature, other ranks are also successful because they performed a handshake together.
+        Bootstrap Requests + Release Requests:
+        - Both can have local failure and need to be consensus on. PP needs to guarantee eventual consistency of local failure and flush malfunc requests out as soft error.
 
-        2. Transferred Requests + Release Requests:
-            a. The first stage polls the transfer finished requests, performs an intersection with the next stage's finished requests, and propagates down to the last stage.
-            b. The last stage receives the requests that have finished transfer on all stages (consensus), then sends them to the first stage to release the memory.
-            c. The first stage receives the release requests, releases the memory, and then propagates the release requests down to the last stage.
         """
-        mbs = [None] * self.pp_size
-        last_mbs = [None] * self.pp_size
+        self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
+        mbs = [None] * self.pp_loop_size
+        last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
-            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
+            ScheduleBatch(reqs=[], batch_is_full=False)
+            for _ in range(self.pp_loop_size)
         ]
+        mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         pp_outputs: Optional[PPProxyTensors] = None
+        last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = deque()
 
-        # Either success or failed
-        bootstrapped_rids: List[str] = []
+        # PD additional
+        consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
+        tmbs = [None] * self.pp_loop_size
+        bmbs = [None] * self.pp_loop_size
 
-        # transferred microbatch
-        tmbs = [None] * self.pp_size
-
-        ENABLE_RELEASE = True  # For debug
+        send_req_work = []
+        send_bootstrapped_work = []
+        send_consensus_bootstrapped_work = []
+        send_proxy_work = []
+        send_release_work = []
+        send_transfer_work = []
 
         while True:
             server_is_idle = True
-
-            for mb_id in range(self.pp_size):
+            for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
+                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
+                next_mb_id = (mb_id + 1) % self.pp_loop_size
+
+                next_pp_outputs = None
+                next_release_rids = None
+                next_consensus_bootstrapped_rids = None
+                d2h_event = None
+                next_batch_result = None
 
                 recv_reqs = self.recv_requests()
-
+                self._pp_commit_comm_work(send_req_work)
                 self.process_input_requests(recv_reqs)
 
-                if self.pp_group.is_first_rank:
-                    # First rank, pop the bootstrap reqs from the bootstrap queue
-                    bootstrapped_reqs, failed_reqs = (
-                        self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                            return_failed_reqs=True
-                        )
-                    )
-                    bootstrapped_rids = [req.rid for req in bootstrapped_reqs] + [
-                        req.rid for req in failed_reqs
-                    ]
-                    self.waiting_queue.extend(bootstrapped_reqs)
-                else:
-                    # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-                    bootstrapped_rids = self.recv_pyobj_from_prev_stage()
-                    bootstrapped_reqs = (
-                        self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                            rids_to_check=bootstrapped_rids
-                        )
-                    )
-                    self.waiting_queue.extend(bootstrapped_reqs)
+                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+                bmbs[mb_id] = bootstrapped_rids
+                self._pp_commit_comm_work(send_bootstrapped_work)
 
-                if self.pp_group.is_first_rank:
-                    transferred_rids = self.get_transferred_rids()
-                # if other ranks,
-                else:
-                    # 1. recv previous stage's transferred reqs info
-                    prev_transferred_rids = self.recv_pyobj_from_prev_stage()
-                    # 2. get the current stage's transferred reqs info
-                    curr_transferred_rids = self.get_transferred_rids()
-                    # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-                    transferred_rids = list(
-                        set(prev_transferred_rids) & set(curr_transferred_rids)
-                    )
-
+                transferred_rids = self._pp_pd_get_transferred_ids()
+                self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                self.process_prefill_chunk()
+                self.process_prefill_chunk_pp()
                 mbs[mb_id] = self.get_new_batch_prefill()
                 self.running_mbs[mb_id] = self.running_batch
 
-                self.cur_batch = mbs[mb_id]
+                self.cur_batch: Optional[ScheduleBatch] = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    result = self.run_batch(self.cur_batch)
-
-                # send the outputs to the next step
-                if self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        next_token_ids = result.next_token_ids
-                        pp_outputs = PPProxyTensors(
-                            {
-                                "next_token_ids": next_token_ids,
-                            }
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                self._pp_commit_comm_work(send_proxy_work)
+                if self.server_args.pp_async_batch_depth > 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_send_recv_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                            mbs,
+                            mb_metadata,
+                            last_rank_comm_queue,
+                            pp_outputs,
                         )
-                        # send the output from the last round to let the next stage worker run post processing
-                        self.pp_group.send_tensor_dict(
-                            pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
+                    )
+                if self.cur_batch:
+                    result, event = self._pp_launch_batch(
+                        mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
+                    )
+                if self.server_args.pp_async_batch_depth == 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_send_recv_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                            mbs,
+                            mb_metadata,
+                            last_rank_comm_queue,
+                            pp_outputs,
                         )
+                    )
+                send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
+                    self._pp_pd_send_consensus_bootstrapped_ids(
+                        bmbs,
+                        next_first_rank_mb_id,
+                        consensus_bootstrapped_rids,
+                        bootstrapped_rids,
+                    )
+                )
+                send_release_work, release_rids = (
+                    self._pp_pd_send_consensus_release_ids(
+                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                    )
+                )
 
-                if ENABLE_RELEASE:
-                    if self.pp_group.is_last_rank:
-                        # At the last stage, all stages has reached the consensus to release memory for transferred_rids
-                        release_rids = transferred_rids
-                        # send to the first rank
-                        self.send_pyobj_to_next_stage(release_rids)
-
-                # receive outputs and post-process (filter finished reqs) the coming microbatch
-                next_mb_id = (mb_id + 1) % self.pp_size
-                next_pp_outputs = None
-                next_release_rids = None
-
+                if bmbs[next_mb_id] is not None:
+                    next_consensus_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
+                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
+                        next_consensus_bootstrapped_rids
+                    )
+                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
+                if tmbs[next_mb_id] is not None:
+                    next_release_rids = self.recv_pyobj_from_prev_stage()
+                self._pp_commit_comm_work(send_release_work)
+                # post-process the coming microbatch
                 if mbs[next_mb_id] is not None:
-                    next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
-                        self.pp_group.recv_tensor_dict(
-                            all_gather_group=self.attn_tp_group
-                        )
+                    d2h_event.synchronize()
+                    self._pp_process_batch_result(
+                        mbs[next_mb_id],
+                        next_batch_result,
                     )
-                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
-                    output_result = GenerationBatchResult(
-                        logits_output=None,
-                        pp_hidden_states_proxy_tensors=None,
-                        next_token_ids=next_pp_outputs["next_token_ids"],
-                        extend_input_len_per_req=None,
-                        extend_logprob_start_len_per_req=None,
-                        can_run_cuda_graph=result.can_run_cuda_graph,
-                    )
-                    self.process_batch_result_disagg_prefill(
-                        mbs[next_mb_id], output_result
-                    )
-
                     last_mbs[next_mb_id] = mbs[next_mb_id]
 
-                if ENABLE_RELEASE:
-                    if tmbs[next_mb_id] is not None:
-                        # recv consensus rids from the previous rank
-                        next_release_rids = self.recv_pyobj_from_prev_stage()
-                        self.process_disagg_prefill_inflight_queue(next_release_rids)
-
-                # carry the outputs to the next stage
+                if tmbs[next_mb_id] is not None:
+                    self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    if pp_outputs:
-                        # send the outputs from the last round to let the next stage worker run post processing
-                        self.pp_group.send_tensor_dict(
-                            pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-                    if ENABLE_RELEASE:
-                        if release_rids is not None:
-                            self.send_pyobj_to_next_stage(release_rids)
-
-                if not self.pp_group.is_last_rank:
-                    # send out reqs to the next stage
-                    self.send_pyobj_to_next_stage(recv_reqs)
-                    self.send_pyobj_to_next_stage(bootstrapped_rids)
-                    self.send_pyobj_to_next_stage(transferred_rids)
-
-                    # send out proxy tensors to the next stage
+                    send_req_work = self.send_pyobj_to_next_stage(
+                        recv_reqs, async_send=True
+                    )
+                    send_bootstrapped_work = self.send_pyobj_to_next_stage(
+                        bootstrapped_rids, async_send=True
+                    )
+                    send_transfer_work = self.send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
                     if self.cur_batch:
-                        # FIXME(lsyin): remove this assert
-                        assert result.pp_hidden_states_proxy_tensors.tensors is not None
-                        self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            all_gather_group=self.attn_tp_group,
+                        torch.cuda.current_stream().wait_event(event)
+                        send_proxy_work = self._pp_send_dict_to_next_stage(
+                            result.pp_hidden_states_proxy_tensors,
+                            async_send=True,
                         )
+
+                # if self.delayed_weight_sync_fn:
+                #     self.delayed_weight_sync_fn()
+                #     self.delayed_weight_sync_fn = None
 
                 pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
+                consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
                 self.running_batch.batch_is_full = False
-
-            if not ENABLE_RELEASE:
-                if len(self.disagg_prefill_inflight_queue) > 0:
-                    self.process_disagg_prefill_inflight_queue()
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.check_memory()
                 self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
+
+
+# Keep this function for xai's PP implementation
+def point_to_point_pyobj(
+    data: List[Any],
+    rank: int,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
+    dst: int = 1,
+    async_send: bool = False,
+):
+    """Send data from src to dst in group."""
+    if async_send:
+        send_func = dist.isend
+    else:
+        send_func = dist.send
+    if rank == src:
+        p2p_works = []
+        if len(data) == 0:
+            tensor_size = torch.tensor(
+                [0],
+                dtype=torch.long,
+            )
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
+        else:
+            serialized_data = pickle.dumps(data)
+            size = len(serialized_data)
+            tensor_data = torch.ByteTensor(
+                np.frombuffer(serialized_data, dtype=np.uint8)
+            )
+            tensor_size = torch.tensor([size], dtype=torch.long)
+
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
+            work = send_func(tensor_data, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_data))
+        return p2p_works
+
+    elif rank == dst:
+        tensor_size = torch.tensor(
+            [0],
+            dtype=torch.long,
+        )
+        work = dist.irecv(tensor_size, src=src, group=group)
+        work.wait()
+        size = tensor_size.item()
+
+        if size == 0:
+            return []
+
+        tensor_data = torch.empty(
+            size,
+            dtype=torch.uint8,
+        )
+        work = dist.irecv(tensor_data, src=src, group=group)
+        work.wait()
+
+        serialized_data = bytes(tensor_data.cpu().numpy())
+        data = pickle.loads(serialized_data)
+        return data
+
+    # Other ranks in pp_group do nothing
+    return []

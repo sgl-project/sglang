@@ -54,6 +54,8 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -70,7 +72,11 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
@@ -78,7 +84,6 @@ from sglang.srt.utils import flatten_nested_list
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -438,7 +443,6 @@ class Req:
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
-        http_worker_ipc: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -461,9 +465,6 @@ class Req:
 
         # The length of KV that have been removed in local attention chunked prefill
         self.evicted_seqlen_local = 0
-
-        # For multi-http worker
-        self.http_worker_ipc = http_worker_ipc
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -491,8 +492,6 @@ class Req:
         # Check finish
         self.tokenizer = None
         self.finished_reason = None
-        # finished position (in output_ids), used when checking stop conditions with speculative decoding
-        self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
         # If we want to abort the request in the middle of the event loop, set this to true
@@ -658,13 +657,6 @@ class Req:
         spec_alg = get_global_server_args().speculative_algorithm
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
-    @property
-    def output_ids_through_stop(self) -> List[int]:
-        """Get the output ids through the stop condition. Stop position is included."""
-        if self.finished_len is not None:
-            return self.output_ids[: self.finished_len]
-        return self.output_ids
-
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:
             return
@@ -716,20 +708,18 @@ class Req:
     def init_incremental_detokenize(self):
         first_iter = self.surr_offset is None or self.read_offset is None
 
-        output_ids = self.output_ids_through_stop
-
         if first_iter:
             self.read_offset = len(self.origin_input_ids_unpadded)
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
             self.surr_and_decode_ids = (
-                self.origin_input_ids_unpadded[self.surr_offset :] + output_ids
+                self.origin_input_ids_unpadded[self.surr_offset :] + self.output_ids
             )
-            self.cur_decode_ids_len = len(output_ids)
+            self.cur_decode_ids_len = len(self.output_ids)
         else:
-            self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])
-            self.cur_decode_ids_len = len(output_ids)
+            self.surr_and_decode_ids.extend(self.output_ids[self.cur_decode_ids_len :])
+            self.cur_decode_ids_len = len(self.output_ids)
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
@@ -776,72 +766,7 @@ class Req:
 
         return False
 
-    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
-        if self.sampling_params.ignore_eos:
-            return False
-
-        # Check stop token ids
-        matched_eos = False
-
-        for i, token_id in enumerate(new_accepted_tokens):
-            if self.sampling_params.stop_token_ids:
-                matched_eos |= token_id in self.sampling_params.stop_token_ids
-            if self.eos_token_ids:
-                matched_eos |= token_id in self.eos_token_ids
-            if self.tokenizer is not None:
-                matched_eos |= token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
-            if matched_eos:
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
-                matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
-                self.finished_len = matched_pos + 1
-                return True
-
-        return False
-
-    def _check_str_based_finish(self):
-        if (
-            len(self.sampling_params.stop_strs) > 0
-            or len(self.sampling_params.stop_regex_strs) > 0
-        ):
-            tail_str = self.tail_str()
-
-            # Check stop strings
-            if len(self.sampling_params.stop_strs) > 0:
-                for stop_str in self.sampling_params.stop_strs:
-                    if stop_str in tail_str or stop_str in self.decoded_text:
-                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        return True
-
-            # Check stop regex
-            if len(self.sampling_params.stop_regex_strs) > 0:
-                for stop_regex_str in self.sampling_params.stop_regex_strs:
-                    if re.search(stop_regex_str, tail_str):
-                        self.finished_reason = FINISHED_MATCHED_REGEX(
-                            matched=stop_regex_str
-                        )
-                        return True
-
-        return False
-
-    def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int] = None):
-        for i, token_id in enumerate(new_accepted_tokens):
-            if token_id > self.vocab_size or token_id < 0:
-                offset = len(self.output_ids) - len(new_accepted_tokens) + i
-                if self.sampling_params.stop_token_ids:
-                    self.output_ids[offset] = next(
-                        iter(self.sampling_params.stop_token_ids)
-                    )
-                if self.eos_token_ids:
-                    self.output_ids[offset] = next(iter(self.eos_token_ids))
-                self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
-                self.finished_len = offset + 1
-                return True
-
-        return False
-
-    def check_finished(self, new_accepted_len: int = 1):
+    def check_finished(self):
         if self.finished():
             return
 
@@ -855,7 +780,6 @@ class Req:
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
             )
-            self.finished_len = self.sampling_params.max_new_tokens
             return
 
         if self.grammar is not None:
@@ -863,16 +787,55 @@ class Req:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
                 return
 
-        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+        last_token_id = self.output_ids[-1]
 
-        if self._check_token_based_finish(new_accepted_tokens):
+        if not self.sampling_params.ignore_eos:
+            matched_eos = False
+
+            # Check stop token ids
+            if self.sampling_params.stop_token_ids:
+                matched_eos = last_token_id in self.sampling_params.stop_token_ids
+            if self.eos_token_ids:
+                matched_eos |= last_token_id in self.eos_token_ids
+            if self.tokenizer is not None:
+                matched_eos |= last_token_id == self.tokenizer.eos_token_id
+                if self.tokenizer.additional_stop_token_ids:
+                    matched_eos |= (
+                        last_token_id in self.tokenizer.additional_stop_token_ids
+                    )
+            if matched_eos:
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
+                return
+
+        if last_token_id > self.vocab_size or last_token_id < 0:
+            if self.sampling_params.stop_token_ids:
+                self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
+            if self.eos_token_ids:
+                self.output_ids[-1] = next(iter(self.eos_token_ids))
+            self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
             return
 
-        if self._check_vocab_boundary_finish(new_accepted_tokens):
-            return
+        if (
+            len(self.sampling_params.stop_strs) > 0
+            or len(self.sampling_params.stop_regex_strs) > 0
+        ):
+            tail_str = self.tail_str()
 
-        if self._check_str_based_finish():
-            return
+            # Check stop strings
+            if len(self.sampling_params.stop_strs) > 0:
+                for stop_str in self.sampling_params.stop_strs:
+                    if stop_str in tail_str or stop_str in self.decoded_text:
+                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                        return
+
+            # Check stop regex
+            if len(self.sampling_params.stop_regex_strs) > 0:
+                for stop_regex_str in self.sampling_params.stop_regex_strs:
+                    if re.search(stop_regex_str, tail_str):
+                        self.finished_reason = FINISHED_MATCHED_REGEX(
+                            matched=stop_regex_str
+                        )
+                        return
 
     def reset_for_retract(self):
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
@@ -1532,6 +1495,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.is_v2_eagle:
             # TODO(spec-v2): all v2 spec should go through this path
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
@@ -1588,6 +1553,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
@@ -1882,3 +1849,68 @@ class ModelWorkerBatch:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+
+@dataclasses.dataclass
+class GenerationBatchResult:
+    logits_output: Optional[LogitsProcessorOutput] = None
+    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
+    next_token_ids: Optional[torch.Tensor] = None
+    num_accepted_tokens: Optional[int] = None
+    bid: Optional[int] = None
+    can_run_cuda_graph: bool = False
+    # For output processing
+    extend_input_len_per_req: Optional[List[int]] = None
+    extend_logprob_start_len_per_req: Optional[List[int]] = None
+    # For overlap scheduling
+    copy_done: Optional[torch.cuda.Event] = None
+    delay_sample_func: Optional[callable] = None
+    future_indices: Optional[FutureIndices] = None
+    # FIXME(lsyin): maybe move to a better place?
+    # sync path: forward stream -> output processor
+    accept_lens: Optional[torch.Tensor] = None
+    allocate_lens: Optional[torch.Tensor] = None
+    # relay path: forward stream -> next step forward
+    next_draft_input: Optional[EagleDraftInput] = None
+
+    def copy_to_cpu(self, return_logprob: bool = False):
+        """Copy tensors to CPU in overlap scheduling.
+        Only the tensors which are needed for processing results are copied,
+        e.g., next_token_ids, logits outputs
+        """
+        if return_logprob:
+            if self.logits_output.next_token_logits is not None:
+                self.logits_output.next_token_logits = (
+                    self.logits_output.next_token_logits.to("cpu", non_blocking=True)
+                )
+            if self.logits_output.input_token_logprobs is not None:
+                self.logits_output.input_token_logprobs = (
+                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                )
+        if self.logits_output.hidden_states is not None:
+            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
+                "cpu", non_blocking=True
+            )
+        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        if self.accept_lens is not None:
+            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+        if self.allocate_lens is not None:
+            self.allocate_lens = self.allocate_lens.to("cpu", non_blocking=True)
+        self.copy_done.record()
+
+    @classmethod
+    def from_pp_proxy(
+        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
+    ):
+        # TODO(lsyin): refactor PP and avoid using dict
+        proxy_dict = next_pp_outputs.tensors
+        return cls(
+            logits_output=logits_output,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=next_pp_outputs["next_token_ids"],
+            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
+            extend_logprob_start_len_per_req=proxy_dict.get(
+                "extend_logprob_start_len_per_req", None
+            ),
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
