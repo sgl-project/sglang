@@ -100,7 +100,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         max_output_tokens: Some(64),
         max_tool_calls: None,
         metadata: None,
-        model: Some("mock-model".to_string()),
+        model: "mock-model".to_string(),
         parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
@@ -134,7 +134,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     };
 
     let resp = router
-        .route_responses(None, &req, req.model.as_deref())
+        .route_responses(None, &req, Some(req.model.as_str()))
         .await;
 
     assert_eq!(resp.status(), StatusCode::OK);
@@ -349,7 +349,7 @@ fn test_responses_request_creation() {
         max_output_tokens: Some(100),
         max_tool_calls: None,
         metadata: None,
-        model: Some("test-model".to_string()),
+        model: "test-model".to_string(),
         parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: Some(ResponseReasoningParam {
@@ -397,7 +397,7 @@ fn test_responses_request_sglang_extensions() {
         max_output_tokens: Some(50),
         max_tool_calls: None,
         metadata: None,
-        model: Some("test-model".to_string()),
+        model: "test-model".to_string(),
         parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
@@ -506,7 +506,7 @@ fn test_json_serialization() {
         max_output_tokens: Some(200),
         max_tool_calls: Some(5),
         metadata: None,
-        model: Some("gpt-4".to_string()),
+        model: "gpt-4".to_string(),
         parallel_tool_calls: Some(false),
         previous_response_id: None,
         reasoning: Some(ResponseReasoningParam {
@@ -545,7 +545,7 @@ fn test_json_serialization() {
         parsed.request_id,
         Some("resp_comprehensive_test".to_string())
     );
-    assert_eq!(parsed.model, Some("gpt-4".to_string()));
+    assert_eq!(parsed.model, "gpt-4");
     assert_eq!(parsed.background, Some(true));
     assert_eq!(parsed.stream, Some(true));
     assert_eq!(parsed.tools.as_ref().map(|t| t.len()), Some(1));
@@ -636,7 +636,7 @@ async fn test_multi_turn_loop_with_mcp() {
         max_output_tokens: Some(128),
         max_tool_calls: None, // No limit - test unlimited
         metadata: None,
-        model: Some("mock-model".to_string()),
+        model: "mock-model".to_string(),
         parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
@@ -812,7 +812,7 @@ async fn test_max_tool_calls_limit() {
         max_output_tokens: Some(128),
         max_tool_calls: Some(1), // Limit to 1 call
         metadata: None,
-        model: Some("mock-model".to_string()),
+        model: "mock-model".to_string(),
         parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
@@ -1006,7 +1006,7 @@ async fn test_streaming_with_mcp_tool_calls() {
         max_output_tokens: Some(256),
         max_tool_calls: Some(3),
         metadata: None,
-        model: Some("mock-model".to_string()),
+        model: "mock-model".to_string(),
         parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
@@ -1287,7 +1287,7 @@ async fn test_streaming_multi_turn_with_mcp() {
         max_output_tokens: Some(512),
         max_tool_calls: Some(5), // Allow multiple rounds
         metadata: None,
-        model: Some("mock-model".to_string()),
+        model: "mock-model".to_string(),
         parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
