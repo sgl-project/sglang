@@ -146,14 +146,16 @@ class MmItemMemoryPool:
     def recyle_chunks(self):
         # traverse all occupid_chunks and check it is a reusable one or not
         # if it's a reusable one, add it to available_chunks
+        new_occupied_chunks = []
         for chunk in self.occupied_chunks:
             accessed_tensor = self.memory_pool[chunk[0] : chunk[1]]
             if torch.equal(accessed_tensor[-MM_ITEM_VERIFY_BYTES:], self.verify_tensor):
-                self.occupied_chunks.remove(chunk)
                 self.available_chunks.append(chunk)
-            # else:
-            #     logger.info("can not recycle")
-            #     logger.info(accessed_tensor[-MM_ITEM_VERIFY_BYTES:])
+            else:
+                new_occupied_chunks.append(chunk)
+                # logger.info("can not recycle")
+                # logger.info(accessed_tensor[-MM_ITEM_VERIFY_BYTES:])
+        self.occupied_chunks = new_occupied_chunks
 
     def merge_chunks(self):
         # merge_all_available_chunks
