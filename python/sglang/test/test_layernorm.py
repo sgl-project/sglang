@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
+from sglang.srt.layers.layernorm import GemmaRMSNorm, LayerNorm, RMSNorm
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -107,6 +107,61 @@ class TestGemmaRMSNorm(CustomTestCase):
                 seed=params[4],
             ):
                 self._run_gemma_rms_norm_test(*params)
+
+
+class TestLayerNorm(CustomTestCase):
+    DTYPES = [torch.bfloat16] # Only bfloat16 input and fp32 gamma/beta is supported for now
+    NUM_TOKENS = [7, 83, 1024]
+    HIDDEN_SIZES = [768, 769, 770, 771, 1024, 2048, 4096, 5120, 5124, 5125, 5126, 8192, 8199]
+    USE_AFFINE = [False, True]
+    USE_BIAS = [False, True]
+    SEEDS = [0]
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        torch.set_default_device("cuda")
+
+    def _run_layer_norm_test(self, num_tokens, hidden_size, use_affine, use_bias, dtype, seed):
+        torch.manual_seed(seed)
+
+        layer = LayerNorm(hidden_size, elementwise_affine=use_affine, bias=use_bias)
+        if use_affine:
+            layer.weight.data.normal_(mean=1.0, std=0.1)
+            if use_bias:
+                layer.bias.data.normal_(mean=0.0, std=0.1)
+        
+        scale = 1 / (2 * hidden_size)
+        x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
+
+        with torch.inference_mode():
+            ref_out = layer.forward_native(x)
+            out = layer(x)
+
+        atol = 1e-2 if dtype in [torch.half, torch.bfloat16] else 1e-5
+        rtol = 1e-2 if dtype in [torch.half, torch.bfloat16] else 1e-5
+        
+        self.assertTrue(torch.allclose(out, ref_out, atol=atol, rtol=rtol))
+
+    def test_layer_norm(self):
+        for params in itertools.product(
+            self.NUM_TOKENS,
+            self.HIDDEN_SIZES,
+            self.USE_AFFINE,
+            self.USE_BIAS,
+            self.DTYPES,
+            self.SEEDS,
+        ):
+            with self.subTest(
+                num_tokens=params[0],
+                hidden_size=params[1],
+                use_affine=params[2],
+                use_bias=params[3],
+                dtype=params[3],
+                seed=params[4],
+            ):
+                self._run_layer_norm_test(*params)
 
 
 if __name__ == "__main__":
