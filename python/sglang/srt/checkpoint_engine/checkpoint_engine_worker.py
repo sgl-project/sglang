@@ -20,7 +20,14 @@ from typing import Callable, Dict, Optional
 
 import torch
 import zmq
-from checkpoint_engine.worker import update_weights_from_ipc
+
+try:
+    from checkpoint_engine.worker import update_weights_from_ipc
+except ImportError:
+    raise ImportError(
+        "checkpoint-engine is not installed. "
+        "Please install it with: pip install sglang[checkpoint-engine]"
+    )
 
 logger = logging.getLogger(__name__)
 

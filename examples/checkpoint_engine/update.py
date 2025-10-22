@@ -1,7 +1,7 @@
 """
 Usage:
 1) Launch the server with wait-for-initial-weights option in one terminal:
-   python -m sglang.launch_server --model-path /workspace/Qwen/Qwen3-4B/ --tensor-parallel-size 2 --port 19730 --load-format dummy --wait-for-initial-weights --mem-fraction-static 0.7
+   python -m sglang.launch_server --model-path /workspace/Qwen/Qwen3-4B/ --tensor-parallel-size 2 --port 19730 --load-format dummy --checkpoint-engine-wait-weights-before-ready --mem-fraction-static 0.7
 
 2) Torchrun this script in another terminal:
     torchrun --nproc-per-node 2 update.py --update-method broadcast --checkpoint-path /workspace/Qwen/Qwen3-4B/  --inference-parallel-size 2
