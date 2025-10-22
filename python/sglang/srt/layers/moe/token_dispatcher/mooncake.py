@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Tuple
 
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -61,14 +62,6 @@ class MooncakeCombineInput(NamedTuple):
 
 
 assert isinstance(MooncakeCombineInput, CombineInput)
-
-
-_ACTIVE_RANKS: Optional[torch.Tensor] = None
-
-
-def get_ep_active_ranks() -> torch.Tensor:
-    assert _ACTIVE_RANKS is not None, "_ACTIVE_RANKS is not initialized"
-    return _ACTIVE_RANKS
 
 
 class EPBuffer:
@@ -153,12 +146,7 @@ class _MooncakeEPDispatcherImpl:
         self.first_execution = True
         self.timeout_us = 10000000
 
-        global _ACTIVE_RANKS
-        if _ACTIVE_RANKS is None:
-            _ACTIVE_RANKS = torch.ones(
-                (self.num_experts,), dtype=torch.int32, device="cuda"
-            )
-        self.active_ranks = _ACTIVE_RANKS
+        self.active_ranks = ElasticEPStateManager.instance().active_ranks
 
         self.handle = None
 
