@@ -19,7 +19,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -29,6 +29,8 @@ if is_cuda():
     from sgl_kernel import fast_topk
 elif is_hip():
     from sgl_kernel import fast_topk
+else:
+    from sglang.srt.utils.common import fast_topk
 
 
 logger = logging.getLogger(__name__)
@@ -331,7 +333,7 @@ def get_target_cache_loc(
     )
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=is_npu())
 def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -381,7 +383,7 @@ def filter_finished_cache_loc_kernel(
     )
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=is_npu())
 def create_accept_length_filter(
     accept_length: torch.Tensor,
     unfinished_index_device: torch.Tensor,
@@ -395,7 +397,7 @@ def create_accept_length_filter(
     return accept_length_filter
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=is_npu())
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -413,7 +415,7 @@ def select_top_k_tokens(
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
             topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device="cuda")
+            torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
         )

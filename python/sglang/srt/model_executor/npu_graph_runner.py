@@ -75,9 +75,13 @@ class NPUGraphRunner(CudaGraphRunner):
 
         # Replay
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
-            seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                self.bs - self.raw_bs
-            )
+            if forward_batch.forward_mode.is_target_verify():
+                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
+                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+            else:
+                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                    self.bs - self.raw_bs
+                )
             thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
             thread.start()
             self.graphs[self.bs].replay()
