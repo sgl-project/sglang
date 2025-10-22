@@ -23,8 +23,6 @@ def _compute_average_score_kernel(
     BLOCK_SIZE_P: tl.constexpr, 
     PADDED_GROUP_SIZE: tl.constexpr,
     PADDED_HEAD_DIM: tl.constexpr,
-    MAX_NUM_TOKEN_PAGES: tl.constexpr,
-    PADDED_MAX_NUM_TOKEN_PAGES: tl.constexpr,
 ):
     bid = tl.program_id(0)
     kv_hid = tl.program_id(1)
@@ -95,8 +93,6 @@ def compute_average_score(q: torch.Tensor,
     PADDED_GROUP_SIZE = max(16, triton.next_power_of_2(GROUP_SIZE))
     PADDED_HEAD_DIM = max(16, triton.next_power_of_2(HEAD_DIM))
 
-    max_num_token_pages = kv_pages_per_seq.shape[1]
-    padded_max_num_token_pages = triton.next_power_of_2(max_num_token_pages)
     
     grid = lambda meta: (
         bs, 
@@ -121,8 +117,6 @@ def compute_average_score(q: torch.Tensor,
         # Padding info
         PADDED_GROUP_SIZE=PADDED_GROUP_SIZE,
         PADDED_HEAD_DIM=PADDED_HEAD_DIM,
-        MAX_NUM_TOKEN_PAGES=max_num_token_pages,
-        PADDED_MAX_NUM_TOKEN_PAGES=padded_max_num_token_pages,
         BLOCK_SIZE_P=32,
         num_warps=2,
         num_stages=4,

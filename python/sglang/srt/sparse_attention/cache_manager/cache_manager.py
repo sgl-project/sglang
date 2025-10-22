@@ -5,35 +5,47 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional, Callable
 from sglang.srt.model_executor.graph_runner import get_global_graph_memory_pool
 
-@dataclass
 class ManagerConfig:
-    # kv_cache config
-    keys: List[torch.Tensor]
-    values: List[torch.Tensor]
-    req_to_token: torch.Tensor
+    def __init__(self,
+                 keys: List[torch.Tensor],
+                 values: List[torch.Tensor],
+                 num_layers: int,
+                 num_q_heads: int,
+                 q_dtype: torch.dtype,
+                 max_bs: int,
+                 page_size: int,
+                 retrive_budget_per_seq: int,
+                 device: torch.device,
+                 async_retrive: bool,
+                 req_to_token: torch.Tensor,
+                 max_seq_len: int,
+                 stream_budget: Tuple[int, int],
+                 is_cuda_graph: bool,
+                 decode_cuda_graph_metadata: Optional[dict] = None
+                 ):
+        self.keys = keys
+        self.values = values
+        self.num_layers = num_layers
+        self.num_q_heads = num_q_heads
+        self.q_dtype = q_dtype
+        self.max_bs = max_bs
+        self.page_size = page_size
+        self.retrive_budget_per_seq = retrive_budget_per_seq
+        self.device = device
     
-    use_cuda_graph: bool
-    max_bs: int
-    max_seq_len: int
-
-    # page config
-    page_size: int
-    retrive_budget_per_seq: int
-    device: torch.device
-    async_retrive: bool
-    num_layers: int
-    num_q_heads: int
-    q_dtype: torch.dtype
-    top_k: int
-    stream_budget: Tuple[int, int]
-    
-    # cuda graph
-    is_cuda_graph: bool
-    decode_cuda_graph_metadata: Optional[dict] = None
-    
+        self.async_retrive = async_retrive
+        self.req_to_token = req_to_token
+        self.max_seq_len = max_seq_len
+        self.stream_budget = stream_budget
+        self.is_cuda_graph = is_cuda_graph
+        
+        self.top_k = (self.retrive_budget_per_seq - self.stream_budget[0] - self.stream_budget[1]) // self.page_size
+        self.head_num = self.keys[0].shape[1]
+        self.head_dim = self.keys[0].shape[2]
+        
 class RetriveQuery:
     def __init__(self, config: ManagerConfig, layer_id: int):
-        self.query = torch.empty(config.max_bs, config.num_q_heads*config.keys[0].shape[2], device=config.device, dtype=config.q_dtype)
+        self.query = torch.empty(config.max_bs, config.num_q_heads*config.head_dim, device=config.device, dtype=config.q_dtype)
         self.req_pool_indices = torch.full(
             size=(config.max_bs,),
             fill_value=-1,
@@ -43,16 +55,16 @@ class RetriveQuery:
         self.seq_lens = torch.empty(config.max_bs, device=config.device, dtype=torch.int32)
         # for quest
         # self.proxy_k_tensor = torch.zeros(
-        #         size=(config.keys[0].shape[0]//config.page_size, 2, config.keys[0].shape[1], config.keys[0].shape[2]),
+        #         size=(config.keys[0].shape[0]//config.page_size, 2, config.head_num, config.head_dim),
         #         device=config.device,
-        #         dtype=config.keys[0].dtype
+        #         dtype=config.q_dtype
         #     )
         
         # for average
         self.proxy_k_tensor = torch.zeros(
-            size=(config.keys[0].shape[0]//config.page_size, 1, config.keys[0].shape[1], config.keys[0].shape[2]),
+            size=(config.keys[0].shape[0]//config.page_size, 1, config.head_num, config.head_dim),
             device=config.device,
-            dtype=config.keys[0].dtype
+            dtype=config.q_dtype
         )
         
         self.count_steps = torch.zeros(
@@ -63,13 +75,13 @@ class RetriveQuery:
 
         self.score = torch.zeros(
             config.max_bs, # bs
-            config.keys[0].shape[1],  # head_num
+            config.head_num,  # head_num
             (config.max_seq_len + config.page_size - 1) // config.page_size,
             dtype=torch.float32, 
             device=config.device)
 
         self.selected_page_indices = torch.full(
-            (config.max_bs, config.keys[0].shape[1], config.top_k), 
+            (config.max_bs, config.head_num, config.top_k), 
             -1, 
             dtype=torch.int32, 
             device=config.device
@@ -81,7 +93,7 @@ class RetriveResult:
     def __init__(self, config: ManagerConfig, layer_id: int):
         self.retrive_budget_per_seq = config.retrive_budget_per_seq
         self.page_table = torch.zeros(
-            (config.max_bs, config.keys[0].shape[1], config.max_seq_len // config.page_size),
+            (config.max_bs, config.head_num, config.max_seq_len // config.page_size),
             dtype=torch.int32,
             device=config.device,
         )
@@ -104,7 +116,7 @@ class RetriveResult:
         )
         
         self.retrived_cache_indices_page = torch.full(
-            (config.max_bs, config.keys[0].shape[1], config.top_k), 
+            (config.max_bs, config.head_num, config.top_k), 
             -1, 
             dtype=torch.int32, 
             device=config.device
@@ -164,7 +176,6 @@ class CacheManager:
         self._retrive_cache_indices = None
         
     def init_cuda_graph(self):
-        return
         self.graph_runner = RetriveCudaGraphRunner(self.config, self.retrived_query, self.retrived_result, 
                                                    self._retrive_one_layer, self.stream, self.config.device)
         

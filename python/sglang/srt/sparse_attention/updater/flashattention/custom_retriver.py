@@ -74,7 +74,6 @@ class NaiveDecodeSparseRetriver:
         self.retrived_cache = {} # {paged_indices: torch.Tensor, cu_seq_len: torch.Tensor}
         self.cache_manager._retrive_cache_indices =  self._retrive_cache_indices
         self.cache_manager._call_after_update_query = self._call_after_update_query
-        self.flag = 0
         
     def update_extend(self, forward_batch: "ForwardBatch", layer_id: int):  
         proxy_k_tensor_extend(
@@ -145,7 +144,7 @@ class NaiveDecodeSparseRetriver:
                     )
         bs = query.shape[0]
         _, topk_indices = torch.topk(score[:bs, :, :], k=top_k, dim=2, sorted=False)
-        score_copy(req_to_token, topk_indices, bs)
+        score_copy(topk_indices, kv_pages_per_seq, bs)
         selected_page_indices[:bs, :, :] = topk_indices
         
     def _call_after_update_query(self,

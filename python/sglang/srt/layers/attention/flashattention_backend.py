@@ -343,16 +343,14 @@ class FlashAttentionBackend(AttentionBackend):
                 num_layers=model_runner.token_to_kv_pool.layer_num,
                 num_q_heads=model_runner.model_config.num_attention_heads,
                 q_dtype=model_runner.dtype,
-                use_cuda_graph=not model_runner.server_args.disable_cuda_graph,
                 max_bs=model_runner.server_args.max_running_requests,
                 page_size=self.page_size,
-                top_k=10,
-                retrive_budget_per_seq=1024,
+                retrive_budget_per_seq=4096,
                 device=model_runner.device,
                 async_retrive=True,
                 req_to_token=model_runner.req_to_token_pool.req_to_token,
                 max_seq_len=self.max_context_len,
-                stream_budget=(128, 256),
+                stream_budget=(256, 512),
                 is_cuda_graph=not model_runner.server_args.disable_cuda_graph,
             )
         
