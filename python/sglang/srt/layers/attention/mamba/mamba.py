@@ -13,7 +13,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.utils import divide
-
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.attention.mamba.ops import (
@@ -47,6 +46,8 @@ if is_cuda():
 elif is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_fn_npu as causal_conv1d_fn,
+    )
+    from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_update_npu as causal_conv1d_update,
     )
 
