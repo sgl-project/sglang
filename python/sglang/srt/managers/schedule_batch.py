@@ -295,7 +295,7 @@ class CudaIpcTensorTransportProxy:
                 "device_index": data.device.index,
                 "storage_offset": data.storage_offset(),
                 "recons_shape": info_data.shape,
-                "reocons_dtype": info_data.dtype,
+                "recons_dtype": info_data.dtype,
             }
             state["tensor_data"] = None
         except Exception as e:
@@ -332,7 +332,7 @@ class CudaIpcTensorTransportProxy:
                 ipc_extra["device_index"],
                 ipc_extra["storage_offset"],
                 ipc_extra["recons_shape"],
-                ipc_extra["reocons_dtype"],
+                ipc_extra["recons_dtype"],
             )
 
             try:
