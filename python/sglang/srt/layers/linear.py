@@ -659,6 +659,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     "the same for all partitions."
                 )
 
+        # Special case for w4a4 msmodelslim models.
+        if len(loaded_weight.shape) == 1:
+            loaded_weight = loaded_weight.unsqueeze(-1)
+
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -1325,6 +1329,10 @@ class RowParallelLinear(LinearBase):
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
+
+        # Special case for w4a4 msmodelslim models.
+        if len(loaded_weight.shape) == 1:
+            loaded_weight = loaded_weight.unsqueeze(-1)
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
