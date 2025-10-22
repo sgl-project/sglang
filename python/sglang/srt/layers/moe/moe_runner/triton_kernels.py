@@ -151,10 +151,10 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
 
 @register_fused_func("none", "triton_kernel")
 def fused_experts_none_to_triton_kernels(
-    dispatch_output: "StandardDispatchOutput",
+    dispatch_output: StandardDispatchOutput,
     quant_info: TritonKernelsQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
     from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
         triton_kernel_moe_forward,
         triton_kernel_moe_with_bias_forward,
@@ -252,7 +252,7 @@ def post_permute_triton_kernels_to_standard(
     quant_info: TritonKernelsQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     hidden_states = runner_output.hidden_states
