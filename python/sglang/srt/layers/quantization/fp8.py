@@ -633,6 +633,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
+            if self._should_use_cutlass_fused_experts():
+                self._ensure_cutlass_buffers_initialized(layer)
 
         else:
             # Allocate 2 scales for w1 and w3 respectively.
@@ -1023,7 +1025,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 return StandardCombineInput(hidden_states=ret)
 
         if self._should_use_cutlass_fused_experts():
-            self._ensure_cutlass_buffers_initialized(layer)
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             topk_weights, topk_ids, _ = topk_output
