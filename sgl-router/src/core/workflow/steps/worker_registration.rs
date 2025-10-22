@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     core::{
@@ -202,7 +202,7 @@ impl StepExecutor for DetectConnectionModeStep {
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
 
-        info!(
+        debug!(
             "Detecting connection mode for {} (timeout: {}s, max_attempts: {})",
             config.url, config.health_check_timeout_secs, config.max_connection_attempts
         );
@@ -217,11 +217,11 @@ impl StepExecutor for DetectConnectionModeStep {
 
         let connection_mode = match (http_result, grpc_result) {
             (Ok(_), _) => {
-                info!("{} detected as HTTP", config.url);
+                debug!("{} detected as HTTP", config.url);
                 ConnectionMode::Http
             }
             (_, Ok(_)) => {
-                info!("{} detected as gRPC", config.url);
+                debug!("{} detected as gRPC", config.url);
                 ConnectionMode::Grpc { port: None }
             }
             (Err(http_err), Err(grpc_err)) => {
@@ -259,7 +259,7 @@ impl StepExecutor for DiscoverMetadataStep {
             .get("connection_mode")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("connection_mode".to_string()))?;
 
-        info!(
+        debug!(
             "Discovering metadata for {} ({:?})",
             config.url, *connection_mode
         );
@@ -275,7 +275,7 @@ impl StepExecutor for DiscoverMetadataStep {
             HashMap::new()
         });
 
-        info!(
+        debug!(
             "Discovered {} metadata labels for {}",
             discovered_labels.len(),
             config.url
@@ -304,14 +304,14 @@ impl StepExecutor for DiscoverDPInfoStep {
 
         // Skip DP discovery if not DP-aware
         if !config.dp_aware {
-            info!(
+            debug!(
                 "Worker {} is not DP-aware, skipping DP discovery",
                 config.url
             );
             return Ok(StepResult::Success);
         }
 
-        info!("Discovering DP info for {} (DP-aware)", config.url);
+        debug!("Discovering DP info for {} (DP-aware)", config.url);
 
         // Get DP info from worker
         let dp_info = WorkerManager::get_dp_info(&config.url, config.api_key.as_deref())
@@ -321,7 +321,7 @@ impl StepExecutor for DiscoverDPInfoStep {
                 message: format!("Failed to get DP info: {}", e),
             })?;
 
-        info!(
+        debug!(
             "Discovered DP size {} for {} (model: {})",
             dp_info.dp_size, config.url, dp_info.model_id
         );
@@ -406,12 +406,12 @@ impl StepExecutor for CreateWorkerStep {
                 .cloned();
 
             if let Some(model_id) = derived_model_id {
-                info!("Derived model_id from metadata: {}", model_id);
+                debug!("Derived model_id from metadata: {}", model_id);
                 final_labels.insert("model_id".to_string(), model_id);
             }
         }
 
-        info!(
+        debug!(
             "Creating worker {} with {} discovered + {} config = {} final labels",
             config.url,
             discovered_labels.len(),
@@ -471,7 +471,7 @@ impl StepExecutor for CreateWorkerStep {
         };
 
         if normalized_url != config.url {
-            info!(
+            debug!(
                 "Normalized worker URL: {} -> {} ({:?})",
                 config.url,
                 normalized_url,
@@ -486,7 +486,7 @@ impl StepExecutor for CreateWorkerStep {
                 .get("dp_info")
                 .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?;
 
-            info!(
+            debug!(
                 "Creating {} DP-aware workers for {} (dp_size: {})",
                 dp_info.dp_size, config.url, dp_info.dp_size
             );
@@ -512,7 +512,7 @@ impl StepExecutor for CreateWorkerStep {
                 worker.set_healthy(false);
                 workers.push(worker);
 
-                info!(
+                debug!(
                     "Created DP-aware worker {}@{}/{} ({:?})",
                     config.url,
                     rank,
@@ -545,7 +545,7 @@ impl StepExecutor for CreateWorkerStep {
             let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
             worker.set_healthy(false);
 
-            info!(
+            debug!(
                 "Created worker object for {} ({:?}) with {} labels",
                 config.url,
                 connection_mode.as_ref(),
@@ -589,7 +589,7 @@ impl StepExecutor for RegisterWorkerStep {
             for worker in workers.iter() {
                 let worker_id = app_context.worker_registry.register(Arc::clone(worker));
                 worker_ids.push(worker_id.clone());
-                info!(
+                debug!(
                     "Registered DP-aware worker {} with ID {:?}",
                     config.url, worker_id
                 );
@@ -607,7 +607,7 @@ impl StepExecutor for RegisterWorkerStep {
                 .worker_registry
                 .register(Arc::clone(worker.as_ref()));
 
-            info!("Registered worker {} with ID {:?}", config.url, worker_id);
+            debug!("Registered worker {} with ID {:?}", config.url, worker_id);
             context.set("worker_id", worker_id);
 
             Ok(StepResult::Success)
@@ -664,7 +664,7 @@ impl StepExecutor for UpdatePoliciesStep {
                 }
             }
 
-            info!(
+            debug!(
                 "Updated policies for {} DP-aware workers {} (model: {})",
                 workers.len(),
                 config.url,
@@ -693,7 +693,7 @@ impl StepExecutor for UpdatePoliciesStep {
                 }
             }
 
-            info!(
+            debug!(
                 "Updated policies for worker {} (model: {})",
                 config.url, model_id
             );
@@ -728,7 +728,7 @@ impl StepExecutor for ActivateWorkerStep {
                 worker.set_healthy(true);
             }
 
-            info!(
+            debug!(
                 "Activated {} DP-aware workers {} (marked as healthy)",
                 workers.len(),
                 config.url
