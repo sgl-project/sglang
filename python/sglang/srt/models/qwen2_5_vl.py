@@ -59,8 +59,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import permute_inv
-from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.models.utils import WeightsMapper, permute_inv
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -496,7 +495,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             # mapping for original checkpoint
             "lm_head.": "language_model.lm_head.",
             "model.": "language_model.model.",
-        }
+        },
     )
 
     def __init__(
