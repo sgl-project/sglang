@@ -1178,11 +1178,7 @@ fn extract_output_items(response_json: &Value) -> Result<Vec<Value>, String> {
     response_json
         .get("output")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            // Return ALL items - no filtering by type
-            // This includes: message, reasoning, function_tool_call, mcp_call, etc.
-            arr.clone()
-        })
+        .cloned()
         .ok_or_else(|| "No output array in response".to_string())
 }
 
