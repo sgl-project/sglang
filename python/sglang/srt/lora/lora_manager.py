@@ -21,7 +21,8 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.lora.backend.base_backend import BaseLoRABackend, get_backend_from_name
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
