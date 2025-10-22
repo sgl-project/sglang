@@ -1406,7 +1406,7 @@ class Scheduler(
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
             self.max_queued_requests is None
-            or len(self.waiting_queue) + 1 <= self.max_queued_requests
+            or len(self.waiting_queue) + len(self.running_batch.reqs) + 1 <= self.max_queued_requests+self.max_running_requests
         ):
             return False
 
