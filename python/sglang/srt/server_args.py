@@ -246,6 +246,7 @@ class ServerArgs:
     # Encode prefill disaggregation
     mm_only: bool = False
     language_only: bool = False
+    embedding_port:int = None
 
     # Quantization and data type
     dtype: str = "auto"
@@ -2017,10 +2018,14 @@ class ServerArgs:
             "--mm-only",
             action='store_true'
         )
-        
         parser.add_argument(
             "--language-only",
             action='store_true'
+        )
+        parser.add_argument(
+            "--embedding-port",
+            type=int,
+            default=54213
         )
 
         # Quantization and data type

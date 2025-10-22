@@ -1,11 +1,15 @@
 import uvicorn
-import pickle
+import zmq
+import asyncio
+import zmq.asyncio
+import torch
 
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse
 from transformers import AutoImageProcessor
 from transformers.image_utils import load_images
 from typing import Optional
+from collections import deque
 
 from sglang.srt.server_args import PortArgs, ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.configs.model_config import ModelConfig
@@ -15,6 +19,30 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.distributed.parallel_state import initialize_model_parallel, init_distributed_environment
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, Modality
+from sglang.srt.utils import get_zmq_socket
+
+class EmbeddingData:
+    def __init__(self, req_id, num_parts, part_idx, mm_embedding):
+        self.req_id = req_id
+        self.num_parts = num_parts
+        self.part_idx = part_idx
+        self.embedding = mm_embedding
+        self.embedding_dict = dict()
+        self.embedding_dict[part_idx] = mm_embedding
+    
+    def add(self, embedding_data):
+        assert self.req_id == embedding_data.req_id
+        assert embedding_data.part_idx not in self.embedding_dict
+        self.embedding_dict[embedding_data.part_idx] = embedding_data.embedding
+    
+    def get(self):
+        assert len(self.embedding_dict) == self.num_parts
+        agg_data = [self.embedding_dict[i] for i in range(self.num_parts)]
+        return torch.concatenate(agg_data)
+    
+    @property
+    def ready(self):
+        return len(self.embedding_dict) == self.num_parts
 
 class ImageEncoder:
     def __init__(self, server_args:ServerArgs):
@@ -53,7 +81,14 @@ class ImageEncoder:
                 device_config=DeviceConfig(),
             )
         
-    def encoding(self,mm_items):
+        context = zmq.asyncio.Context(2)
+        self.send_to_prefill = get_zmq_socket(context, zmq.PUSH, f"tcp://localhost:{server_args.embedding_port}", False)
+        
+        self.wait_queue = deque()
+        
+        self.encode_task = None
+        
+    def encode(self,mm_items):
         images = load_images(mm_items)
         images_input = self.image_processor(images=images)
         mm_item = MultimodalDataItem.from_dict({
@@ -62,7 +97,21 @@ class ImageEncoder:
         })
         mm_item.set('image_grid_thw', images_input['image_grid_thw'])
         mm_embeddings = self.model.get_image_feature([mm_item])
+        del images_input
         return mm_embeddings
+    
+    def add(self,request_data):
+        self.wait_queue.append(request_data)
+        
+    def step(self):
+        request_data = self.wait_queue.popleft()
+        mm_embeddings = self.encode(request_data["mm_items"])
+        send_data = EmbeddingData(request_data['req_id'],
+                                  request_data['num_parts'],
+                                  request_data['part_idx'],
+                                  mm_embeddings)
+        self.send_to_prefill.send_pyobj(send_data)
+        del send_data
 
 app = FastAPI()
 encoder: Optional[ImageEncoder] = None
@@ -74,5 +123,6 @@ def launch_server(server_args:ServerArgs):
 
 @app.post("/encode")
 async def handle_encode_request(request_data: dict):
-    mm_embeddings = encoder.encoding(request_data['mm_items'])
-    return ORJSONResponse(content={'mm_embeddings':mm_embeddings.tolist()})
+    encoder.add(request_data)
+    encoder.step()
+    return ORJSONResponse(content=None)
