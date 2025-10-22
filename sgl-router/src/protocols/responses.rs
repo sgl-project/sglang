@@ -683,6 +683,48 @@ impl GenerationRequest for ResponsesRequest {
     }
 }
 
+/// Normalize a SimpleInputMessage to a proper Message item
+///
+/// This helper converts SimpleInputMessage (which can have flexible content)
+/// into a fully-structured Message item with a generated ID, role, and content array.
+///
+/// SimpleInputMessage items are converted to Message items with IDs generated using
+/// the centralized ID generation pattern with "msg_" prefix for consistency.
+///
+/// # Arguments
+/// * `item` - The input item to normalize
+///
+/// # Returns
+/// A normalized ResponseInputOutputItem (either Message if converted, or original if not SimpleInputMessage)
+pub fn normalize_input_item(item: &ResponseInputOutputItem) -> ResponseInputOutputItem {
+    match item {
+        ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
+            let content_vec = match content {
+                StringOrContentArray::String(s) => {
+                    vec![ResponseContentPart::InputText { text: s.clone() }]
+                }
+                StringOrContentArray::Array(parts) => parts.clone(),
+            };
+
+            // Generate unique ID using centralized pattern with "msg" prefix
+            use rand::RngCore;
+            let mut rng = rand::rng();
+            let mut bytes = [0u8; 25];
+            rng.fill_bytes(&mut bytes);
+            let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            let id = format!("msg_{}", hex_string);
+
+            ResponseInputOutputItem::Message {
+                id,
+                role: role.clone(),
+                content: content_vec,
+                status: Some("completed".to_string()),
+            }
+        }
+        _ => item.clone(),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponsesResponse {
     /// Response ID

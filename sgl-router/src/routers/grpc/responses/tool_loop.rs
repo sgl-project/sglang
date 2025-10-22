@@ -418,27 +418,7 @@ pub(super) async fn execute_tool_loop(
                     // Process all item types, converting SimpleInputMessage to Message
                     items
                         .iter()
-                        .enumerate()
-                        .map(|(idx, item)| match item {
-                            ResponseInputOutputItem::SimpleInputMessage {
-                                content, role, ..
-                            } => {
-                                use crate::protocols::responses::StringOrContentArray;
-                                let content_vec = match content {
-                                    StringOrContentArray::String(s) => {
-                                        vec![ResponseContentPart::InputText { text: s.clone() }]
-                                    }
-                                    StringOrContentArray::Array(parts) => parts.clone(),
-                                };
-                                ResponseInputOutputItem::Message {
-                                    id: format!("msg_{}_{}", state.iteration, idx),
-                                    role: role.clone(),
-                                    content: content_vec,
-                                    status: Some("completed".to_string()),
-                                }
-                            }
-                            _ => item.clone(),
-                        })
+                        .map(crate::protocols::responses::normalize_input_item)
                         .collect()
                 }
             };
@@ -900,27 +880,7 @@ async fn execute_tool_loop_streaming_internal(
                     // Process all item types, converting SimpleInputMessage to Message
                     items
                         .iter()
-                        .enumerate()
-                        .map(|(idx, item)| match item {
-                            ResponseInputOutputItem::SimpleInputMessage {
-                                content, role, ..
-                            } => {
-                                use crate::protocols::responses::StringOrContentArray;
-                                let content_vec = match content {
-                                    StringOrContentArray::String(s) => {
-                                        vec![ResponseContentPart::InputText { text: s.clone() }]
-                                    }
-                                    StringOrContentArray::Array(parts) => parts.clone(),
-                                };
-                                ResponseInputOutputItem::Message {
-                                    id: format!("msg_u_{}_{}", state.iteration, idx),
-                                    role: role.clone(),
-                                    content: content_vec,
-                                    status: Some("completed".to_string()),
-                                }
-                            }
-                            _ => item.clone(),
-                        })
+                        .map(crate::protocols::responses::normalize_input_item)
                         .collect()
                 }
             };

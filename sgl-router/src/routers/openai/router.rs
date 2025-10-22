@@ -579,10 +579,18 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         // Convert input items from stored input (which is now a JSON array)
                         if let Some(input_arr) = stored.input.as_array() {
                             for item in input_arr {
-                                if let Ok(input_item) =
-                                    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
-                                {
-                                    items.push(input_item);
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.clone(),
+                                ) {
+                                    Ok(input_item) => {
+                                        items.push(input_item);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to deserialize stored input item: {}. Item: {}",
+                                            e, item
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -590,10 +598,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         // Convert output items from stored output (which is now a JSON array)
                         if let Some(output_arr) = stored.output.as_array() {
                             for item in output_arr {
-                                if let Ok(output_item) =
-                                    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
-                                {
-                                    items.push(output_item);
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.clone(),
+                                ) {
+                                    Ok(output_item) => {
+                                        items.push(output_item);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to deserialize stored output item: {}. Item: {}", e, item);
+                                    }
                                 }
                             }
                         }
@@ -670,34 +683,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         }
                         ResponseInput::Items(current_items) => {
                             // Process all item types, converting SimpleInputMessage to Message
-                            for item in current_items {
-                                match item {
-                                    ResponseInputOutputItem::SimpleInputMessage {
-                                        content,
-                                        role,
-                                        ..
-                                    } => {
-                                        use crate::protocols::responses::StringOrContentArray;
-                                        let content_vec = match content {
-                                            StringOrContentArray::String(s) => {
-                                                vec![ResponseContentPart::InputText {
-                                                    text: s.clone(),
-                                                }]
-                                            }
-                                            StringOrContentArray::Array(parts) => parts.clone(),
-                                        };
-                                        items.push(ResponseInputOutputItem::Message {
-                                            id: format!("msg_u_{}_{}", conv_id.0, items.len()),
-                                            role: role.clone(),
-                                            content: content_vec,
-                                            status: Some("completed".to_string()),
-                                        });
-                                    }
-                                    _ => {
-                                        // For other types (Message, Reasoning, FunctionToolCall), keep as-is
-                                        items.push(item.clone());
-                                    }
-                                }
+                            for item in current_items.iter() {
+                                let normalized =
+                                    crate::protocols::responses::normalize_input_item(item);
+                                items.push(normalized);
                             }
                         }
                     }
@@ -729,30 +718,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 }
                 ResponseInput::Items(current_items) => {
                     // Process all item types, converting SimpleInputMessage to Message
-                    for item in current_items {
-                        match item {
-                            ResponseInputOutputItem::SimpleInputMessage {
-                                content, role, ..
-                            } => {
-                                use crate::protocols::responses::StringOrContentArray;
-                                let content_vec = match content {
-                                    StringOrContentArray::String(s) => {
-                                        vec![ResponseContentPart::InputText { text: s.clone() }]
-                                    }
-                                    StringOrContentArray::Array(parts) => parts.clone(),
-                                };
-                                items.push(ResponseInputOutputItem::Message {
-                                    id: format!("msg_u_prev_{}", items.len()),
-                                    role: role.clone(),
-                                    content: content_vec,
-                                    status: Some("completed".to_string()),
-                                });
-                            }
-                            _ => {
-                                // For other types (Message, Reasoning, FunctionToolCall), keep as-is
-                                items.push(item.clone());
-                            }
-                        }
+                    for item in current_items.iter() {
+                        let normalized = crate::protocols::responses::normalize_input_item(item);
+                        items.push(normalized);
                     }
                 }
             }
@@ -948,13 +916,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 // Generate IDs for items if they don't have them
                 let items_with_ids: Vec<Value> = items
                     .into_iter()
-                    .enumerate()
-                    .map(|(idx, mut item)| {
+                    .map(|mut item| {
                         if item.get("id").is_none() {
-                            // Generate ID if not present
-                            let id = format!("item_input_{}_{}", response_id, idx);
+                            // Generate ID if not present using centralized utility
                             if let Some(obj) = item.as_object_mut() {
-                                obj.insert("id".to_string(), json!(id));
+                                obj.insert(
+                                    "id".to_string(),
+                                    json!(super::utils::generate_id("msg")),
+                                );
                             }
                         }
                         item

@@ -64,7 +64,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                                         _ => None,
                                     })
                                     .collect::<Vec<_>>()
-                                    .join("\n")
+                                    .join(" ")
                             }
                         };
 
