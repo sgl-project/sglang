@@ -8,6 +8,27 @@ import requests
 from sglang.test.run_eval import run_eval
 
 
+def _wait_for_workers(
+    base_url: str, expected_count: int, timeout: float = 60.0, headers: dict = None
+) -> None:
+    """Poll /workers endpoint until expected number of workers are registered."""
+    start = time.perf_counter()
+    with requests.Session() as session:
+        while time.perf_counter() - start < timeout:
+            try:
+                r = session.get(f"{base_url}/workers", headers=headers, timeout=5)
+                if r.status_code == 200:
+                    workers = r.json().get("workers", [])
+                    if len(workers) >= expected_count:
+                        return
+            except requests.RequestException:
+                pass
+            time.sleep(0.5)
+    raise TimeoutError(
+        f"Expected {expected_count} workers at {base_url}, timed out after {timeout}s"
+    )
+
+
 @pytest.mark.e2e
 def test_mmlu(e2e_router_only_rr, e2e_two_workers_dp2, e2e_model):
     # Attach two dp=2 workers (total 4 GPUs) to a fresh router-only instance
@@ -17,6 +38,9 @@ def test_mmlu(e2e_router_only_rr, e2e_two_workers_dp2, e2e_model):
         assert (
             r.status_code == 202
         ), f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
+
+    # Wait for workers to be registered
+    _wait_for_workers(base, expected_count=2, timeout=60.0)
 
     args = SimpleNamespace(
         base_url=base,
@@ -42,6 +66,9 @@ def test_genai_bench(
             r.status_code == 202
         ), f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
 
+    # Wait for workers to be registered
+    _wait_for_workers(base, expected_count=2, timeout=60.0)
+
     genai_bench_runner(
         router_url=base,
         model_path=e2e_model,
@@ -65,6 +92,9 @@ def test_add_and_remove_worker_live(e2e_router_only_rr, e2e_primary_worker, e2e_
 
     r = requests.post(f"{base}/workers", json={"url": worker_url}, timeout=180)
     assert r.status_code == 202, f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
+
+    # Wait for worker to be registered
+    _wait_for_workers(base, expected_count=1, timeout=60.0)
 
     with requests.Session() as s:
         for i in range(8):
@@ -95,6 +125,9 @@ def test_lazy_fault_tolerance_live(e2e_router_only_rr, e2e_primary_worker, e2e_m
 
     r = requests.post(f"{base}/workers", json={"url": worker.url}, timeout=180)
     assert r.status_code == 202, f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
+
+    # Wait for worker to be registered
+    _wait_for_workers(base, expected_count=1, timeout=60.0)
 
     def killer():
         time.sleep(10)
@@ -143,6 +176,15 @@ def test_dp_aware_worker_expansion_and_api_key(
     )
     assert r.status_code == 202, f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
 
+    # Wait for workers to be registered and expanded
+    _wait_for_workers(
+        router_url,
+        expected_count=2,
+        timeout=60.0,
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+
+    # Verify the expanded workers have correct URLs
     r = requests.get(
         f"{router_url}/workers",
         headers={"Authorization": f"Bearer {api_key}"},
