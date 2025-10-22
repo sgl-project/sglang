@@ -151,6 +151,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self.port_args = port_args
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
