@@ -145,9 +145,7 @@ class MambaPool:
         ssm_dtype = cache_params.dtype.temporal
         self.size = size
         self.device = device
-        self.free_slots = torch.arange(
-            self.size, dtype=torch.int64, device=self.device
-        )
+        self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -226,7 +224,9 @@ class MambaPool:
                         f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
                     )
                 else:
-                    self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
+                    self.mamba_cache = self.State(
+                        conv=conv_state, temporal=temporal_state
+                    )
                     logger.info(
                         f"Mamba Cache is allocated. "
                         f"max_mamba_cache_size: {size}, "
@@ -236,9 +236,6 @@ class MambaPool:
                 self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
                 self.num_mamba_layers = num_mamba_layers
 
-    # def _create_buffers(self):
-    #     with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-    
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
         return self.mamba_cache
