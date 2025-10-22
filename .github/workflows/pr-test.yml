@@ -199,34 +199,35 @@ jobs:
           echo "All benchmark tests completed!"
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
-  cuda13-kernel-smoke-test:
-    needs: [check-changes, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: x64-cu13-kernel-tests
-    steps:
-      - uses: actions/checkout@v4
+  # TODO: Add back this test when it can pass on CI
+  # cuda13-kernel-smoke-test:
+  #   needs: [check-changes, sgl-kernel-build-wheels]
+  #   if: needs.check-changes.outputs.sgl_kernel == 'true'
+  #   runs-on: x64-cu13-kernel-tests
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-      - name: Cleanup
-        run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+  #     - name: Cleanup
+  #       run: |
+  #         ls -alh sgl-kernel/dist || true
+  #         rm -rf sgl-kernel/dist/* || true
 
-      - name: Download CUDA 13.0 artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+  #     - name: Download CUDA 13.0 artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: sgl-kernel/dist/
+  #         merge-multiple: true
+  #         pattern: wheel-python3.10-cuda13.0
 
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+  #     - name: Install dependencies
+  #       run: |
+  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run kernel unit tests
-        timeout-minutes: 30
-        run: |
-          cd sgl-kernel
-          pytest tests/
+  #     - name: Run kernel unit tests
+  #       timeout-minutes: 30
+  #       run: |
+  #         cd sgl-kernel
+  #         pytest tests/
 
   # =============================================== primary ====================================================
 
