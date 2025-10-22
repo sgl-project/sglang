@@ -2,10 +2,12 @@
 //!
 //! Provides centralized registry for workers with model-based indexing
 
-use crate::core::{ConnectionMode, Worker, WorkerType};
-use dashmap::DashMap;
 use std::sync::{Arc, RwLock};
+
+use dashmap::DashMap;
 use uuid::Uuid;
+
+use crate::core::{ConnectionMode, Worker, WorkerType};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -308,9 +310,9 @@ impl WorkerRegistry {
                     }
                 }
 
-                // Check connection_mode if specified
+                // Check connection_mode if specified (using matches for flexible gRPC matching)
                 if let Some(ref conn) = connection_mode {
-                    if w.connection_mode() != *conn {
+                    if !w.connection_mode().matches(conn) {
                         return false;
                     }
                 }
@@ -363,8 +365,10 @@ impl WorkerRegistry {
     /// Start a health checker for all workers in the registry
     /// This should be called once after the registry is populated with workers
     pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -388,7 +392,7 @@ impl WorkerRegistry {
                 }
 
                 // Get all workers from registry
-                let workers: Vec<Arc<dyn crate::core::Worker>> = workers_ref
+                let workers: Vec<Arc<dyn Worker>> = workers_ref
                     .iter()
                     .map(|entry| entry.value().clone())
                     .collect();
@@ -433,9 +437,10 @@ pub struct WorkerRegistryStats {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig};
-    use std::collections::HashMap;
 
     #[test]
     fn test_worker_registry() {
@@ -459,14 +464,12 @@ mod tests {
         // Register worker (WorkerFactory returns Box<dyn Worker>, convert to Arc)
         let worker_id = registry.register(Arc::from(worker));
 
-        // Verify registration
         assert!(registry.get(&worker_id).is_some());
         assert!(registry.get_by_url("http://worker1:8080").is_some());
         assert_eq!(registry.get_by_model("llama-3-8b").len(), 1);
         assert_eq!(registry.get_by_type(&WorkerType::Regular).len(), 1);
         assert_eq!(registry.get_by_connection(&ConnectionMode::Http).len(), 1);
 
-        // Test stats
         let stats = registry.stats();
         assert_eq!(stats.total_workers, 1);
         assert_eq!(stats.total_models, 1);
@@ -519,27 +522,22 @@ mod tests {
         registry.register(Arc::from(worker2));
         registry.register(Arc::from(worker3));
 
-        // Test get_by_model_fast for llama-3
         let llama_workers = registry.get_by_model_fast("llama-3");
         assert_eq!(llama_workers.len(), 2);
         let urls: Vec<String> = llama_workers.iter().map(|w| w.url().to_string()).collect();
         assert!(urls.contains(&"http://worker1:8080".to_string()));
         assert!(urls.contains(&"http://worker2:8080".to_string()));
 
-        // Test get_by_model_fast for gpt-4
         let gpt_workers = registry.get_by_model_fast("gpt-4");
         assert_eq!(gpt_workers.len(), 1);
         assert_eq!(gpt_workers[0].url(), "http://worker3:8080");
 
-        // Test get_by_model_fast for non-existent model
         let unknown_workers = registry.get_by_model_fast("unknown-model");
         assert_eq!(unknown_workers.len(), 0);
 
-        // Test that both get_by_model and get_by_model_fast return same results
         let llama_workers_slow = registry.get_by_model("llama-3");
         assert_eq!(llama_workers.len(), llama_workers_slow.len());
 
-        // Test removal updates the model index
         registry.remove_by_url("http://worker1:8080");
         let llama_workers_after = registry.get_by_model_fast("llama-3");
         assert_eq!(llama_workers_after.len(), 1);

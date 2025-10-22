@@ -1,7 +1,10 @@
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
+
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
@@ -19,7 +22,6 @@ impl Default for PrometheusConfig {
 }
 
 pub fn init_metrics() {
-    // Request metrics
     describe_counter!(
         "sgl_router_requests_total",
         "Total number of requests by route and method"
@@ -45,7 +47,6 @@ pub fn init_metrics() {
         "Total number of requests that exhausted retries by route"
     );
 
-    // Circuit breaker metrics
     describe_gauge!(
         "sgl_router_cb_state",
         "Circuit breaker state per worker (0=closed, 1=open, 2=half_open)"
@@ -59,7 +60,6 @@ pub fn init_metrics() {
         "Total number of circuit breaker outcomes by worker and outcome type (success/failure)"
     );
 
-    // Worker metrics
     describe_gauge!(
         "sgl_router_active_workers",
         "Number of currently active workers"
@@ -74,7 +74,31 @@ pub fn init_metrics() {
         "Total requests processed by each worker"
     );
 
-    // Policy metrics
+    describe_gauge!(
+        "sgl_router_job_queue_depth",
+        "Current number of pending jobs in the queue"
+    );
+    describe_histogram!(
+        "sgl_router_job_duration_seconds",
+        "Job processing duration in seconds by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_success_total",
+        "Total successful job completions by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_failure_total",
+        "Total failed job completions by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_queue_full_total",
+        "Total number of jobs rejected due to queue full"
+    );
+    describe_counter!(
+        "sgl_router_job_shutdown_rejected_total",
+        "Total number of jobs rejected due to shutdown"
+    );
+
     describe_counter!(
         "sgl_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
@@ -92,7 +116,6 @@ pub fn init_metrics() {
     describe_gauge!("sgl_router_max_load", "Maximum worker load");
     describe_gauge!("sgl_router_min_load", "Minimum worker load");
 
-    // PD-specific metrics
     describe_counter!("sgl_router_pd_requests_total", "Total PD requests by route");
     describe_counter!(
         "sgl_router_pd_prefill_requests_total",
@@ -123,7 +146,6 @@ pub fn init_metrics() {
         "PD request duration by route"
     );
 
-    // Service discovery metrics
     describe_counter!(
         "sgl_router_discovery_updates_total",
         "Total service discovery update events"
@@ -137,13 +159,11 @@ pub fn init_metrics() {
         "Number of workers removed in last discovery update"
     );
 
-    // Generate request specific metrics
     describe_histogram!(
         "sgl_router_generate_duration_seconds",
         "Generate request duration"
     );
 
-    // Embedding request specific metrics
     describe_counter!("sgl_router_embeddings_total", "Total embedding requests");
     describe_histogram!(
         "sgl_router_embeddings_duration_seconds",
@@ -155,13 +175,11 @@ pub fn init_metrics() {
     );
     describe_gauge!("sgl_router_embeddings_queue_size", "Embedding queue size");
 
-    // Running requests gauge for cache-aware policy
     describe_gauge!(
         "sgl_router_running_requests",
         "Number of running requests per worker"
     );
 
-    // Tokenizer metrics
     describe_histogram!(
         "sgl_tokenizer_encode_duration_seconds",
         "Time to encode text to tokens"
@@ -207,7 +225,6 @@ pub fn init_metrics() {
         "Vocabulary size of the loaded tokenizer"
     );
 
-    // Stop sequence detection metrics
     describe_counter!(
         "sgl_tokenizer_stop_sequences_detected_total",
         "Total stop sequences detected by type"
@@ -221,7 +238,6 @@ pub fn init_metrics() {
         "Time to check for stop sequences per token"
     );
 
-    // Streaming decode metrics
     describe_counter!(
         "sgl_tokenizer_stream_tokens_total",
         "Total tokens processed in streaming decode"
@@ -235,7 +251,6 @@ pub fn init_metrics() {
         "Time per streaming decode step"
     );
 
-    // Factory metrics
     describe_counter!(
         "sgl_tokenizer_factory_loads_total",
         "Total tokenizer loads by file type"
@@ -251,7 +266,6 @@ pub fn init_metrics() {
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
-    // Initialize metric descriptions
     init_metrics();
 
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
@@ -280,7 +294,6 @@ pub struct RouterMetrics;
 pub struct TokenizerMetrics;
 
 impl RouterMetrics {
-    // Request metrics
     pub fn record_request(route: &str) {
         counter!("sgl_router_requests_total",
             "route" => route.to_string()
@@ -324,7 +337,6 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    // Worker metrics
     pub fn set_active_workers(count: usize) {
         gauge!("sgl_router_active_workers").set(count as f64);
     }
@@ -350,7 +362,6 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    // Policy metrics
     pub fn record_policy_decision(policy: &str, worker: &str) {
         counter!("sgl_router_policy_decisions_total",
             "policy" => policy.to_string(),
@@ -383,7 +394,6 @@ impl RouterMetrics {
         gauge!("sgl_router_min_load").set(min_load as f64);
     }
 
-    // PD-specific metrics
     pub fn record_pd_request(route: &str) {
         counter!("sgl_router_pd_requests_total",
             "route" => route.to_string()
@@ -440,19 +450,16 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    // Service discovery metrics
     pub fn record_discovery_update(added: usize, removed: usize) {
         counter!("sgl_router_discovery_updates_total").increment(1);
         gauge!("sgl_router_discovery_workers_added").set(added as f64);
         gauge!("sgl_router_discovery_workers_removed").set(removed as f64);
     }
 
-    // Generate request metrics
     pub fn record_generate_duration(duration: Duration) {
         histogram!("sgl_router_generate_duration_seconds").record(duration.as_secs_f64());
     }
 
-    // Embeddings metrics
     pub fn record_embeddings_request() {
         counter!("sgl_router_embeddings_total").increment(1);
     }
@@ -473,7 +480,26 @@ impl RouterMetrics {
         gauge!("sgl_router_embeddings_queue_size").set(size as f64);
     }
 
-    // Running requests for cache-aware policy
+    pub fn record_classify_request() {
+        counter!("sgl_router_classify_total").increment(1);
+    }
+
+    pub fn record_classify_duration(duration: Duration) {
+        histogram!("sgl_router_classify_duration_seconds").record(duration.as_secs_f64());
+    }
+
+    pub fn record_classify_error(error_type: &str) {
+        counter!(
+            "sgl_router_classify_errors_total",
+            "error_type" => error_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn set_classify_queue_size(size: usize) {
+        gauge!("sgl_router_classify_queue_size").set(size as f64);
+    }
+
     pub fn set_running_requests(worker: &str, count: usize) {
         gauge!("sgl_router_running_requests",
             "worker" => worker.to_string()
@@ -481,7 +507,6 @@ impl RouterMetrics {
         .set(count as f64);
     }
 
-    // Circuit breaker metrics
     pub fn set_cb_state(worker: &str, state_code: u8) {
         gauge!("sgl_router_cb_state",
             "worker" => worker.to_string()
@@ -505,10 +530,42 @@ impl RouterMetrics {
         )
         .increment(1);
     }
+
+    pub fn set_job_queue_depth(depth: usize) {
+        gauge!("sgl_router_job_queue_depth").set(depth as f64);
+    }
+
+    pub fn record_job_duration(job_type: &str, duration: Duration) {
+        histogram!("sgl_router_job_duration_seconds",
+            "job_type" => job_type.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn record_job_success(job_type: &str) {
+        counter!("sgl_router_job_success_total",
+            "job_type" => job_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_job_failure(job_type: &str) {
+        counter!("sgl_router_job_failure_total",
+            "job_type" => job_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_job_queue_full() {
+        counter!("sgl_router_job_queue_full_total").increment(1);
+    }
+
+    pub fn record_job_shutdown_rejected() {
+        counter!("sgl_router_job_shutdown_rejected_total").increment(1);
+    }
 }
 
 impl TokenizerMetrics {
-    // Encoding metrics
     pub fn record_encode_request(tokenizer_type: &str) {
         counter!("sgl_tokenizer_encode_requests_total",
             "tokenizer_type" => tokenizer_type.to_string()
@@ -535,7 +592,6 @@ impl TokenizerMetrics {
         histogram!("sgl_tokenizer_chars_per_encode").record(char_count as f64);
     }
 
-    // Decoding metrics
     pub fn record_decode_request(tokenizer_type: &str) {
         counter!("sgl_tokenizer_decode_requests_total",
             "tokenizer_type" => tokenizer_type.to_string()
@@ -558,7 +614,6 @@ impl TokenizerMetrics {
         histogram!("sgl_tokenizer_tokens_per_decode").record(token_count as f64);
     }
 
-    // Batch encoding metrics
     pub fn record_encode_batch_duration(duration: Duration, batch_size: usize) {
         histogram!("sgl_tokenizer_encode_batch_duration_seconds",
             "batch_size" => batch_size.to_string()
@@ -566,7 +621,6 @@ impl TokenizerMetrics {
         .record(duration.as_secs_f64());
     }
 
-    // Stop sequence detection metrics
     pub fn record_stop_sequence_detected(stop_type: &str) {
         counter!("sgl_tokenizer_stop_sequences_detected_total",
             "type" => stop_type.to_string()
@@ -582,7 +636,6 @@ impl TokenizerMetrics {
         histogram!("sgl_tokenizer_stop_detection_duration_seconds").record(duration.as_secs_f64());
     }
 
-    // Streaming decode metrics
     pub fn record_stream_token() {
         counter!("sgl_tokenizer_stream_tokens_total").increment(1);
     }
@@ -595,7 +648,6 @@ impl TokenizerMetrics {
         histogram!("sgl_tokenizer_stream_step_duration_seconds").record(duration.as_secs_f64());
     }
 
-    // Factory metrics
     pub fn record_factory_load(file_type: &str) {
         counter!("sgl_tokenizer_factory_loads_total",
             "file_type" => file_type.to_string()
@@ -614,7 +666,6 @@ impl TokenizerMetrics {
         histogram!("sgl_tokenizer_factory_load_duration_seconds").record(duration.as_secs_f64());
     }
 
-    // Vocabulary metrics
     pub fn set_vocab_size(tokenizer_type: &str, size: usize) {
         gauge!("sgl_tokenizer_vocab_size",
             "tokenizer_type" => tokenizer_type.to_string()
@@ -625,10 +676,9 @@ impl TokenizerMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::TcpListener;
 
-    // ============= PrometheusConfig Tests =============
+    use super::*;
 
     #[test]
     fn test_prometheus_config_default() {
@@ -657,8 +707,6 @@ mod tests {
         assert_eq!(cloned.port, config.port);
         assert_eq!(cloned.host, config.host);
     }
-
-    // ============= IP Address Parsing Tests =============
 
     #[test]
     fn test_valid_ipv4_parsing() {
@@ -705,12 +753,9 @@ mod tests {
                 .parse()
                 .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
 
-            // Should fall back to 0.0.0.0
             assert_eq!(ip_addr, IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
         }
     }
-
-    // ============= Socket Address Creation Tests =============
 
     #[test]
     fn test_socket_addr_creation() {
@@ -747,8 +792,6 @@ mod tests {
         }
     }
 
-    // ============= Duration Bucket Tests =============
-
     #[test]
     fn test_duration_bucket_coverage() {
         let test_cases: [(f64, &str); 7] = [
@@ -774,13 +817,10 @@ mod tests {
         }
     }
 
-    // ============= Matcher Configuration Tests =============
-
     #[test]
     fn test_duration_suffix_matcher() {
         let matcher = Matcher::Suffix(String::from("duration_seconds"));
 
-        // Test matching behavior
         let _matching_metrics = [
             "request_duration_seconds",
             "response_duration_seconds",
@@ -789,19 +829,14 @@ mod tests {
 
         let _non_matching_metrics = ["duration_total", "duration_seconds_total", "other_metric"];
 
-        // Note: We can't directly test Matcher matching without the internals,
-        // but we can verify the matcher is created correctly
         match matcher {
             Matcher::Suffix(suffix) => assert_eq!(suffix, "duration_seconds"),
             _ => panic!("Expected Suffix matcher"),
         }
     }
 
-    // ============= Builder Configuration Tests =============
-
     #[test]
     fn test_prometheus_builder_configuration() {
-        // This test verifies the builder configuration without actually starting Prometheus
         let _config = PrometheusConfig::default();
 
         let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
@@ -810,17 +845,13 @@ mod tests {
             60.0, 90.0, 120.0, 180.0, 240.0,
         ];
 
-        // Verify bucket configuration
         assert_eq!(duration_bucket.len(), 20);
 
-        // Verify matcher is suffix type
         match duration_matcher {
             Matcher::Suffix(s) => assert_eq!(s, "duration_seconds"),
             _ => panic!("Expected Suffix matcher"),
         }
     }
-
-    // ============= Upkeep Timeout Tests =============
 
     #[test]
     fn test_upkeep_timeout_duration() {
@@ -828,18 +859,14 @@ mod tests {
         assert_eq!(timeout.as_secs(), 300);
     }
 
-    // ============= Custom Bucket Tests =============
-
     #[test]
     fn test_custom_buckets_for_different_metrics() {
-        // Test that we can create different bucket configurations
         let request_buckets = [0.001, 0.01, 0.1, 1.0, 10.0];
         let generate_buckets = [0.1, 0.5, 1.0, 5.0, 30.0, 60.0];
 
         assert_eq!(request_buckets.len(), 5);
         assert_eq!(generate_buckets.len(), 6);
 
-        // Verify each set is sorted
         for i in 1..request_buckets.len() {
             assert!(request_buckets[i] > request_buckets[i - 1]);
         }
@@ -849,11 +876,8 @@ mod tests {
         }
     }
 
-    // ============= RouterMetrics Tests =============
-
     #[test]
     fn test_metrics_static_methods() {
-        // Test that all static methods can be called without panic
         RouterMetrics::record_request("/generate");
         RouterMetrics::record_request_duration("/generate", Duration::from_millis(100));
         RouterMetrics::record_request_error("/generate", "timeout");
@@ -887,69 +911,51 @@ mod tests {
 
     #[test]
     fn test_tokenizer_metrics_static_methods() {
-        // Test that all tokenizer metric methods can be called without panic
-
-        // Encoding metrics
         TokenizerMetrics::record_encode_request("huggingface");
         TokenizerMetrics::record_encode_duration(Duration::from_millis(10));
         TokenizerMetrics::record_encode_error("invalid_input");
         TokenizerMetrics::record_tokens_per_encode(100);
         TokenizerMetrics::record_chars_per_encode(500);
 
-        // Decoding metrics
         TokenizerMetrics::record_decode_request("huggingface");
         TokenizerMetrics::record_decode_duration(Duration::from_millis(5));
         TokenizerMetrics::record_decode_error("invalid_tokens");
         TokenizerMetrics::record_tokens_per_decode(50);
 
-        // Batch encoding
         TokenizerMetrics::record_encode_batch_duration(Duration::from_millis(100), 10);
 
-        // Stop sequence detection
         TokenizerMetrics::record_stop_sequence_detected("token");
         TokenizerMetrics::record_stop_sequence_detected("string");
         TokenizerMetrics::record_partial_match();
         TokenizerMetrics::record_stop_detection_duration(Duration::from_micros(100));
 
-        // Streaming decode
         TokenizerMetrics::record_stream_token();
         TokenizerMetrics::record_incomplete_utf8();
         TokenizerMetrics::record_stream_step_duration(Duration::from_micros(50));
 
-        // Factory metrics
         TokenizerMetrics::record_factory_load("json");
         TokenizerMetrics::record_factory_error("unsupported_format");
         TokenizerMetrics::record_factory_load_duration(Duration::from_millis(200));
 
-        // Vocabulary metrics
         TokenizerMetrics::set_vocab_size("huggingface", 50000);
     }
 
-    // ============= Port Availability Tests =============
-
     #[test]
     fn test_port_already_in_use() {
-        // Skip this test if we can't bind to the port
-        let port = 29123; // Use a different port to avoid conflicts
+        let port = 29123;
 
         if let Ok(_listener) = TcpListener::bind(("127.0.0.1", port)) {
-            // Port is available, we can test
             let config = PrometheusConfig {
                 port,
                 host: "127.0.0.1".to_string(),
             };
 
-            // Just verify config is created correctly
             assert_eq!(config.port, port);
         }
     }
 
-    // ============= Integration Test Helpers =============
-
     #[test]
     fn test_metrics_endpoint_accessibility() {
-        // This would be an integration test in practice
-        // Here we just verify the configuration
         let config = PrometheusConfig {
             port: 29000,
             host: "127.0.0.1".to_string(),
@@ -963,10 +969,13 @@ mod tests {
 
     #[test]
     fn test_concurrent_metric_updates() {
-        // Test that metric updates can be called concurrently
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        use std::thread;
+        use std::{
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+            thread,
+        };
 
         let done = Arc::new(AtomicBool::new(false));
         let mut handles = vec![];
@@ -984,21 +993,16 @@ mod tests {
             handles.push(handle);
         }
 
-        // Let threads run briefly
         thread::sleep(Duration::from_millis(10));
         done.store(true, Ordering::Relaxed);
 
-        // Wait for all threads
         for handle in handles {
             handle.join().unwrap();
         }
     }
 
-    // ============= Edge Cases Tests =============
-
     #[test]
     fn test_empty_string_metrics() {
-        // Test that empty strings don't cause issues
         RouterMetrics::record_request("");
         RouterMetrics::set_worker_health("", true);
         RouterMetrics::record_policy_decision("", "");
@@ -1030,7 +1034,6 @@ mod tests {
 
     #[test]
     fn test_extreme_metric_values() {
-        // Test extreme values
         RouterMetrics::set_active_workers(0);
         RouterMetrics::set_active_workers(usize::MAX);
 
@@ -1038,7 +1041,6 @@ mod tests {
         RouterMetrics::set_worker_load("worker", usize::MAX);
 
         RouterMetrics::record_request_duration("route", Duration::from_nanos(1));
-        // 24 hours
         RouterMetrics::record_request_duration("route", Duration::from_secs(86400));
     }
 }

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -40,7 +40,7 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, **kwargs):
+    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass
 
     @abstractmethod

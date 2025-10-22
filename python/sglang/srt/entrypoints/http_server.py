@@ -19,7 +19,6 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
-import json
 import logging
 import multiprocessing as multiprocessing
 import os
@@ -51,20 +50,28 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ClassifyRequest,
     CompletionRequest,
+    DetokenizeRequest,
     EmbeddingRequest,
     ErrorResponse,
     ModelCard,
     ModelList,
     ResponsesRequest,
     ScoringRequest,
+    TokenizeRequest,
     V1RerankReqInput,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+from sglang.srt.entrypoints.openai.serving_tokenize import (
+    OpenAIServingDetokenize,
+    OpenAIServingTokenize,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -94,8 +101,8 @@ from sglang.srt.managers.io_struct import (
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
-    MultiTokenizerManager,
     MultiTokenizerRouter,
+    TokenizerWorker,
     get_main_process_id,
     monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
@@ -127,9 +134,7 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: Union[
-        TokenizerManager, MultiTokenizerRouter, MultiTokenizerManager
-    ]
+    tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
 
@@ -144,15 +149,14 @@ def set_global_state(global_state: _GlobalState):
 
 async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
-    pid = os.getpid()
-    main_pid = get_main_process_id()
-    logger.info(f"current worker_id: {pid}, main processID: {main_pid}")
 
     # Read configuration from shared memory
+    main_pid = get_main_process_id()
     port_args, server_args, scheduler_info = read_from_shared_memory(
         f"multi_tokenizer_args_{main_pid}"
     )
     server_args: ServerArgs
+    port_args: PortArgs
 
     # API key authentication is not supported in multi-tokenizer mode
     assert (
@@ -162,9 +166,13 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
+    logger.info(
+        f"Start multi-tokenizer worker process {os.getpid()}, "
+        f"ipc_name={port_args.tokenizer_ipc_name}"
+    )
 
     # Launch multi-tokenizer manager process
-    tokenizer_manager = MultiTokenizerManager(server_args, port_args)
+    tokenizer_manager = TokenizerWorker(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
@@ -172,8 +180,6 @@ async def init_multi_tokenizer() -> ServerArgs:
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
-    # Register this tokenizer with the main tokenizer manager
-    await tokenizer_manager.register_to_main_tokenizer_manager()
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     set_global_state(
@@ -225,10 +231,19 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
+    fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
         _global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
     )
 
@@ -301,7 +316,23 @@ app.add_middleware(
 
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
-    """Enrich HTTP exception with status code and other details"""
+    """Enrich HTTP exception with status code and other details.
+
+    For /v1/responses, emit OpenAI-style nested error envelope:
+    {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
+    """
+    # adjust fmt for responses api
+    if request.url.path.startswith("/v1/responses"):
+        nested_error = {
+            "message": exc.detail,
+            "type": HTTPStatus(exc.status_code).phrase,
+            "param": None,
+            "code": exc.status_code,
+        }
+        return ORJSONResponse(
+            content={"error": nested_error}, status_code=exc.status_code
+        )
+
     error = ErrorResponse(
         object="error",
         message=exc.detail,
@@ -314,7 +345,10 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Override FastAPI's default 422 validation error with 400"""
+    """Override FastAPI's default 422 validation error with 400.
+
+    For /v1/responses, emit OpenAI-style nested error envelope; for other endpoints keep legacy format.
+    """
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
@@ -322,6 +356,16 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         message = f"{exc_str} {errors_str}"
     else:
         message = exc_str
+
+    if request.url.path.startswith("/v1/responses"):
+        # adapt specially, for v1/responses API only (notice the error key is different)
+        nested_error = {
+            "message": message,
+            "type": HTTPStatus.BAD_REQUEST.phrase,
+            "param": None,
+            "code": HTTPStatus.BAD_REQUEST.value,
+        }
+        return ORJSONResponse(status_code=400, content={"error": nested_error})
 
     err = ErrorResponse(
         message=message,
@@ -467,7 +511,7 @@ async def get_load():
 
 
 # example usage:
-# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"max_micro_batch_size": 8}}'
+# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
@@ -516,7 +560,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 async def generate_from_file_request(file: UploadFile, request: Request):
     """Handle a generate request, this is purely to work with input_embeds."""
     content = await file.read()
-    input_embeds = json.loads(content.decode("utf-8"))
+    input_embeds = orjson.loads(content.decode("utf-8"))
 
     obj = GenerateReqInput(
         input_embeds=input_embeds,
@@ -595,6 +639,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         with_stack=obj.with_stack,
         record_shapes=obj.record_shapes,
         profile_by_stage=obj.profile_by_stage,
+        merge_profiles=obj.merge_profiles,
     )
     return Response(
         content="Start profiling.\n",
@@ -1039,6 +1084,54 @@ async def openai_v1_chat_completions(
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
     return await raw_request.app.state.openai_serving_embedding.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/classify",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
+    """OpenAI-compatible classification endpoint."""
+    return await raw_request.app.state.openai_serving_classify.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+@app.post(
+    "/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+    include_in_schema=False,
+)
+async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
+    """OpenAI-compatible tokenization endpoint."""
+    return await raw_request.app.state.openai_serving_tokenize.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/detokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+@app.post(
+    "/detokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+    include_in_schema=False,
+)
+async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request):
+    """OpenAI-compatible detokenization endpoint."""
+    return await raw_request.app.state.openai_serving_detokenize.handle_request(
         request, raw_request
     )
 

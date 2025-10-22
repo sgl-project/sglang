@@ -3,6 +3,8 @@ Run one test prompt.
 
 Usage:
 python3 -m sglang.test.send_one
+python3 -m sglang.test.send_one --profile --profile-steps 5
+python3 -m sglang.test.send_one --profile --profile-by-stage
 """
 
 import argparse
@@ -10,6 +12,9 @@ import dataclasses
 import json
 
 import requests
+import tabulate
+
+from sglang.profiler import run_profile
 
 
 @dataclasses.dataclass
@@ -29,6 +34,9 @@ class BenchArgs:
     image: bool = False
     many_images: bool = False
     stream: bool = False
+    profile: bool = False
+    profile_steps: int = 3
+    profile_by_stage: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -51,6 +59,11 @@ class BenchArgs:
         parser.add_argument("--image", action="store_true")
         parser.add_argument("--many-images", action="store_true")
         parser.add_argument("--stream", action="store_true")
+        parser.add_argument("--profile", action="store_true")
+        parser.add_argument(
+            "--profile-steps", type=int, default=BenchArgs.profile_steps
+        )
+        parser.add_argument("--profile-by-stage", action="store_true")
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -59,6 +72,8 @@ class BenchArgs:
 
 
 def send_one_prompt(args):
+    base_url = f"http://{args.host}:{args.port}"
+
     if args.image:
         args.prompt = (
             "Human: Describe this image in a very short sentence.\n\nAssistant:"
@@ -108,19 +123,35 @@ def send_one_prompt(args):
         "stream": args.stream,
     }
 
+    # Run profiler if requested
+    if args.profile:
+        print(f"Running profiler with {args.profile_steps} steps...")
+        run_profile(
+            base_url,
+            args.profile_steps,
+            ["CPU", "GPU"],
+            None,
+            None,
+            args.profile_by_stage,
+        )
+
     response = requests.post(
-        f"http://{args.host}:{args.port}/generate",
+        f"{base_url}/generate",
         json=json_data,
         stream=args.stream,
     )
 
     if args.stream:
+        last_len = 0
         for chunk in response.iter_lines(decode_unicode=False):
             chunk = chunk.decode("utf-8")
             if chunk and chunk.startswith("data:"):
                 if chunk == "data: [DONE]":
                     break
                 ret = json.loads(chunk[5:].strip("\n"))
+                chunk_str = ret["text"][last_len:]
+                last_len = len(ret["text"])
+                print(chunk_str, end="", flush=True)
     else:
         ret = response.json()
 
@@ -131,21 +162,25 @@ def send_one_prompt(args):
         print(ret)
         return 0, 0
 
-    latency = ret["meta_info"]["e2e_latency"]
-
-    if "spec_verify_ct" in ret["meta_info"]:
+    if "spec_verify_ct" in ret["meta_info"] and ret["meta_info"]["spec_verify_ct"] > 0:
         acc_length = (
             ret["meta_info"]["completion_tokens"] / ret["meta_info"]["spec_verify_ct"]
         )
     else:
         acc_length = 1.0
 
+    latency = ret["meta_info"]["e2e_latency"]
     speed = ret["meta_info"]["completion_tokens"] / latency
+    tokens = ret["meta_info"]["completion_tokens"]
 
-    print(ret["text"])
+    if not args.stream:
+        print(ret["text"])
+
     print()
-    print(f"{acc_length=:.2f}")
-    print(f"{speed=:.2f} token/s")
+    headers = ["Latency (s)", "Tokens", "Acc Length", "Speed (token/s)"]
+    rows = [[f"{latency:.3f}", f"{tokens}", f"{acc_length:.3f}", f"{speed:.2f}"]]
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="pretty")
+    print(msg)
 
     return acc_length, speed
 

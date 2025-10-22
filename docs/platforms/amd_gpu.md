@@ -44,7 +44,7 @@ You can install SGLang using one of the methods below.
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.3rc0 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.3.post3 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Compile sgl-kernel
@@ -54,6 +54,7 @@ python setup_rocm.py install
 
 # Install sglang python package
 cd ..
+rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
 pip install -e "python[all_hip]"
 ```
 

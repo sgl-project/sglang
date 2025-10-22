@@ -30,8 +30,8 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import load_image
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
 
 DEFAULT_PROMPTS = [
@@ -519,6 +519,7 @@ class SRTRunner:
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
         max_loaded_loras: Optional[int] = None,
+        lora_eviction_policy: str = "lru",
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -565,6 +566,7 @@ class SRTRunner:
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
             max_loaded_loras=max_loaded_loras,
+            lora_eviction_policy=lora_eviction_policy,
             **spec_kwargs,
         )
 

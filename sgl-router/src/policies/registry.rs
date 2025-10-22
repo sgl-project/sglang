@@ -1,3 +1,10 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
+use tracing::{debug, info, warn};
+
 /// Policy Registry for managing model-to-policy mappings
 ///
 /// This registry manages the dynamic assignment of load balancing policies to models.
@@ -8,11 +15,7 @@ use super::{
     CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
     RoundRobinPolicy,
 };
-use crate::config::types::PolicyConfig;
-use crate::core::Worker;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use tracing::{debug, info, warn};
+use crate::{config::types::PolicyConfig, core::Worker};
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -255,6 +258,47 @@ impl PolicyRegistry {
             .as_ref()
             .map(Arc::clone)
             .unwrap_or_else(|| self.get_default_policy())
+    }
+
+    /// Get all PowerOfTwo policies that need load updates
+    pub fn get_all_power_of_two_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        let mut power_of_two_policies = Vec::new();
+
+        if self.default_policy.name() == "power_of_two" {
+            power_of_two_policies.push(Arc::clone(&self.default_policy));
+        }
+
+        if let Some(ref policy) = *self.prefill_policy.read().unwrap() {
+            if policy.name() == "power_of_two" && !Arc::ptr_eq(policy, &self.default_policy) {
+                power_of_two_policies.push(Arc::clone(policy));
+            }
+        }
+
+        if let Some(ref policy) = *self.decode_policy.read().unwrap() {
+            if policy.name() == "power_of_two"
+                && !Arc::ptr_eq(policy, &self.default_policy)
+                && !self
+                    .prefill_policy
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(p, policy))
+            {
+                power_of_two_policies.push(Arc::clone(policy));
+            }
+        }
+
+        let model_policies = self.model_policies.read().unwrap();
+        for policy in model_policies.values() {
+            if policy.name() == "power_of_two" {
+                let already_added = power_of_two_policies.iter().any(|p| Arc::ptr_eq(p, policy));
+                if !already_added {
+                    power_of_two_policies.push(Arc::clone(policy));
+                }
+            }
+        }
+
+        power_of_two_policies
     }
 
     /// Initialize cache-aware policy with workers if applicable

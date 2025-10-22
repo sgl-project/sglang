@@ -1,7 +1,7 @@
+use std::{collections::HashMap, sync::Arc};
+
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::sync::Arc;
 
 use super::responses::{ResponseChain, ResponseId, ResponseStorage, Result, StoredResponse};
 
@@ -207,10 +207,10 @@ mod tests {
     async fn test_store_with_custom_id() {
         let store = MemoryResponseStorage::new();
         let mut response = StoredResponse::new("Input".to_string(), "Output".to_string(), None);
-        response.id = ResponseId::from_string("resp_custom".to_string());
+        response.id = ResponseId::from("resp_custom");
         store.store_response(response.clone()).await.unwrap();
         let retrieved = store
-            .get_response(&ResponseId::from_string("resp_custom".to_string()))
+            .get_response(&ResponseId::from("resp_custom"))
             .await
             .unwrap();
         assert!(retrieved.is_some());
@@ -266,7 +266,6 @@ mod tests {
         assert_eq!(chain.responses[1].input, "Second");
         assert_eq!(chain.responses[2].input, "Third");
 
-        // Test with max_depth
         let limited_chain = store.get_response_chain(&id3, Some(2)).await.unwrap();
         assert_eq!(limited_chain.responses.len(), 2);
         assert_eq!(limited_chain.responses[0].input, "Second");
@@ -314,7 +313,6 @@ mod tests {
         let deleted_count = store.delete_user_responses("user1").await.unwrap();
         assert_eq!(deleted_count, 2);
 
-        // Verify they're gone
         let user1_responses_after = store.list_user_responses("user1", None).await.unwrap();
         assert_eq!(user1_responses_after.len(), 0);
 
