@@ -38,6 +38,9 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.flashinfer_mla_backend import (
+        FlashInferMlaAttnBackend,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
@@ -66,7 +69,7 @@ global_workspace_buffer = None
 
 class FlashInferMhaChunkKVRunner:
     def __init__(
-        self, model_runner: ModelRunner, attn_backend: "FlashInferMlaAttnBackend"
+        self, model_runner: ModelRunner, attn_backend: FlashInferMlaAttnBackend
     ):
         # Parse Constants
         self.num_local_heads = (

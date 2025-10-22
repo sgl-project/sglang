@@ -214,7 +214,14 @@ async def preprocess_video(
         interpolation=InterpolationMode.BICUBIC,
         antialias=True,
     ).float()
-    return video
+    video_metadata = {
+        "fps": video_fps,
+        "duration": total_frames / video_fps,
+        "total_num_frames": total_frames,
+        "frames_indices": idx,
+        "video_backend": "torchvision",
+    }
+    return video, video_metadata
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series
@@ -279,14 +286,25 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
 
+        video_metadata = None
         if base_output.videos:
-            base_output.videos = [
-                await preprocess_video(video) for video in base_output.videos
-            ]
+            video_results = await asyncio.gather(
+                *[preprocess_video(video) for video in base_output.videos]
+            )
+            base_output.videos, video_metadata = map(list, zip(*video_results))
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
-        )
+        # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
+        if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output,
+                self.mm_tokens,
+                video_metadata=video_metadata,
+                do_sample_frames=False,
+            )
+        else:
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens
+            )
 
         audio_feature_lengths = None
 

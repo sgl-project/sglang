@@ -22,8 +22,12 @@ use tracing::{error, info, warn, Level};
 use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
     core::{
-        worker_to_info, Job, JobQueue, JobQueueConfig, LoadMonitor, WorkerManager, WorkerRegistry,
-        WorkerType,
+        worker_to_info,
+        workflow::{
+            create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
+            WorkflowEngine,
+        },
+        Job, JobQueue, JobQueueConfig, LoadMonitor, WorkerManager, WorkerRegistry, WorkerType,
     },
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
@@ -77,6 +81,7 @@ pub struct AppContext {
     pub configured_reasoning_parser: Option<String>,
     pub configured_tool_parser: Option<String>,
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
+    pub workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
 }
 
 impl AppContext {
@@ -95,6 +100,7 @@ impl AppContext {
         conversation_item_storage: SharedConversationItemStorage,
         load_monitor: Option<Arc<LoadMonitor>>,
         worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
+        workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
     ) -> Self {
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
@@ -116,6 +122,7 @@ impl AppContext {
             configured_reasoning_parser,
             configured_tool_parser,
             worker_job_queue,
+            workflow_engine,
         }
     }
 }
@@ -436,51 +443,6 @@ async fn v1_conversations_delete_item(
         .await
 }
 
-#[derive(Deserialize)]
-struct AddWorkerQuery {
-    url: String,
-    api_key: Option<String>,
-}
-
-async fn add_worker(
-    State(state): State<Arc<AppState>>,
-    Query(AddWorkerQuery { url, api_key }): Query<AddWorkerQuery>,
-) -> Response {
-    // Warn if router has API key but worker is being added without one
-    if state.context.router_config.api_key.is_some() && api_key.is_none() {
-        warn!(
-            "Adding worker {} without API key while router has API key configured. \
-            Worker will be accessible without authentication. \
-            If the worker requires the same API key as the router, please specify it explicitly.",
-            url
-        );
-    }
-
-    let result = WorkerManager::add_worker(&url, &api_key, &state.context).await;
-
-    match result {
-        Ok(message) => (StatusCode::OK, message).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
-    }
-}
-
-async fn list_workers(State(state): State<Arc<AppState>>) -> Response {
-    let worker_list = WorkerManager::get_worker_urls(&state.context.worker_registry);
-    Json(json!({ "urls": worker_list })).into_response()
-}
-
-async fn remove_worker(
-    State(state): State<Arc<AppState>>,
-    Query(AddWorkerQuery { url, .. }): Query<AddWorkerQuery>,
-) -> Response {
-    let result = WorkerManager::remove_worker(&url, &state.context);
-
-    match result {
-        Ok(message) => (StatusCode::OK, message).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
-    }
-}
-
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
     match WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
         .await
@@ -562,6 +524,12 @@ async fn create_worker(
             config.url
         );
     }
+
+    // Populate dp_aware from router's configuration
+    let config = WorkerConfigRequest {
+        dp_aware: state.context.router_config.dp_aware,
+        ..config
+    };
 
     // Submit job for async processing
     let worker_url = config.url.clone();
@@ -758,9 +726,6 @@ pub fn build_app(
         .route("/get_server_info", get(get_server_info));
 
     let admin_routes = Router::new()
-        .route("/add_worker", post(add_worker))
-        .route("/remove_worker", post(remove_worker))
-        .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -979,8 +944,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.worker_startup_check_interval_secs,
     )));
 
-    // Create empty OnceLock for worker job queue (will be initialized below)
+    // Create empty OnceLock for worker job queue and workflow engine (will be initialized below)
     let worker_job_queue = Arc::new(OnceLock::new());
+    let workflow_engine = Arc::new(OnceLock::new());
 
     // Create AppContext with all initialized components
     let app_context = AppContext::new(
@@ -997,6 +963,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         conversation_item_storage,
         load_monitor,
         worker_job_queue,
+        workflow_engine,
     );
 
     let app_context = Arc::new(app_context);
@@ -1008,17 +975,39 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
 
+    // Initialize workflow engine and register workflows
+    let engine = Arc::new(WorkflowEngine::new());
+
+    engine
+        .event_bus()
+        .subscribe(Arc::new(LoggingSubscriber))
+        .await;
+
+    engine.register_workflow(create_worker_registration_workflow());
+    engine.register_workflow(create_worker_removal_workflow());
+    app_context
+        .workflow_engine
+        .set(engine)
+        .expect("WorkflowEngine should only be initialized once");
+    info!("Workflow engine initialized with worker registration and removal workflows");
+
     info!(
         "Initializing workers for routing mode: {:?}",
         config.router_config.mode
     );
-    WorkerManager::initialize_workers(
-        &config.router_config,
-        &app_context.worker_registry,
-        Some(&app_context.policy_registry),
-    )
-    .await
-    .map_err(|e| format!("Failed to initialize workers: {}", e))?;
+
+    // Submit worker initialization job to queue
+    let job_queue = app_context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue should be initialized");
+    let job = Job::InitializeWorkersFromConfig {
+        router_config: Box::new(config.router_config.clone()),
+    };
+    job_queue
+        .submit(job)
+        .await
+        .map_err(|e| format!("Failed to submit worker initialization job: {}", e))?;
 
     let worker_stats = app_context.worker_registry.stats();
     info!(
