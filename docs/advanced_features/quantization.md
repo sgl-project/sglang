@@ -38,6 +38,8 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
+Ascend supports **per-channel quantized (INT8 or INT4) with per-token dynamic quantization activation**, you can opt to include `--quantization w8a8_int8` or `--quantization w4a4_int4` to invoke the corresponding CANN int8_kernel or int4_kernel. This action will ignore the Hugging Face config's quantization settings. The `--quantization w4a4_int4` option for now supports only msmodelslim models with `quant_model_description.json` config, the w4a4-w8a8 mix-bits supported.
+
 ### Examples of Offline Model Quantization
 
 #### Using [GPTQModel](https://github.com/ModelCloud/GPTQModel)
