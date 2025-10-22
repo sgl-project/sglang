@@ -394,9 +394,7 @@ class HiCacheController:
         )
 
         # Check if this is the decode side in PD separation mode
-        config.is_decode_side = storage_backend_extra_config.get(
-            "is_decode_side", False
-        )
+        config.is_decode_side = storage_backend_extra_config.get("role") == "decode"
         if config.is_decode_side:
             config.prefill_tp_size = storage_backend_extra_config.get("prefill_tp_size")
             config.decode_tp_size = self.tp_size

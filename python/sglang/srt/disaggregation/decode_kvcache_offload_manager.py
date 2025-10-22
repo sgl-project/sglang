@@ -2,6 +2,7 @@ import json
 import logging
 import threading
 import time
+from typing import Optional
 
 import torch
 
@@ -80,15 +81,17 @@ class DecodeKVCacheOffloadManager:
         self.ongoing_backup = {}
         logger.info("Enable offload kv cache for decode side")
 
-    def _parse_storage_backend_extra_config(self, storage_backend_extra_config: str):
+    def _parse_storage_backend_extra_config(self, config_str: Optional[str]):
         """Parse storage backend extra config JSON and extract specific parameters."""
-        try:
-            config = json.loads(storage_backend_extra_config)
-            config["is_decode_side"] = True
-            return config
-        except Exception as e:
-            logger.error(f"Invalid json format for storage backend extra config: {e}")
-            raise e
+        result = {"role": "decode"}
+
+        if config_str is not None:
+            try:
+                result.update(json.loads(config_str))
+            except Exception as e:
+                logger.warning(f"Failed to parse storage backend config: {e}")
+
+        return result
 
     def offload_kv_cache(self, req) -> bool:
         """Offload a finished request's KV cache to storage."""
@@ -96,20 +99,20 @@ class DecodeKVCacheOffloadManager:
         if self.cache_controller is None or self.decode_host_mem_pool is None:
             return False
 
-        if req.req_pool_idx == -1:
+        if req.req_pool_idx == -1 or len(req.output_ids) == 0:
             return False
 
         token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
         if token_indices.dim() == 0 or token_indices.numel() == 0:
             return False
 
-        tokens = req.origin_input_ids + req.output_ids
-        aligned_len = (len(tokens) // self.page_size) * self.page_size
+        all_tokens = req.origin_input_ids + req.output_ids[:-1]
+        aligned_len = (len(all_tokens) // self.page_size) * self.page_size
         if aligned_len == 0:
             return False
 
         token_indices = token_indices[:aligned_len]
-        tokens = tokens[:aligned_len]
+        tokens = all_tokens[:aligned_len]
 
         # Asynchronously offload KV cache from device to host by cache controller
         self.request_counter += 1

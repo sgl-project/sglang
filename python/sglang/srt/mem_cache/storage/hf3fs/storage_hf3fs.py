@@ -172,7 +172,6 @@ class HiCacheHF3FS(HiCacheStorage):
         self.file_size = file_size
         self.numjobs = numjobs
         self.bytes_per_page = bytes_per_page
-        self.gb_per_page = bytes_per_page / (1 << 30)
         self.entries = entries
         self.dtype = dtype
         self.metadata_client = metadata_client
@@ -195,9 +194,6 @@ class HiCacheHF3FS(HiCacheStorage):
         self.rank_clients = {}
 
         self.ac = AtomicCounter(self.numjobs)
-        self.executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.numjobs, thread_name_prefix=f"HiCacheHF3FS-Rank{self.rank}"
-        )
         self.lock = threading.RLock()
 
         if self._should_split_heads():
@@ -212,11 +208,20 @@ class HiCacheHF3FS(HiCacheStorage):
         self.bytes_per_page = self.bytes_per_page // self.split_factor
         self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
+        self.gb_per_page = self.bytes_per_page / (1 << 30)
 
         self._init_target_rank_clients()
 
         for rank in self.target_ranks:
             self.metadata_client.initialize(rank, self.num_pages)
+
+        self.io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.numjobs, thread_name_prefix=f"HiCacheHF3FS-Rank{self.rank}"
+        )
+        self.rank_executors = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(self.target_ranks),
+            thread_name_prefix=f"HiCacheHF3FS-Rank{self.rank}",
+        )
 
         atexit.register(self.close)
         signal.signal(signal.SIGINT, lambda sig, frame: self.close())
@@ -242,6 +247,7 @@ class HiCacheHF3FS(HiCacheStorage):
             and self.mem_pool_host is not None
             and self.mem_pool_host.layout == "page_head"
             and self.is_decode_side
+            and self.prefill_tp_size is not None
             and self.decode_tp_size < self.prefill_tp_size
         )
 
@@ -398,7 +404,7 @@ class HiCacheHF3FS(HiCacheStorage):
         start_time = time.perf_counter()
 
         futures = [
-            self.executor.submit(
+            self.io_executor.submit(
                 self.rank_clients[self.rank][self.ac.next()].batch_read,
                 file_offsets[i : i + self.entries],
                 file_results[i : i + self.entries],
@@ -425,7 +431,6 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return results
 
-    @synchronized()
     def _batch_set(
         self,
         keys: List[str],
@@ -457,7 +462,7 @@ class HiCacheHF3FS(HiCacheStorage):
         start_time = time.perf_counter()
 
         futures = [
-            self.executor.submit(
+            self.io_executor.submit(
                 self.rank_clients[write_rank][self.ac.next()].batch_write,
                 file_offsets[i : i + self.entries],
                 file_values[i : i + self.entries],
@@ -529,7 +534,8 @@ class HiCacheHF3FS(HiCacheStorage):
             for rank, clients in self.rank_clients.items():
                 for c in clients:
                     c.close()
-            self.executor.shutdown(wait=True)
+            self.io_executor.shutdown(wait=True)
+            self.rank_executors.shutdown(wait=True)
         except Exception as e:
             logger.error(f"close HiCacheHF3FS: {e}")
         logger.info("close HiCacheHF3FS")
@@ -565,14 +571,21 @@ class HiCacheHF3FS(HiCacheStorage):
         return _keys
 
     def _get_mha_zero_copy_values(
-        self, values: List[torch.Tensor]
+        self, values: List[torch.Tensor], head_slice: Optional[Tuple[int, int]] = None
     ) -> List[torch.Tensor]:
         _values = []
+
         for value in values:
             k_tensor = value[0]
             v_tensor = value[1]
-            _values.append(k_tensor.flatten() if k_tensor.dim() > 1 else k_tensor)
-            _values.append(v_tensor.flatten() if v_tensor.dim() > 1 else v_tensor)
+
+            if head_slice is not None and self.mem_pool_host.layout == "page_head":
+                start_head, end_head = head_slice
+                k_tensor = k_tensor[:, start_head:end_head, :, :, :]
+                v_tensor = v_tensor[:, start_head:end_head, :, :, :]
+
+            _values.append(k_tensor)
+            _values.append(v_tensor)
         return _values
 
     def _batch_get_preprocess(self, keys, host_indices):
@@ -638,15 +651,9 @@ class HiCacheHF3FS(HiCacheStorage):
             for i in range(page_num)
         ]
 
-        if head_slice is not None and self.mem_pool_host.layout == "page_head":
-            start_head, end_head = head_slice
-            values = [
-                v[:, :, start_head:end_head, :, :, :].contiguous() for v in values
-            ]
-
         if self.is_zero_copy and not self.is_mla_model:
             keys = self._get_mha_zero_copy_keys(keys)
-            values = self._get_mha_zero_copy_values(values)
+            values = self._get_mha_zero_copy_values(values, head_slice=head_slice)
 
         return keys, values
 
@@ -660,10 +667,9 @@ class HiCacheHF3FS(HiCacheStorage):
         split_keys, split_values = self._batch_set_preprocess(
             keys, host_indices, head_slice=head_slice
         )
-        logger.info(
-            f"write_single_rank: {len(split_keys)}, {target_rank}, {head_slice}"
-        )
-        return self._batch_set(split_keys, split_values, target_rank=target_rank)
+
+        results = self._batch_set(split_keys, split_values, target_rank=target_rank)
+        return results
 
     def batch_set_v1(
         self,
@@ -683,21 +689,20 @@ class HiCacheHF3FS(HiCacheStorage):
             start_head = split_idx * heads_per_split
             end_head = (split_idx + 1) * heads_per_split
 
-            result = self._write_single_rank(
-                keys, host_indices, target_rank, (start_head, end_head)
+            future = self.rank_executors.submit(
+                self._write_single_rank,
+                keys,
+                host_indices,
+                target_rank,
+                (start_head, end_head),
             )
-            write_results.append(result)
+            write_results.append(future)
 
+        write_results = [future.result() for future in write_results]
         final_results = [
             all(write_results[i][j] for i in range(self.split_factor))
             for j in range(len(keys))
         ]
-
-        if self.split_factor > 1:
-            logger.info(
-                f"Write done batch_set_v1, len keys: {len(keys)}, write_results: {final_results}"
-            )
-
         return final_results
 
     # Deprecated
