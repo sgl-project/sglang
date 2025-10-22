@@ -120,13 +120,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:
                 x = x.view(-1, x.shape[-1])
             output = torch.ops.sgl_kernel.weight_packed_linear(
-                x, layer.weight, bias, True  # is_vnni
+                x,
+                layer.weight,
+                bias,
+                True,  # is_vnni
             )
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
@@ -237,7 +239,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         return self.forward(
             layer=layer,
             dispatch_output=dispatch_output,
@@ -248,42 +249,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
-
-        if _use_aiter:
-            assert not moe_runner_config.no_combine, "unsupported"
-            topk_weights, topk_ids, _ = topk_output
-            if moe_runner_config.apply_router_weight_on_input:
-                assert (
-                    topk_weights.dim() == 2
-                ), "`topk_weights` should be in shape (num_tokens, topk)"
-                _, topk = topk_weights.shape
-                assert (
-                    topk == 1
-                ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-                x = x * topk_weights.to(x.dtype)
-                topk_weights = torch.ones_like(
-                    topk_weights, dtype=torch.float32
-                )  # topk_weights must be FP32 (float32)
-            output = fused_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                activation=(
-                    ActivationType.Silu
-                    if moe_runner_config.activation == "silu"
-                    else ActivationType.Gelu
-                ),
-            )
-            return StandardCombineInput(hidden_states=output)
 
         backend = self.runner.runner_backend
         if backend.is_triton_kernel():
@@ -297,22 +268,50 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 w13_bias=getattr(layer, "w13_weight_bias", None),
                 w2_bias=getattr(layer, "w2_weight_bias", None),
             )
+            return self.runner.run(dispatch_output, quant_info)
         else:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                b13=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
-            )
-
-        return self.runner.run(dispatch_output, quant_info)
+            if _use_aiter:
+                assert not moe_runner_config.no_combine, "unsupported"
+                topk_weights, topk_ids, _ = topk_output
+                if moe_runner_config.apply_router_weight_on_input:
+                    assert (
+                        topk_weights.dim() == 2
+                    ), "`topk_weights` should be in shape (num_tokens, topk)"
+                    _, topk = topk_weights.shape
+                    assert (
+                        topk == 1
+                    ), "Only support topk=1 when `apply_router_weight_on_input` is True"
+                    x = x * topk_weights.to(x.dtype)
+                    topk_weights = torch.ones_like(
+                        topk_weights, dtype=torch.float32
+                    )  # topk_weights must be FP32 (float32)
+                output = fused_moe(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    activation=(
+                        ActivationType.Silu
+                        if moe_runner_config.activation == "silu"
+                        else ActivationType.Gelu
+                    ),
+                )
+                return StandardCombineInput(hidden_states=output)
+            else:
+                quant_info = TritonMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    b13=getattr(layer, "w13_weight_bias", None),
+                    b2=getattr(layer, "w2_weight_bias", None),
+                )
+                return self.runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -367,7 +366,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         import torch_npu
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
