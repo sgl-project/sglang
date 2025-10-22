@@ -1107,7 +1107,7 @@ async fn persist_items_with_storages(
 /// Converts all input formats to a uniform Vec<Value> representation with IDs
 /// IMPORTANT: This function stores ALL items regardless of type
 fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
-    use crate::protocols::responses::StringOrContentArray;
+    use crate::protocols::responses::{ResponseInputOutputItem, StringOrContentArray};
 
     let items = match input {
         ResponseInput::Text(text) => {
@@ -1120,48 +1120,45 @@ fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
                 "status": "completed"
             })]
         }
-        ResponseInput::SimpleItems(simple_items) => {
-            // Convert SimpleInputItem to standard item format with IDs
-            simple_items.iter().map(|item| {
-                let content = match &item.content {
-                    StringOrContentArray::String(s) => {
-                        // Simple string content
-                        json!([{"type": "input_text", "text": s}])
-                    }
-                    StringOrContentArray::Array(parts) => {
-                        // Array of content parts
-                        serde_json::to_value(parts)
-                            .map_err(|e| format!("Failed to serialize content: {}", e))?
-                    }
-                };
-
-                // Generate ID if not present
-                let id = generate_id("msg");
-
-                // Use provided type or default to "message"
-                Ok(json!({
-                    "id": id,
-                    "type": item.r#type.as_deref().unwrap_or("message"),
-                    "role": item.role,
-                    "content": content,
-                    "status": "completed"
-                }))
-            }).collect::<Result<Vec<_>, String>>()?
-        }
         ResponseInput::Items(items) => {
-            // Already in correct format - serialize ALL items and ensure IDs
+            // Process all item types and ensure IDs
             items.iter().map(|item| {
-                let mut value = serde_json::to_value(item)
-                    .map_err(|e| format!("Failed to serialize item: {}", e))?;
+                match item {
+                    ResponseInputOutputItem::SimpleInputMessage { content, role } => {
+                        // Convert SimpleInputMessage to standard message format with ID
+                        let content_json = match content {
+                            StringOrContentArray::String(s) => {
+                                json!([{"type": "input_text", "text": s}])
+                            }
+                            StringOrContentArray::Array(parts) => {
+                                serde_json::to_value(parts)
+                                    .map_err(|e| format!("Failed to serialize content: {}", e))?
+                            }
+                        };
 
-                // Ensure ID exists - generate if missing
-                if let Some(obj) = value.as_object_mut() {
-                    if !obj.contains_key("id") || obj.get("id").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
-                        obj.insert("id".to_string(), json!(generate_id("item")));
+                        Ok(json!({
+                            "id": generate_id("msg"),
+                            "type": "message",
+                            "role": role,
+                            "content": content_json,
+                            "status": "completed"
+                        }))
+                    }
+                    _ => {
+                        // For other item types (Message, Reasoning, FunctionToolCall), serialize and ensure ID
+                        let mut value = serde_json::to_value(item)
+                            .map_err(|e| format!("Failed to serialize item: {}", e))?;
+
+                        // Ensure ID exists - generate if missing
+                        if let Some(obj) = value.as_object_mut() {
+                            if !obj.contains_key("id") || obj.get("id").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                                obj.insert("id".to_string(), json!(generate_id("item")));
+                            }
+                        }
+
+                        Ok(value)
                     }
                 }
-
-                Ok(value)
             }).collect::<Result<Vec<_>, String>>()?
         }
     };

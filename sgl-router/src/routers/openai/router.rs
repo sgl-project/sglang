@@ -668,26 +668,31 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                                 status: Some("completed".to_string()),
                             });
                         }
-                        ResponseInput::SimpleItems(simple_items) => {
-                            // Convert SimpleItems to full Items format
-                            for item in simple_items {
-                                use crate::protocols::responses::StringOrContentArray;
-                                let content = match &item.content {
-                                    StringOrContentArray::String(s) => {
-                                        vec![ResponseContentPart::InputText { text: s.clone() }]
-                                    }
-                                    StringOrContentArray::Array(parts) => parts.clone(),
-                                };
-                                items.push(ResponseInputOutputItem::Message {
-                                    id: format!("msg_u_{}_{}", conv_id.0, items.len()),
-                                    role: item.role.clone(),
-                                    content,
-                                    status: Some("completed".to_string()),
-                                });
-                            }
-                        }
                         ResponseInput::Items(current_items) => {
-                            items.extend_from_slice(current_items);
+                            // Process all item types, converting SimpleInputMessage to Message
+                            for item in current_items {
+                                match item {
+                                    ResponseInputOutputItem::SimpleInputMessage { content, role } => {
+                                        use crate::protocols::responses::StringOrContentArray;
+                                        let content_vec = match content {
+                                            StringOrContentArray::String(s) => {
+                                                vec![ResponseContentPart::InputText { text: s.clone() }]
+                                            }
+                                            StringOrContentArray::Array(parts) => parts.clone(),
+                                        };
+                                        items.push(ResponseInputOutputItem::Message {
+                                            id: format!("msg_u_{}_{}", conv_id.0, items.len()),
+                                            role: role.clone(),
+                                            content: content_vec,
+                                            status: Some("completed".to_string()),
+                                        });
+                                    }
+                                    _ => {
+                                        // For other types (Message, Reasoning, FunctionToolCall), keep as-is
+                                        items.push(item.clone());
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -716,26 +721,31 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         status: Some("completed".to_string()),
                     });
                 }
-                ResponseInput::SimpleItems(simple_items) => {
-                    // Convert SimpleItems to full Items format
-                    for item in simple_items {
-                        use crate::protocols::responses::StringOrContentArray;
-                        let content = match &item.content {
-                            StringOrContentArray::String(s) => {
-                                vec![ResponseContentPart::InputText { text: s.clone() }]
-                            }
-                            StringOrContentArray::Array(parts) => parts.clone(),
-                        };
-                        items.push(ResponseInputOutputItem::Message {
-                            id: format!("msg_u_prev_{}", items.len()),
-                            role: item.role.clone(),
-                            content,
-                            status: Some("completed".to_string()),
-                        });
-                    }
-                }
                 ResponseInput::Items(current_items) => {
-                    items.extend_from_slice(current_items);
+                    // Process all item types, converting SimpleInputMessage to Message
+                    for item in current_items {
+                        match item {
+                            ResponseInputOutputItem::SimpleInputMessage { content, role } => {
+                                use crate::protocols::responses::StringOrContentArray;
+                                let content_vec = match content {
+                                    StringOrContentArray::String(s) => {
+                                        vec![ResponseContentPart::InputText { text: s.clone() }]
+                                    }
+                                    StringOrContentArray::Array(parts) => parts.clone(),
+                                };
+                                items.push(ResponseInputOutputItem::Message {
+                                    id: format!("msg_u_prev_{}", items.len()),
+                                    role: role.clone(),
+                                    content: content_vec,
+                                    status: Some("completed".to_string()),
+                                });
+                            }
+                            _ => {
+                                // For other types (Message, Reasoning, FunctionToolCall), keep as-is
+                                items.push(item.clone());
+                            }
+                        }
+                    }
                 }
             }
 
