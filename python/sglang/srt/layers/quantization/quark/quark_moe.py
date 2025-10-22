@@ -32,9 +32,9 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
-    from aiter.ops.shuffle import shuffle_weight
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
+    from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
 
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
