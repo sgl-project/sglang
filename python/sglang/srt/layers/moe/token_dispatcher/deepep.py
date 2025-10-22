@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
@@ -212,6 +213,7 @@ class DeepEPBuffer:
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
+            enable_shrink=True,
             allow_mnnvl=True,
         )
         return cls._buffer
@@ -309,6 +311,7 @@ class _DeepEPDispatcherImplBase:
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         assert self.num_max_dispatch_tokens_per_rank <= 1024
+        self.status_tensor = ElasticEPStateManager.instance().rank_status
 
         self.handle = None
 
@@ -666,6 +669,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     else {}
                 ),
             )
+            torch.cuda.synchronize()
+            buffer.low_latency_query_mask_buffer(self.status_tensor)
+            torch.cuda.synchronize()
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook

@@ -237,7 +237,7 @@ class ServerArgs:
 
     # Runtime options
     device: Optional[str] = None
-    elastic_ep_backend: Literal[None, "mooncake"] = None
+    elastic_ep_backend: Literal[None, "mooncake", "deepep"] = None
     mooncake_ib_device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
@@ -599,6 +599,9 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+        # Handle elastic expert parallelism.
+        self._handle_elastic_ep()
 
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
@@ -1224,6 +1227,15 @@ class ServerArgs:
 
         if self.enable_eplb:
             assert self.ep_size > 1
+
+    def _handle_elastic_ep(self):
+        if self.elastic_ep_backend is not None:
+            if self.enable_eplb:
+                if self.eplb_algorithm == "auto":
+                    self.eplb_algorithm = "elasticity_aware"
+                assert (
+                    self.eplb_algorithm == "elasticity_aware"
+                ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -1892,8 +1904,11 @@ class ServerArgs:
             "--elastic-ep-backend",
             type=str,
             default=ServerArgs.elastic_ep_backend,
-            choices=["none", "mooncake"],
-            help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
+            choices=["none", "mooncake", "deepep"],
+            help=(
+                "Specify the collective communication backend for elastic EP. "
+                "Supports 'mooncake' and 'deepep'. Use 'none' to disable."
+            ),
         )
         parser.add_argument(
             "--mooncake-ib-device",
