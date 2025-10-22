@@ -392,8 +392,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             not forward_mode.is_decode_or_idle()
             and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend()
-            and not forward_mode.is_draft_extend_v2()
+            and not forward_mode.is_draft_extend(include_v2=True)
         ):
             return super().init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -434,7 +433,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices,
             max_seq_len_val,
         )
-        if forward_mode.is_draft_extend() or forward_mode.is_draft_extend_v2():
+        if forward_mode.is_draft_extend(include_v2=True):
             num_tokens_per_bs = num_tokens // bs
             metadata.max_seq_len_q = num_tokens_per_bs + 1
             metadata.sum_seq_lens_q = num_tokens_per_bs * bs
@@ -467,8 +466,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             not forward_mode.is_decode_or_idle()
             and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend()
-            and not forward_mode.is_draft_extend_v2()
+            and not forward_mode.is_draft_extend(include_v2=True)
         ):
             return super().init_forward_metadata_replay_cuda_graph(
                 bs,
@@ -487,7 +485,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         metadata = self.decode_cuda_graph_metadata[bs]
 
-        if forward_mode.is_draft_extend() or forward_mode.is_draft_extend_v2():
+        if forward_mode.is_draft_extend(include_v2=True):
             accept_length = spec_info.accept_length[:bs]
             if spec_info.accept_length_cpu:
                 metadata.max_seq_len_q = max(spec_info.accept_length_cpu[:bs])
@@ -530,8 +528,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
-            and not forward_batch.forward_mode.is_draft_extend()
-            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             if self.disable_chunked_prefix_cache:
                 super().init_forward_metadata(forward_batch)
@@ -552,8 +549,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             bs = forward_batch.batch_size
 
@@ -582,10 +578,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_decode_metadata = TRTLLMMLADecodeMetadata(
                 block_kv_indices, max_seq_len_val
             )
-            if (
-                forward_batch.forward_mode.is_draft_extend()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
+            if forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 max_seq = forward_batch.seq_lens_cpu.max().item()
 
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
@@ -934,8 +927,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             metadata = (
                 getattr(forward_batch, "decode_trtllm_mla_metadata", None)
@@ -1007,10 +999,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             # Reshape output directly without slicing
 
-            if (
-                forward_batch.forward_mode.is_draft_extend()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
+            if forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 raw_out = self.unpad_draft_extend_output(
                     raw_out,
                     metadata.cu_seqlens_q,
