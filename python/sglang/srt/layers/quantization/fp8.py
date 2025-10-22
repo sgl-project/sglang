@@ -177,8 +177,9 @@ class Fp8Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-        if isinstance(layer, LinearBase):
+        if isinstance(layer, LinearBase) or isinstance(layer, VocabParallelEmbedding):
             if is_layer_skipped(prefix, self.ignored_layers):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)

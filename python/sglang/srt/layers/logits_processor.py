@@ -880,6 +880,10 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
+            elif hasattr(lm_head, "quant_method") and lm_head.quant_method is not None:
+                logits = lm_head.quant_method.apply(
+                    lm_head, hidden_states
+                )
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T

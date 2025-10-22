@@ -55,6 +55,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -243,7 +244,7 @@ class GptOssAttention(nn.Module):
             self.total_num_kv_heads,
             bias=attention_bias,
             params_dtype=params_dtype,
-            quant_config=quant_config,
+            quant_config=Fp8Config(),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
@@ -261,7 +262,7 @@ class GptOssAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=attention_bias,
-            quant_config=quant_config,
+            quant_config=Fp8Config(),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             reduce_results=False,
@@ -583,7 +584,7 @@ class GptOssForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            # quant_config=quant_config,
+            quant_config=Fp8Config(),
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
