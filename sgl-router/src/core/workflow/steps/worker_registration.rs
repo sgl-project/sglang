@@ -372,7 +372,7 @@ impl StepExecutor for DiscoverDPInfoStep {
         );
 
         // Store DP info in context
-        context.set("dp_info", Arc::new(dp_info));
+        context.set("dp_info", dp_info);
 
         Ok(StepResult::Success)
     }
@@ -567,7 +567,7 @@ impl StepExecutor for CreateWorkerStep {
             }
 
             // Store workers (plural) and labels in context
-            context.set("workers", Arc::new(workers));
+            context.set("workers", workers);
             context.set("labels", final_labels);
 
             Ok(StepResult::Success)
@@ -640,7 +640,7 @@ impl StepExecutor for RegisterWorkerStep {
                 );
             }
 
-            context.set("worker_ids", Arc::new(worker_ids));
+            context.set("worker_ids", worker_ids);
             Ok(StepResult::Success)
         } else {
             // Non-DP-aware path: Register single worker
