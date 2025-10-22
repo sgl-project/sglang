@@ -163,18 +163,6 @@ class MultimodalSpecialTokens:
         self.combined_regex = re.compile(combined, flags)
         return self.combined_regex
 
-
-def lock_if_cuda_ipc(fn):
-    async def wrapper(self, *args, **kwargs):
-        if SGL_USE_CUDA_IPC:
-            async with self._cache_lock:
-                return await fn(self, *args, **kwargs)
-        else:
-            return await fn(self, *args, **kwargs)
-
-    return wrapper
-
-
 class BaseMultimodalProcessor(ABC):
     models = []
 
@@ -618,9 +606,8 @@ class BaseMultimodalProcessor(ABC):
         collected_items = self.collect_mm_items_from_processor_output(ret)
 
         return collected_items, input_ids, ret
-
-    @lock_if_cuda_ipc
-    async def process_and_combine_mm_data(
+    
+    def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,

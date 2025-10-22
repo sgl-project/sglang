@@ -1,0 +1,112 @@
+{
+  "results": {
+    "mmmu_val": {
+      "alias": "mmmu_val",
+      "mmmu_acc,none": 0.5,
+      "mmmu_acc_stderr,none": "N/A",
+      "mmmu_acc_pass_at_k,none": [],
+      "mmmu_acc_pass_at_k_stderr,none": [],
+      "submission,none": [],
+      "submission_stderr,none": []
+    }
+  },
+  "group_subtasks": {
+    "mmmu_val": []
+  },
+  "configs": {
+    "mmmu_val": {
+      "task": "mmmu_val",
+      "dataset_path": "lmms-lab/MMMU",
+      "test_split": "validation",
+      "full_docs": false,
+      "process_results_use_image": false,
+      "doc_to_visual": "<function mmmu_doc_to_visual at 0x7fba4b206840>",
+      "doc_to_text": "<function mmmu_doc_to_text at 0x7fba4b207880>",
+      "doc_to_target": "answer",
+      "doc_to_messages": "<function mmmu_doc_to_messages at 0x7fbd1f4b0ae0>",
+      "process_results": "<function mmmu_process_results at 0x7fbd1f4b1d00>",
+      "description": "",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "mmmu_acc",
+          "aggregation": "<function mmmu_aggregate_results at 0x7fbd1f4b3060>",
+          "higher_is_better": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "max_new_tokens": 16,
+        "until": [
+          "\n\n"
+        ]
+      },
+      "repeats": 1,
+      "should_decontaminate": false,
+      "metadata": {
+        "version": 0.0,
+        "interleaved_format": false
+      },
+      "lmms_eval_specific_kwargs": {
+        "default": {
+          "prompt_type": "format",
+          "multiple_choice_prompt": "Answer with the option's letter from the given choices directly.",
+          "open_ended_prompt": "Answer the question using a single word or phrase."
+        },
+        "prompt_type": "format",
+        "multiple_choice_prompt": "Answer with the option's letter from the given choices directly.",
+        "open_ended_prompt": "Answer the question using a single word or phrase."
+      }
+    }
+  },
+  "versions": {
+    "mmmu_val": 0.0
+  },
+  "n-shot": {
+    "mmmu_val": 0
+  },
+  "higher_is_better": {
+    "mmmu_val": {
+      "mmmu_acc": true
+    }
+  },
+  "n-samples": {
+    "mmmu_val": {
+      "original": 900,
+      "effective": 900
+    }
+  },
+  "config": {
+    "model": "openai_compatible",
+    "model_args": "model_version=\"Qwen/Qwen2.5-VL-7B-Instruct\",tp=1",
+    "batch_size": "16",
+    "batch_sizes": [],
+    "device": null,
+    "use_cache": null,
+    "limit": null,
+    "bootstrap_iters": 100000,
+    "gen_kwargs": "",
+    "random_seed": 0,
+    "numpy_seed": 1234,
+    "torch_seed": 1234,
+    "fewshot_seed": 1234
+  },
+  "git_hash": "74bfd3dad",
+  "date": "20251022_145414",
+  "task_hashes": {
+    "mmmu_val": "614600386b06b53646ff0656be64e14e0f33e49b2e8eb7e528d482ff0ba6e7ae"
+  },
+  "model_source": "openai_compatible",
+  "model_name": "",
+  "model_name_sanitized": "",
+  "system_instruction": null,
+  "system_instruction_sha": null,
+  "fewshot_as_multiturn": false,
+  "chat_template": null,
+  "chat_template_sha": null,
+  "start_time": 3112597.740986777,
+  "end_time": 3112794.324008972,
+  "total_evaluation_time_seconds": "196.58302219491452"
+}
