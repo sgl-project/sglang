@@ -1,42 +1,44 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools-rust>=1.5.2"]
 build-backend = "setuptools.build_meta"
+requires = ["setuptools>=45", "wheel", "setuptools-rust>=1.5.2"]
 
 [project]
-name = "sglang-router"
-version = "0.2.1"
-description = "High-performance Rust-based load balancer for SGLang with multiple routing algorithms and prefill-decode disaggregation support"
 authors = [
-    {name = "Byron Hsu", email = "byronhsu1230@gmail.com"},
-    {name = "Chang Su", email = "mckvtl@gmail.com"},
-    {name = "Keyang Ru", email = "rukeyang@gmail.com"}
+  {name = "Byron Hsu", email = "byronhsu1230@gmail.com"},
+  {name = "Chang Su", email = "mckvtl@gmail.com"},
+  {name = "Keyang Ru", email = "rukeyang@gmail.com"},
 ]
-requires-python = ">=3.8"
-readme = "README.md"
-license = { text = "Apache-2.0" }
 classifiers = [
-    "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
 ]
+description = "High-performance Rust-based load balancer for SGLang with multiple routing algorithms and prefill-decode disaggregation support"
+license = {text = "Apache-2.0"}
+name = "sglang-router"
+readme = "README.md"
+requires-python = ">=3.8"
+version = "0.2.1"
 
 dependencies = [
-    "setproctitle",
-    "aiohttp",
-    "orjson",
-    "uvicorn",
-    "fastapi",
+  "setproctitle",
+  "aiohttp",
+  "orjson",
+  "uvicorn",
+  "fastapi",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "requests>=2.25.0",
+  "requests>=2.25.0",
 ]
 
+[project.scripts]
+sglang-router-serve = "sglang_router.launch_server:main"
 
 # https://github.com/PyO3/setuptools-rust?tab=readme-ov-file
 [tool.setuptools.packages]
-find = { where = ["py_src"] }
+find = {where = ["py_src"]}
 
 # workaround for https://github.com/pypa/twine/issues/1216
 [tool.setuptools]
