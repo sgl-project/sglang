@@ -150,9 +150,9 @@ class TestQwen2AudioServer(AudioOpenAITestMixin):
     model = "Qwen/Qwen2-Audio-7B-Instruct"
 
 
-class TestDeepseekServer(ImageOpenAITestMixin):
+class TestDeepseekOCRServer(ImageOpenAITestMixin):
     model = "deepseek-ai/DeepSeek-OCR"
-    extra_args = ["--disable-cuda-graph"]
+    trust_remote_code = False
 
     def verify_single_image_response_for_ocr(self, response):
         """Verify DeepSeek-OCR grounding output with coordinates"""
@@ -189,7 +189,10 @@ class TestDeepseekServer(ImageOpenAITestMixin):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                            # "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                            "image_url": {
+                                "url": "/sgl-workspace/sglang/assets/document_570p.png"
+                            },
                         },
                         {
                             "type": "text",

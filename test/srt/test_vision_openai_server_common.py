@@ -32,6 +32,7 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
     model: str
     extra_args: list = []
     fixed_args: list = ["--enable-multimodal"]
+    trust_remote_code: bool = True
 
     @classmethod
     def setUpClass(cls):
@@ -42,7 +43,11 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=cls.extra_args + cls.fixed_args,
+            other_args=(
+                cls.extra_args + cls.fixed_args + ["--trust-remote-code"]
+                if cls.trust_remote_code
+                else []
+            ),
         )
         cls.base_url += "/v1"
 

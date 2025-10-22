@@ -457,16 +457,6 @@ def get_processor(
                 **kwargs,
             )
         else:
-            # print(f"{tokenizer_name=}")
-            # if tokenizer_name == "deepseek-ai/DeepSeek-OCR":
-            #     processor = DeepseekOCRProcessor.from_pretrained(
-            #         tokenizer_name,
-            #         *args,
-            #         trust_remote_code=trust_remote_code,
-            #         revision=revision,
-            #         **kwargs,
-            #     )
-            # else:
             processor = AutoProcessor.from_pretrained(
                 tokenizer_name,
                 *args,
