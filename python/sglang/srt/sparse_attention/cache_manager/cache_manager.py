@@ -32,7 +32,7 @@ class ManagerConfig:
     decode_cuda_graph_metadata: Optional[dict] = None
     
 class RetriveQuery:
-    def __init__(self, config: ManagerConfig):
+    def __init__(self, config: ManagerConfig, layer_id: int):
         self.query = torch.empty(config.max_bs, config.num_q_heads*config.keys[0].shape[2], device=config.device, dtype=config.q_dtype)
         self.req_pool_indices = torch.full(
             size=(config.max_bs,),
@@ -75,9 +75,10 @@ class RetriveQuery:
             device=config.device
         )
         self.updated = False
+        self.layer_id = layer_id
         
 class RetriveResult:
-    def __init__(self, config: ManagerConfig):
+    def __init__(self, config: ManagerConfig, layer_id: int):
         self.retrive_budget_per_seq = config.retrive_budget_per_seq
         self.page_table = torch.zeros(
             (config.max_bs, config.keys[0].shape[1], config.max_seq_len // config.page_size),
@@ -109,6 +110,7 @@ class RetriveResult:
             device=config.device
         )
         self.updated = False
+        self.layer_id = layer_id
         
     def copy_from(self, 
                   req_pool_indices: torch.Tensor, 
@@ -155,13 +157,14 @@ class CacheManager:
         self.start_retrive_event = [torch.cuda.Event(external=True) for _ in range(self.config.num_layers)]
         self.end_retrive_event = [torch.cuda.Event(external=True) for _ in range(self.config.num_layers)]
 
-        self.retrived_result = [RetriveResult(self.config) for _ in range(self.config.num_layers)]
-        self.retrived_query = [RetriveQuery(self.config) for _ in range(self.config.num_layers)]
+        self.retrived_result = [RetriveResult(self.config, layer_id) for layer_id in range(self.config.num_layers)]
+        self.retrived_query = [RetriveQuery(self.config, layer_id) for layer_id in range(self.config.num_layers)]
         
         self.accumlation_step = self.config.page_size
         self._retrive_cache_indices = None
         
     def init_cuda_graph(self):
+        return
         self.graph_runner = RetriveCudaGraphRunner(self.config, self.retrived_query, self.retrived_result, 
                                                    self._retrive_one_layer, self.stream, self.config.device)
         
@@ -211,6 +214,7 @@ class CacheManager:
                 top_k=self.config.top_k,
                 score=query.score,
                 selected_page_indices=query.selected_page_indices,
+                layer_id=query.layer_id,
             )
             result.copy_from(
                 req_pool_indices=query.req_pool_indices, 
