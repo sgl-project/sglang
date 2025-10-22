@@ -1495,7 +1495,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
         # TODO (csy): for preempted requests, we may want to insert into the tree
-        self.tree_cache.cache_finished_req(req, is_insert=False)
+        self.tree_cache.cache_finished_req(
+            req, is_insert=False, all_token_len=self.seq_lens_cpu[idx].item()
+        )
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)

@@ -335,9 +335,12 @@ class RadixCache(BasePrefixCache):
 
         return self._insert_helper(self.root_node, key, value)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, all_token_len: Optional[int] = None
+    ):
         """Cache request when it finishes."""
-        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        if all_token_len is None:
+            all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :all_token_len
