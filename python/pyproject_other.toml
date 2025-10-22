@@ -90,6 +90,14 @@ srt_npu = ["sglang[runtime_common]"]
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
 srt_hpu = ["sglang[runtime_common]"]
 
+# MUSA (Meta-computing Unified System Architecture) for Moore Threads
+# => base docker mthreads/vllm-dev:20251024, not from public vllm whl
+srt_musa = [
+    "sglang[runtime_common]",
+    "torch",
+    "torch_musa",
+]
+
 test = [
   "accelerate",
   "expecttest",
@@ -105,10 +113,12 @@ test = [
 all_hip = ["sglang[srt_hip]"]
 all_npu = ["sglang[srt_npu]"]
 all_hpu = ["sglang[srt_hpu]"]
+all_musa = ["sglang[srt_musa]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_npu = ["sglang[all_npu]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+dev_musa = ["sglang[all_musa]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

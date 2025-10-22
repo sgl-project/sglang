@@ -149,6 +149,24 @@ def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
 
+def is_musa() -> bool:
+    if getattr(is_musa, "_patched", False):
+        return hasattr(torch, "musa") and torch.cuda.is_available()
+
+    try:
+        import torch_musa
+    except ImportError:
+        setattr(is_musa, "_patched", False)
+        return False
+
+    torch.cuda.device_count = torch.musa.device_count
+    torch.cuda.get_device_capability = torch.musa.get_device_capability
+    torch.cuda.get_device_name = torch.musa.get_device_name
+    torch.cuda.is_available = torch.musa.is_available
+    setattr(is_musa, "_patched", True)
+    return hasattr(torch, "musa") and torch.cuda.is_available()
+
+
 def get_cuda_version():
     if torch.version.cuda:
         return tuple(map(int, torch.version.cuda.split(".")))
