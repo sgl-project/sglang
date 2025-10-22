@@ -24,7 +24,7 @@ Deterministic inference is only supported with the following three attention bac
 
 The following table shows feature compatibility for deterministic inference across different attention backends:
 
-| Attention Backend | CUDA Graph | Chunked Prefill | Radix Cache | Non-greedy Sampling |
+| Attention Backend | CUDA Graph | Chunked Prefill | Radix Cache | Non-greedy Sampling (Temp > 0) |
 |-------------------|------------|-----------------|-------------|---------------------|
 | **FlashInfer** | ✅ Yes | ✅ Yes | ❌ No | ✅ Yes |
 | **FlashAttention 3 (FA3)** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes |
