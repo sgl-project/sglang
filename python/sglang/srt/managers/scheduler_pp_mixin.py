@@ -205,7 +205,8 @@ class SchedulerPPMixin:
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
         self._pp_commit_comm_work(work=send_output_work)
         if mbs[next_mb_id] is not None:
-            with self.forward_stream_ctx:
+            with self.copy_stream_ctx:
+                self.copy_stream.wait_stream(self.default_stream)
                 batch_result = self._pp_prep_batch_result(
                     mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
                 )
@@ -223,6 +224,7 @@ class SchedulerPPMixin:
     ):
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
+                self.forward_stream.wait_stream(self.default_stream)
                 result = self.run_batch(self.cur_batch, pp_proxy_tensors)
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
