@@ -174,7 +174,11 @@ class FusedMoE(torch.nn.Module):
         self.expert_map_gpu = None
         # expert_mask A tensor of shape like expert_map, for example expert_mask = [0, 1, 1, 1, 1, 0]
         # expert_id from 1-3 is valid and will be processed, while expert_id==0, expert_id == 4 will be masked out
-        if _use_aiter and self.expert_map_cpu is not None:
+        if (
+            _use_aiter
+            and self.expert_map_cpu is not None
+            and not global_server_args_dict["disable_shared_experts_fusion"]
+        ):
             expert_mask = (
                 (self.expert_map_cpu >= 0) & (self.expert_map_cpu < self.num_experts)
             ).to(torch.int32)
