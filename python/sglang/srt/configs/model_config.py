@@ -17,7 +17,7 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -89,7 +89,6 @@ class ModelConfig:
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
-        modelopt_quant: Optional[Union[str, Dict]] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[
@@ -97,15 +96,19 @@ class ModelConfig:
         ] = None,  # TODO: remove this, it is not a model config
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
+        quantize_and_serve: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
-        self.modelopt_quant = modelopt_quant
         self.is_draft_model = is_draft_model
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
+        self.quantize_and_serve = quantize_and_serve
+
+        # Validate quantize_and_serve configuration
+        self._validate_quantize_and_serve_config()
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
@@ -219,10 +222,10 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
-            modelopt_quant=server_args.modelopt_quant,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
+            quantize_and_serve=server_args.quantize_and_serve,
             **kwargs,
         )
 
@@ -546,6 +549,56 @@ class ModelConfig:
         else:
             # Default to FP8 for backward compatibility
             return {"quant_method": "modelopt_fp8"}
+
+    def _is_already_quantized(self) -> bool:
+        """Check if the model is already quantized based on config files."""
+        # Check for HuggingFace quantization config
+        from sglang.srt.utils import has_hf_quant_config
+
+        return has_hf_quant_config(self.model_path)
+
+    def _get_modelopt_quant_type(self) -> str:
+        """Extract ModelOpt quantization type from unified quantization flag."""
+        if self.quantization == "modelopt_fp8":
+            return "fp8"
+        elif self.quantization == "modelopt_fp4":
+            return "nvfp4"
+        elif self.quantization == "modelopt":
+            # Auto-detect from model config
+            quant_cfg = self._parse_quant_hf_config()
+            if quant_cfg:
+                quant_method = quant_cfg.get("quant_method", "").lower()
+                if "fp4" in quant_method:
+                    return "fp4"
+                elif "fp8" in quant_method:
+                    return "fp8"
+            # Default to fp8 if can't detect
+            return "fp8"
+        else:
+            return "fp8"  # Default fallback
+
+    def _validate_quantize_and_serve_config(self):
+        """Validate quantize_and_serve configuration."""
+        if not self.quantize_and_serve:
+            return
+
+        # Check if ModelOpt quantization is specified
+        modelopt_quantization_specified = self.quantization in [
+            "modelopt",
+            "modelopt_fp8",
+            "modelopt_fp4",
+        ]
+
+        if not modelopt_quantization_specified:
+            raise ValueError("quantize_and_serve requires ModelOpt quantization")
+
+        # quantize_and_serve is disabled due to compatibility issues
+        raise NotImplementedError(
+            "quantize_and_serve functionality is currently disabled due to compatibility issues. "
+            "Please use the separate quantize-then-deploy workflow instead. "
+            "Step 1: Quantize and export model. "
+            "Step 2: Deploy the exported model."
+        )
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
