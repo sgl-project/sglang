@@ -42,6 +42,7 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 import uuid
 import warnings
 from collections import OrderedDict, defaultdict
@@ -55,6 +56,7 @@ from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -62,6 +64,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Sequence,
     Set,
     Tuple,
     TypeVar,
@@ -90,6 +93,9 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 
 logger = logging.getLogger(__name__)
 
@@ -452,7 +458,15 @@ def get_available_gpu_memory(
 
         if empty_cache:
             torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+        SHARED_SYSMEM_DEVICE_MEM_SMS = (87, 110, 121)  # Orin, Thor, Spark
+        if get_device_sm() in SHARED_SYSMEM_DEVICE_MEM_SMS:
+            # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
+            # only reports "free" memory, which can be lower than what is actually
+            # available due to not including cache memory. So we use the system available
+            # memory metric instead.
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
@@ -1068,7 +1082,7 @@ def monkey_patch_vllm_gguf_config():
 
     def get_quant_method_with_embedding_replaced(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         if isinstance(layer, LinearBase):
             return GGUFLinearMethod(self)
         elif isinstance(layer, VocabParallelEmbedding):
@@ -1948,7 +1962,9 @@ def direct_register_custom_op(
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
-        if "Tried to register an operator" in str(e) and "multiple times" in str(e):
+        if "Tried to register an operator" in str(error) and "multiple times" in str(
+            error
+        ):
             # Silently ignore duplicate registration errors
             # This can happen in multi-engine scenarios
             pass
