@@ -18,6 +18,28 @@ pub fn default_true() -> bool {
 }
 
 // ============================================================================
+// ID Generation
+// ============================================================================
+
+/// Generate a unique ID with a prefix (similar to OpenAI format)
+///
+/// Generates IDs in the format: `{prefix}_{hex_string}` where hex_string is
+/// 50 hex characters (25 random bytes).
+///
+/// Examples:
+/// - `generate_id("msg")` → "msg_1234567890ab..."
+/// - `generate_id("resp")` → "resp_5678abcdef..."
+pub fn generate_id(prefix: &str) -> String {
+    use rand::RngCore;
+    let mut rng = rand::rng();
+    // Generate exactly 50 hex characters (25 bytes) for the part after the underscore
+    let mut bytes = [0u8; 25];
+    rng.fill_bytes(&mut bytes);
+    let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("{}_{}", prefix, hex_string)
+}
+
+// ============================================================================
 // GenerationRequest Trait
 // ============================================================================
 

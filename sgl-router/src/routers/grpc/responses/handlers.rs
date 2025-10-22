@@ -22,7 +22,6 @@ use serde_json::json;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
-use uuid::Uuid;
 
 use super::{
     conversions,
@@ -37,6 +36,7 @@ use crate::{
     },
     protocols::{
         chat::ChatCompletionStreamResponse,
+        common::generate_id,
         responses::{
             ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
             ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
@@ -306,7 +306,7 @@ async fn route_responses_background(
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 ) -> Response {
     // Generate response_id for background tracking
-    let response_id = format!("resp_{}", Uuid::new_v4());
+    let response_id = generate_id("resp");
 
     // Get current timestamp
     let created_at = SystemTime::now()
@@ -621,7 +621,7 @@ async fn process_and_transform_sse_stream(
     let mut accumulator = StreamingResponseAccumulator::new(&original_request);
 
     // Create event emitter for OpenAI-compatible streaming
-    let response_id = format!("resp_{}", Uuid::new_v4());
+    let response_id = generate_id("resp");
     let model = original_request
         .model
         .clone()
@@ -1076,8 +1076,7 @@ async fn load_conversation_history(
                     ResponseInput::Items(current_items) => {
                         // Process all item types, converting SimpleInputMessage to Message
                         for item in current_items.iter() {
-                            let normalized =
-                                crate::protocols::responses::normalize_input_item(item);
+                            let normalized = crate::protocols::responses::normalize_input_item(item);
                             items.push(normalized);
                         }
                     }

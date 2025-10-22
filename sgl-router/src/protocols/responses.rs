@@ -8,7 +8,7 @@ use serde_json::Value;
 
 // Import shared types from common module
 use super::common::{
-    default_true, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo, StringOrArray, ToolChoice,
+    default_true, generate_id, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo, StringOrArray, ToolChoice,
     UsageInfo,
 };
 
@@ -706,16 +706,8 @@ pub fn normalize_input_item(item: &ResponseInputOutputItem) -> ResponseInputOutp
                 StringOrContentArray::Array(parts) => parts.clone(),
             };
 
-            // Generate unique ID using centralized pattern with "msg" prefix
-            use rand::RngCore;
-            let mut rng = rand::rng();
-            let mut bytes = [0u8; 25];
-            rng.fill_bytes(&mut bytes);
-            let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-            let id = format!("msg_{}", hex_string);
-
             ResponseInputOutputItem::Message {
-                id,
+                id: generate_id("msg"),
                 role: role.clone(),
                 content: content_vec,
                 status: Some("completed".to_string()),
