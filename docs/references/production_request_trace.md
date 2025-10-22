@@ -22,6 +22,9 @@ This section explains how to configure the request tracing and export the trace 
 
 3. start your SGLang server with tracing enabled
     ```bash
+    # set env variables
+    export SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS=500
+    export SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE=64
     # start the prefill and decode server
     python -m sglang.launch_server --enable-trace --otlp-traces-endpoint 0.0.0.0:4317 <other option>
     # start the mini lb
