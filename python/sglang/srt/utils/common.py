@@ -2411,6 +2411,29 @@ def retry(
             time.sleep(delay)
 
 
+def has_hf_quant_config(model_path: str) -> bool:
+    """Check if the model path contains hf_quant_config.json file.
+
+    Args:
+        model_path: Path to the model, can be local path or remote URL.
+
+    Returns:
+        True if hf_quant_config.json exists, False otherwise.
+    """
+    if is_remote_url(model_path):
+        try:
+            from huggingface_hub import HfApi
+
+            hf_api = HfApi()
+            return hf_api.file_exists(model_path, "hf_quant_config.json")
+        except Exception:
+            return False
+    else:
+        import os
+
+        return os.path.exists(os.path.join(model_path, "hf_quant_config.json"))
+
+
 def flatten_nested_list(nested_list):
     if isinstance(nested_list, list):
         return [
