@@ -533,16 +533,13 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
-    def forward_deepep(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
+    def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
-            if not SboFlags.fuse_shared_experts_inside_sbo():
-                shared_output = self._forward_shared_experts(hidden_states)
-            topk_weights, topk_idx, _ = self.topk(
+            router_logits, _ = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
+            topk_output = self.topk(
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
@@ -551,33 +548,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 ),
             )
         else:
-            topk_weights, topk_idx, _ = self.topk.empty_topk_output(
-                hidden_states.device
-            )
-
-        final_hidden_states, sbo_shared_output = single_batch_overlap.execute_sbo(
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+        final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            forward_batch=forward_batch,
-            # SBO args
-            forward_shared_experts=lambda: self._forward_shared_experts(hidden_states),
-            experts=self.experts,
-            alt_stream=self.alt_stream,
+            topk_output=topk_output,
         )
-        if sbo_shared_output is not None:
-            shared_output = sbo_shared_output
 
         if shared_output is not None:
-            x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
-                x.add_(final_hidden_states)
-            else:
-                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        else:
-            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
-                final_hidden_states *= self.routed_scaling_factor
+            final_hidden_states.add_(shared_output)
 
         return final_hidden_states
 
