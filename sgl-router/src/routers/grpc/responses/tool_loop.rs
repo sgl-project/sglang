@@ -411,6 +411,28 @@ pub(super) async fn execute_tool_loop(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
+                ResponseInput::SimpleItems(simple_items) => {
+                    // Convert SimpleItems to full Items format
+                    simple_items
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, item)| {
+                            use crate::protocols::responses::StringOrContentArray;
+                            let content = match &item.content {
+                                StringOrContentArray::String(s) => {
+                                    vec![ResponseContentPart::InputText { text: s.clone() }]
+                                }
+                                StringOrContentArray::Array(parts) => parts.clone(),
+                            };
+                            ResponseInputOutputItem::Message {
+                                id: format!("msg_{}_{}", state.iteration, idx),
+                                role: item.role.clone(),
+                                content,
+                                status: Some("completed".to_string()),
+                            }
+                        })
+                        .collect()
+                }
                 ResponseInput::Items(items) => items.clone(),
             };
 
@@ -864,6 +886,28 @@ async fn execute_tool_loop_streaming_internal(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
+                ResponseInput::SimpleItems(simple_items) => {
+                    // Convert SimpleItems to full Items format
+                    simple_items
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, item)| {
+                            use crate::protocols::responses::StringOrContentArray;
+                            let content = match &item.content {
+                                StringOrContentArray::String(s) => {
+                                    vec![ResponseContentPart::InputText { text: s.clone() }]
+                                }
+                                StringOrContentArray::Array(parts) => parts.clone(),
+                            };
+                            ResponseInputOutputItem::Message {
+                                id: format!("msg_u_{}_{}", state.iteration, idx),
+                                role: item.role.clone(),
+                                content,
+                                status: Some("completed".to_string()),
+                            }
+                        })
+                        .collect()
+                }
                 ResponseInput::Items(items) => items.clone(),
             };
 
