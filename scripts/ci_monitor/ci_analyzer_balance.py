@@ -129,30 +129,36 @@ class SGLangTestBalanceAnalyzer:
                 estimated = int(estimated_str)
                 gap = elapsed - estimated
 
-                if self._is_abnormal_test_data(elapsed, estimated, log_content, filename):
+                if self._is_abnormal_test_data(
+                    elapsed, estimated, log_content, filename
+                ):
                     filtered_count += 1
                     continue
 
-                test_times.append({
-                    "filename": filename,
-                    "elapsed": elapsed,
-                    "estimated": estimated,
-                    "gap": gap
-                })
+                test_times.append(
+                    {
+                        "filename": filename,
+                        "elapsed": elapsed,
+                        "estimated": estimated,
+                        "gap": gap,
+                    }
+                )
             except ValueError:
                 continue
 
         return test_times
 
-    def _is_abnormal_test_data(self, elapsed: int, estimated: int, log_content: str, filename: str) -> bool:
-        
+    def _is_abnormal_test_data(
+        self, elapsed: int, estimated: int, log_content: str, filename: str
+    ) -> bool:
+
         if elapsed >= estimated * 3:
             return True
-        
+
         gap = elapsed - estimated
         if gap >= estimated * 2:
             return True
-        
+
         retry_indicators = [
             "retry",
             "timeout",
@@ -160,47 +166,49 @@ class SGLangTestBalanceAnalyzer:
             "error",
             "exception",
             "killed",
-            "terminated"
+            "terminated",
         ]
-        
+
         log_lower = log_content.lower()
         retry_count = sum(1 for indicator in retry_indicators if indicator in log_lower)
-        
+
         if retry_count >= 2 and elapsed > estimated * 1.5:
             return True
-        
+
         timeout_patterns = [
             "timeout",
             "timed out",
             "killed by timeout",
-            "process killed"
+            "process killed",
         ]
-        
+
         for pattern in timeout_patterns:
             if pattern in log_lower and elapsed > estimated * 1.5:
                 return True
-        
+
         return False
 
     def collect_test_balance_data(self, runs: List[Dict]) -> Dict[str, Dict]:
         print("Starting test balance data collection...")
 
-        test_gaps = defaultdict(lambda: {
-            "max_gap": 0,
-            "max_elapsed": 0,
-            "max_estimated": 0,
-            "max_gap_run_info": {},
-            "total_runs": 0,
-            "all_gaps": []
-        })
-        
+        test_gaps = defaultdict(
+            lambda: {
+                "max_gap": 0,
+                "max_elapsed": 0,
+                "max_estimated": 0,
+                "max_gap_run_info": {},
+                "total_runs": 0,
+                "all_gaps": [],
+            }
+        )
+
         total_tests_parsed = 0
         abnormal_tests_filtered = 0
 
         target_job_prefixes = [
             "unit-test-frontend",
             "unit-test-backend-1-gpu",
-            "unit-test-backend-2-gpu", 
+            "unit-test-backend-2-gpu",
             "unit-test-backend-4-gpu",
             "unit-test-backend-8-gpu-h200",
             "unit-test-backend-8-gpu-h20",
@@ -213,7 +221,7 @@ class SGLangTestBalanceAnalyzer:
             "performance-test-1-gpu-part-3",
             "performance-test-2-gpu",
             "accuracy-test-1-gpu",
-            "accuracy-test-2-gpu"
+            "accuracy-test-2-gpu",
         ]
 
         total_runs = len(runs)
@@ -240,27 +248,27 @@ class SGLangTestBalanceAnalyzer:
                 run_info["pr_number"] = pull_requests[0].get("number")
 
             all_jobs = self.get_all_jobs_for_run(run.get("id"))
-            
+
             for job in all_jobs:
                 job_name = job.get("name", "")
                 job_id = job.get("id")
-                
+
                 matches_prefix = False
                 for prefix in target_job_prefixes:
                     if job_name.startswith(prefix):
                         matches_prefix = True
                         break
-                
+
                 if not matches_prefix:
                     continue
-                
+
                 logs = self.get_job_logs_by_id(job_id)
                 if not logs:
                     continue
 
                 test_times = self.parse_test_times(logs)
                 total_tests_parsed += len(test_times)
-                
+
                 for test_data in test_times:
                     filename = test_data["filename"]
                     elapsed = test_data["elapsed"]
@@ -278,60 +286,80 @@ class SGLangTestBalanceAnalyzer:
                         test_stats["max_gap_run_info"] = {
                             **run_info,
                             "job_name": job_name,
-                            "job_url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}/job/{job_id}"
+                            "job_url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}/job/{job_id}",
                         }
 
             time.sleep(0.1)
 
         return dict(test_gaps)
 
-    def generate_balance_report(self, test_data: Dict[str, Dict], output_file: str = "test_balance_report.json"):
+    def generate_balance_report(
+        self, test_data: Dict[str, Dict], output_file: str = "test_balance_report.json"
+    ):
         print("\n" + "=" * 80)
         print("SGLang Test Balance Analysis Report (PR Test GPU Jobs)")
         print("=" * 80)
 
         sorted_tests = sorted(
-            test_data.items(), 
-            key=lambda x: x[1]["max_gap"], 
-            reverse=True
+            test_data.items(), key=lambda x: x[1]["max_gap"], reverse=True
         )
 
         print(f"\nTotal tests analyzed: {len(sorted_tests)}")
-        print(f"Tests with significant gaps (>100s): {len([t for t in sorted_tests if t[1]['max_gap'] > 100])}")
-        print(f"Tests with large gaps (>300s): {len([t for t in sorted_tests if t[1]['max_gap'] > 300])}")
-        print(f"Note: Abnormal test data (due to failures/retries) has been filtered out")
+        print(
+            f"Tests with significant gaps (>100s): {len([t for t in sorted_tests if t[1]['max_gap'] > 100])}"
+        )
+        print(
+            f"Tests with large gaps (>300s): {len([t for t in sorted_tests if t[1]['max_gap'] > 300])}"
+        )
+        print(
+            f"Note: Abnormal test data (due to failures/retries) has been filtered out"
+        )
 
         report_data = {
             "summary": {
                 "total_tests": len(sorted_tests),
-                "tests_with_gaps_over_100s": len([t for t in sorted_tests if t[1]['max_gap'] > 100]),
-                "tests_with_gaps_over_300s": len([t for t in sorted_tests if t[1]['max_gap'] > 300]),
-                "analysis_timestamp": datetime.now().isoformat()
+                "tests_with_gaps_over_100s": len(
+                    [t for t in sorted_tests if t[1]["max_gap"] > 100]
+                ),
+                "tests_with_gaps_over_300s": len(
+                    [t for t in sorted_tests if t[1]["max_gap"] > 300]
+                ),
+                "analysis_timestamp": datetime.now().isoformat(),
             },
-            "test_balance_table": []
+            "test_balance_table": [],
         }
 
         print(f"\nTop 50 PR Test GPU Jobs with Largest Time Gaps:")
         print("-" * 100)
-        print(f"{'Rank':<4} {'Test File':<40} {'Max Gap':<8} {'Max Elapsed':<12} {'Max Estimated':<15} {'Job Name':<25}")
+        print(
+            f"{'Rank':<4} {'Test File':<40} {'Max Gap':<8} {'Max Elapsed':<12} {'Max Estimated':<15} {'Job Name':<25}"
+        )
         print("-" * 100)
 
         for i, (filename, stats) in enumerate(sorted_tests[:50], 1):
             test_name = filename.split("/")[-1] if "/" in filename else filename
-            job_name = stats["max_gap_run_info"].get("job_name", "Unknown") if stats["max_gap_run_info"] else "Unknown"
-            
-            print(f"{i:<4} {test_name:<40} {stats['max_gap']:<8} {stats['max_elapsed']:<12} {stats['max_estimated']:<15} {job_name:<25}")
-            
-            report_data["test_balance_table"].append({
-                "rank": i,
-                "filename": filename,
-                "test_name": test_name,
-                "max_gap": stats["max_gap"],
-                "max_elapsed": stats["max_elapsed"],
-                "max_estimated": stats["max_estimated"],
-                "max_gap_run_info": stats["max_gap_run_info"],
-                "total_runs": stats["total_runs"]
-            })
+            job_name = (
+                stats["max_gap_run_info"].get("job_name", "Unknown")
+                if stats["max_gap_run_info"]
+                else "Unknown"
+            )
+
+            print(
+                f"{i:<4} {test_name:<40} {stats['max_gap']:<8} {stats['max_elapsed']:<12} {stats['max_estimated']:<15} {job_name:<25}"
+            )
+
+            report_data["test_balance_table"].append(
+                {
+                    "rank": i,
+                    "filename": filename,
+                    "test_name": test_name,
+                    "max_gap": stats["max_gap"],
+                    "max_elapsed": stats["max_elapsed"],
+                    "max_estimated": stats["max_estimated"],
+                    "max_gap_run_info": stats["max_gap_run_info"],
+                    "total_runs": stats["total_runs"],
+                }
+            )
 
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(report_data, f, ensure_ascii=False, indent=2)
@@ -349,34 +377,56 @@ class SGLangTestBalanceAnalyzer:
             print("Generating GitHub Actions summary for Test Balance Analysis...")
 
             summary_lines = []
-            summary_lines.append("# SGLang Test Balance Analysis Report (PR Test GPU Jobs)")
+            summary_lines.append(
+                "# SGLang Test Balance Analysis Report (PR Test GPU Jobs)"
+            )
             summary_lines.append("")
-            summary_lines.append(f"**Analysis Timestamp:** {report_data['summary']['analysis_timestamp']}")
+            summary_lines.append(
+                f"**Analysis Timestamp:** {report_data['summary']['analysis_timestamp']}"
+            )
             summary_lines.append("")
 
             summary_lines.append("## Summary Statistics")
             summary_lines.append("")
             summary_lines.append("| Metric | Count |")
             summary_lines.append("|--------|-------|")
-            summary_lines.append(f"| Total Tests Analyzed | {report_data['summary']['total_tests']} |")
-            summary_lines.append(f"| Tests with Gaps > 100s | {report_data['summary']['tests_with_gaps_over_100s']} |")
-            summary_lines.append(f"| Tests with Gaps > 300s | {report_data['summary']['tests_with_gaps_over_300s']} |")
+            summary_lines.append(
+                f"| Total Tests Analyzed | {report_data['summary']['total_tests']} |"
+            )
+            summary_lines.append(
+                f"| Tests with Gaps > 100s | {report_data['summary']['tests_with_gaps_over_100s']} |"
+            )
+            summary_lines.append(
+                f"| Tests with Gaps > 300s | {report_data['summary']['tests_with_gaps_over_300s']} |"
+            )
             summary_lines.append("")
 
             summary_lines.append("## Top 30 PR Test GPU Jobs with Largest Time Gaps")
             summary_lines.append("")
-            summary_lines.append("| Rank | Test File | Max Gap (s) | Max Elapsed (s) | Max Estimated (s) | Job Name | Job Link | Total Runs |")
-            summary_lines.append("|------|-----------|-------------|----------------|------------------|---------|----------|------------|")
+            summary_lines.append(
+                "| Rank | Test File | Max Gap (s) | Max Elapsed (s) | Max Estimated (s) | Job Name | Job Link | Total Runs |"
+            )
+            summary_lines.append(
+                "|------|-----------|-------------|----------------|------------------|---------|----------|------------|"
+            )
 
             for test in report_data["test_balance_table"][:30]:
                 test_name = test["test_name"]
                 if len(test_name) > 30:
                     test_name = test_name[:27] + "..."
-                
-                job_name = test["max_gap_run_info"].get("job_name", "Unknown") if test["max_gap_run_info"] else "Unknown"
-                job_url = test["max_gap_run_info"].get("job_url", "") if test["max_gap_run_info"] else ""
+
+                job_name = (
+                    test["max_gap_run_info"].get("job_name", "Unknown")
+                    if test["max_gap_run_info"]
+                    else "Unknown"
+                )
+                job_url = (
+                    test["max_gap_run_info"].get("job_url", "")
+                    if test["max_gap_run_info"]
+                    else ""
+                )
                 job_link = f"[{job_name}]({job_url})" if job_url else job_name
-                
+
                 summary_lines.append(
                     f"| {test['rank']} | `{test_name}` | {test['max_gap']} | {test['max_elapsed']} | {test['max_estimated']} | {job_link} | {test['total_runs']} |"
                 )
@@ -384,19 +434,25 @@ class SGLangTestBalanceAnalyzer:
             summary_lines.append("")
             summary_lines.append("## Recommendations")
             summary_lines.append("")
-            summary_lines.append("Based on the analysis above, consider adjusting estimated times for tests with large gaps:")
+            summary_lines.append(
+                "Based on the analysis above, consider adjusting estimated times for tests with large gaps:"
+            )
             summary_lines.append("")
-            
+
             top_5_tests = report_data["test_balance_table"][:5]
             for test in top_5_tests:
                 test_name = test["test_name"]
                 if len(test_name) > 40:
                     test_name = test_name[:37] + "..."
                 suggested_estimated = test["max_elapsed"] + 50
-                summary_lines.append(f"- **{test_name}**: Current max elapsed: {test['max_elapsed']}s, suggested estimated: {suggested_estimated}s")
-            
+                summary_lines.append(
+                    f"- **{test_name}**: Current max elapsed: {test['max_elapsed']}s, suggested estimated: {suggested_estimated}s"
+                )
+
             summary_lines.append("")
-            summary_lines.append("Set estimated times to be slightly higher than the maximum observed elapsed time to avoid CI timeouts.")
+            summary_lines.append(
+                "Set estimated times to be slightly higher than the maximum observed elapsed time to avoid CI timeouts."
+            )
 
             with open(github_step_summary, "w", encoding="utf-8") as f:
                 f.write("\n".join(summary_lines))
@@ -406,33 +462,54 @@ class SGLangTestBalanceAnalyzer:
         except Exception as e:
             print(f"Failed to generate GitHub Actions summary: {e}")
 
-    def save_csv_report(self, report_data: Dict, output_file: str = "test_balance_report.csv"):
+    def save_csv_report(
+        self, report_data: Dict, output_file: str = "test_balance_report.csv"
+    ):
         import csv
-        
+
         with open(output_file, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            
-            writer.writerow([
-                "Rank", "Test File", "Test Name", "Max Gap (s)", "Max Elapsed (s)", 
-                "Max Estimated (s)", "Job Name", "Max Gap Job URL", "Total Runs"
-            ])
-            
+
+            writer.writerow(
+                [
+                    "Rank",
+                    "Test File",
+                    "Test Name",
+                    "Max Gap (s)",
+                    "Max Elapsed (s)",
+                    "Max Estimated (s)",
+                    "Job Name",
+                    "Max Gap Job URL",
+                    "Total Runs",
+                ]
+            )
+
             for test in report_data["test_balance_table"]:
-                max_job_url = test["max_gap_run_info"].get("job_url", "") if test["max_gap_run_info"] else ""
-                job_name = test["max_gap_run_info"].get("job_name", "Unknown") if test["max_gap_run_info"] else "Unknown"
-                
-                writer.writerow([
-                    test["rank"],
-                    test["filename"],
-                    test["test_name"],
-                    test["max_gap"],
-                    test["max_elapsed"],
-                    test["max_estimated"],
-                    job_name,
-                    max_job_url,
-                    test["total_runs"]
-                ])
-        
+                max_job_url = (
+                    test["max_gap_run_info"].get("job_url", "")
+                    if test["max_gap_run_info"]
+                    else ""
+                )
+                job_name = (
+                    test["max_gap_run_info"].get("job_name", "Unknown")
+                    if test["max_gap_run_info"]
+                    else "Unknown"
+                )
+
+                writer.writerow(
+                    [
+                        test["rank"],
+                        test["filename"],
+                        test["test_name"],
+                        test["max_gap"],
+                        test["max_elapsed"],
+                        test["max_estimated"],
+                        job_name,
+                        max_job_url,
+                        test["total_runs"],
+                    ]
+                )
+
         print(f"CSV report saved to: {output_file}")
 
 
@@ -478,6 +555,7 @@ def main():
     except Exception as e:
         print(f"Error during analysis: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 

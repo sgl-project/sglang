@@ -64,7 +64,9 @@ class SGLangCIAnalyzer:
         return all_runs[:limit]
 
     def analyze_ci_failures(self, runs: List[Dict]) -> Dict:
-        print("Analyzing CI failure data (pr-test.yml, vllm-dependency-test.yml, nightly-test.yml jobs only)...")
+        print(
+            "Analyzing CI failure data (pr-test.yml, vllm-dependency-test.yml, nightly-test.yml jobs only)..."
+        )
 
         job_categories = {
             "build": [
@@ -185,7 +187,7 @@ class SGLangCIAnalyzer:
                     "nightly-test-perf-vlms",
                     "nightly-test-1-gpu",
                 ]
-                
+
                 if job_name in target_jobs:
                     if job_conclusion == "success":
                         stats["job_last_success"][job_name] = {
@@ -386,7 +388,9 @@ class SGLangCIAnalyzer:
             print("📊 Generating GitHub Actions summary for CI Analysis...")
 
             summary_lines = []
-            summary_lines.append("# 🔍 SGLang CI Analysis Report (Target Workflows Only)")
+            summary_lines.append(
+                "# 🔍 SGLang CI Analysis Report (Target Workflows Only)"
+            )
             summary_lines.append("")
 
             total = stats["total_runs"]
