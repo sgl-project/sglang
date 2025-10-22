@@ -3,10 +3,9 @@
 ## Why Deterministic Inference Matters
 
 Deterministic inference ensures consistent LLM outputs across runs, which is critical for:
-- **Reinforcement Learning**: Prevents on-policy RL from becoming off-policy
+- **Reinforcement Learning**: Ensures consistent logprobs across runs, reducing stochastic noise and making RL training more stable, reproducible, and debuggable.
 - **Testing & Debugging**: Enables reproducible validation
 - **Production**: Improves reliability and user experience
-- **Research**: Ensures experimental reproducibility
 
 Even with `temperature=0`, standard LLM inference can produce different outputs due to dynamic batching and varying reduction orders in GPU kernels.
 
@@ -17,7 +16,7 @@ The main source is **varying batch sizes**. Different batch sizes cause GPU kern
 
 ## SGLang's Solution
 
-Building on work from [Thinking Machines Lab](https://github.com/thinking-machines-lab/batch_invariant_ops), SGLang provides deterministic LLM inference through batch-invariant kernels.
+Building on [Thinking Machines Lab's batch-invariant operators](https://github.com/thinking-machines-lab/batch_invariant_ops), SGLang achieves fully deterministic inference while maintaining compatibility with chunked prefill, CUDA graphs, radix cache, and non-greedy sampling. With CUDA graphs, SGLang delivers 2.8x acceleration and reduces performance overhead to just 34.35% (vs. TML's 61.5%). 
 
 ### Supported Backends
 
@@ -27,12 +26,6 @@ Deterministic inference is supported on the following attention backends:
 - **Triton**
 
 ## Usage
-
-### Requirements
-
-```bash
-pip install "sglang[all]>=0.5.3"
-```
 
 ### Basic Usage
 
