@@ -2339,7 +2339,7 @@ class ModelRunner:
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self)
             worker.update_weights_from_ipc(recv_req.zmq_handles)
             return True, "IPC weight update completed successfully"
-        except ImportError as e :
+        except ImportError as e:
             return False, f"IPC weight update failed: ImportError {e}"
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
