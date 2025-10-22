@@ -200,6 +200,8 @@ def get_config(
         )
         if "deepseek-ai/DeepSeek-OCR" in model:
             config.model_type = "deepseek-ocr"
+            # Due to an unknown reason, Hugging Face’s AutoConfig mistakenly recognizes the configuration of deepseek-ocr as deepseekvl2.
+            # This is a temporary workaround and will require further optimization.
 
     except ValueError as e:
         if not "deepseek_v32" in str(e):

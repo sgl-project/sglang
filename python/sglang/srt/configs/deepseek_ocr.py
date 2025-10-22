@@ -1,17 +1,8 @@
-import math
-from typing import List, Tuple
+from typing import Tuple
 
-import torch
 import torchvision.transforms as T
-from PIL import Image, ImageOps
-from transformers import (
-    AutoTokenizer,
-    LlamaTokenizerFast,
-    PretrainedConfig,
-    ProcessorMixin,
-)
-
-from sglang.srt.configs.utils import register_image_processor, register_processor
+from PIL import Image
+from transformers import PretrainedConfig
 
 BASE_SIZE = 1024
 IMAGE_SIZE = 640
@@ -24,15 +15,8 @@ PRINT_NUM_VIS_TOKENS = False
 SKIP_REPEAT = True
 MODEL_PATH = "deepseek-ai/DeepSeek-OCR"  # change to your model path
 
-# TODO: change INPUT_PATH
-# .pdf: run_dpsk_ocr_pdf.py;
-# .jpg, .png, .jpeg: run_dpsk_ocr_image.py;
-# Omnidocbench images path: run_dpsk_ocr_eval_batch.py
-
-INPUT_PATH = ""
-OUTPUT_PATH = ""
-
 PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
+
 
 class ImageTransform:
 
