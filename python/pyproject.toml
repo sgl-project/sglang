@@ -13,6 +13,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: Apache Software License",
 ]
+
 dependencies = [
   "IPython",
   "aiohttp",
@@ -21,10 +22,11 @@ dependencies = [
   "build",
   "compressed-tensors",
   "cuda-python",
+  "decord2",
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.4.0",
+  "flashinfer_python==0.4.1",
   "hf_transfer",
   "huggingface_hub",
   "interegular",
@@ -53,12 +55,12 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.15",
+  "sgl-kernel==0.3.16.post3",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
   "torch==2.8.0",
-  "torch_memory_saver==0.0.9rc2",
+  "torch_memory_saver==0.0.9",
   "torchao==0.9.0",
   "torchaudio==2.8.0",
   "torchvision",
@@ -73,7 +75,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-decord = ["decord2"]
+modelopt = ["nvidia-modelopt"]
 test = [
   "accelerate",
   "expecttest",
@@ -86,13 +88,10 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
-tracing = [
-  "opentelemetry-api",
-  "opentelemetry-exporter-otlp",
-  "opentelemetry-exporter-otlp-proto-grpc",
-  "opentelemetry-sdk",
-]
-all = ["sglang[test]", "sglang[decord]"]
+all = []
+dev = ["sglang[test]"]
+
+# Temporary tags
 cu130 = [
   "torch==2.9.0",
   "torchaudio==2.9.0",
@@ -103,14 +102,16 @@ cu130_all = [
   "sglang[decord]",
   "sglang[cu130]"
 ]
+tracing = [
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
+]
 
-
-# The following will be deprecated in 2 weeks
-dev = ["sglang[test]", "sglang[decord]"]
-all_aarch64 = ["sglang[test]"]
-blackwell = ["sglang[test]", "sglang[decord]"]
-blackwell_aarch64 = ["sglang[test]"]
-
+# To be deprecated in 2 weeks
+blackwell = ["sglang[dev]"]
+blackwell_aarch64 = ["sglang[dev]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

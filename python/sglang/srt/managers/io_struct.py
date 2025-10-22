@@ -39,6 +39,7 @@ else:
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -52,6 +53,7 @@ class BaseReq(ABC):
 @dataclass
 class BaseBatchReq(ABC):
     rids: Optional[List[str]] = field(default=None, kw_only=True)
+    http_worker_ipcs: Optional[List[str]] = field(default=None, kw_only=True)
 
     def regenerate_rids(self):
         """Generate new request IDs and return them."""
@@ -879,6 +881,8 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    return_bytes: List[bool]
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1403,18 +1407,6 @@ class LoRAUpdateOutput(BaseReq):
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateOutput
-
-
-@dataclass
-class MultiTokenizerRegisterReq(BaseBatchReq):
-    ipc_name: Optional[str] = None
-
-
-@dataclass
-class MultiTokenizerWrapper:
-    # FIXME(lsyin): remove this
-    worker_id: int
-    obj: Optional[Any] = None
 
 
 class BlockReqType(Enum):
