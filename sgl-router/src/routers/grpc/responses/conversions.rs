@@ -199,7 +199,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
 
     Ok(ChatCompletionRequest {
         messages,
-        model: req.model.clone().unwrap_or_else(|| "default".to_string()),
+        model: req.model.clone(),
         temperature: req.temperature,
         max_completion_tokens: req.max_output_tokens,
         stream: is_streaming,
@@ -361,7 +361,7 @@ mod tests {
         let req = ResponsesRequest {
             input: ResponseInput::Text("Hello, world!".to_string()),
             instructions: Some("You are a helpful assistant.".to_string()),
-            model: Some("gpt-4".to_string()),
+            model: "gpt-4".to_string(),
             temperature: Some(0.7),
             ..Default::default()
         };
