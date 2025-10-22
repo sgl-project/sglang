@@ -8,8 +8,8 @@ use serde_json::Value;
 
 // Import shared types from common module
 use super::common::{
-    default_true, generate_id, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo, StringOrArray, ToolChoice,
-    UsageInfo,
+    default_true, generate_id, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo,
+    StringOrArray, ToolChoice, UsageInfo,
 };
 
 // ============================================================================

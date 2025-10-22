@@ -98,9 +98,8 @@ impl OutputIndexMapper {
 // ============================================================================
 
 // Re-export generate_id from protocols::common for backward compatibility
-pub use crate::protocols::common::generate_id;
-
 // ============================================================================
 // Re-export FunctionCallInProgress from mcp module
 // ============================================================================
 pub(crate) use super::mcp::FunctionCallInProgress;
+pub use crate::protocols::common::generate_id;

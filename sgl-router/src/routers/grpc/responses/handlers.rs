@@ -1076,7 +1076,8 @@ async fn load_conversation_history(
                     ResponseInput::Items(current_items) => {
                         // Process all item types, converting SimpleInputMessage to Message
                         for item in current_items.iter() {
-                            let normalized = crate::protocols::responses::normalize_input_item(item);
+                            let normalized =
+                                crate::protocols::responses::normalize_input_item(item);
                             items.push(normalized);
                         }
                     }

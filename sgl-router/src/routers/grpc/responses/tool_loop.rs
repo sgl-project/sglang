@@ -16,7 +16,6 @@ use serde_json::json;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
-use uuid::Uuid;
 
 use super::{
     conversions,
@@ -32,7 +31,7 @@ use crate::{
     mcp::McpClientManager,
     protocols::{
         chat::ChatCompletionResponse,
-        common::{Tool, ToolChoice, ToolChoiceValue},
+        common::{generate_id, Tool, ToolChoice, ToolChoiceValue},
         responses::{
             McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
             ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest,
@@ -215,11 +214,6 @@ impl ToolLoopState {
 // MCP Metadata Builders
 // ============================================================================
 
-/// Generate unique ID for MCP items
-fn generate_mcp_id(prefix: &str) -> String {
-    format!("{}_{}", prefix, Uuid::new_v4())
-}
-
 /// Build mcp_list_tools output item
 fn build_mcp_list_tools_item(
     mcp: &Arc<McpClientManager>,
@@ -245,7 +239,7 @@ fn build_mcp_list_tools_item(
         .collect();
 
     ResponseOutputItem::McpListTools {
-        id: generate_mcp_id("mcpl"),
+        id: generate_id("mcpl"),
         server_label: server_label.to_string(),
         tools: tools_info,
     }
@@ -261,7 +255,7 @@ fn build_mcp_call_item(
     error: Option<&str>,
 ) -> ResponseOutputItem {
     ResponseOutputItem::McpCall {
-        id: generate_mcp_id("mcp"),
+        id: generate_id("mcp"),
         status: if success { "completed" } else { "failed" }.to_string(),
         approval_request_id: None,
         arguments: arguments.to_string(),
@@ -613,7 +607,7 @@ async fn execute_tool_loop_streaming_internal(
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Create response event emitter
-    let response_id = format!("resp_{}", Uuid::new_v4());
+    let response_id = generate_id("resp");
     let model = current_request
         .model
         .clone()
