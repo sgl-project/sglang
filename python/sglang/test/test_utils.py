@@ -16,7 +16,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
@@ -126,7 +126,12 @@ def is_in_ci():
 
 def is_in_amd_ci():
     """Return whether it is in an AMD CI runner."""
-    return get_bool_env_var("SGLANG_AMD_CI")
+    return get_bool_env_var("SGLANG_IS_IN_CI_AMD")
+
+
+def is_blackwell_system():
+    """Return whether it is running on a Blackwell (B200) system."""
+    return get_bool_env_var("IS_BLACKWELL")
 
 
 def _use_cached_default_models(model_repo: str):
@@ -149,6 +154,9 @@ else:
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+
+if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
 
 
@@ -1622,6 +1630,9 @@ class CustomTestCase(unittest.TestCase):
             max_retry=max_retry,
         )
 
+    def setUp(self):
+        print(f"[Test Method] {self._testMethodName}", flush=True)
+
 
 def dump_bench_raw_result(
     path: str,
@@ -1807,3 +1818,33 @@ def write_results_to_json(model, metrics, mode="a"):
 
     with open("results.json", "w") as f:
         json.dump(existing_results, f, indent=2)
+
+
+def intel_amx_benchmark(extra_args=None, min_throughput=None):
+    def decorator(test_func):
+        @wraps(test_func)
+        def wrapper(self):
+            common_args = [
+                "--attention-backend",
+                "intel_amx",
+                "--disable-radix",
+                "--trust-remote-code",
+            ]
+            full_args = common_args + (extra_args or [])
+
+            model = test_func(self)
+            prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
+                model, full_args
+            )
+
+            print(f"{model=}")
+            print(f"{prefill_latency=}")
+            print(f"{decode_throughput=}")
+            print(f"{decode_latency=}")
+
+            if is_in_ci() and min_throughput is not None:
+                self.assertGreater(decode_throughput, min_throughput)
+
+        return wrapper
+
+    return decorator
