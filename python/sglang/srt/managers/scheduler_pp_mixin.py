@@ -632,7 +632,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if mbs[next_mb_id] is not None:
-                    # d2h_event.synchronize()
+                    d2h_event.synchronize()
                     self._pp_process_batch_result(
                         mbs[next_mb_id],
                         next_batch_result,
