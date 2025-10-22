@@ -14,8 +14,9 @@
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-import torch
 from typing import Any, Optional
+
+import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -34,11 +35,15 @@ WeightsMapping = Mapping[str, Optional[str]]
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns."""
+
     orig_to_new_substr: WeightsMapping = field(default_factory=dict)
     orig_to_new_prefix: WeightsMapping = field(default_factory=dict)
     orig_to_new_suffix: WeightsMapping = field(default_factory=dict)
+
     def _map_name(self, key: str) -> Optional[str]:
-        for substr, new_key in sorted(self.orig_to_new_substr.items(), key=lambda i: len(i[0]), reverse=True):
+        for substr, new_key in sorted(
+            self.orig_to_new_substr.items(), key=lambda i: len(i[0]), reverse=True
+        ):
             if substr in key:
                 if new_key is None:
                     return None
@@ -46,7 +51,9 @@ class WeightsMapper:
                 key = key.replace(substr, new_key, 1)
                 break
 
-        for prefix, new_key in sorted(self.orig_to_new_prefix.items(), key=lambda i: len(i[0]), reverse=True):
+        for prefix, new_key in sorted(
+            self.orig_to_new_prefix.items(), key=lambda i: len(i[0]), reverse=True
+        ):
             if key.startswith(prefix):
                 if new_key is None:
                     return None
@@ -54,7 +61,9 @@ class WeightsMapper:
                 key = key.replace(prefix, new_key, 1)
                 break
 
-        for suffix, new_key in sorted(self.orig_to_new_suffix.items(), key=lambda i: len(i[0]), reverse=True):
+        for suffix, new_key in sorted(
+            self.orig_to_new_suffix.items(), key=lambda i: len(i[0]), reverse=True
+        ):
             if key.endswith(suffix):
                 if new_key is None:
                     return None
@@ -67,12 +76,16 @@ class WeightsMapper:
     def apply(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        return ((out_name, data) for name, data in weights
-                if (out_name := self._map_name(name)) is not None)
+        return (
+            (out_name, data)
+            for name, data in weights
+            if (out_name := self._map_name(name)) is not None
+        )
 
     def apply_list(self, values: list[str]) -> list[str]:
         return [
-            out_name for name in values
+            out_name
+            for name in values
             if (out_name := self._map_name(name)) is not None
         ]
 

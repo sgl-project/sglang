@@ -497,7 +497,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             # mapping for original checkpoint
             "lm_head.": "language_model.lm_head.",
             "model.": "language_model.model.",
-        }
+        },
     )
 
     def __init__(
