@@ -2869,7 +2869,8 @@ class DeepseekV2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         forward_batch.attn_input_tp_scattered = (
-            self.allow_attn_input_tp_scattered
+            hasattr(self, "allow_attn_input_tp_scattered")
+            and self.allow_attn_input_tp_scattered
             and use_attn_input_tp_scattered(forward_batch)
         )
 
