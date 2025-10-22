@@ -48,7 +48,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
             // Structured items → convert each to appropriate chat message
             for item in items {
                 match item {
-                    ResponseInputOutputItem::SimpleInputMessage { content, role } => {
+                    ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
                         // Convert SimpleInputMessage to chat message
                         use crate::protocols::responses::StringOrContentArray;
                         let text = match content {
@@ -58,7 +58,9 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                                 parts
                                     .iter()
                                     .filter_map(|part| match part {
-                                        ResponseContentPart::InputText { text } => Some(text.as_str()),
+                                        ResponseContentPart::InputText { text } => {
+                                            Some(text.as_str())
+                                        }
                                         _ => None,
                                     })
                                     .collect::<Vec<_>>()

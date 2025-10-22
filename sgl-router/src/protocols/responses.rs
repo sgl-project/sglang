@@ -133,15 +133,13 @@ pub enum ResponseInputOutputItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
-    /// Simple message format without type tag: {\"content\": \"...\", \"role\": \"...\"}
-    /// Used for simplified input that matches OpenAI's chat message format
-    /// MUST be last due to #[serde(untagged)] requirement
     #[serde(untagged)]
     SimpleInputMessage {
-        /// Content can be a string or array of content parts (only InputText supported)
         content: StringOrContentArray,
-        /// Role of the message (user, assistant, system, developer)
         role: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "type")]
+        r#type: Option<String>,
     },
 }
 
@@ -566,17 +564,10 @@ pub struct ResponsesRequest {
     pub repetition_penalty: f32,
 }
 
-/// Input for a response - supports multiple formats for flexibility
-///
-/// Note: Items can contain both tagged messages (with "type": "message")
-/// and untagged simple messages (just {\"content\": \"...\", \"role\": \"...\"})
-/// The SimpleInputMessage variant handles the untagged format.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ResponseInput {
-    /// Item array - can contain Message, SimpleInputMessage, Reasoning, FunctionToolCall, etc.
     Items(Vec<ResponseInputOutputItem>),
-    /// Plain text string
     Text(String),
 }
 
@@ -651,11 +642,13 @@ impl GenerationRequest for ResponsesRequest {
                         match content {
                             StringOrContentArray::String(s) => Some(s.clone()),
                             StringOrContentArray::Array(parts) => {
-                                // SimpleInputMessage only supports InputText, not OutputText
+                                // SimpleInputMessage only supports InputText
                                 let texts: Vec<String> = parts
                                     .iter()
                                     .filter_map(|part| match part {
-                                        ResponseContentPart::InputText { text } => Some(text.clone()),
+                                        ResponseContentPart::InputText { text } => {
+                                            Some(text.clone())
+                                        }
                                         _ => None,
                                     })
                                     .collect();

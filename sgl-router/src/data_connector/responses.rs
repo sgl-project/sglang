@@ -190,7 +190,6 @@ pub trait ResponseStorage: Send + Sync {
 
     /// Delete all responses for a user
     async fn delete_user_responses(&self, user: &str) -> Result<usize>;
-
 }
 
 /// Type alias for shared storage

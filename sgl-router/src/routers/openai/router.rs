@@ -672,11 +672,17 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             // Process all item types, converting SimpleInputMessage to Message
                             for item in current_items {
                                 match item {
-                                    ResponseInputOutputItem::SimpleInputMessage { content, role } => {
+                                    ResponseInputOutputItem::SimpleInputMessage {
+                                        content,
+                                        role,
+                                        ..
+                                    } => {
                                         use crate::protocols::responses::StringOrContentArray;
                                         let content_vec = match content {
                                             StringOrContentArray::String(s) => {
-                                                vec![ResponseContentPart::InputText { text: s.clone() }]
+                                                vec![ResponseContentPart::InputText {
+                                                    text: s.clone(),
+                                                }]
                                             }
                                             StringOrContentArray::Array(parts) => parts.clone(),
                                         };
@@ -725,7 +731,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     // Process all item types, converting SimpleInputMessage to Message
                     for item in current_items {
                         match item {
-                            ResponseInputOutputItem::SimpleInputMessage { content, role } => {
+                            ResponseInputOutputItem::SimpleInputMessage {
+                                content, role, ..
+                            } => {
                                 use crate::protocols::responses::StringOrContentArray;
                                 let content_vec = match content {
                                     StringOrContentArray::String(s) => {
@@ -963,19 +971,18 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
                 (StatusCode::OK, Json(response_body)).into_response()
             }
-            Ok(None) => {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({
-                        "error": {
-                            "message": format!("No response found with id '{}'", response_id),
-                            "type": "invalid_request_error",
-                            "param": Value::Null,
-                            "code": "not_found"
-                        }
-                    }))
-                ).into_response()
-            }
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "message": format!("No response found with id '{}'", response_id),
+                        "type": "invalid_request_error",
+                        "param": Value::Null,
+                        "code": "not_found"
+                    }
+                })),
+            )
+                .into_response(),
             Err(e) => {
                 warn!("Failed to retrieve input items for {}: {}", response_id, e);
                 (
@@ -987,8 +994,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             "param": Value::Null,
                             "code": "storage_error"
                         }
-                    }))
-                ).into_response()
+                    })),
+                )
+                    .into_response()
             }
         }
     }

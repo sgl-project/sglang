@@ -1081,7 +1081,8 @@ async fn persist_items_with_storages(
             &input_items,
             &output_items,
             response_id_str,
-        ).await?;
+        )
+        .await?;
 
         info!(
             conversation_id = %conv_id.0,
@@ -1103,9 +1104,6 @@ async fn persist_items_with_storages(
 }
 
 /// Extract and normalize input items from ResponseInput
-///
-/// Converts all input formats to a uniform Vec<Value> representation with IDs
-/// IMPORTANT: This function stores ALL items regardless of type
 fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
     use crate::protocols::responses::{ResponseInputOutputItem, StringOrContentArray};
 
@@ -1122,44 +1120,53 @@ fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
         }
         ResponseInput::Items(items) => {
             // Process all item types and ensure IDs
-            items.iter().map(|item| {
-                match item {
-                    ResponseInputOutputItem::SimpleInputMessage { content, role } => {
-                        // Convert SimpleInputMessage to standard message format with ID
-                        let content_json = match content {
-                            StringOrContentArray::String(s) => {
-                                json!([{"type": "input_text", "text": s}])
-                            }
-                            StringOrContentArray::Array(parts) => {
-                                serde_json::to_value(parts)
-                                    .map_err(|e| format!("Failed to serialize content: {}", e))?
-                            }
-                        };
+            items
+                .iter()
+                .map(|item| {
+                    match item {
+                        ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
+                            // Convert SimpleInputMessage to standard message format with ID
+                            let content_json = match content {
+                                StringOrContentArray::String(s) => {
+                                    json!([{"type": "input_text", "text": s}])
+                                }
+                                StringOrContentArray::Array(parts) => serde_json::to_value(parts)
+                                    .map_err(|e| {
+                                    format!("Failed to serialize content: {}", e)
+                                })?,
+                            };
 
-                        Ok(json!({
-                            "id": generate_id("msg"),
-                            "type": "message",
-                            "role": role,
-                            "content": content_json,
-                            "status": "completed"
-                        }))
-                    }
-                    _ => {
-                        // For other item types (Message, Reasoning, FunctionToolCall), serialize and ensure ID
-                        let mut value = serde_json::to_value(item)
-                            .map_err(|e| format!("Failed to serialize item: {}", e))?;
-
-                        // Ensure ID exists - generate if missing
-                        if let Some(obj) = value.as_object_mut() {
-                            if !obj.contains_key("id") || obj.get("id").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
-                                obj.insert("id".to_string(), json!(generate_id("item")));
-                            }
+                            Ok(json!({
+                                "id": generate_id("msg"),
+                                "type": "message",
+                                "role": role,
+                                "content": content_json,
+                                "status": "completed"
+                            }))
                         }
+                        _ => {
+                            // For other item types (Message, Reasoning, FunctionToolCall), serialize and ensure ID
+                            let mut value = serde_json::to_value(item)
+                                .map_err(|e| format!("Failed to serialize item: {}", e))?;
 
-                        Ok(value)
+                            // Ensure ID exists - generate if missing
+                            if let Some(obj) = value.as_object_mut() {
+                                if !obj.contains_key("id")
+                                    || obj
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.is_empty())
+                                        .unwrap_or(true)
+                                {
+                                    obj.insert("id".to_string(), json!(generate_id("item")));
+                                }
+                            }
+
+                            Ok(value)
+                        }
                     }
-                }
-            }).collect::<Result<Vec<_>, String>>()?
+                })
+                .collect::<Result<Vec<_>, String>>()?
         }
     };
 
@@ -1167,9 +1174,6 @@ fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
 }
 
 /// Extract ALL output items from response JSON
-///
-/// IMPORTANT: Returns ALL items regardless of type
-/// Previously only message items were stored - now we store everything
 fn extract_output_items(response_json: &Value) -> Result<Vec<Value>, String> {
     response_json
         .get("output")
@@ -1183,8 +1187,6 @@ fn extract_output_items(response_json: &Value) -> Result<Vec<Value>, String> {
 }
 
 /// Link ALL input and output items to a conversation
-///
-/// IMPORTANT: Links ALL items regardless of type (message, reasoning, function_call, etc.)
 async fn link_items_to_conversation(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &ConversationId,
@@ -1250,7 +1252,10 @@ async fn link_items_to_conversation(
         // For non-message types, store the entire item as content
         // For message types, extract just the content field
         let content = if item_type == "message" {
-            output_item_value.get("content").cloned().unwrap_or(json!([]))
+            output_item_value
+                .get("content")
+                .cloned()
+                .unwrap_or(json!([]))
         } else {
             // For other types (reasoning, function_tool_call, mcp_call, etc.)
             // store the entire item structure
