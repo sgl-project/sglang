@@ -69,14 +69,12 @@ class DisaggregationHiCacheBase(TestDisaggregationBase):
     def tearDownClass(cls):
         """Clean up all processes including metadata server"""
         # Kill metadata server
-        if hasattr(cls, "process_metadata") and cls.process_metadata:
+        if cls.process_metadata:
             try:
                 kill_process_tree(cls.process_metadata.pid)
-                print("Metadata server killed")
-            except Exception as e:
-                print(f"Error killing metadata server: {e}")
+            except Exception as _:
+                pass
 
-        # Call parent class tearDown to clean up prefill, decode, and lb
         super().tearDownClass()
 
     @classmethod
@@ -121,8 +119,6 @@ class DisaggregationHiCacheBase(TestDisaggregationBase):
             json.dumps(hf3fs_config),
             "--hicache-mem-layout",
             "page_head",
-            "--disaggregation-ib-device",
-            "erdma_0,erdma_1",
         ]
         env = {
             **os.environ,
@@ -226,8 +222,6 @@ class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
             json.dumps(hf3fs_config),
             "--hicache-mem-layout",
             "page_head",
-            "--disaggregation-ib-device",
-            "erdma_0,erdma_1",
         ]
         env = {
             **os.environ,
