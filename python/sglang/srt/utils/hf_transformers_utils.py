@@ -47,6 +47,7 @@ from sglang.srt.configs import (
     LongcatFlashConfig,
     MultiModalityConfig,
     NemotronHConfig,
+    Olmo3Config,
     Qwen3NextConfig,
     Step3VLConfig,
 )
@@ -64,6 +65,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     InternVLChatConfig.model_type: InternVLChatConfig,
     Step3VLConfig.model_type: Step3VLConfig,
     LongcatFlashConfig.model_type: LongcatFlashConfig,
+    Olmo3Config.model_type: Olmo3Config,
     Qwen3NextConfig.model_type: Qwen3NextConfig,
     FalconH1Config.model_type: FalconH1Config,
     DotsVLMConfig.model_type: DotsVLMConfig,
@@ -109,6 +111,12 @@ def get_hf_text_config(config: PretrainedConfig):
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
         return config.text_config
+
+    if hasattr(config, "llm_config"):
+        # PointsV1.5 Chat Model
+        assert hasattr(config.llm_config, "num_attention_heads")
+        return config.llm_config
+
     if hasattr(config, "language_config"):
         return config.language_config
     if hasattr(config, "thinker_config"):
