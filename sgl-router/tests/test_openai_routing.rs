@@ -481,12 +481,10 @@ async fn test_openai_router_responses_streaming_with_mock() {
     let storage = Arc::new(MemoryResponseStorage::new());
 
     // Seed a previous response so previous_response_id logic has data to pull from.
-    let mut previous = StoredResponse::new(
-        "Earlier bedtime question".to_string(),
-        "Earlier answer".to_string(),
-        None,
-    );
+    let mut previous = StoredResponse::new(None);
     previous.id = ResponseId::from("resp_prev_chain");
+    previous.input = serde_json::json!("Earlier bedtime question");
+    previous.output = serde_json::json!("Earlier answer");
     storage.store_response(previous).await.unwrap();
 
     let router = OpenAIRouter::new(
