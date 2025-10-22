@@ -136,6 +136,10 @@ from sglang.srt.managers.scheduler_metrics_mixin import (
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
+from sglang.srt.managers.scheduler_pp_mixin import (
+    SchedulerPPMixin,
+    point_to_point_pyobj,
+)
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_update_weights_mixin import (
@@ -175,7 +179,6 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
     numa_bind_to_node,
-    point_to_point_pyobj,
     pyspy_dump_schedulers,
     require_mlp_sync,
     require_mlp_tp_gather,
@@ -277,6 +280,7 @@ class EmbeddingBatchResult:
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
+    SchedulerPPMixin,
     SchedulerProfilerMixin,
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
@@ -1212,7 +1216,7 @@ class Scheduler(
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.device_group,
+                    self.world_group.cpu_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
@@ -2173,7 +2177,7 @@ class Scheduler(
         pass
 
     def run_batch(
-        self, batch: ScheduleBatch
+        self, batch: ScheduleBatch, pp_proxy_tensors: Optional[PPProxyTensors]
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
@@ -2244,9 +2248,14 @@ class Scheduler(
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             else:
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch_or_worker_batch
-                )
+                if pp_proxy_tensors is not None:
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch_or_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
+                else:
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch_or_worker_batch
+                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 

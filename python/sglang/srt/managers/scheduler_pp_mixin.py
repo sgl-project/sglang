@@ -16,23 +16,25 @@
 from __future__ import annotations
 
 import logging
+import pickle
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
+import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import P2PWork
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import GenerationBatchResult, ScheduleBatch
 from sglang.srt.managers.utils import (
-    GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
+from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +57,7 @@ class SchedulerPPMixin:
     def send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.attn_tp_rank == 0:
-            dp_offset = self.dp_rank * self.attn_tp_size
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
             p2p_work = point_to_point_pyobj(
                 data,
                 self.pp_rank * self.tp_size + dp_offset,
@@ -68,7 +70,7 @@ class SchedulerPPMixin:
 
     def recv_pyobj_from_prev_stage(self: Scheduler):
         if self.attn_tp_rank == 0:
-            dp_offset = self.dp_rank * self.attn_tp_size
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
             data = point_to_point_pyobj(
                 [],
                 self.pp_rank * self.tp_size + dp_offset,
@@ -93,12 +95,11 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
-        if batch.return_logprob:
-            logprob_dict = get_logprob_dict_from_result(result)
-            tensor_dict = {
-                **tensor_dict,
-                **logprob_dict,
-            }
+        logprob_dict = get_logprob_dict_from_result(result)
+        tensor_dict = {
+            **tensor_dict,
+            **logprob_dict,
+        }
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -143,12 +144,11 @@ class SchedulerPPMixin:
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
 
-        if batch.return_logprob:
-            (
-                logits_output,
-                extend_input_len_per_req,
-                extend_logprob_start_len_per_req,
-            ) = get_logprob_from_pp_outputs(pp_outputs)
+        (
+            logits_output,
+            extend_input_len_per_req,
+            extend_logprob_start_len_per_req,
+        ) = get_logprob_from_pp_outputs(pp_outputs)
         batch.output_ids = pp_outputs["next_token_ids"]
         output_result = GenerationBatchResult(
             logits_output=logits_output,
@@ -224,7 +224,9 @@ class SchedulerPPMixin:
             batch_result = self._pp_prep_batch_result(
                 mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
             )
-            d2h_event = self.process_batch_result_d2h(mbs[next_mb_id], batch_result)
+            batch_result.copy_done = torch.get_device_module(self.device).Event()
+            batch_result.copy_to_cpu()
+            d2h_event = batch_result.copy_done
 
         return next_pp_outputs, batch_result, d2h_event
 
@@ -362,13 +364,13 @@ class SchedulerPPMixin:
                             "send_proxy_dict_to_next_stage"
                         ):
                             send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors,
+                                result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                             )
 
-                if self.delayed_weight_sync_fn:
-                    self.delayed_weight_sync_fn()
-                    self.delayed_weight_sync_fn = None
+                # if self.delayed_weight_sync_fn:
+                #     self.delayed_weight_sync_fn()
+                #     self.delayed_weight_sync_fn = None
 
                 pp_outputs = next_pp_outputs
 
@@ -409,7 +411,7 @@ class SchedulerPPMixin:
                 [KVPoll.Failed],
             )
         else:
-            # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the concensus
+            # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
@@ -444,7 +446,7 @@ class SchedulerPPMixin:
                 self.disagg_prefill_inflight_queue,
                 [KVPoll.Success, KVPoll.Failed],
             )
-            # 3. new concensus rids = intersection(previous concensus rids, transfer finished rids)
+            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
             )
@@ -530,7 +532,7 @@ class SchedulerPPMixin:
         There are two additional elements compared to the regular schedule:
 
         Bootstrap Requests + Release Requests:
-        - Both can have local failure and need to be consensus on. PP needs to gurantee eventual consistency of local failure and flush malfunc requests out as soft error.
+        - Both can have local failure and need to be consensus on. PP needs to guarantee eventual consistency of local failure and flush malfunc requests out as soft error.
 
         """
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
@@ -544,7 +546,7 @@ class SchedulerPPMixin:
         pp_outputs: Optional[PPProxyTensors] = None
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = deque()
 
-        # PD additionals
+        # PD additional
         consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
@@ -670,9 +672,9 @@ class SchedulerPPMixin:
                             async_send=True,
                         )
 
-                if self.delayed_weight_sync_fn:
-                    self.delayed_weight_sync_fn()
-                    self.delayed_weight_sync_fn = None
+                # if self.delayed_weight_sync_fn:
+                #     self.delayed_weight_sync_fn()
+                #     self.delayed_weight_sync_fn = None
 
                 pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -686,7 +688,6 @@ class SchedulerPPMixin:
                 self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
                 self.maybe_sleep_on_idle()
-
 
 
 # Keep this function for xai's PP implementation
