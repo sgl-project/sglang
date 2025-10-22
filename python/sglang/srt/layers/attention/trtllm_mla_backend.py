@@ -295,11 +295,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Apply dual constraints (take LCM to satisfy both):
         # 1. TRT-LLM: block_num % (128 / page_size) == 0
-        # 2. Triton: page table builder uses 64-index bursts, needs multiple of 64
+        # 2. Triton: number of pages per block
         trtllm_constraint = TRTLLM_BLOCK_CONSTRAINT // self.page_size
-        constraint_lcm = math.lcm(
-            trtllm_constraint, get_num_page_per_block_flashmla(self.page_size)
-        )
+        triton_constraint = get_num_page_per_block_flashmla(self.page_size)
+        constraint_lcm = math.lcm(trtllm_constraint, triton_constraint)
 
         if blocks % constraint_lcm != 0:
             blocks = triton.cdiv(blocks, constraint_lcm) * constraint_lcm

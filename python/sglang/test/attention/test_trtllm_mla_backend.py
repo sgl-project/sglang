@@ -917,10 +917,10 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Should satisfy TRT-LLM and Triton constraints
                 trtllm_constraint = 128 // scenario["page_size"]
-                constraint_lcm = math.lcm(
-                    trtllm_constraint,
-                    get_num_page_per_block_flashmla(scenario["page_size"]),
+                triton_constraint = get_num_page_per_block_flashmla(
+                    scenario["page_size"]
                 )
+                constraint_lcm = math.lcm(trtllm_constraint, triton_constraint)
                 self.assertEqual(
                     calculated_blocks % constraint_lcm,
                     0,
