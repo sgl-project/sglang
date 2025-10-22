@@ -123,10 +123,17 @@ class MiniLoadBalancer:
                     img_url = item.get('image_url').get('url')
                     img_list.append(img_url)
         
+        if len(img_list) == 0:
+            return
+        
         # Split mm_items
         num_item_per_encoder = (len(img_list)+len(encode_urls)-1) // len(encode_urls)
-        encode_requests = [{'mm_items':img_list[i*num_item_per_encoder:(i+1)*num_item_per_encoder]} 
-                             for i in range(len(encode_urls))]
+        num_encoders = min(len(img_list), len(encode_urls))
+        encode_requests = [{'mm_items':img_list[i*num_item_per_encoder:(i+1)*num_item_per_encoder],
+                            'num_parts': num_encoders,
+                            'part_idx': i,
+                            'req_id': request_data.get('bootstrap_room')} 
+                             for i in range(num_encoders)]
         
         # Send encode requests
         async with aiohttp.ClientSession(
@@ -136,18 +143,13 @@ class MiniLoadBalancer:
         ) as session:
             tasks = [
                 session.post(f"{encode_urls[i]}/{endpoint}", json=encode_requests[i])
-                for i in range(len(encode_urls))
+                for i in range(num_encoders)
             ]
 
-            encode_responses = await asyncio.gather(*tasks)
-            
-            encode_data = [await response.json() for response in encode_responses]
-            encode_data = torch.concatenate([torch.tensor(data['mm_embeddings'], dtype=torch.bfloat16) for data in encode_data])
-            
-            return encode_data
+            await asyncio.gather(*tasks)
 
     async def generate(
-        self, prefill_request, decode_request, prefill_server, decode_server, endpoint
+        self, pd_request, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
@@ -168,8 +170,8 @@ class MiniLoadBalancer:
                 headers = {"trace_context": trace_context}
 
             tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_request),
-                session.post(f"{decode_server}/{endpoint}", json=decode_request),
+                session.post(f"{prefill_server}/{endpoint}", json=pd_request),
+                session.post(f"{decode_server}/{endpoint}", json=pd_request),
             ]
 
             for bootstrap_room in bootstrap_room_list:
@@ -178,7 +180,7 @@ class MiniLoadBalancer:
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
-            if "return_logprob" in prefill_request:
+            if "return_logprob" in pd_request:
 
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
@@ -207,7 +209,7 @@ class MiniLoadBalancer:
             )
 
     async def generate_stream(
-        self, prefill_request, decode_request, prefill_server, decode_server, endpoint="generate"
+        self, pd_request, prefill_server, decode_server, endpoint="generate"
     ):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
@@ -232,8 +234,8 @@ class MiniLoadBalancer:
                     headers = {"trace_context": trace_context}
 
                 tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=prefill_request),
-                    session.post(f"{decode_server}/{endpoint}", json=decode_request),
+                    session.post(f"{prefill_server}/{endpoint}", json=pd_request),
+                    session.post(f"{decode_server}/{endpoint}", json=pd_request),
                 ]
 
                 for bootstrap_room in bootstrap_room_list:
@@ -243,7 +245,7 @@ class MiniLoadBalancer:
                 # Wait for both responses to complete. Since this is streaming, they return immediately.
                 prefill_response, decode_response = await asyncio.gather(*tasks)
 
-                if prefill_request.get("return_logprob", False):
+                if pd_request.get("return_logprob", False):
                     prefill_chunks = []
                     async for chunk in prefill_response.content:
                         prefill_chunks.append(chunk)
@@ -448,40 +450,34 @@ async def handle_generate_request(request_data: dict):
 
 
 async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    mm_result = await lb.encode(request_data, lb.encode_urls, 'encode')
+    bootstrap_room = _generate_bootstrap_room()
+    encode_request = request_data.copy()
+    encode_request.update({"bootstrap_room": bootstrap_room})
+    await lb.encode(encode_request, lb.encode_urls, 'encode')
     
     prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-    decode_request = request_data.copy()
-    decode_request.update(
+    pd_request = encode_request.copy()
+    pd_request.update(
         {
             "bootstrap_host": hostname,
             "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
-        }
-    )
-    prefill_request = decode_request.copy()
-    prefill_request.update(
-        {
-            "image_data_embedding": mm_result.tolist()
         }
     )
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
-            prefill_request,
-            decode_request,
+            pd_request,
             prefill_server,
             decode_server,
             endpoint=endpoint_name,
         )
     else:
         return await lb.generate(
-            prefill_request,
-            decode_request,
+            pd_request,
             prefill_server,
             decode_server,
             endpoint=endpoint_name,

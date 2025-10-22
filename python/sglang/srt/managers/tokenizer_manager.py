@@ -192,6 +192,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         )
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
 
         # Read model args
         self.model_path = server_args.model_path
@@ -310,6 +313,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+
+        # Recv embedding from encoding server
+        if (self.disaggregation_mode == DisaggregationMode.PREFILL and 
+            self.model_config.is_multimodal):
+            self.recv_from_encoder = get_zmq_socket(
+                context, zmq.PULL, f"tcp://*:{server_args.embedding_port}", True
+            )
+            self.received_embeddings = dict()
 
         # Request states
         self._chosen_loop = None
@@ -719,10 +730,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
-            if hasattr(obj, 'image_data_embedding'):
+            
+            while self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if obj.bootstrap_room not in self.received_embeddings:
+                    await self.handle_embedding()
+                    continue
+                if not self.received_embeddings[obj.bootstrap_room].ready:
+                    await self.handle_embedding()
+                    continue
                 for mm_item in mm_inputs["mm_items"]:
                     if mm_item.modality == Modality.IMAGE:
-                        mm_item.precomputed_embeddings = obj.image_data_embedding
+                        mm_item.precomputed_embeddings = self.received_embeddings[
+                            obj.bootstrap_room].get()
+                del self.received_embeddings[obj.bootstrap_room]
+                break
         else:
             mm_inputs = None
 
@@ -1545,6 +1566,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
+    
+    async def handle_embedding(self):
+        recv_obj = await self.recv_from_encoder.recv_pyobj()
+        if recv_obj.req_id not in self.received_embeddings:
+            self.received_embeddings[recv_obj.req_id] = recv_obj
+        else:
+            self.received_embeddings[recv_obj.req_id].add(recv_obj)
 
     def _add_metric_if_present(
         self,
