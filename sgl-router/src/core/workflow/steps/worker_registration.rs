@@ -346,14 +346,11 @@ impl StepExecutor for DiscoverDPInfoStep {
         let config: Arc<WorkerConfigRequest> = context
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
-        // Skip DP discovery if router is not in DP-aware mode
-        if !app_context.router_config.dp_aware {
+        // Skip DP discovery if not DP-aware
+        if !config.dp_aware {
             debug!(
-                "Router is not in DP-aware mode, skipping DP discovery for worker {}",
+                "Worker {} is not DP-aware, skipping DP discovery",
                 config.url
             );
             return Ok(StepResult::Success);
@@ -528,11 +525,7 @@ impl StepExecutor for CreateWorkerStep {
         }
 
         // Handle DP-aware vs non-DP-aware workers
-        // Check if router is in DP-aware mode and we have DP info
-        let is_dp_aware =
-            app_context.router_config.dp_aware && context.get::<Arc<DpInfo>>("dp_info").is_some();
-
-        if is_dp_aware {
+        if config.dp_aware {
             // DP-aware path: Create multiple workers (one per rank)
             let dp_info: Arc<DpInfo> = context
                 .get("dp_info")
@@ -631,12 +624,7 @@ impl StepExecutor for RegisterWorkerStep {
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
         // Check if we have multiple workers (DP-aware) or single worker
-        let is_dp_aware = app_context.router_config.dp_aware
-            && context
-                .get::<Arc<Vec<Arc<dyn Worker>>>>("workers")
-                .is_some();
-
-        if is_dp_aware {
+        if config.dp_aware {
             // DP-aware path: Register multiple workers
             let workers: Arc<Vec<Arc<dyn Worker>>> = context
                 .get("workers")
@@ -695,12 +683,7 @@ impl StepExecutor for UpdatePoliciesStep {
         let policy_hint = labels.get("policy").map(|s| s.as_str());
 
         // Check if we have multiple workers (DP-aware) or single worker
-        let is_dp_aware = app_context.router_config.dp_aware
-            && context
-                .get::<Arc<Vec<Arc<dyn Worker>>>>("workers")
-                .is_some();
-
-        if is_dp_aware {
+        if config.dp_aware {
             // DP-aware path: Update policies for multiple workers
             let workers: Arc<Vec<Arc<dyn Worker>>> = context
                 .get("workers")
@@ -780,11 +763,7 @@ impl StepExecutor for ActivateWorkerStep {
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
 
         // Check if we have multiple workers (DP-aware) or single worker
-        let is_dp_aware = context
-            .get::<Arc<Vec<Arc<dyn Worker>>>>("workers")
-            .is_some();
-
-        if is_dp_aware {
+        if config.dp_aware {
             // DP-aware path: Activate multiple workers
             let workers: Arc<Vec<Arc<dyn Worker>>> = context
                 .get("workers")

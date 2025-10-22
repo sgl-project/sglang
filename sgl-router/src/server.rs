@@ -513,7 +513,7 @@ async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Respons
 
 async fn create_worker(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<WorkerConfigRequest>,
+    Json(mut config): Json<WorkerConfigRequest>,
 ) -> Response {
     // Warn if router has API key but worker is being added without one
     if state.context.router_config.api_key.is_some() && config.api_key.is_none() {
@@ -524,6 +524,9 @@ async fn create_worker(
             config.url
         );
     }
+
+    // Populate dp_aware from router's configuration
+    config.dp_aware = state.context.router_config.dp_aware;
 
     // Submit job for async processing
     let worker_url = config.url.clone();
