@@ -1,4 +1,4 @@
-# RBG Based PD Deploy
+# DeepSeekV32-Exp RBG Based PD Deploy
 
 ## 0. Prerequisites
 
