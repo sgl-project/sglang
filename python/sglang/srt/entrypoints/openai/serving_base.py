@@ -96,11 +96,6 @@ class OpenAIServingBase(ABC):
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
-            
-            request_data = await raw_request.json()
-            image_data_embedding = request_data.get('image_data_embedding', None)
-            if image_data_embedding:
-                adapted_request.image_data_embedding = torch.tensor(image_data_embedding)
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
