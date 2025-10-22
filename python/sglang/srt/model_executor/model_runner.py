@@ -828,6 +828,16 @@ class ModelRunner:
         set_cuda_arch()
 
         # Prepare the model config
+        from sglang.srt.configs.modelopt_config import ModelOptConfig
+
+        modelopt_config = ModelOptConfig(
+            quant=self.server_args.modelopt_quant,
+            checkpoint_restore_path=self.server_args.modelopt_checkpoint_restore_path,
+            checkpoint_save_path=self.server_args.modelopt_checkpoint_save_path,
+            export_path=self.server_args.modelopt_export_path,
+            quantize_and_serve=self.server_args.quantize_and_serve,
+        )
+
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
@@ -836,6 +846,7 @@ class ModelRunner:
             remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+            modelopt_config=modelopt_config,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
