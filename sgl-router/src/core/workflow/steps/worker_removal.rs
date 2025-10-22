@@ -91,9 +91,9 @@ impl StepExecutor for FindWorkersToRemoveStep {
             .map(|w| w.model_id().to_string())
             .collect();
 
-        context.set("workers_to_remove", Arc::new(workers_to_remove));
-        context.set("worker_urls", Arc::new(worker_urls));
-        context.set("affected_models", Arc::new(affected_models));
+        context.set("workers_to_remove", workers_to_remove);
+        context.set("worker_urls", worker_urls);
+        context.set("affected_models", affected_models);
 
         Ok(StepResult::Success)
     }
