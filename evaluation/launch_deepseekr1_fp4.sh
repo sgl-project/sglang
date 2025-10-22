@@ -1,4 +1,4 @@
-model=/data/pretrained-models/DeepSeek-R1-MXFP4-Preview
+model=/data/pretrained-models/amd/DeepSeek-R1-MXFP4-Preview
 TP=8
 EP=1
 
@@ -19,3 +19,5 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 196608 \
     --cuda-graph-max-bs 128 \
     2>&1 | tee log.server.log &
+
+# --enable-torch-compile
