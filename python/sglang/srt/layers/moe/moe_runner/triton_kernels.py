@@ -129,11 +129,6 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
                 **common_kwargs,
             )
 
-        running_state["routing_data"] = runner_input.routing_data
-        running_state["gather_indx"] = runner_input.gather_indx
-        running_state["scatter_indx"] = (
-            None if self.config.no_combine else runner_input.scatter_indx
-        )
 
         if self.config.no_combine:
             tokens = runner_input.hidden_states.shape[0]
@@ -242,9 +237,6 @@ def pre_permute_standard_to_triton_kernels(
 
     routing_data, gather_indx, scatter_indx = topk_output
 
-    running_state["routing_data"] = routing_data
-    running_state["gather_indx"] = gather_indx
-    running_state["scatter_indx"] = None if runner_config.no_combine else scatter_indx
 
     return TritonKernelsRunnerInput(
         hidden_states=hidden_states,
