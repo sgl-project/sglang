@@ -76,6 +76,65 @@ python3 -m sglang.launch_server \
     --enable-deterministic-inference
 ```
 
+### Deterministic Inference with Non-Greedy Sampling (Temperature > 0)
+
+SGLang supports deterministic inference even with non-greedy sampling by using sampling seeds. This is particularly useful for reinforcement learning scenarios like GRPO (Group Relative Policy Optimization) where you need multiple diverse but reproducible responses.
+
+#### Default Behavior
+
+By default, SGLang uses a sampling seed of `42` for reproducible sampling:
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "Tell me a joke",
+        "sampling_params": {
+            "temperature": 0.8,  # Non-greedy sampling
+            "max_new_tokens": 128,
+        },
+    },
+)
+print(response.json())
+# This will always produce the same response across runs
+```
+
+#### Generating Multiple Reproducible Responses
+
+To sample different responses from the same prompt while maintaining reproducibility (e.g., for GRPO training), provide different sampling seeds in your requests:
+
+```python
+import requests
+
+# Prepare a list of sampling seeds for different responses
+sampling_seeds = [42, 43, 44, 45, 46]
+
+responses = []
+for seed in sampling_seeds:
+    response = requests.post(
+        "http://localhost:30000/generate",
+        json={
+            "text": "Tell me a joke",
+            "sampling_params": {
+                "temperature": 0.8,
+                "max_new_tokens": 128,
+                "sampling_seed": seed,  # Specify sampling seed
+            },
+        },
+    )
+    responses.append(response.json())
+
+# Each seed will produce a different but reproducible response
+# Using the same seed will always produce the same response
+```
+
+This approach ensures that:
+- Different seeds produce diverse responses
+- The same seed always produces the same response across different runs
+- Results are reproducible for debugging and evaluation
+
 
 ## Verification
 
