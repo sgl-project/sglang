@@ -47,7 +47,7 @@ def triton_kernel_moe_forward(
 
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    assert TopKOutputChecker.format_is_triton_kernel(topk_output)
+    assert TopKOutputChecker.format_is_triton_kernels(topk_output)
 
     routing_data, gather_idx, scatter_idx = topk_output
 
@@ -184,7 +184,7 @@ def triton_kernel_moe_with_bias_forward(
 ) -> torch.Tensor:
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    assert TopKOutputChecker.format_is_triton_kernel(topk_output)
+    assert TopKOutputChecker.format_is_triton_kernels(topk_output)
 
     routing_data, gather_idx, scatter_idx = topk_output
 

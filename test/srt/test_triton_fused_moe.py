@@ -122,7 +122,7 @@ class TestFusedMOE(CustomTestCase):
         torch_combined = torch_per_expert.sum(dim=1)
 
         def run_runner(config, fused):
-            runner = MoeRunner(MoeRunnerBackend.TRITON_KERNEL, config)
+            runner = MoeRunner(MoeRunnerBackend.TRITON_KERNELS, config)
             if not fused:
                 runner.fused_func = None
             result = runner.run(dispatch_output, quant_info)

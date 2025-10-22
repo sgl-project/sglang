@@ -45,7 +45,7 @@ class TritonKernelsRunnerInput(RunnerInput):
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.TRITON_KERNEL
+        return MoeRunnerBackend.TRITON_KERNELS
 
 
 @dataclass
@@ -56,7 +56,7 @@ class TritonKernelsRunnerOutput(RunnerOutput):
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.TRITON_KERNEL
+        return MoeRunnerBackend.TRITON_KERNELS
 
 
 @dataclass
@@ -141,7 +141,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.TRITON_KERNEL
+        return MoeRunnerBackend.TRITON_KERNELS
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +165,7 @@ def fused_experts_none_to_triton_kernels(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    assert TopKOutputChecker.format_is_triton_kernel(
+    assert TopKOutputChecker.format_is_triton_kernels(
         topk_output
     ), "Triton-kernel runner expects TritonKernelTopKOutput"
 
@@ -231,7 +231,7 @@ def pre_permute_standard_to_triton_kernels(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    assert TopKOutputChecker.format_is_triton_kernel(
+    assert TopKOutputChecker.format_is_triton_kernels(
         topk_output
     ), "Triton-kernel runner expects TritonKernelTopKOutput"
 

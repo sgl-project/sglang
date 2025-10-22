@@ -262,7 +262,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.prefix = prefix
         self.topk_indices_dtype = None
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.flashinfer_mxfp4_moe_precision = (
@@ -615,7 +615,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         backend = get_moe_runner_backend()
         if backend.is_auto():
             backend = (
-                MoeRunnerBackend.TRITON_KERNEL
+                MoeRunnerBackend.TRITON_KERNELS
                 if self.use_triton_kernels
                 else MoeRunnerBackend.TRITON
             )
@@ -697,7 +697,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return StandardCombineInput(hidden_states=trtllm_gen_output)
 
         backend = self.runner.runner_backend
-        if backend.is_triton_kernel():
+        if backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,
             )

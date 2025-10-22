@@ -29,10 +29,10 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
-    def format_is_triton_kernel(
+    def format_is_triton_kernels(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[StandardDispatchOutput]:
-        return dispatch_output.format.is_triton_kernel()
+        return dispatch_output.format.is_triton_kernels()
 
     @staticmethod
     def format_is_deepep_normal(
@@ -56,15 +56,15 @@ class DispatchOutputChecker:
 class DispatchOutputFormat(Enum):
 
     STANDARD = "standard"
-    TRITON_KERNEL = "triton_kernel"
+    TRITON_KERNELS = "triton_kernel"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
 
-    def is_triton_kernel(self) -> bool:
-        return self == DispatchOutputFormat.TRITON_KERNEL
+    def is_triton_kernels(self) -> bool:
+        return self == DispatchOutputFormat.TRITON_KERNELS
 
     def is_deepep_normal(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_NORMAL

@@ -228,7 +228,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         backend = get_moe_runner_backend()
         if backend.is_auto():
             backend = (
-                MoeRunnerBackend.TRITON_KERNEL
+                MoeRunnerBackend.TRITON_KERNELS
                 if self.use_triton_kernels
                 else MoeRunnerBackend.TRITON
             )
@@ -257,7 +257,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         moe_runner_config = self.moe_runner_config
 
         backend = self.runner.runner_backend
-        if backend.is_triton_kernel():
+        if backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,
             )
