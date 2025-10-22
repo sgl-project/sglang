@@ -297,7 +297,7 @@ class MooncakeStore(HiCacheStorage):
         )
         key_list = []
         base_rank = self.local_rank * split_factor
-        target_ranks = [base_rank + i for i in range(self.split_factor)]
+        target_ranks = [base_rank + i for i in range(split_factor)]
         for key_ in keys:
             for target_rank in target_ranks:
                 key_list.append(f"{key_}_{target_rank}_k")
