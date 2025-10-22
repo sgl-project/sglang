@@ -86,7 +86,7 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
                     if (
                         self.disaggregation_mode == DisaggregationMode.LANGUAGE
-                        and req.metadata_buffer_index != -1
+                        and req.embedding_indices is not None
                     ):
                         self.req_to_metadata_buffer_idx_allocator.free_with_req(req)
                     continue
@@ -104,7 +104,7 @@ class SchedulerOutputProcessorMixin:
                         self.tree_cache.cache_unfinished_req(req)
 
                     if self.disaggregation_mode == DisaggregationMode.LANGUAGE:
-                        if req.metadata_buffer_index != -1:
+                        if req.embedding_indices is not None:
                             self.req_to_metadata_buffer_idx_allocator.free_with_req(req)
 
                     if batch.return_logprob:

@@ -557,7 +557,7 @@ class MultimodalDataBuffers:
         ]
         return ptrs, data_lens, item_lens
 
-    def get_buf(self, block_indices: list = None):
+    def get_buf(self, block_indices: list = None, actual_total_length: int = None):
         """Get buffer data using block indices.
 
         Args:
@@ -568,10 +568,12 @@ class MultimodalDataBuffers:
         """
         if block_indices is None or len(block_indices) == 0:
             raise ValueError("Either idx or block_indices must be provided")
-
-        # Get total length from aux_datas in first block
         aux_datas = self.aux_datas[block_indices[0]]
-        total_length = int(aux_datas[0])
+        if actual_total_length is not None:
+            total_length = actual_total_length
+        else:
+            # Get total length from aux_datas in first block
+            total_length = int(aux_datas[0])
 
         gathered_embeddings = []
         gathered_fill_ids = []

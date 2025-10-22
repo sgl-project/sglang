@@ -2885,7 +2885,7 @@ class Scheduler(
 
             if (
                 self.disaggregation_mode == DisaggregationMode.LANGUAGE
-                and req.metadata_buffer_index != -1
+                and req.embedding_indices is not None
             ):
                 self.req_to_metadata_buffer_idx_allocator.free_with_req(req)
 

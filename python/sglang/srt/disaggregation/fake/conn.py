@@ -94,10 +94,11 @@ class FakeKVReceiver(BaseKVReceiver):
         kv_indices: Optional[list[int]] = None,
         aux_index: Optional[int] = None,
         embedding_indices: Optional[list[int]] = None,
+        allocated_tokens: Optional[int] = None,
     ):
         self.has_init = True
         logger.debug(
-            f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}, embedding_indices: {embedding_indices}"
+            f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}, embedding_indices: {embedding_indices}, allocated_tokens: {allocated_tokens}"
         )
 
     def failure_exception(self):

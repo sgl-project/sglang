@@ -65,6 +65,14 @@ class TransferEmbeddingInfo:
     mooncake_session_id: str
     dst_embedding_indices: List[int]
     required_dst_info_num: int
+    sent_tokens: int = 0  # Number of tokens already sent (for resume transfer)
+    allocated_tokens: int = 0  # Number of tokens allocated by Language side
+    # For resume: need to store original embedding data to retrigger transfer
+    src_embedding_indices: List[int] = (
+        None  # Source embedding indices (from Embedding side)
+    )
+    total_tokens: int = 0  # Total tokens to transfer (from Embedding side)
+    resume_ready: bool = False  # Whether ready for resume transfer
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -78,13 +86,32 @@ class TransferEmbeddingInfo:
         else:
             dst_embedding_indices = []
 
+        required_dst_info_num = int(msg[5].decode("ascii"))
+
+        # Parse allocated_tokens (always present in init message, msg[6])
+        # For resume messages, msg[6] is sent_tokens, msg[7] is allocated_tokens
+        allocated_tokens = 0
+        sent_tokens = 0
+
+        if len(msg) >= 7:
+            # Check if this is a resume message (has 8 fields) or init message (has 7 fields)
+            if len(msg) >= 8:
+                # Resume message: msg[6] = sent_tokens, msg[7] = allocated_tokens
+                sent_tokens = int(msg[6].decode("ascii"))
+                allocated_tokens = int(msg[7].decode("ascii"))
+            else:
+                # Init message: msg[6] = allocated_tokens
+                allocated_tokens = int(msg[6].decode("ascii"))
+
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
             dst_embedding_indices=dst_embedding_indices,
-            required_dst_info_num=int(msg[5].decode("ascii")),
+            required_dst_info_num=required_dst_info_num,
+            sent_tokens=sent_tokens,
+            allocated_tokens=allocated_tokens,
         )
 
 
@@ -215,6 +242,8 @@ class MooncakeEmbeddingManager(BaseKVManager):
         dst_embedding_indices: List[int],
         total_tokens: int,
         block_size: int,
+        sent_tokens: int = 0,
+        allocated_tokens: int = None,
     ):
         """Send embedding data using block-based transfer.
 
@@ -225,37 +254,73 @@ class MooncakeEmbeddingManager(BaseKVManager):
             dst_embedding_indices: Destination embedding indices
             total_tokens: Total number of tokens to transfer
             block_size: Number of tokens per block
+            sent_tokens: Number of tokens already sent (for resume transfer)
+            allocated_tokens: Number of tokens allocated by Language side
 
         Returns:
-            0 if all transfers succeed, 1 otherwise
+            Tuple of (ret, is_partial):
+                ret: 0 if all transfers succeed, 1 otherwise
+                is_partial: True if this is a partial transfer (more data remaining)
         """
-        # Validate: source blocks must <= destination blocks
-        if len(embedding_indices) > len(dst_embedding_indices):
+        # Validate block_size consistency
+        if allocated_tokens is not None:
+            expected_block_size = allocated_tokens // len(dst_embedding_indices)
+            if expected_block_size != block_size:
+                raise ValueError(
+                    f"Block size mismatch: Embedding side uses {block_size}, "
+                    f"but Language side allocated {allocated_tokens} tokens "
+                    f"for {len(dst_embedding_indices)} blocks "
+                    f"(implies block_size={expected_block_size})"
+                )
+        else:
+            # Backward compatibility: if no allocated_tokens, calculate from block count
+            allocated_tokens = len(dst_embedding_indices) * block_size
+
+        # Calculate remaining tokens and determine if this is a partial transfer
+        remaining_tokens = total_tokens - sent_tokens
+
+        if remaining_tokens > allocated_tokens:
+            # Need partial transfer
+            logger.info(
+                f"Partial transfer: remaining={remaining_tokens} > "
+                f"allocated={allocated_tokens}. Will transfer {allocated_tokens} tokens."
+            )
+            tokens_to_send = allocated_tokens
+            is_partial = True
+        else:
+            # Can transfer all remaining tokens
+            tokens_to_send = remaining_tokens
+            is_partial = False
+
+        # Calculate required dst blocks
+        dst_blocks_needed = (tokens_to_send + block_size - 1) // block_size
+
+        # Validate dst buffer is sufficient
+        if dst_blocks_needed > len(dst_embedding_indices):
             raise ValueError(
-                f"Source blocks ({len(embedding_indices)}) cannot be greater than "
-                f"destination blocks ({len(dst_embedding_indices)}). "
-                f"Language side allocated insufficient buffer."
+                f"Insufficient dst blocks: need {dst_blocks_needed} blocks "
+                f"for {tokens_to_send} tokens, but only have {len(dst_embedding_indices)} blocks"
             )
 
-        if len(embedding_indices) < len(dst_embedding_indices):
-            logger.warning(
-                f"Source blocks ({len(embedding_indices)}) is less than "
-                f"destination blocks ({len(dst_embedding_indices)}). "
-                f"Some destination buffers will not be used."
-            )
-            dst_embedding_indices = dst_embedding_indices[: len(embedding_indices)]
+        # Calculate source block range based on sent_tokens
+        start_block = sent_tokens // block_size
+        embedding_indices_to_send = embedding_indices[
+            start_block : start_block + dst_blocks_needed
+        ]
+        dst_embedding_indices = dst_embedding_indices[:dst_blocks_needed]
 
         src_addrs = []
         dst_addrs = []
         lengths = []
 
+        tokens_transferred = 0
+
         for block_idx, (src_block_idx, dst_block_idx) in enumerate(
-            zip(embedding_indices, dst_embedding_indices)
+            zip(embedding_indices_to_send, dst_embedding_indices)
         ):
-            # Calculate how many tokens in this block
-            start_pos = block_idx * block_size
-            end_pos = min(start_pos + block_size, total_tokens)
-            tokens_in_block = end_pos - start_pos
+            # Calculate tokens in this block
+            remaining_in_transfer = tokens_to_send - tokens_transferred
+            tokens_in_block = min(block_size, remaining_in_transfer)
 
             if tokens_in_block <= 0:
                 break
@@ -265,25 +330,25 @@ class MooncakeEmbeddingManager(BaseKVManager):
                 embedding_item_len = self.data_args.aux_item_lens[buffer_type_idx]
 
                 # Calculate chunk size based on buffer type and tokens_in_block
-                # For aux_datas, only transfer in first block
+                # For aux_datas, only transfer in first block of initial transfer
                 if buffer_type_idx == 3:  # aux_datas
-                    if block_idx == 0:
+                    if sent_tokens == 0 and block_idx == 0:
                         chunk_size = embedding_item_len  # Transfer full aux_datas
                     else:
-                        continue  # Skip aux_datas for other blocks
+                        continue  # Skip aux_datas for resume or other blocks
                 else:
                     # For embeddings, fill_ids, mrope_positions: scale by tokens_in_block
                     # embedding_item_len already contains the full block size
                     # We need to transfer only tokens_in_block portion
                     chunk_size = (embedding_item_len * tokens_in_block) // block_size
 
-                # Calculate source address: base_ptr + block_idx * item_len
+                # Calculate source address: base_ptr + src_block_idx * item_len
                 embedding_addr = (
                     self.data_args.aux_data_ptrs[buffer_type_idx]
                     + src_block_idx * embedding_item_len
                 )
 
-                # Calculate destination address: base_ptr + block_idx * item_len
+                # Calculate destination address: base_ptr + dst_block_idx * item_len
                 dst_embedding_addr = (
                     dst_embedding_ptrs[buffer_type_idx]
                     + dst_block_idx * embedding_item_len
@@ -293,9 +358,13 @@ class MooncakeEmbeddingManager(BaseKVManager):
                 dst_addrs.append(dst_embedding_addr)
                 lengths.append(chunk_size)
 
-        return self.engine.batch_transfer_sync(
+            tokens_transferred += tokens_in_block
+
+        ret = self.engine.batch_transfer_sync(
             mooncake_session_id, src_addrs, dst_addrs, lengths
         )
+
+        return ret, is_partial
 
     def sync_status_to_language_endpoint(
         self, remote: str, dst_port: int, room: int, status: int
@@ -340,6 +409,11 @@ class MooncakeEmbeddingManager(BaseKVManager):
                             )
                             break
 
+                    # Save source embedding info for potential resume
+                    if req.src_embedding_indices is None:
+                        req.src_embedding_indices = embedding_chunk.embedding_indices
+                        req.total_tokens = embedding_chunk.total_tokens
+
                     # Block-based transfer
                     # Calculate block_size from aux_item_lens
                     # aux_item_lens[0] is for embeddings per block
@@ -348,7 +422,11 @@ class MooncakeEmbeddingManager(BaseKVManager):
                     # Assuming fill_ids is int32 (4 bytes)
                     block_size = self.data_args.aux_item_lens[1] // 4
 
-                    ret = self.send_embedding(
+                    # Get sent_tokens and allocated_tokens from transfer_info
+                    sent_tokens = req.sent_tokens
+                    allocated_tokens = req.allocated_tokens
+
+                    ret, is_partial = self.send_embedding(
                         req.mooncake_session_id,
                         embedding_chunk.embedding_indices,
                         self.language_args_table[
@@ -357,6 +435,8 @@ class MooncakeEmbeddingManager(BaseKVManager):
                         req.dst_embedding_indices,
                         embedding_chunk.total_tokens,
                         block_size,
+                        sent_tokens,
+                        allocated_tokens,
                     )
                     if ret != 0:
                         with self.session_lock:
@@ -380,12 +460,26 @@ class MooncakeEmbeddingManager(BaseKVManager):
                         )
                         break
 
+                    # Update sent_tokens after successful transfer
+                    tokens_sent = min(
+                        embedding_chunk.total_tokens - sent_tokens, allocated_tokens
+                    )
+                    req.sent_tokens += tokens_sent
+
                     polls.append(True if ret == 0 else False)
                     dst_ranks_infos.append((req.endpoint, req.dst_port, req.room))
 
                     # Only sync status when all the dst ranks have received the embedding data
                     if len(polls) == req.required_dst_info_num:
-                        status = KVPoll.Success if all(polls) else KVPoll.Failed
+                        if is_partial:
+                            # Partial transfer complete, waiting for resume
+                            status = (
+                                KVPoll.Transferring if all(polls) else KVPoll.Failed
+                            )
+                        else:
+                            # Complete transfer done
+                            status = KVPoll.Success if all(polls) else KVPoll.Failed
+
                         self.update_status(req.room, status)
                         for endpoint, dst_port, room in dst_ranks_infos:
                             self.sync_status_to_language_endpoint(
@@ -426,17 +520,108 @@ class MooncakeEmbeddingManager(BaseKVManager):
                             del self.session_failures[mooncake_session_id]
                     continue
                 else:
-                    required_dst_info_num = int(waiting_req_bytes[5].decode("ascii"))
                     room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferEmbeddingInfo.from_zmq(waiting_req_bytes)
-                    )
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.update_status(room, KVPoll.WaitingForInput)
+                    # Check if this is a resume request (8 fields) or init request (7 fields)
+                    is_resume = len(waiting_req_bytes) >= 8
+
+                    if is_resume:
+                        # Resume request: update existing transfer_info and trigger transfer
+                        if (
+                            room in self.transfer_infos
+                            and mooncake_session_id in self.transfer_infos[room]
+                        ):
+                            transfer_info = TransferEmbeddingInfo.from_zmq(
+                                waiting_req_bytes
+                            )
+                            req = self.transfer_infos[room][mooncake_session_id]
+
+                            # Update the existing transfer_info with resume data
+                            req.sent_tokens = transfer_info.sent_tokens
+                            req.allocated_tokens = transfer_info.allocated_tokens
+                            req.dst_embedding_indices = (
+                                transfer_info.dst_embedding_indices
+                            )
+
+                            logger.debug(
+                                f"Resume transfer for room={room}, sent_tokens={transfer_info.sent_tokens}, "
+                                f"sent_tokens={transfer_info.sent_tokens}, "
+                                f"allocated_tokens={transfer_info.allocated_tokens}"
+                            )
+
+                            # Don't reset status - it should remain in current state (Transferring)
+
+                            req.resume_ready = True
+                            # Check if all sessions are ready for resume (similar to init logic)
+                            all_dst_ranks_ready = all(
+                                dst_req.resume_ready
+                                for dst_req in self.transfer_infos[room].values()
+                            )
+
+                            # Only trigger resume transfer when all dst ranks are ready
+                            if all_dst_ranks_ready:
+                                if (
+                                    req.src_embedding_indices is not None
+                                    and req.total_tokens > 0
+                                ):
+                                    # Calculate which queue to use (same as add_transfer_request)
+                                    dst_infos = self.transfer_infos[room].keys()
+                                    session_port_sum = sum(
+                                        int(session.split(":")[1])
+                                        for session in dst_infos
+                                    )
+                                    shard_idx = session_port_sum % len(
+                                        self.transfer_queues
+                                    )
+
+                                    # Add resume transfer chunk to queue (only once for all sessions)
+                                    self.transfer_queues[shard_idx].put(
+                                        TransferEmbeddingChunk(
+                                            room=room,
+                                            embedding_indices=req.src_embedding_indices,
+                                            is_last=True,  # Resume is always the last part
+                                            total_tokens=req.total_tokens,
+                                        )
+                                    )
+
+                                    logger.debug(
+                                        f"Resume transfer triggered: room={room}, "
+                                        f"queue_idx={shard_idx}, src_blocks={len(req.src_embedding_indices)}, "
+                                        f"all {len(self.transfer_infos[room])} sessions ready"
+                                    )
+                                    for dst_req in self.transfer_infos[room].values():
+                                        dst_req.resume_ready = (
+                                            False  # Reset for potential future resumes
+                                        )
+                                else:
+                                    logger.error(
+                                        f"Cannot trigger resume: missing src_embedding_indices or total_tokens "
+                                        f"for room={room} session={mooncake_session_id}"
+                                    )
+                            else:
+                                logger.debug(
+                                    f"Waiting for all dst ranks to be ready for resume: room={room}, "
+                                    f"ready={sum(dst_req.resume_ready for dst_req in self.transfer_infos[room].values())}/{len(self.transfer_infos[room])}"
+                                )
+                        else:
+                            logger.error(
+                                f"Cannot resume: room={room} session={mooncake_session_id} not found in transfer_infos"
+                            )
+                    else:
+                        # Init request: create new transfer_info
+                        required_dst_info_num = int(
+                            waiting_req_bytes[5].decode("ascii")
+                        )
+
+                        if room not in self.transfer_infos:
+                            self.transfer_infos[room] = {}
+
+                        self.transfer_infos[room][mooncake_session_id] = (
+                            TransferEmbeddingInfo.from_zmq(waiting_req_bytes)
+                        )
+                        # NOTE: after bootstrapping we can mark the req as waiting for input
+                        if len(self.transfer_infos[room]) == required_dst_info_num:
+                            self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=embedding_thread).start()
 
@@ -523,6 +708,11 @@ class MooncakeEmbeddingManager(BaseKVManager):
     ):
         """Add block-based transfer request to queue.
 
+        Note:
+            - This method is only called for initial transfer (by send_embedding)
+            - Resume transfers are triggered by Language side sending resume messages
+            - sent_tokens information is maintained in transfer_infos
+
         Args:
             bootstrap_room: Room ID for the request
             embedding_indices: List of source embedding indices
@@ -543,6 +733,14 @@ class MooncakeEmbeddingManager(BaseKVManager):
             # This means that the current rank is a dummy rank for this request,
             # and it has already been marked as success, so there is no need to
             # add further chunks into the transfer queue.
+            return
+
+        # Prevent duplicate transfer: if already in Transferring or Success state, skip
+        current_status = self.check_status(bootstrap_room)
+        if current_status in [KVPoll.Transferring, KVPoll.Success]:
+            logger.debug(
+                f"Skip duplicate transfer for room={bootstrap_room}, status={current_status}"
+            )
             return
 
         # NOTE(shangming): sharding according to the dst_infos to make sure
@@ -920,16 +1118,25 @@ class MooncakeEmbeddingReceiver(BaseKVReceiver):
     def init(
         self,
         embedding_indices: Optional[List[int]] = None,
+        allocated_tokens: Optional[int] = None,
     ):
         """Initialize receiver with embedding indices.
 
         Args:
             embedding_indices: List of embedding indices for block-based allocation
+            allocated_tokens: Number of tokens allocated by Language side
         """
         if embedding_indices is not None:
             embedding_indices_str = ",".join(str(idx) for idx in embedding_indices)
         else:
             embedding_indices_str = ""
+
+        # Calculate allocated_tokens if not provided
+        if allocated_tokens is None and embedding_indices is not None:
+            # Calculate from block indices
+            # block_size = aux_item_lens[1] / fill_ids.itemsize (assuming int32 = 4 bytes)
+            block_size = self.embedding_mgr.data_args.aux_item_lens[1] // 4
+            allocated_tokens = len(embedding_indices) * block_size
 
         for bootstrap_info in self.bootstrap_infos:
             self.embedding_server_url = (
@@ -948,6 +1155,42 @@ class MooncakeEmbeddingReceiver(BaseKVReceiver):
                             "ascii"
                         ),  # Send comma-separated embedding indices
                         str(self.required_dst_info_num).encode("ascii"),
+                        str(allocated_tokens).encode("ascii"),  # Send allocated tokens
+                    ]
+                )
+
+    def resume_transfer(
+        self,
+        embedding_indices: List[int],
+        sent_tokens: int,
+        allocated_tokens: int,
+    ):
+        """Resume transfer with new allocation after partial transfer.
+
+        Args:
+            embedding_indices: New block allocation for remaining data
+            sent_tokens: Number of tokens already transferred
+            allocated_tokens: Number of tokens in new allocation
+        """
+        embedding_indices_str = ",".join(str(idx) for idx in embedding_indices)
+
+        for bootstrap_info in self.bootstrap_infos:
+            self.embedding_server_url = (
+                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+            )
+
+            sock, lock = self._connect("tcp://" + self.embedding_server_url)
+            with lock:
+                sock.send_multipart(
+                    [
+                        str(self.bootstrap_room).encode("ascii"),
+                        get_local_ip_by_remote().encode("ascii"),
+                        str(self.embedding_mgr.rank_port).encode("ascii"),
+                        self.session_id.encode("ascii"),
+                        embedding_indices_str.encode("ascii"),  # New allocation
+                        str(self.required_dst_info_num).encode("ascii"),
+                        str(sent_tokens).encode("ascii"),  # Resume marker
+                        str(allocated_tokens).encode("ascii"),  # New allocation size
                     ]
                 )
 
