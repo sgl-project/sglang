@@ -86,7 +86,7 @@ jobs:
   pytest-rust:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: 4-gpu-a10
-    timeout-minutes: 25
+    timeout-minutes: 32
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -143,6 +143,12 @@ jobs:
           python3 -m pip --no-cache-dir install --upgrade --ignore-installed blinker
           python3 -m pip --no-cache-dir install --upgrade --break-system-packages genai-bench==0.0.2
           pytest -m e2e -s  -vv -o log_cli=true --log-cli-level=INFO
+
+      - name: Run Python E2E gRPC tests
+        run: |
+          bash scripts/killall_sglang.sh "nuk_gpus"
+          cd sgl-router
+          SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Upload benchmark results
         if: success()
