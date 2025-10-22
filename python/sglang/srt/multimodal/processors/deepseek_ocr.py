@@ -11,6 +11,7 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
     models = [DeepseekOCRForCausalLM]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        _processor.image_size = 640
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<image>", image_token_id=self._processor.image_token_id

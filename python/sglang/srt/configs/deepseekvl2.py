@@ -339,10 +339,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
                 - num_image_tokens (List[int]): the number of image tokens
         """
 
-        assert (
-            prompt is None or conversations is None
-        ), "prompt and conversations cannot be used at the same time."
-
         prompt = conversations or prompt
         (
             input_ids,

@@ -181,7 +181,7 @@ class TestDeepseekOCRServer(ImageOpenAITestMixin):
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         # image_url = "/root/sgl-workspace/afiles/screenshot.png"
-        image_url = "/root/sgl-workspace/afiles/ocr-text.png"
+        image_url = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/ocr-text.png"
 
         response = client.chat.completions.create(
             model="default",
