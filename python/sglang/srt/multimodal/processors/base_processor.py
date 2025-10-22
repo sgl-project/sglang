@@ -163,6 +163,7 @@ class MultimodalSpecialTokens:
         self.combined_regex = re.compile(combined, flags)
         return self.combined_regex
 
+
 class BaseMultimodalProcessor(ABC):
     models = []
 
@@ -283,7 +284,7 @@ class BaseMultimodalProcessor(ABC):
         return result
 
     @abstractmethod
-    def process_mm_data_async(
+    async def process_mm_data_async(
         self,
         image_data,
         audio_data,
@@ -606,7 +607,7 @@ class BaseMultimodalProcessor(ABC):
         collected_items = self.collect_mm_items_from_processor_output(ret)
 
         return collected_items, input_ids, ret
-    
+
     def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
