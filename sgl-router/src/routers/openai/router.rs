@@ -576,20 +576,19 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 Ok(chain) => {
                     let mut items = Vec::new();
                     for stored in chain.responses.iter() {
-                        // Convert input to conversation item
-                        items.push(ResponseInputOutputItem::Message {
-                            id: format!("msg_u_{}", stored.id.0.trim_start_matches("resp_")),
-                            role: "user".to_string(),
-                            content: vec![ResponseContentPart::InputText {
-                                text: stored.input.clone(),
-                            }],
-                            status: Some("completed".to_string()),
-                        });
+                        // Convert input items from stored input (which is now a JSON array)
+                        if let Some(input_arr) = stored.input.as_array() {
+                            for item in input_arr {
+                                if let Ok(input_item) =
+                                    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
+                                {
+                                    items.push(input_item);
+                                }
+                            }
+                        }
 
-                        // Convert output to conversation items directly from stored response
-                        if let Some(output_arr) =
-                            stored.raw_response.get("output").and_then(|v| v.as_array())
-                        {
+                        // Convert output items from stored output (which is now a JSON array)
+                        if let Some(output_arr) = stored.output.as_array() {
                             for item in output_arr {
                                 if let Ok(output_item) =
                                     serde_json::from_value::<ResponseInputOutputItem>(item.clone())
@@ -669,6 +668,24 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                                 status: Some("completed".to_string()),
                             });
                         }
+                        ResponseInput::SimpleItems(simple_items) => {
+                            // Convert SimpleItems to full Items format
+                            for item in simple_items {
+                                use crate::protocols::responses::StringOrContentArray;
+                                let content = match &item.content {
+                                    StringOrContentArray::String(s) => {
+                                        vec![ResponseContentPart::InputText { text: s.clone() }]
+                                    }
+                                    StringOrContentArray::Array(parts) => parts.clone(),
+                                };
+                                items.push(ResponseInputOutputItem::Message {
+                                    id: format!("msg_u_{}_{}", conv_id.0, items.len()),
+                                    role: item.role.clone(),
+                                    content,
+                                    status: Some("completed".to_string()),
+                                });
+                            }
+                        }
                         ResponseInput::Items(current_items) => {
                             items.extend_from_slice(current_items);
                         }
@@ -698,6 +715,24 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         content: vec![ResponseContentPart::InputText { text: text.clone() }],
                         status: Some("completed".to_string()),
                     });
+                }
+                ResponseInput::SimpleItems(simple_items) => {
+                    // Convert SimpleItems to full Items format
+                    for item in simple_items {
+                        use crate::protocols::responses::StringOrContentArray;
+                        let content = match &item.content {
+                            StringOrContentArray::String(s) => {
+                                vec![ResponseContentPart::InputText { text: s.clone() }]
+                            }
+                            StringOrContentArray::Array(parts) => parts.clone(),
+                        };
+                        items.push(ResponseInputOutputItem::Message {
+                            id: format!("msg_u_prev_{}", items.len()),
+                            role: item.role.clone(),
+                            content,
+                            status: Some("completed".to_string()),
+                        });
+                    }
                 }
                 ResponseInput::Items(current_items) => {
                     items.extend_from_slice(current_items);
@@ -874,6 +909,77 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 format!("Failed to contact upstream: {}", e),
             )
                 .into_response(),
+        }
+    }
+
+    async fn list_response_input_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        response_id: &str,
+    ) -> Response {
+        let resp_id = ResponseId::from(response_id);
+
+        match self.response_storage.get_response(&resp_id).await {
+            Ok(Some(stored)) => {
+                // Extract items from input field (which is a JSON array)
+                let items = match &stored.input {
+                    Value::Array(arr) => arr.clone(),
+                    _ => vec![],
+                };
+
+                // Generate IDs for items if they don't have them
+                let items_with_ids: Vec<Value> = items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, mut item)| {
+                        if item.get("id").is_none() {
+                            // Generate ID if not present
+                            let id = format!("item_input_{}_{}", response_id, idx);
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert("id".to_string(), json!(id));
+                            }
+                        }
+                        item
+                    })
+                    .collect();
+
+                let response_body = json!({
+                    "object": "list",
+                    "data": items_with_ids,
+                    "first_id": items_with_ids.first().and_then(|v| v.get("id").and_then(|i| i.as_str())),
+                    "last_id": items_with_ids.last().and_then(|v| v.get("id").and_then(|i| i.as_str())),
+                    "has_more": false
+                });
+
+                (StatusCode::OK, Json(response_body)).into_response()
+            }
+            Ok(None) => {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": {
+                            "message": format!("No response found with id '{}'", response_id),
+                            "type": "invalid_request_error",
+                            "param": Value::Null,
+                            "code": "not_found"
+                        }
+                    }))
+                ).into_response()
+            }
+            Err(e) => {
+                warn!("Failed to retrieve input items for {}: {}", response_id, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": {
+                            "message": format!("Failed to retrieve input items: {}", e),
+                            "type": "internal_error",
+                            "param": Value::Null,
+                            "code": "storage_error"
+                        }
+                    }))
+                ).into_response()
+            }
         }
     }
 

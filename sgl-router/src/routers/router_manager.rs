@@ -434,14 +434,21 @@ impl RouterTrait for RouterManager {
 
     async fn list_response_input_items(
         &self,
-        _headers: Option<&HeaderMap>,
-        _response_id: &str,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "responses api not yet implemented in inference gateway mode",
-        )
-            .into_response()
+        // Delegate to the default router (typically http-regular)
+        // Response storage is shared across all routers via AppContext
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.list_response_input_items(headers, response_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to list response input items",
+            )
+                .into_response()
+        }
     }
 
     async fn get_response(
