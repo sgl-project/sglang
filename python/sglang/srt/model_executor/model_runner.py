@@ -668,15 +668,27 @@ class ModelRunner:
                     self.model_config.hf_config, "quantization_config", None
                 )
             ) is not None:
-                text_config = self.model_config.hf_text_config
                 weight_block_size_n = quantization_config["weight_block_size"][0]
-                if (
-                    text_config.moe_intermediate_size
-                    // (self.tp_size // self.moe_ep_size)
-                ) % weight_block_size_n != 0:
+
+                if self.tp_size % self.moe_ep_size != 0:
                     raise ValueError(
-                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0. "
-                        f"You can fix this by using arguments such as `--tp-size 8 --ep-size 8`"
+                        f"tp_size {self.tp_size} must be divisible by moe_ep_size {self.moe_ep_size}"
+                    )
+                moe_tp_size = self.tp_size // self.moe_ep_size
+
+                moe_intermediate_size = (
+                    self.model_config.hf_text_config.moe_intermediate_size
+                )
+                if moe_intermediate_size % moe_tp_size != 0:
+                    raise ValueError(
+                        f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
+                    )
+
+                if (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0:
+                    raise ValueError(
+                        f"For qwen3-vl-fp8 models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
+                        f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size}). "
+                        f"You can fix this by setting arguments `--tp-size` and `--ep-size` correctly."
                     )
 
     def init_torch_distributed(self):
