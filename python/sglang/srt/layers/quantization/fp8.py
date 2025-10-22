@@ -1122,12 +1122,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         backend = get_moe_runner_backend()
         env_force = get_bool_env_var("SGLANG_CUTLASS_MOE")
         # TODO: remove env var in the future, it should be handled by moe runner backend
-        if env_force and (backend.is_cutlass() or backend.is_flashinfer_cutlass()):
-            return (
-                self.cutlass_fp8_supported
-                and self.block_quant
-                and (is_sm100_supported() or is_sm90_supported())
-            )
+        if env_force:
+            return True
         return (
             (backend.is_cutlass() or backend.is_flashinfer_cutlass())
             and self.cutlass_fp8_supported
