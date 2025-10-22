@@ -13,8 +13,10 @@ def test_mmlu(e2e_router_only_rr, e2e_two_workers_dp2, e2e_model):
     # Attach two dp=2 workers (total 4 GPUs) to a fresh router-only instance
     base = e2e_router_only_rr.url
     for w in e2e_two_workers_dp2:
-        r = requests.post(f"{base}/add_worker", params={"url": w.url}, timeout=180)
-        r.raise_for_status()
+        r = requests.post(f"{base}/workers", json={"url": w.url}, timeout=180)
+        assert (
+            r.status_code == 202
+        ), f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
 
     args = SimpleNamespace(
         base_url=base,
@@ -35,8 +37,10 @@ def test_genai_bench(
     """Attach a worker to the regular router and run a short genai-bench."""
     base = e2e_router_only_rr.url
     for w in e2e_two_workers_dp2:
-        r = requests.post(f"{base}/add_worker", params={"url": w.url}, timeout=180)
-        r.raise_for_status()
+        r = requests.post(f"{base}/workers", json={"url": w.url}, timeout=180)
+        assert (
+            r.status_code == 202
+        ), f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
 
     genai_bench_runner(
         router_url=base,
@@ -59,8 +63,8 @@ def test_add_and_remove_worker_live(e2e_router_only_rr, e2e_primary_worker, e2e_
     base = e2e_router_only_rr.url
     worker_url = e2e_primary_worker.url
 
-    r = requests.post(f"{base}/add_worker", params={"url": worker_url}, timeout=180)
-    r.raise_for_status()
+    r = requests.post(f"{base}/workers", json={"url": worker_url}, timeout=180)
+    assert r.status_code == 202, f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
 
     with requests.Session() as s:
         for i in range(8):
@@ -77,8 +81,11 @@ def test_add_and_remove_worker_live(e2e_router_only_rr, e2e_primary_worker, e2e_
             r.raise_for_status()
 
     # Remove the worker
-    r = requests.post(f"{base}/remove_worker", params={"url": worker_url}, timeout=60)
-    r.raise_for_status()
+    from urllib.parse import quote
+
+    encoded_url = quote(worker_url, safe="")
+    r = requests.delete(f"{base}/workers/{encoded_url}", timeout=60)
+    assert r.status_code == 202, f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
 
 
 @pytest.mark.e2e
@@ -86,8 +93,8 @@ def test_lazy_fault_tolerance_live(e2e_router_only_rr, e2e_primary_worker, e2e_m
     base = e2e_router_only_rr.url
     worker = e2e_primary_worker
 
-    r = requests.post(f"{base}/add_worker", params={"url": worker.url}, timeout=180)
-    r.raise_for_status()
+    r = requests.post(f"{base}/workers", json={"url": worker.url}, timeout=180)
+    assert r.status_code == 202, f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
 
     def killer():
         time.sleep(10)
@@ -129,12 +136,12 @@ def test_dp_aware_worker_expansion_and_api_key(
 
     # Attach worker; router should expand to dp_size logical workers
     r = requests.post(
-        f"{router_url}/add_worker",
-        params={"url": worker_url, "api_key": api_key},
+        f"{router_url}/workers",
+        json={"url": worker_url, "api_key": api_key},
         headers={"Authorization": f"Bearer {api_key}"},
         timeout=180,
     )
-    r.raise_for_status()
+    assert r.status_code == 202, f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
 
     r = requests.get(
         f"{router_url}/list_workers",

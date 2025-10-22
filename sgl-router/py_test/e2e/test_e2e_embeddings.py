@@ -12,8 +12,8 @@ def test_embeddings_basic(
     worker_url = e2e_primary_embedding_worker.url
 
     # Attach embedding worker to router-only instance
-    r = requests.post(f"{base}/add_worker", params={"url": worker_url}, timeout=180)
-    r.raise_for_status()
+    r = requests.post(f"{base}/workers", json={"url": worker_url}, timeout=180)
+    assert r.status_code == 202, f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
 
     # Simple embedding request with two inputs
     payload = {
