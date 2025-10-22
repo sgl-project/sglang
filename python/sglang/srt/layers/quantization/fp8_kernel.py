@@ -1831,3 +1831,21 @@ def triton_scaled_mm(
     )
 
     return result.to(out_dtype)
+
+
+if _is_cuda:
+    if enable_sgl_per_token_group_quant_8bit:
+
+        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_8bit")
+        def _(
+            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        ):
+            return
+
+    else:
+
+        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_fp8")
+        def _(
+            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        ):
+            return
