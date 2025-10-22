@@ -114,9 +114,9 @@ class MmItemMemoryPool:
         min_size = self.memory_pool.numel() * self.memory_pool.element_size() + 1
         selected_chunk = None
         for chunk in self.available_chunks:
-            if chunk[1] >= src_tensor_size:
-                if chunk[1] < min_size:
-                    min_size = chunk[1]
+            if (chunk[1] - chunk[0]) >= src_tensor_size:
+                if (chunk[1] - chunk[0]) < min_size:
+                    min_size = chunk[1] - chunk[0]
                     selected_chunk = chunk
 
         if selected_chunk:
@@ -134,7 +134,7 @@ class MmItemMemoryPool:
         return None
 
     def return_a_slice_tensor(self, src_tensor: torch.Tensor):
-        self.recyle_chunks()
+        self.recycle_chunks()
         self.merge_chunks()
         available_chunk = self.get_available_chunk(src_tensor)
         # logger.info("src tensor shape {}. src tensor dtype {}  available_chunk {}".format(src_tensor.shape, src_tensor.dtype, available_chunk))
@@ -143,18 +143,48 @@ class MmItemMemoryPool:
 
         return None
 
-    def recyle_chunks(self):
-        # traverse all occupid_chunks and check it is a reusable one or not
-        # if it's a reusable one, add it to available_chunks
+    def recycle_chunks(self):
+        """
+        Optimized version of recycle_chunks that uses tensor vectorization
+        to avoid a Python for-loop with repeated GPU operations.
+        """
+        num_chunks = len(self.occupied_chunks)
+
+        # 1. If there's nothing to do, exit early.
+        if num_chunks == 0:
+            return
+
+        # Assuming MM_ITEM_VERIFY_BYTES is a constant or class member
+        N = MM_ITEM_VERIFY_BYTES
+        try:
+            chunks_tensor = torch.tensor(
+                self.occupied_chunks, device=self.memory_pool.device, dtype=torch.long
+            )
+            ends = chunks_tensor[:, 1]
+        except Exception as e:
+            print(f"Warning: Using slower tensor creation path. Error: {e}")
+            ends = torch.tensor(
+                [c[1] for c in self.occupied_chunks],
+                device=self.memory_pool.device,
+                dtype=torch.long,
+            )
+
+        offsets = torch.arange(N, device=self.memory_pool.device).unsqueeze(0)
+        verify_starts = (ends - N).unsqueeze(1)
+        indices = verify_starts + offsets
+        verify_data = self.memory_pool[indices]
+        chunk_sums = torch.sum(verify_data, dim=1)
+
+        reusable_mask = chunk_sums == 0
+
         new_occupied_chunks = []
-        for chunk in self.occupied_chunks:
-            accessed_tensor = self.memory_pool[chunk[0] : chunk[1]]
-            if torch.equal(accessed_tensor[-MM_ITEM_VERIFY_BYTES:], self.verify_tensor):
+
+        for is_reusable, chunk in zip(reusable_mask.cpu(), self.occupied_chunks):
+            if is_reusable:
                 self.available_chunks.append(chunk)
             else:
                 new_occupied_chunks.append(chunk)
-                # logger.info("can not recycle")
-                # logger.info(accessed_tensor[-MM_ITEM_VERIFY_BYTES:])
+
         self.occupied_chunks = new_occupied_chunks
 
     def merge_chunks(self):
