@@ -411,6 +411,14 @@ fn default_repetition_penalty() -> f32 {
     1.0
 }
 
+fn default_temperature() -> Option<f32> {
+    Some(1.0)
+}
+
+fn default_top_p() -> Option<f32> {
+    Some(1.0)
+}
+
 // ============================================================================
 // Request/Response Types
 // ============================================================================
@@ -477,7 +485,10 @@ pub struct ResponsesRequest {
     pub stream: Option<bool>,
 
     /// Temperature for sampling
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "default_temperature",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub temperature: Option<f32>,
 
     /// Tool choice behavior
@@ -493,7 +504,7 @@ pub struct ResponsesRequest {
     pub top_logprobs: Option<u32>,
 
     /// Top-p sampling parameter
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_top_p", skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
     /// Truncation behavior
