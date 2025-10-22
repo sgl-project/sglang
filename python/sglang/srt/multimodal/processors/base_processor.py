@@ -620,7 +620,7 @@ class BaseMultimodalProcessor(ABC):
         return collected_items, input_ids, ret
 
     @lock_if_cuda_ipc
-    async def process_and_combine_mm_data(
+    def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,
