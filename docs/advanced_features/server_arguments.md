@@ -228,6 +228,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--sampling-backend` | Choose the kernels for sampling layers. | None |
 | `--grammar-backend` | Choose the backend for grammar-guided decoding. | None |
 | `--mm-attention-backend` | Set multimodal attention backend. | None |
+| `--nsa-prefill-backend` | Prefill attention implementation for nsa backend. | `flashmla_sparse` |
+| `--nsa-decode-backend` | Decode attention implementation for nsa backend. | `flashmla_kv` |
 
 ## Speculative decoding
 

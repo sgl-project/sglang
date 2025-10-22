@@ -112,10 +112,10 @@ class RotaryEmbedding(CustomOp):
         if not _is_cuda:
             cache = cache.to(dtype)
 
-        if (
+        if dtype == torch.float32 or (
             (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
             and not (_is_cpu and _is_cpu_amx_available)
-            and not _is_xpu
+            and not (_is_xpu)
         ):
             from vllm._custom_ops import rotary_embedding
 
@@ -254,7 +254,11 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cuda and (self.head_size in [64, 128, 256, 512]):
+        if (
+            _is_cuda
+            and (self.head_size in [64, 128, 256, 512])
+            and self.dtype != torch.float32
+        ):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -298,6 +302,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # TODO: make a wrapper, and XPU will implement this kernel later.
+        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
         return self.forward_native(positions, query, key, offsets)
 
 
@@ -1280,7 +1285,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
-    def forward_native(
+    def _forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1340,6 +1345,27 @@ class MRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with optional Triton kernel acceleration.
+        Args:
+            positions:
+                [num_tokens,] (text only) or
+                [3, num_tokens] (T/H/W positions with multimodal inputs)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        assert positions.ndim == 1 or positions.ndim == 2
+
+        if positions.ndim == 2 and self.mrope_section and _is_cuda:
+            return self._forward_triton(positions, query, key)
+        else:
+            return self._forward_native(positions, query, key)
+
+    def _forward_triton(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
         assert key is not None
