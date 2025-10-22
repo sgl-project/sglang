@@ -168,7 +168,7 @@ class RouterManager:
         )
 
     def remove_worker(
-        self, base_url: str, worker_url: str, timeout: float = 10.0
+        self, base_url: str, worker_url: str, timeout: float = 30.0
     ) -> None:
         # URL encode the worker_url for path parameter
         from urllib.parse import quote
@@ -181,6 +181,7 @@ class RouterManager:
 
         # Poll until worker is actually removed (GET returns 404) or timeout
         start = time.time()
+        last_status = None
         with requests.Session() as s:
             while time.time() - start < timeout:
                 try:
@@ -192,15 +193,22 @@ class RouterManager:
                         # Check if removal job failed
                         data = r.json()
                         job_status = data.get("job_status")
-                        if job_status and job_status.get("state") == "failed":
-                            raise RuntimeError(
-                                f"Worker removal failed: {job_status.get('message', 'Unknown error')}"
-                            )
+                        if job_status:
+                            last_status = job_status
+                            if job_status.get("state") == "failed":
+                                raise RuntimeError(
+                                    f"Worker removal failed: {job_status.get('message', 'Unknown error')}"
+                                )
                     # Worker still being processed, continue polling
                 except requests.RequestException:
                     pass
                 time.sleep(0.1)
-        raise TimeoutError(f"Worker {worker_url} was not removed after {timeout}s")
+
+        # Provide detailed timeout error with last known status
+        error_msg = f"Worker {worker_url} was not removed after {timeout}s"
+        if last_status:
+            error_msg += f". Last job status: {last_status}"
+        raise TimeoutError(error_msg)
 
     def list_workers(self, base_url: str) -> list[str]:
         r = requests.get(f"{base_url}/workers")

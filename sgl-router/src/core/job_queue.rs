@@ -452,7 +452,7 @@ impl JobQueue {
         };
 
         let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-        workflow_context.set("removal_request", Arc::new(removal_request));
+        workflow_context.set("removal_request", removal_request);
         workflow_context.set_arc("app_context", Arc::clone(context));
 
         engine
