@@ -269,10 +269,8 @@ class SchedulerOutputProcessorMixin:
         # We should ignore using next_token_ids for spec decoding cases.
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
-            if req.is_retracted:
-                continue
 
-            if self.enable_overlap and req.finished():
+            if self.enable_overlap and (req.finished() or req.is_retracted):
                 indices_to_free = None
                 if batch.spec_algorithm.is_eagle():
                     from sglang.srt.speculative.eagle_info import EagleDraftInput
