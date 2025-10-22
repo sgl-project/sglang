@@ -26,6 +26,8 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from sglang.srt.utils import get_int_env_var
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Req
 
@@ -197,10 +199,17 @@ def process_tracing_init(otlp_endpoint, server_name):
             resource=resource, id_generator=SglangTraceCustomIdGenerator()
         )
 
+        schedule_delay_millis = get_int_env_var(
+            "SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS", 500
+        )
+        max_export_batch_size = get_int_env_var(
+            "SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE", 64
+        )
+
         processor = BatchSpanProcessor(
             OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True),
-            schedule_delay_millis=500,
-            max_export_batch_size=64,
+            schedule_delay_millis=schedule_delay_millis,
+            max_export_batch_size=max_export_batch_size,
         )
         tracer_provider.add_span_processor(processor)
         trace.set_tracer_provider(tracer_provider)
