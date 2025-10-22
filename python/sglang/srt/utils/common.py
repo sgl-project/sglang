@@ -95,7 +95,7 @@ from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -1065,32 +1065,6 @@ def monkey_patch_p2p_access_check():
     )
 
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
-
-
-def monkey_patch_vllm_gguf_config():
-    try:
-        from vllm.model_executor.layers.quantization.gguf import (
-            GGUFConfig,
-            GGUFEmbeddingMethod,
-            GGUFLinearMethod,
-        )
-    except ImportError:
-        return
-
-    from sglang.srt.layers.linear import LinearBase
-    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-
-    def get_quant_method_with_embedding_replaced(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[QuantizeMethodBase]:
-        if isinstance(layer, LinearBase):
-            return GGUFLinearMethod(self)
-        elif isinstance(layer, VocabParallelEmbedding):
-            # patch to own VocabParallelEmbedding
-            return GGUFEmbeddingMethod(self)
-        return None
-
-    setattr(GGUFConfig, "get_quant_method", get_quant_method_with_embedding_replaced)
 
 
 def set_ulimit(target_soft_limit=65535):
