@@ -168,9 +168,9 @@ def lock_if_cuda_ipc(fn):
     async def wrapper(self, *args, **kwargs):
         if SGL_USE_CUDA_IPC:
             async with self._cache_lock:
-                return await fn(self, *args, **kwargs)
+                return await asyncio.to_thread(fn, self, *args, **kwargs)
         else:
-            return await fn(self, *args, **kwargs)
+            return await asyncio.to_thread(fn, self, *args, **kwargs)
 
     return wrapper
 
@@ -295,7 +295,7 @@ class BaseMultimodalProcessor(ABC):
         return result
 
     @abstractmethod
-    async def process_mm_data_async(
+    def process_mm_data_async(
         self,
         image_data,
         audio_data,
