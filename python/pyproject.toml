@@ -26,7 +26,7 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.4.0",
+  "flashinfer_python==0.4.1",
   "hf_transfer",
   "huggingface_hub",
   "interegular",
@@ -55,7 +55,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.15",
+  "sgl-kernel==0.3.16.post3",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
@@ -75,12 +75,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-tracing = [
-  "opentelemetry-api",
-  "opentelemetry-exporter-otlp",
-  "opentelemetry-exporter-otlp-proto-grpc",
-  "opentelemetry-sdk",
-]
+modelopt = ["nvidia-modelopt"]
 test = [
   "accelerate",
   "expecttest",
@@ -106,6 +101,12 @@ cu130_all = [
   "sglang[test]",
   "sglang[decord]",
   "sglang[cu130]"
+]
+tracing = [
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
 ]
 
 # To be deprecated in 2 weeks

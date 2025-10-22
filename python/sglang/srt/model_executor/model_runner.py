@@ -668,15 +668,27 @@ class ModelRunner:
                     self.model_config.hf_config, "quantization_config", None
                 )
             ) is not None:
-                text_config = self.model_config.hf_text_config
                 weight_block_size_n = quantization_config["weight_block_size"][0]
-                if (
-                    text_config.moe_intermediate_size
-                    // (self.tp_size // self.moe_ep_size)
-                ) % weight_block_size_n != 0:
+
+                if self.tp_size % self.moe_ep_size != 0:
                     raise ValueError(
-                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0. "
-                        f"You can fix this by using arguments such as `--tp-size 8 --ep-size 8`"
+                        f"tp_size {self.tp_size} must be divisible by moe_ep_size {self.moe_ep_size}"
+                    )
+                moe_tp_size = self.tp_size // self.moe_ep_size
+
+                moe_intermediate_size = (
+                    self.model_config.hf_text_config.moe_intermediate_size
+                )
+                if moe_intermediate_size % moe_tp_size != 0:
+                    raise ValueError(
+                        f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
+                    )
+
+                if (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0:
+                    raise ValueError(
+                        f"For qwen3-vl-fp8 models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
+                        f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size}). "
+                        f"You can fix this by setting arguments `--tp-size` and `--ep-size` correctly."
                     )
 
     def init_torch_distributed(self):
@@ -816,6 +828,16 @@ class ModelRunner:
         set_cuda_arch()
 
         # Prepare the model config
+        from sglang.srt.configs.modelopt_config import ModelOptConfig
+
+        modelopt_config = ModelOptConfig(
+            quant=self.server_args.modelopt_quant,
+            checkpoint_restore_path=self.server_args.modelopt_checkpoint_restore_path,
+            checkpoint_save_path=self.server_args.modelopt_checkpoint_save_path,
+            export_path=self.server_args.modelopt_export_path,
+            quantize_and_serve=self.server_args.quantize_and_serve,
+        )
+
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
@@ -824,6 +846,7 @@ class ModelRunner:
             remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+            modelopt_config=modelopt_config,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
