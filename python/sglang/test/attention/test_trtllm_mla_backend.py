@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
 )
-from sglang.srt.layers.attention.utils import TRITON_PAD_NUM_PAGE_PER_BLOCK
+from sglang.srt.layers.attention.utils import get_num_page_per_block_flashmla
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -918,7 +918,8 @@ class TestTRTLLMMLA(CustomTestCase):
                 # Should satisfy TRT-LLM and Triton constraints
                 trtllm_constraint = 128 // scenario["page_size"]
                 constraint_lcm = math.lcm(
-                    trtllm_constraint, TRITON_PAD_NUM_PAGE_PER_BLOCK
+                    trtllm_constraint,
+                    get_num_page_per_block_flashmla(scenario["page_size"]),
                 )
                 self.assertEqual(
                     calculated_blocks % constraint_lcm,
