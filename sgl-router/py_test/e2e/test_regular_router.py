@@ -144,12 +144,13 @@ def test_dp_aware_worker_expansion_and_api_key(
     assert r.status_code == 202, f"Expected 202 ACCEPTED, got {r.status_code}: {r.text}"
 
     r = requests.get(
-        f"{router_url}/list_workers",
+        f"{router_url}/workers",
         headers={"Authorization": f"Bearer {api_key}"},
         timeout=30,
     )
     r.raise_for_status()
-    urls = r.json().get("urls", [])
+    workers = r.json().get("workers", [])
+    urls = [w["url"] for w in workers]
     assert len(urls) == 2
     assert set(urls) == {f"{worker_url}@0", f"{worker_url}@1"}
 
