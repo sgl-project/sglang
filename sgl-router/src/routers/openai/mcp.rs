@@ -337,16 +337,8 @@ pub(super) fn build_resume_payload(
             });
             input_array.push(user_item);
         }
-        ResponseInput::SimpleItems(items) => {
-            // Convert SimpleInputItem to standard format
-            if let Ok(items_value) = to_value(items) {
-                if let Some(items_arr) = items_value.as_array() {
-                    input_array.extend_from_slice(items_arr);
-                }
-            }
-        }
         ResponseInput::Items(items) => {
-            // Items are already structured ResponseInputOutputItem, convert to JSON
+            // Items are ResponseInputOutputItem (including SimpleInputMessage), convert to JSON
             if let Ok(items_value) = to_value(items) {
                 if let Some(items_arr) = items_value.as_array() {
                     input_array.extend_from_slice(items_arr);

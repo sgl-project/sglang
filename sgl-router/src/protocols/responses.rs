@@ -94,22 +94,7 @@ pub enum ReasoningSummary {
 // Input/Output Items
 // ============================================================================
 
-/// Simple input item format for the new API (matches [{\"content\": \"...\", \"role\": \"...\"}])
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SimpleInputItem {
-    /// Content can be a string or array of content parts
-    pub content: StringOrContentArray,
-
-    /// Role of the message (user, assistant, system, developer)
-    pub role: String,
-
-    /// Type is always "message" if present (optional field)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "type")]
-    pub r#type: Option<String>,
-}
-
-/// Content can be either a simple string or array of content parts
+/// Content can be either a simple string or array of content parts (for SimpleInputMessage)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum StringOrContentArray {
@@ -147,6 +132,16 @@ pub enum ResponseInputOutputItem {
         output: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+    },
+    /// Simple message format without type tag: {\"content\": \"...\", \"role\": \"...\"}
+    /// Used for simplified input that matches OpenAI's chat message format
+    /// MUST be last due to #[serde(untagged)] requirement
+    #[serde(untagged)]
+    SimpleInputMessage {
+        /// Content can be a string or array of content parts (only InputText supported)
+        content: StringOrContentArray,
+        /// Role of the message (user, assistant, system, developer)
+        role: String,
     },
 }
 
@@ -572,13 +567,15 @@ pub struct ResponsesRequest {
 }
 
 /// Input for a response - supports multiple formats for flexibility
+///
+/// Note: Items can contain both tagged messages (with "type": "message")
+/// and untagged simple messages (just {\"content\": \"...\", \"role\": \"...\"})
+/// The SimpleInputMessage variant handles the untagged format.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ResponseInput {
-    /// Full item format with type tags
+    /// Item array - can contain Message, SimpleInputMessage, Reasoning, FunctionToolCall, etc.
     Items(Vec<ResponseInputOutputItem>),
-    /// Simple message array: [{\"content\": \"...\", \"role\": \"...\"}]
-    SimpleItems(Vec<SimpleInputItem>),
     /// Plain text string
     Text(String),
 }
@@ -632,28 +629,6 @@ impl GenerationRequest for ResponsesRequest {
     fn extract_text_for_routing(&self) -> String {
         match &self.input {
             ResponseInput::Text(text) => text.clone(),
-            ResponseInput::SimpleItems(items) => items
-                .iter()
-                .filter_map(|item| match &item.content {
-                    StringOrContentArray::String(s) => Some(s.clone()),
-                    StringOrContentArray::Array(parts) => {
-                        let texts: Vec<String> = parts
-                            .iter()
-                            .filter_map(|part| match part {
-                                ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
-                                ResponseContentPart::InputText { text } => Some(text.clone()),
-                                ResponseContentPart::Unknown => None,
-                            })
-                            .collect();
-                        if texts.is_empty() {
-                            None
-                        } else {
-                            Some(texts.join(" "))
-                        }
-                    }
-                })
-                .collect::<Vec<String>>()
-                .join(" "),
             ResponseInput::Items(items) => items
                 .iter()
                 .filter_map(|item| match item {
@@ -670,6 +645,26 @@ impl GenerationRequest for ResponsesRequest {
                             None
                         } else {
                             Some(texts.join(" "))
+                        }
+                    }
+                    ResponseInputOutputItem::SimpleInputMessage { content, .. } => {
+                        match content {
+                            StringOrContentArray::String(s) => Some(s.clone()),
+                            StringOrContentArray::Array(parts) => {
+                                // SimpleInputMessage only supports InputText, not OutputText
+                                let texts: Vec<String> = parts
+                                    .iter()
+                                    .filter_map(|part| match part {
+                                        ResponseContentPart::InputText { text } => Some(text.clone()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                if texts.is_empty() {
+                                    None
+                                } else {
+                                    Some(texts.join(" "))
+                                }
+                            }
                         }
                     }
                     ResponseInputOutputItem::Reasoning { content, .. } => {
