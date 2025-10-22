@@ -161,7 +161,7 @@ class TestDeepseekOCRServer(ImageOpenAITestMixin):
         assert isinstance(text, str)
 
         # DeepSeek-OCR uses grounding format, outputs coordinates
-        assert "image" in text.lower(), f"OCR text: {text}, should contain 'image'"
+        assert "text" in text.lower(), f"OCR text: {text}, should contain 'text'"
 
         # Verify coordinate format [[x1, y1, x2, y2]]
         import re

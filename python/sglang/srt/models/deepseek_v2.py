@@ -2407,12 +2407,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         self.layer_id = layer_id
         self.is_nextn = is_nextn
-        if getattr(config, "use_mla", True):
-            self_attn_cls = DeepseekV2AttentionMLA
-        else:
-            self_attn_cls = DeepseekV2Attention
-
-        self.self_attn = self_attn_cls(
+        self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,

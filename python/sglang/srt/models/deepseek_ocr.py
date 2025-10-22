@@ -1251,10 +1251,8 @@ class DeepseekOCRForCausalLM(nn.Module):
         images_in_this_batch = []
 
         with torch.no_grad():
-            print(f"DEBUG: {images_spatial_crop.size()=}")
             for jdx in range(images_spatial_crop.size(0)):
                 patches = images_crop[jdx][0].to(torch.bfloat16)
-                print(f"DEBUG: {patches.size()=}, {torch.sum(patches).item()=}")
                 image_ori = pixel_values[jdx]
                 crop_shape = images_spatial_crop[jdx][0]
 
@@ -1366,20 +1364,17 @@ class DeepseekOCRForCausalLM(nn.Module):
         pixel_values = torch.stack([item.feature for item in mm_items], dim=0).type(
             self.vision_model.dtype
         )
-        print(f"DEBUG: {pixel_values.size()=}")
 
         images_crop = (
             torch.stack([item.images_crop for item in mm_items], dim=0)
-            .type(self.vision_model.dtype)
+            .type(torch.long)
             .to(device=pixel_values.device)
         )
-        print(f"DEBUG: {images_crop.size()=}")
         images_spatial_crop = (
             torch.cat([item.images_spatial_crop for item in mm_items], dim=0)
-            .type(self.vision_model.dtype)
+            .type(torch.long)
             .to(device=pixel_values.device)
         )
-        print(f"DEBUG: {images_spatial_crop.size()=}")
 
         assert images_crop.dim() == 6
         assert images_spatial_crop.dim() == 3
