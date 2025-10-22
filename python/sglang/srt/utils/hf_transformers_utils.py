@@ -111,6 +111,12 @@ def get_hf_text_config(config: PretrainedConfig):
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
         return config.text_config
+
+    if hasattr(config, "llm_config"):
+        # PointsV1.5 Chat Model
+        assert hasattr(config.llm_config, "num_attention_heads")
+        return config.llm_config
+
     if hasattr(config, "language_config"):
         return config.language_config
     if hasattr(config, "thinker_config"):

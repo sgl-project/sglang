@@ -410,7 +410,7 @@ impl RouterTrait for RouterManager {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let selected_model = body.model.as_deref().or(model_id);
+        let selected_model = model_id.or(Some(body.model.as_str()));
         let router = self.select_router_for_request(headers, selected_model);
 
         if let Some(router) = router {

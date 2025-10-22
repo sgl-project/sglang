@@ -165,18 +165,14 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::OpenAI { worker_urls } => {
-                // Require exactly one worker URL for OpenAI router
-                if worker_urls.len() != 1 {
+                // Require at least one worker URL for OpenAI router
+                if worker_urls.is_empty() {
                     return Err(ConfigError::ValidationFailed {
-                        reason: "OpenAI mode requires exactly one --worker-urls entry".to_string(),
+                        reason: "OpenAI mode requires at least one --worker-urls entry".to_string(),
                     });
                 }
-                // Validate URL format
-                if let Err(e) = url::Url::parse(&worker_urls[0]) {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: format!("Invalid OpenAI worker URL '{}': {}", &worker_urls[0], e),
-                    });
-                }
+                // Validate URLs
+                Self::validate_urls(worker_urls)?;
             }
         }
         Ok(())

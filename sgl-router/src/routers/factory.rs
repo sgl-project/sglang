@@ -55,7 +55,7 @@ impl RouterFactory {
                     )
                     .await
                 }
-                RoutingMode::OpenAI { worker_urls, .. } => {
+                RoutingMode::OpenAI { worker_urls } => {
                     Self::create_openai_router(worker_urls.clone(), ctx).await
                 }
             },
@@ -122,13 +122,12 @@ impl RouterFactory {
         worker_urls: Vec<String>,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        let base_url = worker_urls
-            .first()
-            .cloned()
-            .ok_or_else(|| "OpenAI mode requires at least one worker URL".to_string())?;
+        if worker_urls.is_empty() {
+            return Err("OpenAI mode requires at least one worker URL".to_string());
+        }
 
         let router = OpenAIRouter::new(
-            base_url,
+            worker_urls,
             Some(ctx.router_config.circuit_breaker.clone()),
             ctx.response_storage.clone(),
             ctx.conversation_storage.clone(),
