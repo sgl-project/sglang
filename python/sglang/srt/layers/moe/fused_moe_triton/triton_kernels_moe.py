@@ -13,7 +13,8 @@ from triton_kernels.matmul_ogs import (
     PrecisionConfig,
     matmul_ogs,
 )
-from triton_kernels.numerics import InFlexData
+from triton_kernels.numerics import InFlexData, MicroscalingCtx
+from triton_kernels.quantization import downcast_to_mxfp
 from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
 
@@ -119,14 +120,14 @@ def triton_kernel_fused_experts(
     block_shape: Optional[list[int]] = None,
 ) -> torch.Tensor:
 
-    assert use_fp8_w8a8 == False, "use_fp8_w8a8 is not supported"
-    assert per_channel_quant == False, "per_channel_quant is not supported"
-    assert expert_map == None, "expert_map is not supported"
-    assert w1_scale == None, "w1_scale is not supported"
-    assert w2_scale == None, "w2_scale is not supported"
-    assert a1_scale == None, "a1_scale is not supported"
-    assert a2_scale == None, "a2_scale is not supported"
-    assert block_shape == None, "block_shape is not supported"
+    assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
+    assert per_channel_quant is False, "per_channel_quant is not supported"
+    assert expert_map is None, "expert_map is not supported"
+    assert w1_scale is None, "w1_scale is not supported"
+    assert w2_scale is None, "w2_scale is not supported"
+    assert a1_scale is None, "a1_scale is not supported"
+    assert a2_scale is None, "a2_scale is not supported"
+    assert block_shape is None, "block_shape is not supported"
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
@@ -143,7 +144,7 @@ def triton_kernel_fused_experts(
     ), f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
 
     # feature check
-    assert inplace == False, "Inplace is not supported in new triton MoE kernel"
+    assert inplace is False, "Inplace is not supported in new triton MoE kernel"
 
     M, K = hidden_states.shape
     E, _, N = w1.shape
@@ -264,14 +265,14 @@ def triton_kernel_fused_experts_with_bias(
     gemm1_alpha: Optional[float] = None,
     gemm1_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
-    assert use_fp8_w8a8 == False, "use_fp8_w8a8 is not supported"
-    assert per_channel_quant == False, "per_channel_quant is not supported"
-    assert expert_map == None, "expert_map is not supported"
-    assert w1_scale == None, "w1_scale is not supported"
-    assert w2_scale == None, "w2_scale is not supported"
-    assert a1_scale == None, "a1_scale is not supported"
-    assert a2_scale == None, "a2_scale is not supported"
-    assert block_shape == None, "block_shape is not supported"
+    assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
+    assert per_channel_quant is False, "per_channel_quant is not supported"
+    assert expert_map is None, "expert_map is not supported"
+    assert w1_scale is None, "w1_scale is not supported"
+    assert w2_scale is None, "w2_scale is not supported"
+    assert a1_scale is None, "a1_scale is not supported"
+    assert a2_scale is None, "a2_scale is not supported"
+    assert block_shape is None, "block_shape is not supported"
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
@@ -290,7 +291,7 @@ def triton_kernel_fused_experts_with_bias(
     ), f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
 
     # feature check
-    assert inplace == False, "Inplace is not supported in new triton MoE kernel"
+    assert inplace is False, "Inplace is not supported in new triton MoE kernel"
 
     E, _, _ = w1.shape
 

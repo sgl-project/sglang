@@ -749,29 +749,41 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             ] {
                 obj.remove(key);
             }
-            // XAI doesn't support the OPENAI item type input: https://platform.openai.com/docs/api-reference/responses/create#responses-create-input-input-item-list-item
-            // To Achieve XAI compatibility, strip extra fields from input messages (id, status)
-            // XAI doesn't support output_text as type for content with role of assistant
-            // so normalize content types: output_text -> input_text
-            if let Some(input_arr) = obj.get_mut("input").and_then(Value::as_array_mut) {
-                for item_obj in input_arr.iter_mut().filter_map(Value::as_object_mut) {
-                    // Remove fields not universally supported
-                    item_obj.remove("id");
-                    item_obj.remove("status");
+            // XAI (Grok models) requires special handling of input items
+            // Check if model is a Grok model
+            let is_grok_model = obj
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(|m| m.starts_with("grok"))
+                .unwrap_or(false);
 
-                    // Normalize content types to input_text (xAI compatibility)
-                    if let Some(content_arr) =
-                        item_obj.get_mut("content").and_then(Value::as_array_mut)
-                    {
-                        for content_obj in content_arr.iter_mut().filter_map(Value::as_object_mut) {
-                            // Change output_text to input_text
-                            if content_obj.get("type").and_then(Value::as_str)
-                                == Some("output_text")
+            if is_grok_model {
+                // XAI doesn't support the OPENAI item type input: https://platform.openai.com/docs/api-reference/responses/create#responses-create-input-input-item-list-item
+                // To Achieve XAI compatibility, strip extra fields from input messages (id, status)
+                // XAI doesn't support output_text as type for content with role of assistant
+                // so normalize content types: output_text -> input_text
+                if let Some(input_arr) = obj.get_mut("input").and_then(Value::as_array_mut) {
+                    for item_obj in input_arr.iter_mut().filter_map(Value::as_object_mut) {
+                        // Remove fields not universally supported
+                        item_obj.remove("id");
+                        item_obj.remove("status");
+
+                        // Normalize content types to input_text (xAI compatibility)
+                        if let Some(content_arr) =
+                            item_obj.get_mut("content").and_then(Value::as_array_mut)
+                        {
+                            for content_obj in
+                                content_arr.iter_mut().filter_map(Value::as_object_mut)
                             {
-                                content_obj.insert(
-                                    "type".to_string(),
-                                    Value::String("input_text".to_string()),
-                                );
+                                // Change output_text to input_text
+                                if content_obj.get("type").and_then(Value::as_str)
+                                    == Some("output_text")
+                                {
+                                    content_obj.insert(
+                                        "type".to_string(),
+                                        Value::String("input_text".to_string()),
+                                    );
+                                }
                             }
                         }
                     }
