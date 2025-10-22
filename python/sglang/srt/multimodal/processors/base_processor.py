@@ -168,9 +168,9 @@ def lock_if_cuda_ipc(fn):
     async def wrapper(self, *args, **kwargs):
         if SGL_USE_CUDA_IPC:
             async with self._cache_lock:
-                return await asyncio.to_thread(fn, self, *args, **kwargs)
+                return await fn(self, *args, **kwargs)
         else:
-            return await asyncio.to_thread(fn, self, *args, **kwargs)
+            return await fn(self, *args, **kwargs)
 
     return wrapper
 
@@ -620,7 +620,7 @@ class BaseMultimodalProcessor(ABC):
         return collected_items, input_ids, ret
 
     @lock_if_cuda_ipc
-    def process_and_combine_mm_data(
+    async def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,

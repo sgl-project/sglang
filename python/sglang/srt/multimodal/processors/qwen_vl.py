@@ -295,14 +295,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
         if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            mm_items, input_ids, ret =  await self.process_and_combine_mm_data(
                 base_output,
                 self.mm_tokens,
                 video_metadata=video_metadata,
                 do_sample_frames=False,
             )
         else:
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            mm_items, input_ids, ret = await self.process_and_combine_mm_data(
                 base_output, self.mm_tokens
             )
 
