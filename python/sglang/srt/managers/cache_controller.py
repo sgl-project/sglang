@@ -400,6 +400,7 @@ class HiCacheController:
             config.should_split_heads = (
                 not config.is_mla_model
                 and self.mem_pool_host.layout == "page_head"
+                and config.prefill_tp_size is not None
                 and config.decode_tp_size < config.prefill_tp_size
             )
 

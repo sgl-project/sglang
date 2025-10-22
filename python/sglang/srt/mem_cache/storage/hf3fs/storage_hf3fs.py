@@ -164,8 +164,7 @@ class HiCacheHF3FS(HiCacheStorage):
         is_mla_model: bool = False,
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
-        should_split_heads: bool = False,
-        attn_tp_info: Optional[Tuple[int, int, bool]] = None,
+        attn_tp_info: Optional[Tuple[int, int, bool, bool]] = None,
     ):
         self.rank = rank
         self.file_path_prefix = file_path_prefix
@@ -179,15 +178,19 @@ class HiCacheHF3FS(HiCacheStorage):
         self.is_page_first_layout = is_page_first_layout
         self.skip_backup = False
         self.use_mock_client = use_mock_client
-        self.should_split_heads = should_split_heads
         if self.is_mla_model and self.rank != 0:
             self.skip_backup = True
             self.rank = 0
 
         self.is_zero_copy = False
 
-        self.decode_tp_size, self.prefill_tp_size, self.is_decode_side = (
-            attn_tp_info if attn_tp_info else (None, None, False)
+        (
+            self.decode_tp_size,
+            self.prefill_tp_size,
+            self.is_decode_side,
+            self.should_split_heads,
+        ) = (
+            attn_tp_info if attn_tp_info else (None, None, False, False)
         )
         self.split_factor = 1
         self.target_ranks = [self.rank]
@@ -260,7 +263,6 @@ class HiCacheHF3FS(HiCacheStorage):
         bytes_per_page: int,
         dtype: torch.dtype,
         storage_config: HiCacheStorageConfig = None,
-        mem_pool_host: Optional[HostKVCache] = None,
     ) -> "HiCacheHF3FS":
         """Create a HiCacheHF3FS instance from environment configuration.
 
@@ -296,7 +298,12 @@ class HiCacheHF3FS(HiCacheStorage):
             )
 
         attn_tp_info = (
-            (storage_config.decode_tp_size, storage_config.prefill_tp_size, True)
+            (
+                storage_config.decode_tp_size,
+                storage_config.prefill_tp_size,
+                storage_config.is_decode_side,
+                storage_config.should_split_heads,
+            )
             if storage_config.is_decode_side
             else None
         )
@@ -319,7 +326,6 @@ class HiCacheHF3FS(HiCacheStorage):
                 is_page_first_layout=is_page_first_layout,
                 use_mock_client=use_mock_client,
                 attn_tp_info=attn_tp_info,
-                mem_pool_host=mem_pool_host,
             )
 
         try:
@@ -370,7 +376,6 @@ class HiCacheHF3FS(HiCacheStorage):
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
             attn_tp_info=attn_tp_info,
-            mem_pool_host=mem_pool_host,
         )
 
     @synchronized()
@@ -631,7 +636,9 @@ class HiCacheHF3FS(HiCacheStorage):
         results = self._batch_get(keys, values)
         return self._batch_get_postprocess(host_indices, values, results)
 
-    def _batch_set_preprocess(self, keys, host_indices, head_slice=None):
+    def _batch_set_preprocess(
+        self, keys, host_indices, head_slice: Optional[Tuple[int, int]] = None
+    ):
         page_num = len(host_indices) // self.mem_pool_host.page_size
         flat = not self.is_zero_copy
         values = [
@@ -652,7 +659,7 @@ class HiCacheHF3FS(HiCacheStorage):
         keys: List[str],
         host_indices: torch.Tensor,
         target_rank: int,
-        head_slice: Tuple[int, int],
+        head_slice: Optional[Tuple[int, int]] = None,
     ) -> List[bool]:
         split_keys, split_values = self._batch_set_preprocess(
             keys, host_indices, head_slice=head_slice
@@ -667,8 +674,7 @@ class HiCacheHF3FS(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         if self.split_factor == 1:
-            keys, values = self._batch_set_preprocess(keys, host_indices)
-            return self._batch_set(keys, values)
+            return self._write_single_rank(keys, host_indices, self.rank)
 
         head_num = self.mem_pool_host.head_num
         heads_per_split = head_num // self.split_factor
