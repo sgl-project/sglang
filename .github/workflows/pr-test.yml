@@ -100,10 +100,6 @@ jobs:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - uses: actions/checkout@v4
 
@@ -117,7 +113,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -133,10 +129,6 @@ jobs:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - uses: actions/checkout@v4
 
@@ -150,7 +142,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -166,10 +158,6 @@ jobs:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       CI: true
@@ -186,7 +174,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -214,7 +202,7 @@ jobs:
   cuda13-kernel-smoke-test:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 4-gpu-l40s-cu13
+    runs-on: x64-cu13-kernel-tests
     steps:
       - uses: actions/checkout@v4
 
@@ -247,10 +235,6 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -261,7 +245,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -281,7 +265,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda-version: ["12.9"]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
       - name: Checkout code
@@ -293,7 +276,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -313,7 +296,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda-version: ["12.9"]
         part: [0, 1]
     steps:
       - name: Checkout code
@@ -325,7 +307,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -345,7 +327,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda-version: ["12.9"]
         part: [0, 1]
     steps:
       - name: Checkout code
@@ -357,7 +338,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -373,7 +354,6 @@ jobs:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-
     runs-on: 8-gpu-h200
     strategy:
       fail-fast: false
@@ -389,7 +369,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -439,10 +419,6 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -453,7 +429,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -502,10 +478,6 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -516,7 +488,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -557,10 +529,6 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -571,7 +539,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -594,10 +562,6 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -608,7 +572,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -655,10 +619,6 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -669,7 +629,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -689,10 +649,6 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -703,7 +659,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -723,10 +679,6 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-h100
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -737,7 +689,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -754,10 +706,6 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -768,7 +716,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -814,8 +762,6 @@ jobs:
     runs-on: 4-gpu-b200
     strategy:
       fail-fast: false
-      matrix:
-        cuda-version: ["12.9"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -826,7 +772,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda${{ matrix.cuda-version }}
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
