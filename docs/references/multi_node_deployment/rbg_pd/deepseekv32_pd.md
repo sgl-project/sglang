@@ -13,7 +13,7 @@ For RBG installation, please refer to: https://github.com/sgl-project/rbg
 `lmsysorg/sglang:latest`
 
 
-### 2. All In One manifest file 
+### 2. All In One manifest file
 
 *Note: The NodeSelector section, model location section, and taint toleration section can be adjusted according to your actual deployment environment*
 
@@ -28,7 +28,7 @@ metadata:
 spec:
   roles:
     - name: prefill
-      replicas: 1 
+      replicas: 1
       workload:
         apiVersion: leaderworkerset.x-k8s.io/v1
         kind: LeaderWorkerSet
@@ -48,14 +48,14 @@ spec:
               - sglang.launch_server
               - --model-path
               - /work/models
-              - --port 
+              - --port
               - "30000"
-              - --trust-remote 
+              - --trust-remote
               - --host
-              -  0.0.0.0 
+              -  0.0.0.0
               - --disable-radix-cache
               - --disaggregation-ib-device
-              -  mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7 
+              -  mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
               - --disable-radix-cache
               - --chunked-prefill-size
               - "131072"
@@ -124,7 +124,7 @@ spec:
               - containerPort: 30000
                 name: sglang-http
                 protocol: TCP
-    
+
         patchWorkerTemplate: {}
       template:
         metadata:
@@ -173,9 +173,9 @@ spec:
                 - name: NCCL_MIN_NCHANNELS
                   value: "4"
                 - name: NCCL_SOCKET_IFNAME
-                  value: bond0 
+                  value: bond0
                 - name: GLOO_SOCKET_IFNAME
-                  value: bond0 
+                  value: bond0
                 - name: NCCL_IB_HCA
                   value: ^=mlx5_0,mlx5_5,mlx5_6
                 - name: NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME
@@ -198,7 +198,7 @@ spec:
                 - mountPath: /work/models
                   name: model
                 - mountPath: /dev/infiniband
-                  name: ib              
+                  name: ib
                 - mountPath: /sgl-workspace/sglang
                   name: src
 
@@ -206,10 +206,10 @@ spec:
             hostIPC: true
             hostNetwork: true
             nodeSelector:
-              pd: "yes" 
-            tolerations: 
+              pd: "yes"
+            tolerations:
               - key: pd
-                operator: Exists 
+                operator: Exists
             volumes:
             - hostPath:
                 path: /var/run/sys-topology
@@ -233,12 +233,12 @@ spec:
               name: src
 
     - name: decode
-      replicas: 1 
+      replicas: 1
       workload:
         apiVersion: leaderworkerset.x-k8s.io/v1
         kind: LeaderWorkerSet
       leaderWorkerSet:
-        size: 1 
+        size: 1
         patchLeaderTemplate:
           metadata:
             labels:
@@ -310,7 +310,7 @@ spec:
                 initialDelaySeconds: 300
                 periodSeconds: 60
                 successThreshold: 1
-                timeoutSeconds: 10 
+                timeoutSeconds: 10
               name: sglang
               readinessProbe:
                 failureThreshold: 20
@@ -339,11 +339,11 @@ spec:
                 - --page-size
                 - "64"
                 - --enable-dp-attention
-                - --enable-dp-lm-head 
+                - --enable-dp-lm-head
                 - --dp-size
                 - "32"
                 - --moe-a2a-backend
-                - "deepep" 
+                - "deepep"
                 - --deepep-mode
                 - low_latency
                 - --disaggregation-mode
@@ -353,7 +353,7 @@ spec:
                 - --context-length
                 - "32768"
                 - --disaggregation-ib-device
-                -  mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7 
+                -  mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
                 - --max-running-requests
                 - "4096"
                 - --cuda-graph-max-bs
@@ -408,7 +408,7 @@ spec:
               env:
                 - name: SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK
                   value: "1"
-                - name: SGLANG_DISAGGREGATION_WAITING_TIMEOUT 
+                - name: SGLANG_DISAGGREGATION_WAITING_TIMEOUT
                   value: "100000000"
                 - name: NVSHMEM_DISABLE_P2P
                   value: "0"
@@ -453,9 +453,9 @@ spec:
             dnsPolicy: ClusterFirstWithHostNet
             hostIPC: true
             hostNetwork: true
-            nodeSelector: 
+            nodeSelector:
               pd: "yes"
-            tolerations: 
+            tolerations:
             - key: pd
               operator: Exists
             volumes:
@@ -514,8 +514,8 @@ apiVersion: v1
 kind: Service
 metadata:
   labels:
-    app: deepseek-rbg-32exp 
-  name: deepseek-rbg-32exp 
+    app: deepseek-rbg-32exp
+  name: deepseek-rbg-32exp
   namespace: default
 spec:
   ports:
@@ -524,9 +524,9 @@ spec:
       protocol: TCP
       targetPort: 8080
       nodePort: 30080
-  
+
   selector:
-    rolebasedgroup.workloads.x-k8s.io/name: deepseek-rbg-32exp 
+    rolebasedgroup.workloads.x-k8s.io/name: deepseek-rbg-32exp
     rolebasedgroup.workloads.x-k8s.io/role: router
   type: NodePort
 
