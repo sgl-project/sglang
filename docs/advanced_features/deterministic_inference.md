@@ -16,14 +16,19 @@ The main source is **varying batch sizes**. Different batch sizes cause GPU kern
 
 ## SGLang's Solution
 
-Building on [Thinking Machines Lab's batch-invariant operators](https://github.com/thinking-machines-lab/batch_invariant_ops), SGLang achieves fully deterministic inference while maintaining compatibility with chunked prefill, CUDA graphs, radix cache, and non-greedy sampling. With CUDA graphs, SGLang delivers 2.8x acceleration and reduces performance overhead to just 34.35% (vs. TML's 61.5%). 
+Building on [Thinking Machines Lab's batch-invariant operators](https://github.com/thinking-machines-lab/batch_invariant_ops), SGLang achieves fully deterministic inference while maintaining compatibility with chunked prefill, CUDA graphs, radix cache, and non-greedy sampling.
 
 ### Supported Backends
 
-Deterministic inference is supported on the following attention backends:
-- **FlashInfer**
-- **FlashAttention 3 (FA3)**
-- **Triton**
+Deterministic inference is only supported with the following three attention backends: **FlashInfer**, **FlashAttention 3 (FA3)**, and **Triton**.
+
+The following table shows feature compatibility for deterministic inference across different attention backends:
+
+| Attention Backend | CUDA Graph | Chunked Prefill | Radix Cache | Non-greedy Sampling |
+|-------------------|------------|-----------------|-------------|---------------------|
+| **FlashInfer** | ✅ Yes | ✅ Yes | ❌ No | ✅ Yes |
+| **FlashAttention 3 (FA3)** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes |
+| **Triton** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes |
 
 ## Usage
 
