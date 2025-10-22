@@ -1065,7 +1065,11 @@ async fn load_conversation_history(
                         // Process all item types, converting SimpleInputMessage to Message
                         for item in current_items {
                             match item {
-                                ResponseInputOutputItem::SimpleInputMessage { content, role } => {
+                                ResponseInputOutputItem::SimpleInputMessage {
+                                    content,
+                                    role,
+                                    ..
+                                } => {
                                     use crate::protocols::responses::StringOrContentArray;
                                     let content_vec = match content {
                                         StringOrContentArray::String(s) => {
@@ -1118,7 +1122,7 @@ async fn load_conversation_history(
                 // Process all item types, converting SimpleInputMessage to Message
                 for item in current_items {
                     match item {
-                        ResponseInputOutputItem::SimpleInputMessage { content, role } => {
+                        ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
                             use crate::protocols::responses::StringOrContentArray;
                             let content_vec = match content {
                                 StringOrContentArray::String(s) => {
