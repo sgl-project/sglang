@@ -34,18 +34,6 @@ OUTPUT_PATH = ""
 
 PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
 
-# PROMPT = '<image>\nFree OCR.'
-# TODO commonly used prompts
-# document: <image>\n<|grounding|>Convert the document to markdown.
-# other image: <image>\n<|grounding|>OCR this image.
-# without layouts: <image>\nFree OCR.
-# figures in document: <image>\nParse the figure.
-# general: <image>\nDescribe this image in detail.
-# rec: <image>\nLocate <|ref|>xxxx<|/ref|> in the image.
-# '先天下之忧而忧'
-# .......
-
-
 TOKENIZER = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 
 
@@ -345,19 +333,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
             "images_spatial_crop": images_spatial_crop,
             "num_image_tokens": num_image_tokens,
         }
-
-        # prepare = BatchFeature(
-        #     data=dict(
-        #         input_ids=input_ids,
-        #         pixel_values=pixel_values,
-        #         images_crop = images_crop,
-        #         images_seq_mask=images_seq_mask,
-        #         images_spatial_crop=images_spatial_crop,
-        #         num_image_tokens=num_image_tokens,
-        #     ),
-        #     tensor_type="pt",
-        # )
-        # return prepare
 
     def __call__(
         self,

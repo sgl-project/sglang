@@ -265,7 +265,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
             bos=True,
             eos=True,
             cropping=len(pil_images) <= 2,
-            # max_req_input_len=max_req_input_len,
         )
 
         image_index = image_token_cnt
