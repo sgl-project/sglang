@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-SGLang CI Test Balance Analyzer
-Analyze test time gaps between elapsed and estimated times to help balance CI
-"""
 
 import argparse
 import json
@@ -18,7 +14,6 @@ import requests
 
 
 class SGLangTestBalanceAnalyzer:
-    """SGLang CI Test Balance Analyzer"""
 
     def __init__(self, token: str):
         self.token = token
@@ -32,14 +27,11 @@ class SGLangTestBalanceAnalyzer:
         self.session = requests.Session()
         self.session.headers.update(self.headers)
 
-        # Pattern to match test time information from logs
-        # Example: filename='/public_sglang_ci/runner-l3b-gpu-0/_work/sglang/sglang/test/srt/models/test_encoder_embedding_models.py', elapsed=350, estimated_time=100
         self.test_time_pattern = re.compile(
             r"filename='([^']+)',\s*elapsed=(\d+),\s*estimated_time=(\d+)"
         )
 
     def get_recent_runs(self, limit: int = 1000) -> List[Dict]:
-        """Get recent CI run data"""
         print(f"Fetching {limit} recent CI runs...")
 
         all_runs = []
@@ -65,7 +57,7 @@ class SGLangTestBalanceAnalyzer:
                     break
 
                 page += 1
-                time.sleep(0.1)  # Avoid API rate limits
+                time.sleep(0.1)
 
             except requests.exceptions.RequestException as e:
                 print(f"Error fetching CI data: {e}")
@@ -74,25 +66,21 @@ class SGLangTestBalanceAnalyzer:
         return all_runs[:limit]
 
     def get_job_logs(self, run_id: int, job_name: str) -> Optional[str]:
-        """Get logs for specific job"""
         try:
-            # First get job list
             jobs_url = f"{self.base_url}/repos/{self.repo}/actions/runs/{run_id}/jobs"
             response = self.session.get(jobs_url)
             response.raise_for_status()
             jobs_data = response.json()
 
-            # Find matching job
             target_job = None
             for job in jobs_data.get("jobs", []):
-                if job_name in job.get("name", ""):
+                if job.get("name", "") == job_name:
                     target_job = job
                     break
 
             if not target_job:
                 return None
 
-            # Get logs
             logs_url = f"{self.base_url}/repos/{self.repo}/actions/jobs/{target_job['id']}/logs"
             response = self.session.get(logs_url)
             response.raise_for_status()
@@ -104,13 +92,35 @@ class SGLangTestBalanceAnalyzer:
                 print(f"Failed to get job {job_name} logs: {e}")
             return None
 
+    def get_all_jobs_for_run(self, run_id: int) -> List[Dict]:
+        try:
+            jobs_url = f"{self.base_url}/repos/{self.repo}/actions/runs/{run_id}/jobs"
+            response = self.session.get(jobs_url)
+            response.raise_for_status()
+            jobs_data = response.json()
+            return jobs_data.get("jobs", [])
+        except Exception as e:
+            print(f"Failed to get jobs for run {run_id}: {e}")
+            return []
+
+    def get_job_logs_by_id(self, job_id: int) -> Optional[str]:
+        try:
+            logs_url = f"{self.base_url}/repos/{self.repo}/actions/jobs/{job_id}/logs"
+            response = self.session.get(logs_url)
+            response.raise_for_status()
+            return response.text
+        except Exception as e:
+            if "404" not in str(e):
+                print(f"Failed to get job {job_id} logs: {e}")
+            return None
+
     def parse_test_times(self, log_content: str) -> List[Dict]:
-        """Parse test time information from logs"""
         if not log_content:
             return []
 
         test_times = []
         matches = self.test_time_pattern.findall(log_content)
+        filtered_count = 0
 
         for match in matches:
             filename, elapsed_str, estimated_str = match
@@ -118,6 +128,10 @@ class SGLangTestBalanceAnalyzer:
                 elapsed = int(elapsed_str)
                 estimated = int(estimated_str)
                 gap = elapsed - estimated
+
+                if self._is_abnormal_test_data(elapsed, estimated, log_content, filename):
+                    filtered_count += 1
+                    continue
 
                 test_times.append({
                     "filename": filename,
@@ -130,37 +144,86 @@ class SGLangTestBalanceAnalyzer:
 
         return test_times
 
+    def _is_abnormal_test_data(self, elapsed: int, estimated: int, log_content: str, filename: str) -> bool:
+        
+        if elapsed >= estimated * 3:
+            return True
+        
+        gap = elapsed - estimated
+        if gap >= estimated * 2:
+            return True
+        
+        retry_indicators = [
+            "retry",
+            "timeout",
+            "failed",
+            "error",
+            "exception",
+            "killed",
+            "terminated"
+        ]
+        
+        log_lower = log_content.lower()
+        retry_count = sum(1 for indicator in retry_indicators if indicator in log_lower)
+        
+        if retry_count >= 2 and elapsed > estimated * 1.5:
+            return True
+        
+        timeout_patterns = [
+            "timeout",
+            "timed out",
+            "killed by timeout",
+            "process killed"
+        ]
+        
+        for pattern in timeout_patterns:
+            if pattern in log_lower and elapsed > estimated * 1.5:
+                return True
+        
+        return False
+
     def collect_test_balance_data(self, runs: List[Dict]) -> Dict[str, Dict]:
-        """Collect test balance data from all runs"""
         print("Starting test balance data collection...")
 
-        # Track gap statistics for each test
         test_gaps = defaultdict(lambda: {
             "max_gap": 0,
             "max_elapsed": 0,
             "max_estimated": 0,
             "max_gap_run_info": {},
-            "min_gap": float('inf'),
-            "min_elapsed": 0,
-            "min_estimated": 0,
-            "min_gap_run_info": {},
             "total_runs": 0,
             "all_gaps": []
         })
+        
+        total_tests_parsed = 0
+        abnormal_tests_filtered = 0
 
-        # Job names to analyze (unit test jobs)
-        target_jobs = [
+        target_job_prefixes = [
+            "unit-test-frontend",
             "unit-test-backend-1-gpu",
             "unit-test-backend-2-gpu", 
             "unit-test-backend-4-gpu",
-            "unit-test-backend-8-gpu",
-            "unit-test-frontend"
+            "unit-test-backend-8-gpu-h200",
+            "unit-test-backend-8-gpu-h20",
+            "unit-test-backend-4-gpu-b200",
+            "unit-test-deepep-4-gpu",
+            "unit-test-deepep-8-gpu",
+            "unit-test-backend-8-gpu-deepseek-v32",
+            "performance-test-1-gpu-part-1",
+            "performance-test-1-gpu-part-2",
+            "performance-test-1-gpu-part-3",
+            "performance-test-2-gpu",
+            "accuracy-test-1-gpu",
+            "accuracy-test-2-gpu"
         ]
 
         total_runs = len(runs)
         for i, run in enumerate(runs, 1):
-            if i % 50 == 0 or i == total_runs:
+            if i % 10 == 0 or i == total_runs:
                 print(f"Processing run {i}/{total_runs}: #{run.get('run_number')}")
+
+            workflow_name = run.get("name", "")
+            if "AMD" in workflow_name or "amd" in workflow_name.lower():
+                continue
 
             run_info = {
                 "run_number": run.get("run_number"),
@@ -172,19 +235,31 @@ class SGLangTestBalanceAnalyzer:
                 "url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}",
             }
 
-            # Extract PR number
             pull_requests = run.get("pull_requests", [])
             if pull_requests:
                 run_info["pr_number"] = pull_requests[0].get("number")
 
-            # Get logs for each target job
-            for job_name in target_jobs:
-                logs = self.get_job_logs(run.get("id"), job_name)
+            all_jobs = self.get_all_jobs_for_run(run.get("id"))
+            
+            for job in all_jobs:
+                job_name = job.get("name", "")
+                job_id = job.get("id")
+                
+                matches_prefix = False
+                for prefix in target_job_prefixes:
+                    if job_name.startswith(prefix):
+                        matches_prefix = True
+                        break
+                
+                if not matches_prefix:
+                    continue
+                
+                logs = self.get_job_logs_by_id(job_id)
                 if not logs:
                     continue
 
-                # Parse test times from logs
                 test_times = self.parse_test_times(logs)
+                total_tests_parsed += len(test_times)
                 
                 for test_data in test_times:
                     filename = test_data["filename"]
@@ -192,42 +267,29 @@ class SGLangTestBalanceAnalyzer:
                     estimated = test_data["estimated"]
                     gap = test_data["gap"]
 
-                    # Update statistics for this test
                     test_stats = test_gaps[filename]
                     test_stats["total_runs"] += 1
                     test_stats["all_gaps"].append(gap)
 
-                    # Track maximum gap
                     if gap > test_stats["max_gap"]:
                         test_stats["max_gap"] = gap
                         test_stats["max_elapsed"] = elapsed
                         test_stats["max_estimated"] = estimated
                         test_stats["max_gap_run_info"] = {
                             **run_info,
-                            "job_name": job_name
+                            "job_name": job_name,
+                            "job_url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}/job/{job_id}"
                         }
 
-                    # Track minimum gap
-                    if gap < test_stats["min_gap"]:
-                        test_stats["min_gap"] = gap
-                        test_stats["min_elapsed"] = elapsed
-                        test_stats["min_estimated"] = estimated
-                        test_stats["min_gap_run_info"] = {
-                            **run_info,
-                            "job_name": job_name
-                        }
-
-            time.sleep(0.1)  # Avoid API rate limits
+            time.sleep(0.1)
 
         return dict(test_gaps)
 
     def generate_balance_report(self, test_data: Dict[str, Dict], output_file: str = "test_balance_report.json"):
-        """Generate test balance report"""
         print("\n" + "=" * 80)
-        print("SGLang Test Balance Analysis Report")
+        print("SGLang Test Balance Analysis Report (PR Test GPU Jobs)")
         print("=" * 80)
 
-        # Convert to list and sort by max gap (descending)
         sorted_tests = sorted(
             test_data.items(), 
             key=lambda x: x[1]["max_gap"], 
@@ -237,8 +299,8 @@ class SGLangTestBalanceAnalyzer:
         print(f"\nTotal tests analyzed: {len(sorted_tests)}")
         print(f"Tests with significant gaps (>100s): {len([t for t in sorted_tests if t[1]['max_gap'] > 100])}")
         print(f"Tests with large gaps (>300s): {len([t for t in sorted_tests if t[1]['max_gap'] > 300])}")
+        print(f"Note: Abnormal test data (due to failures/retries) has been filtered out")
 
-        # Generate detailed report
         report_data = {
             "summary": {
                 "total_tests": len(sorted_tests),
@@ -249,18 +311,17 @@ class SGLangTestBalanceAnalyzer:
             "test_balance_table": []
         }
 
-        print(f"\nTop 100 Tests with Largest Time Gaps:")
-        print("-" * 120)
-        print(f"{'Rank':<4} {'Test File':<50} {'Max Gap':<8} {'Max Elapsed':<12} {'Max Estimated':<15} {'Min Gap':<8} {'Min Elapsed':<12} {'Min Estimated':<15}")
-        print("-" * 120)
+        print(f"\nTop 50 PR Test GPU Jobs with Largest Time Gaps:")
+        print("-" * 100)
+        print(f"{'Rank':<4} {'Test File':<40} {'Max Gap':<8} {'Max Elapsed':<12} {'Max Estimated':<15} {'Job Name':<25}")
+        print("-" * 100)
 
-        for i, (filename, stats) in enumerate(sorted_tests[:100], 1):
-            # Extract just the test filename from the full path
+        for i, (filename, stats) in enumerate(sorted_tests[:50], 1):
             test_name = filename.split("/")[-1] if "/" in filename else filename
+            job_name = stats["max_gap_run_info"].get("job_name", "Unknown") if stats["max_gap_run_info"] else "Unknown"
             
-            print(f"{i:<4} {test_name:<50} {stats['max_gap']:<8} {stats['max_elapsed']:<12} {stats['max_estimated']:<15} {stats['min_gap']:<8} {stats['min_elapsed']:<12} {stats['min_estimated']:<15}")
+            print(f"{i:<4} {test_name:<40} {stats['max_gap']:<8} {stats['max_elapsed']:<12} {stats['max_estimated']:<15} {job_name:<25}")
             
-            # Add to report data
             report_data["test_balance_table"].append({
                 "rank": i,
                 "filename": filename,
@@ -269,14 +330,9 @@ class SGLangTestBalanceAnalyzer:
                 "max_elapsed": stats["max_elapsed"],
                 "max_estimated": stats["max_estimated"],
                 "max_gap_run_info": stats["max_gap_run_info"],
-                "min_gap": stats["min_gap"],
-                "min_elapsed": stats["min_elapsed"],
-                "min_estimated": stats["min_estimated"],
-                "min_gap_run_info": stats["min_gap_run_info"],
                 "total_runs": stats["total_runs"]
             })
 
-        # Save detailed report
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(report_data, f, ensure_ascii=False, indent=2)
         print(f"\nDetailed report saved to: {output_file}")
@@ -284,7 +340,6 @@ class SGLangTestBalanceAnalyzer:
         return report_data
 
     def generate_github_summary(self, report_data: Dict):
-        """Generate GitHub Actions summary"""
         try:
             github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
             if not github_step_summary:
@@ -294,7 +349,7 @@ class SGLangTestBalanceAnalyzer:
             print("Generating GitHub Actions summary for Test Balance Analysis...")
 
             summary_lines = []
-            summary_lines.append("# SGLang Test Balance Analysis Report")
+            summary_lines.append("# SGLang Test Balance Analysis Report (PR Test GPU Jobs)")
             summary_lines.append("")
             summary_lines.append(f"**Analysis Timestamp:** {report_data['summary']['analysis_timestamp']}")
             summary_lines.append("")
@@ -308,18 +363,22 @@ class SGLangTestBalanceAnalyzer:
             summary_lines.append(f"| Tests with Gaps > 300s | {report_data['summary']['tests_with_gaps_over_300s']} |")
             summary_lines.append("")
 
-            summary_lines.append("## Top 20 Tests with Largest Time Gaps")
+            summary_lines.append("## Top 30 PR Test GPU Jobs with Largest Time Gaps")
             summary_lines.append("")
-            summary_lines.append("| Rank | Test File | Max Gap (s) | Max Elapsed (s) | Max Estimated (s) | Min Gap (s) | Min Elapsed (s) | Min Estimated (s) | Total Runs |")
-            summary_lines.append("|------|-----------|-------------|----------------|------------------|-------------|----------------|------------------|------------|")
+            summary_lines.append("| Rank | Test File | Max Gap (s) | Max Elapsed (s) | Max Estimated (s) | Job Name | Job Link | Total Runs |")
+            summary_lines.append("|------|-----------|-------------|----------------|------------------|---------|----------|------------|")
 
-            for test in report_data["test_balance_table"][:20]:
+            for test in report_data["test_balance_table"][:30]:
                 test_name = test["test_name"]
                 if len(test_name) > 30:
                     test_name = test_name[:27] + "..."
                 
+                job_name = test["max_gap_run_info"].get("job_name", "Unknown") if test["max_gap_run_info"] else "Unknown"
+                job_url = test["max_gap_run_info"].get("job_url", "") if test["max_gap_run_info"] else ""
+                job_link = f"[{job_name}]({job_url})" if job_url else job_name
+                
                 summary_lines.append(
-                    f"| {test['rank']} | `{test_name}` | {test['max_gap']} | {test['max_elapsed']} | {test['max_estimated']} | {test['min_gap']} | {test['min_elapsed']} | {test['min_estimated']} | {test['total_runs']} |"
+                    f"| {test['rank']} | `{test_name}` | {test['max_gap']} | {test['max_elapsed']} | {test['max_estimated']} | {job_link} | {test['total_runs']} |"
                 )
 
             summary_lines.append("")
@@ -348,23 +407,19 @@ class SGLangTestBalanceAnalyzer:
             print(f"Failed to generate GitHub Actions summary: {e}")
 
     def save_csv_report(self, report_data: Dict, output_file: str = "test_balance_report.csv"):
-        """Save CSV report for easy analysis"""
         import csv
         
         with open(output_file, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
             
-            # Write header
             writer.writerow([
                 "Rank", "Test File", "Test Name", "Max Gap (s)", "Max Elapsed (s)", 
-                "Max Estimated (s)", "Max Gap Run URL", "Min Gap (s)", "Min Elapsed (s)", 
-                "Min Estimated (s)", "Min Gap Run URL", "Total Runs"
+                "Max Estimated (s)", "Job Name", "Max Gap Job URL", "Total Runs"
             ])
             
-            # Write data
             for test in report_data["test_balance_table"]:
-                max_run_url = test["max_gap_run_info"].get("url", "") if test["max_gap_run_info"] else ""
-                min_run_url = test["min_gap_run_info"].get("url", "") if test["min_gap_run_info"] else ""
+                max_job_url = test["max_gap_run_info"].get("job_url", "") if test["max_gap_run_info"] else ""
+                job_name = test["max_gap_run_info"].get("job_name", "Unknown") if test["max_gap_run_info"] else "Unknown"
                 
                 writer.writerow([
                     test["rank"],
@@ -373,11 +428,8 @@ class SGLangTestBalanceAnalyzer:
                     test["max_gap"],
                     test["max_elapsed"],
                     test["max_estimated"],
-                    max_run_url,
-                    test["min_gap"],
-                    test["min_elapsed"],
-                    test["min_estimated"],
-                    min_run_url,
+                    job_name,
+                    max_job_url,
                     test["total_runs"]
                 ])
         
@@ -401,32 +453,26 @@ def main():
 
     args = parser.parse_args()
 
-    # Create analyzer
     analyzer = SGLangTestBalanceAnalyzer(args.token)
 
     try:
-        # Get CI run data
         runs = analyzer.get_recent_runs(args.limit)
 
         if not runs:
             print("No CI run data found")
             return
 
-        # Collect test balance data
         test_data = analyzer.collect_test_balance_data(runs)
 
         if not test_data:
             print("No test balance data found")
             return
 
-        # Generate report
         report_data = analyzer.generate_balance_report(test_data, args.output)
 
-        # Generate CSV report
         csv_output = args.output.replace(".json", ".csv")
         analyzer.save_csv_report(report_data, csv_output)
 
-        # Generate GitHub summary
         analyzer.generate_github_summary(report_data)
 
     except Exception as e:

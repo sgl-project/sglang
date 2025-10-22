@@ -28,10 +28,10 @@ A comprehensive toolkit to analyze CI failures and performance trends for the SG
 - **Time-Based Sampling**: Intelligent sampling strategy to cover extended time periods (up to 30 days) with limited API calls
 
 ### Test Balance Analyzer (`ci_analyzer_balance.py`)
-- **Time Gap Analysis**: Identify tests with large gaps between elapsed and estimated times
+- **Time Gap Analysis**: Identify GPU tests with large gaps between elapsed and estimated times
 - **CI Balancing**: Help optimize CI by identifying tests that need time adjustments
 - **Gap Tracking**: Track maximum time gaps for each test across multiple CI runs
-- **Statistical Analysis**: Calculate average gaps and total run counts for each test
+- **PR Test Focus**: Only analyzes GPU jobs from pr-test.yml workflow (excludes AMD and other workflows)
 - **Ranking System**: Sort tests by time gap severity to prioritize adjustments
 - **CSV Export**: Export analysis results in CSV format for easy review
 - **GitHub Integration**: Generate GitHub Actions summaries with recommendations
@@ -119,14 +119,14 @@ python ci_analyzer_perf.py --token YOUR_GITHUB_TOKEN --limit 1000 --upload-to-gi
 #### Basic Usage
 
 ```bash
-# Analyze test time gaps from recent CI runs
+# Analyze PR Test GPU job time gaps from recent CI runs
 python ci_analyzer_balance.py --token YOUR_GITHUB_TOKEN
 ```
 
 #### Advanced Usage
 
 ```bash
-# Analyze last 1000 CI runs for comprehensive test balance analysis
+# Analyze last 1000 PR Test GPU CI runs for comprehensive test balance analysis
 python ci_analyzer_balance.py --token YOUR_GITHUB_TOKEN --limit 1000
 
 # Custom output file
