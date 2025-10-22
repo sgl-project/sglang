@@ -44,6 +44,57 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                 name: None,
             });
         }
+        ResponseInput::SimpleItems(simple_items) => {
+            // Convert SimpleItems to messages
+            for item in simple_items {
+                use crate::protocols::responses::StringOrContentArray;
+                let text = match &item.content {
+                    StringOrContentArray::String(s) => s.clone(),
+                    StringOrContentArray::Array(parts) => {
+                        // Extract text from content parts
+                        parts
+                            .iter()
+                            .filter_map(|part| match part {
+                                ResponseContentPart::InputText { text } => Some(text.as_str()),
+                                ResponseContentPart::OutputText { text, .. } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                };
+
+                match item.role.as_str() {
+                    "user" => {
+                        messages.push(ChatMessage::User {
+                            content: UserMessageContent::Text(text),
+                            name: None,
+                        });
+                    }
+                    "assistant" => {
+                        messages.push(ChatMessage::Assistant {
+                            content: Some(text),
+                            name: None,
+                            tool_calls: None,
+                            reasoning_content: None,
+                        });
+                    }
+                    "system" => {
+                        messages.push(ChatMessage::System {
+                            content: text,
+                            name: None,
+                        });
+                    }
+                    _ => {
+                        // Unknown role, treat as user message
+                        messages.push(ChatMessage::User {
+                            content: UserMessageContent::Text(text),
+                            name: None,
+                        });
+                    }
+                }
+            }
+        }
         ResponseInput::Items(items) => {
             // Structured items → convert each to appropriate chat message
             for item in items {

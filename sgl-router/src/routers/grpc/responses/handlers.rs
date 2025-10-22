@@ -963,20 +963,19 @@ async fn load_conversation_history(
             Ok(chain) => {
                 let mut items = Vec::new();
                 for stored in chain.responses.iter() {
-                    // Convert input to conversation item
-                    items.push(ResponseInputOutputItem::Message {
-                        id: format!("msg_u_{}", stored.id.0.trim_start_matches("resp_")),
-                        role: "user".to_string(),
-                        content: vec![ResponseContentPart::InputText {
-                            text: stored.input.clone(),
-                        }],
-                        status: Some("completed".to_string()),
-                    });
+                    // Convert input items from stored input (which is now a JSON array)
+                    if let Some(input_arr) = stored.input.as_array() {
+                        for item in input_arr {
+                            if let Ok(input_item) =
+                                serde_json::from_value::<ResponseInputOutputItem>(item.clone())
+                            {
+                                items.push(input_item);
+                            }
+                        }
+                    }
 
-                    // Convert output to conversation items
-                    if let Some(output_arr) =
-                        stored.raw_response.get("output").and_then(|v| v.as_array())
-                    {
+                    // Convert output items from stored output (which is now a JSON array)
+                    if let Some(output_arr) = stored.output.as_array() {
                         for item in output_arr {
                             if let Ok(output_item) =
                                 serde_json::from_value::<ResponseInputOutputItem>(item.clone())
@@ -1062,6 +1061,24 @@ async fn load_conversation_history(
                             status: Some("completed".to_string()),
                         });
                     }
+                    ResponseInput::SimpleItems(simple_items) => {
+                        // Convert SimpleItems to full Items format
+                        for item in simple_items {
+                            use crate::protocols::responses::StringOrContentArray;
+                            let content = match &item.content {
+                                StringOrContentArray::String(s) => {
+                                    vec![ResponseContentPart::InputText { text: s.clone() }]
+                                }
+                                StringOrContentArray::Array(parts) => parts.clone(),
+                            };
+                            items.push(ResponseInputOutputItem::Message {
+                                id: format!("msg_u_{}_{}", conv_id.0, items.len()),
+                                role: item.role.clone(),
+                                content,
+                                status: Some("completed".to_string()),
+                            });
+                        }
+                    }
                     ResponseInput::Items(current_items) => {
                         items.extend_from_slice(current_items);
                     }
@@ -1092,6 +1109,24 @@ async fn load_conversation_history(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 });
+            }
+            ResponseInput::SimpleItems(simple_items) => {
+                // Convert SimpleItems to full Items format
+                for item in simple_items {
+                    use crate::protocols::responses::StringOrContentArray;
+                    let content = match &item.content {
+                        StringOrContentArray::String(s) => {
+                            vec![ResponseContentPart::InputText { text: s.clone() }]
+                        }
+                        StringOrContentArray::Array(parts) => parts.clone(),
+                    };
+                    items.push(ResponseInputOutputItem::Message {
+                        id: format!("msg_u_prev_{}", items.len()),
+                        role: item.role.clone(),
+                        content,
+                        status: Some("completed".to_string()),
+                    });
+                }
             }
             ResponseInput::Items(current_items) => {
                 items.extend_from_slice(current_items);
