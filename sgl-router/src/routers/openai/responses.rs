@@ -36,7 +36,7 @@ pub(super) fn build_stored_response(
         .get("model")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| original_body.model.clone());
+        .or_else(|| Some(original_body.model.clone()));
 
     stored_response.user = response_json
         .get("user")
@@ -140,9 +140,10 @@ pub(super) fn patch_streaming_response_json(
             .map(|s| s.is_empty())
             .unwrap_or(true)
         {
-            if let Some(model) = &original_body.model {
-                obj.insert("model".to_string(), Value::String(model.clone()));
-            }
+            obj.insert(
+                "model".to_string(),
+                Value::String(original_body.model.clone()),
+            );
         }
 
         if obj.get("user").map(|v| v.is_null()).unwrap_or(false) {

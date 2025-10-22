@@ -8,7 +8,7 @@ use serde_json::Value;
 
 // Import shared types from common module
 use super::common::{
-    default_true, generate_id, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo,
+ default_model, generate_id, default_true, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo,
     StringOrArray, ToolChoice, UsageInfo,
 };
 
@@ -468,9 +468,9 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, Value>>,
 
-    /// Model to use (optional to match vLLM)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    /// Model to use
+    #[serde(default = "default_model")]
+    pub model: String,
 
     /// Optional conversation id to persist input/output as items
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -581,7 +581,7 @@ impl Default for ResponsesRequest {
             max_output_tokens: None,
             max_tool_calls: None,
             metadata: None,
-            model: None,
+            model: default_model(),
             conversation: None,
             parallel_tool_calls: None,
             previous_response_id: None,
@@ -614,7 +614,7 @@ impl GenerationRequest for ResponsesRequest {
     }
 
     fn get_model(&self) -> Option<&str> {
-        self.model.as_deref()
+        Some(self.model.as_str())
     }
 
     fn extract_text_for_routing(&self) -> String {
