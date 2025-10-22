@@ -13,7 +13,7 @@ from triton_kernels.matmul_ogs import (
     PrecisionConfig,
     matmul_ogs,
 )
-from triton_kernels.numerics import InFlexData, MicroscalingCtx
+from triton_kernels.numerics import InFlexData
 from triton_kernels.quantization import downcast_to_mxfp
 from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
