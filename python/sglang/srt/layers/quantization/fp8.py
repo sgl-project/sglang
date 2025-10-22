@@ -1125,7 +1125,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if env_force:
             return True
         return (
-            (backend.is_cutlass() or backend.is_flashinfer_cutlass())
+            backend.is_flashinfer_cutlass()
             and self.cutlass_fp8_supported
             and self.block_quant
             and (is_sm100_supported() or is_sm90_supported())
