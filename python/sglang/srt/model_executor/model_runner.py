@@ -673,8 +673,7 @@ class ModelRunner:
                 quantization_config := getattr(
                     self.model_config.hf_config, "quantization_config", None
                 )
-            ) is not None:
-                text_config = self.model_config.hf_text_config
+            ) is not None and "weight_block_size" in quantization_config:
                 weight_block_size_n = quantization_config["weight_block_size"][0]
 
                 if self.tp_size % self.moe_ep_size != 0:
