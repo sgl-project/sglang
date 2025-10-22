@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from: https://github.com/vllm-project/vllm/blob/ab3e80042eac24dd362408e6d63ad98768046359/vllm/model_executor/layers/quantization/gguf.py
+from __future__ import annotations
 
 import logging
 import warnings
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import gguf
 import torch
@@ -42,7 +43,7 @@ if _is_cuda:
         ggml_mul_mat_vec_a8,
     )
 else:
-    warnings.warn(f"Only CUDA support AWQ currently.")
+    warnings.warn(f"Only CUDA support GGUF q uantization currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +51,15 @@ logger = logging.getLogger(__name__)
 class GGUFConfig(QuantizationConfig):
     """Config class for GGUF."""
 
-    def __init__(self, unquantized_modules: list[str] | None = None) -> None:
+    def __init__(self, modules_to_not_convert: list[str] | None = None) -> None:
         super().__init__()
-        self.unquantized_modules = unquantized_modules or []
+        self.modules_to_not_convert = modules_to_not_convert or []
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
+
+    def get_scaled_act_names(self) -> List[str]:
+        return []
 
     def get_name(self) -> "str":
         return "gguf"
@@ -73,7 +77,10 @@ class GGUFConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "GGUFConfig":
-        return cls()
+        modules_to_not_convert = cls.get_from_keys_or(
+            config, ["modules_to_not_convert"], None
+        )
+        return cls(modules_to_not_convert)
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -82,18 +89,18 @@ class GGUFConfig(QuantizationConfig):
         from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped_gguf(prefix, self.unquantized_modules):
+            if is_layer_skipped_gguf(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
             return GGUFLinearMethod(self)
         elif isinstance(layer, VocabParallelEmbedding):
             return GGUFEmbeddingMethod(self)
         elif isinstance(layer, FusedMoE):
-            return GGUFMoEMethod(self, layer.moe_config)
+            return GGUFMoEMethod(self)
         return None
 
 
-def is_layer_skipped_gguf(prefix: str, unquantized_modules: list[str]):
-    return any(module_name in prefix for module_name in unquantized_modules)
+def is_layer_skipped_gguf(prefix: str, modules_to_not_convert: list[str]):
+    return any(module_name in prefix for module_name in modules_to_not_convert)
 
 
 UNQUANTIZED_TYPES = {WeightType.F32, WeightType.F16, WeightType.BF16}
@@ -528,7 +535,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             x=x,
             w1=layer.w13_qweight,
             w2=layer.w2_qweight,
-            topk_weight=topk_weights,
+            topk_weights=topk_weights,
             topk_ids=topk_ids,
             qweight_type=layer.w13_qweight_type.weight_type,
             qweight_type2=layer.w2_qweight_type.weight_type,
