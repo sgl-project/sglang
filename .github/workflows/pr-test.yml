@@ -358,7 +358,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2]
+        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
