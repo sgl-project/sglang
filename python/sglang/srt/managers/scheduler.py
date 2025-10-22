@@ -2064,9 +2064,13 @@ class Scheduler(
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             else:
+                kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if self.spec_algorithm.is_none()
+                    else {}
+                )
                 batch_result = self.model_worker.forward_batch_generation(
-                    batch_or_worker_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
+                    batch_or_worker_batch, **kwargs
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
