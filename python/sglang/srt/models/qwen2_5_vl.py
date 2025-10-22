@@ -649,10 +649,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            
-            # Skip loading language model weights
-            if name not in params_dict:
-                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -677,6 +673,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip loading language model weights
+                if self.config.mm_only and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
