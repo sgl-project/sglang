@@ -1,4 +1,4 @@
-# Set Enviroment
+# Set Environment
 
 1. Docker image:
    For MI30X:
@@ -10,7 +10,7 @@
    rocm/sgl-dev:v0.5.3.post1-rocm700-mi35x-20251011
    ```
 2. Install aiter dev/perf branch:
-   ``` 
+   ```
    pip uninstall aiter
    git clone -b dev/perf git@github.com:ROCm/aiter.git
    cd aiter
@@ -59,8 +59,32 @@
         --chunked-prefill-size 196608 \
         --mem-fraction-static 0.9 \
         --disable-radix-cache \
-        --num-continuous-decode-steps 4 \
         --max-prefill-tokens 196608 \
+        --cuda-graph-max-bs 128 \
+        2>&1 | tee log.server.log &
+    ```
+
+Or if you want to use the PTPC FP8 model, you can change the `model` argument. Due to w8a8fp8 kernel scale limitations, the `chunked-prefill-size` and `max-prefill-tokens` argument must be restricted to 32k in the command like this:
+
+    ```
+    bash launch_deepseekr1_fp8.sh
+    ```
+    The example command:
+    ```
+    model=/data/models/Deepseek-r1-FP8-Dynamic
+    TP=8
+    EP=1
+    python3 -m sglang.launch_server \
+        --model-path ${model} \
+        --host localhost \
+        --port 9000 \
+        --tp-size ${TP} \
+        --ep-size ${EP} \
+        --trust-remote-code \
+        --chunked-prefill-size 32768 \
+        --mem-fraction-static 0.9 \
+        --disable-radix-cache \
+        --max-prefill-tokens 32768 \
         --cuda-graph-max-bs 128 \
         2>&1 | tee log.server.log &
     ```
@@ -71,7 +95,7 @@
     curl -X POST "http://localhost:9000/v1/completions" \
         -H "Content-Type: application/json" \
         -d '{
-            "prompt": "The capital of China", "temperature": 0, "top_p": 1, "top_k": 0, "repetition_penalty": 1.0, "presence_penalty": 0, "frequency_penalty": 0, "stream": false, "ignore_eos": false, "n": 1, "seed": 123 
+            "prompt": "The capital of China", "temperature": 0, "top_p": 1, "top_k": 0, "repetition_penalty": 1.0, "presence_penalty": 0, "frequency_penalty": 0, "stream": false, "ignore_eos": false, "n": 1, "seed": 123
     }'
    ```
    The result should be:

@@ -23,6 +23,7 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 import torch
+import torch.nn.functional as F
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
@@ -46,6 +47,8 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_compiler_backend,
+    get_int_env_var,
+    is_cpu,
     is_cuda,
     is_hip,
     set_weight_attrs,
@@ -67,6 +70,8 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
@@ -327,15 +332,76 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             )
 
         if _use_aiter:
+            padding_size = get_int_env_var("AITER_MOE_PADDING_SIZE")
+
+            N = layer.w2_weight.shape[-1]
+            if padding_size:
+                pad_size = (padding_size - (N % padding_size)) % padding_size
+            else:
+                pad_size = 0
+
+            if self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
+                # pad w13_weight_scale
+                with torch.no_grad():
+                    part1 = layer.w13_weight_scale.data[:, :N, :]
+                    part2 = layer.w13_weight_scale.data[:, N:, :]
+                    # 1. pad part1
+                    part1_padded = torch.nn.functional.pad(
+                        part1,
+                        (0, 0, 0, pad_size, 0, 0),  # pad on right on dim 1
+                        mode="constant",
+                        value=0,
+                    )
+                    # 2. pad part2
+                    part2_padded = torch.nn.functional.pad(
+                        part2,
+                        (0, 0, 0, pad_size, 0, 0),  # pad on right on dim 1
+                        mode="constant",
+                        value=0,
+                    )
+
+                    # 3. concat part1 and part2
+                    padded_w13_weight_scale = torch.cat(
+                        [part1_padded, part2_padded], dim=1
+                    )
+                    layer.w13_weight_scale = torch.nn.Parameter(
+                        padded_w13_weight_scale,
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+
             with torch.no_grad():
                 # Pre-shuffle weights
+                part1 = layer.w13_weight.data[
+                    :, :N, :
+                ]  # part1: [1..192]，shape: [128, 192, 512]
+                part2 = layer.w13_weight.data[
+                    :, N:, :
+                ]  # part2: [193..384]，shape: [128, 192, 512]
+
+                # 1. pad part1
+                part1_padded = torch.nn.functional.pad(
+                    part1, (0, 0, 0, pad_size, 0, 0), mode="constant", value=0
+                )
+
+                # 2. pad part2
+                part2_padded = torch.nn.functional.pad(
+                    part2, (0, 0, 0, pad_size, 0, 0), mode="constant", value=0
+                )
+
+                # 3. concate
+                padded_w13_wight = torch.cat([part1_padded, part2_padded], dim=1)
+
                 layer.w13_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w13_weight.data, (16, 16)),
+                    shuffle_weight(padded_w13_wight, (16, 16)),
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
+                padded_w2_wight = F.pad(
+                    layer.w2_weight.data, (0, pad_size, 0, 0, 0, 0), "constant", 0
+                )
                 layer.w2_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w2_weight.data, (16, 16)),
+                    shuffle_weight(padded_w2_wight, (16, 16)),
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
@@ -359,29 +425,48 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
         moe_runner_config = self.moe_runner_config
 
-        if (
-            _use_aiter
-            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-            and moe_runner_config.apply_router_weight_on_input
-        ):
+        if _use_aiter:
             topk_weights, topk_ids, _ = topk_output
-            output = rocm_fused_experts_tkw1(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                activation=moe_runner_config.activation,
-                apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
-                use_fp8_w8a8=True,
-                per_channel_quant=self.weight_quant.strategy
-                == QuantizationStrategy.CHANNEL,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a1_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-            )
-            return StandardCombineInput(hidden_states=output)
+            if (
+                self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+                and moe_runner_config.apply_router_weight_on_input
+            ):
+                output = rocm_fused_experts_tkw1(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    activation=moe_runner_config.activation,
+                    apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+                    use_fp8_w8a8=True,
+                    per_channel_quant=self.weight_quant.strategy
+                    == QuantizationStrategy.CHANNEL,
+                    w1_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    a1_scale=layer.w13_input_scale,
+                    a2_scale=layer.w2_input_scale,
+                )
+                return StandardCombineInput(hidden_states=output)
+            else:
+                return fused_moe(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    quant_type=QuantType.per_Token,
+                    w1_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    a1_scale=layer.w13_input_scale,
+                    a2_scale=layer.w2_input_scale,
+                    activation=(
+                        ActivationType.Silu
+                        if moe_runner_config.activation == "silu"
+                        else ActivationType.Gelu
+                    ),
+                    expert_mask=layer.expert_mask_gpu,
+                )
         else:
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
