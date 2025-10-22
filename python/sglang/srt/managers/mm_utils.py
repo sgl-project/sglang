@@ -661,7 +661,11 @@ def general_mm_embed_routine(
         Hidden states from language model forward pass
     """
     assert hasattr(language_model, "get_input_embeddings")
-    embed_tokens = language_model.get_input_embeddings()
+    try:
+        embed_tokens = language_model.get_input_embeddings()
+    except TypeError:
+        embed_tokens = language_model.model.embed_tokens
+
     if (
         not forward_batch.forward_mode.is_decode()
         and not forward_batch.forward_mode.is_target_verify()

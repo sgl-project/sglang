@@ -10,6 +10,7 @@ from PIL import Image
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.interns1 import InternS1ForConditionalGeneration
 from sglang.srt.models.internvl import InternVLChatModel
+from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -17,7 +18,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 
 class InternVLImageProcessor(BaseMultimodalProcessor):
-    models = [InternVLChatModel, InternS1ForConditionalGeneration]
+    models = [InternVLChatModel, InternS1ForConditionalGeneration, NemotronH_Nano_VL_V2]
 
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
     IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -44,8 +45,14 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             image_size = image_size[0]
         if isinstance(patch_size, list):
             patch_size = patch_size[0]
+        self.image_size = image_size
 
-        self.IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
+        self.VIDEO_CONTEXT_TOKEN = getattr(hf_config, "video_context_token", None)
+        if self.VIDEO_CONTEXT_TOKEN is None:
+            self.VIDEO_CONTEXT_TOKEN = "<VIDEO_CONTEXT>"
+        self.IMG_CONTEXT_TOKEN = getattr(hf_config, "img_context_token", None)
+        if self.IMG_CONTEXT_TOKEN is None:
+            self.IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
         self.IMG_START_TOKEN = "<img>"
         self.IMG_END_TOKEN = "</img>"
         self.num_image_token = int(
@@ -60,8 +67,10 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         self.img_start_token_id = tokenizer.convert_tokens_to_ids(self.IMG_START_TOKEN)
         self.img_end_token_id = tokenizer.convert_tokens_to_ids(self.IMG_END_TOKEN)
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token="<IMG_CONTEXT>",
+            image_token=self.IMG_CONTEXT_TOKEN,
             image_token_id=tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT_TOKEN),
+            video_token=self.VIDEO_CONTEXT_TOKEN,
+            video_token_id=tokenizer.convert_tokens_to_ids(self.VIDEO_CONTEXT_TOKEN),
         ).build(_image_processor)
 
     @staticmethod
@@ -217,7 +226,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
 
                 tensor = (tensor - mean) / std
                 tiles = self.dynamic_preprocess(
-                    tensor, image_size=448, max_num=12, use_thumbnail=True
+                    tensor, image_size=self.image_size, max_num=12, use_thumbnail=True
                 )
 
                 pixel_values.append(tiles)
