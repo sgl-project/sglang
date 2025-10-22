@@ -94,6 +94,29 @@ pub enum ReasoningSummary {
 // Input/Output Items
 // ============================================================================
 
+/// Simple input item format for the new API (matches [{\"content\": \"...\", \"role\": \"...\"}])
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SimpleInputItem {
+    /// Content can be a string or array of content parts
+    pub content: StringOrContentArray,
+
+    /// Role of the message (user, assistant, system, developer)
+    pub role: String,
+
+    /// Type is always "message" if present (optional field)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "type")]
+    pub r#type: Option<String>,
+}
+
+/// Content can be either a simple string or array of content parts
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum StringOrContentArray {
+    String(String),
+    Array(Vec<ResponseContentPart>),
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -548,11 +571,16 @@ pub struct ResponsesRequest {
     pub repetition_penalty: f32,
 }
 
+/// Input for a response - supports multiple formats for flexibility
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ResponseInput {
-    Text(String),
+    /// Full item format with type tags
     Items(Vec<ResponseInputOutputItem>),
+    /// Simple message array: [{\"content\": \"...\", \"role\": \"...\"}]
+    SimpleItems(Vec<SimpleInputItem>),
+    /// Plain text string
+    Text(String),
 }
 
 impl Default for ResponsesRequest {
@@ -604,6 +632,28 @@ impl GenerationRequest for ResponsesRequest {
     fn extract_text_for_routing(&self) -> String {
         match &self.input {
             ResponseInput::Text(text) => text.clone(),
+            ResponseInput::SimpleItems(items) => items
+                .iter()
+                .filter_map(|item| match &item.content {
+                    StringOrContentArray::String(s) => Some(s.clone()),
+                    StringOrContentArray::Array(parts) => {
+                        let texts: Vec<String> = parts
+                            .iter()
+                            .filter_map(|part| match part {
+                                ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
+                                ResponseContentPart::InputText { text } => Some(text.clone()),
+                                ResponseContentPart::Unknown => None,
+                            })
+                            .collect();
+                        if texts.is_empty() {
+                            None
+                        } else {
+                            Some(texts.join(" "))
+                        }
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join(" "),
             ResponseInput::Items(items) => items
                 .iter()
                 .filter_map(|item| match item {
