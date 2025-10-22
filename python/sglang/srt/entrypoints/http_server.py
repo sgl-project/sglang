@@ -1303,6 +1303,7 @@ def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
     if weight_version is not None:
         _global_state.tokenizer_manager.server_args.weight_version = weight_version
 
+
 def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
