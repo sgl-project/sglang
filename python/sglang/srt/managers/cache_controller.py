@@ -14,11 +14,10 @@ limitations under the License.
 """
 
 import logging
-import math
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Set, Tuple
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
@@ -41,7 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
 logger = logging.getLogger(__name__)
 
@@ -398,6 +397,11 @@ class HiCacheController:
         if config.is_decode_side:
             config.prefill_tp_size = storage_backend_extra_config.get("prefill_tp_size")
             config.decode_tp_size = self.tp_size
+            config.should_split_heads = (
+                not config.is_mla_model
+                and self.mem_pool_host.layout == "page_head"
+                and config.decode_tp_size < config.prefill_tp_size
+            )
 
         return config
 

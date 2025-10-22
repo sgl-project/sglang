@@ -174,13 +174,18 @@ void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 
-void fast_topk_interface(at::Tensor score, at::Tensor indices, at::Tensor lengths);
+void fast_topk_interface(const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths);
 void fast_topk_transform_interface(
-    at::Tensor score,
-    at::Tensor lengths,
-    at::Tensor dst_page_table,
-    at::Tensor src_page_table,
-    at::Tensor cu_seqlens_q);
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_page_table,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q);
+void fast_topk_transform_ragged_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& topk_indices_ragged,
+    const at::Tensor& topk_indices_offset);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
@@ -865,4 +870,13 @@ void es_fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& stride_b,
     const torch::Tensor& stride_d,
     const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets);
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+/*
+ * From fast-hadamard-transform
+ */
+torch::Tensor fast_hadamard_transform(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_12N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_20N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_28N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_40N(torch::Tensor& x, double scale);
