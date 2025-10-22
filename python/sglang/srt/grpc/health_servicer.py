@@ -129,6 +129,10 @@ class SGLangHealthServicer(health_pb2_grpc.HealthServicer):
             )
 
             # If no recent activity and we have active requests, might be stuck
+            # NOTE: 30s timeout is hardcoded. This is more conservative than
+            # HEALTH_CHECK_TIMEOUT (20s) used for custom HealthCheck RPC.
+            # Consider making this configurable via environment variable in the future
+            # if different workloads need different responsiveness thresholds.
             if (
                 time_since_last_receive > 30
                 and len(self.request_manager.rid_to_state) > 0
