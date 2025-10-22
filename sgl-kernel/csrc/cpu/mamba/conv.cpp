@@ -193,16 +193,16 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
 };
 #endif
 
-#define LAUNCH_TINYGEMM_KERNEL(K, NB_SIZE)                                     \
-  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply(            \
-      input + bs * seqlen * dim + mb_start * dim + nb_start,                   \
-      weight + nb_start * width,                                               \
-      out + bs * seqlen * dim + mb_start * dim + nb_start,                     \
-      has_bias ? bias + nb_start : nullptr,                                    \
-      has_conv_states ? conv_states + bs * (K - 1) * dim + nb_start : nullptr, \
-      has_initial_states_value,                                                \
-      mb_size,                                                                 \
-      dim,                                                                     \
+#define LAUNCH_TINYGEMM_KERNEL(K, NB_SIZE)                                                   \
+  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply(                          \
+      input + bs * seqlen * dim + mb_start * dim + nb_start,                                 \
+      weight + nb_start * width,                                                             \
+      out + bs * seqlen * dim + mb_start * dim + nb_start,                                   \
+      has_bias ? bias + nb_start : nullptr,                                                  \
+      has_conv_states ? conv_states + conv_state_index * (K - 1) * dim + nb_start : nullptr, \
+      has_initial_states_value,                                                              \
+      mb_size,                                                                               \
+      dim,                                                                                   \
       mb_start == 0);
 
 template <typename scalar_t>
@@ -212,6 +212,7 @@ void causal_conv1d_fwd_kernel_impl(
     const scalar_t* __restrict__ weight,
     const scalar_t* __restrict__ bias,
     scalar_t* __restrict__ conv_states,
+    const int32_t* __restrict__ conv_indices,
     const bool* __restrict__ has_initial_state,
     bool silu_activation,
     int64_t batch,
@@ -230,6 +231,7 @@ void causal_conv1d_fwd_kernel_impl(
 
   const int64_t num_blocks_per_seq = div_up(seqlen, BLOCK_M);
   const bool has_conv_states = conv_states != nullptr;
+  const bool has_conv_indices = conv_indices != nullptr;
 
   // parallel on [batch, seq, NB]
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
@@ -247,6 +249,7 @@ void causal_conv1d_fwd_kernel_impl(
           int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
 
           const bool has_initial_states_value = has_conv_states ? has_initial_state[bs] : false;
+          int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
 
           switch (width << 4 | nb_size >> 4) {
             case 0x42:
@@ -307,9 +310,6 @@ void causal_conv1d_fwd_varlen_kernel_impl(
     int64_t dim,
     int64_t width,
     int64_t num_seq_blocks) {
-  // std::cout << "### causal_conv1d_fwd_varlen_ernel_impl: " << std::endl;
-  // std::cout << "dim = " << dim << "; width = " << width << "; num_seq_blocks = " << num_seq_blocks << std::endl;
-
   // handle 32 x 64 per block
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n() * 2;
@@ -364,15 +364,13 @@ void causal_conv1d_update_kernel_impl(
     int64_t dim,
     int64_t seqlen,
     int64_t width) {
-  std::cout << "### causal_conv1d_update_kernel_impl: batch = " << batch << "; dim = " << dim;
-  std::cout << "; seqlen = " << seqlen << "; width = " << width << std::endl;
-
   // handle 32 x 64 per block
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n() * 2;
   const int64_t NB = div_up(dim, BLOCK_N);
 
   const bool has_conv_states = conv_states != nullptr;
+  const bool has_conv_indices = conv_indices != nullptr;
 
   // parallel on [batch, NB]
   AT_DISPATCH_BOOL2(bias != nullptr, has_bias, silu_activation, has_silu, [&] {
@@ -387,6 +385,7 @@ void causal_conv1d_update_kernel_impl(
         int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
 
         const bool has_initial_states_value = true;
+        int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
 
         switch (width << 4 | nb_size >> 4) {
           case 0x42:
@@ -405,12 +404,13 @@ void causal_conv1d_update_kernel_impl(
     });
   });
 
-#define CONV_STATE_INDEXR(w) conv_states + bs*(width - 1) * dim + (w) * dim
+#define CONV_STATE_INDEXR(w) conv_states + conv_state_index*(width - 1) * dim + (w) * dim
 
   // update conv_states
   at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
     for (int64_t bs = begin; bs < end; ++bs) {
       // update old states, range [1, width - 1)
+      int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
       for (int64_t w = 1; w < width - 1; ++w) {
         std::memcpy(CONV_STATE_INDEXR(w - 1), CONV_STATE_INDEXR(w), dim * sizeof(scalar_t));
       }
@@ -598,6 +598,7 @@ at::Tensor causal_conv1d_fwd_cpu(
           packed_w.data_ptr<scalar_t>(),
           conditional_data_ptr<scalar_t>(bias),
           conditional_data_ptr<scalar_t>(conv_states),
+          conditional_data_ptr<int32_t>(cache_indices),
           conditional_data_ptr<bool>(has_initial_state),
           silu_activation,
           batch,
