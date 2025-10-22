@@ -1182,7 +1182,7 @@ mod responses_endpoint_tests {
     }
 
     #[tokio::test]
-    async fn test_v1_responses_delete_and_list_not_implemented() {
+    async fn test_v1_responses_delete_not_implemented() {
         let ctx = TestContext::new(vec![MockWorkerConfig {
             port: 18954,
             worker_type: WorkerType::Regular,
@@ -1194,7 +1194,7 @@ mod responses_endpoint_tests {
 
         let app = ctx.create_app().await;
 
-        // Use an arbitrary id for delete/list
+        // Test DELETE is not implemented
         let resp_id = "resp-test-123";
 
         let req = Request::builder()
@@ -1205,13 +1205,105 @@ mod responses_endpoint_tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
 
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_input_items() {
+        // Use OpenAI routing mode for this test since input_items is only implemented there
+        let config = RouterConfig {
+            chat_template: None,
+            mode: RoutingMode::OpenAI {
+                worker_urls: vec!["http://127.0.0.1:18955/v1".to_string()],
+            },
+            policy: PolicyConfig::Random,
+            host: "127.0.0.1".to_string(),
+            port: 3002,
+            max_payload_size: 256 * 1024 * 1024,
+            request_timeout_secs: 600,
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 1,
+            discovery: None,
+            dp_aware: false,
+            api_key: None,
+            metrics: None,
+            log_dir: None,
+            log_level: None,
+            request_id_headers: None,
+            max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
+            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+            oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+        };
+
+        let ctx = TestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 18955,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+
+        let app = ctx.create_app().await;
+
+        // Directly store a response in the storage to test the retrieval endpoint
+        use sglang_router_rs::data_connector::{ResponseId, StoredResponse};
+        let mut stored_response = StoredResponse::new(None);
+        stored_response.id = ResponseId::from("resp_test_input_items");
+        stored_response.input = json!([
+            {"content": "hello", "role": "user"},
+            {"content": "hi there", "role": "assistant"}
+        ]);
+        stored_response.output = json!([
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "test response"}]}
+        ]);
+
+        ctx.app_context
+            .response_storage
+            .store_response(stored_response)
+            .await
+            .expect("Failed to store response");
+
+        // Fetch input_items for the created response
         let req = Request::builder()
             .method("GET")
-            .uri(format!("/v1/responses/{}/input", resp_id))
+            .uri("/v1/responses/resp_test_input_items/input_items")
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let items_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify response structure
+        assert_eq!(items_json["object"], "list");
+        assert!(items_json["data"].is_array());
+
+        // Should have 2 input items
+        let items = items_json["data"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
 
         ctx.shutdown().await;
     }
