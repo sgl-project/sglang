@@ -299,6 +299,9 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(indices_to_free)
                 continue
 
+            if req.is_retracted:
+                continue
+
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
