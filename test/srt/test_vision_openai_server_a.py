@@ -180,6 +180,8 @@ class TestDeepseekOCRServer(ImageOpenAITestMixin):
 
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        # image_url = "/root/sgl-workspace/afiles/screenshot.png"
+        image_url = "/root/sgl-workspace/afiles/ocr-text.png"
 
         response = client.chat.completions.create(
             model="default",
@@ -189,10 +191,7 @@ class TestDeepseekOCRServer(ImageOpenAITestMixin):
                     "content": [
                         {
                             "type": "image_url",
-                            # "image_url": {"url": IMAGE_MAN_IRONING_URL},
-                            "image_url": {
-                                "url": "/sgl-workspace/sglang/assets/document_570p.png"
-                            },
+                            "image_url": {"url": image_url},
                         },
                         {
                             "type": "text",

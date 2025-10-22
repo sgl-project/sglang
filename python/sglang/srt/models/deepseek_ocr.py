@@ -1251,8 +1251,10 @@ class DeepseekOCRForCausalLM(nn.Module):
         images_in_this_batch = []
 
         with torch.no_grad():
+            print(f"DEBUG: {images_spatial_crop.size()=}")
             for jdx in range(images_spatial_crop.size(0)):
                 patches = images_crop[jdx][0].to(torch.bfloat16)
+                print(f"DEBUG: {patches.size()=}, {torch.sum(patches).item()=}")
                 image_ori = pixel_values[jdx]
                 crop_shape = images_spatial_crop[jdx][0]
 
@@ -1286,7 +1288,9 @@ class DeepseekOCRForCausalLM(nn.Module):
                     _2, hw2, n_dim2 = local_features.shape
                     h2 = w2 = int(hw2**0.5)
 
-                    width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
+                    width_crop_num, height_crop_num = int(crop_shape[0]), int(
+                        crop_shape[1]
+                    )
 
                     global_features = global_features.view(h, w, n_dim)
 
@@ -1362,14 +1366,22 @@ class DeepseekOCRForCausalLM(nn.Module):
         pixel_values = torch.stack([item.feature for item in mm_items], dim=0).type(
             self.vision_model.dtype
         )
+        print(f"DEBUG: {pixel_values.size()=}")
 
-        images_crop = torch.cat([item.images_crop for item in mm_items], dim=0).type(
-            self.vision_model.dtype
+        images_crop = (
+            torch.stack([item.images_crop for item in mm_items], dim=0)
+            .type(self.vision_model.dtype)
+            .to(device=pixel_values.device)
         )
-        images_spatial_crop = torch.cat(
-            [item.images_spatial_crop for item in mm_items], dim=0
-        ).type(self.vision_model.dtype)
+        print(f"DEBUG: {images_crop.size()=}")
+        images_spatial_crop = (
+            torch.cat([item.images_spatial_crop for item in mm_items], dim=0)
+            .type(self.vision_model.dtype)
+            .to(device=pixel_values.device)
+        )
+        print(f"DEBUG: {images_spatial_crop.size()=}")
 
+        assert images_crop.dim() == 6
         assert images_spatial_crop.dim() == 3
 
         vision_feature_lists = self._pixel_values_to_embedding(
