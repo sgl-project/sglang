@@ -167,13 +167,9 @@ class FusedMoE(torch.nn.Module):
             and self.expert_map_cpu is not None
             and not global_server_args_dict["disable_shared_experts_fusion"]
         ):
-            expert_mask = torch.ones((self.num_experts + 1,), dtype=torch.int32)
-            expert_mask[:-1] = (
+            expert_mask = (
                 (self.expert_map_cpu >= 0) & (self.expert_map_cpu < self.num_experts)
             ).to(torch.int32)
-            expert_mask[-1] = 0
-            # FIXME(Ling): here we need to do 1-mask to keep the acc. We are still checking why the original expert mask leads to the acc crash.
-            expert_mask = 1 - expert_mask
             self.expert_mask_gpu = expert_mask.to(device="cuda")
         # if use flashinfer_cutlass_moe or aiter do not need to map global expert_id to local expert_id
 
@@ -881,11 +877,6 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
-
-        if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
-            if self.expert_map_cpu is not None and self.expert_map_gpu is None:
-                # If we are in EP mode, we need to move the expert map to GPU.
-                self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
         if self.expert_map_gpu is not None:
             if TopKOutputChecker.format_is_standard(topk_output):
