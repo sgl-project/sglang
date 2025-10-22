@@ -16,7 +16,7 @@ The main source is **varying batch sizes**. Different batch sizes cause GPU kern
 
 ## SGLang's Solution
 
-Building on [Thinking Machines Lab's batch-invariant operators](https://github.com/thinking-machines-lab/batch_invariant_ops), SGLang achieves fully deterministic inference while maintaining compatibility with chunked prefill, CUDA graphs, radix cache, and non-greedy sampling.
+Building on [Thinking Machines Lab's batch-invariant operators](https://github.com/thinking-machines-lab/batch_invariant_ops), SGLang achieves fully deterministic inference while maintaining compatibility with chunked prefill, CUDA graphs, radix cache, and non-greedy sampling. The development roadmap for deterministic inference features can be found in this [issue](https://github.com/sgl-project/sglang/issues/10278).
 
 ### Supported Backends
 
@@ -146,6 +146,9 @@ python3 -m sglang.test.test_deterministic --test-mode single --n-trials 50
 
 # Prefix test: prompts with different prefix lengths
 python3 -m sglang.test.test_deterministic --test-mode prefix --n-trials 50
+
+# Radix Cache Consistency mode: test radix cache determinism (cached vs uncached prefill)
+python3 -m sglang.test.test_deterministic --test-mode radix_cache
 ```
 
 Expected result: All tests should show `Unique samples: 1` (perfectly deterministic).
