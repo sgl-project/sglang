@@ -1,18 +1,18 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
+requires = ["setuptools>=61.0", "wheel"]
 
 [project]
-name = "sglang"
-version = "0.5.3.post3"
-description = "SGLang is a fast serving framework for large language models and vision language models."
-readme = "README.md"
-requires-python = ">=3.10"
-license = { file = "LICENSE" }
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: Apache Software License",
 ]
+description = "SGLang is a fast serving framework for large language models and vision language models."
+license = {file = "LICENSE"}
+name = "sglang"
+readme = "README.md"
+requires-python = ">=3.10"
+version = "0.5.3.post3"
 
 dependencies = [
   "torch==2.8.0",
@@ -62,20 +62,15 @@ dependencies = [
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
-  "uvloop",
-  # "xgrammar==0.1.24", , xgrammar depends on CUDA PyTorch and Triton only
+  "uvloop", # "xgrammar==0.1.24", , xgrammar depends on CUDA PyTorch and Triton only
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
 ]
 
 [project.optional-dependencies]
-tracing = [
-  "opentelemetry-sdk",
-  "opentelemetry-api",
-  "opentelemetry-exporter-otlp",
-  "opentelemetry-exporter-otlp-proto-grpc",
-]
+all = []
+dev = ["sglang[test]"]
 test = [
   "accelerate",
   "expecttest",
@@ -87,12 +82,19 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
-all = []
-dev = ["sglang[test]"]
+tracing = [
+  "opentelemetry-sdk",
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+]
 
 [project.urls]
-"Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+"Homepage" = "https://github.com/sgl-project/sglang"
+
+[project.scripts]
+sglang-serve = "sglang.launch_server:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
