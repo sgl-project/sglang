@@ -24,6 +24,9 @@ from typing import TYPE_CHECKING, Union
 import torch
 import tqdm
 
+from sglang.srt.compilation.compilation_config import CompilationConfig
+from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
+from sglang.srt.compilation.piecewise_context_manager import set_forward_context
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -35,17 +38,10 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
-from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
-from sglang.srt.model_executor.compilation.compile import (
-    install_torch_compiled,
-    set_compiled,
-)
-from sglang.srt.model_executor.compilation.piecewise_context_manager import (
-    set_forward_context,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -108,9 +104,10 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
 
 
 @contextmanager
-def patch_model(model: torch.nn.Module):
+def patch_model(model: torch.nn.Module, compiler: str):
     try:
-        _to_torch(model, reverse=False, num_tokens=16)
+        if compiler != "eager":
+            _to_torch(model, reverse=False, num_tokens=16)
         yield model
     finally:
         _to_torch(model, reverse=True, num_tokens=16)
@@ -149,8 +146,13 @@ class PiecewiseCudaGraphRunner:
         assert (
             self.model_runner.server_args.piecewise_cuda_graph_tokens is not None
         ), "piecewise_cuda_graph_tokens is not set"
+        assert self.model_runner.server_args.piecewise_cuda_graph_compiler in [
+            "eager",
+            "inductor",
+        ], "By now, only eager and inductor are supported for piecewise cuda graph compiler."
         self.compile_config = CompilationConfig(
-            self.model_runner.server_args.piecewise_cuda_graph_tokens
+            self.model_runner.server_args.piecewise_cuda_graph_tokens,
+            self.model_runner.server_args.piecewise_cuda_graph_compiler,
         )
 
         # Batch sizes to capture
@@ -184,7 +186,9 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
-        with patch_model(self.model_runner.model.model) as patched_model:
+        with patch_model(
+            self.model_runner.model.model, self.compile_config.compiler
+        ) as patched_model:
             install_torch_compiled(
                 patched_model,
                 fullgraph=True,
@@ -196,14 +200,14 @@ class PiecewiseCudaGraphRunner:
             with set_compiled(True):
                 self.warmup_and_capture()
 
-        # Capture
-        try:
-            with model_capture_mode():
-                self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
-            )
+            # Capture
+            try:
+                with model_capture_mode():
+                    self.capture()
+            except RuntimeError as e:
+                raise Exception(
+                    f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                )
 
         self.raw_num_tokens = 0
 
@@ -374,6 +378,9 @@ class PiecewiseCudaGraphRunner:
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
+            # It is True in this context but we need to set it to use low latency deepep mode.
+            set_is_extend_in_batch(False)
 
             kwargs = {}
             with set_forward_context(forward_batch, self.attention_layers):
