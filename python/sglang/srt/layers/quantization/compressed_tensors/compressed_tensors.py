@@ -44,6 +44,13 @@ from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 try:
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_24 import (
+        CompressedTensors24,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a16_sparse24 import (
+        W4A16SPARSE24_SUPPORTED_BITS,
+        CompressedTensorsW4A16Sparse24,
+    )
     from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
         WNA16_SUPPORTED_BITS,
         CompressedTensorsWNA16,

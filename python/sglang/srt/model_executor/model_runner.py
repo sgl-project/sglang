@@ -24,7 +24,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -51,6 +51,7 @@ from sglang.srt.distributed import (
     set_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
@@ -379,6 +380,11 @@ class ModelRunner:
         )
         self.expert_location_updater = ExpertLocationUpdater()
 
+        (
+            ElasticEPStateManager.init(self.server_args)
+            if self.server_args.elastic_ep_backend
+            else None
+        )
         # Load the model
         self.sampler = Sampler()
         self.load_model()
@@ -668,15 +674,27 @@ class ModelRunner:
                     self.model_config.hf_config, "quantization_config", None
                 )
             ) is not None:
-                text_config = self.model_config.hf_text_config
                 weight_block_size_n = quantization_config["weight_block_size"][0]
-                if (
-                    text_config.moe_intermediate_size
-                    // (self.tp_size // self.moe_ep_size)
-                ) % weight_block_size_n != 0:
+
+                if self.tp_size % self.moe_ep_size != 0:
                     raise ValueError(
-                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0. "
-                        f"You can fix this by using arguments such as `--tp-size 8 --ep-size 8`"
+                        f"tp_size {self.tp_size} must be divisible by moe_ep_size {self.moe_ep_size}"
+                    )
+                moe_tp_size = self.tp_size // self.moe_ep_size
+
+                moe_intermediate_size = (
+                    self.model_config.hf_text_config.moe_intermediate_size
+                )
+                if moe_intermediate_size % moe_tp_size != 0:
+                    raise ValueError(
+                        f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
+                    )
+
+                if (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0:
+                    raise ValueError(
+                        f"For qwen3-vl-fp8 models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
+                        f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size}). "
+                        f"You can fix this by setting arguments `--tp-size` and `--ep-size` correctly."
                     )
 
     def init_torch_distributed(self):
@@ -816,6 +834,16 @@ class ModelRunner:
         set_cuda_arch()
 
         # Prepare the model config
+        from sglang.srt.configs.modelopt_config import ModelOptConfig
+
+        modelopt_config = ModelOptConfig(
+            quant=self.server_args.modelopt_quant,
+            checkpoint_restore_path=self.server_args.modelopt_checkpoint_restore_path,
+            checkpoint_save_path=self.server_args.modelopt_checkpoint_save_path,
+            export_path=self.server_args.modelopt_export_path,
+            quantize_and_serve=self.server_args.quantize_and_serve,
+        )
+
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
@@ -824,6 +852,7 @@ class ModelRunner:
             remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+            modelopt_config=modelopt_config,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
@@ -933,16 +962,33 @@ class ModelRunner:
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        self.expert_location_updater.update(
-            self.model.routed_experts_weights_of_layer,
-            new_expert_location_metadata,
-            update_layer_ids=update_layer_ids,
-            nnodes=self.server_args.nnodes,
-            rank=self.tp_rank,
-        )
+        if ElasticEPStateManager.instance() is not None:
+            # TODO: refactor the weights update when elastic ep
+            old_expert_location_metadata = get_global_expert_location_metadata()
+            assert old_expert_location_metadata is not None
+            old_expert_location_metadata.update(
+                new_expert_location_metadata,
+                update_layer_ids=update_layer_ids,
+            )
+            self.update_weights_from_disk(
+                self.server_args.model_path,
+                self.server_args.load_format,
+                lambda name: "mlp.experts" in name and "mlp.shared_experts" not in name,
+            )
+        else:
+            self.expert_location_updater.update(
+                self.model.routed_experts_weights_of_layer,
+                new_expert_location_metadata,
+                update_layer_ids=update_layer_ids,
+                nnodes=self.server_args.nnodes,
+                rank=self.tp_rank,
+            )
 
     def update_weights_from_disk(
-        self, model_path: str, load_format: str
+        self,
+        model_path: str,
+        load_format: str,
+        weight_name_filter: Optional[Callable[[str], bool]] = None,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -964,6 +1010,11 @@ class ModelRunner:
             iter = loader._get_weights_iterator(
                 DefaultModelLoader.Source.init_new(config, self.model)
             )
+            if weight_name_filter is not None:
+                iter = (
+                    (name, weight) for name, weight in iter if weight_name_filter(name)
+                )
+
             return iter
 
         def model_load_weights(model, iter):

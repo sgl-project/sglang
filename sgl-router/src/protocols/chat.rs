@@ -625,8 +625,6 @@ pub struct ChatCompletionMessage {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
-    /// Reasoning content for O1-style models (SGLang extension)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     // Note: function_call is deprecated and not included
     // Note: refusal, annotations, audio are not added yet
@@ -669,8 +667,6 @@ pub struct ChatMessageDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
-    /// Reasoning content delta for O1-style models (SGLang extension)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
 }
 

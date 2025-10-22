@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import tqdm
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -3499,7 +3500,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         # temporarily only support DeepSeek V3/R1
         weight_block_size = [128, 128]
 
-        for layer_id in trange(
+        for layer_id in tqdm.trange(
             self.config.num_hidden_layers + int(is_nextn),
             desc="quant attn to fp8 ue8m0",
         ):
