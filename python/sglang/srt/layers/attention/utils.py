@@ -1,8 +1,8 @@
 import triton
 import triton.language as tl
 
-FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
-FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(FLASHMLA_CREATE_KV_BLOCK_SIZE)
+_FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
+FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
 
 
 @triton.jit
@@ -45,7 +45,7 @@ def create_flashinfer_kv_indices_triton(
 
 
 def get_num_page_per_block_flashmla(page_size: int = 64) -> int:
-    num_page_per_block = FLASHMLA_CREATE_KV_BLOCK_SIZE // page_size
+    num_page_per_block = _FLASHMLA_CREATE_KV_BLOCK_SIZE // page_size
     return num_page_per_block
 
 
