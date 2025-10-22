@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable, Optional
+from typing import Callable
 
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
@@ -14,19 +14,21 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
+
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-        apply_fp8_marlin_linear, prepare_fp8_layer_for_marlin)
+        apply_fp8_marlin_linear,
+        prepare_fp8_layer_for_marlin,
+    )
     from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-        convert_to_channelwise)
+        convert_to_channelwise,
+    )
 except Exception as e:
     print(f"import vllm failed: {e}")
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
-SUPPORTED_STRATEGIES = [
-    QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSOR
-]
+SUPPORTED_STRATEGIES = [QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSOR]
 
 
 class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):

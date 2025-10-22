@@ -30,7 +30,10 @@ from sglang.srt.layers.quantization.marlin_utils import (
     verify_marlin_supports_shape,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.quantization.utils.utils import get_scalar_types, replace_parameter
+from sglang.srt.layers.quantization.utils.utils import (
+    get_scalar_types,
+    replace_parameter,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig

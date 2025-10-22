@@ -1,13 +1,14 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Callable
+
 import torch
-from collections.abc import Callable, Sequence
 
 from sglang.srt.layers.parameter import (
+    BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
     PerTensorScaleParameter,
-    BlockQuantScaleParameter,
 )
 
 

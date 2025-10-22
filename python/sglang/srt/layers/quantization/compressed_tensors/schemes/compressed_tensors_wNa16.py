@@ -1,15 +1,15 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 from collections.abc import Callable
 
 import torch
 from compressed_tensors.quantization import ActivationOrdering
 
-import logging
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
-)
+# yapf: enable
+from sgl_kernel.scalar_type import scalar_types
+
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     ChannelQuantScaleParameter,
@@ -18,8 +18,9 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
     RowvLLMParameter,
 )
-# yapf: enable
-from sgl_kernel.scalar_type import scalar_types
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsScheme,
+)
 
 try:
     from vllm.model_executor.layers.quantization.kernels.mixed_precision import (

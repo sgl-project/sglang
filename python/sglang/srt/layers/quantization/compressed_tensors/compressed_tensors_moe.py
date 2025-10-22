@@ -28,6 +28,7 @@ from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -40,16 +41,15 @@ from sglang.srt.layers.quantization.utils.utils import (
     replace_parameter,
 )
 from sglang.srt.utils import (
-    is_sm90_supported,
-    is_sm100_supported,
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    is_cpu,
     is_hip,
+    is_sm90_supported,
+    is_sm100_supported,
     set_weight_attrs,
 )
-from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -146,7 +146,6 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
 
 class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
-
     def __init__(self, quant_config: CompressedTensorsConfig):
         self.quant_config = quant_config
         self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
@@ -157,6 +156,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         self.static_input_scales = not self.input_quant.dynamic
 
         from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
+
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.use_cutlass_fused_experts_fp8 = (
             get_bool_env_var("SGLANG_CUTLASS_MOE")
@@ -191,7 +191,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         params_dtype = torch.float8_e4m3fn
 
         from sglang.srt.distributed import get_tensor_model_parallel_world_size
-    
+
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
@@ -213,7 +213,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                         f"{intermediate_size_per_partition} is not divisible by "
                         f"weight quantization block_k = {block_k}."
                     )
-
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
