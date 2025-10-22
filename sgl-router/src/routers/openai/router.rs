@@ -577,7 +577,8 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     let mut items = Vec::new();
                     for stored in chain.responses.iter() {
                         // Convert input to conversation item
-                        items.push(ResponseInputOutputItem::Message {
+                        items.push(ResponseInputOutputItem::OutputMessage {
+                            message_type: "message".to_string(),
                             id: format!("msg_u_{}", stored.id.0.trim_start_matches("resp_")),
                             role: "user".to_string(),
                             content: vec![ResponseContentPart::InputText {
@@ -647,7 +648,8 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                                     item.content.clone(),
                                 )
                             {
-                                items.push(ResponseInputOutputItem::Message {
+                                items.push(ResponseInputOutputItem::OutputMessage {
+                                    message_type: "message".to_string(),
                                     id: item.id.0.clone(),
                                     role: item.role.clone().unwrap_or_else(|| "user".to_string()),
                                     content: content_parts,
@@ -660,7 +662,8 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     // Append current request
                     match &request_body.input {
                         ResponseInput::Text(text) => {
-                            items.push(ResponseInputOutputItem::Message {
+                            items.push(ResponseInputOutputItem::OutputMessage {
+                                message_type: "message".to_string(),
                                 id: format!("msg_u_{}", conv_id.0),
                                 role: "user".to_string(),
                                 content: vec![ResponseContentPart::InputText {
@@ -687,7 +690,8 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             // Append current request
             match &request_body.input {
                 ResponseInput::Text(text) => {
-                    items.push(ResponseInputOutputItem::Message {
+                    items.push(ResponseInputOutputItem::OutputMessage {
+                        message_type: "message".to_string(),
                         id: format!(
                             "msg_u_{}",
                             original_previous_response_id
