@@ -116,7 +116,7 @@ python -m sglang_router.launch_router --pd-disaggregation \
   --port 8000 \
 ```
 
-Please refer to [this PR](https://github.com/sgl-project/sglang/pull/10912) for more information.
+If you need more advanced deployment methods or production-ready deployment methods, such as RBG or LWS-based deployment, please refer to [references/multi_node_deployment/rbg_pd/deepseekv32_pd.md](../references/multi_node_deployment/rbg_pd/deepseekv32_pd.md). Additionally, you can also find startup commands for DeepEP-based EP parallelism in the aforementioned documentation.
 
 
 ## Benchmarking Results
