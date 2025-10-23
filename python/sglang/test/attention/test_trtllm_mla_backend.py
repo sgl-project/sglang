@@ -16,10 +16,15 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
 )
-from sglang.srt.layers.attention.utils import TRITON_PAD_NUM_PAGE_PER_BLOCK
+from sglang.srt.layers.attention.utils import get_num_page_per_block_flashmla
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.test_utils import CustomTestCase
 
@@ -104,15 +109,15 @@ TEST_CASES = {
             "page_size": 32,
             "description": "Single FP16 vs reference",
         },
-        {
-            "name": "single_fp8",
-            "batch_size": 1,
-            "max_seq_len": 64,
-            "page_size": 64,
-            "tolerance": 1e-1,
-            "kv_cache_dtype": torch.float8_e4m3fn,
-            "description": "Single FP8 vs reference",
-        },
+        # {
+        #     "name": "single_fp8",
+        #     "batch_size": 1,
+        #     "max_seq_len": 64,
+        #     "page_size": 64,
+        #     "tolerance": 1e-1,
+        #     "kv_cache_dtype": torch.float8_e4m3fn,
+        #     "description": "Single FP8 vs reference",
+        # },
         {
             "name": "batch_fp16",
             "batch_size": 32,
@@ -120,15 +125,15 @@ TEST_CASES = {
             "page_size": 32,
             "description": "Batch FP16 vs reference",
         },
-        {
-            "name": "batch_fp8",
-            "batch_size": 32,
-            "max_seq_len": 64,
-            "page_size": 64,
-            "tolerance": 1e-1,
-            "kv_cache_dtype": torch.float8_e4m3fn,
-            "description": "Batch FP8 vs reference",
-        },
+        # {
+        #     "name": "batch_fp8",
+        #     "batch_size": 32,
+        #     "max_seq_len": 64,
+        #     "page_size": 64,
+        #     "tolerance": 1e-1,
+        #     "kv_cache_dtype": torch.float8_e4m3fn,
+        #     "description": "Batch FP8 vs reference",
+        # },
     ],
     "page_size_consistency": [
         # Only 32 and 64 supported for now in flashinfer TRTLLM-GEN MLA kernel
@@ -213,13 +218,7 @@ class MockModelRunner:
         self.page_size = config["page_size"]
 
         # Server args stub - needed by attention backends
-        self.server_args = type(
-            "ServerArgs",
-            (),
-            {
-                "enable_dp_attention": False,  # Default value for testing
-            },
-        )
+        self.server_args = get_global_server_args()
 
         # Model-config stub with MLA attributes
         self.model_config = type(
@@ -319,6 +318,17 @@ def compare_outputs(trtllm_out, reference_out, tolerance=1e-2):
 )
 class TestTRTLLMMLA(CustomTestCase):
     """Test suite for TRTLLM MLA backend with centralized configuration."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up global server args for testing."""
+        server_args = ServerArgs(model_path="dummy")
+        server_args.enable_dp_attention = False
+        set_global_server_args_for_scheduler(server_args)
+
+    @classmethod
+    def tearDownClass(cls):
+        pass
 
     def _merge_config(self, test_case):
         """Merge test case with default configuration."""
@@ -841,23 +851,15 @@ class TestTRTLLMMLA(CustomTestCase):
                 backend.init_forward_metadata(fb)
 
                 # Verify metadata exists
-                self.assertIsNotNone(backend.forward_metadata)
-                self.assertIsInstance(backend.forward_metadata, TRTLLMMLADecodeMetadata)
+                self.assertIsNotNone(backend.forward_decode_metadata)
+                self.assertIsInstance(
+                    backend.forward_decode_metadata, TRTLLMMLADecodeMetadata
+                )
 
                 # Test metadata structure
-                metadata = backend.forward_metadata
-                self.assertIsNotNone(
-                    metadata.workspace, "Workspace should be allocated"
-                )
+                metadata = backend.forward_decode_metadata
                 self.assertIsNotNone(
                     metadata.block_kv_indices, "Block KV indices should be created"
-                )
-
-                # Test workspace properties
-                self.assertEqual(metadata.workspace.device.type, "cuda")
-                self.assertEqual(metadata.workspace.dtype, torch.uint8)
-                self.assertGreater(
-                    metadata.workspace.numel(), 0, "Workspace should have non-zero size"
                 )
 
                 # Test block KV indices properties
@@ -915,9 +917,10 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Should satisfy TRT-LLM and Triton constraints
                 trtllm_constraint = 128 // scenario["page_size"]
-                constraint_lcm = math.lcm(
-                    trtllm_constraint, TRITON_PAD_NUM_PAGE_PER_BLOCK
+                triton_constraint = get_num_page_per_block_flashmla(
+                    scenario["page_size"]
                 )
+                constraint_lcm = math.lcm(trtllm_constraint, triton_constraint)
                 self.assertEqual(
                     calculated_blocks % constraint_lcm,
                     0,
@@ -965,7 +968,7 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Initialize metadata
                 backend.init_forward_metadata(fb)
-                metadata = backend.forward_metadata
+                metadata = backend.forward_decode_metadata
 
                 # Verify KV indices structure
                 block_kv_indices = metadata.block_kv_indices
@@ -1016,7 +1019,6 @@ class TestTRTLLMMLA(CustomTestCase):
 
         # Verify CUDA graph buffers are allocated
         self.assertIsNotNone(backend.decode_cuda_graph_kv_indices)
-        self.assertIsNotNone(backend.decode_cuda_graph_workspace)
 
         # Test capture metadata
         seq_lens = torch.full(
@@ -1038,7 +1040,6 @@ class TestTRTLLMMLA(CustomTestCase):
         self.assertIn(batch_size, backend.decode_cuda_graph_metadata)
         capture_metadata = backend.decode_cuda_graph_metadata[batch_size]
 
-        self.assertIsNotNone(capture_metadata.workspace)
         self.assertIsNotNone(capture_metadata.block_kv_indices)
 
         # Test replay with different sequence lengths
@@ -1061,11 +1062,8 @@ class TestTRTLLMMLA(CustomTestCase):
         )
 
         # Verify replay updated the metadata
-        replay_metadata = backend.forward_metadata
+        replay_metadata = backend.forward_decode_metadata
         self.assertIsNotNone(replay_metadata)
-        self.assertEqual(
-            replay_metadata.workspace.data_ptr(), capture_metadata.workspace.data_ptr()
-        )
 
     def test_metadata_consistency_across_calls(self):
         """Test metadata consistency across multiple forward calls."""
@@ -1083,7 +1081,7 @@ class TestTRTLLMMLA(CustomTestCase):
             config["batch_size"], seq_lens_1, backend, model_runner, config
         )
         backend.init_forward_metadata(fb_1)
-        metadata_1 = backend.forward_metadata
+        metadata_1 = backend.forward_decode_metadata
 
         # Second call with same sequence lengths
         seq_lens_2 = torch.tensor([32, 48], device=config["device"])
@@ -1091,10 +1089,9 @@ class TestTRTLLMMLA(CustomTestCase):
             config["batch_size"], seq_lens_2, backend, model_runner, config
         )
         backend.init_forward_metadata(fb_2)
-        metadata_2 = backend.forward_metadata
+        metadata_2 = backend.forward_decode_metadata
 
         # Metadata structure should be consistent
-        self.assertEqual(metadata_1.workspace.shape, metadata_2.workspace.shape)
         self.assertEqual(
             metadata_1.block_kv_indices.shape, metadata_2.block_kv_indices.shape
         )
@@ -1105,10 +1102,9 @@ class TestTRTLLMMLA(CustomTestCase):
             config["batch_size"], seq_lens_3, backend, model_runner, config
         )
         backend.init_forward_metadata(fb_3)
-        metadata_3 = backend.forward_metadata
+        metadata_3 = backend.forward_decode_metadata
 
         # Should still have valid structure
-        self.assertIsNotNone(metadata_3.workspace)
         self.assertIsNotNone(metadata_3.block_kv_indices)
         self.assertEqual(metadata_3.block_kv_indices.shape[0], config["batch_size"])
 

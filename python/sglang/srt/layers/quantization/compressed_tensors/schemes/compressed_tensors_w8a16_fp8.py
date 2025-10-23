@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable
+from typing import Callable, List, Optional
 
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
@@ -14,17 +14,11 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
-
-try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-        apply_fp8_marlin_linear,
-        prepare_fp8_layer_for_marlin,
-    )
-    from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-        convert_to_channelwise,
-    )
-except Exception as e:
-    print(f"import vllm failed: {e}")
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear,
+    prepare_fp8_layer_for_marlin,
+)
+from sglang.srt.layers.quantization.utils.utils import convert_to_channelwise
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
@@ -32,7 +26,6 @@ SUPPORTED_STRATEGIES = [QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSO
 
 
 class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
-
     def __init__(self, strategy: str, is_static_input_scheme: bool):
         self.strategy = strategy
         self.is_static_input_scheme = is_static_input_scheme
@@ -65,13 +58,13 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             layer.input_scale = torch.nn.Parameter(
                 layer.input_scale.data, requires_grad=False
             )
-        prepare_fp8_layer_for_marlin(layer)
+        prepare_fp8_layer_for_marlin(layer, size_k_first=True)
 
     def create_weights(
         self,
         layer: torch.nn.Module,
         input_size: int,
-        output_partition_sizes: list[int],
+        output_partition_sizes: List[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
         weight_loader: Callable,
@@ -82,7 +75,6 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
-        layer.weight_block_size = None
 
         # WEIGHT
         weight = ModelWeightParameter(
@@ -130,7 +122,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        bias: torch.Tensor | None = None,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return apply_fp8_marlin_linear(
             input=x,

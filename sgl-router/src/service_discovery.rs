@@ -18,11 +18,7 @@ use rustls;
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    core::{Job, WorkerManager},
-    protocols::worker_spec::WorkerConfigRequest,
-    server::AppContext,
-};
+use crate::{core::Job, protocols::worker_spec::WorkerConfigRequest, server::AppContext};
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
@@ -386,7 +382,7 @@ async fn handle_pod_event(
                 reasoning_parser: None,
                 tool_parser: None,
                 chat_template: None,
-                api_key: None,
+                api_key: app_context.router_config.api_key.clone(),
                 health_check_timeout_secs: app_context.router_config.health_check.timeout_secs,
                 health_check_interval_secs: app_context
                     .router_config
@@ -453,8 +449,24 @@ async fn handle_pod_deletion(
             pod_info.name, pod_info.pod_type, worker_url
         );
 
-        if let Err(e) = WorkerManager::remove_worker(&worker_url, &app_context) {
-            error!("Failed to remove worker {}: {}", worker_url, e);
+        let job = Job::RemoveWorker {
+            url: worker_url.clone(),
+        };
+
+        if let Some(job_queue) = app_context.worker_job_queue.get() {
+            if let Err(e) = job_queue.submit(job).await {
+                error!(
+                    "Failed to submit worker removal job for {}: {}",
+                    worker_url, e
+                );
+            } else {
+                debug!("Submitted worker removal job for {}", worker_url);
+            }
+        } else {
+            error!(
+                "JobQueue not initialized, cannot remove worker {}",
+                worker_url
+            );
         }
     } else {
         debug!(

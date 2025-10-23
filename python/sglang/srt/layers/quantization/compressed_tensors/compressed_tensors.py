@@ -428,6 +428,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                     group_size=weight_quant.group_size,
                     actorder=weight_quant.actorder,
                 )
+            else:
+                raise ImportError(
+                    "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
+                )
 
         act_quant_format = is_activation_quantization_format(format)
         if act_quant_format:
@@ -492,11 +496,9 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Find the "target" in the compressed-tensors config
         # that our layer conforms to.
-        # TODO (@kylesayrs): support ignore module names with ct matching utils
-        if should_ignore_layer(
-            layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
-        ):
-            return None
+        # TODO : add compressed-tensors as dep
+        # so we do not have to re-write these functions
+        # need to make accelerate optional in ct to do this
 
         # Will be empty for models with only sparsity
         weight_quant = input_quant = None
@@ -528,7 +530,13 @@ class CompressedTensorsConfig(QuantizationConfig):
             )
             sparsity_scheme = self.sparsity_scheme_map[matched_target]
 
-        if weight_quant is None:
+        if self.supports_cutlass_24(
+            weight_quant=weight_quant,
+            input_quant=input_quant,
+            sparsity_scheme=sparsity_scheme,
+        ):
+            raise ImportError("CompressedTensors24 is not supported now")
+        elif weight_quant is None:
             logger.warning_once(
                 "Acceleration for non-quantized schemes is "
                 "not supported by Compressed Tensors. "

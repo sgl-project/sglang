@@ -324,10 +324,11 @@ async fn route_responses_background(
         incomplete_details: None,
         instructions: request.instructions.clone(),
         max_output_tokens: request.max_output_tokens,
-        model: request
-            .model
-            .clone()
-            .unwrap_or_else(|| "default".to_string()),
+        model: if request.model.is_empty() {
+            "default".to_string()
+        } else {
+            request.model.clone()
+        },
         output: Vec::new(),
         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
         previous_response_id: request.previous_response_id.clone(),
@@ -622,10 +623,11 @@ async fn process_and_transform_sse_stream(
 
     // Create event emitter for OpenAI-compatible streaming
     let response_id = format!("resp_{}", Uuid::new_v4());
-    let model = original_request
-        .model
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
+    let model = if original_request.model.is_empty() {
+        "default".to_string()
+    } else {
+        original_request.model.clone()
+    };
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
 
