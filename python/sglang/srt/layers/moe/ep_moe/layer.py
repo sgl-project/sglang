@@ -440,9 +440,9 @@ class DeepEPMoE(FusedMoE):
         hidden_states, hidden_states_scale, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
-        assert (
-            hidden_states_scale.dtype == torch.float32
-            or (deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and hidden_states_scale.dtype == torch.int32)
+        assert hidden_states_scale.dtype == torch.float32 or (
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and hidden_states_scale.dtype == torch.int32
         ), f"hidden_states_scale.dtype: {hidden_states_scale.dtype}, DEEPGEMM_SCALE_UE8M0: {deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0}"
 
         # GroupGemm-0
