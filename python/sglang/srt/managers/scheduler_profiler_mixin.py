@@ -213,8 +213,7 @@ class SchedulerProfilerMixin:
                 message="Profiling is not in progress. Call /start_profile first.",
             )
 
-        if not self.torch_profiler_output_dir.exists():
-            self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
+        self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
 
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
