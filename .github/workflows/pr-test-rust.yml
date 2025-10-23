@@ -195,13 +195,10 @@ jobs:
           pip install --force-reinstall dist/*.whl
 
       - name: Run Python E2E response API tests
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
-          pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=WARNING
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} XAI_API_KEY=${{ secrets.XAI_API_KEY }} pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=WARNING
 
       - name: Run Python E2E gRPC tests
         run: |
