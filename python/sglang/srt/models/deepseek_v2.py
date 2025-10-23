@@ -189,6 +189,10 @@ elif _is_npu:
     import custom_ops  # noqa: F401
     import sgl_kernel_npu  # noqa: F401
     import torch_npu  # noqa: F401
+
+    from sglang.srt.layers.quantization.awq_triton import (
+        awq_dequantize_decomposition as awq_dequantize,
+    )
 else:
     pass
 
@@ -2965,7 +2969,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             )
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # AWQ compatible
-                if _is_cuda or _is_hip:
+                if _is_cuda or _is_hip or _is_npu:
                     w = awq_dequantize(
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,
