@@ -1,14 +1,18 @@
-use std::collections::{BTreeMap, HashMap};
-use std::sync::RwLock;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::RwLock,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use super::conversation_items::{
-    make_item_id, ConversationItem, ConversationItemId, ConversationItemStorage, ListParams,
-    Result, SortOrder,
+use super::{
+    conversation_items::{
+        make_item_id, ConversationItem, ConversationItemId, ConversationItemStorage, ListParams,
+        Result, SortOrder,
+    },
+    conversations::ConversationId,
 };
-use super::conversations::ConversationId;
 
 #[derive(Default)]
 pub struct MemoryConversationItemStorage {
@@ -190,8 +194,9 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::{TimeZone, Utc};
+
+    use super::*;
 
     fn make_item(
         item_type: &str,

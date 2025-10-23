@@ -70,7 +70,7 @@ def compile_proto(proto_file: Path, output_dir: Path, verbose: bool = True) -> b
 
     # Check if grpc_tools is available
     try:
-        import grpc_tools.protoc
+        import grpc_tools.protoc  # noqa: F401
     except ImportError:
         print("Error: grpcio-tools not installed")
         print(

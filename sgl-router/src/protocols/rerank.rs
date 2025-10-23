@@ -1,6 +1,7 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use validator::Validate;
 
 use super::common::{default_model, default_true, GenerationRequest, StringOrArray, UsageInfo};

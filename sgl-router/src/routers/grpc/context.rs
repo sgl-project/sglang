@@ -4,20 +4,22 @@
 //! eliminating deep parameter passing chains and providing a single source of truth
 //! for request state.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::http::HeaderMap;
 use serde_json::Value;
 
-use crate::core::Worker;
-use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::chat::{ChatCompletionRequest, ChatCompletionResponse};
-use crate::protocols::generate::{GenerateRequest, GenerateResponse};
-use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
-use crate::tokenizer::stop::StopSequenceDecoder;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserFactory as ToolParserFactory;
+use crate::{
+    core::Worker,
+    grpc_client::{proto, SglangSchedulerClient},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatCompletionResponse},
+        generate::{GenerateRequest, GenerateResponse},
+    },
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer},
+    tool_parser::ParserFactory as ToolParserFactory,
+};
 
 // ============================================================================
 // Core Context Types

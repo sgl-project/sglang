@@ -1007,11 +1007,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
 
+        from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.utils import (
             get_moe_a2a_backend,
             get_moe_runner_backend,
         )
-        from sglang.srt.layers.quantization import deep_gemm_wrapper
 
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()

@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 
-use crate::protocols::common::Tool;
-
-use crate::tool_parser::{
-    errors::ParserResult,
-    traits::{TokenToolParser, ToolParser},
-    types::{StreamingParseResult, ToolCall},
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::ParserResult,
+        traits::{TokenToolParser, ToolParser},
+        types::{StreamingParseResult, ToolCall},
+    },
 };
 
 /// Placeholder for the Harmony-backed GPT-OSS parser.

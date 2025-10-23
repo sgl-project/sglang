@@ -87,6 +87,7 @@ class _DpGatheredBufferWrapper:
     _global_dp_buffer_len: int
     _local_dp_buffer_len: int
     _global_num_tokens: Optional[List[int]]
+    _is_extend_in_batch: bool
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -145,6 +146,14 @@ class _DpGatheredBufferWrapper:
     def get_dp_device(cls) -> torch.device:
         return cls._device
 
+    @classmethod
+    def set_is_extend_in_batch(cls, is_extend_in_batch: bool):
+        cls._is_extend_in_batch = is_extend_in_batch
+
+    @classmethod
+    def get_is_extend_in_batch(cls) -> bool:
+        return cls._is_extend_in_batch
+
 
 def set_dp_buffer_len(
     global_dp_buffer_len: int,
@@ -186,6 +195,14 @@ def get_dp_dtype() -> torch.dtype:
 
 def get_dp_device() -> torch.device:
     return _DpGatheredBufferWrapper.get_dp_device()
+
+
+def set_is_extend_in_batch(is_extend_in_batch: bool):
+    _DpGatheredBufferWrapper.set_is_extend_in_batch(is_extend_in_batch)
+
+
+def get_is_extend_in_batch() -> bool:
+    return _DpGatheredBufferWrapper.get_is_extend_in_batch()
 
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):

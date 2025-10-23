@@ -12,6 +12,7 @@
 /python/sglang/srt/eplb @fzyzcjy
 /python/sglang/srt/function_call @CatherineSue @JustinTong0323
 /python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock @HaiShaw @ch-wan @BBuf @kushanam @Edwardf0t1
+/python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg
 /python/sglang/srt/layers/attention/ascend_backend.py @ping1jing2
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann

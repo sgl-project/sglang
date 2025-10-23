@@ -194,10 +194,14 @@ struct Router {
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
-    connection_mode: config::ConnectionMode,
+    connection_mode: core::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
     chat_template: Option<String>,
+    tokenizer_cache_enable_l0: bool,
+    tokenizer_cache_l0_max_entries: usize,
+    tokenizer_cache_enable_l1: bool,
+    tokenizer_cache_l1_max_memory: usize,
     reasoning_parser: Option<String>,
     tool_call_parser: Option<String>,
     backend: BackendType,
@@ -207,13 +211,13 @@ struct Router {
 
 impl Router {
     /// Determine connection mode from worker URLs
-    fn determine_connection_mode(worker_urls: &[String]) -> config::ConnectionMode {
+    fn determine_connection_mode(worker_urls: &[String]) -> core::ConnectionMode {
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-                return config::ConnectionMode::Grpc;
+                return core::ConnectionMode::Grpc { port: None };
             }
         }
-        config::ConnectionMode::Http
+        core::ConnectionMode::Http
     }
 
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
@@ -350,6 +354,12 @@ impl Router {
             oracle,
             reasoning_parser: self.reasoning_parser.clone(),
             tool_call_parser: self.tool_call_parser.clone(),
+            tokenizer_cache: config::TokenizerCacheConfig {
+                enable_l0: self.tokenizer_cache_enable_l0,
+                l0_max_entries: self.tokenizer_cache_l0_max_entries,
+                enable_l1: self.tokenizer_cache_enable_l1,
+                l1_max_memory: self.tokenizer_cache_l1_max_memory,
+            },
         })
     }
 }
@@ -415,6 +425,10 @@ impl Router {
         model_path = None,
         tokenizer_path = None,
         chat_template = None,
+        tokenizer_cache_enable_l0 = false,
+        tokenizer_cache_l0_max_entries = 10000,
+        tokenizer_cache_enable_l1 = false,
+        tokenizer_cache_l1_max_memory = 52428800,
         reasoning_parser = None,
         tool_call_parser = None,
         backend = BackendType::Sglang,
@@ -480,6 +494,10 @@ impl Router {
         model_path: Option<String>,
         tokenizer_path: Option<String>,
         chat_template: Option<String>,
+        tokenizer_cache_enable_l0: bool,
+        tokenizer_cache_l0_max_entries: usize,
+        tokenizer_cache_enable_l1: bool,
+        tokenizer_cache_l1_max_memory: usize,
         reasoning_parser: Option<String>,
         tool_call_parser: Option<String>,
         backend: BackendType,
@@ -559,6 +577,10 @@ impl Router {
             model_path,
             tokenizer_path,
             chat_template,
+            tokenizer_cache_enable_l0,
+            tokenizer_cache_l0_max_entries,
+            tokenizer_cache_enable_l1,
+            tokenizer_cache_l1_max_memory,
             reasoning_parser,
             tool_call_parser,
             backend,

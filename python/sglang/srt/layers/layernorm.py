@@ -42,17 +42,10 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 
-if _is_cuda:
+if _is_cuda or _is_xpu:
     # if _is_flashinfer_available:
     #     from flashinfer.norm import fused_add_rmsnorm
     # else:
-    from sgl_kernel import (
-        fused_add_rmsnorm,
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
-    )
-elif _is_xpu:
     from sgl_kernel import (
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
@@ -372,4 +365,4 @@ if not (
     logger.info(
         "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
     )
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm  # noqa: F401

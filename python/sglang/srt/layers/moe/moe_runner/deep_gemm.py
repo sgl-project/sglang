@@ -105,10 +105,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
 
+        from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.ep_moe.kernels import (
             silu_and_mul_masked_post_quant_fwd,
         )
-        from sglang.srt.layers.quantization import deep_gemm_wrapper
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale

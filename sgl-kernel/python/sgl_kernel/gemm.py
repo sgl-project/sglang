@@ -137,6 +137,11 @@ def sgl_per_token_group_quant_8bit(
     )
 
 
+# For legacy usage
+sgl_per_token_group_quant_fp8 = sgl_per_token_group_quant_8bit
+sgl_per_token_group_quant_int8 = sgl_per_token_group_quant_8bit
+
+
 def sgl_per_tensor_quant_fp8(
     input: torch.Tensor,
     output_q: torch.Tensor,

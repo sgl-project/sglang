@@ -48,7 +48,7 @@ RUN --mount=type=secret,id=github_token \
     cd /home/sdp && \
     . /home/sdp/miniforge3/bin/activate && \
     conda activate py${PYTHON_VERSION} && \
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
+    pip3 install torch==2.8.0+xpu torchao torchvision torchaudio pytorch-triton-xpu==3.4.0 --index-url https://download.pytorch.org/whl/xpu
 
 RUN --mount=type=secret,id=github_token \
     cd /home/sdp && \
@@ -59,13 +59,8 @@ RUN --mount=type=secret,id=github_token \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install . && \
-    echo "Cloning ${SG_LANG_KERNEL_REPO} from ${SG_LANG_KERNEL_BRANCH}" && \
-    git clone --branch ${SG_LANG_KERNEL_BRANCH} --single-branch ${SG_LANG_KERNEL_REPO} && \
-    cd sgl-kernel-xpu && \
-    pip install -v . && \
+    pip install xgrammar --no-deps && \
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops --root-user-action=ignore && \
-    pip uninstall pytorch-triton-xpu -y && \
-    pip install --pre pytorch-triton-xpu --index-url https://download.pytorch.org/whl/xpu && \
     conda install libsqlite=3.48.0 -y && \
     # Add environment setup commands to .bashrc again (in case it was overwritten)
     echo ". /home/sdp/miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; cd /home/sdp" >> /home/sdp/.bashrc

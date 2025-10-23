@@ -1,5 +1,7 @@
 //! Router implementations
 
+use std::fmt::Debug;
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -7,15 +9,17 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use std::fmt::Debug;
-
-use crate::protocols::chat::ChatCompletionRequest;
-use crate::protocols::completion::CompletionRequest;
-use crate::protocols::embedding::EmbeddingRequest;
-use crate::protocols::generate::GenerateRequest;
-use crate::protocols::rerank::RerankRequest;
-use crate::protocols::responses::{ResponsesGetParams, ResponsesRequest};
 use serde_json::Value;
+
+use crate::protocols::{
+    chat::ChatCompletionRequest,
+    classify::ClassifyRequest,
+    completion::CompletionRequest,
+    embedding::EmbeddingRequest,
+    generate::GenerateRequest,
+    rerank::RerankRequest,
+    responses::{ResponsesGetParams, ResponsesRequest},
+};
 
 pub mod factory;
 pub mod grpc;
@@ -25,7 +29,6 @@ pub mod openai; // New refactored OpenAI router module
 pub mod router_manager;
 
 pub use factory::RouterFactory;
-
 // Re-export HTTP routers for convenience
 pub use http::{pd_router, pd_types, router};
 
@@ -120,6 +123,14 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         headers: Option<&HeaderMap>,
         body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response;
+
+    /// Route classification requests (OpenAI-compatible /v1/classify)
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response;
 

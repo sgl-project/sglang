@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +23,7 @@ import sys
 import threading
 from functools import partialmethod
 from multiprocessing import shared_memory
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Union
 
 import setproctitle
 import zmq
@@ -30,18 +32,21 @@ import zmq.asyncio
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
+    BaseBatchReq,
+    BaseReq,
     BatchEmbeddingOutput,
     BatchMultimodalOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
-    MultiTokenizerRegisterReq,
-    MultiTokenizerWrapper,
 )
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 
 logger = logging.getLogger(__name__)
 
@@ -56,29 +61,24 @@ class SocketMapping:
             socket.close()
         self._mapping.clear()
 
-    def register_ipc_mapping(
-        self, recv_obj: MultiTokenizerRegisterReq, worker_id: str, is_tokenizer: bool
-    ):
+    def _register_ipc_mapping(self, ipc_name: str, is_tokenizer: bool):
         type_str = "tokenizer" if is_tokenizer else "detokenizer"
-        if worker_id in self._mapping:
-            logger.warning(
-                f"{type_str} already registered with worker {worker_id}, skipping..."
-            )
+        if ipc_name in self._mapping:
+            logger.warning(f"{type_str} already registered {ipc_name=}, skipping...")
             return
-        logger.info(
-            f"{type_str} not registered with worker {worker_id}, registering..."
-        )
-        socket = get_zmq_socket(self._zmq_context, zmq.PUSH, recv_obj.ipc_name, False)
-        self._mapping[worker_id] = socket
-        self._mapping[worker_id].send_pyobj(recv_obj)
+        logger.info(f"Registering {type_str} {ipc_name=} in SocketMapping...")
+        socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
+        self._mapping[ipc_name] = socket
 
-    def send_output(self, worker_id: str, output: Any):
-        if worker_id not in self._mapping:
-            logger.error(
-                f"worker ID {worker_id} not registered. Check if the server Process is alive"
-            )
+    def send_output(self, ipc_name: str, output: Any):
+        if ipc_name is None:
+            # Some unhandled cases
+            logger.warning(f"IPC name is None, output type={type(output)}, skipping...")
             return
-        self._mapping[worker_id].send_pyobj(output)
+
+        if ipc_name not in self._mapping:
+            self._register_ipc_mapping(ipc_name, is_tokenizer=False)
+        self._mapping[ipc_name].send_pyobj(output)
 
 
 def _handle_output_by_index(output, i):
@@ -362,20 +362,11 @@ def _handle_output_by_index(output, i):
 class MultiHttpWorkerDetokenizerMixin:
     """Mixin class for DetokenizerManager"""
 
-    def get_worker_ids_from_req_rids(self, rids):
-        if isinstance(rids, list):
-            worker_ids = [int(rid.split("_")[0]) for rid in rids]
-        elif isinstance(rids, str):
-            worker_ids = [int(rids.split("_")[0])]
-        else:
-            worker_ids = []
-        return worker_ids
-
-    def maybe_clear_socket_mapping(self):
+    def maybe_clear_socket_mapping(self: DetokenizerManager):
         if hasattr(self, "socket_mapping"):
             self.socket_mapping.clear_all_sockets()
 
-    def multi_http_worker_event_loop(self):
+    def multi_http_worker_event_loop(self: DetokenizerManager):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
@@ -383,23 +374,15 @@ class MultiHttpWorkerDetokenizerMixin:
             output = self._request_dispatcher(recv_obj)
             if output is None:
                 continue
-            # Extract worker_id from rid
-            if isinstance(recv_obj.rids, list):
-                worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
-            else:
-                raise RuntimeError(
-                    f"for tokenizer_worker_num > 1, recv_obj.rids must be a list"
-                )
+
+            assert isinstance(
+                recv_obj, BaseBatchReq
+            ), "for multi-http-worker, recv_obj must be BaseBatchReq"
 
             # Send data using the corresponding socket
-            for i, worker_id in enumerate(worker_ids):
-                if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                    self.socket_mapping.register_ipc_mapping(
-                        recv_obj, worker_id, is_tokenizer=False
-                    )
-                else:
-                    new_output = _handle_output_by_index(output, i)
-                    self.socket_mapping.send_output(worker_id, new_output)
+            for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
+                new_output = _handle_output_by_index(output, i)
+                self.socket_mapping.send_output(ipc_name, new_output)
 
 
 class MultiTokenizerRouter:
@@ -449,26 +432,17 @@ class MultiTokenizerRouter:
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
-        """Distribute result to corresponding workers based on rid"""
-        if isinstance(recv_obj, MultiTokenizerWrapper):
-            worker_ids = [recv_obj.worker_id]
-            recv_obj = recv_obj.obj
-        else:
-            worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
-
-        if len(worker_ids) == 0:
-            logger.error(f"Cannot find worker_id from rids {recv_obj.rids}")
-            return
-
         # Distribute result to each worker
-        for i, worker_id in enumerate(worker_ids):
-            if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                self.socket_mapping.register_ipc_mapping(
-                    recv_obj, worker_id, is_tokenizer=True
-                )
-            else:
-                new_recv_obj = _handle_output_by_index(recv_obj, i)
-                self.socket_mapping.send_output(worker_id, new_recv_obj)
+        if isinstance(recv_obj, BaseReq):
+            ipc_names = [recv_obj.http_worker_ipc]
+        elif isinstance(recv_obj, BaseBatchReq):
+            ipc_names = recv_obj.http_worker_ipcs
+        else:
+            raise ValueError(f"Unknown recv_obj type: {type(recv_obj)}")
+
+        for i, ipc_name in enumerate(ipc_names):
+            new_recv_obj = _handle_output_by_index(recv_obj, i)
+            self.socket_mapping.send_output(ipc_name, new_recv_obj)
 
 
 class TokenizerWorker(TokenizerManager):
@@ -500,21 +474,15 @@ class TokenizerWorker(TokenizerManager):
         self.register_multi_tokenizer_communicator = _Communicator(
             self.send_to_scheduler, 2
         )
-        self._result_dispatcher._mapping.append(
-            (
-                MultiTokenizerRegisterReq,
-                self.register_multi_tokenizer_communicator.handle_recv,
-            )
-        )
 
-    async def register_to_main_tokenizer_manager(self):
-        """Register this worker to the main TokenizerManager"""
-        # create a handle loop to receive messages from the main TokenizerManager
-        self.auto_create_handle_loop()
-        req = MultiTokenizerRegisterReq(rids=[f"{self.worker_id}_register"])
-        req.ipc_name = self.tokenizer_ipc_name
-        _Communicator.enable_multi_tokenizer = True
-        await self.register_multi_tokenizer_communicator(req)
+    def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
+
+        if isinstance(req, BaseReq):
+            req.http_worker_ipc = self.tokenizer_ipc_name
+        elif isinstance(req, BaseBatchReq):
+            req.http_worker_ipcs = [self.tokenizer_ipc_name] * len(req.rids)
+        else:
+            raise ValueError(f"Unknown req type: {type(req)}")
 
 
 async def print_exception_wrapper(func):

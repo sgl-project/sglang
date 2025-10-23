@@ -1,5 +1,13 @@
 //! Comprehensive integration tests for OpenAI backend functionality
 
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+
 use axum::{
     body::Body,
     extract::Request,
@@ -26,13 +34,10 @@ use sglang_router_rs::{
     },
     routers::{openai::OpenAIRouter, RouterTrait},
 };
-use std::collections::HashMap;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use tokio::{
+    net::TcpListener,
+    time::{sleep, Duration},
 };
-use tokio::net::TcpListener;
-use tokio::time::{sleep, Duration};
 use tower::ServiceExt;
 
 mod common;
@@ -94,7 +99,7 @@ fn create_minimal_completion_request() -> CompletionRequest {
 #[tokio::test]
 async fn test_openai_router_creation() {
     let router = OpenAIRouter::new(
-        "https://api.openai.com".to_string(),
+        vec!["https://api.openai.com".to_string()],
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
@@ -113,7 +118,7 @@ async fn test_openai_router_creation() {
 #[tokio::test]
 async fn test_openai_router_server_info() {
     let router = OpenAIRouter::new(
-        "https://api.openai.com".to_string(),
+        vec!["https://api.openai.com".to_string()],
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
@@ -144,7 +149,7 @@ async fn test_openai_router_models() {
     // Use mock server for deterministic models response
     let mock_server = MockOpenAIServer::new().await;
     let router = OpenAIRouter::new(
-        mock_server.base_url(),
+        vec![mock_server.base_url()],
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
@@ -224,7 +229,7 @@ async fn test_openai_router_responses_with_mock() {
     let storage = Arc::new(MemoryResponseStorage::new());
 
     let router = OpenAIRouter::new(
-        base_url,
+        vec![base_url],
         None,
         storage.clone(),
         Arc::new(MemoryConversationStorage::new()),
@@ -234,7 +239,7 @@ async fn test_openai_router_responses_with_mock() {
     .unwrap();
 
     let request1 = ResponsesRequest {
-        model: Some("gpt-4o-mini".to_string()),
+        model: "gpt-4o-mini".to_string(),
         input: ResponseInput::Text("Say hi".to_string()),
         store: Some(true),
         ..Default::default()
@@ -250,7 +255,7 @@ async fn test_openai_router_responses_with_mock() {
     assert_eq!(body1["previous_response_id"], serde_json::Value::Null);
 
     let request2 = ResponsesRequest {
-        model: Some("gpt-4o-mini".to_string()),
+        model: "gpt-4o-mini".to_string(),
         input: ResponseInput::Text("Thanks".to_string()),
         store: Some(true),
         previous_response_id: Some(resp1_id.clone()),
@@ -485,7 +490,7 @@ async fn test_openai_router_responses_streaming_with_mock() {
     storage.store_response(previous).await.unwrap();
 
     let router = OpenAIRouter::new(
-        base_url,
+        vec![base_url],
         None,
         storage.clone(),
         Arc::new(MemoryConversationStorage::new()),
@@ -498,7 +503,7 @@ async fn test_openai_router_responses_streaming_with_mock() {
     metadata.insert("topic".to_string(), json!("unicorns"));
 
     let request = ResponsesRequest {
-        model: Some("gpt-5-nano".to_string()),
+        model: "gpt-5-nano".to_string(),
         input: ResponseInput::Text("Tell me a bedtime story.".to_string()),
         instructions: Some("Be kind".to_string()),
         metadata: Some(metadata),
@@ -590,7 +595,7 @@ async fn test_router_factory_openai_mode() {
 #[tokio::test]
 async fn test_unsupported_endpoints() {
     let router = OpenAIRouter::new(
-        "https://api.openai.com".to_string(),
+        vec!["https://api.openai.com".to_string()],
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
@@ -655,7 +660,7 @@ async fn test_openai_router_chat_completion_with_mock() {
 
     // Create router pointing to mock server
     let router = OpenAIRouter::new(
-        base_url,
+        vec![base_url],
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
@@ -697,7 +702,7 @@ async fn test_openai_e2e_with_server() {
 
     // Create router
     let router = OpenAIRouter::new(
-        base_url,
+        vec![base_url],
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
@@ -768,7 +773,7 @@ async fn test_openai_router_chat_streaming_with_mock() {
     let mock_server = MockOpenAIServer::new().await;
     let base_url = mock_server.base_url();
     let router = OpenAIRouter::new(
-        base_url,
+        vec![base_url],
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
@@ -822,7 +827,7 @@ async fn test_openai_router_circuit_breaker() {
     };
 
     let router = OpenAIRouter::new(
-        "http://invalid-url-that-will-fail".to_string(),
+        vec!["http://invalid-url-that-will-fail".to_string()],
         Some(cb_config),
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
@@ -851,7 +856,7 @@ async fn test_openai_router_models_auth_forwarding() {
     let expected_auth = "Bearer test-token".to_string();
     let mock_server = MockOpenAIServer::new_with_auth(Some(expected_auth.clone())).await;
     let router = OpenAIRouter::new(
-        mock_server.base_url(),
+        vec![mock_server.base_url()],
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
@@ -860,7 +865,8 @@ async fn test_openai_router_models_auth_forwarding() {
     .await
     .unwrap();
 
-    // 1) Without auth header -> expect 401
+    // 1) Without auth header -> expect 200 with empty model list
+    // (multi-endpoint aggregation silently skips failed endpoints)
     let req = Request::builder()
         .method(Method::GET)
         .uri("/models")
@@ -868,7 +874,13 @@ async fn test_openai_router_models_auth_forwarding() {
         .unwrap();
 
     let response = router.get_models(req).await;
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::OK);
+    let (_, body) = response.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+    let models: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(models["object"], "list");
+    assert_eq!(models["data"].as_array().unwrap().len(), 0); // Empty when auth fails
 
     // 2) With auth header -> expect 200
     let req = Request::builder()
@@ -957,70 +969,4 @@ fn oracle_config_validation_accepts_wallet_alias() {
     };
 
     ConfigValidator::validate(&config).expect("wallet-based config should validate");
-}
-
-/// Test that RouterManager delegates /v1/models to OpenAI router in single-router mode
-#[tokio::test]
-async fn test_router_manager_delegates_models_to_openai_router() {
-    use sglang_router_rs::routers::router_manager::RouterManager;
-    use sglang_router_rs::server::ServerConfig;
-
-    // Start a mock OpenAI server
-    let mock_server = MockOpenAIServer::new().await;
-    let base_url = mock_server.base_url();
-
-    // Create router config in OpenAI mode
-    let routing_mode = RoutingMode::OpenAI {
-        worker_urls: vec![base_url.clone()],
-    };
-
-    let router_config =
-        RouterConfig::new(routing_mode, sglang_router_rs::config::PolicyConfig::Random);
-
-    let server_config = ServerConfig {
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        router_config: router_config.clone(),
-        max_payload_size: 1024 * 1024,
-        log_dir: None,
-        log_level: None,
-        service_discovery_config: None,
-        prometheus_config: None,
-        request_timeout_secs: 300,
-        request_id_headers: None,
-    };
-
-    // Create app context
-    let app_context = common::create_test_context(router_config);
-
-    // Create RouterManager (single-router mode, enable_igw=false)
-    let router_manager = RouterManager::from_config(&server_config, &app_context)
-        .await
-        .expect("RouterManager creation should succeed");
-
-    // Make a request to /v1/models
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/v1/models")
-        .body(Body::empty())
-        .unwrap();
-
-    // RouterManager should delegate to OpenAI router, which proxies to mock server
-    let response = router_manager.get_models(req).await;
-
-    // Should succeed (not 503 "No models available")
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "RouterManager should delegate to OpenAI router and return models"
-    );
-
-    // Verify response contains model list
-    let (_, body) = response.into_parts();
-    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
-    let models: serde_json::Value = serde_json::from_str(&body_str).unwrap();
-
-    assert_eq!(models["object"], "list");
-    assert!(models["data"].is_array());
 }

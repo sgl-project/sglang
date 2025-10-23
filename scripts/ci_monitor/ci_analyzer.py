@@ -395,6 +395,137 @@ class SGLangCIAnalyzer:
             json.dump(stats, f, ensure_ascii=False, indent=2)
         print(f"\nDetailed report saved to: {output_file}")
 
+    def generate_github_summary(self, stats: Dict):
+        """Generate GitHub Actions summary"""
+        try:
+            github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            if not github_step_summary:
+                print("ℹ️  Not running in GitHub Actions, skipping summary generation")
+                return
+
+            print("📊 Generating GitHub Actions summary for CI Analysis...")
+
+            summary_lines = []
+            summary_lines.append("# 🔍 SGLang CI Analysis Report (CUDA Only)")
+            summary_lines.append("")
+
+            # Overall statistics
+            total = stats["total_runs"]
+            failed = stats["failed_runs"]
+            success = stats["successful_runs"]
+            cancelled = stats["cancelled_runs"]
+            skipped = stats["skipped_runs"]
+            success_rate = (success / total * 100) if total > 0 else 0
+
+            summary_lines.append("## 📊 Overall Statistics")
+            summary_lines.append("")
+            summary_lines.append("| Metric | Count | Percentage |")
+            summary_lines.append("|--------|-------|------------|")
+            summary_lines.append(f"| Total Runs | {total} | 100% |")
+            summary_lines.append(
+                f"| ✅ Successful | {success} | {success/total*100:.1f}% |"
+            )
+            summary_lines.append(f"| ❌ Failed | {failed} | {failed/total*100:.1f}% |")
+            summary_lines.append(
+                f"| 🚫 Cancelled | {cancelled} | {cancelled/total*100:.1f}% |"
+            )
+            summary_lines.append(
+                f"| ⏭️ Skipped | {skipped} | {skipped/total*100:.1f}% |"
+            )
+            summary_lines.append(f"| **Success Rate** | **{success_rate:.1f}%** | - |")
+            summary_lines.append("")
+
+            # Category failure statistics
+            if stats["category_failures"]:
+                summary_lines.append("## 📁 Category Failure Statistics")
+                summary_lines.append("")
+                summary_lines.append("| Category | Failures |")
+                summary_lines.append("|----------|----------|")
+                for category, count in sorted(
+                    stats["category_failures"].items(), key=lambda x: x[1], reverse=True
+                ):
+                    summary_lines.append(f"| {category} | {count} |")
+                summary_lines.append("")
+
+            # Most frequently failed jobs (Top 20)
+            if stats["job_failures"]:
+                summary_lines.append("## 🔴 Most Frequently Failed Jobs (Top 20)")
+                summary_lines.append("")
+
+                top_failures = sorted(
+                    stats["job_failures"].items(), key=lambda x: x[1], reverse=True
+                )[:20]
+
+                for i, (job, count) in enumerate(top_failures, 1):
+                    summary_lines.append(f"### {i}. `{job}` ({count} failures)")
+                    summary_lines.append("")
+
+                    # Show last successful run
+                    if job in stats["job_last_success"]:
+                        last_success = stats["job_last_success"][job]
+                        success_date = datetime.fromisoformat(
+                            last_success["created_at"].replace("Z", "+00:00")
+                        )
+                        pr_info = last_success["pr_info"]
+
+                        pr_text = ""
+                        if pr_info["pr_number"]:
+                            pr_text = (
+                                f" (PR #{pr_info['pr_number']} by {pr_info['author']})"
+                            )
+                        else:
+                            pr_text = f" by {pr_info['author']}"
+
+                        summary_lines.append(
+                            f"✅ **Last Success:** [Run #{last_success['run_number']}]({last_success['url']}) ({success_date.strftime('%Y-%m-%d %H:%M')}){pr_text}"
+                        )
+                        summary_lines.append("")
+
+                    # Show recent failure links
+                    if (
+                        job in stats["job_failure_links"]
+                        and stats["job_failure_links"][job]
+                    ):
+                        summary_lines.append("❌ **Recent Failures:**")
+                        for link_info in stats["job_failure_links"][job]:
+                            created_at = datetime.fromisoformat(
+                                link_info["created_at"].replace("Z", "+00:00")
+                            )
+
+                            pr_info = link_info.get("pr_info", {})
+                            pr_text = ""
+                            if pr_info.get("pr_number"):
+                                pr_text = f" (PR #{pr_info['pr_number']} by {pr_info.get('author', 'Unknown')})"
+                            else:
+                                pr_text = f" by {pr_info.get('author', 'Unknown')}"
+
+                            summary_lines.append(
+                                f"- [Run #{link_info['run_number']}]({link_info['url']}) ({created_at.strftime('%Y-%m-%d %H:%M')}){pr_text}"
+                            )
+                        summary_lines.append("")
+
+            # Failure pattern analysis
+            if stats["failure_patterns"]:
+                summary_lines.append("## 🔬 Failure Pattern Analysis")
+                summary_lines.append("")
+                summary_lines.append("| Pattern | Count |")
+                summary_lines.append("|---------|-------|")
+                for pattern, count in sorted(
+                    stats["failure_patterns"].items(), key=lambda x: x[1], reverse=True
+                ):
+                    summary_lines.append(f"| {pattern} | {count} |")
+                summary_lines.append("")
+
+            # Write summary to GitHub Actions
+            with open(github_step_summary, "w", encoding="utf-8") as f:
+                f.write("\n".join(summary_lines))
+                f.write("\n\n---\n\n")  # Add separator between reports
+
+            print("✅ GitHub Actions summary generated successfully")
+
+        except Exception as e:
+            print(f"❌ Failed to generate GitHub Actions summary: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="SGLang CI Analyzer")
@@ -439,6 +570,9 @@ def main():
 
         # Save detailed report
         analyzer.save_detailed_report(stats, args.output)
+
+        # Generate GitHub summary
+        analyzer.generate_github_summary(stats)
 
     except Exception as e:
         print(f"Error during analysis: {e}")

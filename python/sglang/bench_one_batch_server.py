@@ -16,6 +16,7 @@ import argparse
 import dataclasses
 import itertools
 import json
+import logging
 import multiprocessing
 import os
 import random
@@ -38,6 +39,8 @@ from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
+
+logger = logging.getLogger(__name__)
 
 
 class ProfileLinks(BaseModel):
@@ -137,12 +140,10 @@ def generate_markdown_report(trace_dir, results: List["BenchmarkResult"]) -> str
 
     # all results should share the same isl & osl
     for result in results:
-        base_url = os.getenv(
-            "TRACE_BASE_URL", "https://github.com/sgl-project/ci-data/traces"
-        ).rstrip("/")
+        base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
         relay_base = os.getenv(
             "PERFETTO_RELAY_URL",
-            "https://docs.sglang.ai/ci-data/pages/perfetto_relay.html",
+            "",
         ).rstrip("/")
         summary += result.to_markdown_row(trace_dir, base_url, relay_base)
 

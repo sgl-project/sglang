@@ -212,6 +212,10 @@ class LayerCommunicator:
             )
         )
 
+        self._speculative_algo = SpeculativeAlgorithm.from_string(
+            get_global_server_args().speculative_algorithm
+        )
+
     def prepare_attn(
         self,
         hidden_states: torch.Tensor,
@@ -315,13 +319,10 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        speculative_algo = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
-        )
         if (
             is_dp_attention_enabled()
-            and speculative_algo is not None
-            and speculative_algo.is_eagle()
+            and self._speculative_algo is not None
+            and self._speculative_algo.is_eagle()
         ):
             return False
 

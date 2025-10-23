@@ -1,10 +1,13 @@
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt::{Display, Formatter};
-use std::sync::Arc;
 
 use super::conversations::ConversationId;
 

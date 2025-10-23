@@ -1,9 +1,6 @@
-from dataclasses import astuple, dataclass
-from functools import lru_cache
 from typing import Optional, Union
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule

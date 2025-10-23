@@ -1,14 +1,15 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::protocols::common::Tool;
-
-use crate::tool_parser::{
-    errors::{ParserError, ParserResult},
-    parsers::helpers,
-    partial_json::PartialJson,
-    traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall},
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::{ParserError, ParserResult},
+        parsers::helpers,
+        partial_json::PartialJson,
+        traits::ToolParser,
+        types::{FunctionCall, StreamingParseResult, ToolCall},
+    },
 };
 
 /// Llama 3.2 format parser for tool calls

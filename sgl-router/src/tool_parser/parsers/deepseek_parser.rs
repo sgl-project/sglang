@@ -2,13 +2,14 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::protocols::common::Tool;
-
-use crate::tool_parser::{
-    errors::{ParserError, ParserResult},
-    parsers::helpers,
-    traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::{ParserError, ParserResult},
+        parsers::helpers,
+        traits::ToolParser,
+        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+    },
 };
 
 /// DeepSeek V3 format parser for tool calls

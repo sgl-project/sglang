@@ -47,6 +47,8 @@ from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
+    from sglang.srt.managers.schedule_batch import Req
+
 
 logger = logging.getLogger(__name__)
 
@@ -341,7 +343,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
     def alloc(
-        self, need_size: int, reqs: Optional[List["Req"]] = None
+        self, need_size: int, reqs: Optional[List[Req]] = None
     ) -> Optional[List[int]]:
         select_index = super().alloc(need_size)
         if select_index == None:

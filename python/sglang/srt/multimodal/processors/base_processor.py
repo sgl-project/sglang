@@ -178,6 +178,7 @@ class BaseMultimodalProcessor(ABC):
             "image_attention_mask": Modality.IMAGE,
             "image_emb_mask": Modality.IMAGE,
             "images_spatial_crop": Modality.IMAGE,
+            "images_crop": Modality.IMAGE,
             "tgt_size": Modality.IMAGE,
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
@@ -313,7 +314,9 @@ class BaseMultimodalProcessor(ABC):
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data)
-                return img.convert("RGB") if discard_alpha_channel else img
+                if discard_alpha_channel and img.mode != "RGB":
+                    img = img.convert("RGB")
+                return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:

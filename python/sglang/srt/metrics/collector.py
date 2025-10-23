@@ -150,6 +150,9 @@ class SchedulerStats:
     engine_startup_time: float = 0.0
     engine_load_weights_time: float = 0.0
 
+    # CUDA graph
+    is_cuda_graph: float = 0.0
+
 
 class SchedulerMetricsCollector:
 
@@ -499,6 +502,13 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["stage"],
         )
 
+        self.is_cuda_graph = Gauge(
+            name="sglang:is_cuda_graph",
+            documentation="Whether the batch is using CUDA graph.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -573,6 +583,9 @@ class SchedulerMetricsCollector:
             self._log_gauge(
                 self.engine_load_weights_time, stats.engine_load_weights_time
             )
+
+        # CUDA graph
+        self._log_gauge(self.is_cuda_graph, stats.is_cuda_graph)
 
         self.last_log_time = time.perf_counter()
 

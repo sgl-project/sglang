@@ -116,8 +116,6 @@ def cutlass_fused_experts_fp8(
 
     if is_cuda:
         from sglang.srt.layers.quantization.fp8_kernel import (
-            per_group_transpose,
-            per_token_group_quant_fp8_hopper_moe_mn_major,
             sglang_per_token_group_quant_fp8,
         )
 

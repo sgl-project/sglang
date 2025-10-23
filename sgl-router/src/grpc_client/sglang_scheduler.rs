@@ -1,16 +1,23 @@
-use std::convert::TryFrom;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    convert::TryFrom,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
+
 use tonic::{transport::Channel, Request, Streaming};
 use tracing::{debug, warn};
 
-use crate::protocols::chat::ChatCompletionRequest;
-use crate::protocols::common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue};
-use crate::protocols::generate::GenerateRequest;
-use crate::protocols::sampling_params::SamplingParams as GenerateSamplingParams;
+use crate::protocols::{
+    chat::ChatCompletionRequest,
+    common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
+    generate::GenerateRequest,
+    sampling_params::SamplingParams as GenerateSamplingParams,
+};
 
 // Include the generated protobuf code
 pub mod proto {
@@ -125,7 +132,6 @@ impl SglangSchedulerClient {
         };
 
         let channel = Channel::from_shared(http_endpoint)?
-            .timeout(Duration::from_secs(600)) // 10 minute timeout for connection
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)

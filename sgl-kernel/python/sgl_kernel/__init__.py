@@ -265,6 +265,8 @@ from sgl_kernel.gemm import (
     scaled_fp4_quant,
     sgl_per_tensor_quant_fp8,
     sgl_per_token_group_quant_8bit,
+    sgl_per_token_group_quant_fp8,
+    sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
     shuffle_rows,
     silu_and_mul_scaled_fp4_grouped_quant,
@@ -325,7 +327,12 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
-from sgl_kernel.top_k import fast_topk, fast_topk_transform_fused, fast_topk_v2
+from sgl_kernel.top_k import (
+    fast_topk,
+    fast_topk_transform_fused,
+    fast_topk_transform_ragged_fused,
+    fast_topk_v2,
+)
 from sgl_kernel.version import __version__
 
 if torch.version.hip is not None:

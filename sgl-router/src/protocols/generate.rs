@@ -1,10 +1,13 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use validator::Validate;
 
-use super::common::{default_true, GenerationRequest, InputIds};
-use super::sampling_params::SamplingParams;
+use super::{
+    common::{default_true, GenerationRequest, InputIds},
+    sampling_params::SamplingParams,
+};
 use crate::protocols::validated::Normalizable;
 
 // ============================================================================

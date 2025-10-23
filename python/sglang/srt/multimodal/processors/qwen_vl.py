@@ -9,6 +9,7 @@ import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
@@ -23,8 +24,14 @@ from sglang.utils import logger
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
-MAX_PIXELS = 16384 * 28 * 28
+MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
 MAX_RATIO = 200
+RESIZE_RESAMPLE = getattr(Image, envs.SGLANG_RESIZE_RESAMPLE.get(), None)
+if envs.SGLANG_RESIZE_RESAMPLE.is_set() and RESIZE_RESAMPLE is None:
+    logger.warning(
+        f"Invalid RESIZE_RESAMPLE value: '{envs.SGLANG_RESIZE_RESAMPLE.get()}'. "
+        f"Ignoring and using default."
+    )
 VIDEO_TOTAL_PIXELS = int(
     float(os.environ.get("VIDEO_MAX_PIXELS", 128000 * 28 * 28 * 0.9))
 )
@@ -86,7 +93,7 @@ def resize_image(
         min_pixels=min_pixels,
         max_pixels=max_pixels,
     )
-    image = image.resize((resized_width, resized_height))
+    image = image.resize((resized_width, resized_height), resample=RESIZE_RESAMPLE)
     return image
 
 
@@ -207,7 +214,14 @@ async def preprocess_video(
         interpolation=InterpolationMode.BICUBIC,
         antialias=True,
     ).float()
-    return video
+    video_metadata = {
+        "fps": video_fps,
+        "duration": total_frames / video_fps,
+        "total_num_frames": total_frames,
+        "frames_indices": idx,
+        "video_backend": "torchvision",
+    }
+    return video, video_metadata
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series
@@ -272,14 +286,25 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
 
+        video_metadata = None
         if base_output.videos:
-            base_output.videos = [
-                await preprocess_video(video) for video in base_output.videos
-            ]
+            video_results = await asyncio.gather(
+                *[preprocess_video(video) for video in base_output.videos]
+            )
+            base_output.videos, video_metadata = map(list, zip(*video_results))
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
-        )
+        # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
+        if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output,
+                self.mm_tokens,
+                video_metadata=video_metadata,
+                do_sample_frames=False,
+            )
+        else:
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens
+            )
 
         audio_feature_lengths = None
 

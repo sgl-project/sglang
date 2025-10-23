@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copied from vLLM
-import json
 import logging
 from abc import ABC, abstractmethod
 from typing import Union
