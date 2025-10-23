@@ -891,7 +891,7 @@ async fn execute_tool_loop_streaming_internal(
                 max_output_tokens: current_request.max_output_tokens,
                 temperature: current_request.temperature,
                 top_p: current_request.top_p,
-                stream: Some(true), 
+                stream: Some(true),
                 store: Some(false),
                 background: Some(false),
                 max_tool_calls: current_request.max_tool_calls,
