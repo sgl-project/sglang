@@ -621,14 +621,12 @@ class TokenizerMetricsCollector:
         bucket_inter_token_latency: Optional[List[float]] = None,
         bucket_e2e_request_latency: Optional[List[float]] = None,
         collect_tokens_histogram: bool = False,
-        collect_retraction_histogram: bool = False,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Histogram
 
         self.labels = labels or {}
         self.collect_tokens_histogram = collect_tokens_histogram
-        self.collect_retraction_histogram = collect_retraction_histogram
 
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
@@ -813,33 +811,33 @@ class TokenizerMetricsCollector:
             buckets=bucket_e2e_request_latency,
         )
 
-        if self.collect_retraction_histogram:
-            self.num_retractions = Histogram(
-                name="sglang:num_retractions",
-                documentation="Histogram of retraction counts per request.",
-                labelnames=labels.keys(),
-                buckets=[
-                    0,
-                    1,
-                    2,
-                    3,
-                    4,
-                    5,
-                    6,
-                    7,
-                    8,
-                    9,
-                    10,
-                    15,
-                    20,
-                    25,
-                    30,
-                    40,
-                    50,
-                    75,
-                    100,
-                ],
-            )
+        # Retraction count histogram
+        self.num_retractions = Histogram(
+            name="sglang:num_retractions",
+            documentation="Histogram of retraction counts per request.",
+            labelnames=labels.keys(),
+            buckets=[
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                15,
+                20,
+                25,
+                30,
+                40,
+                50,
+                75,
+                100,
+            ],
+        )
 
     def observe_one_finished_request(
         self,
@@ -864,8 +862,7 @@ class TokenizerMetricsCollector:
             self.generation_tokens_histogram.labels(**labels).observe(
                 float(generation_tokens)
             )
-        if self.collect_retraction_histogram:
-            self.num_retractions.labels(**labels).observe(retraction_count)
+        self.num_retractions.labels(**labels).observe(retraction_count)
 
     def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
         self.histogram_time_to_first_token.labels(**labels).observe(value)

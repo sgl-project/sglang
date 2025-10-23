@@ -37,7 +37,7 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
-from xgrammar import StructuralTag
+from xgrammar import StructuralTagItem
 
 from sglang.utils import convert_json_schema_to_str
 
@@ -137,7 +137,7 @@ class LegacyStructuralTagResponseFormat(BaseModel):
 
 
 StructuralTagResponseFormat: TypeAlias = Union[
-    LegacyStructuralTagResponseFormat, StructuralTag
+    LegacyStructuralTagResponseFormat, StructuralTagItem
 ]
 
 ToolCallConstraint: TypeAlias = Union[
