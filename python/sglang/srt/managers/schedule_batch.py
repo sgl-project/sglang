@@ -78,6 +78,7 @@ from sglang.srt.utils import flatten_nested_list
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -437,6 +438,7 @@ class Req:
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        http_worker_ipc: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -459,6 +461,9 @@ class Req:
 
         # The length of KV that have been removed in local attention chunked prefill
         self.evicted_seqlen_local = 0
+
+        # For multi-http worker
+        self.http_worker_ipc = http_worker_ipc
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1506,8 +1511,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.is_v2_eagle:
             # TODO(spec-v2): all v2 spec should go through this path
-            from sglang.srt.speculative.eagle_info import EagleDraftInput
-
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
@@ -1564,8 +1567,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:
-            from sglang.srt.speculative.eagle_info import EagleDraftInput
-
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
