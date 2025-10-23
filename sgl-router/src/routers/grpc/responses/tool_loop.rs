@@ -16,6 +16,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use super::{
     conversions,
@@ -31,7 +32,7 @@ use crate::{
     mcp::McpClientManager,
     protocols::{
         chat::ChatCompletionResponse,
-        common::{generate_id, Tool, ToolChoice, ToolChoiceValue},
+        common::{Tool, ToolChoice, ToolChoiceValue},
         responses::{
             McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
             ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest,
@@ -40,6 +41,11 @@ use crate::{
     },
     routers::grpc::{context::SharedComponents, pipeline::RequestPipeline},
 };
+
+/// Generate unique ID for MCP items
+fn generate_mcp_id(prefix: &str) -> String {
+    format!("{}_{}", prefix, Uuid::new_v4())
+}
 
 /// Extract function call from a chat completion response
 /// Returns (call_id, tool_name, arguments_json_str) if found
@@ -239,7 +245,7 @@ fn build_mcp_list_tools_item(
         .collect();
 
     ResponseOutputItem::McpListTools {
-        id: generate_id("mcpl"),
+        id: generate_mcp_id("mcpl"),
         server_label: server_label.to_string(),
         tools: tools_info,
     }
@@ -255,7 +261,7 @@ fn build_mcp_call_item(
     error: Option<&str>,
 ) -> ResponseOutputItem {
     ResponseOutputItem::McpCall {
-        id: generate_id("mcp"),
+        id: generate_mcp_id("mcp"),
         status: if success { "completed" } else { "failed" }.to_string(),
         approval_request_id: None,
         arguments: arguments.to_string(),
@@ -607,7 +613,7 @@ async fn execute_tool_loop_streaming_internal(
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Create response event emitter
-    let response_id = generate_id("resp");
+    let response_id = format!("resp_{}", Uuid::new_v4());
     let model = current_request.model.clone();
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -868,7 +874,6 @@ async fn execute_tool_loop_streaming_internal(
                     status: Some("completed".to_string()),
                 }],
                 ResponseInput::Items(items) => {
-                    // Process all item types, converting SimpleInputMessage to Message
                     items
                         .iter()
                         .map(crate::protocols::responses::normalize_input_item)
@@ -876,10 +881,8 @@ async fn execute_tool_loop_streaming_internal(
                 }
             };
 
-            // Append all conversation history
             input_items.extend_from_slice(&state.conversation_history);
 
-            // Build new request for next iteration
             current_request = ResponsesRequest {
                 input: ResponseInput::Items(input_items),
                 model: current_request.model.clone(),
@@ -888,8 +891,8 @@ async fn execute_tool_loop_streaming_internal(
                 max_output_tokens: current_request.max_output_tokens,
                 temperature: current_request.temperature,
                 top_p: current_request.top_p,
-                stream: Some(true), // Keep streaming enabled
-                store: Some(false), // Don't store intermediate responses
+                stream: Some(true), 
+                store: Some(false),
                 background: Some(false),
                 max_tool_calls: current_request.max_tool_calls,
                 tool_choice: current_request.tool_choice.clone(),

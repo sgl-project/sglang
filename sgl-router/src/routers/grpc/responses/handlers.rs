@@ -29,6 +29,8 @@ use super::{
     tool_loop::{create_mcp_manager_from_request, execute_tool_loop, execute_tool_loop_streaming},
     types::BackgroundTaskInfo,
 };
+use uuid::Uuid;
+
 use crate::{
     data_connector::{
         ConversationId, ResponseId, SharedConversationItemStorage, SharedConversationStorage,
@@ -36,7 +38,6 @@ use crate::{
     },
     protocols::{
         chat::ChatCompletionStreamResponse,
-        common::generate_id,
         responses::{
             ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
             ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
@@ -306,7 +307,7 @@ async fn route_responses_background(
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 ) -> Response {
     // Generate response_id for background tracking
-    let response_id = generate_id("resp");
+    let response_id = format!("resp_{}", Uuid::new_v4());
 
     // Get current timestamp
     let created_at = SystemTime::now()
@@ -618,7 +619,7 @@ async fn process_and_transform_sse_stream(
     let mut accumulator = StreamingResponseAccumulator::new(&original_request);
 
     // Create event emitter for OpenAI-compatible streaming
-    let response_id = generate_id("resp");
+    let response_id = format!("resp_{}", Uuid::new_v4());
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);

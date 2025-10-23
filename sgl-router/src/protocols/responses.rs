@@ -8,8 +8,8 @@ use serde_json::Value;
 
 // Import shared types from common module
 use super::common::{
-    default_model, default_true, generate_id, ChatLogProbs, GenerationRequest,
-    PromptTokenUsageInfo, StringOrArray, ToolChoice, UsageInfo,
+    default_model, default_true, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo,
+    StringOrArray, ToolChoice, UsageInfo,
 };
 
 // ============================================================================
@@ -715,6 +715,16 @@ pub fn normalize_input_item(item: &ResponseInputOutputItem) -> ResponseInputOutp
         }
         _ => item.clone(),
     }
+}
+
+pub fn generate_id(prefix: &str) -> String {
+    use rand::RngCore;
+    let mut rng = rand::rng();
+    // Generate exactly 50 hex characters (25 bytes) for the part after the underscore
+    let mut bytes = [0u8; 25];
+    rng.fill_bytes(&mut bytes);
+    let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("{}_{}", prefix, hex_string)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
