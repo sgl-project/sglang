@@ -33,8 +33,8 @@ def main(args: Namespace):
 
     # lmms_eval settings from test_vlm_models.py
     model = "openai_compatible"
-    tasks = "videomme"
-    tasks = "video_mmmu_adaptation_question_only"
+    tasks = args.tasks
+    tasks_str = ", ".join(args.tasks)
     log_suffix = "openai_compatible"
     os.makedirs(args.output_path, exist_ok=True)
 

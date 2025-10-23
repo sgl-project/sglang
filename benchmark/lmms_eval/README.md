@@ -1,6 +1,6 @@
-# Video-MME Benchmark
+# Benchmark with lmms_eval
 
-This directory contains scripts to benchmark VLMs on the lmms-lab/Video-MME benchmark with any openai-compatible server.
+This directory contains scripts to benchmark LLM/MLLM from lmms_eval with any openai-compatible server.
 
 ## Setup
 
@@ -21,5 +21,9 @@ For Video benchmark, we recommend you leave as much memory as possible to avoid 
 
 2. **Run the benchmark script:**
    ```shell
-   python bench_openai_server --port 30000
+   python bench_openai_server --port 30000 --tasks task1, task2
    ```
+
+## Recommended Benchmark Task Name:
+
+- video: video_mmmu_adaptation_question_only
