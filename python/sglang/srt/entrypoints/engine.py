@@ -653,7 +653,8 @@ class Engine(EngineBase):
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
+    if "NCCL_CUMEM_ENABLE" not in os.environ:
+        os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if not server_args.enable_symm_mem:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
