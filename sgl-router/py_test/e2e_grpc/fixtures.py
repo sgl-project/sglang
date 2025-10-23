@@ -8,12 +8,15 @@ This module provides fixtures for launching SGLang workers and gRPC router separ
 This approach gives more control and matches production deployment patterns.
 """
 
+import logging
 import socket
 import subprocess
 import time
 from typing import Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 def find_free_port() -> int:
@@ -56,9 +59,11 @@ def wait_for_workers_ready(
             attempt += 1
             elapsed = int(time.time() - start_time)
 
-            # Print progress every 10 seconds
+            # Log progress every 10 seconds
             if elapsed > 0 and elapsed % 10 == 0 and attempt % 10 == 0:
-                print(f"  Still waiting for workers... ({elapsed}/{timeout}s elapsed)")
+                logger.info(
+                    f"  Still waiting for workers... ({elapsed}/{timeout}s elapsed)"
+                )
 
             try:
                 response = session.get(
@@ -69,7 +74,7 @@ def wait_for_workers_ready(
                     total_workers = data.get("total", 0)
 
                     if total_workers == expected_workers:
-                        print(
+                        logger.info(
                             f"  All {expected_workers} workers connected after {elapsed}s"
                         )
                         return
@@ -161,14 +166,14 @@ def popen_launch_workers_and_router(
     else:
         router_port = find_free_port()
 
-    print(f"\n{'='*70}")
-    print(f"Launching gRPC cluster (separate workers + router)")
-    print(f"{'='*70}")
-    print(f"  Model: {model}")
-    print(f"  Router port: {router_port}")
-    print(f"  Workers: {num_workers}")
-    print(f"  TP size: {tp_size}")
-    print(f"  Policy: {policy}")
+    logger.info(f"\n{'='*70}")
+    logger.info(f"Launching gRPC cluster (separate workers + router)")
+    logger.info(f"{'='*70}")
+    logger.info(f"  Model: {model}")
+    logger.info(f"  Router port: {router_port}")
+    logger.info(f"  Workers: {num_workers}")
+    logger.info(f"  TP size: {tp_size}")
+    logger.info(f"  Policy: {policy}")
 
     # Step 1: Launch workers with gRPC enabled
     workers = []
@@ -179,9 +184,9 @@ def popen_launch_workers_and_router(
         worker_url = f"grpc://127.0.0.1:{worker_port}"
         worker_urls.append(worker_url)
 
-        print(f"\n[Worker {i+1}/{num_workers}]")
-        print(f"  Port: {worker_port}")
-        print(f"  URL: {worker_url}")
+        logger.info(f"\n[Worker {i+1}/{num_workers}]")
+        logger.info(f"  Port: {worker_port}")
+        logger.info(f"  URL: {worker_url}")
 
         # Build worker command
         worker_cmd = [
@@ -226,17 +231,19 @@ def popen_launch_workers_and_router(
             )
 
         workers.append(worker_proc)
-        print(f"  PID: {worker_proc.pid}")
+        logger.info(f"  PID: {worker_proc.pid}")
 
     # Give workers a moment to start binding to ports
     # The router will check worker health when it starts
-    print(f"\nWaiting for {num_workers} workers to initialize (20s)...")
+    logger.info(f"\nWaiting for {num_workers} workers to initialize (20s)...")
     time.sleep(20)
 
     # Quick check: make sure worker processes are still alive
     for i, worker in enumerate(workers):
         if worker.poll() is not None:
-            print(f"  ✗ Worker {i+1} died during startup (exit code: {worker.poll()})")
+            logger.error(
+                f"  ✗ Worker {i+1} died during startup (exit code: {worker.poll()})"
+            )
             # Cleanup: kill all workers
             for w in workers:
                 try:
@@ -245,12 +252,14 @@ def popen_launch_workers_and_router(
                     pass
             raise RuntimeError(f"Worker {i+1} failed to start")
 
-    print(f"✓ All {num_workers} workers started (router will verify connectivity)")
+    logger.info(
+        f"✓ All {num_workers} workers started (router will verify connectivity)"
+    )
 
     # Step 2: Launch router pointing to workers
-    print(f"\n[Router]")
-    print(f"  Port: {router_port}")
-    print(f"  Worker URLs: {', '.join(worker_urls)}")
+    logger.info(f"\n[Router]")
+    logger.info(f"  Port: {router_port}")
+    logger.info(f"  Worker URLs: {', '.join(worker_urls)}")
 
     # Build router command
     router_cmd = [
@@ -284,7 +293,7 @@ def popen_launch_workers_and_router(
         router_cmd.extend(router_args)
 
     if show_output:
-        print(f"  Command: {' '.join(router_cmd)}")
+        logger.info(f"  Command: {' '.join(router_cmd)}")
 
     # Launch router
     if show_output:
@@ -296,19 +305,19 @@ def popen_launch_workers_and_router(
             stderr=subprocess.PIPE,
         )
 
-    print(f"  PID: {router_proc.pid}")
+    logger.info(f"  PID: {router_proc.pid}")
 
     # Wait for router to be ready
     router_url = f"http://127.0.0.1:{router_port}"
-    print(f"\nWaiting for router to start at {router_url}...")
+    logger.info(f"\nWaiting for router to start at {router_url}...")
 
     try:
         wait_for_workers_ready(
             router_url, expected_workers=num_workers, timeout=180, api_key=api_key
         )
-        print(f"✓ Router ready at {router_url}")
+        logger.info(f"✓ Router ready at {router_url}")
     except TimeoutError:
-        print(f"✗ Router failed to start")
+        logger.error(f"✗ Router failed to start")
         # Cleanup: kill router and all workers
         try:
             router_proc.kill()
@@ -321,11 +330,11 @@ def popen_launch_workers_and_router(
                 pass
         raise
 
-    print(f"\n{'='*70}")
-    print(f"✓ gRPC cluster ready!")
-    print(f"  Router: {router_url}")
-    print(f"  Workers: {len(workers)}")
-    print(f"{'='*70}\n")
+    logger.info(f"\n{'='*70}")
+    logger.info(f"✓ gRPC cluster ready!")
+    logger.info(f"  Router: {router_url}")
+    logger.info(f"  Workers: {len(workers)}")
+    logger.info(f"{'='*70}\n")
 
     return {
         "workers": workers,

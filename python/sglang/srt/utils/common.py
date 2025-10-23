@@ -510,6 +510,8 @@ def get_available_gpu_memory(
                 f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
                 "which may cause useless memory allocation for torch NPU context.",
             )
+        if empty_cache:
+            torch.npu.empty_cache()
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
 
     if distributed:
