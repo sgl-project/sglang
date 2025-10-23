@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -121,7 +120,6 @@ class TestDeepseekV3W4Afp8Mtp(CustomTestCase):
 
 
 class TestDeepseekV3W4Afp8DeepepNormal(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = try_cached_model(DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST)
