@@ -50,20 +50,16 @@ echo "CMake download cache: ${CMAKE_DOWNLOAD_CACHE}"
 echo "ccache directory: ${CCACHE_DIR}"
 echo ""
 
-# Get current user and group information
+# Get current user and group information to set ownership of generated files
 CURRENT_UID=$(id -u)
 CURRENT_GID=$(id -g)
-CURRENT_USER=$(id -un)
-CURRENT_GROUP=$(id -gn)
-
-echo "Running as user: ${CURRENT_USER} (${CURRENT_UID}:${CURRENT_GID})"
-echo ""
 
 docker run --rm \
-   --user ${CURRENT_UID}:${CURRENT_GID} \
    -v $(pwd):/sgl-kernel \
    -v ${CMAKE_DOWNLOAD_CACHE}:/cmake-downloads \
    -v ${CCACHE_DIR}:/ccache \
+   -e HOST_UID="${CURRENT_UID}" \
+   -e HOST_GID="${CURRENT_GID}" \
    -e ENABLE_CMAKE_PROFILE="${ENABLE_CMAKE_PROFILE:-}" \
    -e ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE:-}" \
    ${DOCKER_IMAGE} \
@@ -238,5 +234,14 @@ docker run --rm \
    echo \"ccache Statistics\"
    echo \"==================================\"
    ccache -s
+   echo \"\"
+
+   # Fix ownership of generated files to match host user
+   echo \"==================================\"
+   echo \"Setting file ownership\"
+   echo \"==================================\"
+   echo \"Changing ownership to \${HOST_UID}:\${HOST_GID}\"
+   chown -R \"\${HOST_UID}:\${HOST_GID}\" /sgl-kernel/dist /sgl-kernel/build /cmake-downloads /ccache
+   echo \"Ownership updated successfully\"
    echo \"\"
    "
