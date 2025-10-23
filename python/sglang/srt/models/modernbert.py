@@ -142,6 +142,7 @@ class ModernBertSelfAttention(nn.Module):
             base=rope_theta,
             rope_scaling=None,
             is_neox_style=True,
+            dtype=torch.float16,
         )
         sliding_window_size = -1
         if not self.is_global_layer and self.local_attention > 0:
@@ -392,7 +393,11 @@ class ModernBertModel(nn.Module):
 
 
 class ModernBertForMaskedLM(ModernBertModel):
+    """ModernBertForMaskedLM is not implemented in SGLang. "
+    Please use ModernBertModel for embedding tasks only.
+    """
+
     pass
 
 
-EntryClass = [ModernBertModel]
+EntryClass = [ModernBertModel, ModernBertForMaskedLM]

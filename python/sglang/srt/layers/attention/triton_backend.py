@@ -801,7 +801,7 @@ class TritonAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         # Save KV cache first (must do this before unified kernel)
-        if save_kv_cache:
+        if save_kv_cache and layer.attn_type != AttentionType.ENCODER_ONLY:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
@@ -811,7 +811,7 @@ class TritonAttnBackend(AttentionBackend):
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
-            
+
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
             return self._forward_extend_unified(
