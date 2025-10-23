@@ -968,6 +968,11 @@ class ServerArgs:
                 "triton",
                 "trtllm_mha",
             }, "fa3, aiter, triton, or trtllm_mha is required for Llama4 model"
+            if is_sm100_supported() and self.attention_backend is None:
+                self.attention_backend = "trtllm_mha"
+                logger.warning(
+                    "Use trtllm_mha as attention backend on sm100 for Llama4 model"
+                )
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
