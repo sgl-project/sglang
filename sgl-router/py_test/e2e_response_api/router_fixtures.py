@@ -1,26 +1,20 @@
 """
-Fixtures for launching gRPC router + workers for e2e testing.
+Fixtures for launching OpenAI/XAI router for response API e2e testing.
 
-This module provides fixtures for launching SGLang workers and gRPC router separately:
-    1. Launch N SGLang workers with gRPC enabled
-    2. Launch router pointing to those workers
+This module provides fixtures for launching SGLang router with OpenAI or XAI backends:
+    1. Launch router with --backend openai pointing to OpenAI or XAI API
+    2. Configure history backend (memory or oracle)
 
-This approach gives more control and matches production deployment patterns.
+This supports testing the Response API against real cloud providers.
 """
 
+import os
 import socket
 import subprocess
 import time
 from typing import Optional
 
 import requests
-
-
-def find_free_port() -> int:
-    """Find an available port on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def wait_for_workers_ready(
@@ -95,6 +89,237 @@ def wait_for_workers_ready(
     )
 
 
+def find_free_port() -> int:
+    """Find an available port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def wait_for_router_ready(
+    router_url: str,
+    timeout: int = 60,
+    api_key: Optional[str] = None,
+) -> None:
+    """
+    Wait for router to be ready.
+
+    Polls the /health endpoint until it returns 200.
+
+    Args:
+        router_url: Base URL of router (e.g., "http://127.0.0.1:30000")
+        timeout: Max seconds to wait
+        api_key: Optional API key for authentication
+    """
+    start_time = time.time()
+    last_error = None
+    attempt = 0
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    with requests.Session() as session:
+        while time.time() - start_time < timeout:
+            attempt += 1
+            elapsed = int(time.time() - start_time)
+
+            # Print progress every 10 seconds
+            if elapsed > 0 and elapsed % 10 == 0 and attempt % 10 == 0:
+                print(f"  Still waiting for router... ({elapsed}/{timeout}s elapsed)")
+
+            try:
+                response = session.get(
+                    f"{router_url}/health", headers=headers, timeout=5
+                )
+                if response.status_code == 200:
+                    print(f"  Router ready after {elapsed}s")
+                    return
+                else:
+                    last_error = f"HTTP {response.status_code}"
+            except requests.ConnectionError:
+                last_error = "Connection refused (router not ready yet)"
+            except requests.Timeout:
+                last_error = "Timeout"
+            except requests.RequestException as e:
+                last_error = str(e)
+
+            time.sleep(1)
+
+    raise TimeoutError(
+        f"Router at {router_url} did not become ready within {timeout}s.\n"
+        f"Last status: {last_error}\n"
+        f"Hint: Run with SHOW_ROUTER_LOGS=1 to see startup logs"
+    )
+
+
+def popen_launch_openai_xai_router(
+    backend: str,  # "openai" or "xai"
+    base_url: str,
+    timeout: int = 60,
+    history_backend: str = "memory",
+    api_key: Optional[str] = None,
+    router_args: Optional[list] = None,
+    stdout=None,
+    stderr=None,
+    prometheus_port: Optional[int] = None,
+) -> dict:
+    """
+    Launch SGLang router with OpenAI or XAI backend.
+
+    This approach:
+    1. Starts router with --backend openai
+    2. Points to OpenAI or XAI API via --worker-urls
+    3. Configures history backend (memory or oracle)
+    4. Waits for router health check to pass
+
+    Args:
+        backend: "openai" or "xai"
+        base_url: Base URL for router (e.g., "http://127.0.0.1:30000")
+        timeout: Timeout for router startup (default: 60s)
+        history_backend: "memory" or "oracle" (default: memory)
+        api_key: Optional API key for router authentication
+        router_args: Additional arguments for router
+        stdout: Optional file handle for router stdout
+        stderr: Optional file handle for router stderr
+
+    Returns:
+        dict with:
+            - router: router process object
+            - base_url: router URL (HTTP endpoint)
+
+    Example:
+        >>> cluster = popen_launch_openai_xai_router(
+        ...     "openai", "http://127.0.0.1:30000"
+        ... )
+        >>> # Use cluster['base_url'] for HTTP requests
+        >>> # Cleanup:
+        >>> kill_process_tree(cluster['router'].pid)
+    """
+    show_output = os.environ.get("SHOW_ROUTER_LOGS", "0") == "1"
+
+    # Parse router port from base_url
+    if ":" in base_url.split("//")[-1]:
+        router_port = int(base_url.split(":")[-1])
+    else:
+        router_port = find_free_port()
+
+    print(f"\n{'='*70}")
+    print(f"Launching {backend.upper()} router")
+    print(f"{'='*70}")
+    print(f"  Backend: {backend}")
+    print(f"  Router port: {router_port}")
+    print(f"  History backend: {history_backend}")
+
+    # Determine worker URL based on backend
+    if backend == "openai":
+        worker_url = "https://api.openai.com"
+        # Get API key from environment
+        backend_api_key = os.environ.get("OPENAI_API_KEY")
+        if not backend_api_key:
+            raise ValueError(
+                "OPENAI_API_KEY environment variable must be set for OpenAI backend"
+            )
+    elif backend == "xai":
+        worker_url = "https://api.x.ai"
+        # Get API key from environment
+        backend_api_key = os.environ.get("XAI_API_KEY")
+        if not backend_api_key:
+            raise ValueError(
+                "XAI_API_KEY environment variable must be set for XAI backend"
+            )
+    else:
+        raise ValueError(f"Unsupported backend: {backend}")
+
+    print(f"  Worker URL: {worker_url}")
+
+    # Build router command
+    router_cmd = [
+        "python3",
+        "-m",
+        "sglang_router.launch_router",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(router_port),
+        "--backend",
+        "openai",
+        "--worker-urls",
+        worker_url,
+        "--history-backend",
+        history_backend,
+        "--log-level",
+        "warn",
+    ]
+
+    # Note: Not adding --api-key to router command for local testing
+    # The router will not require authentication
+
+    # Add Prometheus port to avoid conflicts (use unique port or disable)
+    if prometheus_port is None:
+        # Auto-assign a unique prometheus port based on router port
+        prometheus_port = router_port + 1000
+    router_cmd.extend(["--prometheus-port", str(prometheus_port)])
+
+    # Add router-specific args
+    if router_args:
+        router_cmd.extend(router_args)
+
+    if show_output:
+        print(f"  Command: {' '.join(router_cmd)}")
+
+    # Set up environment with backend API key
+    env = os.environ.copy()
+    if backend == "openai":
+        env["OPENAI_API_KEY"] = backend_api_key
+    else:
+        env["XAI_API_KEY"] = backend_api_key
+
+    # Launch router
+    if show_output:
+        router_proc = subprocess.Popen(
+            router_cmd,
+            env=env,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    else:
+        router_proc = subprocess.Popen(
+            router_cmd,
+            stdout=stdout if stdout is not None else subprocess.PIPE,
+            stderr=stderr if stderr is not None else subprocess.PIPE,
+            env=env,
+        )
+
+    print(f"  PID: {router_proc.pid}")
+
+    # Wait for router to be ready
+    router_url = f"http://127.0.0.1:{router_port}"
+    print(f"\nWaiting for router to start at {router_url}...")
+
+    try:
+        wait_for_router_ready(router_url, timeout=timeout, api_key=None)
+        print(f"✓ Router ready at {router_url}")
+    except TimeoutError:
+        print(f"✗ Router failed to start")
+        # Cleanup: kill router
+        try:
+            router_proc.kill()
+        except:
+            pass
+        raise
+
+    print(f"\n{'='*70}")
+    print(f"✓ {backend.upper()} router ready!")
+    print(f"  Router: {router_url}")
+    print(f"{'='*70}\n")
+
+    return {
+        "router": router_proc,
+        "base_url": router_url,
+    }
+
+
 def popen_launch_workers_and_router(
     model: str,
     base_url: str,
@@ -149,11 +374,7 @@ def popen_launch_workers_and_router(
         >>>     kill_process_tree(worker.pid)
         >>> kill_process_tree(cluster['router'].pid)
     """
-    import os
-
     show_output = os.environ.get("SHOW_ROUTER_LOGS", "0") == "1"
-
-    # Note: timeout parameter is used for router health check below
 
     # Parse router port from base_url
     if ":" in base_url.split("//")[-1]:
