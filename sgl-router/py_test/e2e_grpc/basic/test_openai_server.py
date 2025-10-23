@@ -20,7 +20,6 @@ import unittest
 from pathlib import Path
 
 import openai
-import requests
 
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
