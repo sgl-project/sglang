@@ -93,13 +93,22 @@ impl TestContext {
         }
 
         // Update config with worker URLs if not already set
-        if let RoutingMode::Regular {
-            worker_urls: ref mut urls,
-        } = config.mode
-        {
-            if urls.is_empty() {
-                *urls = worker_urls.clone();
+        match &mut config.mode {
+            RoutingMode::Regular {
+                worker_urls: ref mut urls,
+            } => {
+                if urls.is_empty() {
+                    *urls = worker_urls.clone();
+                }
             }
+            RoutingMode::OpenAI {
+                worker_urls: ref mut urls,
+            } => {
+                if urls.is_empty() {
+                    *urls = worker_urls.clone();
+                }
+            }
+            _ => {} // PrefillDecode mode has its own setup
         }
 
         let client = Client::builder()
@@ -1022,11 +1031,12 @@ mod responses_endpoint_tests {
 
     #[tokio::test]
     async fn test_v1_responses_input_items() {
-        // Use OpenAI routing mode for this test since input_items is only implemented there
+        // This test uses OpenAI mode because the input_items endpoint
+        // is only implemented in OpenAIRouter and reads from storage (no workers needed)
         let config = RouterConfig {
             chat_template: None,
             mode: RoutingMode::OpenAI {
-                worker_urls: vec!["http://127.0.0.1:18955/v1".to_string()],
+                worker_urls: vec!["http://dummy.local".to_string()], // Dummy URL (won't be called)
             },
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
@@ -1065,13 +1075,7 @@ mod responses_endpoint_tests {
 
         let ctx = TestContext::new_with_config(
             config,
-            vec![MockWorkerConfig {
-                port: 18955,
-                worker_type: WorkerType::Regular,
-                health_status: HealthStatus::Healthy,
-                response_delay_ms: 0,
-                fail_rate: 0.0,
-            }],
+            vec![], // No workers needed
         )
         .await;
 
@@ -1082,8 +1086,8 @@ mod responses_endpoint_tests {
         let mut stored_response = StoredResponse::new(None);
         stored_response.id = ResponseId::from("resp_test_input_items");
         stored_response.input = json!([
-            {"content": "hello", "role": "user"},
-            {"content": "hi there", "role": "assistant"}
+            {"id": "item_1", "content": "hello", "role": "user"},
+            {"id": "item_2", "content": "hi there", "role": "assistant"}
         ]);
         stored_response.output = json!([
             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "test response"}]}
