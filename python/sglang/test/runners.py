@@ -496,7 +496,7 @@ class SRTRunner:
         attention_backend: Optional[str] = None,
         prefill_attention_backend: Optional[str] = None,
         decode_attention_backend: Optional[str] = None,
-        lora_backend: str = "csgmv",
+        lora_backend: str = "triton",
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
         chunked_prefill_size: Optional[int] = None,

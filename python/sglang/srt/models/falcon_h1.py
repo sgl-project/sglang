@@ -1,4 +1,3 @@
-import enum
 import logging
 from typing import Any, Iterable, List, Optional, Set, Tuple
 

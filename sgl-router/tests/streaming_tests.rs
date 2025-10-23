@@ -1,13 +1,15 @@
 mod common;
 
+use std::sync::Arc;
+
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{RouterConfig, RoutingMode};
-use sglang_router_rs::core::WorkerManager;
-use sglang_router_rs::routers::{RouterFactory, RouterTrait};
-use std::sync::Arc;
+use sglang_router_rs::{
+    config::{RouterConfig, RoutingMode},
+    routers::{RouterFactory, RouterTrait},
+};
 
 /// Test context that manages mock workers
 struct TestContext {
@@ -48,13 +50,6 @@ impl TestContext {
         };
 
         let app_context = common::create_test_context(config.clone());
-
-        // Initialize workers in the registry before creating router
-        if !worker_urls.is_empty() {
-            WorkerManager::initialize_workers(&config, &app_context.worker_registry, None)
-                .await
-                .expect("Failed to initialize workers");
-        }
 
         let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
