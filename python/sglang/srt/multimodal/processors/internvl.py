@@ -91,19 +91,30 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         return frame_indices
 
     @staticmethod
-    def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=32):
-        try:
-            vr = VideoReader(video_path, ctx=gpu(0), num_threads=1)
-            use_gpu = True
-        except (RuntimeError, OSError) as e:
-            print(
-                f"[WARNING] Load video on gpu decoding failed: {e}. Falling back to CPU."
-            )
-            vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
-            use_gpu = False
+    def _does_video_reader_use_gpu():
+        # Based on load_video function in python/sglang/srt/utils/common.py
+        from decord import gpu
 
-        max_frame = len(vr) - 1
-        fps = float(vr.get_avg_fps())
+        try:
+            from decord.bridge import decord_bridge
+
+            _ = decord_bridge.get_ctx_device(gpu(0))
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def load_video(
+        video_reader: VideoReader,
+        bound=None,
+        input_size=448,
+        max_num=1,
+        num_segments=32,
+    ) -> tuple[torch.Tensor, list[int], list[float]]:
+        use_gpu = InternVLImageProcessor._does_video_reader_use_gpu()
+
+        max_frame = len(video_reader) - 1
+        fps = float(video_reader.get_avg_fps())
 
         pixel_values_list = []
         num_patches_list = []
@@ -115,7 +126,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
 
         for frame_index in frame_indices:
             # Load frame
-            frame = vr[frame_index]
+            frame = video_reader[frame_index]
             if use_gpu:
                 img = frame.cuda().permute(2, 0, 1).float() / 255.0
             else:
@@ -132,7 +143,8 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             num_patches_list.append(tiles.shape[0])
 
         pixel_values = torch.cat(pixel_values_list, dim=0)
-        return pixel_values, num_patches_list
+        timestamps = [i / fps for i in frame_indices]
+        return pixel_values, num_patches_list, timestamps
 
     @staticmethod
     def dynamic_preprocess(tensor, image_size=448, max_num=12, use_thumbnail=False):
@@ -202,19 +214,38 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
+            video_data=request_obj.video_data,
             multimodal_tokens=self.mm_tokens,
             discard_alpha_channel=True,
         )
 
-        num_patches_list = []
-        pixel_values = []
+        image_num_patches_list = []
+        video_num_patches_list = []
+        image_pixel_values = []
+        video_pixel_values = []
+        video_frame_timestamps = []
 
         mean, std = InternVLImageProcessor._get_normalize_tensors(device="cuda")
+
+        for video_index, video_reader in enumerate(base_output.videos):
+            try:
+                video_pixel_value, num_patches, timestamps = (
+                    InternVLImageProcessor.load_video(
+                        video_reader,
+                        bound=None,
+                        input_size=self.image_size,
+                    )
+                )
+                video_pixel_values.append(video_pixel_value)
+                video_num_patches_list.extend(num_patches)
+                video_frame_timestamps.append(timestamps)
+            except Exception as e:
+                print(f"[Error] Failed to process video {video_index}: {e}")
+                return None
 
         # Process each input with allocated frames
         for image_index, image in enumerate(base_output.images):
             try:
-                # TODO: video input
                 # Convert PIL to GPU tensor
                 if isinstance(image, Image.Image):
                     img_np = np.array(image.convert("RGB"))
@@ -229,33 +260,58 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
                     tensor, image_size=self.image_size, max_num=12, use_thumbnail=True
                 )
 
-                pixel_values.append(tiles)
-                num_patches_list.append(tiles.shape[0])
+                image_pixel_values.append(tiles)
+                image_num_patches_list.append(tiles.shape[0])
 
             except Exception as e:
                 print(f"[Error] Failed to process image {image_index}: {e}")
                 return None
 
-        # Concatenate all
-        pixel_values = torch.cat(pixel_values, dim=0)
-
-        original_placeholder = "<<<__IMG_CONTEXT_PLACEHOLDER__>>>"
-        input_text = input_text.replace(self.IMG_CONTEXT_TOKEN, original_placeholder)
-
+        original_placeholder = "<<<__CONTEXT_PLACEHOLDER__>>>"
         input_text_updated = input_text
-        for num_patches in num_patches_list:
-            image_tokens = (
-                self.IMG_START_TOKEN
-                + self.IMG_CONTEXT_TOKEN * self.num_image_token * num_patches
-                + self.IMG_END_TOKEN
-            )
+        if image_pixel_values:
+            # Concatenate all
+            image_pixel_values = torch.cat(image_pixel_values, dim=0)
+
             input_text_updated = input_text_updated.replace(
-                original_placeholder, image_tokens, 1
+                self.IMG_CONTEXT_TOKEN, original_placeholder
             )
 
-        input_text_updated = input_text_updated.replace(
-            original_placeholder, self.IMG_CONTEXT_TOKEN
-        )
+            for num_patches in image_num_patches_list:
+                image_tokens = (
+                    self.IMG_START_TOKEN
+                    + self.IMG_CONTEXT_TOKEN * self.num_image_token * num_patches
+                    + self.IMG_END_TOKEN
+                )
+                input_text_updated = input_text_updated.replace(
+                    original_placeholder, image_tokens, 1
+                )
+
+            input_text_updated = input_text_updated.replace(
+                original_placeholder, self.IMG_CONTEXT_TOKEN
+            )
+
+        if video_frame_timestamps:
+            video_pixel_values = torch.cat(video_pixel_values, dim=0)
+            for i in range(len(video_frame_timestamps)):
+                if self.VIDEO_CONTEXT_TOKEN in input_text_updated:
+                    frame = (
+                        self.IMG_START_TOKEN
+                        + original_placeholder * self.num_image_token
+                        + self.IMG_END_TOKEN
+                    )
+                    video_prompt = "This is a video:\n"
+                    for j, timestamp in enumerate(video_frame_timestamps[i]):
+                        video_prompt += (
+                            f"Frame {j+1} sampled at {timestamp:.2f} seconds: {frame}\n"
+                        )
+
+                    input_text_updated = input_text_updated.replace(
+                        self.VIDEO_CONTEXT_TOKEN, video_prompt, 1
+                    )
+                input_text_updated = input_text_updated.replace(
+                    original_placeholder, self.VIDEO_CONTEXT_TOKEN
+                )
 
         # Tokenize
         input_ids_tensor = self.tokenizer(input_text_updated, return_tensors="pt")[
@@ -268,14 +324,29 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             input_ids=input_ids_tensor.to("cuda"),
             mm_token_id=self.mm_tokens.image_token_id,
         )
+        # Get video token offsets
+        video_offsets = self.get_mm_items_offset(
+            input_ids=input_ids_tensor.to("cuda"),
+            mm_token_id=self.mm_tokens.video_token_id,
+        )
 
-        items = [
-            MultimodalDataItem(
-                feature=pixel_values,
-                modality=Modality.IMAGE,
-                offsets=image_offsets,
+        items = []
+        if image_num_patches_list:
+            items.append(
+                MultimodalDataItem(
+                    feature=image_pixel_values,
+                    modality=Modality.IMAGE,
+                    offsets=image_offsets,
+                )
             )
-        ]
+        if video_num_patches_list:
+            items.append(
+                MultimodalDataItem(
+                    feature=video_pixel_values,
+                    modality=Modality.VIDEO,
+                    offsets=video_offsets,
+                )
+            )
 
         return {
             "input_ids": input_ids,
@@ -283,4 +354,5 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             "im_start_id": self.img_start_token_id,
             "im_end_id": self.img_end_token_id,
             "im_token_id": self.mm_tokens.image_token_id,
+            "video_token_id": self.mm_tokens.video_token_id,
         }
