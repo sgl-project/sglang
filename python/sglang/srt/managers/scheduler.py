@@ -2115,7 +2115,10 @@ class Scheduler(
             batch_result.extend_logprob_start_len_per_req = (
                 extend_logprob_start_len_per_req
             )
-            if self.server_args.enable_dp_attention:
+            if (
+                self.server_args.enable_dp_attention
+                and self.server_args.elastic_ep_backend == "mooncake"
+            ):
                 # Get the tensors indicating rank activeness
                 tp_active_ranks = get_tp_active_ranks().detach().cpu().numpy()
                 tp_active_ranks_cpu = get_tp_active_ranks_cpu().detach().numpy()
@@ -2266,11 +2269,14 @@ class Scheduler(
             local_info,
             group=group,
         )
-        global_info.view(-1, 6)[tp_active_ranks == 0, :] = torch.tensor(
-            [0, 1, 0, 0, 1, ForwardMode.IDLE.value],
-            device=global_info.device,
-            dtype=global_info.dtype,
-        )
+        if tp_active_ranks is not None:
+            # Mooncake Backend tells which ranks are non-active
+            # Set a fallback value for those ranks
+            global_info.view(-1, 6)[tp_active_ranks == 0, :] = torch.tensor(
+                [0, 1, 0, 0, 1, ForwardMode.IDLE.value],
+                device=global_info.device,
+                dtype=global_info.dtype,
+            )
         global_num_tokens = global_info[:, 0, 0].tolist()
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
