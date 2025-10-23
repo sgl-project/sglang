@@ -158,6 +158,7 @@ class Envs:
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -236,6 +237,9 @@ class Envs:
     SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
     SGLANG_KT_AMX_METHOD = EnvStr(None)
     SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
+
+    # Sparse Embeddings
+    SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
     # fmt: on
 
