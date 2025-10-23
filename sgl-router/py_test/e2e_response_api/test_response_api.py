@@ -12,21 +12,18 @@ import sys
 import unittest
 from pathlib import Path
 
-# Add current directory and e2e_grpc for imports
+# Add current directory for imports
 _TEST_DIR = Path(__file__).parent
-_E2E_GRPC_DIR = _TEST_DIR.parent / "e2e_grpc"
 sys.path.insert(0, str(_TEST_DIR))
-sys.path.insert(1, str(_E2E_GRPC_DIR))
-
-# Import from e2e_grpc for gRPC backend tests
-
-from base import ConversationCRUDBaseTest, ResponseCRUDBaseTest
-from fixtures import popen_launch_workers_and_router
-from mcp import MCPTests
-from router_fixtures import popen_launch_openai_xai_router
-from state_management import StateManagementTests
 
 # Import local modules
+from base import ConversationCRUDBaseTest, ResponseCRUDBaseTest
+from mcp import MCPTests
+from router_fixtures import (
+    popen_launch_openai_xai_router,
+    popen_launch_workers_and_router,
+)
+from state_management import StateManagementTests
 from util import kill_process_tree
 
 
