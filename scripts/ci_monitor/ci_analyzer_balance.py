@@ -396,7 +396,7 @@ class SGLangTestBalanceAnalyzer:
                 job_link = f"[{job_name}]({job_url})" if job_url else job_name
 
                 summary_lines.append(
-                    f"| {test['rank']} | `{test_name}` | {test['max_gap']} | {test['max_elapsed']} | {test['max_estimated']} | {job_link} | {test['total_runs']} |"
+                    f"| {test['rank']} | `{test_name}` | {test['max_gap']} | {test['max_elapsed']} | {test['max_estimated']} | {job_name} | [{job_name}]({job_url}) | {test['total_runs']} |"
                 )
 
             summary_lines.append("")
