@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -117,7 +118,12 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = None
 
         # Init draft worker
-        with empty_context():
+        tp_group = None
+        ctx = empty_context()
+        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
+            tp_group = get_attention_tp_group()
+            ctx = draft_tp_context(tp_group)
+        with ctx:
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,

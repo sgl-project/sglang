@@ -824,7 +824,7 @@ class ServerArgs:
             capture_bs = (
                 list(range(1, 9, 1))
                 + list(range(10, 33, 2))
-                + list(range(40, 64, 4))
+                + list(range(40, 65, 4))
                 + list(range(72, 257, 8))
                 + list(range(272, self.cuda_graph_max_bs + 1, 16))
             )
