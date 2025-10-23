@@ -160,7 +160,7 @@ jobs:
   pytest-rust-2:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: 4-gpu-a10
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -194,12 +194,6 @@ jobs:
           python3 -m build
           pip install --force-reinstall dist/*.whl
 
-      - name: Run Python E2E gRPC tests
-        run: |
-          bash scripts/killall_sglang.sh "nuk_gpus"
-          cd sgl-router
-          SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=WARNING
-
       - name: Run Python E2E response API tests
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -208,6 +202,14 @@ jobs:
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
           pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=WARNING
+
+      - name: Run Python E2E gRPC tests
+        run: |
+          bash scripts/killall_sglang.sh "nuk_gpus"
+          cd sgl-router
+          SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=WARNING
+
+
 
   finish:
     needs: [unit-test-rust, pytest-rust]
