@@ -42,20 +42,19 @@ def check_sglang_ready(
     transport = None
     if uds is not None:
         transport = httpx.HTTPTransport(uds=uds)
-    while True:
-        try:
-            response = httpx.Client(transport=transport).get(
-                f"{endpoint}/ping", timeout=10
-            )
-            response.raise_for_status()
-            break
-        except (httpx.ConnectError, httpx.HTTPStatusError) as e:
-            if retry_num % 10 == 0:
-                logger.warning(
-                    f"fail to check sglang ready, retry {retry_num} times, error: {e}"
-                )
-            retry_num += 1
-            time.sleep(0.1)
+    with httpx.Client(transport=transport) as client:
+        while True:
+            try:
+                response = client.get(f"{endpoint}/ping", timeout=10)
+                response.raise_for_status()
+                break
+            except (httpx.ConnectError, httpx.HTTPStatusError) as e:
+                if retry_num % 10 == 0:
+                    logger.warning(
+                        f"fail to check sglang ready, retry {retry_num} times, error: {e}"
+                    )
+                retry_num += 1
+                time.sleep(0.1)
 
 
 def split_checkpoint_files(
