@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::ConfigResult;
+use crate::core::ConnectionMode;
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,16 +207,6 @@ impl std::fmt::Debug for OracleConfig {
             .field("pool_timeout_secs", &self.pool_timeout_secs)
             .finish()
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(tag = "type")]
-pub enum ConnectionMode {
-    #[default]
-    #[serde(rename = "http")]
-    Http,
-    #[serde(rename = "grpc")]
-    Grpc,
 }
 
 /// Routing mode configuration

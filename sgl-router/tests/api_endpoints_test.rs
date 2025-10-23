@@ -11,10 +11,8 @@ use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType
 use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::{
-    config::{
-        CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
-    },
-    core::Job,
+    config::{CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode},
+    core::{ConnectionMode, Job},
     routers::{RouterFactory, RouterTrait},
     server::AppContext,
 };

@@ -2,11 +2,8 @@
 mod test_pd_routing {
     use serde_json::json;
     use sglang_router_rs::{
-        config::{
-            CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig,
-            RoutingMode,
-        },
-        core::{BasicWorkerBuilder, Worker, WorkerType},
+        config::{CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode},
+        core::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType},
         routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
     };
 
