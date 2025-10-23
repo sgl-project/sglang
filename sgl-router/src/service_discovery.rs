@@ -156,9 +156,14 @@ impl PodInfo {
         self.is_ready && self.status == "Running"
     }
 
-    pub fn worker_url(&self, port: u16) -> String {
-        // Default to http:// prefix; workflow will detect actual protocol (HTTP vs gRPC)
-        format!("http://{}:{}", self.ip, port)
+    pub fn worker_url(&self, port: u16, grpc_mode: bool) -> String {
+        // Use grpc:// prefix if grpc_mode is enabled, otherwise http://
+        // The workflow will detect the actual protocol if not in grpc_mode
+        if grpc_mode {
+            format!("grpc://{}:{}", self.ip, port)
+        } else {
+            format!("http://{}:{}", self.ip, port)
+        }
     }
 }
 
@@ -325,7 +330,12 @@ async fn handle_pod_event(
     port: u16,
     pd_mode: bool,
 ) {
-    let worker_url = pod_info.worker_url(port);
+    // Check if grpc_mode is enabled from the router config
+    let grpc_mode = matches!(
+        app_context.router_config.connection_mode,
+        crate::core::ConnectionMode::Grpc { .. }
+    );
+    let worker_url = pod_info.worker_url(port, grpc_mode);
 
     if pod_info.is_healthy() {
         let should_add = {
@@ -430,7 +440,12 @@ async fn handle_pod_deletion(
     app_context: Arc<AppContext>,
     port: u16,
 ) {
-    let worker_url = pod_info.worker_url(port);
+    // Check if grpc_mode is enabled from the router config
+    let grpc_mode = matches!(
+        app_context.router_config.connection_mode,
+        crate::core::ConnectionMode::Grpc { .. }
+    );
+    let worker_url = pod_info.worker_url(port, grpc_mode);
 
     let was_tracked = {
         let mut tracked = match tracked_pods.lock() {
