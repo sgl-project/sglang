@@ -51,7 +51,7 @@ def main(args: Namespace):
         "--model",
         model,
         "--tasks",
-        tasks,
+        tasks_str,
         "--batch_size",
         str(args.batch_size),
         "--log_samples",

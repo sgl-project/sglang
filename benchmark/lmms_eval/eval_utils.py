@@ -2,6 +2,7 @@
 
 import argparse
 import dataclasses
+from typing import Tuple
 
 
 @dataclasses.dataclass
@@ -10,7 +11,7 @@ class EvalArgs:
 
     dataset_path: str = ""
     # tasks of lmms_eval
-    tasks: list[str] = dataclasses.field(default_factory=list)
+    tasks: Tuple[int] = ()
     split: str = "lvb_val.json"
 
     result_filename: str = "./val_sglang.json"
@@ -32,7 +33,7 @@ class EvalArgs:
         parser.add_argument("--output-path", type=str, default=EvalArgs.output_path)
 
         parser.add_argument("--dataset-path", type=str, default=EvalArgs.dataset_path)
-        parser.add_argument("--tasks", type=int, nargs="+", default=EvalArgs.tasks)
+        parser.add_argument("--tasks", type=str, nargs="+", default=EvalArgs.tasks)
         parser.add_argument("--seed", type=int, default=EvalArgs.seed)
         parser.add_argument("--split", type=str, default=EvalArgs.split)
         parser.add_argument("--concurrency", type=int, default=EvalArgs.concurrency)
