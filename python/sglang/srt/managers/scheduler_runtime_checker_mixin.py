@@ -13,58 +13,59 @@ if TYPE_CHECKING:
 
 class SchedulerRuntimeCheckerMixin:
 
-    def check_memory(self: Scheduler):
-        if self.is_hybrid:
-            (
-                full_num_used,
-                swa_num_used,
-                _,
-                _,
-                full_available_size,
-                full_evictable_size,
-                swa_available_size,
-                swa_evictable_size,
-            ) = self._get_swa_token_info()
-            memory_leak = full_num_used != 0 or swa_num_used != 0
-            token_msg = (
-                f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {self.tree_cache.full_protected_size()=}\n"
-                f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}\n"
-            )
-        elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
-            (
-                full_num_used,
-                mamba_num_used,
-                _,
-                _,
-                full_available_size,
-                full_evictable_size,
-                mamba_available_size,
-                mamba_evictable_size,
-            ) = self._get_mamba_token_info()
-            memory_leak = (
-                full_num_used != self.tree_cache.full_protected_size()
-                or mamba_num_used != self.tree_cache.mamba_protected_size()
-            )
-            token_msg = (
-                f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
-                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}\n"
-            )
-        else:
-            _, _, available_size, evictable_size = self._get_token_info()
-            protected_size = self.tree_cache.protected_size()
-            memory_leak = (available_size + evictable_size) != (
-                # self.max_total_num_tokens
-                # if not self.enable_hierarchical_cache
-                # else self.max_total_num_tokens - protected_size
-                self.max_total_num_tokens
-                - protected_size
-            )
-            token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+    def _check_hybrid_memory(self: Scheduler):
+        (
+            full_num_used,
+            swa_num_used,
+            _,
+            _,
+            full_available_size,
+            full_evictable_size,
+            swa_available_size,
+            swa_evictable_size,
+        ) = self._get_swa_token_info()
+        memory_leak = full_num_used != 0 or swa_num_used != 0
+        token_msg = (
+            f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {self.tree_cache.full_protected_size()=}\n"
+            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}\n"
+        )
+        return memory_leak, token_msg
 
-        if memory_leak:
-            msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
-            raise ValueError(msg)
+    def _check_mamba_memory(self: Scheduler):
+        (
+            full_num_used,
+            mamba_num_used,
+            _,
+            _,
+            full_available_size,
+            full_evictable_size,
+            mamba_available_size,
+            mamba_evictable_size,
+        ) = self._get_mamba_token_info()
+        memory_leak = (
+            full_num_used != self.tree_cache.full_protected_size()
+            or mamba_num_used != self.tree_cache.mamba_protected_size()
+        )
+        token_msg = (
+            f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
+            f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}\n"
+        )
+        return memory_leak, token_msg
 
+    def _check_radix_cache_memory(self: Scheduler):
+        _, _, available_size, evictable_size = self._get_token_info()
+        protected_size = self.tree_cache.protected_size()
+        memory_leak = (available_size + evictable_size) != (
+            # self.max_total_num_tokens
+            # if not self.enable_hierarchical_cache
+            # else self.max_total_num_tokens - protected_size
+            self.max_total_num_tokens
+            - protected_size
+        )
+        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+        return memory_leak, token_msg
+
+    def _check_req_pool(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             req_total_size = (
                 self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
@@ -79,6 +80,20 @@ class SchedulerRuntimeCheckerMixin:
                 f"total_size={self.req_to_token_pool.size}\n"
             )
             raise ValueError(msg)
+
+    def check_memory(self: Scheduler):
+        if self.is_hybrid:
+            memory_leak, token_msg = self._check_hybrid_memory()
+        elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
+            memory_leak, token_msg = self._check_mamba_memory()
+        else:
+            memory_leak, token_msg = self._check_radix_cache_memory()
+
+        if memory_leak:
+            msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+            raise ValueError(msg)
+
+        self._check_req_pool()
 
         if (
             self.enable_metrics
