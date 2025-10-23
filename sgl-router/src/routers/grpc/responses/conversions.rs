@@ -50,10 +50,10 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                 match item {
                     ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
                         // Convert SimpleInputMessage to chat message
-                        use crate::protocols::responses::StringOrContentArray;
+                        use crate::protocols::responses::StringOrContentParts;
                         let text = match content {
-                            StringOrContentArray::String(s) => s.clone(),
-                            StringOrContentArray::Array(parts) => {
+                            StringOrContentParts::String(s) => s.clone(),
+                            StringOrContentParts::Array(parts) => {
                                 // Extract text from content parts (only InputText supported)
                                 parts
                                     .iter()

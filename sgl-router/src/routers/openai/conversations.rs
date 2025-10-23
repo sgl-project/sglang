@@ -1105,7 +1105,7 @@ async fn persist_items_with_storages(
 
 /// Extract and normalize input items from ResponseInput
 fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
-    use crate::protocols::responses::{ResponseInputOutputItem, StringOrContentArray};
+    use crate::protocols::responses::{ResponseInputOutputItem, StringOrContentParts};
 
     let items = match input {
         ResponseInput::Text(text) => {
@@ -1127,10 +1127,10 @@ fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
                         ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
                             // Convert SimpleInputMessage to standard message format with ID
                             let content_json = match content {
-                                StringOrContentArray::String(s) => {
+                                StringOrContentParts::String(s) => {
                                     json!([{"type": "input_text", "text": s}])
                                 }
-                                StringOrContentArray::Array(parts) => serde_json::to_value(parts)
+                                StringOrContentParts::Array(parts) => serde_json::to_value(parts)
                                     .map_err(|e| {
                                     format!("Failed to serialize content: {}", e)
                                 })?,

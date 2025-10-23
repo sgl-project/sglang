@@ -97,7 +97,7 @@ pub enum ReasoningSummary {
 /// Content can be either a simple string or array of content parts (for SimpleInputMessage)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum StringOrContentArray {
+pub enum StringOrContentParts {
     String(String),
     Array(Vec<ResponseContentPart>),
 }
@@ -135,7 +135,7 @@ pub enum ResponseInputOutputItem {
     },
     #[serde(untagged)]
     SimpleInputMessage {
-        content: StringOrContentArray,
+        content: StringOrContentParts,
         role: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(rename = "type")]
@@ -640,8 +640,8 @@ impl GenerationRequest for ResponsesRequest {
                     }
                     ResponseInputOutputItem::SimpleInputMessage { content, .. } => {
                         match content {
-                            StringOrContentArray::String(s) => Some(s.clone()),
-                            StringOrContentArray::Array(parts) => {
+                            StringOrContentParts::String(s) => Some(s.clone()),
+                            StringOrContentParts::Array(parts) => {
                                 // SimpleInputMessage only supports InputText
                                 let texts: Vec<String> = parts
                                     .iter()
@@ -700,10 +700,10 @@ pub fn normalize_input_item(item: &ResponseInputOutputItem) -> ResponseInputOutp
     match item {
         ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
             let content_vec = match content {
-                StringOrContentArray::String(s) => {
+                StringOrContentParts::String(s) => {
                     vec![ResponseContentPart::InputText { text: s.clone() }]
                 }
-                StringOrContentArray::Array(parts) => parts.clone(),
+                StringOrContentParts::Array(parts) => parts.clone(),
             };
 
             ResponseInputOutputItem::Message {

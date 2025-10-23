@@ -42,11 +42,6 @@ use crate::{
     routers::grpc::{context::SharedComponents, pipeline::RequestPipeline},
 };
 
-/// Generate unique ID for MCP items
-fn generate_mcp_id(prefix: &str) -> String {
-    format!("{}_{}", prefix, Uuid::new_v4())
-}
-
 /// Extract function call from a chat completion response
 /// Returns (call_id, tool_name, arguments_json_str) if found
 fn extract_function_call_from_chat(
@@ -219,6 +214,11 @@ impl ToolLoopState {
 // ============================================================================
 // MCP Metadata Builders
 // ============================================================================
+
+/// Generate unique ID for MCP items
+fn generate_mcp_id(prefix: &str) -> String {
+    format!("{}_{}", prefix, Uuid::new_v4())
+}
 
 /// Build mcp_list_tools output item
 fn build_mcp_list_tools_item(
@@ -415,7 +415,6 @@ pub(super) async fn execute_tool_loop(
                     status: Some("completed".to_string()),
                 }],
                 ResponseInput::Items(items) => {
-                    // Process all item types, converting SimpleInputMessage to Message
                     items
                         .iter()
                         .map(crate::protocols::responses::normalize_input_item)
