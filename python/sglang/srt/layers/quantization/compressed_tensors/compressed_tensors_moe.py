@@ -174,10 +174,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 )
             self.block_quant = True
             self.weight_block_size = self.weight_quant.block_structure
-            if not self.use_cutlass_fused_experts_fp8:
-                raise RuntimeError(
-                    f"BLOCK quantization strategy is only supported with Cutlass fused experts fp8 kernel. Please set SGLANG_CUTLASS_MOE=1 and use sm90 or sm100 GPU."
-                )
 
     def create_weights(
         self,
@@ -591,6 +587,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 w2_scale=layer.w2_weight_scale,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
+                block_shape=self.weight_block_size,
             )
             return self.runner.run(dispatch_output, quant_info)
 

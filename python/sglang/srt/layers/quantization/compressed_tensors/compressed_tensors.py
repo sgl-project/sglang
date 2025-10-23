@@ -1,12 +1,17 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/v0.8.2/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
 
 import logging
 from contextlib import suppress
 from typing import Any, Literal, NamedTuple, Optional, cast
 
 import torch
-from compressed_tensors.config import CompressionFormat, SparsityCompressionConfig
+from compressed_tensors.config import (
+    CompressionFormat,
+    SparsityCompressionConfig,
+    SparsityStructure,
+)
 from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
@@ -571,6 +576,72 @@ class CompressedTensorsConfig(QuantizationConfig):
             return name.replace(".v_proj.output_scale", ".attn.v_scale")
         # If no matches, return None
         return None
+
+    @staticmethod
+    def supports_cutlass_24(
+        weight_quant: Optional[QuantizationArgs],
+        input_quant: Optional[QuantizationArgs],
+        sparsity_scheme: Optional[SparsityCompressionConfig] = None,
+    ) -> bool:
+        """
+        Check if the layer is supported by the Cutlass 2:4 Kernel
+        Conditions:
+            - Overarching condition: Sparsity Structure is 2:4
+            - Unquantized cases are supported
+            - Weight only quantization is not-supported
+            - Supported weight quantization strategies are TENSOR and CHANNEL
+            - Supported input quantization strategies are TENSOR and TOKEN
+            - Only 8 bit quantization is supported
+
+        :return: True if the layer is supported by the Cutlass 2:4 Kernel
+            False otherwise
+        """
+        if sparsity_scheme is None:
+            return False
+
+        is_valid_sparsity_structure: bool = (
+            sparsity_scheme.sparsity_structure == SparsityStructure.TWO_FOUR.value
+        )
+
+        valid_compressors = {
+            CompressionFormat.dense.value,
+            CompressionFormat.sparse_24_bitmask.value,
+        }
+
+        is_valid_sparsity = (
+            is_valid_sparsity_structure and sparsity_scheme.format in valid_compressors
+        )
+
+        if not is_valid_sparsity:
+            return False
+
+        # Unquantized cases are supported
+        if weight_quant is None and input_quant is None:
+            return True
+
+        # Weight only quantization is not-supported
+        if weight_quant is not None and input_quant is None:
+            return False
+
+        supported_weight_quant_strategies = [
+            QuantizationStrategy.TENSOR.value,
+            QuantizationStrategy.CHANNEL.value,
+        ]
+
+        assert weight_quant is not None
+        assert input_quant is not None
+        if weight_quant.strategy not in supported_weight_quant_strategies:
+            return False
+
+        supported_input_quant_strategies = [
+            QuantizationStrategy.TENSOR.value,
+            QuantizationStrategy.TOKEN.value,
+        ]
+
+        if input_quant.strategy not in supported_input_quant_strategies:
+            return False
+
+        return weight_quant.num_bits == input_quant.num_bits == 8
 
 
 class CompressedTensorsLinearMethod(LinearMethodBase):
