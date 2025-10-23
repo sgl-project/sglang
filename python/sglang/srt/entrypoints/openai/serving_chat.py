@@ -196,6 +196,7 @@ class OpenAIServingChat(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             custom_labels=custom_labels,
+            custom_logit_processor=request.custom_logit_processor,
         )
 
         return adapted_request, request

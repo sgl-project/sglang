@@ -112,6 +112,11 @@ class ModelOptFp8Config(QuantizationConfig):
             )
 
     @classmethod
+    def override_quantization_method(cls, hf_quant_config, user_quant):
+        """Override quantization method based on the model's config."""
+        return cls._modelopt_override_quantization_method(hf_quant_config, user_quant)
+
+    @classmethod
     def get_name(cls) -> str:
         return "modelopt_fp8"
 
@@ -528,6 +533,11 @@ class ModelOptFp4Config(QuantizationConfig):
         self.exclude_modules = exclude_modules
 
     @classmethod
+    def override_quantization_method(cls, hf_quant_config, user_quant):
+        """Override quantization method based on the model's config."""
+        return cls._modelopt_override_quantization_method(hf_quant_config, user_quant)
+
+    @classmethod
     def get_name(cls) -> str:
         return "modelopt_fp4"
 
@@ -608,7 +618,16 @@ class ModelOptFp4Config(QuantizationConfig):
                 else:
                     kv_cache_quant_algo = "auto"
 
-            group_size = ModelOptFp4Config.common_group_size(config)
+            group_size = config.get("group_size")
+            # If group_size is not at top level, try to extract from config_groups
+            if group_size is None:
+                config_groups = config.get("config_groups", {})
+                if config_groups:
+                    # Get group_size from the first group's weights config
+                    first_group = next(iter(config_groups.values()), {})
+                    weights_config = first_group.get("weights", {})
+                    group_size = weights_config.get("group_size")
+
             exclude_modules = config.get("ignore", [])
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
@@ -634,15 +653,15 @@ class ModelOptFp4Config(QuantizationConfig):
             )
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
 
-        if not (group_size and kv_cache_quant_algo) or exclude_modules is None:
+        if group_size is None or exclude_modules is None:
             logger.warning(
                 f"group_size: {group_size},"
                 f"kv_cache_quant_algo: {kv_cache_quant_algo},"
                 f"exclude_modules: {exclude_modules}"
             )
             raise ValueError(
-                "NVFP4 quantization requires group size and "
-                "kv_cache_quant_algo specified in the quantization config"
+                "NVFP4 quantization requires group_size and exclude_modules "
+                "specified in the quantization config"
             )
         return cls(
             is_checkpoint_nvfp4_serialized,
@@ -1061,8 +1080,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     ):
         from flashinfer import nvfp4_block_scale_interleave
         from flashinfer.fused_moe.core import (
-            _maybe_get_cached_w2_permute_indices,
             _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
         )
 
         """Prepare quantized weights for kernel (done offline with weights)."""
@@ -1123,7 +1142,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             )
 
-            permute_indices = _maybe_get_cached_w2_permute_indices(
+            permute_indices = get_w2_permute_indices_with_cache(
                 self._cache_permute_indices,
                 gemm2_weights_fp4[i].view(torch.uint8),
                 epilogue_tile_m,
@@ -1134,7 +1153,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 .contiguous()
             )
 
-            permute_sf_indices = _maybe_get_cached_w2_permute_indices(
+            permute_sf_indices = get_w2_permute_indices_with_cache(
                 self._cache_permute_indices,
                 gemm2_scales_linear_fp4[i].view(torch.uint8),
                 epilogue_tile_m,

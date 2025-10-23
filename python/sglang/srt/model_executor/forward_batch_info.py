@@ -84,11 +84,16 @@ class ForwardMode(IntEnum):
     def is_prefill(self):
         return self.is_extend()
 
-    def is_extend(self):
+    def is_extend(self, include_draft_extend_v2: bool = False):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
+            or (
+                self == ForwardMode.DRAFT_EXTEND_V2
+                if include_draft_extend_v2
+                else False
+            )
             or self == ForwardMode.TARGET_VERIFY
         )
 
@@ -107,7 +112,11 @@ class ForwardMode(IntEnum):
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
-    def is_draft_extend(self):
+    def is_draft_extend(self, include_v2: bool = False):
+        if include_v2:
+            return (
+                self == ForwardMode.DRAFT_EXTEND_V2 or self == ForwardMode.DRAFT_EXTEND
+            )
         return self == ForwardMode.DRAFT_EXTEND
 
     def is_draft_extend_v2(self):

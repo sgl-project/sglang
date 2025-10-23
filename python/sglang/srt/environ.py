@@ -237,6 +237,9 @@ class Envs:
     SGLANG_KT_AMX_METHOD = EnvStr(None)
     SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
 
+    # Sparse Embeddings
+    SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
+
     # fmt: on
 
 

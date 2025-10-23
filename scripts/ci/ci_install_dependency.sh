@@ -27,6 +27,9 @@ if [ "$IS_BLACKWELL" = "1" ]; then
 
     # Clean up existing installations
     $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
+
+    # Install the main package
+    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
@@ -38,10 +41,16 @@ else
 
     # Clean up existing installations
     $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
-fi
 
-# Install the main package
-$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
+    # Install the main package without deps
+    $PIP_CMD install -e "python[dev]" --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
+
+    # Install flashinfer-python 0.4.1 dependency that requires prerelease (This should be removed when flashinfer fixes this issue)
+    $PIP_CMD install flashinfer-python==0.4.1 --prerelease=allow $PIP_INSTALL_SUFFIX
+
+    # Install the main package
+    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --upgrade
+fi
 
 # Install router for pd-disagg test
 SGLANG_ROUTER_BUILD_NO_RUST=1 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
@@ -86,14 +95,6 @@ if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
     git checkout ${FLASHMLA_COMMIT}
     git submodule update --init --recursive
     FLASH_MLA_DISABLE_SM100=${FLASH_MLA_DISABLE_SM100} $PIP_CMD install -v . $PIP_INSTALL_SUFFIX --no-build-isolation
-    cd ..
-
-    # Install fast-hadamard-transform
-    FAST_HADAMARD_TRANSFORM_COMMIT="7fd811c2b47f63b0b08d2582619f939e14dad77c"
-    git clone https://github.com/Dao-AILab/fast-hadamard-transform
-    cd fast-hadamard-transform
-    git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT}
-    $PIP_CMD install . $PIP_INSTALL_SUFFIX --no-build-isolation
     cd ..
 fi
 
