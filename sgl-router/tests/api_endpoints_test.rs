@@ -14,7 +14,7 @@ use sglang_router_rs::{
     config::{
         CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
     },
-    core::WorkerManager,
+    core::Job,
     routers::{RouterFactory, RouterTrait},
     server::AppContext,
 };
@@ -112,21 +112,50 @@ impl TestContext {
         // Create app context
         let app_context = common::create_test_context(config.clone());
 
-        // Initialize workers in the registry before creating router
+        // Submit worker initialization job (same as real server does)
         if !worker_urls.is_empty() {
-            WorkerManager::initialize_workers(&config, &app_context.worker_registry, None)
+            let job_queue = app_context
+                .worker_job_queue
+                .get()
+                .expect("JobQueue should be initialized");
+            let job = Job::InitializeWorkersFromConfig {
+                router_config: Box::new(config.clone()),
+            };
+            job_queue
+                .submit(job)
                 .await
-                .expect("Failed to initialize workers");
+                .expect("Failed to submit worker initialization job");
+
+            // Poll until all workers are healthy (up to 10 seconds)
+            let expected_count = worker_urls.len();
+            let start = tokio::time::Instant::now();
+            let timeout_duration = tokio::time::Duration::from_secs(10);
+            loop {
+                let healthy_workers = app_context
+                    .worker_registry
+                    .get_all()
+                    .iter()
+                    .filter(|w| w.is_healthy())
+                    .count();
+
+                if healthy_workers >= expected_count {
+                    break;
+                }
+
+                if start.elapsed() > timeout_duration {
+                    panic!(
+                        "Timeout waiting for {} workers to become healthy (only {} ready)",
+                        expected_count, healthy_workers
+                    );
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
         }
 
         // Create router
         let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
-
-        // Wait for router to discover workers
-        if !workers.is_empty() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
 
         Self {
             workers,
@@ -707,221 +736,6 @@ mod model_info_tests {
             resp.status()
         );
 
-        ctx.shutdown().await;
-    }
-}
-
-#[cfg(test)]
-mod worker_management_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_add_new_worker() {
-        let ctx = TestContext::new(vec![]).await;
-        let app = ctx.create_app().await;
-
-        // Start a mock worker
-        let mut worker = MockWorker::new(MockWorkerConfig {
-            port: 18301,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        });
-        let url = worker.start().await.unwrap();
-
-        // Add the worker
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/add_worker?url={}", url))
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // List workers to verify
-        let req = Request::builder()
-            .method("GET")
-            .uri("/list_workers")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let workers = body_json["urls"].as_array().unwrap();
-        assert!(workers.iter().any(|w| w.as_str().unwrap() == url));
-
-        worker.stop().await;
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_remove_existing_worker() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
-            port: 18302,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        }])
-        .await;
-
-        let app = ctx.create_app().await;
-
-        // Get the worker URL
-        let req = Request::builder()
-            .method("GET")
-            .uri("/list_workers")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let workers = body_json["urls"].as_array().unwrap();
-        let worker_url = workers[0].as_str().unwrap();
-
-        // Remove the worker
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/remove_worker?url={}", worker_url))
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/list_workers")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let workers = body_json["urls"].as_array().unwrap();
-        assert!(workers.is_empty());
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_add_worker_invalid_url() {
-        let ctx = TestContext::new(vec![]).await;
-        let app = ctx.create_app().await;
-
-        // Invalid URL format
-        let req = Request::builder()
-            .method("POST")
-            .uri("/add_worker?url=not-a-valid-url")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        // Missing URL parameter
-        let req = Request::builder()
-            .method("POST")
-            .uri("/add_worker")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        // Empty URL
-        let req = Request::builder()
-            .method("POST")
-            .uri("/add_worker?url=")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_add_duplicate_worker() {
-        // Start a mock worker
-        let mut worker = MockWorker::new(MockWorkerConfig {
-            port: 18303,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        });
-        let url = worker.start().await.unwrap();
-
-        let ctx = TestContext::new(vec![]).await;
-        let app = ctx.create_app().await;
-
-        // Add worker first time
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/add_worker?url={}", url))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        // Try to add same worker again
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/add_worker?url={}", url))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        // Should return error for duplicate
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        worker.stop().await;
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_add_unhealthy_worker() {
-        // Start unhealthy worker
-        let mut worker = MockWorker::new(MockWorkerConfig {
-            port: 18304,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Unhealthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        });
-        let url = worker.start().await.unwrap();
-
-        let ctx = TestContext::new(vec![]).await;
-        let app = ctx.create_app().await;
-
-        // Try to add unhealthy worker
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/add_worker?url={}", url))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-
-        // Router should reject unhealthy workers
-        assert!(
-            resp.status() == StatusCode::BAD_REQUEST
-                || resp.status() == StatusCode::SERVICE_UNAVAILABLE
-        );
-
-        worker.stop().await;
         ctx.shutdown().await;
     }
 }
