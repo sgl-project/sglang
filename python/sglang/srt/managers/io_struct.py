@@ -1078,6 +1078,8 @@ class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     backend: str = "nccl"
 
 
+# Now UpdateWeightsFromIPCReqInput and UpdateWeightsFromIPCReqOutput
+# are only used by Checkpoint Engine (https://github.com/MoonshotAI/checkpoint-engine)
 @dataclass
 class UpdateWeightsFromIPCReqInput(BaseReq):
     # ZMQ socket paths for each device UUID
