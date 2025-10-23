@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import copy
+from collections import deque
 import json
 import logging
 import os
@@ -586,35 +587,44 @@ def popen_launch_server(
 
     print(f"command={' '.join(command)}")
 
+    # Always capture logs for error reporting (keep last 500 lines)
+    log_buffer_stdout = deque(maxlen=500)
+    log_buffer_stderr = deque(maxlen=500)
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+
+    def _dump(src, sinks, log_buffer):
+        for line in iter(src.readline, ""):
+            log_buffer.append(line.rstrip())
+            for sink in sinks:
+                sink.write(line)
+                sink.flush()
+        src.close()
+
+    # Build list of sinks for stdout/stderr
+    stdout_sinks = [sys.stdout]
+    stderr_sinks = [sys.stderr]
     if return_stdout_stderr:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            text=True,
-            bufsize=1,
-        )
+        stdout_sinks.insert(0, return_stdout_stderr[0])
+        stderr_sinks.insert(0, return_stdout_stderr[1])
 
-        def _dump(src, sinks):
-            for line in iter(src.readline, ""):
-                for sink in sinks:
-                    sink.write(line)
-                    sink.flush()
-            src.close()
-
-        threading.Thread(
-            target=_dump,
-            args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_dump,
-            args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
-            daemon=True,
-        ).start()
-    else:
-        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+    threading.Thread(
+        target=_dump,
+        args=(process.stdout, stdout_sinks, log_buffer_stdout),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_dump,
+        args=(process.stderr, stderr_sinks, log_buffer_stderr),
+        daemon=True,
+    ).start()
 
     start_time = time.perf_counter()
     with requests.Session() as session:
@@ -622,10 +632,21 @@ def popen_launch_server(
             return_code = process.poll()
             if return_code is not None:
                 # Server failed to start (non-zero exit code) or crashed
-                raise Exception(
-                    f"Server process exited with code {return_code}. "
-                    "Check server logs for errors."
-                )
+                error_msg = f"Server process exited with code {return_code}.\n"
+
+                # Include recent logs if available
+                if log_buffer_stderr or log_buffer_stdout:
+                    error_msg += "Recent server logs:\n"
+                    error_msg += "=" * 80 + "\n"
+                    if log_buffer_stdout:
+                        error_msg += "STDOUT (last 50 lines):\n"
+                        error_msg += "\n".join(list(log_buffer_stdout)[-50:]) + "\n"
+                    if log_buffer_stderr:
+                        error_msg += "\nSTDERR (last 50 lines):\n"
+                        error_msg += "\n".join(list(log_buffer_stderr)[-50:]) + "\n"
+                    error_msg += "=" * 80
+
+                raise Exception(error_msg)
 
             try:
                 headers = {
