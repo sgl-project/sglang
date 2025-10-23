@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -175,7 +176,21 @@ class SchedulerOutputProcessorMixin:
                             logprob_pt += num_input_logprobs
 
         else:  # embedding or reward model
-            embeddings = result.embeddings.tolist()
+            is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+
+            embeddings = result.embeddings
+
+            if is_sparse:
+                batch_ids, token_ids = embeddings.indices()
+                values = embeddings.values()
+
+                embeddings = [{} for _ in range(embeddings.size(0))]
+                for i in range(batch_ids.shape[0]):
+                    embeddings[batch_ids[i].item()][token_ids[i].item()] = values[
+                        i
+                    ].item()
+            else:
+                embeddings = embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
