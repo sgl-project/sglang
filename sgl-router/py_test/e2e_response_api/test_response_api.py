@@ -19,7 +19,6 @@ sys.path.insert(0, str(_TEST_DIR))
 sys.path.insert(1, str(_E2E_GRPC_DIR))
 
 # Import from e2e_grpc for gRPC backend tests
-import sys
 
 from base import ConversationCRUDBaseTest, ResponseCRUDBaseTest
 from mcp import MCPTests
@@ -28,8 +27,6 @@ from state_management import StateManagementTests
 
 # Import local modules
 from util import kill_process_tree
-
-sys.path.insert(0, str(_E2E_GRPC_DIR))
 from fixtures import popen_launch_workers_and_router
 
 
@@ -122,8 +119,8 @@ class TestGrpcBackend(StateManagementTests, MCPTests):
         super().test_mcp_basic_tool_call()
 
     @unittest.skip("TODO: no event fields")
-    def test_mcp_tool_call_execution(self):
-        super().test_mcp_tool_call_execution()
+    def test_mcp_basic_tool_call_streaming(self):
+        return super().test_mcp_basic_tool_call_streaming()
 
 
 if __name__ == "__main__":

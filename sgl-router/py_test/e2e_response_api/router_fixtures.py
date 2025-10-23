@@ -124,8 +124,6 @@ def popen_launch_openai_xai_router(
         >>> # Cleanup:
         >>> kill_process_tree(cluster['router'].pid)
     """
-    import os
-
     show_output = os.environ.get("SHOW_ROUTER_LOGS", "0") == "1"
 
     # Parse router port from base_url

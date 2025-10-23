@@ -5,8 +5,6 @@ Tests MCP tool calling in both streaming and non-streaming modes.
 These tests should work across all backends that support MCP (OpenAI, XAI).
 """
 
-import logging
-
 from base import ResponseAPIBaseTest
 
 
@@ -34,7 +32,7 @@ class MCPTests(ResponseAPIBaseTest):
         self.assertEqual(resp.status_code, 200)
 
         data = resp.json()
-        logging.info(f"MCP response: {data}")
+        print(f"MCP response: {data}")
 
         # Basic response structure
         self.assertIn("id", data)

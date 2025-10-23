@@ -53,15 +53,6 @@ class ResponseAPIBaseTest(CustomTestCase):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        # Log request details
-        print(f"\n REQUEST:")
-        print(f"  Method: {method}")
-        print(f"  URL: {url}")
-        if json_data:
-            import json as json_module
-
-            print(f"  Body: {json_module.dumps(json_data, indent=2)}")
-
         if method == "POST":
             resp = requests.post(url, json=json_data, headers=headers, params=params)
         elif method == "GET":
@@ -70,13 +61,6 @@ class ResponseAPIBaseTest(CustomTestCase):
             resp = requests.delete(url, headers=headers, params=params)
         else:
             raise ValueError(f"Unsupported method: {method}")
-
-        # Log response details
-        print(f"\n RESPONSE:")
-        print(f"  Status: {resp.status_code}")
-        print(f"  Headers: {dict(resp.headers)}")
-        print(f"  Body: {resp.text[:1000]}")  # First 500 chars
-
         return resp
 
     def create_response(

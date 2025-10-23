@@ -133,30 +133,3 @@ class StateManagementTests(ResponseAPIBaseTest):
                     text_parts.append(part.get("text", ""))
 
         return " ".join(text_parts)
-
-    def _extract_content_from_events(self, events: list) -> str:
-        """Extract text content from SSE events."""
-        content_parts = []
-
-        for event in events:
-            data = event.get("data", {})
-
-            # Handle different event types
-            if isinstance(data, dict):
-                # Check for delta content
-                if "delta" in data:
-                    delta = data["delta"]
-                    if "content" in delta:
-                        for part in delta["content"]:
-                            if part.get("type") == "output_text":
-                                content_parts.append(part.get("text", ""))
-
-                # Check for output in final event
-                if "output" in data:
-                    for item in data["output"]:
-                        content = item.get("content", [])
-                        for part in content:
-                            if part.get("type") == "output_text":
-                                content_parts.append(part.get("text", ""))
-
-        return " ".join(content_parts)
