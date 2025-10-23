@@ -13,7 +13,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerCore,
     RunnerInput,
     RunnerOutput,
-    register_fused_func,
     register_post_permute,
     register_pre_permute,
 )
@@ -147,76 +146,6 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
 # ---------------------------------------------------------------------------
 # Permute / fused hooks
 # ---------------------------------------------------------------------------
-
-
-@register_fused_func("none", "triton_kernel")
-def fused_experts_none_to_triton_kernels(
-    dispatch_output: StandardDispatchOutput,
-    quant_info: TritonKernelsQuantInfo,
-    runner_config: MoeRunnerConfig,
-) -> StandardCombineInput:
-    from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-        triton_kernel_moe_forward,
-        triton_kernel_moe_with_bias_forward,
-    )
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
-
-    hidden_states = dispatch_output.hidden_states
-    topk_output = dispatch_output.topk_output
-
-    assert TopKOutputChecker.format_is_triton_kernels(
-        topk_output
-    ), "Triton-kernel runner expects TritonKernelTopKOutput"
-
-    has_bias = quant_info.w13_bias is not None or quant_info.w2_bias is not None
-
-    if runner_config.no_combine:
-        topk_output = topk_output._replace(scatter_indx=None)
-
-    if has_bias:
-        assert (
-            quant_info.w13_bias is not None and quant_info.w2_bias is not None
-        ), "Bias execution requires both w13_bias and w2_bias"
-        output = triton_kernel_moe_with_bias_forward(
-            hidden_states=hidden_states,
-            w1=quant_info.w13_weight,
-            w1_pcg=quant_info.w13_precision_config,
-            b1=quant_info.w13_bias,
-            w2=quant_info.w2_weight,
-            w2_pcg=quant_info.w2_precision_config,
-            b2=quant_info.w2_bias,
-            topk_output=topk_output,
-            moe_runner_config=runner_config,
-            global_num_experts=quant_info.global_num_experts,
-        )
-    else:
-        output = triton_kernel_moe_forward(
-            hidden_states=hidden_states,
-            w1=quant_info.w13_weight,
-            w2=quant_info.w2_weight,
-            topk_output=topk_output,
-            moe_runner_config=runner_config,
-            apply_router_weight_on_input=runner_config.apply_router_weight_on_input,
-            global_num_experts=quant_info.global_num_experts,
-        )
-
-    if runner_config.no_combine:
-        tokens = hidden_states.shape[0]
-        hidden = hidden_states.shape[-1]
-        top_k = runner_config.top_k
-        assert (
-            top_k is not None
-        ), "runner_config.top_k must be set when no_combine=True for Triton kernels"
-        output = output.view(tokens, top_k, hidden)
-
-    if (
-        runner_config.routed_scaling_factor is not None
-        and runner_config.routed_scaling_factor != 1.0
-    ):
-        output.mul_(runner_config.routed_scaling_factor)
-
-    return StandardCombineInput(hidden_states=output)
 
 
 @register_pre_permute("standard", "triton_kernel")

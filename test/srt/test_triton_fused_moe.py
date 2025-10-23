@@ -121,41 +121,23 @@ class TestFusedMOE(CustomTestCase):
         )
         torch_combined = torch_per_expert.sum(dim=1)
 
-        def run_runner(config, fused):
+        def run_runner(config):
             runner = MoeRunner(MoeRunnerBackend.TRITON_KERNELS, config)
-            if not fused:
-                runner.fused_func = None
             result = runner.run(dispatch_output, quant_info)
             return result.hidden_states
 
-        # Case 1: fused path, combined output (no_combine=False)
-        fused_config = MoeRunnerConfig(inplace=False)
-        fused_output = run_runner(fused_config, fused=True)
-        torch.testing.assert_close(fused_output, torch_combined, rtol=rtol, atol=atol)
-
-        # Case 2: fused path, per-expert output (no_combine=True)
-        fused_no_combine_config = MoeRunnerConfig(
-            inplace=False, no_combine=True, top_k=topk
-        )
-        fused_no_combine_output = run_runner(fused_no_combine_config, fused=True)
-        torch.testing.assert_close(
-            fused_no_combine_output, torch_per_expert, rtol=rtol, atol=atol
-        )
-
-        # Case 3: non-fused path, combined output (no_combine=False)
+        # Combined output (no_combine=False)
         non_fused_config = MoeRunnerConfig(inplace=False)
-        non_fused_output = run_runner(non_fused_config, fused=False)
+        non_fused_output = run_runner(non_fused_config)
         torch.testing.assert_close(
             non_fused_output, torch_combined, rtol=rtol, atol=atol
         )
 
-        # Case 4: non-fused path, per-expert output (no_combine=True)
+        # Per-expert output (no_combine=True)
         non_fused_no_combine_config = MoeRunnerConfig(
             inplace=False, no_combine=True, top_k=topk
         )
-        non_fused_no_combine_output = run_runner(
-            non_fused_no_combine_config, fused=False
-        )
+        non_fused_no_combine_output = run_runner(non_fused_no_combine_config)
         torch.testing.assert_close(
             non_fused_no_combine_output, torch_per_expert, rtol=rtol, atol=atol
         )
