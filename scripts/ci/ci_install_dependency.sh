@@ -4,7 +4,13 @@ set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 RUN_DEEPSEEK_V32=${RUN_DEEPSEEK_V32:-0}
-CU_VERSION="cu128"
+CU_VERSION="cu129"
+
+if [ "$CU_VERSION" = "cu130" ]; then
+    NVRTC_SPEC="nvidia-cuda-nvrtc"
+else
+    NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
+fi
 
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -70,12 +76,11 @@ fi
 # Show current packages
 $PIP_CMD list
 
-# Install additional dependencies
-$PIP_CMD install mooncake-transfer-engine==0.3.6.post1 nvidia-cuda-nvrtc-cu12 py-spy scipy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.6.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
-    git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 
     # Install xformers
