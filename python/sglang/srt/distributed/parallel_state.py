@@ -1637,13 +1637,17 @@ def initialize_model_parallel(
         group_ranks.append(ranks)
 
     global _TP_ACTIVE_RANKS
-    _TP_ACTIVE_RANKS = torch.ones(
-        (tensor_model_parallel_size,), dtype=torch.int32, device="cuda"
-    )
     global _TP_ACTIVE_RANKS_CPU
-    _TP_ACTIVE_RANKS_CPU = torch.ones(
-        (tensor_model_parallel_size,), dtype=torch.int32, device="cpu"
-    )
+    if backend == "mooncake":
+        _TP_ACTIVE_RANKS = torch.ones(
+            (tensor_model_parallel_size,), dtype=torch.int32, device="cuda"
+        )
+        _TP_ACTIVE_RANKS_CPU = torch.ones(
+            (tensor_model_parallel_size,), dtype=torch.int32, device="cpu"
+        )
+    else:
+        _TP_ACTIVE_RANKS = None
+        _TP_ACTIVE_RANKS_CPU = None
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
         group_ranks,

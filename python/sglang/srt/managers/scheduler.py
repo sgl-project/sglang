@@ -2120,7 +2120,10 @@ class Scheduler(
             batch_result.extend_logprob_start_len_per_req = (
                 extend_logprob_start_len_per_req
             )
-            if self.server_args.enable_dp_attention:
+            if (
+                self.server_args.enable_dp_attention
+                and self.server_args.elastic_ep_backend == "mooncake"
+            ):
                 # Get the tensors indicating rank activeness
                 tp_active_ranks = get_tp_active_ranks().detach().cpu().numpy()
                 tp_active_ranks_cpu = get_tp_active_ranks_cpu().detach().numpy()
