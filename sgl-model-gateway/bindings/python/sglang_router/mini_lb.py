@@ -69,6 +69,8 @@ class MiniLoadBalancer:
             )
             self.enable_trace = False
         self.encode_urls = router_args.encode_urls
+        
+        self.encode_idx = list(range(len(self.encode_urls)))
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -126,13 +128,25 @@ class MiniLoadBalancer:
             return
         
         # Split mm_items
-        num_item_per_encoder = (len(img_list)+len(encode_urls)-1) // len(encode_urls)
-        num_encoders = min(len(img_list), len(encode_urls))
-        encode_requests = [{'mm_items':img_list[i*num_item_per_encoder:(i+1)*num_item_per_encoder],
-                            'num_parts': num_encoders,
-                            'part_idx': i,
-                            'req_id': request_data.get('bootstrap_room')} 
-                             for i in range(num_encoders)]
+        encode_requests = []
+        random.shuffle(self.encode_idx)
+        num_items_assigned = [(idx+len(img_list)) // len(self.encode_urls) for idx in self.encode_idx]
+        num_parts = sum(1 for x in num_items_assigned if x != 0)
+        cum_num_items = 0
+        cum_idx = 0
+        for idx,assigned_num in enumerate(num_items_assigned):
+            if assigned_num == 0:
+                continue
+            encode_requests.append(
+                {
+                'encoder_idx':idx,
+                'mm_items':img_list[cum_num_items:cum_num_items+assigned_num],
+                'num_parts': num_parts,
+                'part_idx': cum_idx,
+                'req_id': request_data.get('bootstrap_room')
+                })
+            cum_idx += 1
+            cum_num_items += assigned_num
         
         # Send encode requests
         async with aiohttp.ClientSession(
@@ -141,8 +155,8 @@ class MiniLoadBalancer:
             )  # Add timeout for request reliability
         ) as session:
             tasks = [
-                session.post(f"{encode_urls[i]}/{endpoint}", json=encode_requests[i])
-                for i in range(num_encoders)
+                session.post(f"{encode_urls[encode_request['encoder_idx']]}/{endpoint}", json=encode_request)
+                for encode_request in encode_requests
             ]
 
             await asyncio.gather(*tasks)
