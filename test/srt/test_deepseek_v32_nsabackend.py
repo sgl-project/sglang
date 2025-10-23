@@ -54,7 +54,7 @@ class TestDeepseekV32NasBackend_flashmla(CustomTestCase):
             data_path=None,
             num_questions=1400,
             parallel=1400,
-            max_new_tokens=100000,
+            max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
@@ -118,7 +118,7 @@ class TestDeepseekV32NasBackend_fa3(CustomTestCase):
             data_path=None,
             num_questions=1400,
             parallel=1400,
-            max_new_tokens=100000,
+            max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
