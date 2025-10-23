@@ -199,6 +199,8 @@ def popen_launch_workers_and_router(
             "0.8",
             "--attention-backend",
             "fa3",
+            "--log-level",
+            "warn",
         ]
 
         # Add TP size

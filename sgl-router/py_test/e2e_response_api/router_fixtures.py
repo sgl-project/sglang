@@ -205,7 +205,12 @@ def popen_launch_openai_xai_router(
 
     # Launch router
     if show_output:
-        router_proc = subprocess.Popen(router_cmd, env=env)
+        router_proc = subprocess.Popen(
+            router_cmd,
+            env=env,
+            stdout=stdout,
+            stderr=stderr,
+        )
     else:
         router_proc = subprocess.Popen(
             router_cmd,

@@ -21,13 +21,13 @@ sys.path.insert(1, str(_E2E_GRPC_DIR))
 # Import from e2e_grpc for gRPC backend tests
 
 from base import ConversationCRUDBaseTest, ResponseCRUDBaseTest
+from fixtures import popen_launch_workers_and_router
 from mcp import MCPTests
 from router_fixtures import popen_launch_openai_xai_router
 from state_management import StateManagementTests
 
 # Import local modules
 from util import kill_process_tree
-from fixtures import popen_launch_workers_and_router
 
 
 class TestOpenaiBackend(
