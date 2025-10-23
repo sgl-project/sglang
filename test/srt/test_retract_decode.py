@@ -1,8 +1,5 @@
-import time
 import unittest
 from types import SimpleNamespace
-
-import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -55,6 +52,18 @@ class TestRetractDecodeChunkCache(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=["--disable-radix-cache", "--chunked-prefill-size", 128],
             )
+
+    def test_mmlu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
+        )
+
+        metrics = run_eval(args)
+        self.assertGreaterEqual(metrics["score"], 0.65)
 
 
 if __name__ == "__main__":
