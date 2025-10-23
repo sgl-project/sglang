@@ -22,19 +22,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
-import torch_npu
-import tqdm
-from torch_npu.profiler import ProfilerActivity, profile
 
 from sglang.srt.configs.model_config import is_deepseek_nsa
-from sglang.srt.distributed import get_tensor_model_parallel_rank, graph_capture
-from sglang.srt.layers.torchao_utils import save_gemlite_cache
-from sglang.srt.model_executor.cuda_graph_runner import (
-    CudaGraphRunner,
-    freeze_gc,
-    patch_model,
-)
-from sglang.srt.utils import empty_context, get_available_gpu_memory
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.utils import is_npu
+
+is_npu = is_npu()
+
+if is_npu:
+    import torch_npu
+    from torch_npu.profiler import ProfilerActivity, profile
 
 logger = logging.getLogger(__name__)
 
@@ -72,80 +69,33 @@ class NPUGraphRunner(CudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int32
 
-    def capture(self) -> None:
-        profile_context = empty_context()
-        if self.enable_profile_cuda_graph:
-            output_dir = os.path.join(
-                os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp"), "graph_capture_profile"
-            )
-            if not Path(output_dir).exists():
-                Path(output_dir).mkdir(parents=True, exist_ok=True)
-            logger.info(
-                f"Profiling starts for graph capture for NPU. Traces will be saved to: {output_dir}"
-            )
-            experimental_config = torch_npu.profiler._ExperimentalConfig(
-                export_type=[torch_npu.profiler.ExportType.Text],
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-                l2_cache=False,
-                op_attr=False,
-                data_simplification=False,
-            )
-            profile_context = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
-                record_shapes=True,
-                profile_memory=True,
-                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                    output_dir, analyse_flag=False
-                ),
-                experimental_config=experimental_config,
-            )
+    def _init_profile_context_and_memory_record(self):
+        output_dir = os.path.join(
+            os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp"), "graph_capture_profile"
+        )
+        if not Path(output_dir).exists():
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+        logger.info(
+            f"Profiling starts for graph capture for NPU. Traces will be saved to: {output_dir}"
+        )
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=[torch_npu.profiler.ExportType.Text],
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        )
+        profile_context = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
+            record_shapes=True,
+            profile_memory=True,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                output_dir, async_mode=True
+            ),
+            experimental_config=experimental_config,
+        )
+        return profile_context
 
-        # Trigger NPU graph capture for specific shapes.
-        # Capture the large shapes first so that the smaller shapes
-        # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
-            with profile_context as prof:
-                self.stream = graph_capture_context.stream
-                avail_mem = get_available_gpu_memory(
-                    self.model_runner.device,
-                    self.model_runner.gpu_id,
-                    empty_cache=False,
-                )
-                # Reverse the order to enable better memory sharing across NPU graphs.
-                capture_range = (
-                    tqdm.tqdm(list(reversed(self.capture_bs)))
-                    if get_tensor_model_parallel_rank() == 0
-                    else reversed(self.capture_bs)
-                )
-                for i, bs in enumerate(capture_range):
-                    if get_tensor_model_parallel_rank() == 0:
-                        avail_mem = get_available_gpu_memory(
-                            self.model_runner.device,
-                            self.model_runner.gpu_id,
-                            empty_cache=False,
-                        )
-                        capture_range.set_description(
-                            f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
-                        )
-
-                    with patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.num_tokens_per_bs,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        (
-                            graph,
-                            output_buffers,
-                        ) = self.capture_one_batch_size(bs, forward)
-                        self.graphs[bs] = graph
-                        self.output_buffers[bs] = output_buffers
-
-                    # Save gemlite cache after each capture
-                    save_gemlite_cache()
+    def _post_process_after_profile(self, prof_context):
+        # for NPU, profile data will be saved to disk for further analysis.
+        pass
 
     def replay(
         self,
