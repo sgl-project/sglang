@@ -63,7 +63,6 @@ class DispatchOutputFormat(Enum):
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
 
-
     def is_deepep_normal(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_NORMAL
 

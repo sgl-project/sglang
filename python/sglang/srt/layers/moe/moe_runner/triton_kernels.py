@@ -128,7 +128,6 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
                 **common_kwargs,
             )
 
-
         if self.config.no_combine:
             tokens = runner_input.hidden_states.shape[0]
             hidden = runner_input.hidden_states.shape[-1]
@@ -165,7 +164,6 @@ def pre_permute_standard_to_triton_kernels(
     ), "Triton-kernel runner expects TritonKernelTopKOutput"
 
     routing_data, gather_indx, scatter_indx = topk_output
-
 
     return TritonKernelsRunnerInput(
         hidden_states=hidden_states,
