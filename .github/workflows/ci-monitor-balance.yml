@@ -3,9 +3,6 @@ name: CI Monitor Balance
 on:
   schedule:
     - cron: '0 6 * * *'   # 6:00 AM UTC daily
-    - cron: '0 18 * * *'  # 6:00 PM UTC daily
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
     inputs:
       limit:
