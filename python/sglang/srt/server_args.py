@@ -965,6 +965,7 @@ class ServerArgs:
                 "fa3",
                 "aiter",
                 "triton",
+                "trtllm_mha",
             }, "fa3, aiter, or triton is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
