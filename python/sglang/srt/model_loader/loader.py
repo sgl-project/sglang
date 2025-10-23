@@ -180,12 +180,11 @@ def _get_quantization_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
     packed_modules_mapping: Dict[str, List[str]],
-    remap_prefix: Dict[str, str] | None = None,
 ) -> Optional[QuantizationConfig]:
     """Get the quantization config."""
     if model_config.quantization is not None:
         quant_config = get_quant_config(
-            model_config, load_config, packed_modules_mapping, remap_prefix
+            model_config, load_config, packed_modules_mapping
         )
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
@@ -221,7 +220,6 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
-    remap_prefix = getattr(model_class, "remap_prefix", None)
     if _is_npu:
         packed_modules_mapping.update(
             {
@@ -245,7 +243,7 @@ def _initialize_model(
         )
 
     quant_config = _get_quantization_config(
-        model_config, load_config, packed_modules_mapping, remap_prefix
+        model_config, load_config, packed_modules_mapping
     )
 
     # Build kwargs conditionally
