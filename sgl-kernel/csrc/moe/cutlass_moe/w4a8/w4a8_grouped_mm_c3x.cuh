@@ -186,7 +186,9 @@ void cutlass_w4a8_group_gemm_caller(
   TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have 3 columns (N, M, K)");
   TORCH_CHECK(b_tensors.size(0) == num_experts, "B tensor first dimension must match number of groups");
   TORCH_CHECK(b_scales.size(0) == num_experts, "Scale tensor first dimension must match number of groups");
-  TORCH_CHECK(b_scales.size(2) == 4 * b_tensors.size(1), "Scale tensor last dimension must be 4*N");
+  TORCH_CHECK(
+      b_tensors.size(2) * 2 == a_tensors.size(1) or b_tensors.size(2) * 2 == a_tensors.size(2),
+      "B tensor K/2 dimension must match A tensor K dimension");
 
   // Check tensor types
   TORCH_CHECK(a_tensors.scalar_type() == torch::kFloat8_e4m3fn, "A tensor must be fp8 (float_e4m3_t) type");
