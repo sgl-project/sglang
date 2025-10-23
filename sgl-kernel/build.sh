@@ -50,7 +50,17 @@ echo "CMake download cache: ${CMAKE_DOWNLOAD_CACHE}"
 echo "ccache directory: ${CCACHE_DIR}"
 echo ""
 
+# Get current user and group information
+CURRENT_UID=$(id -u)
+CURRENT_GID=$(id -g)
+CURRENT_USER=$(id -un)
+CURRENT_GROUP=$(id -gn)
+
+echo "Running as user: ${CURRENT_USER} (${CURRENT_UID}:${CURRENT_GID})"
+echo ""
+
 docker run --rm \
+   --user ${CURRENT_UID}:${CURRENT_GID} \
    -v $(pwd):/sgl-kernel \
    -v ${CMAKE_DOWNLOAD_CACHE}:/cmake-downloads \
    -v ${CCACHE_DIR}:/ccache \
