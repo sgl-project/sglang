@@ -150,7 +150,7 @@ class TestQwen2AudioServer(AudioOpenAITestMixin):
     model = "Qwen/Qwen2-Audio-7B-Instruct"
 
 
-class TestDeepseekOCRServer(ImageOpenAITestMixin):
+class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
     model = "deepseek-ai/DeepSeek-OCR"
     trust_remote_code = False
 
