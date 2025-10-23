@@ -613,8 +613,8 @@ class EAGLEWorker(TpModelWorker):
         return parent_list, top_scores_index, draft_tokens
 
     def clear_cache_pool(self):
-        self.model_runner.req_to_token_pool.clear()
-        self.model_runner.token_to_kv_pool_allocator.clear()
+        # allocator and kv cache pool are shared with target worker
+        pass
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)

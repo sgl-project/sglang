@@ -38,6 +38,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
@@ -377,6 +378,9 @@ class PiecewiseCudaGraphRunner:
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
+            # It is True in this context but we need to set it to use low latency deepep mode.
+            set_is_extend_in_batch(False)
 
             kwargs = {}
             with set_forward_context(forward_batch, self.attention_layers):
