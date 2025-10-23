@@ -1,10 +1,14 @@
+from __future__ import annotations
+
 import logging
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -17,9 +21,14 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +49,11 @@ class SchedulerUpdateWeightsMixin:
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success, message)
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        """Destroy the online model parameter update group."""
+        success, message = self.tp_worker.destroy_weights_update_group(recv_req)
+        return DestroyWeightsUpdateGroupReqOutput(success, message)
 
     def update_weights_from_distributed(
         self,
@@ -68,11 +82,25 @@ class SchedulerUpdateWeightsMixin:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        """Update the online model parameter from IPC for checkpoint-engine integration."""
+        success, message = self.tp_worker.update_weights_from_ipc(recv_req)
+        if success:
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return UpdateWeightsFromIPCReqOutput(success, message)
+
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
 
-    def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+    def release_memory_occupation(
+        self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
+    ):
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
@@ -87,14 +115,16 @@ class SchedulerUpdateWeightsMixin:
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.stashed_model_static_state = _export_static_state(
-                self.tp_worker.worker.model_runner.model
+                self.tp_worker.model_runner.model
             )
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         return ReleaseMemoryOccupationReqOutput()
 
-    def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+    def resume_memory_occupation(
+        self: Scheduler, recv_req: ResumeMemoryOccupationReqInput
+    ):
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
@@ -107,7 +137,7 @@ class SchedulerUpdateWeightsMixin:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
             _import_static_state(
-                self.tp_worker.worker.model_runner.model,
+                self.tp_worker.model_runner.model,
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
@@ -117,17 +147,20 @@ class SchedulerUpdateWeightsMixin:
 
         return ResumeMemoryOccupationReqOutput()
 
-    def save_remote_model(self, params):
+    def save_remote_model(self: Scheduler, params):
         url = params["url"]
 
-        worker = self.tp_worker.worker
+        self.tp_worker.model_runner.save_remote_model(url)
 
-        worker.model_runner.save_remote_model(url)
+        if self.draft_worker is not None:
+            draft_url = params.get("draft_url", None)
+            assert (
+                draft_url is not None
+            ), "draft_url must be provided when draft model is enabled"
+            self.draft_worker.model_runner.save_remote_model(draft_url)
 
-    def save_sharded_model(self, params):
-        worker = self.tp_worker.worker
-
-        worker.model_runner.save_sharded_model(
+    def save_sharded_model(self: Scheduler, params):
+        self.tp_worker.model_runner.save_sharded_model(
             path=params["path"],
             pattern=params["pattern"],
             max_size=params["max_size"],

@@ -98,7 +98,7 @@ def dsv3_fused_a_gemm(
     return output
 
 
-def sgl_per_token_group_quant_fp8(
+def sgl_per_token_group_quant_8bit(
     input: torch.Tensor,
     output_q: torch.Tensor,
     output_s: torch.Tensor,
@@ -106,25 +106,40 @@ def sgl_per_token_group_quant_fp8(
     eps: float,
     fp8_min: float,
     fp8_max: float,
-    scale_ue8m0: bool,
+    scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
 ) -> None:
-    torch.ops.sgl_kernel.sgl_per_token_group_quant_fp8.default(
+    if enable_v2 is None:
+        from sglang.srt.utils import get_bool_env_var
+
+        enable_v2 = get_bool_env_var("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
+
+    if enable_v2:
+        return torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(
+            input,
+            output_q,
+            output_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0,
+            fuse_silu_and_mul,
+            masked_m,
+        )
+
+    assert not fuse_silu_and_mul, "only v2 support fuse_silu_and_mul"
+    assert masked_m is None, "only v2 support masked_m"
+    torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
         input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
     )
 
 
-def sgl_per_token_group_quant_int8(
-    input: torch.Tensor,
-    output_q: torch.Tensor,
-    output_s: torch.Tensor,
-    group_size: int,
-    eps: float,
-    int8_min: float,
-    int8_max: float,
-) -> None:
-    torch.ops.sgl_kernel.sgl_per_token_group_quant_int8.default(
-        input, output_q, output_s, group_size, eps, int8_min, int8_max
-    )
+# For legacy usage
+sgl_per_token_group_quant_fp8 = sgl_per_token_group_quant_8bit
+sgl_per_token_group_quant_int8 = sgl_per_token_group_quant_8bit
 
 
 def sgl_per_tensor_quant_fp8(
@@ -298,6 +313,7 @@ def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
 def scaled_fp4_grouped_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
+    mask: torch.Tensor,
 ):
     """
     Quantize input tensor to FP4 and return quantized tensor and scale, for
@@ -331,22 +347,14 @@ def scaled_fp4_grouped_quant(
     output_scales = torch.empty(
         l, padded_m, padded_k_int32, device=device, dtype=torch.int32
     )
-    input_offsets = torch.arange(0, (l + 1) * m, step=m, dtype=torch.int, device=device)
-    output_offsets = torch.arange(
-        0,
-        (l + 1) * padded_m,
-        step=padded_m,
-        dtype=torch.int,
-        device=device,
-    )
 
-    torch.ops.sgl_kernel.scaled_fp4_experts_quant.default(
+    torch.ops.sgl_kernel.silu_and_mul_scaled_fp4_experts_quant.default(
         output.view(l * m, k // 2),
         output_scales.view(l * padded_m, padded_k_int32),
         input_tensor.view(l * m, k),
         input_global_scale,
-        input_offsets,
-        output_offsets,
+        mask,
+        use_silu_and_mul=False,
     )
     # The physical layout of the output is (l, m, k // 2), but we want to return a
     # logical layout (m, k // 2, l) required by the flashinfer masked group gemm.
@@ -400,23 +408,14 @@ def silu_and_mul_scaled_fp4_grouped_quant(
     output_scales = torch.empty(
         l, padded_m, padded_k_int32, device=device, dtype=torch.int32
     )
-    input_offsets = torch.arange(0, (l + 1) * m, step=m, dtype=torch.int, device=device)
-    output_offsets = torch.arange(
-        0,
-        (l + 1) * padded_m,
-        step=padded_m,
-        dtype=torch.int,
-        device=device,
-    )
 
     torch.ops.sgl_kernel.silu_and_mul_scaled_fp4_experts_quant.default(
         output.view(l * m, k // 2),
         output_scales.view(l * padded_m, padded_k_int32),
         input_tensor.view(l * m, k_by_2),
         input_global_scale,
-        input_offsets,
-        output_offsets,
         mask,
+        use_silu_and_mul=True,
     )
     # The physical layout of the output is (l, m, k // 2), but we want to return a
     # logical layout (m, k // 2, l) required by the flashinfer masked group gemm.

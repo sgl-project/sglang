@@ -102,6 +102,19 @@ BASIC_TESTS = [
         ],
         op_sequence=[
             Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                expected_error="already loaded",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data(
                     [
@@ -223,6 +236,19 @@ BASIC_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                expected_error="already loaded",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -824,6 +850,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
             disable_cuda_graph=self.disable_cuda_graph,
             cuda_graph_max_bs=self.cuda_graph_max_bs,
             enable_lora=self.enable_lora,
+            disable_radix_cache=True,
         )
         self.handle.__enter__()
         return self
@@ -958,6 +985,7 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             "1",
             "--mem-fraction-static",
             str(MEM_FRACTION_STATIC),
+            "--disable-radix-cache",
         ]
         if self.enable_lora:
             other_args.append("--enable-lora")
