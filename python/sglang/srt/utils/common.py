@@ -2103,12 +2103,71 @@ class MultiprocessingSerializer:
             data = pybase64.b64decode(data, validate=True)
 
         class SafeUnpickler(pickle.Unpickler):
+            ALLOWED_MODULE_PREFIXES = {
+                # --- Python types ---
+                "builtins.",
+                "collections.",
+                "copyreg.",
+                "functools.",
+                "itertools.",
+                "operator.",
+                "types.",
+                "weakref.",
+                # --- PyTorch types ---
+                "torch.",
+                "torch._tensor.",
+                "torch.storage.",
+                "torch.nn.parameter.",
+                "torch.autograd.function.",
+                # --- torch distributed ---
+                "torch.distributed.",
+                "torch.distributed._shard.",
+                "torch.distributed._composable.",
+                "torch._C._distributed_c10d.",
+                "torch._C._distributed_fsdp.",
+                "torch.distributed.optim.",
+                # --- multiprocessing ---
+                "multiprocessing.resource_sharer.",
+                "multiprocessing.reduction.",
+                "pickletools.",
+                # --- PEFT / LoRA ---
+                "peft.",
+                "transformers.",
+                "huggingface_hub.",
+                # --- SGLang & Unitest ---
+                "sglang.srt.weight_sync.tensor_bucket.",
+                "sglang.srt.model_executor.model_runner.",
+                "sglang.srt.layers.",
+                "sglang.srt.utils.",
+            }
+
+            DENY_CLASSES = {
+                ("builtins", "eval"),
+                ("builtins", "exec"),
+                ("builtins", "compile"),
+                ("os", "system"),
+                ("subprocess", "Popen"),
+                ("subprocess", "run"),
+                ("codecs", "decode"),
+                ("types", "CodeType"),
+                ("types", "FunctionType"),
+            }
+
             def find_class(self, module, name):
+                # Block deterministic attacks
+                if (module, name) in self.DENY_CLASSES:
+                    raise RuntimeError(
+                        f"Blocked unsafe class loading ({module}.{name}), "
+                        f"to prevent exploitation of CVE-2025-10164"
+                    )
                 # Allowlist of safe-to-load modules.
-                if module.startswith(("torch", "collections")):
+                if any(
+                    (module + ".").startswith(prefix)
+                    for prefix in self.ALLOWED_MODULE_PREFIXES
+                ):
                     return super().find_class(module, name)
 
-                # Block everything else.
+                # Block everything else. (Potential attack surface)
                 raise RuntimeError(
                     f"Blocked unsafe class loading ({module}.{name}), "
                     f"to prevent exploitation of CVE-2025-10164"
