@@ -149,7 +149,11 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
 
     Ok(ChatCompletionRequest {
         messages,
-        model: req.model.clone().unwrap_or_else(|| "default".to_string()),
+        model: if req.model.is_empty() {
+            "default".to_string()
+        } else {
+            req.model.clone()
+        },
         temperature: req.temperature,
         max_completion_tokens: req.max_output_tokens,
         stream: is_streaming,
@@ -187,7 +191,7 @@ fn extract_text_from_content(content: &[ResponseContentPart]) -> String {
 /// Convert a ChatCompletionResponse to ResponsesResponse
 ///
 /// # Conversion Logic
-/// - `id` → `id` (pass through)
+/// - `id` → `response_id_override` if provided, otherwise `chat_resp.id`
 /// - `model` → `model` (pass through)
 /// - `choices[0].message` → `output` array (convert to ResponseOutputItem::Message)
 /// - `choices[0].finish_reason` → determines `status` (stop/length → Completed)
@@ -195,6 +199,7 @@ fn extract_text_from_content(content: &[ResponseContentPart]) -> String {
 pub fn chat_to_responses(
     chat_resp: &ChatCompletionResponse,
     original_req: &ResponsesRequest,
+    response_id_override: Option<String>,
 ) -> Result<ResponsesResponse, String> {
     // Extract the first choice (responses API doesn't support n>1)
     let choice = chat_resp
@@ -275,7 +280,7 @@ pub fn chat_to_responses(
 
     // Generate response
     Ok(ResponsesResponse {
-        id: chat_resp.id.clone(),
+        id: response_id_override.unwrap_or_else(|| chat_resp.id.clone()),
         object: "response".to_string(),
         created_at: chat_resp.created as i64,
         status,
@@ -310,7 +315,7 @@ mod tests {
         let req = ResponsesRequest {
             input: ResponseInput::Text("Hello, world!".to_string()),
             instructions: Some("You are a helpful assistant.".to_string()),
-            model: Some("gpt-4".to_string()),
+            model: "gpt-4".to_string(),
             temperature: Some(0.7),
             ..Default::default()
         };

@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use super::{
@@ -324,10 +324,11 @@ async fn route_responses_background(
         incomplete_details: None,
         instructions: request.instructions.clone(),
         max_output_tokens: request.max_output_tokens,
-        model: request
-            .model
-            .clone()
-            .unwrap_or_else(|| "default".to_string()),
+        model: if request.model.is_empty() {
+            "default".to_string()
+        } else {
+            request.model.clone()
+        },
         output: Vec::new(),
         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
         previous_response_id: request.previous_response_id.clone(),
@@ -622,10 +623,11 @@ async fn process_and_transform_sse_stream(
 
     // Create event emitter for OpenAI-compatible streaming
     let response_id = format!("resp_{}", Uuid::new_v4());
-    let model = original_request
-        .model
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
+    let model = if original_request.model.is_empty() {
+        "default".to_string()
+    } else {
+        original_request.model.clone()
+    };
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
 
@@ -935,14 +937,14 @@ async fn execute_without_mcp(
             headers,
             model_id,
             components,
-            response_id,
+            response_id.clone(),
             background_tasks,
         )
         .await
         .map_err(|e| format!("Pipeline execution failed: {}", e))?;
 
     // Convert ChatCompletionResponse → ResponsesResponse
-    conversions::chat_to_responses(&chat_response, original_request)
+    conversions::chat_to_responses(&chat_response, original_request, response_id)
         .map_err(|e| format!("Failed to convert to responses format: {}", e))
 }
 
@@ -1207,13 +1209,20 @@ pub async fn cancel_response_impl(
                         )
                             .into_response()
                     } else {
-                        // Task handle not found (may have already completed)
+                        // Task handle not found but status is queued/in_progress
+                        // This can happen if: (1) task crashed, or (2) storage persistence failed
+                        error!(
+                            "Response {} has status '{}' but task handle is missing. Task may have crashed or storage update failed.",
+                            response_id, current_status
+                        );
                         (
-                            StatusCode::OK,
+                            StatusCode::INTERNAL_SERVER_ERROR,
                             axum::Json(json!({
-                                "id": response_id,
-                                "status": "completed_or_not_found",
-                                "message": "Task may have already completed before cancellation"
+                                "error": {
+                                    "message": "Internal error: background task completed but failed to update status in storage",
+                                    "type": "internal_error",
+                                    "code": "status_update_failed"
+                                }
                             })),
                         )
                             .into_response()

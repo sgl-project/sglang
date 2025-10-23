@@ -365,9 +365,12 @@ pub(super) async fn execute_tool_loop(
                 );
 
                 // Convert chat response to responses format and mark as incomplete
-                let mut responses_response =
-                    conversions::chat_to_responses(&chat_response, original_request)
-                        .map_err(|e| format!("Failed to convert to responses format: {}", e))?;
+                let mut responses_response = conversions::chat_to_responses(
+                    &chat_response,
+                    original_request,
+                    response_id.clone(),
+                )
+                .map_err(|e| format!("Failed to convert to responses format: {}", e))?;
 
                 // Mark as completed but with incomplete details
                 responses_response.status = ResponseStatus::Completed;
@@ -461,9 +464,12 @@ pub(super) async fn execute_tool_loop(
             );
 
             // Convert final chat response to responses format
-            let mut responses_response =
-                conversions::chat_to_responses(&chat_response, original_request)
-                    .map_err(|e| format!("Failed to convert to responses format: {}", e))?;
+            let mut responses_response = conversions::chat_to_responses(
+                &chat_response,
+                original_request,
+                response_id.clone(),
+            )
+            .map_err(|e| format!("Failed to convert to responses format: {}", e))?;
 
             // Inject MCP metadata into output
             if state.total_calls > 0 {
@@ -602,10 +608,11 @@ async fn execute_tool_loop_streaming_internal(
 
     // Create response event emitter
     let response_id = format!("resp_{}", Uuid::new_v4());
-    let model = current_request
-        .model
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
+    let model = if current_request.model.is_empty() {
+        "default".to_string()
+    } else {
+        current_request.model.clone()
+    };
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

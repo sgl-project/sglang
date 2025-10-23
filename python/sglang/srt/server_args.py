@@ -83,6 +83,7 @@ QUANTIZATION_CHOICES = [
     "bitsandbytes",
     "gguf",
     "modelopt",
+    "modelopt_fp8",
     "modelopt_fp4",
     "petit_nvfp4",
     "w8a8_int8",
@@ -192,6 +193,8 @@ class ServerArgs:
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
     modelopt_checkpoint_save_path: Optional[str] = None
+    modelopt_export_path: Optional[str] = None
+    quantize_and_serve: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -430,6 +433,7 @@ class ServerArgs:
     enable_symm_mem: bool = False
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
     enable_tokenizer_batch_encode: bool = False
+    disable_tokenizer_batch_decode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
@@ -596,6 +600,9 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+        # Handle elastic expert parallelism.
+        self._handle_elastic_ep()
 
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
@@ -1223,6 +1230,15 @@ class ServerArgs:
         if self.enable_eplb:
             assert self.ep_size > 1
 
+    def _handle_elastic_ep(self):
+        if self.elastic_ep_backend is not None:
+            if self.enable_eplb:
+                if self.eplb_algorithm == "auto":
+                    self.eplb_algorithm = "elasticity_aware"
+                assert (
+                    self.eplb_algorithm == "elasticity_aware"
+                ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
+
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
@@ -1743,6 +1759,22 @@ class ServerArgs:
             default=ServerArgs.modelopt_checkpoint_save_path,
             help="Path to save the ModelOpt quantized checkpoint after quantization. "
             "This allows reusing the quantized model in future runs.",
+        )
+        parser.add_argument(
+            "--modelopt-export-path",
+            type=str,
+            default=ServerArgs.modelopt_export_path,
+            help="Path to export the quantized model in HuggingFace format after ModelOpt quantization. "
+            "The exported model can then be used directly with SGLang for inference. "
+            "If not provided, the model will not be exported.",
+        )
+        parser.add_argument(
+            "--quantize-and-serve",
+            action="store_true",
+            default=ServerArgs.quantize_and_serve,
+            help="Quantize the model with ModelOpt and immediately serve it without exporting. "
+            "This is useful for development and prototyping. For production, it's recommended "
+            "to use separate quantization and deployment steps.",
         )
         parser.add_argument(
             "--kv-cache-dtype",
@@ -2867,6 +2899,11 @@ class ServerArgs:
             "--enable-tokenizer-batch-encode",
             action="store_true",
             help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
+        )
+        parser.add_argument(
+            "--disable-tokenizer-batch-decode",
+            action="store_true",
+            help="Disable batch decoding when decoding multiple completions.",
         )
         parser.add_argument(
             "--disable-outlines-disk-cache",

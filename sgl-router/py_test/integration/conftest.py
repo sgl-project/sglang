@@ -2,7 +2,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pytest
 import requests
@@ -84,7 +84,7 @@ def mock_workers():
 
     procs: List[subprocess.Popen] = []
 
-    def _start(n: int, args: List[str] | None = None):
+    def _start(n: int, args: Optional[List[str]] = None):
         args = args or []
         new_procs: List[subprocess.Popen] = []
         urls: List[str] = []
