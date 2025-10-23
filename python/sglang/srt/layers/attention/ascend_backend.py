@@ -140,7 +140,7 @@ class AscendAttnBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.graph_metadata = {
             "block_tables": torch.empty(
-                (max_bs, self.max_context_len // self.page_size),
+                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
                 dtype=torch.int32,
                 device=self.device,
             ),
@@ -183,6 +183,8 @@ class AscendAttnBackend(AttentionBackend):
     ):
         metadata = self.graph_metadata[bs]
         max_len = seq_lens_cpu[:bs].max().item()
+        if forward_mode.is_target_verify():
+            max_len += self.speculative_num_draft_tokens
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
         metadata.block_tables[:bs, :max_seq_pages].copy_(
