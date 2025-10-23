@@ -14,7 +14,6 @@ Run with:
 
 import json
 
-# CHANGE: Import router launcher instead of server launcher
 import sys
 import unittest
 from pathlib import Path

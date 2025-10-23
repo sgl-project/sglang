@@ -10,7 +10,6 @@ import json
 import sys
 import unittest
 
-# CHANGE: Import router launcher instead of server launcher
 from pathlib import Path
 
 import requests

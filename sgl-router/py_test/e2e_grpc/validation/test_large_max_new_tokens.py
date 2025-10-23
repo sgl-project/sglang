@@ -4,7 +4,6 @@ python3 -m unittest openai_server.validation.test_large_max_new_tokens.TestLarge
 
 import os
 
-# CHANGE: Import router launcher instead of server launcher
 import sys
 import time
 import unittest
