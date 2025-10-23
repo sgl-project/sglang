@@ -1,10 +1,8 @@
 import triton
 import triton.language as tl
 
-# Keep this in sync with the Triton kernel inside `create_flashmla_kv_indices_triton`.
-# Number of pages that the kernel writes per iteration.
-# Exposed here so other Python modules can import it instead of hard-coding 64.
-TRITON_PAD_NUM_PAGE_PER_BLOCK = 64
+_FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
+FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
 
 
 @triton.jit
@@ -46,6 +44,11 @@ def create_flashinfer_kv_indices_triton(
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
 
 
+def get_num_page_per_block_flashmla(page_size: int = 64) -> int:
+    num_page_per_block = _FLASHMLA_CREATE_KV_BLOCK_SIZE // page_size
+    return num_page_per_block
+
+
 @triton.jit
 def create_flashmla_kv_indices_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
@@ -55,10 +58,11 @@ def create_flashmla_kv_indices_triton(
     kv_indices_ptr,
     req_to_token_ptr_stride: tl.constexpr,
     kv_indices_ptr_stride: tl.constexpr,
-    NUM_PAGE_PER_BLOCK: tl.constexpr = TRITON_PAD_NUM_PAGE_PER_BLOCK,
     PAGED_SIZE: tl.constexpr = 64,
 ):
-    BLOCK_SIZE: tl.constexpr = 4096
+    NUM_PAGE_PER_BLOCK: tl.constexpr = (
+        FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON // PAGED_SIZE
+    )
     pid = tl.program_id(axis=0)
 
     # find the req pool idx, this is for batch to token
@@ -73,7 +77,7 @@ def create_flashmla_kv_indices_triton(
     kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
 
     num_paged = tl.cdiv(kv_end - kv_start, PAGED_SIZE)
-    num_pages_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
+    num_pages_loop = tl.cdiv(kv_end - kv_start, FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON)
 
     for i in range(num_pages_loop):
         # index into req_to_token_ptr needs to be int64
