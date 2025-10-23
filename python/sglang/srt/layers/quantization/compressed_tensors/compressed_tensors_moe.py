@@ -167,6 +167,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             and (is_sm100_supported() or is_sm90_supported())
         )
 
+        self.block_quant = False
         if self.weight_quant.strategy == QuantizationStrategy.BLOCK:
             if self.weight_quant.block_structure is None:
                 raise RuntimeError(
@@ -587,7 +588,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 w2_scale=layer.w2_weight_scale,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
-                block_shape=self.weight_block_size,
+                block_shape=self.weight_block_size if self.block_quant else None,
             )
             return self.runner.run(dispatch_output, quant_info)
 
