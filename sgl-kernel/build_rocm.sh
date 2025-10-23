@@ -118,6 +118,7 @@ docker pull "${IMAGE}"
 
 docker run --rm \
    -v $(pwd):/sgl-kernel \
+   -e AMDGPU_TARGET="${AMDGPU_TARGET}" \
    ${IMAGE} \
    bash -c "
    # Install CMake (version >= 3.26) - Robust Installation
