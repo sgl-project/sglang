@@ -2770,10 +2770,6 @@ class DeepseekV2Model(nn.Module):
         self.pp_group = get_pp_group()
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-        self.allow_attn_input_tp_scattered = support_attn_input_tp_scattered(
-            q_lora_rank,
-            is_deepseek_nsa(config),
-        )
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -2868,12 +2864,6 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        forward_batch.attn_input_tp_scattered = (
-            hasattr(self, "allow_attn_input_tp_scattered")
-            and self.allow_attn_input_tp_scattered
-            and use_attn_input_tp_scattered(forward_batch)
-        )
-
         total_num_layers = self.end_layer - self.start_layer
         device = input_embeds.device if input_embeds is not None else input_ids.device
         zero_allocator = BumpAllocator(
@@ -3012,6 +3002,19 @@ class DeepseekV2ForCausalLM(nn.Module):
                 for layer_id, layer in enumerate(self.model.layers)
                 if isinstance(layer.mlp, DeepseekV2MoE)
             }
+        )
+
+        q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
+        self.allow_attn_input_tp_scattered = support_attn_input_tp_scattered(
+            q_lora_rank,
+            is_deepseek_nsa(config),
+        )
+
+    def attn_input_tp_scattered(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            hasattr(self, "allow_attn_input_tp_scattered")
+            and self.allow_attn_input_tp_scattered
+            and use_attn_input_tp_scattered(forward_batch)
         )
 
     @property
