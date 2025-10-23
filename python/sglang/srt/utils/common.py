@@ -2275,6 +2275,11 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
 
     app = FastAPI()
 
+    @app.get("/ping")
+    async def ping():
+        """Could be used by the checkpoint-engine update script to confirm the server is up."""
+        return Response(status_code=200)
+
     @app.get("/health")
     async def health():
         """Check the health of the http server."""
