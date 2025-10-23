@@ -1590,18 +1590,24 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.w_kc.to(torch.bfloat16) * self.w_scale,
                 )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
-            # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
-            q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                q_nope.transpose(0, 1),
-                (
-                    torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
-                    if _is_cublas_ge_129
-                    else zero_allocator.allocate(1)
-                ),
-            )
-            q_nope_out = bmm_fp8(
-                q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-            )
+            if _is_cpu:
+                q_nope_out = torch.bmm(
+                    q_nope.to(torch.bfloat16).transpose(0, 1),
+                    self.w_kc.to(torch.bfloat16) * self.w_scale,
+                )
+            else:
+                # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
+                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+                    q_nope.transpose(0, 1),
+                    (
+                        torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
+                        if _is_cublas_ge_129
+                        else zero_allocator.allocate(1)
+                    ),
+                )
+                q_nope_out = bmm_fp8(
+                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
+                )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
@@ -1739,22 +1745,31 @@ class DeepseekV2AttentionMLA(nn.Module):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
-            attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
-                attn_output.transpose(0, 1),
-                (
-                    torch.zeros((1,), dtype=torch.float32, device=attn_output.device)
-                    if _is_cublas_ge_129
-                    else zero_allocator.allocate(1)
-                ),
-            )
-            attn_bmm_output = bmm_fp8(
-                attn_output_val,
-                self.w_vc,
-                attn_output_scale,
-                self.w_scale,
-                torch.bfloat16,
-            )
-            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+            if _is_cpu:
+                attn_bmm_output = torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    self.w_vc.to(torch.bfloat16) * self.w_scale,
+                )
+                attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+            else:
+                attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
+                    attn_output.transpose(0, 1),
+                    (
+                        torch.zeros(
+                            (1,), dtype=torch.float32, device=attn_output.device
+                        )
+                        if _is_cublas_ge_129
+                        else zero_allocator.allocate(1)
+                    ),
+                )
+                attn_bmm_output = bmm_fp8(
+                    attn_output_val,
+                    self.w_vc,
+                    attn_output_scale,
+                    self.w_scale,
+                    torch.bfloat16,
+                )
+                attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
             attn_bmm_output = torch.empty(
                 (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
