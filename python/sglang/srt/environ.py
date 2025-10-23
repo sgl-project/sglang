@@ -142,6 +142,7 @@ class Envs:
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
 
     # Constrained Decoding
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
@@ -157,6 +158,7 @@ class Envs:
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -220,6 +222,24 @@ class Envs:
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
+
+    # Overlap Spec V2
+    SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+
+    # VLM
+    SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
+    SGLANG_RESIZE_RESAMPLE = EnvStr("")
+
+    # Ktransformers
+    SGLANG_KT_MOE_NUM_GPU_EXPERTS = EnvInt(None)
+    SGLANG_KT_MOE_CPUINFER = EnvInt(None)
+    SGLANG_KT_THREADPOOL_COUNT = EnvInt(None)
+    SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
+    SGLANG_KT_AMX_METHOD = EnvStr(None)
+    SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
+
+    # Sparse Embeddings
+    SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
     # fmt: on
 
