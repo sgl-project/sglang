@@ -420,10 +420,16 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         # TODO: make a wrapper, and XPU will implement this kernel later.
         self.cos_sin_cache = self.cos_sin_cache.to(query.device)
-        return self.forward_native(positions, query, key, offsets)
+        return self.forward_native(
+            positions, query, key, offsets, fused_set_kv_buffer_arg
+        )
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
