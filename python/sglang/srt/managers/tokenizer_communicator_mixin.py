@@ -313,9 +313,7 @@ class TokenizerCommunicatorMixin:
         env_record_shapes: bool = get_bool_env_var(
             "SGLANG_PROFILE_RECORD_SHAPES", "true"
         )
-        record_shapes = (
-            False if record_shapes is False or env_record_shapes is False else True
-        )
+        record_shapes = (record_shapes is not False) and env_record_shapes
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
