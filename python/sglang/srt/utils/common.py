@@ -1623,13 +1623,18 @@ def get_cpu_memory_capacity():
         for numa_id in range(n_numa_node):
             file_meminfo = f"node{numa_id}/meminfo"
             with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # 1st line contains 'MemTotal'
-                line = f.read().split("\n")[0]
-                numa_mem_list.append(int(line.split()[3]))
+                # MemTotal info is at the 1st line
+                line = f.readline()
+                # Expected format: "Node 0 MemTotal:       100000000 kB"
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] == "MemTotal:":
+                    numa_mem_list.append(int(parts[3]))
+                else:
+                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
         # Retrieved value in KB, need MB
         numa_mem = float(min(numa_mem_list) // 1024)
         return numa_mem
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError, IndexError):
         numa_mem = psutil.virtual_memory().total / n_numa_node
         # Retrieved value in Byte, need MB
         return float(numa_mem // (1 << 20))
@@ -2270,6 +2275,11 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
 
     app = FastAPI()
 
+    @app.get("/ping")
+    async def ping():
+        """Could be used by the checkpoint-engine update script to confirm the server is up."""
+        return Response(status_code=200)
+
     @app.get("/health")
     async def health():
         """Check the health of the http server."""
@@ -2420,18 +2430,15 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
-    if is_remote_url(model_path):
-        try:
-            from huggingface_hub import HfApi
+    if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
+        return True
+    try:
+        from huggingface_hub import HfApi
 
-            hf_api = HfApi()
-            return hf_api.file_exists(model_path, "hf_quant_config.json")
-        except Exception:
-            return False
-    else:
-        import os
-
-        return os.path.exists(os.path.join(model_path, "hf_quant_config.json"))
+        hf_api = HfApi()
+        return hf_api.file_exists(model_path, "hf_quant_config.json")
+    except Exception:
+        return False
 
 
 def flatten_nested_list(nested_list):

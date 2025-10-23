@@ -9,18 +9,11 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
-import os
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
-
-if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
-    import logging
-
-    torch._logging.set_logs(dynamo=logging.ERROR)
-    torch._dynamo.config.suppress_errors = True
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -44,6 +37,12 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
+    import logging
+
+    torch._logging.set_logs(dynamo=logging.ERROR)
+    torch._dynamo.config.suppress_errors = True
 
 if is_flashinfer_available():
     from flashinfer import (
