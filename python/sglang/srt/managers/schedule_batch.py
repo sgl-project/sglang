@@ -1779,6 +1779,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Only contain fields that will be used by process_batch_result
         return ScheduleBatch(
             reqs=self.reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,

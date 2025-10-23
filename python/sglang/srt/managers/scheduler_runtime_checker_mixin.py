@@ -4,6 +4,7 @@ import time
 from typing import TYPE_CHECKING
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -64,6 +65,74 @@ class SchedulerRuntimeCheckerMixin:
         )
         token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
         return memory_leak, token_msg
+
+    def _check_non_idle(self: Scheduler):
+        current_batch: ScheduleBatch = self.last_batch
+
+        if current_batch is None:
+            return
+
+        _, _, available_size, evictable_size = self._get_token_info()
+        protected_size = self.tree_cache.protected_size()
+
+        print(f"[Mem Check] {self.forward_ct=}")
+
+        print(
+            f"[Mem Check] {available_size=}, {evictable_size=}, sum={available_size + evictable_size}\n"
+            f"[Mem Check] {protected_size=}, {self.max_total_num_tokens=}",
+        )
+
+        extend_size = 0
+        for i, req in enumerate(current_batch.reqs):
+            seq_len = len(req.origin_input_ids) + len(req.output_ids)
+            fill_len = len(req.fill_ids) if req.fill_ids is not None else 0
+            prefix_len = (
+                len(req.prefix_indices) if req.prefix_indices is not None else 0
+            )
+
+            if current_batch.forward_mode.is_decode():
+                if req.finished():
+                    unreleased_len = 1
+                else:
+                    unreleased_len = seq_len - prefix_len
+            else:
+                unreleased_len = fill_len - prefix_len
+
+            print(
+                f"[Req] {i=}, {seq_len=}, {fill_len=}, {prefix_len=}, {req.finished()=}, {unreleased_len=}"
+            )
+            extend_size += unreleased_len
+
+        if (
+            current_batch.forward_mode.is_extend()
+            and self.running_batch is not None
+            and not self.running_batch.is_empty()
+            and self.running_batch.forward_mode.is_decode()
+        ):
+            for i, req in enumerate(self.running_batch.reqs):
+                seq_len = len(req.origin_input_ids) + len(req.output_ids)
+                prefix_len = (
+                    len(req.prefix_indices) if req.prefix_indices is not None else 0
+                )
+
+                if req.finished():
+                    unreleased_len = 0
+                else:
+                    unreleased_len = seq_len - prefix_len - 1
+
+                print(
+                    f"[Running Req] {i=}, {seq_len=}, {prefix_len=}, {unreleased_len=}"
+                )
+                extend_size += unreleased_len
+
+        print(
+            f"[Mem Check] extend_size={extend_size}\n",
+        )
+
+        total_tokens = available_size + evictable_size + protected_size + extend_size
+
+        print(f"\x1b[31m[Mem Check] total_tokens={total_tokens}\x1b[0m")
+        assert total_tokens == self.max_total_num_tokens, "Memory leak detected!"
 
     def _check_req_pool(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
