@@ -200,7 +200,6 @@ _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
 _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
-
 logger = logging.getLogger(__name__)
 
 
