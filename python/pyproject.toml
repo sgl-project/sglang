@@ -74,12 +74,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-tracing = [
-  "opentelemetry-api",
-  "opentelemetry-exporter-otlp",
-  "opentelemetry-exporter-otlp-proto-grpc",
-  "opentelemetry-sdk",
-]
 test = [
   "accelerate",
   "expecttest",
