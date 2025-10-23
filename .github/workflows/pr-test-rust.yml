@@ -198,13 +198,13 @@ jobs:
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
-          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} XAI_API_KEY=${{ secrets.XAI_API_KEY }} pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=WARNING
+          pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=WARN
 
       - name: Run Python E2E gRPC tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
-          SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=WARNING
+          SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=WARN
 
 
 
