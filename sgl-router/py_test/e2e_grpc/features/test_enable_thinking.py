@@ -124,7 +124,6 @@ class TestEnableThinking(CustomTestCase):
         has_reasoning = False
         has_content = False
 
-        print("\n=== Stream With Reasoning ===")
         for line in response.iter_lines():
             if line:
                 line = line.decode("utf-8")
@@ -169,7 +168,6 @@ class TestEnableThinking(CustomTestCase):
         has_reasoning = False
         has_content = False
 
-        print("\n=== Stream Without Reasoning ===")
         for line in response.iter_lines():
             if line:
                 line = line.decode("utf-8")

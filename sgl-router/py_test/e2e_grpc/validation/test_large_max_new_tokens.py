@@ -103,7 +103,6 @@ class TestLargeMaxNewTokens(CustomTestCase):
                 self.stderr.flush()
                 lines = open(STDERR_FILENAME).readlines()
                 for line in lines[pt:]:
-                    print(line, end="", flush=True)
                     if f"#running-req: {num_requests}" in line:
                         all_requests_running = True
                         pt = -1

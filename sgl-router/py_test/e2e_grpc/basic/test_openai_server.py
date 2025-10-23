@@ -223,7 +223,6 @@ class TestOpenAIServer(CustomTestCase):
         try:
             js_obj = json.loads(text)
         except (TypeError, json.decoder.JSONDecodeError):
-            print("JSONDecodeError", text)
             raise
         assert isinstance(js_obj["name"], str)
         assert isinstance(js_obj["population"], int)
