@@ -488,6 +488,8 @@ def popen_launch_workers_and_router(
         policy,
         "--model-path",
         model,
+        "--log-level",
+        "warn",
     ]
 
     # Add worker URLs
