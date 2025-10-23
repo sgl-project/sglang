@@ -203,7 +203,7 @@ class SchedulerPPMixin:
         if mbs[next_mb_id] is not None:
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
-        self._pp_commit_comm_work(work=send_output_work)
+        # self._pp_commit_comm_work(work=send_output_work)
         if mbs[next_mb_id] is not None:
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.default_stream)
@@ -213,7 +213,7 @@ class SchedulerPPMixin:
                 d2h_event = torch.cuda.Event()
                 d2h_event.record(torch.cuda.current_stream())
 
-        return next_pp_outputs, batch_result, d2h_event
+        return next_pp_outputs, batch_result, d2h_event, send_output_work
 
     def _pp_launch_batch(
         self: Scheduler,
@@ -280,6 +280,7 @@ class SchedulerPPMixin:
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = deque()
         send_req_work = []
         send_proxy_work = []
+        send_output_work = []
         event = None
         while True:
             server_is_idle = True
@@ -290,7 +291,7 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.recv_requests()
-                    self._pp_commit_comm_work(send_req_work)
+                    # self._pp_commit_comm_work(send_req_work)
                     self.process_input_requests(recv_reqs)
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     mbs[mb_id] = self.get_next_batch_to_run()
@@ -299,12 +300,13 @@ class SchedulerPPMixin:
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                self._pp_commit_comm_work(send_proxy_work)
+                # self._pp_commit_comm_work(send_proxy_work)
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
                 if self.server_args.pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
+                    self._pp_commit_comm_work(work=send_output_work)
+                    next_pp_outputs, next_batch_result, d2h_event, send_output_work = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
@@ -320,7 +322,8 @@ class SchedulerPPMixin:
                         mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
                     )
                 if self.server_args.pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
+                    self._pp_commit_comm_work(work=send_output_work)
+                    next_pp_outputs, next_batch_result, d2h_event, send_output_work = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
@@ -339,6 +342,7 @@ class SchedulerPPMixin:
                         )
                     last_mbs[next_mb_id] = mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         send_req_work = self._pp_send_pyobj_to_next_stage(
                             recv_reqs,
@@ -346,6 +350,7 @@ class SchedulerPPMixin:
                         )
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(event)
+                        self._pp_commit_comm_work(send_proxy_work)
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
                         ):
