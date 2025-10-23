@@ -75,8 +75,6 @@ class SchedulerRuntimeCheckerMixin:
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
 
-        print(f"[Mem Check] {self.forward_ct=}")
-
         print(
             f"[Mem Check] {available_size=}, {evictable_size=}, sum={available_size + evictable_size}\n"
             f"[Mem Check] {protected_size=}, {self.max_total_num_tokens=}",

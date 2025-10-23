@@ -77,7 +77,7 @@ class SchedulerOutputProcessorMixin:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if self.enable_overlap and req.is_retracted:
+                if self.enable_overlap and req.is_retracted and len(req.output_ids) > 0:
                     req_idx = batch.req_pool_indices[i]
                     seq_len = len(req.origin_input_ids) + len(req.output_ids)
                     pos = batch.req_to_token_pool.req_to_token[req_idx][
