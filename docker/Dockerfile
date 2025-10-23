@@ -1,14 +1,15 @@
 ARG CUDA_VERSION=12.9.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
-ARG TARGETARCH
 
-ARG GRACE_BLACKWELL=0
+ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
+ARG GRACE_BLACKWELL=0
+
+ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
-ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
-ARG CMAKE_BUILD_PARALLEL_LEVEL=2
+
 ARG SGL_KERNEL_VERSION=0.3.16.post3
 ARG GDRCOPY_VERSION=2.5.1
 ARG NVSHMEM_VERSION=3.4.5
@@ -114,7 +115,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 # Download NVSHMEM source files
-# We use Tom's DeepEP fork for GB200 for now
+# We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
 RUN set -eux; \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
       wget "https://github.com/NVIDIA/nvshmem/releases/download/v${NVSHMEM_VERSION}-0/nvshmem_src_cuda-all-all-${NVSHMEM_VERSION}.tar.gz"; \
@@ -126,7 +127,7 @@ RUN set -eux; \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git && \
       cd DeepEP && \
-      git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 && \
+      git checkout gb200_blog_part_2 && \
       sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
       cd .. ; \
     else \

@@ -102,6 +102,7 @@ class DeepEPMoE(FusedMoE):
         else:
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
+            self.use_w4afp8 = False
 
         self.deepep_mode = get_deepep_mode()
 

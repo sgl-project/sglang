@@ -91,7 +91,6 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
-<<<<<<< HEAD
 tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
@@ -103,12 +102,6 @@ cu120 = [
   "torchaudio==2.8.0",
   "torchvision==0.24.0",
 ]
-=======
-all = []
-dev = ["sglang[test]"]
-
-# Temporary tags
->>>>>>> main
 cu130 = [
   "torch==2.9.0",
   "torchaudio==2.9.0",
@@ -124,10 +117,6 @@ cu130_all = [
   "sglang[decord]",
   "sglang[cu130]"
 ]
-
-# To be deprecated in 2 weeks
-blackwell = ["sglang[dev]"]
-blackwell_aarch64 = ["sglang[dev]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
