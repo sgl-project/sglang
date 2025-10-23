@@ -1,3 +1,4 @@
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -38,6 +39,9 @@ class TestRetractDecode(CustomTestCase):
 
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
+        time.sleep(1)  # wait for mem check
+
+        assert self.process.poll() is None, "Server crashed during test"
 
 
 class TestRetractDecodeChunkCache(CustomTestCase):
@@ -64,6 +68,13 @@ class TestRetractDecodeChunkCache(CustomTestCase):
 
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
+        time.sleep(1)  # wait for mem check
+
+        assert self.process.poll() is None, "Server crashed during test"
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
 
 
 if __name__ == "__main__":
