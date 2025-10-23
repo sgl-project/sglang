@@ -179,7 +179,7 @@ def popen_launch_openai_xai_router(
         "--history-backend",
         history_backend,
         "--log-level",
-        "warn"
+        "warn",
     ]
 
     # Note: Not adding --api-key to router command for local testing

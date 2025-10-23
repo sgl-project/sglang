@@ -6,6 +6,7 @@ These tests should work across all backends that support MCP (OpenAI, XAI).
 """
 
 import logging
+
 from base import ResponseAPIBaseTest
 
 
@@ -51,13 +52,15 @@ class MCPTests(ResponseAPIBaseTest):
         output_types = [item.get("type") for item in output]
 
         # Should have mcp_list_tools - tools are listed before calling
-        self.assertIn("mcp_list_tools", output_types,
-                     "Response should contain mcp_list_tools")
+        self.assertIn(
+            "mcp_list_tools", output_types, "Response should contain mcp_list_tools"
+        )
 
         # Should have at least one mcp_call
         mcp_calls = [item for item in output if item.get("type") == "mcp_call"]
-        self.assertGreater(len(mcp_calls), 0,
-                          "Response should contain at least one mcp_call")
+        self.assertGreater(
+            len(mcp_calls), 0, "Response should contain at least one mcp_call"
+        )
 
         # Verify mcp_call structure
         for mcp_call in mcp_calls:
@@ -72,8 +75,9 @@ class MCPTests(ResponseAPIBaseTest):
 
         # Should have final message output
         messages = [item for item in output if item.get("type") == "message"]
-        self.assertGreater(len(messages), 0,
-                          "Response should contain at least one message")
+        self.assertGreater(
+            len(messages), 0, "Response should contain at least one message"
+        )
 
         # Verify message structure
         for msg in messages:
@@ -94,7 +98,7 @@ class MCPTests(ResponseAPIBaseTest):
                 "type": "mcp",
                 "server_label": "deepwiki",
                 "server_url": "https://mcp.deepwiki.com/mcp",
-                "require_approval": "never"
+                "require_approval": "never",
             }
         ]
 
@@ -113,38 +117,73 @@ class MCPTests(ResponseAPIBaseTest):
         event_types = [e.get("event") for e in events]
 
         # Check for lifecycle events
-        self.assertIn("response.created", event_types,
-                     "Should have response.created event")
-        self.assertIn("response.completed", event_types,
-                     "Should have response.completed event")
+        self.assertIn(
+            "response.created", event_types, "Should have response.created event"
+        )
+        self.assertIn(
+            "response.completed", event_types, "Should have response.completed event"
+        )
 
         # Check for MCP list tools events
-        self.assertIn("response.output_item.added", event_types,
-                     "Should have output_item.added events")
-        self.assertIn("response.mcp_list_tools.in_progress", event_types,
-                     "Should have mcp_list_tools.in_progress event")
-        self.assertIn("response.mcp_list_tools.completed", event_types,
-                     "Should have mcp_list_tools.completed event")
+        self.assertIn(
+            "response.output_item.added",
+            event_types,
+            "Should have output_item.added events",
+        )
+        self.assertIn(
+            "response.mcp_list_tools.in_progress",
+            event_types,
+            "Should have mcp_list_tools.in_progress event",
+        )
+        self.assertIn(
+            "response.mcp_list_tools.completed",
+            event_types,
+            "Should have mcp_list_tools.completed event",
+        )
 
         # Check for MCP call events
-        self.assertIn("response.mcp_call.in_progress", event_types,
-                     "Should have mcp_call.in_progress event")
-        self.assertIn("response.mcp_call_arguments.delta", event_types,
-                     "Should have mcp_call_arguments.delta event")
-        self.assertIn("response.mcp_call_arguments.done", event_types,
-                     "Should have mcp_call_arguments.done event")
-        self.assertIn("response.mcp_call.completed", event_types,
-                     "Should have mcp_call.completed event")
+        self.assertIn(
+            "response.mcp_call.in_progress",
+            event_types,
+            "Should have mcp_call.in_progress event",
+        )
+        self.assertIn(
+            "response.mcp_call_arguments.delta",
+            event_types,
+            "Should have mcp_call_arguments.delta event",
+        )
+        self.assertIn(
+            "response.mcp_call_arguments.done",
+            event_types,
+            "Should have mcp_call_arguments.done event",
+        )
+        self.assertIn(
+            "response.mcp_call.completed",
+            event_types,
+            "Should have mcp_call.completed event",
+        )
 
         # Check for text output events
-        self.assertIn("response.content_part.added", event_types,
-                     "Should have content_part.added event")
-        self.assertIn("response.output_text.delta", event_types,
-                     "Should have output_text.delta events")
-        self.assertIn("response.output_text.done", event_types,
-                     "Should have output_text.done event")
-        self.assertIn("response.content_part.done", event_types,
-                     "Should have content_part.done event")
+        self.assertIn(
+            "response.content_part.added",
+            event_types,
+            "Should have content_part.added event",
+        )
+        self.assertIn(
+            "response.output_text.delta",
+            event_types,
+            "Should have output_text.delta events",
+        )
+        self.assertIn(
+            "response.output_text.done",
+            event_types,
+            "Should have output_text.done event",
+        )
+        self.assertIn(
+            "response.content_part.done",
+            event_types,
+            "Should have content_part.done event",
+        )
 
         # Verify final completed event has full response
         completed_events = [e for e in events if e.get("event") == "response.completed"]
@@ -183,7 +222,9 @@ class MCPTests(ResponseAPIBaseTest):
         self.assertGreater(len(text_deltas), 0, "Should have text deltas")
 
         # Get final text from output_text.done event
-        text_done_events = [e for e in events if e.get("event") == "response.output_text.done"]
+        text_done_events = [
+            e for e in events if e.get("event") == "response.output_text.done"
+        ]
         self.assertGreater(len(text_done_events), 0)
 
         final_text = text_done_events[0].get("data", {}).get("text", "")

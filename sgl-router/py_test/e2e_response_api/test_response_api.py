@@ -18,23 +18,28 @@ _E2E_GRPC_DIR = _TEST_DIR.parent / "e2e_grpc"
 sys.path.insert(0, str(_TEST_DIR))
 sys.path.insert(1, str(_E2E_GRPC_DIR))
 
-# Import local modules
-from util import kill_process_tree
-from base import ConversationCRUDBaseTest, ResponseCRUDBaseTest
-from router_fixtures import popen_launch_openai_xai_router
-from mcp import MCPTests
-from state_management import StateManagementTests
-
 # Import from e2e_grpc for gRPC backend tests
 import sys
+
+from base import ConversationCRUDBaseTest, ResponseCRUDBaseTest
+from mcp import MCPTests
+from router_fixtures import popen_launch_openai_xai_router
+from state_management import StateManagementTests
+
+# Import local modules
+from util import kill_process_tree
+
 sys.path.insert(0, str(_E2E_GRPC_DIR))
-from fixtures import popen_launch_workers_and_router 
+from fixtures import popen_launch_workers_and_router
 
 
-
-class TestOpenaiBackend(ResponseCRUDBaseTest, ConversationCRUDBaseTest, StateManagementTests, MCPTests):
+class TestOpenaiBackend(
+    ResponseCRUDBaseTest, ConversationCRUDBaseTest, StateManagementTests, MCPTests
+):
     """End to end tests for OpenAI backend."""
+
     api_key = os.environ.get("OPENAI_API_KEY")
+
     @classmethod
     def setUpClass(cls):
         cls.model = "gpt-5-nano"
@@ -55,7 +60,9 @@ class TestOpenaiBackend(ResponseCRUDBaseTest, ConversationCRUDBaseTest, StateMan
 
 class TestXaiBackend(StateManagementTests):
     """End to end tests for XAI backend."""
+
     api_key = os.environ.get("XAI_API_KEY")
+
     @classmethod
     def setUpClass(cls):
         cls.model = "grok-4-fast"
@@ -73,9 +80,10 @@ class TestXaiBackend(StateManagementTests):
     def tearDownClass(cls):
         kill_process_tree(cls.cluster["router"].pid)
 
+
 class TestGrpcBackend(StateManagementTests, MCPTests):
     """End to end tests for gRPC backend."""
-    
+
     @classmethod
     def setUpClass(cls):
         cls.model = "/home/ubuntu/models/meta-llama/Llama-3.1-8B-Instruct"
@@ -98,7 +106,7 @@ class TestGrpcBackend(StateManagementTests, MCPTests):
         kill_process_tree(cls.cluster["router"].pid)
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
-   
+
     @unittest.skip("TODO: return 501 Not Implemented")
     def test_conversation_with_multiple_turns(self):
         super().test_conversation_with_multiple_turns()
@@ -107,14 +115,16 @@ class TestGrpcBackend(StateManagementTests, MCPTests):
     def test_mutually_exclusive_parameters(self):
         super().test_mutually_exclusive_parameters()
 
-    @unittest.skip("TODO: Pipeline execution failed: Pipeline stage WorkerSelection failed")
+    @unittest.skip(
+        "TODO: Pipeline execution failed: Pipeline stage WorkerSelection failed"
+    )
     def test_mcp_basic_tool_call(self):
         super().test_mcp_basic_tool_call()
-        
+
     @unittest.skip("TODO: no event fields")
     def test_mcp_tool_call_execution(self):
         super().test_mcp_tool_call_execution()
-    
+
 
 if __name__ == "__main__":
     unittest.main()

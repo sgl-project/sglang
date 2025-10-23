@@ -59,6 +59,7 @@ class ResponseAPIBaseTest(CustomTestCase):
         print(f"  URL: {url}")
         if json_data:
             import json as json_module
+
             print(f"  Body: {json_module.dumps(json_data, indent=2)}")
 
         if method == "POST":
@@ -381,7 +382,7 @@ class ResponseCRUDBaseTest(ResponseAPIBaseTest):
         # input_data = input_resp.json()
         # self.assertIn("data", input_data)
         # self.assertGreater(len(input_data["data"]), 0)
-    
+
     @unittest.skip("TODO: Add delete response feature")
     def test_delete_response(self):
         """Test deleting response."""

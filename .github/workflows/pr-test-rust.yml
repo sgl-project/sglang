@@ -209,7 +209,7 @@ jobs:
           cd sgl-router
           pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=WARNING
 
-finish:
+  finish:
     needs: [unit-test-rust, pytest-rust]
     runs-on: ubuntu-latest
     steps:

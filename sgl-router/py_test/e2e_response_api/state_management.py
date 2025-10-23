@@ -6,6 +6,7 @@ These tests should work across all backends (OpenAI, XAI, gRPC).
 """
 
 import unittest
+
 from base import ResponseAPIBaseTest
 
 
@@ -23,8 +24,7 @@ class StateManagementTests(ResponseAPIBaseTest):
 
         # Second response referencing first
         resp2 = self.create_response(
-            "What is my name",
-            previous_response_id=response1_id
+            "What is my name", previous_response_id=response1_id
         )
         self.assertEqual(resp2.status_code, 200)
         response2_data = resp2.json()
@@ -43,7 +43,6 @@ class StateManagementTests(ResponseAPIBaseTest):
         self.assertEqual(resp3.status_code, 200)
         self.assertIn("Bob", output_text)
 
-    
     @unittest.skip("TODO: Add the invalid previous_response_id check")
     def test_previous_response_id_invalid(self):
         """Test using invalid previous_response_id."""
@@ -66,9 +65,7 @@ class StateManagementTests(ResponseAPIBaseTest):
         conversation_id = conv_resp.json()["id"]
 
         # First response in conversation
-        resp1 = self.create_response(
-            "I have 5 apples.", conversation=conversation_id
-        )
+        resp1 = self.create_response("I have 5 apples.", conversation=conversation_id)
         self.assertEqual(resp1.status_code, 200)
 
         # Second response in same conversation
@@ -97,7 +94,6 @@ class StateManagementTests(ResponseAPIBaseTest):
         items = list_resp.json()["data"]
         # Should have at least 6 items (3 inputs + 3 outputs)
         self.assertGreaterEqual(len(items), 6)
-
 
     def test_mutually_exclusive_parameters(self):
         """Test that previous_response_id and conversation are mutually exclusive."""

@@ -46,7 +46,8 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             itself.kill()
         except psutil.NoSuchProcess:
             pass
-        
+
+
 class CustomTestCase(unittest.TestCase):
     """
     Custom test case base class with retry support.
