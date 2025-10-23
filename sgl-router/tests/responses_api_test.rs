@@ -16,9 +16,10 @@ use common::{
 };
 use sglang_router_rs::{
     config::{
-        CircuitBreakerConfig, ConnectionMode, HealthCheckConfig, PolicyConfig, RetryConfig,
-        RouterConfig, RoutingMode,
+        CircuitBreakerConfig, HealthCheckConfig, PolicyConfig, RetryConfig, RouterConfig,
+        RoutingMode,
     },
+    core::ConnectionMode,
     routers::RouterFactory,
 };
 
