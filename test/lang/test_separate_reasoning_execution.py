@@ -64,7 +64,7 @@ class TestSeparateReasoningExecution(CustomTestCase):
         for ev in self.events:
             ev.set()
 
-    @patch("sglang.srt.reasoning_parser.ReasoningParser")
+    @patch("sglang.srt.parser.reasoning_parser.ReasoningParser")
     def test_execute_separate_reasoning(self, mock_parser_class):
         """Test that _execute_separate_reasoning correctly calls the ReasoningParser."""
         # Setup mock parser
@@ -136,7 +136,7 @@ class TestSeparateReasoningExecution(CustomTestCase):
         # Verify that the text was updated
         self.assertEqual(executor.text_, f"[NORMAL from deepseek-r1]: {var_value}")
 
-    @patch("sglang.srt.reasoning_parser.ReasoningParser")
+    @patch("sglang.srt.parser.reasoning_parser.ReasoningParser")
     def test_reasoning_parser_integration(self, mock_parser_class):
         """Test the integration between separate_reasoning and ReasoningParser."""
         # Setup mock parsers for different model types
@@ -167,7 +167,7 @@ class TestSeparateReasoningExecution(CustomTestCase):
         self.assertEqual(reasoning, f"[REASONING from qwen3]: {test_text}")
         self.assertEqual(normal_text, f"[NORMAL from qwen3]: {test_text}")
 
-    @patch("sglang.srt.reasoning_parser.ReasoningParser")
+    @patch("sglang.srt.parser.reasoning_parser.ReasoningParser")
     def test_reasoning_parser_invalid_model(self, mock_parser_class):
         """Test that ReasoningParser raises an error for invalid model types."""
 

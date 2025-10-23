@@ -7,9 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisionConfig
 
-from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -28,6 +28,7 @@ from sglang.srt.models.qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
 )
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +94,8 @@ class Glm4vVisionBlock(Qwen2_5_VisionBlock):
             quant_config=quant_config,
             prefix=prefix,
             num_dummy_heads=config.num_dummy_heads,
+            rms_norm_eps=config.rms_norm_eps,
         )
-        self.norm1 = Glm4vRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm2 = Glm4vRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.mlp = Glm4vVisionMLP(
             config.hidden_size,
@@ -435,7 +435,7 @@ class Glm4vVisionModel(nn.Module):
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         x = self.embeddings(
@@ -497,6 +497,9 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat(

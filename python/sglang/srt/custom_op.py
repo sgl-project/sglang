@@ -1,12 +1,20 @@
 from torch import nn
 
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 
 class CustomOp(nn.Module):
@@ -88,5 +96,7 @@ class CustomOp(nn.Module):
             return self.forward_cpu
         elif _is_npu:
             return self.forward_npu
+        elif _is_xpu:
+            return self.forward_xpu
         else:
             return self.forward_native

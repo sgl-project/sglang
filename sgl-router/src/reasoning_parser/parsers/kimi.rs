@@ -1,8 +1,10 @@
 // Kimi specific reasoning parser.
 // This parser uses Unicode tokens and starts with in_reasoning=false.
 
-use crate::reasoning_parser::parsers::BaseReasoningParser;
-use crate::reasoning_parser::traits::{ParseError, ParserConfig, ParserResult, ReasoningParser};
+use crate::reasoning_parser::{
+    parsers::BaseReasoningParser,
+    traits::{ParseError, ParserConfig, ParserResult, ReasoningParser},
+};
 
 /// Kimi reasoning parser.
 ///
@@ -54,6 +56,10 @@ impl ReasoningParser for KimiParser {
     fn model_type(&self) -> &str {
         self.base.model_type()
     }
+
+    fn is_in_reasoning(&self) -> bool {
+        self.base.is_in_reasoning()
+    }
 }
 
 #[cfg(test)]
@@ -88,7 +94,6 @@ mod tests {
     fn test_kimi_partial_unicode() {
         let mut parser = KimiParser::new();
 
-        // Test partial Unicode token buffering
         let result1 = parser
             .parse_reasoning_streaming_incremental("◁thi")
             .unwrap();

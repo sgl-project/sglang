@@ -36,6 +36,28 @@ def topk_softmax(
     )
 
 
+def moe_sum_reduce(
+    input_tensor,
+    output_tensor,
+    routed_scaling_factor=0,
+):
+    torch.ops.sgl_kernel.moe_sum_reduce.default(
+        input_tensor,
+        output_tensor,
+        routed_scaling_factor,
+    )
+
+
+def moe_sum(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+):
+    torch.ops.sgl_kernel.moe_sum.default(
+        input_tensor,
+        output_tensor,
+    )
+
+
 def moe_fused_gate(
     input_tensor,
     bias,
@@ -68,70 +90,6 @@ def moe_fused_gate(
         num_fused_shared_experts,
         routed_scaling_factor,
         apply_routed_scaling_factor_on_output,
-    )
-
-
-def ep_moe_pre_reorder(
-    input_tensor,
-    gateup_input,
-    src2dst,
-    topk_ids,
-    a1_scales,
-    start_expert_id,
-    end_expert_id,
-    topk,
-    use_per_token_if_dynamic,
-):
-    return torch.ops.sgl_kernel.ep_moe_pre_reorder.default(
-        input_tensor,
-        gateup_input,
-        src2dst,
-        topk_ids,
-        a1_scales,
-        start_expert_id,
-        end_expert_id,
-        topk,
-        use_per_token_if_dynamic,
-    )
-
-
-def ep_moe_silu_and_mul(
-    gateup_output,
-    down_input,
-    reorder_topk_ids,
-    scales,
-    start_expert_id,
-    end_expert_id,
-):
-    return torch.ops.sgl_kernel.ep_moe_silu_and_mul.default(
-        gateup_output,
-        down_input,
-        reorder_topk_ids,
-        scales,
-        start_expert_id,
-        end_expert_id,
-    )
-
-
-def ep_moe_post_reorder(
-    down_output,
-    output,
-    src2dst,
-    topk_ids,
-    topk_weights,
-    start_expert_id,
-    end_expert_id,
-    topk,
-):
-    return torch.ops.sgl_kernel.ep_moe_post_reorder.default(
-        down_output,
-        output,
-        src2dst,
-        topk_ids,
-        topk_weights,
-        start_expert_id,
-        end_expert_id,
-        topk,
     )
 
 

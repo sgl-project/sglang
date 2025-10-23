@@ -55,12 +55,21 @@ class EPLBManager:
         enable_timing = self._rebalance_layers_per_chunk is None
 
         if enable_timing:
-            torch.cuda.synchronize()
+            torch.get_device_module().synchronize()
             time_start = time.time()
 
-        logical_count = get_global_expert_distribution_recorder().dump_record(
+        dump_record_output = get_global_expert_distribution_recorder().dump_record(
             output_mode="object"
-        )["logical_count"]
+        )
+        logical_count = dump_record_output["logical_count"]
+        average_utilization_rate_over_window = dump_record_output[
+            "average_utilization_rate_over_window"
+        ]
+
+        # Check whether rebalancing is needed
+        if not self._check_rebalance_needed(average_utilization_rate_over_window):
+            return
+
         expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
             self._server_args, self._model_runner.model_config, logical_count
         )
@@ -76,10 +85,25 @@ class EPLBManager:
 
         msg = f"[EPLBManager] rebalance end"
         if enable_timing:
-            torch.cuda.synchronize()
+            torch.get_device_module().synchronize()
             time_end = time.time()
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)
+
+    def _check_rebalance_needed(self, average_utilization_rate_over_window):
+        if average_utilization_rate_over_window is None:
+            return True
+
+        if (
+            average_utilization_rate_over_window
+            > self._server_args.eplb_min_rebalancing_utilization_threshold
+        ):
+            logger.info(
+                f"[EPLBManager] Skipped ep rebalancing: current GPU utilization {average_utilization_rate_over_window:.2f} > minimum rebalance threshold {self._server_args.eplb_min_rebalancing_utilization_threshold:.2f}"
+            )
+            return False
+
+        return True
 
     def _compute_update_layer_ids_chunks(self) -> List[List[int]]:
         all_layer_ids = sorted(

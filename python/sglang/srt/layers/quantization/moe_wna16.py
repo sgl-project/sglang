@@ -9,6 +9,8 @@ import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -22,8 +24,10 @@ from sglang.srt.utils import get_device_capability, set_weight_attrs
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 
 def get_weight_perm(num_bits: int):
@@ -349,37 +353,36 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 layer.register_parameter(key, param)
                 set_weight_attrs(param, extra_weight_attrs)
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
-        # avoid circular import
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         assert (
-            moe_runner_config.activation == "silu"
+            self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
         weight_bits = self.quant_config.weight_bits
         has_zp = self.quant_config.has_zp
 
-        return fused_experts(
-            x,
-            layer.w13_qweight,
-            layer.w2_qweight,
-            topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_qweight,
+            w2_weight=layer.w2_qweight,
             use_int4_w4a16=weight_bits == 4,
             use_int8_w8a16=weight_bits == 8,
-            w1_scale=layer.w13_scales,
+            w13_scale=layer.w13_scales,
             w2_scale=layer.w2_scales,
-            w1_zp=layer.w13_qzeros if has_zp else None,
+            w13_zp=layer.w13_qzeros if has_zp else None,
             w2_zp=layer.w2_qzeros if has_zp else None,
             block_shape=[0, layer.group_size],
         )
+        return self.runner.run(dispatch_output, quant_info)
 
     @staticmethod
     def get_weight_loader(layer, weight_loader):

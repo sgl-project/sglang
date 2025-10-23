@@ -18,7 +18,7 @@ import time
 import unittest
 from typing import Dict, List, Optional
 
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
     BatchRequest,
@@ -150,9 +150,25 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(len(request.messages), 1)
         self.assertEqual(request.messages[0].role, "user")
         self.assertEqual(request.messages[0].content, "Hello")
-        self.assertEqual(request.temperature, 0.7)  # default
+        self.assertEqual(request.temperature, None)  # default
         self.assertFalse(request.stream)  # default
         self.assertEqual(request.tool_choice, "none")  # default when no tools
+
+    def test_sampling_param_build(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=0.8,
+            max_tokens=150,
+            min_tokens=5,
+            top_p=0.9,
+            stop=["</s>"],
+        )
+        params = req.to_sampling_params(["</s>"], {}, None)
+        self.assertEqual(params["temperature"], 0.8)
+        self.assertEqual(params["max_new_tokens"], 150)
+        self.assertEqual(params["min_new_tokens"], 5)
+        self.assertEqual(params["stop"], ["</s>"])
 
     def test_chat_completion_tool_choice_validation(self):
         """Test tool choice validation logic"""
@@ -191,6 +207,95 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.separate_reasoning)
         self.assertFalse(request.stream_reasoning)
         self.assertEqual(request.chat_template_kwargs, {"custom_param": "value"})
+
+    def test_chat_completion_reasoning_effort(self):
+        """Test chat completion with reasoning effort"""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning={
+                "enabled": True,
+                "reasoning_effort": "high",
+            },
+        )
+        self.assertEqual(request.reasoning_effort, "high")
+        self.assertEqual(request.chat_template_kwargs, {"thinking": True})
+
+    def test_chat_completion_json_format(self):
+        """Test chat completion json format"""
+        transcript = "Good morning! It's 7:00 AM, and I'm just waking up. Today is going to be a busy day, "
+        "so let's get started. First, I need to make a quick breakfast. I think I'll have some "
+        "scrambled eggs and toast with a cup of coffee. While I'm cooking, I'll also check my "
+        "emails to see if there's anything urgent."
+
+        messages = [
+            {
+                "role": "system",
+                "content": "The following is a voice message transcript. Only answer in JSON.",
+            },
+            {
+                "role": "user",
+                "content": transcript,
+            },
+        ]
+
+        class VoiceNote(BaseModel):
+            title: str = Field(description="A title for the voice note")
+            summary: str = Field(
+                description="A short one sentence summary of the voice note."
+            )
+            strict: Optional[bool] = True
+            actionItems: List[str] = Field(
+                description="A list of action items from the voice note"
+            )
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            top_k=40,
+            min_p=0.05,
+            separate_reasoning=False,
+            stream_reasoning=False,
+            chat_template_kwargs={"custom_param": "value"},
+            response_format={
+                "type": "json_schema",
+                "schema": VoiceNote.model_json_schema(),
+            },
+        )
+        res_format = request.response_format
+        json_format = res_format.json_schema
+        name = json_format.name
+        schema = json_format.schema_
+        strict = json_format.strict
+        self.assertEqual(name, "VoiceNote")
+        self.assertEqual(strict, True)
+        self.assertNotIn("strict", schema["properties"])
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            top_k=40,
+            min_p=0.05,
+            separate_reasoning=False,
+            stream_reasoning=False,
+            chat_template_kwargs={"custom_param": "value"},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "VoiceNote",
+                    "schema": VoiceNote.model_json_schema(),
+                    "strict": True,
+                },
+            },
+        )
+        res_format = request.response_format
+        json_format = res_format.json_schema
+        name = json_format.name
+        schema = json_format.schema_
+        strict = json_format.strict
+        self.assertEqual(name, "VoiceNote")
+        self.assertEqual(strict, True)
 
 
 class TestModelSerialization(unittest.TestCase):

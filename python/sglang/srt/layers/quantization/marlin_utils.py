@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy
@@ -55,6 +56,17 @@ MARLIN_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 # changed to False, which allows Marlin to perform global reductions in fp16
 # precision (instead of fp32), and therefore, save on some memory movements.
 USE_FP32_REDUCE_DEFAULT = True
+
+
+@dataclass
+class MarlinLinearLayerConfig:
+    full_weight_shape: tuple[int, int]  # [in, out]
+    partition_weight_shape: tuple[int, int]
+    weight_type: ScalarType
+    act_type: torch.dtype
+    group_size: int
+    zero_points: bool
+    has_g_idx: bool
 
 
 # For binary size and compile time, we don't support the same types for with and
@@ -304,6 +316,13 @@ def marlin_permute_scales(
     s = s.reshape((-1, size_n)).contiguous()
 
     return s
+
+
+def marlin_permute_bias(s: torch.Tensor) -> torch.Tensor:
+    origin_shape = s.shape
+    _, scale_perm_single = get_scale_perms()
+    s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+    return s.reshape(*origin_shape).contiguous()
 
 
 def marlin_moe_permute_scales(

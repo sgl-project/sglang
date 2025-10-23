@@ -4,7 +4,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 import torch
 
 from sglang.srt.distributed import divide
-from sglang.srt.hf_transformers_utils import AutoConfig
+from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -17,6 +17,7 @@ from sglang.srt.lora.utils import (
     get_stacked_multiply,
     get_target_module_name,
 )
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ class LoRAMemoryPool:
         max_lora_rank: int,
         target_modules: Set[str],
         base_model: torch.nn.Module,
+        eviction_policy: str,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -63,6 +65,9 @@ class LoRAMemoryPool:
         self.tp_rank: int = tp_rank
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
+
+        # Initialize eviction policy
+        self.eviction_policy = get_eviction_policy(eviction_policy)
 
         # Both A_buffer and B_buffer maps lora weight names to its buffer space.
         # A_buffer contains num_layer number of row-major tensors with shape
@@ -104,12 +109,18 @@ class LoRAMemoryPool:
             return all(_can_support(x) for x in config)
 
     def get_lora_A_shape(
-        self, module_name: str, base_model: torch.nn.Module, max_lora_dim: int
+        self,
+        module_name: str,
+        base_model: torch.nn.Module,
+        max_lora_dim: int,
+        layer_idx: int,
     ) -> Tuple[int]:
         """
         Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
-        input_dim, _ = get_hidden_dim(module_name, self.base_hf_config, base_model)
+        input_dim, _ = get_hidden_dim(
+            module_name, self.base_hf_config, base_model, layer_idx
+        )
         c = get_stacked_multiply(module_name)
         if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             input_dim = divide(input_dim, self.tp_size)
@@ -120,12 +131,18 @@ class LoRAMemoryPool:
         )
 
     def get_lora_B_shape(
-        self, module_name: str, base_model: torch.nn.Module, max_lora_dim: int
+        self,
+        module_name: str,
+        base_model: torch.nn.Module,
+        max_lora_dim: int,
+        layer_idx: int,
     ) -> Tuple[int]:
         """
         Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
-        _, output_dim = get_hidden_dim(module_name, self.base_hf_config, base_model)
+        _, output_dim = get_hidden_dim(
+            module_name, self.base_hf_config, base_model, layer_idx
+        )
         if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             output_dim = divide(output_dim, self.tp_size)
         return (
@@ -140,19 +157,21 @@ class LoRAMemoryPool:
         def init_buffer(
             buffer: Dict[str, List[torch.Tensor]],
             target_modules: Set[str],
-            get_lora_shape_fn: Callable[[str, torch.nn.Module, int], Tuple[int]],
+            get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
         ):
             for module_name in target_modules:
-                lora_shape = get_lora_shape_fn(
-                    module_name, base_model, self.max_lora_rank
-                )
                 buffer[module_name] = [
                     torch.empty(
-                        lora_shape,
+                        get_lora_shape_fn(
+                            module_name,
+                            base_model,
+                            self.max_lora_rank,
+                            idx,
+                        ),
                         dtype=self.dtype,
                         device=device,
                     )
-                    for _ in range(self.num_layer)
+                    for idx in range(self.num_layer)
                 ]
 
         init_buffer(
@@ -175,31 +194,50 @@ class LoRAMemoryPool:
         lora_refs: Dict[str, LoRARef],
     ):
         def get_available_buffer_slot():
+            # 1. Prioritize empty slots
             for buffer_id in range(self.max_loras_per_batch):
-                # Prioritize empty slots
                 if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
                     return buffer_id
+
+            # 2. Memory pool is full, need to evict using policy
+            candidates = set()
 
             for buffer_id in range(self.max_loras_per_batch):
                 uid = self.buffer_id_to_uid[buffer_id]
 
-                # Evict unneeded lora
-                if uid not in cur_uids:
-                    # Skip pinned LoRAs
-                    # TODO (lifuhuang): we might consider supporting pinning base model (uid == None) in the future.
-                    if uid is not None:
-                        lora_ref = lora_refs.get(uid)
-                        if lora_ref is not None and lora_ref.pinned:
-                            continue
+                # Skip if this adapter is needed by current batch
+                # TODO (lifuhuang): we might consider supporting pinning base model (uid == None) in the future.
+                if uid in cur_uids:
+                    continue
 
-                    self.uid_to_buffer_id.pop(uid)
-                    logger.debug(f"Evicting LoRA {uid} from buffer slot {buffer_id}.")
-                    self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
-                    return buffer_id
+                # Skip if this adapter is pinned (base model cannot be pinned, so can be evicted)
+                if uid is not None:
+                    lora_ref = lora_refs.get(uid)
+                    if lora_ref and lora_ref.pinned:
+                        continue
+                candidates.add(uid)
 
-            raise ValueError(
-                "No available buffer slots found. Please ensure the number of active loras is less than max_loras_per_batch."
+            if not candidates:
+                raise ValueError(
+                    "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
+                )
+
+            # Select victim using eviction policy
+            victim_uid = self.eviction_policy.select_victim(candidates)
+
+            # Evict the selected victim
+            victim_buffer_id = self.uid_to_buffer_id[victim_uid]
+            self.uid_to_buffer_id.pop(victim_uid)
+            self.eviction_policy.remove(victim_uid)
+            self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
+            logger.debug(
+                f"Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}."
             )
+            return victim_buffer_id
+
+        # Mark all adapters in current batch as used (for LRU tracking)
+        for uid in cur_uids:
+            self.eviction_policy.mark_used(uid)
 
         for uid in cur_uids:
             if uid not in self.uid_to_buffer_id:

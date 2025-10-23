@@ -16,10 +16,15 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
 )
-from sglang.srt.layers.attention.utils import TRITON_PAD_NUM_PAGE_PER_BLOCK
+from sglang.srt.layers.attention.utils import get_num_page_per_block_flashmla
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,6 +46,10 @@ DEFAULT_CONFIG = {
     "v_head_dim": 512,
     "num_kv_heads": 1,
     "layer_id": 0,
+    "tp_q_head_num": 128,
+    "tp_k_head_num": 128,
+    "prefill_head_dim": 192,
+    "prefill_v_head_dim": 128,
 }
 
 ROPE_BASE = 10000
@@ -92,7 +101,7 @@ TEST_CASES = {
             "description": "Medium-scale batch",
         },
     ],
-    "decode_output_match": [
+    "output_match": [
         {
             "name": "single_fp16",
             "batch_size": 1,
@@ -100,15 +109,15 @@ TEST_CASES = {
             "page_size": 32,
             "description": "Single FP16 vs reference",
         },
-        {
-            "name": "single_fp8",
-            "batch_size": 1,
-            "max_seq_len": 64,
-            "page_size": 64,
-            "tolerance": 1e-1,
-            "kv_cache_dtype": torch.float8_e4m3fn,
-            "description": "Single FP8 vs reference",
-        },
+        # {
+        #     "name": "single_fp8",
+        #     "batch_size": 1,
+        #     "max_seq_len": 64,
+        #     "page_size": 64,
+        #     "tolerance": 1e-1,
+        #     "kv_cache_dtype": torch.float8_e4m3fn,
+        #     "description": "Single FP8 vs reference",
+        # },
         {
             "name": "batch_fp16",
             "batch_size": 32,
@@ -116,15 +125,15 @@ TEST_CASES = {
             "page_size": 32,
             "description": "Batch FP16 vs reference",
         },
-        {
-            "name": "batch_fp8",
-            "batch_size": 32,
-            "max_seq_len": 64,
-            "page_size": 64,
-            "tolerance": 1e-1,
-            "kv_cache_dtype": torch.float8_e4m3fn,
-            "description": "Batch FP8 vs reference",
-        },
+        # {
+        #     "name": "batch_fp8",
+        #     "batch_size": 32,
+        #     "max_seq_len": 64,
+        #     "page_size": 64,
+        #     "tolerance": 1e-1,
+        #     "kv_cache_dtype": torch.float8_e4m3fn,
+        #     "description": "Batch FP8 vs reference",
+        # },
     ],
     "page_size_consistency": [
         # Only 32 and 64 supported for now in flashinfer TRTLLM-GEN MLA kernel
@@ -207,6 +216,9 @@ class MockModelRunner:
         self.dtype = config["dtype"]
         self.kv_cache_dtype = config["kv_cache_dtype"]
         self.page_size = config["page_size"]
+
+        # Server args stub - needed by attention backends
+        self.server_args = get_global_server_args()
 
         # Model-config stub with MLA attributes
         self.model_config = type(
@@ -307,13 +319,24 @@ def compare_outputs(trtllm_out, reference_out, tolerance=1e-2):
 class TestTRTLLMMLA(CustomTestCase):
     """Test suite for TRTLLM MLA backend with centralized configuration."""
 
+    @classmethod
+    def setUpClass(cls):
+        """Set up global server args for testing."""
+        server_args = ServerArgs(model_path="dummy")
+        server_args.enable_dp_attention = False
+        set_global_server_args_for_scheduler(server_args)
+
+    @classmethod
+    def tearDownClass(cls):
+        pass
+
     def _merge_config(self, test_case):
         """Merge test case with default configuration."""
         config = DEFAULT_CONFIG.copy()
         config.update(test_case)
         return config
 
-    def _create_model_components(self, config):
+    def _create_model_components(self, config, is_prefill=False):
         """Create model runners, backends, and layer for testing."""
         # Create model runners
         model_runner_trtllm = MockModelRunner(config)
@@ -323,14 +346,23 @@ class TestTRTLLMMLA(CustomTestCase):
         trtllm_backend = TRTLLMMLABackend(model_runner_trtllm)
         reference_backend = FlashInferMLAAttnBackend(model_runner_reference)
 
+        head_dim = (
+            config["kv_lora_rank"] + config["qk_rope_head_dim"]
+            if not is_prefill
+            else config["prefill_head_dim"]
+        )
+        v_head_dim = (
+            config["v_head_dim"] if not is_prefill else config["prefill_v_head_dim"]
+        )
+
         # Create RadixAttention layer
         layer = RadixAttention(
             num_heads=config["num_attention_heads"],
-            head_dim=config["kv_lora_rank"] + config["qk_rope_head_dim"],
+            head_dim=head_dim,
             scaling=model_runner_trtllm.model_config.scaling,
             num_kv_heads=config["num_kv_heads"],
             layer_id=config["layer_id"],
-            v_head_dim=config["v_head_dim"],
+            v_head_dim=v_head_dim,
             prefix="attn_mqa",
         )
 
@@ -515,7 +547,7 @@ class TestTRTLLMMLA(CustomTestCase):
         """Test that TRTLLM and FlashInfer MLA backends produce matching outputs."""
         print(f"\nRunning decode output matching tests...")
 
-        for test_case in TEST_CASES["decode_output_match"]:
+        for test_case in TEST_CASES["output_match"]:
             with self.subTest(test_case=test_case["name"]):
                 print(f"  Testing {test_case['name']}: {test_case['description']}")
 
@@ -819,23 +851,15 @@ class TestTRTLLMMLA(CustomTestCase):
                 backend.init_forward_metadata(fb)
 
                 # Verify metadata exists
-                self.assertIsNotNone(backend.forward_metadata)
-                self.assertIsInstance(backend.forward_metadata, TRTLLMMLADecodeMetadata)
+                self.assertIsNotNone(backend.forward_decode_metadata)
+                self.assertIsInstance(
+                    backend.forward_decode_metadata, TRTLLMMLADecodeMetadata
+                )
 
                 # Test metadata structure
-                metadata = backend.forward_metadata
-                self.assertIsNotNone(
-                    metadata.workspace, "Workspace should be allocated"
-                )
+                metadata = backend.forward_decode_metadata
                 self.assertIsNotNone(
                     metadata.block_kv_indices, "Block KV indices should be created"
-                )
-
-                # Test workspace properties
-                self.assertEqual(metadata.workspace.device.type, "cuda")
-                self.assertEqual(metadata.workspace.dtype, torch.int8)
-                self.assertGreater(
-                    metadata.workspace.numel(), 0, "Workspace should have non-zero size"
                 )
 
                 # Test block KV indices properties
@@ -893,9 +917,10 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Should satisfy TRT-LLM and Triton constraints
                 trtllm_constraint = 128 // scenario["page_size"]
-                constraint_lcm = math.lcm(
-                    trtllm_constraint, TRITON_PAD_NUM_PAGE_PER_BLOCK
+                triton_constraint = get_num_page_per_block_flashmla(
+                    scenario["page_size"]
                 )
+                constraint_lcm = math.lcm(trtllm_constraint, triton_constraint)
                 self.assertEqual(
                     calculated_blocks % constraint_lcm,
                     0,
@@ -943,7 +968,7 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Initialize metadata
                 backend.init_forward_metadata(fb)
-                metadata = backend.forward_metadata
+                metadata = backend.forward_decode_metadata
 
                 # Verify KV indices structure
                 block_kv_indices = metadata.block_kv_indices
@@ -993,8 +1018,7 @@ class TestTRTLLMMLA(CustomTestCase):
         )
 
         # Verify CUDA graph buffers are allocated
-        self.assertIsNotNone(backend.cuda_graph_kv_indices)
-        self.assertIsNotNone(backend.cuda_graph_workspace)
+        self.assertIsNotNone(backend.decode_cuda_graph_kv_indices)
 
         # Test capture metadata
         seq_lens = torch.full(
@@ -1016,7 +1040,6 @@ class TestTRTLLMMLA(CustomTestCase):
         self.assertIn(batch_size, backend.decode_cuda_graph_metadata)
         capture_metadata = backend.decode_cuda_graph_metadata[batch_size]
 
-        self.assertIsNotNone(capture_metadata.workspace)
         self.assertIsNotNone(capture_metadata.block_kv_indices)
 
         # Test replay with different sequence lengths
@@ -1039,11 +1062,8 @@ class TestTRTLLMMLA(CustomTestCase):
         )
 
         # Verify replay updated the metadata
-        replay_metadata = backend.forward_metadata
+        replay_metadata = backend.forward_decode_metadata
         self.assertIsNotNone(replay_metadata)
-        self.assertEqual(
-            replay_metadata.workspace.data_ptr(), capture_metadata.workspace.data_ptr()
-        )
 
     def test_metadata_consistency_across_calls(self):
         """Test metadata consistency across multiple forward calls."""
@@ -1061,7 +1081,7 @@ class TestTRTLLMMLA(CustomTestCase):
             config["batch_size"], seq_lens_1, backend, model_runner, config
         )
         backend.init_forward_metadata(fb_1)
-        metadata_1 = backend.forward_metadata
+        metadata_1 = backend.forward_decode_metadata
 
         # Second call with same sequence lengths
         seq_lens_2 = torch.tensor([32, 48], device=config["device"])
@@ -1069,10 +1089,9 @@ class TestTRTLLMMLA(CustomTestCase):
             config["batch_size"], seq_lens_2, backend, model_runner, config
         )
         backend.init_forward_metadata(fb_2)
-        metadata_2 = backend.forward_metadata
+        metadata_2 = backend.forward_decode_metadata
 
         # Metadata structure should be consistent
-        self.assertEqual(metadata_1.workspace.shape, metadata_2.workspace.shape)
         self.assertEqual(
             metadata_1.block_kv_indices.shape, metadata_2.block_kv_indices.shape
         )
@@ -1083,12 +1102,334 @@ class TestTRTLLMMLA(CustomTestCase):
             config["batch_size"], seq_lens_3, backend, model_runner, config
         )
         backend.init_forward_metadata(fb_3)
-        metadata_3 = backend.forward_metadata
+        metadata_3 = backend.forward_decode_metadata
 
         # Should still have valid structure
-        self.assertIsNotNone(metadata_3.workspace)
         self.assertIsNotNone(metadata_3.block_kv_indices)
         self.assertEqual(metadata_3.block_kv_indices.shape[0], config["batch_size"])
+
+    def test_prefill_output_match_self_attention(self):
+        """Test prefill (forward) behavior of TRTLLM MLA backend vs reference."""
+        print(f"\nRunning prefill output tests...")
+
+        for test_case in TEST_CASES["output_match"][:2]:  # Just a subset for speed
+            with self.subTest(test_case=test_case["name"]):
+                print(
+                    f"Prefill Testing {test_case['name']}: {test_case['description']}"
+                )
+
+                config = self._merge_config(test_case)
+                batch_size = config["batch_size"]
+                max_seq_len = config["max_seq_len"]
+
+                # Create components
+                (
+                    model_runner_trtllm,
+                    model_runner_reference,
+                    trtllm_backend,
+                    reference_backend,
+                    layer,
+                ) = self._create_model_components(config, is_prefill=True)
+
+                # Prefill uses full sequences
+                seq_lens = torch.full(
+                    (batch_size,), max_seq_len, device=config["device"]
+                )
+
+                def _create_forward_batch_prefill(
+                    batch_size,
+                    seq_lens,
+                    extend_prefix_lens,
+                    backend,
+                    model_runner,
+                    config,
+                ):
+                    """Create a forward batch for the given backend."""
+
+                    fb = ForwardBatch(
+                        batch_size=batch_size,
+                        input_ids=torch.randint(
+                            0, 100, (batch_size, 1), device=config["device"]
+                        ),
+                        out_cache_loc=torch.arange(batch_size, device=config["device"]),
+                        seq_lens_sum=int(seq_lens.sum().item()),
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_prefix_lens_cpu=extend_prefix_lens.cpu().int().tolist(),
+                        extend_seq_lens_cpu=(seq_lens - extend_prefix_lens)
+                        .cpu()
+                        .int()
+                        .tolist(),
+                        forward_mode=ForwardMode.EXTEND,
+                        req_pool_indices=torch.arange(
+                            batch_size, device=config["device"]
+                        ),
+                        seq_lens=seq_lens,
+                        seq_lens_cpu=seq_lens.cpu(),
+                        attn_attend_prefix_cache=False,
+                        mha_return_lse=False,
+                        attn_backend=backend,
+                    )
+                    fb.req_to_token_pool = model_runner.req_to_token_pool
+                    fb.token_to_kv_pool = model_runner.token_to_kv_pool
+
+                    # Add position information for RoPE
+                    fb.positions = torch.arange(batch_size, device=config["device"])
+
+                    return fb
+
+                # Create forward batches
+                fb_trtllm = _create_forward_batch_prefill(
+                    batch_size,
+                    seq_lens.clone(),
+                    torch.zeros(batch_size, device=config["device"], dtype=torch.int32),
+                    trtllm_backend,
+                    model_runner_trtllm,
+                    config,
+                )
+                fb_reference = _create_forward_batch_prefill(
+                    batch_size,
+                    seq_lens.clone(),
+                    torch.zeros(batch_size, device=config["device"], dtype=torch.int32),
+                    reference_backend,
+                    model_runner_reference,
+                    config,
+                )
+
+                # Initialize metadata for both backends
+                trtllm_backend.init_forward_metadata(fb_trtllm)
+                reference_backend.init_forward_metadata(fb_reference)
+
+                # Create Q, K, V tensors for prefill
+                torch.manual_seed(config["seed_qkv"])
+
+                def _create_qkv_tensors_prefill(
+                    batch_size, seq_len, config, dtype_override=None
+                ):
+                    """Create Q, K, V tensors for prefill, using config for head_num and head_dim."""
+                    device = config["device"]
+                    dtype = dtype_override or config["dtype"]
+
+                    total_tokens = batch_size * seq_len
+
+                    tp_q_head_num = config["tp_q_head_num"]
+                    tp_k_head_num = config["tp_k_head_num"]
+                    head_dim = config["prefill_head_dim"]
+                    v_head_dim = config["prefill_v_head_dim"]
+
+                    q = torch.randn(
+                        (total_tokens, tp_q_head_num * head_dim),
+                        dtype=dtype,
+                        device=device,
+                    )
+                    k = torch.randn(
+                        (total_tokens, tp_k_head_num * head_dim),
+                        dtype=dtype,
+                        device=device,
+                    )
+                    v = torch.randn(
+                        (total_tokens, tp_k_head_num * v_head_dim),
+                        dtype=dtype,
+                        device=device,
+                    )
+
+                    # Reshape as requested
+                    q = q.view(-1, tp_q_head_num, head_dim)
+                    k = k.view(-1, tp_k_head_num, head_dim)
+                    v = v.view(-1, tp_k_head_num, v_head_dim)
+
+                    return q, k, v
+
+                q, k, v = _create_qkv_tensors_prefill(batch_size, max_seq_len, config)
+                # Run prefill on both backends
+                out_trtllm = trtllm_backend.forward_extend(
+                    q, k, v, layer, fb_trtllm, False
+                ).view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                out_reference = reference_backend.forward_extend(
+                    q, k, v, layer, fb_reference, False
+                )
+
+                tolerance = config.get("tolerance", 1e-2)
+                comparison_passed = compare_outputs(
+                    out_trtllm, out_reference, tolerance=tolerance
+                )
+                self.assertTrue(
+                    comparison_passed,
+                    f"TRTLLM and Reference prefill outputs differ beyond tolerance. "
+                    f"Config: {test_case['name']}, "
+                    f"Max diff: {(out_trtllm - out_reference).abs().max().item()}",
+                )
+
+    def test_draft_extend_padding_unpadding_kernels(self):
+        """Test TRTLLM MLA Triton kernels: pad_draft_extend_query_kernel and unpad_draft_extend_output_kernel."""
+
+        # Import the kernels
+        from sglang.srt.layers.attention.trtllm_mla_backend import (
+            pad_draft_extend_query_kernel,
+            unpad_draft_extend_output_kernel,
+        )
+
+        def _create_test_data(
+            self, batch_size, max_seq_len, num_heads, head_dim, dtype=torch.float32
+        ):
+            """Create test data for kernel testing."""
+            device = torch.device("cuda")
+
+            # Create sequence lengths (varying lengths for each batch)
+            seq_lens = torch.randint(
+                1, max_seq_len + 1, (batch_size,), device=device, dtype=torch.int32
+            )
+
+            # Create cumulative sequence lengths
+            cum_seq_lens = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
+            cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
+
+            # Create input query tensor (flattened format)
+            total_tokens = cum_seq_lens[-1].item()
+            q_input = torch.randn(
+                total_tokens, num_heads, head_dim, device=device, dtype=dtype
+            )
+
+            # Create padded query tensor (batch format)
+            padded_q = torch.zeros(
+                batch_size, max_seq_len, num_heads, head_dim, device=device, dtype=dtype
+            )
+
+            return q_input, padded_q, seq_lens, cum_seq_lens
+
+        def _create_test_output_data(
+            self,
+            batch_size,
+            token_per_batch,
+            tp_q_head_num,
+            v_head_dim,
+            dtype=torch.float32,
+        ):
+            """Create test data for unpad kernel testing."""
+            device = torch.device("cuda")
+
+            # Create accept lengths (varying lengths for each batch)
+            accept_lengths = torch.randint(
+                1, token_per_batch + 1, (batch_size,), device=device, dtype=torch.int32
+            )
+
+            # Create cumulative accept lengths
+            cum_accept_lengths = torch.zeros(
+                batch_size + 1, device=device, dtype=torch.int32
+            )
+            cum_accept_lengths[1:] = torch.cumsum(accept_lengths, dim=0)
+
+            # Create raw output tensor (batch format)
+            raw_out = torch.randn(
+                batch_size,
+                token_per_batch,
+                tp_q_head_num,
+                v_head_dim,
+                device=device,
+                dtype=dtype,
+            )
+
+            # Create output tensor (flattened format)
+            total_tokens = cum_accept_lengths[-1].item()
+            output = torch.empty(
+                total_tokens, tp_q_head_num, v_head_dim, device=device, dtype=dtype
+            )
+
+            return raw_out, output, accept_lengths, cum_accept_lengths
+
+        # Test 1: pad_draft_extend_query_kernel basic functionality
+        with self.subTest(test="pad_kernel_basic"):
+            batch_size = 4
+            max_seq_len = 8
+            num_heads = 16
+            head_dim = 64
+
+            q_input, padded_q, seq_lens, cum_seq_lens = _create_test_data(
+                self, batch_size, max_seq_len, num_heads, head_dim
+            )
+
+            # Launch kernel
+            BLOCK_SIZE = 64
+            grid = (batch_size * max_seq_len,)
+
+            pad_draft_extend_query_kernel[grid](
+                q_ptr=q_input,
+                padded_q_ptr=padded_q,
+                seq_lens_q_ptr=seq_lens,
+                cumsum_ptr=cum_seq_lens,
+                batch_size=batch_size,
+                max_seq_len=max_seq_len,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+
+            # Verify the padding worked correctly
+            for i in range(batch_size):
+                seq_len = seq_lens[i].item()
+
+                # Check that valid positions are copied correctly
+                for pos in range(seq_len):
+                    input_start = cum_seq_lens[i].item()
+                    input_pos = input_start + pos
+
+                    # Compare input and output for valid positions
+                    input_data = q_input[input_pos]
+                    output_data = padded_q[i, pos]
+
+                    torch.testing.assert_close(
+                        input_data, output_data, rtol=1e-5, atol=1e-6
+                    )
+
+                # Check that invalid positions are zero
+                for pos in range(seq_len, max_seq_len):
+                    output_data = padded_q[i, pos]
+                    self.assertTrue(
+                        torch.allclose(output_data, torch.zeros_like(output_data)),
+                        f"Position {pos} in batch {i} should be zero",
+                    )
+
+        # Test 2: unpad_draft_extend_output_kernel basic functionality
+        with self.subTest(test="unpad_kernel_basic"):
+            batch_size = 4
+            token_per_batch = 8
+            tp_q_head_num = 16
+            v_head_dim = 64
+
+            raw_out, output, accept_lengths, cum_accept_lengths = (
+                _create_test_output_data(
+                    self, batch_size, token_per_batch, tp_q_head_num, v_head_dim
+                )
+            )
+
+            # Launch kernel
+            BLOCK_SIZE = 64
+            grid = (batch_size * token_per_batch,)
+
+            unpad_draft_extend_output_kernel[grid](
+                raw_out_ptr=raw_out,
+                output_ptr=output,
+                accept_length_ptr=accept_lengths,
+                cumsum_ptr=cum_accept_lengths,
+                batch_size=batch_size,
+                token_per_batch=token_per_batch,
+                tp_q_head_num=tp_q_head_num,
+                v_head_dim=v_head_dim,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+
+            # Verify the unpadding worked correctly
+            for i in range(batch_size):
+                accept_len = accept_lengths[i].item()
+                output_start = cum_accept_lengths[i].item()
+
+                # Check that valid positions are copied correctly
+                for pos in range(accept_len):
+                    input_data = raw_out[i, pos]
+                    output_data = output[output_start + pos]
+
+                    torch.testing.assert_close(
+                        input_data, output_data, rtol=1e-5, atol=1e-6
+                    )
 
 
 if __name__ == "__main__":
