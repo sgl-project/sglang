@@ -1,6 +1,9 @@
 import os
+import time
 import unittest
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
@@ -54,6 +57,39 @@ class TestRetractDecodeChunkCache(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=["--disable-radix-cache", "--chunked-prefill-size", 128],
         )
+
+
+class TestRetractFreeOneDelayedToken(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ["SGLANG_INIT_NEW_TOKEN_RATIO"] = "0"
+
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--max-total-tokens", "200", "--disable-cuda-graph"],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        del os.environ["SGLANG_INIT_NEW_TOKEN_RATIO"]
+        kill_process_tree(cls.process.pid)
+
+    def test_retract_free_one_delayed_token(self):
+        data = {
+            "input_ids": [[233] * 25, [266] * 25],
+            "sampling_params": {
+                "max_new_tokens": 125,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            },
+        }
+        res = requests.post(f"{self.base_url}/generate", json=data)
+        self.assertEqual(res.status_code, 200)
+        time.sleep(1)  # wait for memory check
 
 
 if __name__ == "__main__":
