@@ -11,6 +11,11 @@ python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruc
 python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --output-len 32 256 --run-name test_run
 ## run with profiling:
 python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --profile
+## run with profiling to custom directory:
+export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 --input-len 256 --profile
+## run with CUDA profiler (nsys):
+nsys profile --force-overwrite=true -o bench_one_batch python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 --input-len 256 --cuda-profiler
 # Usage (correctness test):
 python -m sglang.bench_one_batch --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
 
@@ -93,6 +98,22 @@ profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
 ]
 
 
+def start_cuda_profiler(rank_print):
+    try:
+        torch.cuda.cudart().cudaProfilerStart()
+        rank_print("CUDA Profiler started (nsys will begin capturing)")
+    except Exception as e:
+        rank_print(f"Failed to start CUDA profiler: {e}")
+
+
+def stop_cuda_profiler(rank_print):
+    try:
+        torch.cuda.cudart().cudaProfilerStop()
+        rank_print("CUDA Profiler stopped (nsys should dump traces)")
+    except Exception as e:
+        rank_print(f"Failed to stop CUDA profiler: {e}")
+
+
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
@@ -108,6 +129,8 @@ class BenchArgs:
     profile: bool = False
     profile_record_shapes: bool = False
     profile_filename_prefix: str = "profile"
+    cuda_profiler: bool = False
+    cuda_profiler_stage: str = "all"  # "all", "prefill", "decode"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -149,6 +172,19 @@ class BenchArgs:
             default=BenchArgs.profile_filename_prefix,
             help="Prefix of the profiling file names. The full profiling result file(s) be "
             '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
+        )
+        parser.add_argument(
+            "--cuda-profiler",
+            action="store_true",
+            help="Use CUDA Profiler API for nsys profiling.",
+        )
+
+        parser.add_argument(
+            "--cuda-profiler-stage",
+            type=str,
+            default=BenchArgs.cuda_profiler_stage,
+            choices=["all", "prefill", "decode"],
+            help="Which stage to profile with CUDA profiler: all, prefill, or decode only.",
         )
 
     @classmethod
@@ -337,6 +373,18 @@ def _read_prompts_from_file(prompt_file, rank_print):
         return pf.readlines()
 
 
+def _get_torch_profiler_output_dir():
+    return os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+
+
+def _create_torch_profiler_filename(
+    profile_filename_prefix, batch_size, input_len, output_len, stage
+):
+    output_dir = _get_torch_profiler_output_dir()
+    filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_{stage}.trace.json.gz"
+    return os.path.join(output_dir, filename)
+
+
 def _save_profile_trace_results(profiler, filename):
     parent_dir = os.path.dirname(os.path.abspath(filename))
     os.makedirs(parent_dir, exist_ok=True)
@@ -414,6 +462,9 @@ def latency_test_run_once(
     profile,
     profile_record_shapes,
     profile_filename_prefix,
+    cuda_profiler,
+    cuda_profiler_stage,
+    tp_rank,
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
@@ -437,6 +488,8 @@ def latency_test_run_once(
 
     profiler = None
     if profile:
+        torch_profiler_dir = _get_torch_profiler_output_dir()
+        rank_print(f"Torch profiler traces will be saved to: {torch_profiler_dir}")
         profiler = torch.profiler.profile(
             activities=profile_activities,
             with_stack=True,
@@ -445,11 +498,20 @@ def latency_test_run_once(
         profiler.start()
 
     # Prefill
+    if cuda_profiler and cuda_profiler_stage in ["all", "prefill"]:
+        start_cuda_profiler(rank_print)
+
     synchronize(device)
     tic = time.perf_counter()
     next_token_ids, _, batch = extend(reqs, model_runner)
     synchronize(device)
     prefill_latency = time.perf_counter() - tic
+
+    if cuda_profiler and cuda_profiler_stage in ["all", "prefill"]:
+        stop_cuda_profiler(rank_print)
+        rank_print(
+            f"CUDA profiler trace for prefill completed (batch={batch_size}, input={input_len}, output={output_len})"
+        )
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
     rank_print(
@@ -460,7 +522,9 @@ def latency_test_run_once(
 
     if profile:
         profiler.stop()
-        trace_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_prefill.trace.json.gz"
+        trace_filename = _create_torch_profiler_filename(
+            profile_filename_prefix, batch_size, input_len, output_len, "prefill"
+        )
         _save_profile_trace_results(profiler, trace_filename)
         rank_print(f"torch profiler chrome trace for prefill saved to {trace_filename}")
 
@@ -468,7 +532,7 @@ def latency_test_run_once(
     decode_latencies = []
     for i in range(output_len - 1):
         synchronize(device)
-        if profile and i == output_len / 2:
+        if profile and i == output_len // 2:
             profiler = None
             profiler = torch.profiler.profile(
                 activities=profile_activities,
@@ -477,10 +541,28 @@ def latency_test_run_once(
             )
             profiler.start()
 
+        if (
+            cuda_profiler
+            and cuda_profiler_stage in ["all", "decode"]
+            and i == output_len // 2
+        ):
+            start_cuda_profiler(rank_print)
+
         tic = time.perf_counter()
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
         synchronize(device)
         latency = time.perf_counter() - tic
+
+        if (
+            cuda_profiler
+            and cuda_profiler_stage in ["all", "decode"]
+            and i == output_len // 2
+        ):
+            stop_cuda_profiler(rank_print)
+            rank_print(
+                f"CUDA profiler trace for decode completed (batch={batch_size}, input={input_len}, output={output_len})"
+            )
+
         tot_latency += latency
         throughput = batch_size / latency
         decode_latencies.append(latency)
@@ -489,9 +571,11 @@ def latency_test_run_once(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
 
-        if profile and i == output_len / 2:
+        if profile and i == output_len // 2:
             profiler.stop()
-            trace_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_decode.trace.json.gz"
+            trace_filename = _create_torch_profiler_filename(
+                profile_filename_prefix, batch_size, input_len, output_len, "decode"
+            )
             _save_profile_trace_results(profiler, trace_filename)
             rank_print(
                 f"torch profiler chrome trace for decoding 1 token saved to {trace_filename}"
@@ -558,6 +642,9 @@ def latency_test(
         profile=False,
         profile_record_shapes=False,
         profile_filename_prefix="",  # not used
+        cuda_profiler=False,  # no profiling during warmup
+        cuda_profiler_stage="all",  # not used during warmup
+        tp_rank=tp_rank,
     )
 
     rank_print("Benchmark ...")
@@ -605,6 +692,9 @@ def latency_test(
             bench_args.profile if tp_rank == 0 else None,
             bench_args.profile_record_shapes if tp_rank == 0 else None,
             bench_args.profile_filename_prefix,
+            bench_args.cuda_profiler if tp_rank == 0 else False,
+            bench_args.cuda_profiler_stage,
+            tp_rank,
         )
         if ret is not None:
             result_list.append(ret)
