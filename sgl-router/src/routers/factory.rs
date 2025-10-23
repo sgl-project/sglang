@@ -9,7 +9,8 @@ use super::{
     RouterTrait,
 };
 use crate::{
-    config::{ConnectionMode, PolicyConfig, RoutingMode},
+    config::{PolicyConfig, RoutingMode},
+    core::ConnectionMode,
     policies::PolicyFactory,
     server::AppContext,
 };
@@ -21,7 +22,7 @@ impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
         match ctx.router_config.connection_mode {
-            ConnectionMode::Grpc => match &ctx.router_config.mode {
+            ConnectionMode::Grpc { .. } => match &ctx.router_config.mode {
                 RoutingMode::Regular { .. } => Self::create_grpc_router(ctx).await,
                 RoutingMode::PrefillDecode {
                     prefill_policy,
