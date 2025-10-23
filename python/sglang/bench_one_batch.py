@@ -272,7 +272,7 @@ def prepare_synthetic_inputs_for_latency_test(
 def extend(reqs, model_runner):
     # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
     dummy_tree_cache = SimpleNamespace(
-        page_size=1,
+        page_size=model_runner.server_args.page_size,
         device=model_runner.device,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
     )

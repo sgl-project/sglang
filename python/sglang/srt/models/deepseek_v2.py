@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import tqdm
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -44,6 +45,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -81,7 +83,12 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.quantization import CompressedTensorsConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    CompressedTensorsWNA16AMXEPMoEMethod,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
@@ -707,6 +714,10 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
+            if isinstance(
+                self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
+            ):
+                topk_output.topk_weights.mul_(self.routed_scaling_factor)
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
@@ -2853,6 +2864,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
+            CompressedTensorsConfig.DeepSeekFP8Config = Fp8Config(
+                True, "dynamic", None, [128, 128]
+            )
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -2992,11 +3007,13 @@ class DeepseekV2ForCausalLM(nn.Module):
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
-                if (
-                    hasattr(self.quant_config, "weight_block_size")
-                    and self.quant_config.weight_block_size is not None
-                ):
-                    weight_block_size = self.quant_config.weight_block_size
+                selected_quant_config = getattr(
+                    self.quant_config, "DeepSeekFP8Config", self.quant_config
+                )
+                weight_block_size = getattr(
+                    selected_quant_config, "weight_block_size", None
+                )
+                if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
                     if _is_fp8_fnuz:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
@@ -3491,7 +3508,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         # temporarily only support DeepSeek V3/R1
         weight_block_size = [128, 128]
 
-        for layer_id in trange(
+        for layer_id in tqdm.trange(
             self.config.num_hidden_layers + int(is_nextn),
             desc="quant attn to fp8 ue8m0",
         ):

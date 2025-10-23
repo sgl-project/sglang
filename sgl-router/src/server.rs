@@ -22,8 +22,12 @@ use tracing::{error, info, warn, Level};
 use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
     core::{
-        worker_to_info, workflow::WorkflowEngine, Job, JobQueue, JobQueueConfig, LoadMonitor,
-        WorkerManager, WorkerRegistry, WorkerType,
+        worker_to_info,
+        workflow::{
+            create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
+            WorkflowEngine,
+        },
+        Job, JobQueue, JobQueueConfig, LoadMonitor, WorkerManager, WorkerRegistry, WorkerType,
     },
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
@@ -439,51 +443,6 @@ async fn v1_conversations_delete_item(
         .await
 }
 
-#[derive(Deserialize)]
-struct AddWorkerQuery {
-    url: String,
-    api_key: Option<String>,
-}
-
-async fn add_worker(
-    State(state): State<Arc<AppState>>,
-    Query(AddWorkerQuery { url, api_key }): Query<AddWorkerQuery>,
-) -> Response {
-    // Warn if router has API key but worker is being added without one
-    if state.context.router_config.api_key.is_some() && api_key.is_none() {
-        warn!(
-            "Adding worker {} without API key while router has API key configured. \
-            Worker will be accessible without authentication. \
-            If the worker requires the same API key as the router, please specify it explicitly.",
-            url
-        );
-    }
-
-    let result = WorkerManager::add_worker(&url, &api_key, &state.context).await;
-
-    match result {
-        Ok(message) => (StatusCode::OK, message).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
-    }
-}
-
-async fn list_workers(State(state): State<Arc<AppState>>) -> Response {
-    let worker_list = WorkerManager::get_worker_urls(&state.context.worker_registry);
-    Json(json!({ "urls": worker_list })).into_response()
-}
-
-async fn remove_worker(
-    State(state): State<Arc<AppState>>,
-    Query(AddWorkerQuery { url, .. }): Query<AddWorkerQuery>,
-) -> Response {
-    let result = WorkerManager::remove_worker(&url, &state.context);
-
-    match result {
-        Ok(message) => (StatusCode::OK, message).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
-    }
-}
-
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
     match WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
         .await
@@ -565,6 +524,12 @@ async fn create_worker(
             config.url
         );
     }
+
+    // Populate dp_aware from router's configuration
+    let config = WorkerConfigRequest {
+        dp_aware: state.context.router_config.dp_aware,
+        ..config
+    };
 
     // Submit job for async processing
     let worker_url = config.url.clone();
@@ -761,9 +726,6 @@ pub fn build_app(
         .route("/get_server_info", get(get_server_info));
 
     let admin_routes = Router::new()
-        .route("/add_worker", post(add_worker))
-        .route("/remove_worker", post(remove_worker))
-        .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -1018,15 +980,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     engine
         .event_bus()
-        .subscribe(Arc::new(crate::core::workflow::LoggingSubscriber))
+        .subscribe(Arc::new(LoggingSubscriber))
         .await;
 
-    engine.register_workflow(crate::core::workflow::create_worker_registration_workflow());
+    engine.register_workflow(create_worker_registration_workflow());
+    engine.register_workflow(create_worker_removal_workflow());
     app_context
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
-    info!("Workflow engine initialized with worker registration workflow");
+    info!("Workflow engine initialized with worker registration and removal workflows");
 
     info!(
         "Initializing workers for routing mode: {:?}",

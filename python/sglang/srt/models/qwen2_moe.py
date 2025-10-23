@@ -17,6 +17,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
+from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -590,7 +591,12 @@ class Qwen2MoeModel(nn.Module):
                         if residual is not None
                         else hidden_states
                     )
-                with get_global_expert_distribution_recorder().with_current_layer(i):
+                ctx = (
+                    nullcontext()
+                    if get_global_server_args().enable_piecewise_cuda_graph
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
                     layer = self.layers[i]
                     hidden_states, residual = layer(
                         positions, hidden_states, forward_batch, residual
