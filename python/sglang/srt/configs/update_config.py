@@ -129,24 +129,32 @@ def adjust_config_with_unaligned_cpu_tp(
     model_config = update_intermediate_size(
         model_config, "intermediate_size_mlp", intermediate_padding_size
     )
-    if (
-        hasattr(model_config.hf_config, "vision_config")
-        and model_config.hf_config.vision_config.model_type == "siglip_vision_model"
-    ):
+    if hasattr(model_config.hf_config, "vision_config"):
         model_config.hf_config.vision_config.original_num_attention_heads = (
             model_config.num_attention_heads
         )
-        if model_config.hf_config.vision_config.num_attention_heads % tp_size != 0:
-            model_config.hf_config.vision_config.head_dim = (
-                model_config.hf_config.vision_config.hidden_size
-                // model_config.hf_config.vision_config.num_attention_heads
-            )
-            from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+        att_heads = -1
+        if hasattr(model_config.hf_config.vision_config, "num_attention_heads"):
+            att_heads = model_config.hf_config.vision_config.num_attention_heads
+        if hasattr(model_config.hf_config.vision_config, "attention_heads"):
+            att_heads = model_config.hf_config.vision_config.attention_heads
+        if att_heads > -1:
+            if att_heads % tp_size != 0:
+                model_config.hf_config.vision_config.head_dim = (
+                    model_config.hf_config.vision_config.hidden_size
+                    // att_heads
+                )
+                from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-            pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
-            model_config.hf_config.vision_config.num_attention_heads = pad_vocab_size(
-                model_config.hf_config.vision_config.num_attention_heads, pad_size
-            )
+                pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
+                att_heads = pad_vocab_size(
+                    att_heads, pad_size
+                )
+                model_config.hf_config.vision_config.hidden_size = model_config.hf_config.vision_config.head_dim * att_heads
+                if hasattr(model_config.hf_config.vision_config, "num_attention_heads"):
+                    model_config.hf_config.vision_config.num_attention_heads = att_heads
+                if hasattr(model_config.hf_config.vision_config, "attention_heads"):
+                    model_config.hf_config.vision_config.attention_heads = att_heads
         model_config.hf_config.vision_config = update_intermediate_size(
             model_config.hf_config.vision_config,
             "intermediate_size",
