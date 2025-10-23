@@ -1,10 +1,10 @@
-import os
 import time
 import unittest
 from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -19,13 +19,12 @@ from sglang.test.test_utils import (
 class TestRetractDecode(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_TEST_RETRACT"] = "1"
-
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-        )
+        with envs.SGLANG_TEST_RETRACT.override(True):
+            cls.process = popen_launch_server(
+                cls.model, cls.base_url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -47,35 +46,32 @@ class TestRetractDecode(CustomTestCase):
 class TestRetractDecodeChunkCache(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_TEST_RETRACT"] = "1"
-
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--disable-radix-cache", "--chunked-prefill-size", 128],
-        )
+        with envs.SGLANG_TEST_RETRACT.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=["--disable-radix-cache", "--chunked-prefill-size", 128],
+            )
 
 
 class TestRetractFreeOneDelayedToken(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_INIT_NEW_TOKEN_RATIO"] = "0"
-
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--max-total-tokens", "200", "--disable-cuda-graph"],
-        )
+        with envs.SGLANG_INIT_NEW_TOKEN_RATIO.override(0):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=["--max-total-tokens", "200", "--disable-cuda-graph"],
+            )
 
     @classmethod
     def tearDownClass(cls):
-        del os.environ["SGLANG_INIT_NEW_TOKEN_RATIO"]
         kill_process_tree(cls.process.pid)
 
     def test_retract_free_one_delayed_token(self):
