@@ -104,18 +104,19 @@ def req_inference(
 
     def req_func(socket_paths: list[tuple[str, str]]):
         if rank == src:
-            resp = httpx.Client(transport=httpx.HTTPTransport(uds=uds)).post(
-                f"{endpoint}/update_weights_from_ipc",
-                json={
-                    "zmq_handles": dict(
-                        socket_paths[src : src + inference_parallel_size]
-                    ),
-                    "flush_cache": True,
-                    "weight_version": weight_version,
-                },
-                timeout=timeout,
-            )
-            resp.raise_for_status()
+            with httpx.Client(transport=httpx.HTTPTransport(uds=uds)) as client:
+                resp = client.post(
+                    f"{endpoint}/update_weights_from_ipc",
+                    json={
+                        "zmq_handles": dict(
+                            socket_paths[src : src + inference_parallel_size]
+                        ),
+                        "flush_cache": True,
+                        "weight_version": weight_version,
+                    },
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
 
     return req_func
 
