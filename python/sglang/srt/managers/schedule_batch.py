@@ -885,7 +885,6 @@ class Req:
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
-        self.req_pool_idx = None
         self.mamba_pool_idx = None
         self.already_computed = 0
 

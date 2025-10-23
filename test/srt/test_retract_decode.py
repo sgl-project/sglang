@@ -88,7 +88,8 @@ class TestRetractFreeOneDelayedToken(CustomTestCase):
             },
         }
         res = requests.post(f"{self.base_url}/generate", json=data)
-        self.assertEqual(res.status_code, 200)
+        assert res.status_code == 200
+        print(res.json())
         time.sleep(1)  # wait for memory check
 
 
