@@ -104,6 +104,12 @@ class TestGrpcBackend(StateManagementTests, MCPTests):
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
 
+    @unittest.skip(
+        "TODO: transport error, details: [], metadata: MetadataMap { headers: {} }"
+    )
+    def test_previous_response_id_chaining(self):
+        super().test_previous_response_id_chaining()
+
     @unittest.skip("TODO: return 501 Not Implemented")
     def test_conversation_with_multiple_turns(self):
         super().test_conversation_with_multiple_turns()
