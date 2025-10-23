@@ -203,8 +203,8 @@ def get_config(
             == "modeling_deepseekocr.DeepseekOCRForCausalLM"
         ):
             config.model_type = "deepseek-ocr"
-            # Due to an unknown reason, Hugging Face’s AutoConfig mistakenly recognizes the configuration of deepseek-ocr as deepseekvl2.
-            # This is a temporary workaround and will require further optimization.
+            # TODO: Remove this workaround when AutoConfig correctly identifies deepseek-ocr.
+            # Hugging Face's AutoConfig currently misidentifies it as deepseekvl2.
 
     except ValueError as e:
         if not "deepseek_v32" in str(e):
