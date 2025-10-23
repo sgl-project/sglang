@@ -150,7 +150,8 @@ class SGLangTestBalanceAnalyzer:
         self, elapsed: int, estimated: int, log_content: str, filename: str
     ) -> bool:
 
-        if elapsed >= estimated * 3:
+        # To avoid collect retry data
+        if elapsed % estimated == 0:
             return True
 
         return False
