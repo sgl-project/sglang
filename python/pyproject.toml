@@ -74,6 +74,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+checkpoint-engine = ["checkpoint-engine==0.1.2"]
 test = [
   "accelerate",
   "expecttest",
