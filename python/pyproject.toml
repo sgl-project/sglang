@@ -93,7 +93,7 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
-checkpoint-engine = ["checkpoint-engine>=0.1.2"]
+checkpoint-engine = ["checkpoint-engine==0.1.2"]
 all = []
 dev = ["sglang[test]"]
 
