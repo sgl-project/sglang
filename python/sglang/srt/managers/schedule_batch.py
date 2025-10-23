@@ -438,6 +438,7 @@ class Req:
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        http_worker_ipc: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -460,6 +461,9 @@ class Req:
 
         # The length of KV that have been removed in local attention chunked prefill
         self.evicted_seqlen_local = 0
+
+        # For multi-http worker
+        self.http_worker_ipc = http_worker_ipc
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
