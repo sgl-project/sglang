@@ -30,6 +30,7 @@ import zmq
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
+    GetLoadReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
@@ -80,18 +81,49 @@ class LoadBalanceMethod(Enum):
 
 
 class DPBudget:
-    def __init__(self):
+    def __init__(self, dp_size: int):
         # TODO: support minimum tokens method
         self.budget_queue = deque()
+        self.dp_size = dp_size
+        self.loads = [
+            GetLoadReqOutput(
+                dp_rank=i,
+                num_reqs=0,
+                num_waiting_reqs=0,
+                num_tokens=0,
+                num_finished_reqs=0,
+            )
+            for i in range(dp_size)
+        ]
 
     def update_budget(self, load_update: WatchLoadUpdateReq):
         """Update the budget queue.
         Use num_reqs instead of num_waiting_reqs to balance decode running batch.
         """
-        loads = load_update.loads
-        self.budget_queue.clear()
+        load_updated = False
 
-        num_reqs = [load.num_reqs for load in loads]
+        # Check if any finished requests.
+        for load in load_update.loads:
+            if load.num_finished_reqs > 0:
+                origin_load = self.loads[load.dp_rank].num_reqs
+                new_load = max(0, origin_load - load.num_finished_reqs)
+                if new_load != origin_load - load.num_finished_reqs:
+                    logger.warning(
+                        "Negative requests count detected, clamping to 0 "
+                        f"dp_rank={load.dp_rank}, "
+                        f"finished={load.num_finished_reqs}, "
+                        f"origin_load={origin_load}"
+                    )
+                self.loads[load.dp_rank].num_reqs = new_load
+                load_updated = True
+
+        # No load update.
+        if not load_updated:
+            return
+
+        # Ready to update budget_queue.
+        self.budget_queue.clear()
+        num_reqs = [load.num_reqs for load in self.loads]
         if not num_reqs:
             return
 
@@ -101,18 +133,21 @@ class DPBudget:
 
         while any(x != num_reqs[0] for x in num_reqs):
             min_load = min(num_reqs)
-            min_indices = [i for i, x in enumerate(num_reqs) if x == min_load]
+            min_indices = [
+                dp_rank for dp_rank, x in enumerate(num_reqs) if x == min_load
+            ]
             second_min_load = min(x for x in num_reqs if x > min_load)
             self.budget_queue.extend(
-                [loads[i].dp_rank for i in min_indices] * (second_min_load - min_load)
+                [dp_rank for dp_rank in min_indices] * (second_min_load - min_load)
             )
             for idx in min_indices:
                 num_reqs[idx] = second_min_load
 
     def dispatch(self):
-        if self.budget_queue:
-            return self.budget_queue.popleft()
-        return None
+        if not self.budget_queue:
+            self.budget_queue.extend(range(self.dp_size))
+
+        return self.budget_queue.popleft()
 
 
 class DataParallelController:
@@ -147,7 +182,7 @@ class DataParallelController:
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
         # Load balance budget
-        self.dp_budget = DPBudget()
+        self.dp_budget = DPBudget(server_args.dp_size)
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -453,10 +488,14 @@ class DataParallelController:
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
+    def load_account(self, target_rank: int):
+        self.dp_budget.loads[target_rank].num_reqs += 1
+
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.data_parallel_rank is not None:
             logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
             self.workers[req.data_parallel_rank].send_pyobj(req)
+            self.load_account(req.data_parallel_rank)
             return True
         return False
 
@@ -466,6 +505,7 @@ class DataParallelController:
 
         if self.server_args.disaggregation_mode == "null":
             self.workers[self.round_robin_counter].send_pyobj(req)
+            self.load_account(self.round_robin_counter)
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
             )
@@ -473,7 +513,9 @@ class DataParallelController:
             assert (
                 req.bootstrap_room is not None
             ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
-            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+            target_rank = req.bootstrap_room % len(self.workers)
+            self.workers[target_rank].send_pyobj(req)
+            self.load_account(target_rank)
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
@@ -483,6 +525,7 @@ class DataParallelController:
             self.round_robin_scheduler(req)
         else:
             self.workers[target_worker].send_pyobj(req)
+            self.load_account(target_worker)
 
     def minimum_tokens_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
