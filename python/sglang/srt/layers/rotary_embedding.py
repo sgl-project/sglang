@@ -112,10 +112,10 @@ class RotaryEmbedding(CustomOp):
         if not _is_cuda:
             cache = cache.to(dtype)
 
-        if (
+        if dtype == torch.float32 or (
             (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
             and not (_is_cpu and _is_cpu_amx_available)
-            and not _is_xpu
+            and not (_is_xpu)
         ):
             from vllm._custom_ops import rotary_embedding
 
@@ -123,6 +123,23 @@ class RotaryEmbedding(CustomOp):
 
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
+
+        self._hip_cached_cos: Optional[torch.Tensor] = None
+        self._hip_cached_sin: Optional[torch.Tensor] = None
+        if _use_aiter:
+            half_rotary = cache.shape[-1] // 2
+            cos_cache = (
+                cache[:, :half_rotary]
+                .contiguous()
+                .view(self.max_position_embeddings, 1, 1, half_rotary)
+            )
+            sin_cache = (
+                cache[:, half_rotary:]
+                .contiguous()
+                .view(self.max_position_embeddings, 1, 1, half_rotary)
+            )
+            self.register_buffer("_hip_cos_cache", cos_cache, persistent=False)
+            self.register_buffer("_hip_sin_cache", sin_cache, persistent=False)
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -183,6 +200,109 @@ class RotaryEmbedding(CustomOp):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    def forward_hip(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor],
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional["FusedSetKVBufferArg"] = None,
+        *,
+        is_nope_first: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not _use_aiter:
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
+
+        if fused_set_kv_buffer_arg is not None:
+            raise NotImplementedError(
+                "fused_set_kv_buffer_arg is not supported for HIP path"
+            )
+
+        import aiter as ops
+
+        if not hasattr(self, "_hip_cos_cache") or not hasattr(self, "_hip_sin_cache"):
+            raise RuntimeError("HIP caches not initialised")
+
+        cos = self._hip_cached_cos
+        sin = self._hip_cached_sin
+        if cos is None or cos.device != query.device or cos.dtype != query.dtype:
+            cos = self._hip_cos_cache.to(query.device, dtype=query.dtype)
+            sin = self._hip_sin_cache.to(query.device, dtype=query.dtype)
+            self._hip_cached_cos = cos
+            self._hip_cached_sin = sin
+
+        rotate_style = 0 if self.is_neox_style else 1
+
+        num_tokens = positions.numel()
+        query_shape = query.shape
+        query = query.view(1, num_tokens, -1, self.head_size)
+        key_shape = key.shape if key is not None else None
+        if key is not None:
+            key = key.view(1, num_tokens, -1, self.head_size)
+
+        positions = positions.view(*query.shape[:2])
+        if offsets is not None:
+            offsets = offsets.view(*query.shape[:2])
+
+        if not is_nope_first:
+            query_rot = query[..., : self.rotary_dim]
+            key_rot = key[..., : self.rotary_dim] if key is not None else None
+        else:
+            query_rot = query[..., -self.rotary_dim :]
+            key_rot = key[..., -self.rotary_dim :] if key is not None else None
+
+        if key_rot is None:
+            if offsets is None:
+                ops.rope_cached_positions_fwd_inplace(
+                    query_rot,
+                    cos,
+                    sin,
+                    positions,
+                    rotate_style,
+                    reuse_freqs_front_part=True,
+                    nope_first=is_nope_first,
+                )
+            else:
+                ops.rope_cached_positions_offsets_fwd_inplace(
+                    query_rot,
+                    cos,
+                    sin,
+                    positions,
+                    offsets,
+                    rotate_style,
+                    reuse_freqs_front_part=True,
+                    nope_first=is_nope_first,
+                )
+            return query.view(query_shape), None
+
+        if offsets is None:
+            ops.rope_cached_positions_2c_fwd_inplace(
+                query_rot,
+                key_rot,
+                cos,
+                sin,
+                positions,
+                rotate_style,
+                reuse_freqs_front_part=True,
+                nope_first=is_nope_first,
+            )
+        else:
+            ops.rope_cached_positions_offsets_2c_fwd_inplace(
+                query_rot,
+                key_rot,
+                cos,
+                sin,
+                positions,
+                offsets,
+                rotate_style,
+                reuse_freqs_front_part=True,
+                nope_first=is_nope_first,
+            )
+
+        return query.view(query_shape), key.view(key_shape) if key is not None else None
 
     def forward_npu(
         self,
@@ -254,7 +374,11 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cuda and (self.head_size in [64, 128, 256, 512]):
+        if (
+            _is_cuda
+            and (self.head_size in [64, 128, 256, 512])
+            and self.dtype != torch.float32
+        ):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -298,6 +422,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # TODO: make a wrapper, and XPU will implement this kernel later.
+        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
         return self.forward_native(positions, query, key, offsets)
 
 
@@ -1280,7 +1405,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
-    def forward_native(
+    def _forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1340,6 +1465,27 @@ class MRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with optional Triton kernel acceleration.
+        Args:
+            positions:
+                [num_tokens,] (text only) or
+                [3, num_tokens] (T/H/W positions with multimodal inputs)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        assert positions.ndim == 1 or positions.ndim == 2
+
+        if positions.ndim == 2 and self.mrope_section and _is_cuda:
+            return self._forward_triton(positions, query, key)
+        else:
+            return self._forward_native(positions, query, key)
+
+    def _forward_triton(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
         assert key is not None

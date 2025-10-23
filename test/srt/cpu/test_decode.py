@@ -69,9 +69,8 @@ class TestDecodeAttention(CustomTestCase):
         return output
 
     def _test_grouped_decode_attention_once(
-        self, B, H_Q, H_KV, D, D_V, is_cross_attn, device
+        self, B, H_Q, H_KV, D, D_V, is_cross_attn, dtype, device
     ):
-        dtype = torch.bfloat16
         # This represents the number of tokens already in the sequence
         seq_len = 1024
         encoder_len = 10
@@ -174,12 +173,13 @@ class TestDecodeAttention(CustomTestCase):
         ]
 
         for B, H_Q, H_KV, D, D_V in configs:
-            self._test_grouped_decode_attention_once(
-                B, H_Q, H_KV, D, D_V, False, device=device
-            )
-            self._test_grouped_decode_attention_once(
-                B, H_Q, H_KV, D, D_V, True, device=device
-            )
+            for dtype in [torch.bfloat16, torch.float16]:
+                self._test_grouped_decode_attention_once(
+                    B, H_Q, H_KV, D, D_V, False, dtype=dtype, device=device
+                )
+                self._test_grouped_decode_attention_once(
+                    B, H_Q, H_KV, D, D_V, True, dtype=dtype, device=device
+                )
 
     def test_grouped_decode_attention(self):
         self._test_grouped_decode_attention("cpu")
