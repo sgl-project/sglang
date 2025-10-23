@@ -33,7 +33,7 @@ def create_test_mapping(num_types=30):
 
 
 def test_inheritance():
-    print("\n"+"=" * 60)
+    print("\n" + "=" * 60)
     print("test for inheritance")
     print("=" * 60)
 
@@ -147,7 +147,7 @@ def benchmark_dispatchers():
 
         print(f"for list: {list_time:.4f} s")
         print(f"for dict: {dict_time:.4f} s")
-        print(f"improvement: {list_time/dict_time:.2f}x")
+        print(f"improvement: {list_time/dict_time:.2f} x")
         print(f"time reduce: {(1-dict_time/list_time) * 100:.1f} %")
 
 
