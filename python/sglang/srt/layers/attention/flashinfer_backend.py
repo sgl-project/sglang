@@ -50,7 +50,6 @@ if is_flashinfer_available():
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.decode import _get_range_buf, get_seq_lens
 
 
 class WrapperDispatch(Enum):
@@ -195,7 +194,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         if init_new_workspace:
             self.workspace_buffer = torch.empty(
-                global_config.flashinfer_workspace_size,
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                 dtype=torch.uint8,
                 device=model_runner.device,
             )

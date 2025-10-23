@@ -24,7 +24,6 @@ from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
-from types import SimpleNamespace
 from typing import Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
@@ -63,10 +62,11 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    BaseBatchReq,
+    BaseReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     ClearHiCacheReqInput,
@@ -90,8 +90,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
-    MultiTokenizerRegisterReq,
-    MultiTokenizerWrapper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -114,7 +112,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
-from sglang.srt.managers.overlap_utils import FutureIndices, FutureMap
+from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -136,22 +134,21 @@ from sglang.srt.managers.scheduler_metrics_mixin import (
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.utils import validate_input_length
+from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
-from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
@@ -199,77 +196,6 @@ GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
 @dataclass
-class GenerationBatchResult:
-    logits_output: Optional[LogitsProcessorOutput] = None
-    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
-    next_token_ids: Optional[torch.Tensor] = None
-    num_accepted_tokens: Optional[int] = None
-    can_run_cuda_graph: bool = False
-
-    # For output processing
-    extend_input_len_per_req: Optional[List[int]] = None
-    extend_logprob_start_len_per_req: Optional[List[int]] = None
-
-    # For overlap scheduling
-    copy_done: Optional[torch.cuda.Event] = None
-    delay_sample_func: Optional[callable] = None
-    future_indices: Optional[FutureIndices] = None
-
-    # FIXME(lsyin): maybe move to a better place?
-    # sync path: forward stream -> output processor
-    accept_lens: Optional[torch.Tensor] = None
-    allocate_lens: Optional[torch.Tensor] = None
-
-    # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
-
-    def copy_to_cpu(self, return_logprob: bool = False):
-        """Copy tensors to CPU in overlap scheduling.
-        Only the tensors which are needed for processing results are copied,
-        e.g., next_token_ids, logits outputs
-        """
-        if return_logprob:
-            if self.logits_output.next_token_logits is not None:
-                self.logits_output.next_token_logits = (
-                    self.logits_output.next_token_logits.to("cpu", non_blocking=True)
-                )
-            if self.logits_output.input_token_logprobs is not None:
-                self.logits_output.input_token_logprobs = (
-                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
-                )
-        if self.logits_output.hidden_states is not None:
-            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
-                "cpu", non_blocking=True
-            )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
-
-        if self.accept_lens is not None:
-            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
-
-        if self.allocate_lens is not None:
-            self.allocate_lens = self.allocate_lens.to("cpu", non_blocking=True)
-
-        self.copy_done.record()
-
-    @classmethod
-    def from_pp_proxy(
-        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
-    ):
-        # TODO(lsyin): refactor PP and avoid using dict
-        proxy_dict = next_pp_outputs.tensors
-        return cls(
-            logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
-            next_token_ids=next_pp_outputs["next_token_ids"],
-            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
-            extend_logprob_start_len_per_req=proxy_dict.get(
-                "extend_logprob_start_len_per_req", None
-            ),
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
-
-
-@dataclass
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
 
@@ -281,6 +207,7 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
+    SchedulerPPMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -306,6 +233,9 @@ class Scheduler(
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.abort_on_priority_when_disabled = (
+            server_args.abort_on_priority_when_disabled
+        )
         self.schedule_low_priority_values_first = (
             server_args.schedule_low_priority_values_first
         )
@@ -346,47 +276,7 @@ class Scheduler(
         self.model_config = ModelConfig.from_server_args(server_args)
 
         # Init inter-process communication
-        context = zmq.Context(2)
-        self.idle_sleeper = None
-        if self.pp_rank == 0 and self.attn_tp_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
-            )
-            self.recv_from_rpc = get_zmq_socket(
-                context, zmq.DEALER, port_args.rpc_ipc_name, False
-            )
-
-            self.send_to_tokenizer = get_zmq_socket(
-                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-            )
-            if server_args.skip_tokenizer_init:
-                # Directly send to the TokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-                )
-            else:
-                # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
-                )
-
-            if self.server_args.sleep_on_idle:
-                self.idle_sleeper = IdleSleeper(
-                    [
-                        self.recv_from_tokenizer,
-                        self.recv_from_rpc,
-                    ]
-                )
-        else:
-            self.recv_from_tokenizer = None
-            self.recv_from_rpc = None
-            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-
-        if self.current_scheduler_metrics_enabled():
-            self.send_metrics_from_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.metrics_ipc_name, False
-            )
+        self.init_sockets(server_args, port_args)
 
         # Init tokenizer
         self.init_tokenizer()
@@ -647,7 +537,6 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
                 (GetLoadReqInput, self.get_load),
             ]
         )
@@ -702,6 +591,75 @@ class Scheduler(
             )
         else:
             self.draft_worker = None
+
+    def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
+        context = zmq.Context(2)
+        self.idle_sleeper = None
+
+        class SenderWrapper:
+            def __init__(self, socket: zmq.Socket):
+                self.socket = socket
+
+            def send_output(
+                self,
+                output: Union[BaseReq, BaseBatchReq],
+                recv_obj: Optional[Union[BaseReq, BaseBatchReq]] = None,
+            ):
+                if self.socket is None:
+                    return
+
+                if (
+                    isinstance(recv_obj, BaseReq)
+                    and recv_obj.http_worker_ipc is not None
+                    and output.http_worker_ipc is None
+                ):
+                    # handle communicator reqs for multi-http worker case
+                    output.http_worker_ipc = recv_obj.http_worker_ipc
+
+                self.socket.send_pyobj(output)
+
+        if self.pp_rank == 0 and self.attn_tp_rank == 0:
+            self.recv_from_tokenizer = get_zmq_socket(
+                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            )
+            self.recv_from_rpc = get_zmq_socket(
+                context, zmq.DEALER, port_args.rpc_ipc_name, False
+            )
+
+            send_to_tokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
+            if server_args.skip_tokenizer_init:
+                # Directly send to the TokenizerManager
+                send_to_detokenizer = get_zmq_socket(
+                    context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+                )
+            else:
+                # Send to the DetokenizerManager
+                send_to_detokenizer = get_zmq_socket(
+                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
+                )
+
+            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
+            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
+
+            if self.server_args.sleep_on_idle:
+                self.idle_sleeper = IdleSleeper(
+                    [
+                        self.recv_from_tokenizer,
+                        self.recv_from_rpc,
+                    ]
+                )
+        else:
+            self.recv_from_tokenizer = None
+            self.recv_from_rpc = None
+            self.send_to_tokenizer = SenderWrapper(None)
+            self.send_to_detokenizer = SenderWrapper(None)
+
+        if self.current_scheduler_metrics_enabled():
+            self.send_metrics_from_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.metrics_ipc_name, False
+            )
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -1055,128 +1013,6 @@ class Scheduler(
             self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
-    @DynamicGradMode()
-    def event_loop_pp(self):
-        """A non-overlap scheduler loop for pipeline parallelism."""
-        mbs = [None] * self.pp_size
-        last_mbs = [None] * self.pp_size
-        self.running_mbs = [
-            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
-        ]
-        pp_outputs: Optional[PPProxyTensors] = None
-        while True:
-            server_is_idle = True
-            for mb_id in range(self.pp_size):
-                self.running_batch = self.running_mbs[mb_id]
-                self.last_batch = last_mbs[mb_id]
-
-                recv_reqs = self.recv_requests()
-                self.process_input_requests(recv_reqs)
-                mbs[mb_id] = self.get_next_batch_to_run()
-                self.running_mbs[mb_id] = self.running_batch
-
-                self.cur_batch = mbs[mb_id]
-                if self.cur_batch:
-                    server_is_idle = False
-                    result = self.run_batch(self.cur_batch)
-
-                # (last rank) send the outputs to the next step
-                if self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        next_token_ids = result.next_token_ids
-                        if self.cur_batch.return_logprob:
-                            pp_outputs = PPProxyTensors(
-                                {
-                                    "next_token_ids": next_token_ids,
-                                    "extend_input_len_per_req": result.extend_input_len_per_req,
-                                    "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
-                                }
-                                | (
-                                    {
-                                        f"logits_output.{k}": v
-                                        for k, v in result.logits_output.__dict__.items()
-                                    }
-                                    if result.logits_output is not None
-                                    else {}
-                                )
-                            )
-                        else:
-                            pp_outputs = PPProxyTensors(
-                                {
-                                    "next_token_ids": next_token_ids,
-                                }
-                            )
-                        # send the output from the last round to let the next stage worker run post processing
-                        self.pp_group.send_tensor_dict(
-                            pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-
-                # receive outputs and post-process (filter finished reqs) the coming microbatch
-                next_mb_id = (mb_id + 1) % self.pp_size
-                next_pp_outputs = None
-                if mbs[next_mb_id] is not None:
-                    next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
-                        self.pp_group.recv_tensor_dict(
-                            all_gather_group=self.attn_tp_group
-                        )
-                    )
-                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
-                    logits_output_args = {
-                        k[len("logits_output.") :]: v
-                        for k, v in next_pp_outputs.tensors.items()
-                        if k.startswith("logits_output.")
-                    }
-                    if len(logits_output_args) > 0:
-                        logits_output = LogitsProcessorOutput(**logits_output_args)
-                    else:
-                        logits_output = None
-
-                    output_result = GenerationBatchResult.from_pp_proxy(
-                        logits_output=logits_output,
-                        next_pp_outputs=next_pp_outputs,
-                        can_run_cuda_graph=result.can_run_cuda_graph,
-                    )
-                    self.process_batch_result(mbs[next_mb_id], output_result)
-                    last_mbs[next_mb_id] = mbs[next_mb_id]
-
-                # (not last rank)
-                if not self.pp_group.is_last_rank:
-                    # carry the outputs to the next stage
-                    # send the outputs from the last round to let the next stage worker run post processing
-                    if pp_outputs:
-                        self.pp_group.send_tensor_dict(
-                            pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-
-                    # send out reqs to the next stage
-                    dp_offset = self.attn_dp_rank * self.attn_tp_size
-                    if self.attn_tp_rank == 0:
-                        point_to_point_pyobj(
-                            recv_reqs,
-                            self.pp_rank * self.tp_size + dp_offset,
-                            self.world_group.device_group,
-                            self.pp_rank * self.tp_size + dp_offset,
-                            (self.pp_rank + 1) * self.tp_size + dp_offset,
-                        )
-
-                    # send out proxy tensors to the next stage
-                    if self.cur_batch:
-                        # FIXME(lsyin): remove this assert
-                        assert result.pp_hidden_states_proxy_tensors.tensors is not None
-                        self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-
-                pp_outputs = next_pp_outputs
-
-            # When the server is idle, self-check and re-init some states
-            if server_is_idle:
-                # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
-
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
@@ -1298,23 +1134,13 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
 
-            # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
-            if isinstance(recv_req, MultiTokenizerWrapper):
-                worker_id = recv_req.worker_id
-                recv_req = recv_req.obj
-                output = self._request_dispatcher(recv_req)
-                if output is not None:
-                    output = MultiTokenizerWrapper(worker_id, output)
-                    self.send_to_tokenizer.send_pyobj(output)
-                continue
-
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if isinstance(output, RpcReqOutput):
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
                 else:
-                    self.send_to_tokenizer.send_pyobj(output)
+                    self.send_to_tokenizer.send_output(output, recv_req)
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
@@ -1370,6 +1196,7 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
 
@@ -1560,7 +1387,11 @@ class Scheduler(
                 req.priority = sys.maxsize
             else:
                 req.priority = -sys.maxsize - 1
-        elif not self.enable_priority_scheduling and req.priority is not None:
+        elif (
+            not self.enable_priority_scheduling
+            and req.priority is not None
+            and self.abort_on_priority_when_disabled
+        ):
             abort_req = AbortReq(
                 finished_reason={
                     "type": "abort",
@@ -1569,7 +1400,7 @@ class Scheduler(
                 },
                 rid=req.rid,
             )
-            self.send_to_tokenizer.send_pyobj(abort_req)
+            self.send_to_tokenizer.send_output(abort_req, req)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -1601,7 +1432,7 @@ class Scheduler(
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
-        self.send_to_tokenizer.send_pyobj(
+        self.send_to_tokenizer.send_output(
             AbortReq(
                 finished_reason={
                     "type": "abort",
@@ -1609,7 +1440,8 @@ class Scheduler(
                     "message": message,
                 },
                 rid=req_to_abort.rid,
-            )
+            ),
+            req_to_abort,
         )
         return req_to_abort.rid == recv_req.rid
 
@@ -1624,6 +1456,7 @@ class Scheduler(
             recv_req.sampling_params,
             token_type_ids=recv_req.token_type_ids,
             priority=recv_req.priority,
+            http_worker_ipc=recv_req.http_worker_ipc,
         )
         req.tokenizer = self.tokenizer
 
@@ -2140,8 +1973,8 @@ class Scheduler(
             self.num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
-                self.send_to_tokenizer.send_pyobj(
-                    AbortReq(abort_reason=req.to_abort_message, rid=req.rid)
+                self.send_to_tokenizer.send_output(
+                    AbortReq(abort_reason=req.to_abort_message, rid=req.rid), req
                 )
 
             logger.info(
@@ -2325,7 +2158,7 @@ class Scheduler(
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
             self.return_health_check_ct -= 1
-            self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
+            self.send_to_tokenizer.send_output(HealthCheckOutput())
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return self.prepare_mlp_sync_batch_raw(
@@ -2339,6 +2172,7 @@ class Scheduler(
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
+            offload_tags=self.offload_tags,
         )
 
     @staticmethod
@@ -2353,6 +2187,7 @@ class Scheduler(
         speculative_num_draft_tokens,
         require_mlp_tp_gather: bool,
         disable_overlap_schedule: bool,
+        offload_tags: set[str],
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -2383,7 +2218,7 @@ class Scheduler(
         )
 
         tbo_preparer = TboDPAttentionPreparer()
-        if disable_overlap_schedule:
+        if len(offload_tags) == 0 and disable_overlap_schedule:
             group = tp_group.device_group
             device = tp_group.device
         else:
@@ -2770,7 +2605,7 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.send_to_tokenizer.send_pyobj(AbortReq(rid=req.rid))
+            self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.tree_cache.cache_finished_req(req)
@@ -2854,10 +2689,6 @@ class Scheduler(
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
 
-    def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
-        self.send_to_detokenizer.send_pyobj(recv_req)
-        return recv_req
-
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
     ):
@@ -2936,7 +2767,7 @@ class Scheduler(
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
         freeze_gc("Scheduler")
-        self.send_to_detokenizer.send_pyobj(recv_req)
+        self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
 
