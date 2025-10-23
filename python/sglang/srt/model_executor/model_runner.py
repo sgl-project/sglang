@@ -1044,10 +1044,6 @@ class ModelRunner:
         self.server_args.load_format = load_format
         self.load_config = load_config
 
-        # Recapture device graph after model weight update.
-        if not self.server_args.disable_cuda_graph and self.device == "cuda":
-            self.init_device_graphs()
-
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
@@ -2390,6 +2386,23 @@ class ModelRunner:
             f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
+
+    def update_weights_from_ipc(self, recv_req):
+        """Update weights from IPC for checkpoint-engine integration."""
+        try:
+            from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
+                SGLangCheckpointEngineWorkerExtensionImpl,
+            )
+
+            # Create a worker extension that integrates with SGLang's model
+            worker = SGLangCheckpointEngineWorkerExtensionImpl(self)
+            worker.update_weights_from_ipc(recv_req.zmq_handles)
+            return True, "IPC weight update completed successfully"
+        except ImportError as e:
+            return False, f"IPC weight update failed: ImportError {e}"
+        except Exception as e:
+            logger.error(f"IPC weight update failed: {e}")
+            return False, str(e)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

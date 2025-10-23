@@ -199,7 +199,11 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
 
     Ok(ChatCompletionRequest {
         messages,
-        model: req.model.clone(),
+        model: if req.model.is_empty() {
+            "default".to_string()
+        } else {
+            req.model.clone()
+        },
         temperature: req.temperature,
         max_completion_tokens: req.max_output_tokens,
         stream: is_streaming,

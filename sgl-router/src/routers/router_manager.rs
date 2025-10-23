@@ -18,8 +18,8 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::{ConnectionMode, RoutingMode},
-    core::{WorkerRegistry, WorkerType},
+    config::RoutingMode,
+    core::{ConnectionMode, WorkerRegistry, WorkerType},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -148,13 +148,13 @@ impl RouterManager {
             (ConnectionMode::Http, RoutingMode::OpenAI { .. }) => {
                 RouterId::new("http-openai".to_string())
             }
-            (ConnectionMode::Grpc, RoutingMode::Regular { .. }) => {
+            (ConnectionMode::Grpc { .. }, RoutingMode::Regular { .. }) => {
                 RouterId::new("grpc-regular".to_string())
             }
-            (ConnectionMode::Grpc, RoutingMode::PrefillDecode { .. }) => {
+            (ConnectionMode::Grpc { .. }, RoutingMode::PrefillDecode { .. }) => {
                 RouterId::new("grpc-pd".to_string())
             }
-            (ConnectionMode::Grpc, RoutingMode::OpenAI { .. }) => {
+            (ConnectionMode::Grpc { .. }, RoutingMode::OpenAI { .. }) => {
                 RouterId::new("grpc-regular".to_string())
             }
         }
