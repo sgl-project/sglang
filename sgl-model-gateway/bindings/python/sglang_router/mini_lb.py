@@ -7,7 +7,6 @@ import ipaddress
 import logging
 import random
 import urllib
-import torch
 from http import HTTPStatus
 from itertools import chain
 from typing import Optional
@@ -453,7 +452,7 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
     bootstrap_room = _generate_bootstrap_room()
     encode_request = request_data.copy()
     encode_request.update({"bootstrap_room": bootstrap_room})
-    await lb.encode(encode_request, lb.encode_urls, 'encode')
+    asyncio.create_task(lb.encode(encode_request, lb.encode_urls, 'encode'))
     
     prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
