@@ -306,12 +306,6 @@ def _is_extend_without_speculative(forward_batch):
 def _handle_attention_backend(
     attn: DeepseekV2AttentionMLA, forward_batch, backend_name
 ):
-    if (
-        get_global_server_args().enable_deterministic_inference
-        and backend_name == "fa3"
-    ):
-        return _dispatch_mla_subtype(attn, forward_batch)
-
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
     disable_ragged = (
         backend_name in ["flashinfer", "flashmla"]
@@ -338,7 +332,11 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 
 def handle_attention_fa3(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "fa3")
+    # when deterministic inference is enabled, use MLA
+    if get_global_server_args().enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)
+    else:
+        return _handle_attention_backend(attn, forward_batch, "fa3")
 
 
 def handle_attention_flashmla(attn, forward_batch):
@@ -382,6 +380,7 @@ def handle_attention_nsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
+    # when deterministic inference is enabled, use MLA
     if get_global_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
 
