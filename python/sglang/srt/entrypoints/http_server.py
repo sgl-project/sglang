@@ -149,15 +149,14 @@ def set_global_state(global_state: _GlobalState):
 
 async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
-    pid = os.getpid()
-    main_pid = get_main_process_id()
-    logger.info(f"current worker_id: {pid}, main processID: {main_pid}")
 
     # Read configuration from shared memory
+    main_pid = get_main_process_id()
     port_args, server_args, scheduler_info = read_from_shared_memory(
         f"multi_tokenizer_args_{main_pid}"
     )
     server_args: ServerArgs
+    port_args: PortArgs
 
     # API key authentication is not supported in multi-tokenizer mode
     assert (
@@ -166,6 +165,10 @@ async def init_multi_tokenizer() -> ServerArgs:
 
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+    )
+    logger.info(
+        f"Start multi-tokenizer worker process {os.getpid()}, "
+        f"ipc_name={port_args.tokenizer_ipc_name}"
     )
 
     # Launch multi-tokenizer manager process
@@ -177,8 +180,6 @@ async def init_multi_tokenizer() -> ServerArgs:
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
-    # Register this tokenizer with the main tokenizer manager
-    await tokenizer_manager.register_to_main_tokenizer_manager()
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     set_global_state(
