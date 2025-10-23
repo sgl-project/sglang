@@ -442,7 +442,8 @@ class DeepEPMoE(FusedMoE):
         assert self.moe_runner_config.activation == "silu"
         assert (
             hidden_states_scale.dtype == torch.float32
-        ), f"hidden_states_scale.dtype: {hidden_states_scale.dtype}"
+            or (deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and hidden_states_scale.dtype == torch.int32)
+        ), f"hidden_states_scale.dtype: {hidden_states_scale.dtype}, DEEPGEMM_SCALE_UE8M0: {deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0}"
 
         # GroupGemm-0
         num_groups, m, k = hidden_states.size()
