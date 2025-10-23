@@ -127,6 +127,12 @@ class SGLangTestBalanceAnalyzer:
                 estimated = int(estimated_str)
                 gap = elapsed - estimated
 
+                if self._is_abnormal_test_data(
+                    elapsed, estimated, log_content, filename
+                ):
+                    filtered_count += 1
+                    continue
+
                 test_times.append(
                     {
                         "filename": filename,
@@ -140,6 +146,15 @@ class SGLangTestBalanceAnalyzer:
 
         return test_times
 
+    def _is_abnormal_test_data(
+        self, elapsed: int, estimated: int, log_content: str, filename: str
+    ) -> bool:
+
+        if elapsed >= estimated * 3:
+            return True
+
+        return False
+
     def collect_test_balance_data(self, runs: List[Dict]) -> Dict[str, Dict]:
         print("Starting test balance data collection...")
 
@@ -149,16 +164,13 @@ class SGLangTestBalanceAnalyzer:
                 "max_elapsed": 0,
                 "max_estimated": 0,
                 "max_gap_run_info": {},
-                "second_max_gap": 0,
-                "second_max_elapsed": 0,
-                "second_max_estimated": 0,
-                "second_max_gap_run_info": {},
                 "total_runs": 0,
                 "all_gaps": [],
             }
         )
 
         total_tests_parsed = 0
+        abnormal_tests_filtered = 0
 
         target_job_prefixes = [
             "unit-test-frontend",
@@ -181,10 +193,6 @@ class SGLangTestBalanceAnalyzer:
 
         total_runs = len(runs)
         for i, run in enumerate(runs, 1):
-            if run is None:
-                print(f"Skipping run {i}/{total_runs}: run data is None")
-                continue
-
             if i % 10 == 0 or i == total_runs:
                 print(f"Processing run {i}/{total_runs}: #{run.get('run_number')}")
 
@@ -206,17 +214,9 @@ class SGLangTestBalanceAnalyzer:
             if pull_requests:
                 run_info["pr_number"] = pull_requests[0].get("number")
 
-            run_id = run.get("id")
-            if run_id is None:
-                print(f"Skipping run {i}/{total_runs}: run ID is None")
-                continue
-
-            all_jobs = self.get_all_jobs_for_run(run_id)
+            all_jobs = self.get_all_jobs_for_run(run.get("id"))
 
             for job in all_jobs:
-                if job is None:
-                    continue
-
                 job_name = job.get("name", "")
                 job_id = job.get("id")
 
@@ -247,32 +247,10 @@ class SGLangTestBalanceAnalyzer:
                     test_stats["all_gaps"].append(gap)
 
                     if gap > test_stats["max_gap"]:
-                        # Move current max to second max
-                        test_stats["second_max_gap"] = test_stats["max_gap"]
-                        test_stats["second_max_elapsed"] = test_stats["max_elapsed"]
-                        test_stats["second_max_estimated"] = test_stats["max_estimated"]
-                        test_stats["second_max_gap_run_info"] = test_stats[
-                            "max_gap_run_info"
-                        ]
-
-                        # Set new max
                         test_stats["max_gap"] = gap
                         test_stats["max_elapsed"] = elapsed
                         test_stats["max_estimated"] = estimated
                         test_stats["max_gap_run_info"] = {
-                            **run_info,
-                            "job_name": job_name,
-                            "job_url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}/job/{job_id}",
-                        }
-                    elif (
-                        gap > test_stats["second_max_gap"]
-                        and gap < test_stats["max_gap"]
-                    ):
-                        # Update second max only if it's smaller than max but larger than current second max
-                        test_stats["second_max_gap"] = gap
-                        test_stats["second_max_elapsed"] = elapsed
-                        test_stats["second_max_estimated"] = estimated
-                        test_stats["second_max_gap_run_info"] = {
                             **run_info,
                             "job_name": job_name,
                             "job_url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}/job/{job_id}",
@@ -300,6 +278,9 @@ class SGLangTestBalanceAnalyzer:
         print(
             f"Tests with large gaps (>300s): {len([t for t in sorted_tests if t[1]['max_gap'] > 300])}"
         )
+        print(
+            f"Note: Abnormal test data (due to failures/retries) has been filtered out"
+        )
 
         report_data = {
             "summary": {
@@ -316,11 +297,11 @@ class SGLangTestBalanceAnalyzer:
         }
 
         print(f"\nTop 50 PR Test GPU Jobs with Largest Time Gaps:")
-        print("-" * 150)
+        print("-" * 100)
         print(
-            f"{'Rank':<4} {'Test File':<40} {'Max Gap':<8} {'Max Elapsed':<12} {'Max Estimated':<15} {'Job Name':<25} {'2nd Gap':<8} {'2nd Elapsed':<12} {'2nd Estimated':<15} {'2nd Job':<25}"
+            f"{'Rank':<4} {'Test File':<40} {'Max Gap':<8} {'Max Elapsed':<12} {'Max Estimated':<15} {'Job Name':<25}"
         )
-        print("-" * 150)
+        print("-" * 100)
 
         for i, (filename, stats) in enumerate(sorted_tests[:50], 1):
             test_name = filename.split("/")[-1] if "/" in filename else filename
@@ -330,14 +311,8 @@ class SGLangTestBalanceAnalyzer:
                 else "Unknown"
             )
 
-            second_job_name = (
-                stats["second_max_gap_run_info"].get("job_name", "Unknown")
-                if stats["second_max_gap_run_info"]
-                else "Unknown"
-            )
-
             print(
-                f"{i:<4} {test_name:<40} {stats['max_gap']:<8} {stats['max_elapsed']:<12} {stats['max_estimated']:<15} {job_name:<25} {stats['second_max_gap']:<8} {stats['second_max_elapsed']:<12} {stats['second_max_estimated']:<15} {second_job_name:<25}"
+                f"{i:<4} {test_name:<40} {stats['max_gap']:<8} {stats['max_elapsed']:<12} {stats['max_estimated']:<15} {job_name:<25}"
             )
 
             report_data["test_balance_table"].append(
@@ -349,10 +324,6 @@ class SGLangTestBalanceAnalyzer:
                     "max_elapsed": stats["max_elapsed"],
                     "max_estimated": stats["max_estimated"],
                     "max_gap_run_info": stats["max_gap_run_info"],
-                    "second_max_gap": stats["second_max_gap"],
-                    "second_max_elapsed": stats["second_max_elapsed"],
-                    "second_max_estimated": stats["second_max_estimated"],
-                    "second_max_gap_run_info": stats["second_max_gap_run_info"],
                     "total_runs": stats["total_runs"],
                 }
             )
@@ -476,11 +447,6 @@ class SGLangTestBalanceAnalyzer:
                     "Max Estimated (s)",
                     "Job Name",
                     "Max Gap Job URL",
-                    "2nd Max Gap (s)",
-                    "2nd Max Elapsed (s)",
-                    "2nd Max Estimated (s)",
-                    "2nd Job Name",
-                    "2nd Max Gap Job URL",
                     "Total Runs",
                 ]
             )
@@ -497,17 +463,6 @@ class SGLangTestBalanceAnalyzer:
                     else "Unknown"
                 )
 
-                second_max_job_url = (
-                    test["second_max_gap_run_info"].get("job_url", "")
-                    if test["second_max_gap_run_info"]
-                    else ""
-                )
-                second_job_name = (
-                    test["second_max_gap_run_info"].get("job_name", "Unknown")
-                    if test["second_max_gap_run_info"]
-                    else "Unknown"
-                )
-
                 writer.writerow(
                     [
                         test["rank"],
@@ -518,11 +473,6 @@ class SGLangTestBalanceAnalyzer:
                         test["max_estimated"],
                         job_name,
                         max_job_url,
-                        test["second_max_gap"],
-                        test["second_max_elapsed"],
-                        test["second_max_estimated"],
-                        second_job_name,
-                        second_max_job_url,
                         test["total_runs"],
                     ]
                 )
