@@ -99,7 +99,7 @@ def req_inference(
     uds: str | None = None,
     weight_version: str | None = None,
 ) -> Callable[[list[tuple[str, str]]], None]:
-    rank = int(os.getenv("RANK", None))
+    rank = int(os.getenv("RANK", 0))
     src = rank // inference_parallel_size * inference_parallel_size
 
     def req_func(socket_paths: list[tuple[str, str]]):
