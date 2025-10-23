@@ -1,19 +1,7 @@
 // gRPC Router Implementation
 
-use crate::config::types::{
-    CircuitBreakerConfig as ConfigCircuitBreakerConfig,
-    HealthCheckConfig as ConfigHealthCheckConfig, RetryConfig,
-};
-use crate::core::{
-    BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig, Worker, WorkerType,
-};
-use crate::grpc::SglangSchedulerClient;
-use crate::metrics::RouterMetrics;
-use crate::policies::LoadBalancingPolicy;
-use crate::reasoning_parser::ParserFactory;
-use crate::routers::{RouterTrait, WorkerManagement};
-use crate::tokenizer::{factory, traits::Tokenizer};
-use crate::tool_parser::ParserRegistry;
+use std::{collections::HashMap, sync::Arc};
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -21,148 +9,199 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
-use tracing::{info, warn};
+use tokio::sync::RwLock;
+use tracing::debug;
+
+use super::{
+    context::SharedComponents,
+    pipeline::RequestPipeline,
+    responses::{self, BackgroundTaskInfo},
+};
+use crate::{
+    config::types::RetryConfig,
+    core::WorkerRegistry,
+    data_connector::{
+        SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
+    },
+    policies::PolicyRegistry,
+    protocols::{
+        chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    routers::RouterTrait,
+    server::AppContext,
+    tokenizer::traits::Tokenizer,
+    tool_parser::ParserFactory as ToolParserFactory,
+};
 
 /// gRPC router implementation for SGLang
-#[allow(dead_code)] // Fields will be used once implementation is complete
+#[derive(Clone)]
+#[allow(dead_code)]
 pub struct GrpcRouter {
-    /// Worker connections
-    workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
-    /// gRPC clients for each worker
-    grpc_clients: Arc<RwLock<HashMap<String, SglangSchedulerClient>>>,
-    /// Load balancing policy
-    policy: Arc<dyn LoadBalancingPolicy>,
-    /// Tokenizer for handling text encoding/decoding
+    worker_registry: Arc<WorkerRegistry>,
+    policy_registry: Arc<PolicyRegistry>,
     tokenizer: Arc<dyn Tokenizer>,
-    /// Reasoning parser factory for structured reasoning outputs
-    reasoning_parser_factory: ParserFactory,
-    /// Tool parser registry for function/tool calls
-    tool_parser_registry: &'static ParserRegistry,
-    /// Worker health checker
-    _health_checker: Option<HealthChecker>,
-    /// Configuration
-    timeout_secs: u64,
-    interval_secs: u64,
+    reasoning_parser_factory: ReasoningParserFactory,
+    tool_parser_factory: ToolParserFactory,
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
-    circuit_breaker_config: CircuitBreakerConfig,
+    configured_reasoning_parser: Option<String>,
+    configured_tool_parser: Option<String>,
+    pipeline: RequestPipeline,
+    shared_components: Arc<SharedComponents>,
+    // Storage backends for /v1/responses support
+    response_storage: SharedResponseStorage,
+    conversation_storage: SharedConversationStorage,
+    conversation_item_storage: SharedConversationItemStorage,
+    // Optional MCP manager for tool execution (enabled via SGLANG_MCP_CONFIG env var)
+    mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    // Background task handles for cancellation support (includes gRPC client for Python abort)
+    background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 }
 
 impl GrpcRouter {
     /// Create a new gRPC router
-    #[allow(clippy::too_many_arguments)]
-    pub async fn new(
-        worker_urls: Vec<String>,
-        policy: Arc<dyn LoadBalancingPolicy>,
-        timeout_secs: u64,
-        interval_secs: u64,
-        dp_aware: bool,
-        api_key: Option<String>,
-        retry_config: RetryConfig,
-        circuit_breaker_config: ConfigCircuitBreakerConfig,
-        health_check_config: ConfigHealthCheckConfig,
-        tokenizer_path_or_model: String,
-    ) -> Result<Self, String> {
-        // Update metrics
-        RouterMetrics::set_active_workers(worker_urls.len());
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
+        // Extract necessary components from context
+        let tokenizer = ctx
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "gRPC router requires tokenizer".to_string())?
+            .clone();
+        let reasoning_parser_factory = ctx
+            .reasoning_parser_factory
+            .as_ref()
+            .ok_or_else(|| "gRPC router requires reasoning parser factory".to_string())?
+            .clone();
+        let tool_parser_factory = ctx
+            .tool_parser_factory
+            .as_ref()
+            .ok_or_else(|| "gRPC router requires tool parser factory".to_string())?
+            .clone();
 
-        // Initialize tokenizer
-        let tokenizer = factory::create_tokenizer(&tokenizer_path_or_model)
-            .map_err(|e| format!("Failed to create tokenizer: {}", e))?;
+        let worker_registry = ctx.worker_registry.clone();
+        let policy_registry = ctx.policy_registry.clone();
 
-        // Initialize reasoning parser factory
-        let reasoning_parser_factory = ParserFactory::new();
+        // Extract storage backends from context
+        let response_storage = ctx.response_storage.clone();
+        let conversation_storage = ctx.conversation_storage.clone();
+        let conversation_item_storage = ctx.conversation_item_storage.clone();
 
-        // Get tool parser registry
-        let tool_parser_registry = ParserRegistry::new();
-
-        // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
-        let core_cb_config = CircuitBreakerConfig {
-            failure_threshold: circuit_breaker_config.failure_threshold,
-            success_threshold: circuit_breaker_config.success_threshold,
-            timeout_duration: Duration::from_secs(circuit_breaker_config.timeout_duration_secs),
-            window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
-        };
-
-        // Create gRPC clients for each worker
-        let mut grpc_clients = HashMap::new();
-        for url in &worker_urls {
-            match SglangSchedulerClient::connect(url).await {
-                Ok(client) => {
-                    grpc_clients.insert(url.clone(), client);
-                    info!("Connected to gRPC worker at {}", url);
-                }
-                Err(e) => {
-                    warn!("Failed to connect to gRPC worker at {}: {}", url, e);
-                    // Continue with other workers
+        // Optional MCP manager activation via env var path (config-driven gate)
+        let mcp_manager = match std::env::var("SGLANG_MCP_CONFIG").ok() {
+            Some(path) if !path.trim().is_empty() => {
+                match crate::mcp::McpConfig::from_file(&path).await {
+                    Ok(cfg) => match crate::mcp::McpClientManager::new(cfg).await {
+                        Ok(mgr) => Some(Arc::new(mgr)),
+                        Err(err) => {
+                            tracing::warn!("Failed to initialize MCP manager: {}", err);
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!("Failed to load MCP config from '{}': {}", path, err);
+                        None
+                    }
                 }
             }
-        }
+            _ => None,
+        };
 
-        if grpc_clients.is_empty() {
-            return Err("Failed to connect to any gRPC workers".to_string());
-        }
+        // Create shared components for pipeline
+        let shared_components = Arc::new(SharedComponents {
+            tokenizer: tokenizer.clone(),
+            tool_parser_factory: tool_parser_factory.clone(),
+            reasoning_parser_factory: reasoning_parser_factory.clone(),
+        });
 
-        // Create Worker trait objects with gRPC connection mode
-        let workers: Vec<Box<dyn Worker>> = worker_urls
-            .iter()
-            .map(|url| {
-                let worker = BasicWorker::with_connection_mode(
-                    url.clone(),
-                    WorkerType::Regular,
-                    crate::core::ConnectionMode::Grpc { port: None },
-                )
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
-                    timeout_secs: health_check_config.timeout_secs,
-                    check_interval_secs: health_check_config.check_interval_secs,
-                    endpoint: health_check_config.endpoint.clone(),
-                    failure_threshold: health_check_config.failure_threshold,
-                    success_threshold: health_check_config.success_threshold,
-                });
-                Box::new(worker) as Box<dyn Worker>
-            })
-            .collect();
-
-        // Initialize policy with workers if needed
-        if let Some(cache_aware) = policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_aware.init_workers(&workers);
-        }
-
-        let workers = Arc::new(RwLock::new(workers));
-        let health_checker = crate::core::start_health_checker(Arc::clone(&workers), interval_secs);
+        // Create pipeline
+        let pipeline = RequestPipeline::new_regular(
+            worker_registry.clone(),
+            policy_registry.clone(),
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            ctx.configured_tool_parser.clone(),
+            ctx.configured_reasoning_parser.clone(),
+        );
 
         Ok(GrpcRouter {
-            workers,
-            grpc_clients: Arc::new(RwLock::new(grpc_clients)),
-            policy,
+            worker_registry,
+            policy_registry,
             tokenizer,
             reasoning_parser_factory,
-            tool_parser_registry,
-            _health_checker: Some(health_checker),
-            timeout_secs,
-            interval_secs,
-            dp_aware,
-            api_key,
-            retry_config,
-            circuit_breaker_config: core_cb_config,
+            tool_parser_factory,
+            dp_aware: ctx.router_config.dp_aware,
+            api_key: ctx.router_config.api_key.clone(),
+            retry_config: ctx.router_config.effective_retry_config(),
+            configured_reasoning_parser: ctx.configured_reasoning_parser.clone(),
+            configured_tool_parser: ctx.configured_tool_parser.clone(),
+            pipeline,
+            shared_components,
+            response_storage,
+            conversation_storage,
+            conversation_item_storage,
+            mcp_manager,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Main route_chat implementation
+    async fn route_chat_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        debug!(
+            "Processing chat completion request for model: {:?}",
+            model_id
+        );
+
+        // Use pipeline for ALL requests (streaming and non-streaming)
+        self.pipeline
+            .execute_chat(
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                self.shared_components.clone(),
+            )
+            .await
+    }
+
+    /// Main route_generate implementation
+    async fn route_generate_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        debug!("Processing generate request for model: {:?}", model_id);
+
+        // Use pipeline for ALL requests (streaming and non-streaming)
+        self.pipeline
+            .execute_generate(
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                self.shared_components.clone(),
+            )
+            .await
     }
 }
 
 impl std::fmt::Debug for GrpcRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stats = self.worker_registry.stats();
         f.debug_struct("GrpcRouter")
-            .field("workers_count", &self.workers.read().unwrap().len())
-            .field("timeout_secs", &self.timeout_secs)
-            .field("interval_secs", &self.interval_secs)
+            .field("workers_count", &stats.total_workers)
             .field("dp_aware", &self.dp_aware)
             .finish()
     }
@@ -174,12 +213,13 @@ impl RouterTrait for GrpcRouter {
         self
     }
 
-    async fn health(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        // TODO: Implement actual generation test for gRPC
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Health generate not yet implemented for gRPC",
+        )
+            .into_response()
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
@@ -196,62 +236,102 @@ impl RouterTrait for GrpcRouter {
 
     async fn route_generate(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::GenerateRequest,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        self.route_generate_impl(headers, body, model_id).await
     }
 
     async fn route_chat(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::ChatCompletionRequest,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        self.route_chat_impl(headers, body, model_id).await
     }
 
     async fn route_completion(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::CompletionRequest,
+        _body: &CompletionRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
-    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        // Use responses module for ALL requests (streaming and non-streaming)
+        // Responses module handles:
+        // - Request validation (previous_response_id XOR conversation)
+        // - Loading response chain / conversation history from storage
+        // - Conversion: ResponsesRequest → ChatCompletionRequest
+        // - Execution through chat pipeline stages
+        // - Conversion: ChatCompletionResponse → ResponsesResponse
+        // - Response persistence
+        // - MCP tool loop wrapper (future)
+        responses::route_responses(
+            &self.pipeline,
+            Arc::new(body.clone()),
+            headers.cloned(),
+            model_id.map(|s| s.to_string()),
+            self.shared_components.clone(),
+            self.response_storage.clone(),
+            self.conversation_storage.clone(),
+            self.conversation_item_storage.clone(),
+            self.background_tasks.clone(),
+        )
+        .await
+    }
+
+    async fn get_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        response_id: &str,
+        _params: &ResponsesGetParams,
+    ) -> Response {
+        responses::get_response_impl(&self.response_storage, response_id).await
+    }
+
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        responses::cancel_response_impl(&self.response_storage, &self.background_tasks, response_id)
+            .await
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
-    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+    async fn route_embeddings(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &EmbeddingRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
-    async fn flush_cache(&self) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
-    async fn get_worker_loads(&self) -> Response {
+    async fn route_rerank(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &RerankRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
     fn router_type(&self) -> &'static str {
         "grpc"
-    }
-
-    fn readiness(&self) -> Response {
-        (StatusCode::SERVICE_UNAVAILABLE).into_response()
-    }
-}
-
-#[async_trait]
-impl WorkerManagement for GrpcRouter {
-    async fn add_worker(&self, _worker_url: &str) -> Result<String, String> {
-        Err("Not implemented".to_string())
-    }
-
-    fn remove_worker(&self, _worker_url: &str) {}
-
-    fn get_worker_urls(&self) -> Vec<String> {
-        vec![]
     }
 }

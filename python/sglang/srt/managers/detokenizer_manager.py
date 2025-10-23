@@ -24,17 +24,15 @@ import psutil
 import setproctitle
 import zmq
 
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
-    BatchEmbeddingOut,
+    BatchEmbeddingOutput,
     BatchMultimodalDecodeReq,
-    BatchMultimodalOut,
-    BatchStrOut,
-    BatchTokenIDOut,
+    BatchMultimodalOutput,
+    BatchStrOutput,
+    BatchTokenIDOutput,
     FreezeGCReq,
-    MultiTokenizerRegisterReq,
 )
-from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerMixin
+from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -42,6 +40,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
@@ -69,7 +68,7 @@ class DecodeStatus:
     sent_offset: int = 0
 
 
-class DetokenizerManager(MultiTokenizerMixin):
+class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -101,10 +100,9 @@ class DetokenizerManager(MultiTokenizerMixin):
 
         self._request_dispatcher = TypeBasedDispatcher(
             [
-                (BatchEmbeddingOut, self.handle_batch_embedding_out),
-                (BatchTokenIDOut, self.handle_batch_token_id_out),
+                (BatchEmbeddingOutput, self.handle_batch_embedding_out),
+                (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
-                (MultiTokenizerRegisterReq, lambda x: x),
                 (FreezeGCReq, self.handle_freeze_gc_req),
             ]
         )
@@ -142,14 +140,15 @@ class DetokenizerManager(MultiTokenizerMixin):
             if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
                 return output
             assert len(output) > 0
+            # NOTE: We can always assume the last token is the matched stop token
             return output[:-1]
         return output
 
-    def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):
+    def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOutput):
         # If it is embedding model, no detokenization is needed.
         return recv_obj
 
-    def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
+    def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
 
         # Initialize decode status
@@ -224,8 +223,9 @@ class DetokenizerManager(MultiTokenizerMixin):
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
-        return BatchStrOut(
+        return BatchStrOutput(
             rids=recv_obj.rids,
+            http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
             output_ids=recv_obj.decode_ids,
@@ -233,6 +233,7 @@ class DetokenizerManager(MultiTokenizerMixin):
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
             spec_verify_ct=recv_obj.spec_verify_ct,
+            spec_accepted_tokens=recv_obj.spec_accepted_tokens,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,
@@ -245,18 +246,25 @@ class DetokenizerManager(MultiTokenizerMixin):
             input_token_ids_logprobs_idx=recv_obj.input_token_ids_logprobs_idx,
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
+            output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
+            token_steps=recv_obj.token_steps,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
         outputs = self.tokenizer.detokenize(recv_obj)
-        return BatchMultimodalOut(
+        return BatchMultimodalOutput(
             rids=recv_obj.rids,
+            http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             outputs=outputs,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
@@ -289,11 +297,11 @@ def run_detokenizer_process(
     try:
         manager = DetokenizerManager(server_args, port_args)
         if server_args.tokenizer_worker_num > 1:
-            manager.multi_tokenizer_manager_event_loop()
+            manager.multi_http_worker_event_loop()
         else:
             manager.event_loop()
     except Exception:
-        manager.clear_tokenizer_mapping()
+        manager.maybe_clear_socket_mapping()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)

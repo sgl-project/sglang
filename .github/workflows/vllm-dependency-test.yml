@@ -7,12 +7,16 @@ on:
       - "python/**"
       - "scripts/ci/**"
       - "test/**"
+      - ".github/workflows/vllm-dependency-test.yml"
   pull_request:
     branches: [ main ]
     paths:
       - "python/**"
       - "scripts/ci/**"
       - "test/**"
+      - ".github/workflows/vllm-dependency-test.yml"
+    types: [synchronize, labeled]
+  workflow_dispatch:
 
 concurrency:
   group: vllm-dependency-test-${{ github.ref }}
@@ -20,8 +24,7 @@ concurrency:
 
 jobs:
   vllm-dependency-test:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -32,12 +35,8 @@ jobs:
           bash scripts/ci/ci_install_dependency.sh
           pip install "bitsandbytes>=0.44.0"
 
-          pip install "sgl-kernel==0.3.7"
-
       - name: Run vLLM dependency tests
-        timeout-minutes: 60
+        timeout-minutes: 30
         run: |
-          export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
-
           cd test/srt
-          python3 run_suite.py --suite vllm_dependency_test --timeout-per-file 3600
+          python3 run_suite.py --suite vllm_dependency_test

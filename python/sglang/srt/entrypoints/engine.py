@@ -30,8 +30,8 @@ import time
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
-import zmq.asyncio
-from PIL.Image import Image
+
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -45,6 +45,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -65,7 +66,6 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
@@ -75,10 +75,12 @@ from sglang.srt.utils import (
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
+    maybe_reindex_device_id,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -137,6 +139,18 @@ class Engine(EngineBase):
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
+
+        if server_args.enable_trace:
+            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+            if server_args.disaggregation_mode == "null":
+                thread_label = "Tokenizer"
+                trace_set_thread_info(thread_label)
+
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
 
     def generate(
         self,
@@ -201,7 +215,6 @@ class Engine(EngineBase):
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
         )
-        loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream:
@@ -209,14 +222,14 @@ class Engine(EngineBase):
             def generator_wrapper():
                 while True:
                     try:
-                        chunk = loop.run_until_complete(generator.__anext__())
+                        chunk = self.loop.run_until_complete(generator.__anext__())
                         yield chunk
                     except StopAsyncIteration:
                         break
 
             return generator_wrapper()
         else:
-            ret = loop.run_until_complete(generator.__anext__())
+            ret = self.loop.run_until_complete(generator.__anext__())
             return ret
 
     async def async_generate(
@@ -308,9 +321,8 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
         )
-        loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
-        ret = loop.run_until_complete(generator.__anext__())
+        ret = self.loop.run_until_complete(generator.__anext__())
         return ret
 
     async def async_encode(
@@ -344,9 +356,8 @@ class Engine(EngineBase):
         Please refer to `EmbeddingReqInput` for the documentation.
         """
         obj = EmbeddingReqInput(text=prompt, is_cross_encoder_request=True)
-        loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
-        ret = loop.run_until_complete(generator.__anext__())
+        ret = self.loop.run_until_complete(generator.__anext__())
         return ret
 
     def shutdown(self):
@@ -361,38 +372,31 @@ class Engine(EngineBase):
         return False
 
     def flush_cache(self):
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.flush_cache())
+        return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
-    def start_profile(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.start_profile())
+    def start_profile(self, **kwargs):
+        self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
 
     def stop_profile(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.stop_profile())
+        self.loop.run_until_complete(self.tokenizer_manager.stop_profile())
 
     def start_expert_distribution_record(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(
+        self.loop.run_until_complete(
             self.tokenizer_manager.start_expert_distribution_record()
         )
 
     def stop_expert_distribution_record(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(
+        self.loop.run_until_complete(
             self.tokenizer_manager.stop_expert_distribution_record()
         )
 
     def dump_expert_distribution_record(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(
+        self.loop.run_until_complete(
             self.tokenizer_manager.dump_expert_distribution_record()
         )
 
     def get_server_info(self):
-        loop = asyncio.get_event_loop()
-        internal_states = loop.run_until_complete(
+        internal_states = self.loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
         return {
@@ -420,9 +424,20 @@ class Engine(EngineBase):
             group_name=group_name,
             backend=backend,
         )
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.init_weights_update_group(obj, None)
+        )
+
+    def destroy_weights_update_group(
+        self,
+        group_name: str,
+    ):
+        """Destroy parameter update group."""
+        obj = DestroyWeightsUpdateGroupReqInput(
+            group_name=group_name,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.destroy_weights_update_group(obj, None)
         )
 
     def update_weights_from_distributed(
@@ -441,8 +456,7 @@ class Engine(EngineBase):
             group_name=group_name,
             flush_cache=flush_cache,
         )
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
         )
 
@@ -466,9 +480,7 @@ class Engine(EngineBase):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        loop = asyncio.get_event_loop()
-
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
 
@@ -488,16 +500,14 @@ class Engine(EngineBase):
             load_format=load_format,
         )
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_disk(obj, None)
         )
 
     def get_weights_by_name(self, name: str, truncate_size: int = 100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
@@ -510,8 +520,7 @@ class Engine(EngineBase):
             pinned=pinned,
         )
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.load_lora_adapter(obj, None)
         )
 
@@ -520,22 +529,19 @@ class Engine(EngineBase):
 
         obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.unload_lora_adapter(obj, None)
         )
 
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.release_memory_occupation(obj, None)
         )
 
     def resume_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
         )
 
@@ -552,8 +558,7 @@ class Engine(EngineBase):
         collection.
         """
 
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.freeze_gc())
+        self.loop.run_until_complete(self.tokenizer_manager.freeze_gc())
 
     """
     Execute an RPC call on all scheduler processes.
@@ -611,8 +616,7 @@ class Engine(EngineBase):
             ValueError: If query is not provided, or if items is not provided,
                       or if token IDs are out of vocabulary, or if logprobs are not available for the specified tokens.
         """
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.score_request(
                 query=query,
                 items=items,
@@ -655,7 +659,15 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
     # flashinfer uses this environment variable for various kernels from MoE to quant kernels
-    os.environ["TRTLLM_ENABLE_PDL"] = "1"
+    if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
+        os.environ["TRTLLM_ENABLE_PDL"] = "1"
+
+    if os.environ.get("CUTE_DSL_LOG_LEVEL") is None:
+        # Default to warning level, to avoid too many logs
+        os.environ["CUTE_DSL_LOG_LEVEL"] = "30"
+    if os.environ.get("CUTE_DSL_LOG_TO_CONSOLE") is None:
+        # Need to set log to console, otherwise the log level won't take effect
+        os.environ["CUTE_DSL_LOG_TO_CONSOLE"] = "1"
 
     # Can also be passed as argument
     os.environ["SGLANG_RUN_ID"] = (
@@ -673,7 +685,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.3.0",
+            "0.4.1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -681,7 +693,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.8",
+            "0.3.16.post3",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -701,6 +713,24 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+
+
+def _init_tokenizer_manager(
+    server_args: ServerArgs, port_args: PortArgs
+) -> TokenizerManager:
+    # Launch tokenizer process
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+
+    # Initialize templates
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
+    )
+
+    return tokenizer_manager, template_manager
 
 
 def _launch_subprocesses(
@@ -753,23 +783,24 @@ def _launch_subprocesses(
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-                proc = mp.Process(
-                    target=run_scheduler_process,
-                    args=(
-                        server_args,
-                        port_args,
-                        gpu_id,
-                        tp_rank,
-                        moe_ep_rank,
-                        pp_rank,
-                        None,
-                        writer,
-                        None,
-                    ),
-                )
 
-                with memory_saver_adapter.configure_subprocess():
-                    proc.start()
+                with maybe_reindex_device_id(gpu_id) as gpu_id:
+                    proc = mp.Process(
+                        target=run_scheduler_process,
+                        args=(
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                        ),
+                    )
+                    with memory_saver_adapter.configure_subprocess():
+                        proc.start()
+
                 scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
     else:
@@ -815,23 +846,15 @@ def _launch_subprocesses(
         ),
     )
     detoken_proc.start()
+
+    # Init tokenizer manager first, as the bootstrap server is initialized here
     if server_args.tokenizer_worker_num > 1:
         # Launch multi-tokenizer router
         tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-
-        # Initialize templates
         template_manager = None
     else:
-        # Launch tokenizer process
-        tokenizer_manager = TokenizerManager(server_args, port_args)
-
-        # Initialize templates
-        template_manager = TemplateManager()
-        template_manager.initialize_templates(
-            tokenizer_manager=tokenizer_manager,
-            model_path=server_args.model_path,
-            chat_template=server_args.chat_template,
-            completion_template=server_args.completion_template,
+        tokenizer_manager, template_manager = _init_tokenizer_manager(
+            server_args, port_args
         )
 
     # Wait for the model to finish loading
@@ -855,5 +878,7 @@ def _launch_subprocesses(
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
+
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
     return tokenizer_manager, template_manager, scheduler_info
