@@ -306,9 +306,12 @@ def _is_extend_without_speculative(forward_batch):
 def _handle_attention_backend(
     attn: DeepseekV2AttentionMLA, forward_batch, backend_name
 ):
-    if get_global_server_args().enable_deterministic_inference and backend_name == "fa3":
+    if (
+        get_global_server_args().enable_deterministic_inference
+        and backend_name == "fa3"
+    ):
         return _dispatch_mla_subtype(attn, forward_batch)
-        
+
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
     disable_ragged = (
         backend_name in ["flashinfer", "flashmla"]
