@@ -1481,7 +1481,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_estimate_ratio = (
             total_decoded_tokens
             + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(self.reqs)
-        ) / total_max_new_tokens
+        ) / (
+            total_max_new_tokens + 1
+        )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio, []
