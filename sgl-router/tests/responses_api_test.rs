@@ -14,10 +14,7 @@ use common::{
     mock_mcp_server::MockMCPServer,
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
-use sglang_router_rs::{
-    config::RouterConfig,
-    routers::RouterFactory,
-};
+use sglang_router_rs::{config::RouterConfig, routers::RouterFactory};
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
