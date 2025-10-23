@@ -1131,7 +1131,7 @@ def _silu_and_mul_post_per_tensor_quant_kernel(
     offset_d = block_id_dim * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_d = offset_d < inner_dim
 
-    # 计算 base pointers for current expert and dim block
+    # base pointers for current expert and dim block
     input_base_offs = input_ptr + expert_id * stride_input_expert + offset_d
     output_base_offs = output_ptr + expert_id * stride_output_expert + offset_d
 
