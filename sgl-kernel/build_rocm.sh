@@ -117,26 +117,26 @@ echo "Pulling Docker image: ${IMAGE}"
 docker pull "${IMAGE}"
 
 docker run --rm \
-   -v $(pwd):/sgl-kernel \
-   -e AMDGPU_TARGET="${AMDGPU_TARGET}" \
-   ${IMAGE} \
-   bash -c "
-   # Install CMake (version >= 3.26) - Robust Installation
-   export CMAKE_VERSION_MAJOR=3.31
-   export CMAKE_VERSION_MINOR=1
-   echo \"Downloading CMake from: https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64.tar.gz\"
-   wget https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64.tar.gz
-   tar -xzf cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64.tar.gz
-   mv cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64 /opt/cmake
-   export PATH=/opt/cmake/bin:\$PATH
+  -v $(pwd):/sgl-kernel \
+  -e AMDGPU_TARGET="${AMDGPU_TARGET}" \
+  ${IMAGE} \
+  bash -c "
+  # Install CMake (version >= 3.26) - Robust Installation
+  export CMAKE_VERSION_MAJOR=3.31
+  export CMAKE_VERSION_MINOR=1
+  echo \"Downloading CMake from: https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64.tar.gz\"
+  wget https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64.tar.gz
+  tar -xzf cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64.tar.gz
+  mv cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64 /opt/cmake
+  export PATH=/opt/cmake/bin:\$PATH
 
-    ${PYTHON_ROOT_PATH}/pip uninstall -y torch torchvision && \
-    ${TORCH_INSTALL_CMD} && \
-    ${PYTHON_ROOT_PATH}/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core && \
+  ${PYTHON_ROOT_PATH}/pip uninstall -y torch torchvision && \
+  ${TORCH_INSTALL_CMD} && \
+  ${PYTHON_ROOT_PATH}/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core && \
 
-    cd /sgl-kernel && \
-    rm -rf CMakeLists.txt && mv CMakeLists_rocm.txt CMakeLists.txt && \
-    ${PYTHON_ROOT_PATH}/python rocm_hipify.py && \
-    ${PYTHON_ROOT_PATH}/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
-   ./rename_wheels_rocm.sh
+  cd /sgl-kernel && \
+  rm -rf CMakeLists.txt && mv CMakeLists_rocm.txt CMakeLists.txt && \
+  ${PYTHON_ROOT_PATH}/python rocm_hipify.py && \
+  ${PYTHON_ROOT_PATH}/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
+  ./rename_wheels_rocm.sh
 "
