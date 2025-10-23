@@ -248,7 +248,6 @@ class SchedulerMetricsMixin:
 
         msg = f"Decode batch [{self.forward_ct}], #running-req: {num_running_reqs}, {token_usage_msg}"
 
-
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
             spec_accept_rate = 0
