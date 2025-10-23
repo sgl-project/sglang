@@ -112,7 +112,7 @@ suites = {
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_request_queue_validation.py", 30),
-        TestFile("test_retract_decode.py", 54),
+        TestFile("test_retract_decode.py", 90),
         TestFile("test_score_api.py", 310),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
@@ -135,6 +135,8 @@ suites = {
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_vision_openai_server_a.py", 918),
         TestFile("test_vlm_input_format.py", 300),
+        TestFile("test_modelopt_loader.py", 30),
+        TestFile("test_modelopt_export.py", 30),
     ],
     "per-commit-2-gpu": [
         TestFile("ep/test_moe_ep.py", 140),

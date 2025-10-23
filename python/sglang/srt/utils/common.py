@@ -1623,13 +1623,18 @@ def get_cpu_memory_capacity():
         for numa_id in range(n_numa_node):
             file_meminfo = f"node{numa_id}/meminfo"
             with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # 1st line contains 'MemTotal'
-                line = f.read().split("\n")[0]
-                numa_mem_list.append(int(line.split()[3]))
+                # MemTotal info is at the 1st line
+                line = f.readline()
+                # Expected format: "Node 0 MemTotal:       100000000 kB"
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] == "MemTotal:":
+                    numa_mem_list.append(int(parts[3]))
+                else:
+                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
         # Retrieved value in KB, need MB
         numa_mem = float(min(numa_mem_list) // 1024)
         return numa_mem
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError, IndexError):
         numa_mem = psutil.virtual_memory().total / n_numa_node
         # Retrieved value in Byte, need MB
         return float(numa_mem // (1 << 20))
@@ -2409,6 +2414,29 @@ def retry(
             )
 
             time.sleep(delay)
+
+
+def has_hf_quant_config(model_path: str) -> bool:
+    """Check if the model path contains hf_quant_config.json file.
+
+    Args:
+        model_path: Path to the model, can be local path or remote URL.
+
+    Returns:
+        True if hf_quant_config.json exists, False otherwise.
+    """
+    if is_remote_url(model_path):
+        try:
+            from huggingface_hub import HfApi
+
+            hf_api = HfApi()
+            return hf_api.file_exists(model_path, "hf_quant_config.json")
+        except Exception:
+            return False
+    else:
+        import os
+
+        return os.path.exists(os.path.join(model_path, "hf_quant_config.json"))
 
 
 def flatten_nested_list(nested_list):
