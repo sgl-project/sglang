@@ -1,9 +1,11 @@
 import timeit
-from typing import List, Tuple, Type, Callable, Any
+from typing import Any, Callable, List, Tuple, Type
+
 from sglang.srt.utils import TypeBasedDispatcher
 
+
 class TypeBasedDispatcherList:
-    '''origin implementation of TypeBasedDispatcher'''
+    """origin implementation of TypeBasedDispatcher"""
 
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
         self._mapping = mapping
@@ -15,25 +17,34 @@ class TypeBasedDispatcherList:
                 return fn(obj)
         raise ValueError(f"Invalid object: {obj}")
 
+
 def create_test_mapping(num_types=30):
     types = [type(f"RequestType{i}", (), {}) for i in range(num_types)]
 
     def create_handler(i):
         def handler(req):
             return f"handler{i}"
+
         return handler
+
     handlers = [create_handler(i) for i in range(num_types)]
 
     return list(zip(types, handlers))
+
 
 def test_inheritance():
     print("\n"+"=" * 60)
     print("test for inheritance")
     print("=" * 60)
 
-    class BaseRequest: pass
-    def base_handler(req): return "base_handler"
-    class DerivedRequest(BaseRequest): pass
+    class BaseRequest:
+        pass
+
+    def base_handler(req):
+        return "base_handler"
+
+    class DerivedRequest(BaseRequest):
+        pass
 
     mapping = [(BaseRequest, base_handler)]
     dict_dispatcher = TypeBasedDispatcher(mapping)
@@ -41,24 +52,34 @@ def test_inheritance():
     derived_obj = DerivedRequest()
     expected = "base_handler"
 
-    #This test will fail with the current implementation, but pass with the suggested MRO-based fix
+    # This test will fail with the current implementation, but pass with the suggested MRO-based fix
     result_dict = dict_dispatcher(derived_obj)
     assert result_dict == expected, f"Expected '{expected}', but got '{result_dict}'"
     print("Pass: dict dispatcher handles inheritance.")
 
-def benchmark_with_inheritance():
 
+def benchmark_with_inheritance():
     """Performance test with inheritance scenarios"""
     print("\nBenchmarking with inheritance scenarios...")
 
     # Create type hierarchy with inheritance relationships
-    class BaseType: pass
-    class ChildType1(BaseType): pass
-    class ChildType2(BaseType): pass
-    class GrandChildType(ChildType1): pass
-    class UnrelatedType: pass
+    class BaseType:
+        pass
 
-    def base_handler(obj): return "handled"
+    class ChildType1(BaseType):
+        pass
+
+    class ChildType2(BaseType):
+        pass
+
+    class GrandChildType(ChildType1):
+        pass
+
+    class UnrelatedType:
+        pass
+
+    def base_handler(obj):
+        return "handled"
 
     mapping = [(BaseType, base_handler)]
     dispatcher = TypeBasedDispatcher(mapping)
@@ -68,7 +89,7 @@ def benchmark_with_inheritance():
         ChildType1(),
         ChildType2(),
         GrandChildType(),
-        UnrelatedType()
+        UnrelatedType(),
     ]
 
     # Test first call (includes MRO lookup)
@@ -85,9 +106,12 @@ def benchmark_with_inheritance():
             time_taken = timeit.timeit(lambda: dispatcher(case), number=1000)
             cached_call_times.append(time_taken)
 
-    print(f"First call (with MRO lookup): {sum(first_call_times)/len(first_call_times):.6f}s avg")
+    print(
+        f"First call (with MRO lookup): {sum(first_call_times)/len(first_call_times):.6f}s avg"
+    )
     print(f"Cached call: {sum(cached_call_times)/len(cached_call_times):.6f}s avg")
     print(f"Caching improvement: {sum(first_call_times)/sum(cached_call_times):.2f}x")
+
 
 def benchmark_dispatchers():
     mapping = create_test_mapping(30)
@@ -100,7 +124,7 @@ def benchmark_dispatchers():
 
     test_scenarios = [
         ("the first", [test_cases[0]] * 1000),
-        ("the middle", [test_cases[len(test_cases)//2]] * 1000),
+        ("the middle", [test_cases[len(test_cases) // 2]] * 1000),
         ("the last", [test_cases[-1]] * 1000),
         ("the random", test_cases * 1000),
     ]
@@ -114,13 +138,11 @@ def benchmark_dispatchers():
         print(f"\ntest numbers: {len(cases)}")
 
         list_time = timeit.timeit(
-            lambda: [list_dispatcher(case) for case in cases],
-            number=10
+            lambda: [list_dispatcher(case) for case in cases], number=10
         )
 
         dict_time = timeit.timeit(
-            lambda: [dist_dispatcher(case) for case in cases],
-            number=10
+            lambda: [dist_dispatcher(case) for case in cases], number=10
         )
 
         print(f"for list: {list_time:.4f} s")
@@ -147,6 +169,7 @@ def test_memory_usage():
     print(f"memory used by dict version: {dict_size} bytes")
     print(f"compare memory used by the two version: {dict_size - list_size} bytes")
 
+
 def test_edge_case():
     """test for edge case"""
     print("\n" + "=" * 60)
@@ -164,7 +187,8 @@ def test_edge_case():
     assert result1 == result2
     print("Pass for normal test")
 
-    class UnkownType: pass
+    class UnkownType:
+        pass
 
     try:
         list_dispatcher(UnkownType())
@@ -187,6 +211,7 @@ def simulate_real_workload():
     print("=" * 60)
 
     from collections import Counter
+
     mapping = create_test_mapping(30)
 
     request_distribution = {
@@ -206,21 +231,21 @@ def simulate_real_workload():
 
     remaining = 1000 - len(test_requests)
     for i in range(remaining):
-        test_requests.append(mapping[ i  % len(mapping)][0]())
+        test_requests.append(mapping[i % len(mapping)][0]())
 
     list_time = timeit.timeit(
-        lambda: [list_dispatcher(req) for req in test_requests],
-        number=100
+        lambda: [list_dispatcher(req) for req in test_requests], number=100
     )
 
     dict_time = timeit.timeit(
-        lambda: [dict_dispatcher(req) for req in test_requests],
-        number=100
+        lambda: [dict_dispatcher(req) for req in test_requests], number=100
     )
 
     print(f"list version: {list_time:.4f} s")
     print(f"dict version: {dict_time:.4f} s")
     print(f"improvement: {list_time/dict_time:.2f} x")
+
+
 if __name__ == "__main__":
     benchmark_dispatchers()
     test_memory_usage()
@@ -228,4 +253,3 @@ if __name__ == "__main__":
     simulate_real_workload()
     test_inheritance()
     benchmark_with_inheritance()
-
