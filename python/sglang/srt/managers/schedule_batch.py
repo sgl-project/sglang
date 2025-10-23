@@ -892,7 +892,6 @@ class Req:
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
-        self.req_pool_idx = None
         self.mamba_pool_idx = None
         self.already_computed = 0
 
@@ -1489,7 +1488,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_estimate_ratio = (
             total_decoded_tokens
             + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(self.reqs)
-        ) / total_max_new_tokens
+        ) / (
+            total_max_new_tokens + 1
+        )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio, []
@@ -1787,6 +1788,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Only contain fields that will be used by process_batch_result
         return ScheduleBatch(
             reqs=self.reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,

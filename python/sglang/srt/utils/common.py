@@ -42,6 +42,7 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 import uuid
 import warnings
 from collections import OrderedDict, defaultdict
@@ -55,6 +56,7 @@ from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -62,6 +64,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Sequence,
     Set,
     Tuple,
     TypeVar,
@@ -90,6 +93,9 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 
 logger = logging.getLogger(__name__)
 
@@ -452,7 +458,15 @@ def get_available_gpu_memory(
 
         if empty_cache:
             torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+        SHARED_SYSMEM_DEVICE_MEM_SMS = (87, 110, 121)  # Orin, Thor, Spark
+        if get_device_sm() in SHARED_SYSMEM_DEVICE_MEM_SMS:
+            # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
+            # only reports "free" memory, which can be lower than what is actually
+            # available due to not including cache memory. So we use the system available
+            # memory metric instead.
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
@@ -496,6 +510,8 @@ def get_available_gpu_memory(
                 f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
                 "which may cause useless memory allocation for torch NPU context.",
             )
+        if empty_cache:
+            torch.npu.empty_cache()
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
 
     if distributed:
@@ -1068,7 +1084,7 @@ def monkey_patch_vllm_gguf_config():
 
     def get_quant_method_with_embedding_replaced(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         if isinstance(layer, LinearBase):
             return GGUFLinearMethod(self)
         elif isinstance(layer, VocabParallelEmbedding):
@@ -1609,13 +1625,18 @@ def get_cpu_memory_capacity():
         for numa_id in range(n_numa_node):
             file_meminfo = f"node{numa_id}/meminfo"
             with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # 1st line contains 'MemTotal'
-                line = f.read().split("\n")[0]
-                numa_mem_list.append(int(line.split()[3]))
+                # MemTotal info is at the 1st line
+                line = f.readline()
+                # Expected format: "Node 0 MemTotal:       100000000 kB"
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] == "MemTotal:":
+                    numa_mem_list.append(int(parts[3]))
+                else:
+                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
         # Retrieved value in KB, need MB
         numa_mem = float(min(numa_mem_list) // 1024)
         return numa_mem
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError, IndexError):
         numa_mem = psutil.virtual_memory().total / n_numa_node
         # Retrieved value in Byte, need MB
         return float(numa_mem // (1 << 20))
@@ -1948,7 +1969,9 @@ def direct_register_custom_op(
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
-        if "Tried to register an operator" in str(e) and "multiple times" in str(e):
+        if "Tried to register an operator" in str(error) and "multiple times" in str(
+            error
+        ):
             # Silently ignore duplicate registration errors
             # This can happen in multi-engine scenarios
             pass
@@ -2254,6 +2277,11 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
 
     app = FastAPI()
 
+    @app.get("/ping")
+    async def ping():
+        """Could be used by the checkpoint-engine update script to confirm the server is up."""
+        return Response(status_code=200)
+
     @app.get("/health")
     async def health():
         """Check the health of the http server."""
@@ -2393,6 +2421,26 @@ def retry(
             )
 
             time.sleep(delay)
+
+
+def has_hf_quant_config(model_path: str) -> bool:
+    """Check if the model path contains hf_quant_config.json file.
+
+    Args:
+        model_path: Path to the model, can be local path or remote URL.
+
+    Returns:
+        True if hf_quant_config.json exists, False otherwise.
+    """
+    if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
+        return True
+    try:
+        from huggingface_hub import HfApi
+
+        hf_api = HfApi()
+        return hf_api.file_exists(model_path, "hf_quant_config.json")
+    except Exception:
+        return False
 
 
 def flatten_nested_list(nested_list):

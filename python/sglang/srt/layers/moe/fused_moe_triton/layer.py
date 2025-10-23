@@ -49,7 +49,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_flashinfer_available,
     is_hip,
-    next_power_of_2,
     round_up,
 )
 
@@ -72,21 +71,11 @@ if should_use_flashinfer_trtllm_moe():
 logger = logging.getLogger(__name__)
 
 
-def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
-    # Guess tokens per expert assuming perfect expert distribution first.
-    num_tokens_per_expert = (num_tokens * top_k) // num_experts
-    # And pad the number to the next power of 2.
-    tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
-    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
-    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-    return tile_tokens_dim
-
-
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none():
         return StandardDispatcher(moe_runner_config)
-    elif a2a_backend.is_deepep():
+    elif a2a_backend.is_deepep() or a2a_backend.is_mooncake():
         return MaybeTboDeepEPDispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
@@ -1080,9 +1069,7 @@ class FlashInferFP4MoE(FusedMoE):
             local_expert_offset=self.moe_ep_rank * self.num_local_experts,
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
-            tile_tokens_dim=_get_tile_tokens_dim(
-                hidden_states.shape[0], topk_config.top_k, self.num_local_experts
-            ),
+            tile_tokens_dim=None,
             routing_method_type=RoutingMethodType.DeepSeekV3,
             do_finalize=True,
         )[0]

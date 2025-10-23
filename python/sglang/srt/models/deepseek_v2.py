@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import tqdm
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -188,6 +189,10 @@ elif _is_npu:
     import custom_ops  # noqa: F401
     import sgl_kernel_npu  # noqa: F401
     import torch_npu  # noqa: F401
+
+    from sglang.srt.layers.quantization.awq_triton import (
+        awq_dequantize_decomposition as awq_dequantize,
+    )
 else:
     pass
 
@@ -2964,7 +2969,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             )
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # AWQ compatible
-                if _is_cuda or _is_hip:
+                if _is_cuda or _is_hip or _is_npu:
                     w = awq_dequantize(
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,
@@ -3499,7 +3504,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         # temporarily only support DeepSeek V3/R1
         weight_block_size = [128, 128]
 
-        for layer_id in trange(
+        for layer_id in tqdm.trange(
             self.config.num_hidden_layers + int(is_nextn),
             desc="quant attn to fp8 ue8m0",
         ):
