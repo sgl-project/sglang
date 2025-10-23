@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use clap::{ArgAction, Parser, ValueEnum};
 use sglang_router_rs::{
     config::{
-        CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-        HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig,
-        RouterConfig, RoutingMode, TokenizerCacheConfig,
+        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
+        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig, RouterConfig,
+        RoutingMode, TokenizerCacheConfig,
     },
+    core::ConnectionMode,
     metrics::PrometheusConfig,
     server::{self, ServerConfig},
     service_discovery::ServiceDiscoveryConfig,
@@ -325,7 +326,7 @@ impl CliArgs {
     fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-                return ConnectionMode::Grpc;
+                return ConnectionMode::Grpc { port: None };
             }
         }
         ConnectionMode::Http
