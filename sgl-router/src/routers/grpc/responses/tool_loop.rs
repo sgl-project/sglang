@@ -414,12 +414,10 @@ pub(super) async fn execute_tool_loop(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
-                ResponseInput::Items(items) => {
-                    items
-                        .iter()
-                        .map(crate::protocols::responses::normalize_input_item)
-                        .collect()
-                }
+                ResponseInput::Items(items) => items
+                    .iter()
+                    .map(crate::protocols::responses::normalize_input_item)
+                    .collect(),
             };
 
             // Append all conversation history (function calls and outputs)
