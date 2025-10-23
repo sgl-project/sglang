@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import os
 import time
 import uuid
 from collections import deque
@@ -46,7 +45,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
-    MultiTokenizerWrapper,
     OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
@@ -83,8 +81,6 @@ logger = logging.getLogger(__name__)
 class _Communicator(Generic[T]):
     """Note: The communicator now only run up to 1 in-flight request at any time."""
 
-    enable_multi_tokenizer = False
-
     def __init__(self, sender: zmq.Socket, fan_out: int, mode="queueing"):
         self._sender = sender
         self._fan_out = fan_out
@@ -104,8 +100,6 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
-            if _Communicator.enable_multi_tokenizer:
-                obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()
@@ -126,8 +120,6 @@ class _Communicator(Generic[T]):
             self._result_event = asyncio.Event()
 
             if obj:
-                if _Communicator.enable_multi_tokenizer:
-                    obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
                 self._sender.send_pyobj(obj)
 
         await self._result_event.wait()
@@ -617,8 +609,6 @@ class TokenizerCommunicatorMixin:
         elif obj.session_id in self.session_futures:
             return None
 
-        if self.server_args.tokenizer_worker_num > 1:
-            obj = MultiTokenizerWrapper(self.worker_id, obj)
         self.send_to_scheduler.send_pyobj(obj)
 
         self.session_futures[obj.session_id] = asyncio.Future()
@@ -638,43 +628,27 @@ class TokenizerCommunicatorMixin:
         if self.log_requests:
             if self.log_requests_level == 0:
                 max_length = 1 << 30
-                skip_names = set(
-                    [
-                        "text",
-                        "input_ids",
-                        "input_embeds",
-                        "image_data",
-                        "audio_data",
-                        "lora_path",
-                        "sampling_params",
-                    ]
-                )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                        "embedding",
-                    ]
-                )
+                skip_names = {
+                    "text",
+                    "input_ids",
+                    "input_embeds",
+                    "image_data",
+                    "audio_data",
+                    "lora_path",
+                    "sampling_params",
+                }
+                out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 1:
                 max_length = 1 << 30
-                skip_names = set(
-                    [
-                        "text",
-                        "input_ids",
-                        "input_embeds",
-                        "image_data",
-                        "audio_data",
-                        "lora_path",
-                    ]
-                )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                        "embedding",
-                    ]
-                )
+                skip_names = {
+                    "text",
+                    "input_ids",
+                    "input_embeds",
+                    "image_data",
+                    "audio_data",
+                    "lora_path",
+                }
+                out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 2:
                 max_length = 2048
             elif self.log_requests_level == 3:
