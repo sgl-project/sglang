@@ -2425,18 +2425,15 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
-    if is_remote_url(model_path):
-        try:
-            from huggingface_hub import HfApi
+    if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
+        return True
+    try:
+        from huggingface_hub import HfApi
 
-            hf_api = HfApi()
-            return hf_api.file_exists(model_path, "hf_quant_config.json")
-        except Exception:
-            return False
-    else:
-        import os
-
-        return os.path.exists(os.path.join(model_path, "hf_quant_config.json"))
+        hf_api = HfApi()
+        return hf_api.file_exists(model_path, "hf_quant_config.json")
+    except Exception:
+        return False
 
 
 def flatten_nested_list(nested_list):
