@@ -1,7 +1,7 @@
 use super::{
-    CircuitBreakerConfig, ConfigResult, DiscoveryConfig, HealthCheckConfig, HistoryBackend,
-    MetricsConfig, OracleConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
-    TokenizerCacheConfig,
+    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
+    HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig, RouterConfig,
+    RoutingMode, TokenizerCacheConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -10,6 +10,10 @@ use crate::core::ConnectionMode;
 #[derive(Debug, Clone, Default)]
 pub struct RouterConfigBuilder {
     config: RouterConfig,
+    // Temporary fields for certificate paths (read during build)
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
+    ca_cert_paths: Vec<String>,
 }
 
 impl RouterConfigBuilder {
@@ -20,7 +24,12 @@ impl RouterConfigBuilder {
 
     /// Create a builder from an existing configuration (takes ownership)
     pub fn from_config(config: RouterConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            client_cert_path: None,
+            client_key_path: None,
+            ca_cert_paths: Vec::new(),
+        }
     }
 
     /// Create a builder from a reference to an existing configuration
@@ -569,6 +578,48 @@ impl RouterConfigBuilder {
         self
     }
 
+    // ==================== mTLS Configuration ====================
+
+    /// Set client certificate and key paths for mTLS authentication
+    /// Both paths must be provided together
+    /// Files will be read during build()
+    pub fn client_cert_and_key<S1: Into<String>, S2: Into<String>>(
+        mut self,
+        cert_path: S1,
+        key_path: S2,
+    ) -> Self {
+        self.client_cert_path = Some(cert_path.into());
+        self.client_key_path = Some(key_path.into());
+        self
+    }
+
+    /// Set client certificate and key paths for mTLS if both paths are provided
+    /// Files will be read during build()
+    pub fn maybe_client_cert_and_key(
+        mut self,
+        cert_path: Option<impl Into<String>>,
+        key_path: Option<impl Into<String>>,
+    ) -> Self {
+        self.client_cert_path = cert_path.map(|p| p.into());
+        self.client_key_path = key_path.map(|p| p.into());
+        self
+    }
+
+    /// Add a CA certificate path for verifying worker TLS certificates
+    /// File will be read during build()
+    pub fn add_ca_certificate<S: Into<String>>(mut self, ca_cert_path: S) -> Self {
+        self.ca_cert_paths.push(ca_cert_path.into());
+        self
+    }
+
+    /// Add multiple CA certificate paths for verifying worker TLS certificates
+    /// Files will be read during build()
+    pub fn add_ca_certificates<S: Into<String>>(mut self, ca_cert_paths: Vec<S>) -> Self {
+        self.ca_cert_paths
+            .extend(ca_cert_paths.into_iter().map(|p| p.into()));
+        self
+    }
+
     // ==================== Builder Methods ====================
 
     /// Build the RouterConfig, validating if requested
@@ -582,12 +633,67 @@ impl RouterConfigBuilder {
     }
 
     /// Build with optional validation
-    pub fn build_with_validation(self, validate: bool) -> ConfigResult<RouterConfig> {
+    pub fn build_with_validation(mut self, validate: bool) -> ConfigResult<RouterConfig> {
+        // Read mTLS certificates from paths if provided
+        self = self.read_mtls_certificates()?;
+
         let config: RouterConfig = self.into();
         if validate {
             config.validate()?;
         }
         Ok(config)
+    }
+
+    /// Internal method to read mTLS certificates from paths
+    fn read_mtls_certificates(mut self) -> ConfigResult<Self> {
+        // Read client certificate and key
+        match (&self.client_cert_path, &self.client_key_path) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert = std::fs::read(cert_path).map_err(|e| ConfigError::ValidationFailed {
+                    reason: format!(
+                        "Failed to read client certificate from {}: {}",
+                        cert_path, e
+                    ),
+                })?;
+                let key = std::fs::read(key_path).map_err(|e| ConfigError::ValidationFailed {
+                    reason: format!("Failed to read client key from {}: {}", key_path, e),
+                })?;
+
+                // Combine cert and key into single PEM for reqwest::Identity
+                // When using rustls, certificate must come first, then key
+                // Ensure proper PEM formatting with newlines
+                let mut combined = cert;
+                if !combined.ends_with(b"\n") {
+                    combined.push(b'\n');
+                }
+                combined.extend_from_slice(&key);
+                if !combined.ends_with(b"\n") {
+                    combined.push(b'\n');
+                }
+
+                self.config.client_identity = Some(combined);
+            }
+            (None, None) => {
+                // No client cert configured, that's fine
+            }
+            _ => {
+                return Err(ConfigError::ValidationFailed {
+                    reason:
+                        "Both --client-cert-path and --client-key-path must be specified together"
+                            .to_string(),
+                });
+            }
+        }
+
+        // Read CA certificates
+        for path in &self.ca_cert_paths {
+            let cert = std::fs::read(path).map_err(|e| ConfigError::ValidationFailed {
+                reason: format!("Failed to read CA certificate from {}: {}", path, e),
+            })?;
+            self.config.ca_certificates.push(cert);
+        }
+
+        Ok(self)
     }
 }
 
