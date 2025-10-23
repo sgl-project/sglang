@@ -1252,9 +1252,12 @@ def sample_random_requests(
             else:
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
                 input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            input_content = input_ids
-            if return_text:
-                input_content = tokenizer.decode(input_content)
+            token_text, token_ids, token_mismatch = adjust_prompt_decode_to_target_len(
+                tokenizer, input_ids, input_lens[i]
+            )
+            if token_mismatch > 0:
+                continue  # skip this request
+            input_content = token_text if return_text else token_ids
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,
@@ -1267,12 +1270,16 @@ def sample_random_requests(
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
         input_requests = []
         for i in range(num_prompts):
-            input_content = [
+            input_ids = [
                 (offsets[i] + i + j) % tokenizer.vocab_size
                 for j in range(input_lens[i])
             ]
-            if return_text:
-                input_content = tokenizer.decode(input_content)
+            token_text, token_ids, token_mismatch = adjust_prompt_decode_to_target_len(
+                tokenizer, input_ids, input_lens[i]
+            )
+            if token_mismatch > 0:
+                continue  # skip this request
+            input_content = token_text if return_text else token_ids
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,
@@ -1284,6 +1291,51 @@ def sample_random_requests(
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
+
+
+def adjust_prompt_decode_to_target_len(
+    tokenizer: PreTrainedTokenizerBase,
+    token_sequence: int,
+    target_token_len: int,
+    max_retry: int = 10,
+) -> tuple[str, list[int]]:
+    """
+    Refer https://github.com/vllm-project/vllm/pull/24937
+    Ensure decoded-then-encoded prompt length matches the target token length.
+
+    This function decodes an initial token sequence to text and re-encodes it
+    , iteratively adjusting the token sequence length to match a target.
+    This is necessary because some tokenizers do not guarantee a 1:1 mapping
+    between consecutive tokens and the decoded-then-encoded sequence length.
+    For example, for GPT2Tokenizer:
+    [6880, 6881] -> ['Ġcalls', 'here'] ->
+    [1650, 939, 486] -> ['Ġcall', 'sh', 'ere']
+    """
+    remain_num_try = max_retry
+    token_mismatch = 0
+    while True:
+        prompt = tokenizer.decode(token_sequence)
+        token_sequence = tokenizer.encode(prompt)
+        if remain_num_try <= 0:
+            if len(token_sequence) != target_token_len:
+                token_mismatch = len(token_sequence) - target_token_len
+            break
+
+        if len(token_sequence) == target_token_len:
+            break
+        elif len(token_sequence) < target_token_len:
+            extra_tokens = np.random.randint(
+                0,
+                tokenizer.vocab_size,
+                size=target_token_len - len(token_sequence),
+            ).tolist()
+            token_sequence.extend(extra_tokens)
+        elif len(token_sequence) > target_token_len:
+            token_sequence = token_sequence[:target_token_len]
+
+        remain_num_try -= 1
+
+    return prompt, token_sequence, token_mismatch
 
 
 def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
@@ -1431,9 +1483,13 @@ def sample_image_requests(
 
     dataset: List[DatasetRow] = []
     total_image_bytes = 0
+    token_mismatch_total = 0
     for i in range(num_requests):
         # Generate text prompt
-        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]))
+        text_prompt, token_mismatch = gen_prompt(
+            processor.tokenizer, int(input_lens[i])
+        )
+        token_mismatch_total += token_mismatch
 
         # Generate image list
         images, images_base64, images_bytes = zip(
@@ -1456,6 +1512,15 @@ def sample_image_requests(
     print(
         f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"
     )
+    if token_mismatch_total != 0:
+        print(
+            "Across all generated prompts, there were %d %s tokens "
+            "than expected after decoding and re-encoding. This is "
+            "expected due to the imperfect nature of the sampling "
+            "procedure.",
+            abs(token_mismatch_total),
+            "more" if token_mismatch_total > 0 else "fewer",
+        )
     return dataset
 
 
@@ -1463,7 +1528,10 @@ def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = list(tokenizer.get_vocab().values())
     selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
+    prompt, _, token_mismatch = adjust_prompt_decode_to_target_len(
+        tokenizer, selected_tokens, token_num
+    )
+    return prompt, token_mismatch
 
 
 def get_gen_prefix_cache_path(args, tokenizer):
@@ -1501,14 +1569,17 @@ def sample_generated_shared_prefix_requests(
 
     # Generate system prompts for each group
     system_prompts = []
+    mismatch_token_total = 0
     for _ in range(num_groups):
-        system_prompt = gen_prompt(tokenizer, system_prompt_len)
+        system_prompt, system_prompt_mismatch = gen_prompt(tokenizer, system_prompt_len)
+        mismatch_token_total += system_prompt_mismatch
         system_prompts.append(system_prompt)
 
     # Generate questions
     questions = []
     for _ in range(num_groups * prompts_per_group):
-        question = gen_prompt(tokenizer, question_len)
+        question, question_mismatch = gen_prompt(tokenizer, question_len)
+        mismatch_token_total += question_mismatch
         questions.append(question)
 
     # Combine system prompts with questions
@@ -1551,6 +1622,15 @@ def sample_generated_shared_prefix_requests(
     print(
         f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
     )
+    if mismatch_token_total != 0:
+        print(
+            "Across all generated prompts, there were %d %s tokens "
+            "than expected after decoding and re-encoding. This is "
+            "expected due to the imperfect nature of the sampling "
+            "procedure.",
+            abs(mismatch_token_total),
+            "more" if mismatch_token_total > 0 else "fewer",
+        )
 
     # Save to cache
     cache_path.parent.mkdir(parents=True, exist_ok=True)
