@@ -293,6 +293,13 @@ class SchedulerPPMixin:
                     recv_reqs = self.recv_requests()
                     # self._pp_commit_comm_work(send_req_work)
                     self.process_input_requests(recv_reqs)
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(send_req_work)
+                    with torch.profiler.record_function("send_reqs_to_next_stage"):
+                        send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs,
+                            async_send=True,
+                        )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
@@ -342,12 +349,12 @@ class SchedulerPPMixin:
                         )
                     last_mbs[next_mb_id] = mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(send_req_work)
-                    with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
-                        )
+                    # self._pp_commit_comm_work(send_req_work)
+                    # with torch.profiler.record_function("send_reqs_to_next_stage"):
+                    #     send_req_work = self._pp_send_pyobj_to_next_stage(
+                    #         recv_reqs,
+                    #         async_send=True,
+                    #     )
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(event)
                         self._pp_commit_comm_work(send_proxy_work)
