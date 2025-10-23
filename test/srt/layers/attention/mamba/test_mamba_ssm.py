@@ -1,6 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -290,7 +289,3 @@ def test_selective_state_update_with_heads_with_batch_indices(
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     assert torch.allclose(state[state_indices, :], state_ref, rtol=rtol, atol=atol)
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__])
