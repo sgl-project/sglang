@@ -15,75 +15,79 @@ class TypeBasedDispatcherList:
                 return fn(obj)
         raise ValueError(f"Invalid object: {obj}")
 
-class RequestType0: pass
-class RequestType1: pass
-class RequestType2: pass
-class RequestType3: pass
-class RequestType4: pass
-class RequestType5: pass
-class RequestType6: pass
-class RequestType7: pass
-class RequestType8: pass
-class RequestType9: pass
-class RequestType10: pass
-class RequestType11: pass
-class RequestType12: pass
-class RequestType13: pass
-class RequestType14: pass
-class RequestType15: pass
-class RequestType16: pass
-class RequestType17: pass
-class RequestType18: pass
-class RequestType19: pass
-class RequestType20: pass
-class RequestType21: pass
-class RequestType22: pass
-class RequestType23: pass
-class RequestType24: pass
-class RequestType25: pass
-class RequestType26: pass
-class RequestType27: pass
-class RequestType28: pass
-class RequestType29: pass
-
-def handler0(req): return "handler0"
-def handler1(req): return "handler1"
-def handler2(req): return "handler2"
-def handler3(req): return "handler3"
-def handler4(req): return "handler4"
-def handler5(req): return "handler5"
-def handler6(req): return "handler6"
-def handler7(req): return "handler7"
-def handler8(req): return "handler8"
-def handler9(req): return "handler9"
-def handler10(req): return "handler10"
-def handler11(req): return "handler11"
-def handler12(req): return "handler12"
-def handler13(req): return "handler13"
-def handler14(req): return "handler14"
-def handler15(req): return "handler15"
-def handler16(req): return "handler16"
-def handler17(req): return "handler17"
-def handler18(req): return "handler18"
-def handler19(req): return "handler19"
-def handler20(req): return "handler20"
-def handler21(req): return "handler21"
-def handler22(req): return "handler22"
-def handler23(req): return "handler23"
-def handler24(req): return "handler24"
-def handler25(req): return "handler25"
-def handler26(req): return "handler26"
-def handler27(req): return "handler27"
-def handler28(req): return "handler28"
-def handler29(req): return "handler29"
-
-
 def create_test_mapping(num_types=30):
-
     types = [type(f"RequestType{i}", (), {}) for i in range(num_types)]
-    handlers = [getattr(__import__(__name__), f"handler{i}") for i in range(num_types)]
+
+    def create_handler(i):
+        def handler(req):
+            return f"hanlder{i}"
+        return handler
+    handlers = [create_handler(i) for i in range(num_types)]
 
     return list(zip(types, handlers))
+
+def test_inheritance():
+    print("\n"+"=" * 60)
+    print("test for inheritance")
+    print("=" * 60)
+
+    class BaseRequest: pass
+    def base_handler(req): return "base_handler"
+    class DerivedRequest(BaseRequest): pass
+
+    mapping = [(BaseRequest, base_handler)]
+    dict_dispatcher = TypeBasedDispatcher(mapping)
+
+    derived_obj = DerivedRequest()
+    expected = "base_handler"
+
+    #This test will fail with the current implementation, but pass with the suggested MRO-based fix
+    result_dict = dict_dispatcher(derived_obj)
+    assert result_dict == expected, f"Expected '{expected}', but got '{result_dict}'"
+    print("Pass: dict dispatcher handles inheritance.")
+
+def benchmark_with_inheritance():
+
+    """Performance test with inheritance scenarios"""
+    print("\nBenchmarking with inheritance scenarios...")
+
+    # Create type hierarchy with inheritance relationships
+    class BaseType: pass
+    class ChildType1(BaseType): pass
+    class ChildType2(BaseType): pass
+    class GrandChildType(ChildType1): pass
+    class UnrelatedType: pass
+
+    def base_handler(obj): return "handled"
+
+    mapping = [(BaseType, base_handler)]
+    dispatcher = TypeBasedDispatcher(mapping)
+
+    test_cases = [
+        BaseType(),
+        ChildType1(),
+        ChildType2(),
+        GrandChildType(),
+        UnrelatedType()
+    ]
+
+    # Test first call (includes MRO lookup)
+    first_call_times = []
+    for case in test_cases:
+        if not isinstance(case, UnrelatedType):
+            time_taken = timeit.timeit(lambda: dispatcher(case), number=1000)
+            first_call_times.append(time_taken)
+
+    # Test subsequent calls (using cache)
+    cached_call_times = []
+    for case in test_cases:
+        if not isinstance(case, UnrelatedType):
+            time_taken = timeit.timeit(lambda: dispatcher(case), number=1000)
+            cached_call_times.append(time_taken)
+
+    print(f"First call (with MRO lookup): {sum(first_call_times)/len(first_call_times):.6f}s avg")
+    print(f"Cached call: {sum(cached_call_times)/len(cached_call_times):.6f}s avg")
+    print(f"Caching improvement: {sum(first_call_times)/sum(cached_call_times):.2f}x")
 
 def benchmark_dispatchers():
     mapping = create_test_mapping(30)
@@ -143,7 +147,7 @@ def test_memory_usage():
     print(f"memory used by dict version: {dict_size} bytes")
     print(f"compare memory used by the two version: {dict_size - list_size} bytes")
 
-def test_egde_case():
+def test_edge_case():
     """test for edge case"""
     print("\n" + "=" * 60)
     print("test for edge case")
@@ -210,8 +214,8 @@ def simulate_real_workload():
     )
 
     dict_time = timeit.timeit(
-            lambda: [dict_dispatcher(req) for req in test_requests],
-            number=100
+        lambda: [dict_dispatcher(req) for req in test_requests],
+        number=100
     )
 
     print(f"list version: {list_time:.4f} s")
@@ -220,8 +224,8 @@ def simulate_real_workload():
 if __name__ == "__main__":
     benchmark_dispatchers()
     test_memory_usage()
-    test_egde_case()
+    test_edge_case()
     simulate_real_workload()
-
-
+    test_inheritance()
+    benchmark_with_inheritance()
 
