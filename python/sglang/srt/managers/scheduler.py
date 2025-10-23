@@ -351,6 +351,17 @@ class Scheduler(
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
+        # With DP attention enabled, the entry rank is attn_tp_rank==0;
+        # otherwise the entry rank is TP group local rank 0.
+        # For #11910, use the CPU communication group to broadcast VLM Python objects,
+        # avoiding any coupling with CUDA streams/devices.
+        if self.server_args.enable_dp_attention:
+            self.cpu_group = self.attn_tp_cpu_group
+            self.is_entry_rank = self.attn_tp_rank == 0
+        else:
+            self.cpu_group = self.tp_cpu_group
+            self.is_entry_rank = self.tp_group.rank == 0
+
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
@@ -1153,22 +1164,69 @@ class Scheduler(
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
-    def _is_entry_rank(self) -> bool:
-        # With DP attention enabled, the entry rank is attn_tp_rank==0;
-        # otherwise the entry rank is TP group local rank 0.
-        if self.server_args.enable_dp_attention:
-            return self.attn_tp_rank == 0
-        else:
-            return self.tp_group.rank == 0
+    def _process_and_broadcast_mm_inputs(
+        self,
+        raw_mm_inputs: Optional[dict],
+    ):
+        """Materialize MultimodalInputs once on the entry rank and broadcast to others.
 
-    def _cpu_group(self):
-        # Use the CPU communication group to broadcast Python objects,
-        # avoiding any coupling with CUDA streams/devices.
-        return (
-            self.attn_tp_cpu_group
-            if self.server_args.enable_dp_attention
-            else self.tp_cpu_group
-        )
+        Entry rank:
+        - constructs MultimodalInputs.from_dict(raw_mm_inputs) once
+        - broadcasts to other ranks in self.cpu_group (if world_size > 1)
+
+        Non-entry ranks:
+        - receive the object via broadcast (if world_size > 1)
+        - otherwise (single-rank / no group) fall back to local from_dict
+
+        Returns:
+            MultimodalInputs | None
+        """
+        if raw_mm_inputs is None:
+            return None
+
+        group_world_size = 1
+        try:
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and self.cpu_group is not None
+            ):
+                group_world_size = torch.distributed.get_world_size(
+                    group=self.cpu_group
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to get world size in mm_inputs handling with {e}, fallback to 1."
+            )
+
+        # In case tp size > 1, all the Scheduler TP ranks runs the duplicated computing
+        # process in CPU which occupies the main thread CPU cycle. This computing logic
+        # merely needs to be run on TP0 and be broadcast to other TP ranks.
+        # Since the Scheduler is single-threaded, any large CPU cost will impact
+        # handling of other messages. For example, CPU hits 99.9% can significantly
+        # increase the CUDA kernel launch time.
+        if self.is_entry_rank:
+            # Only the entry rank materializes once from dict.
+            image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
+            # Broadcast to other TP ranks (use src=0 within the group).
+            if group_world_size > 1:
+                obj_list = [image_inputs]
+                torch.distributed.broadcast_object_list(
+                    obj_list, src=0, group=self.cpu_group
+                )
+                image_inputs = obj_list[0]
+        else:
+            # Non-entry ranks: receive if group size > 1; otherwise materialize locally.
+            if group_world_size > 1:
+                obj_list = [None]
+                torch.distributed.broadcast_object_list(
+                    obj_list, src=0, group=self.cpu_group
+                )
+                image_inputs = obj_list[0]
+            else:
+                image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
+
+        return image_inputs
 
     def handle_generate_request(
         self,
@@ -1251,50 +1309,10 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
+            image_inputs = self._process_and_broadcast_mm_inputs(recv_req.mm_inputs)
 
-            # Perform deserialization of multimodal mm_inputs (from_dict + validation + set_pad_value)
-            # only once on the entry Scheduler (rank 0 within the TP group / Attn-TP0).
-            # The entry rank (rank 0) then broadcasts the materialized MultimodalInputs to the other TP
-            # ranks via the CPU communication group using broadcast_object_list.
-            # The other ranks no longer call from_dict; they only do local pad_input_ids and
-            # extend_image_inputs.
-            # This reduces Scheduler CPU utilization and avoids contending with request scheduling.
-            is_entry = self._is_entry_rank()
-            cpu_group = self._cpu_group()
-            group_world_size = 1
-            try:
-                if torch.dist.is_available() and torch.dist.is_initialized():
-                    group_world_size = torch.dist.get_world_size(group=cpu_group)
-            except Exception:
-                group_world_size = 1
-            if is_entry:
-                # Only the entry rank materializes once from dict.
-                image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
-                # Perform validation/pad-value setup only once to avoid repeating on every rank.
-                if hasattr(image_inputs, "mm_items") and isinstance(
-                    image_inputs.mm_items, list
-                ):
-                    image_inputs.mm_items = [
-                        it for it in image_inputs.mm_items if it.is_valid()
-                    ]
-                    for it in image_inputs.mm_items:
-                        it.set_pad_value()
-                # Broadcast to other TP ranks (use src=0 within the group).
-                if group_world_size > 1:
-                    obj_list = [image_inputs]
-                    torch.dist.broadcast_object_list(obj_list, src=0, group=cpu_group)
-                    image_inputs = obj_list[0]
-            else:
-                # Non-entry ranks: if group size > 1, receive the object;
-                # otherwise (size == 1) we shouldn't reach here in practice.
-                if group_world_size > 1:
-                    obj_list = [None]
-                    torch.dist.broadcast_object_list(obj_list, src=0, group=cpu_group)
-                    image_inputs = obj_list[0]
-                else:
-                    # Fallback for single-card or no-group scenarios: materialize locally.
-                    image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
-            # These two steps are already fast (<~3ms); execute locally on each rank.
+            # The following steps are already fast, execute locally on each rank.
+            # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
             )
@@ -1522,7 +1540,7 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
-            image_inputs = MultimodalInputs.from_dict(recv_req.image_inputs)
+            image_inputs = self._process_and_broadcast_mm_inputs(recv_req.image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
