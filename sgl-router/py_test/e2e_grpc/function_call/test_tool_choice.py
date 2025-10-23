@@ -8,7 +8,6 @@ Tests: required, auto, and specific function choices in both streaming and non-s
 """
 
 import json
-
 import sys
 import unittest
 from pathlib import Path

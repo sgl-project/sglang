@@ -9,7 +9,6 @@ python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinki
 import json
 import sys
 import unittest
-
 from pathlib import Path
 
 import requests

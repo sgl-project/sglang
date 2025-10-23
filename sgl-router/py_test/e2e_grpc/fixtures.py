@@ -61,7 +61,9 @@ def wait_for_workers_ready(
 
             # Log progress every 10 seconds
             if elapsed > 0 and elapsed % 10 == 0 and attempt % 10 == 0:
-                logger.info(f"  Still waiting for workers... ({elapsed}/{timeout}s elapsed)")
+                logger.info(
+                    f"  Still waiting for workers... ({elapsed}/{timeout}s elapsed)"
+                )
 
             try:
                 response = session.get(
@@ -239,7 +241,9 @@ def popen_launch_workers_and_router(
     # Quick check: make sure worker processes are still alive
     for i, worker in enumerate(workers):
         if worker.poll() is not None:
-            logger.error(f"  ✗ Worker {i+1} died during startup (exit code: {worker.poll()})")
+            logger.error(
+                f"  ✗ Worker {i+1} died during startup (exit code: {worker.poll()})"
+            )
             # Cleanup: kill all workers
             for w in workers:
                 try:
@@ -248,7 +252,9 @@ def popen_launch_workers_and_router(
                     pass
             raise RuntimeError(f"Worker {i+1} failed to start")
 
-    logger.info(f"✓ All {num_workers} workers started (router will verify connectivity)")
+    logger.info(
+        f"✓ All {num_workers} workers started (router will verify connectivity)"
+    )
 
     # Step 2: Launch router pointing to workers
     logger.info(f"\n[Router]")
