@@ -197,7 +197,11 @@ def get_config(
         config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-        if "deepseek-ai/DeepSeek-OCR" in model:
+        if (
+            config.auto_map
+            and config.auto_map.get("AutoModel")
+            == "modeling_deepseekocr.DeepseekOCRForCausalLM"
+        ):
             config.model_type = "deepseek-ocr"
             # Due to an unknown reason, Hugging Face’s AutoConfig mistakenly recognizes the configuration of deepseek-ocr as deepseekvl2.
             # This is a temporary workaround and will require further optimization.
