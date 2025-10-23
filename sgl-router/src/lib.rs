@@ -212,17 +212,39 @@ struct Router {
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
+    grpc_mode: bool,
 }
 
 impl Router {
-    /// Determine connection mode from worker URLs
-    fn determine_connection_mode(worker_urls: &[String]) -> core::ConnectionMode {
+    /// Determine connection mode from worker URLs and grpc_mode flag
+    fn determine_connection_mode(
+        worker_urls: &[String],
+        grpc_mode: bool,
+    ) -> config::ConfigResult<core::ConnectionMode> {
+        // If --grpc-mode flag is set, validate and return gRPC mode
+        if grpc_mode {
+            // Check for conflicting HTTP/HTTPS URLs
+            for url in worker_urls {
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    return Err(config::ConfigError::ValidationFailed {
+                        reason: format!(
+                            "--grpc-mode flag conflicts with HTTP/HTTPS URL: {}. Use grpc:// prefix or remove the flag.",
+                            url
+                        ),
+                    });
+                }
+            }
+            return Ok(core::ConnectionMode::Grpc { port: None });
+        }
+
+        // If flag not set, detect from URL prefixes
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-                return core::ConnectionMode::Grpc { port: None };
+                return Ok(core::ConnectionMode::Grpc { port: None });
             }
         }
-        core::ConnectionMode::Http
+
+        Ok(core::ConnectionMode::Http)
     }
 
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
@@ -449,6 +471,7 @@ impl Router {
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
+        grpc_mode = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -522,6 +545,7 @@ impl Router {
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
+        grpc_mode: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -535,7 +559,8 @@ impl Router {
             all_urls.extend(decode_urls.clone());
         }
 
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+        let connection_mode = Self::determine_connection_mode(&all_urls, grpc_mode)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
 
         Ok(Router {
             host,
@@ -609,6 +634,7 @@ impl Router {
             client_cert_path,
             client_key_path,
             ca_cert_paths,
+            grpc_mode,
         })
     }
 

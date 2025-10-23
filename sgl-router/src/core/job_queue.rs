@@ -499,6 +499,13 @@ impl JobQueue {
         workflow_context.set("worker_config", config.clone());
         workflow_context.set_arc("app_context", Arc::clone(context));
 
+        // If connection mode is already determined (e.g., via --grpc-mode flag),
+        // set it in the workflow context to skip detection
+        workflow_context.set(
+            "connection_mode",
+            context.router_config.connection_mode.clone(),
+        );
+
         engine
             .start_workflow(WorkflowId::new("worker_registration"), workflow_context)
             .await

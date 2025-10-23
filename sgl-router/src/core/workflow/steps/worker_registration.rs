@@ -252,6 +252,9 @@ impl StepExecutor for DetectConnectionModeStep {
         let app_context: Arc<AppContext> = context
             .get("app_context")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let configured_mode: Arc<ConnectionMode> = context
+            .get("connection_mode")
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("connection_mode".to_string()))?;
 
         debug!(
             "Detecting connection mode for {} (timeout: {}s, max_attempts: {})",
@@ -268,13 +271,14 @@ impl StepExecutor for DetectConnectionModeStep {
             try_grpc_health_check(&url, timeout)
         );
 
-        let connection_mode = match (http_result, grpc_result) {
+        // Determine what the worker actually supports
+        let detected_mode = match (http_result, grpc_result) {
             (Ok(_), _) => {
-                debug!("{} detected as HTTP", config.url);
+                debug!("{} detected as HTTP", url);
                 ConnectionMode::Http
             }
             (_, Ok(_)) => {
-                debug!("{} detected as gRPC", config.url);
+                debug!("{} detected as gRPC", url);
                 ConnectionMode::Grpc { port: None }
             }
             (Err(http_err), Err(grpc_err)) => {
@@ -282,16 +286,38 @@ impl StepExecutor for DetectConnectionModeStep {
                     step_id: StepId::new("detect_connection_mode"),
                     message: format!(
                         "Both HTTP and gRPC health checks failed for {}: HTTP: {}, gRPC: {}",
-                        config.url, http_err, grpc_err
+                        url, http_err, grpc_err
                     ),
                 });
             }
         };
 
-        // Store connection mode in context
-        context.set("connection_mode", connection_mode);
+        // Compare detected mode with configured mode
+        let modes_match =
+            std::mem::discriminant(&*configured_mode) == std::mem::discriminant(&detected_mode);
 
-        Ok(StepResult::Success)
+        if modes_match {
+            // Expected mode detected - perfect match
+            info!("{} validated successfully ({:?})", url, detected_mode);
+            Ok(StepResult::Success)
+        } else if app_context.router_config.enable_igw {
+            // Mismatch but IGW mode allows mixed protocols
+            warn!(
+                "Connection mode mismatch for {}: configured={:?}, detected={:?}. IGW mode enabled, using detected mode.",
+                url, configured_mode, detected_mode
+            );
+            context.set("connection_mode", detected_mode);
+            Ok(StepResult::Success)
+        } else {
+            // Mismatch in strict mode - error
+            Err(WorkflowError::StepFailed {
+                step_id: StepId::new("detect_connection_mode"),
+                message: format!(
+                    "Connection mode mismatch for {}: worker supports {:?} but {:?} was configured. Use correct URL prefix (grpc://) or --grpc-mode flag.",
+                    url, detected_mode, configured_mode
+                ),
+            })
+        }
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
