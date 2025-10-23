@@ -16,6 +16,7 @@
 import contextlib
 import json
 import os
+import tempfile
 import warnings
 from pathlib import Path
 from typing import Any, Dict, Optional, Type, Union
@@ -46,6 +47,7 @@ from sglang.srt.configs import (
     LongcatFlashConfig,
     MultiModalityConfig,
     NemotronHConfig,
+    Olmo3Config,
     Qwen3NextConfig,
     Step3VLConfig,
 )
@@ -63,6 +65,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     InternVLChatConfig.model_type: InternVLChatConfig,
     Step3VLConfig.model_type: Step3VLConfig,
     LongcatFlashConfig.model_type: LongcatFlashConfig,
+    Olmo3Config.model_type: Olmo3Config,
     Qwen3NextConfig.model_type: Qwen3NextConfig,
     FalconH1Config.model_type: FalconH1Config,
     DotsVLMConfig.model_type: DotsVLMConfig,
@@ -108,6 +111,12 @@ def get_hf_text_config(config: PretrainedConfig):
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
         return config.text_config
+
+    if hasattr(config, "llm_config"):
+        # PointsV1.5 Chat Model
+        assert hasattr(config.llm_config, "num_attention_heads")
+        return config.llm_config
+
     if hasattr(config, "language_config"):
         return config.language_config
     if hasattr(config, "thinker_config"):
@@ -145,7 +154,7 @@ def _load_deepseek_v32_model(
     config_json["architectures"] = ["DeepseekV3ForCausalLM"]
     config_json["model_type"] = "deepseek_v3"
 
-    tmp_path = os.path.join(local_path, "_tmp_config_folder")
+    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
     os.makedirs(tmp_path, exist_ok=True)
 
     unique_path = os.path.join(tmp_path, f"deepseek_v32_{os.getpid()}")

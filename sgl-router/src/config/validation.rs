@@ -29,9 +29,72 @@ impl ConfigValidator {
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
-        if config.history_backend == HistoryBackend::Oracle && config.oracle.is_none() {
+        // Validate Oracle configuration if enabled
+        if config.history_backend == HistoryBackend::Oracle {
+            if config.oracle.is_none() {
+                return Err(ConfigError::MissingRequired {
+                    field: "oracle".to_string(),
+                });
+            }
+            // Validate Oracle configuration details
+            if let Some(oracle) = &config.oracle {
+                Self::validate_oracle(oracle)?;
+            }
+        }
+
+        // Validate tokenizer cache configuration
+        Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+
+        Ok(())
+    }
+
+    /// Validate Oracle configuration
+    fn validate_oracle(oracle: &OracleConfig) -> ConfigResult<()> {
+        // Validate username is not empty
+        if oracle.username.is_empty() {
             return Err(ConfigError::MissingRequired {
-                field: "oracle".to_string(),
+                field: "oracle.username".to_string(),
+            });
+        }
+
+        // Validate password is not empty
+        if oracle.password.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle.password".to_string(),
+            });
+        }
+
+        // Validate connect_descriptor is not empty
+        if oracle.connect_descriptor.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle_dsn or oracle_tns_alias".to_string(),
+            });
+        }
+
+        // Validate pool_min is at least 1
+        if oracle.pool_min < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_min".to_string(),
+                value: oracle.pool_min.to_string(),
+                reason: "Must be at least 1".to_string(),
+            });
+        }
+
+        // Validate pool_max is greater than or equal to pool_min
+        if oracle.pool_max < oracle.pool_min {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_max".to_string(),
+                value: oracle.pool_max.to_string(),
+                reason: "Must be >= oracle.pool_min".to_string(),
+            });
+        }
+
+        // Validate pool_timeout_secs is greater than 0
+        if oracle.pool_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_timeout_secs".to_string(),
+                value: oracle.pool_timeout_secs.to_string(),
+                reason: "Must be > 0".to_string(),
             });
         }
 
@@ -102,18 +165,14 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::OpenAI { worker_urls } => {
-                // Require exactly one worker URL for OpenAI router
-                if worker_urls.len() != 1 {
+                // Require at least one worker URL for OpenAI router
+                if worker_urls.is_empty() {
                     return Err(ConfigError::ValidationFailed {
-                        reason: "OpenAI mode requires exactly one --worker-urls entry".to_string(),
+                        reason: "OpenAI mode requires at least one --worker-urls entry".to_string(),
                     });
                 }
-                // Validate URL format
-                if let Err(e) = url::Url::parse(&worker_urls[0]) {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: format!("Invalid OpenAI worker URL '{}': {}", &worker_urls[0], e),
-                    });
-                }
+                // Validate URLs
+                Self::validate_urls(worker_urls)?;
             }
         }
         Ok(())
@@ -203,6 +262,24 @@ impl ConfigValidator {
                 value: config.request_timeout_secs.to_string(),
                 reason: "Must be > 0".to_string(),
             });
+        }
+
+        if config.queue_size > 0 && config.queue_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "queue_timeout_secs".to_string(),
+                value: config.queue_timeout_secs.to_string(),
+                reason: "Must be > 0 when queue_size > 0".to_string(),
+            });
+        }
+
+        if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
+            if tokens_per_second <= 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "rate_limit_tokens_per_second".to_string(),
+                    value: tokens_per_second.to_string(),
+                    reason: "Must be > 0 when specified".to_string(),
+                });
+            }
         }
 
         if config.worker_startup_timeout_secs == 0 {
@@ -365,6 +442,29 @@ impl ConfigValidator {
                 reason: "Must be > 0".to_string(),
             });
         }
+        Ok(())
+    }
+
+    /// Validate tokenizer cache configuration
+    fn validate_tokenizer_cache(cache: &TokenizerCacheConfig) -> ConfigResult<()> {
+        // Validate L0 max entries when L0 is enabled
+        if cache.enable_l0 && cache.l0_max_entries == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l0_max_entries".to_string(),
+                value: cache.l0_max_entries.to_string(),
+                reason: "Must be > 0 when L0 cache is enabled".to_string(),
+            });
+        }
+
+        // Validate L1 max memory when L1 is enabled
+        if cache.enable_l1 && cache.l1_max_memory == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l1_max_memory".to_string(),
+                value: cache.l1_max_memory.to_string(),
+                reason: "Must be > 0 when L1 cache is enabled".to_string(),
+            });
+        }
+
         Ok(())
     }
 

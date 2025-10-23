@@ -1,12 +1,15 @@
 //! Response storage, patching, and extraction utilities
 
-use crate::data_connector::{ResponseId, StoredResponse};
-use crate::protocols::spec::{ResponseInput, ResponseToolType, ResponsesRequest};
-use serde_json::{json, Value};
 use std::collections::HashMap;
+
+use serde_json::{json, Value};
 use tracing::warn;
 
 use super::utils::event_types;
+use crate::{
+    data_connector::{ResponseId, StoredResponse},
+    protocols::responses::{ResponseInput, ResponseToolType, ResponsesRequest},
+};
 
 // ============================================================================
 // Response Storage Operations
@@ -36,7 +39,7 @@ pub(super) fn build_stored_response(
         .get("model")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| original_body.model.clone());
+        .or_else(|| Some(original_body.model.clone()));
 
     stored_response.user = response_json
         .get("user")
@@ -129,7 +132,10 @@ pub(super) fn patch_streaming_response_json(
             }
         }
 
-        obj.insert("store".to_string(), Value::Bool(original_body.store));
+        obj.insert(
+            "store".to_string(),
+            Value::Bool(original_body.store.unwrap_or(false)),
+        );
 
         if obj
             .get("model")
@@ -137,9 +143,10 @@ pub(super) fn patch_streaming_response_json(
             .map(|s| s.is_empty())
             .unwrap_or(true)
         {
-            if let Some(model) = &original_body.model {
-                obj.insert("model".to_string(), Value::String(model.clone()));
-            }
+            obj.insert(
+                "model".to_string(),
+                Value::String(original_body.model.clone()),
+            );
         }
 
         if obj.get("user").map(|v| v.is_null()).unwrap_or(false) {
@@ -150,7 +157,7 @@ pub(super) fn patch_streaming_response_json(
 
         // Attach conversation id for client response if present (final aggregated JSON)
         if let Some(conv_id) = original_body.conversation.clone() {
-            obj.insert("conversation".to_string(), json!({"id": conv_id}));
+            obj.insert("conversation".to_string(), json!({ "id": conv_id }));
         }
     }
 }
@@ -205,7 +212,7 @@ pub(super) fn rewrite_streaming_block(
 
     let mut changed = false;
     if let Some(response_obj) = parsed.get_mut("response").and_then(|v| v.as_object_mut()) {
-        let desired_store = Value::Bool(original_body.store);
+        let desired_store = Value::Bool(original_body.store.unwrap_or(false));
         if response_obj.get("store") != Some(&desired_store) {
             response_obj.insert("store".to_string(), desired_store);
             changed = true;
@@ -228,7 +235,7 @@ pub(super) fn rewrite_streaming_block(
 
         // Attach conversation id into streaming event response content with ordering
         if let Some(conv_id) = original_body.conversation.clone() {
-            response_obj.insert("conversation".to_string(), json!({"id": conv_id}));
+            response_obj.insert("conversation".to_string(), json!({ "id": conv_id }));
             changed = true;
         }
     }
@@ -267,10 +274,11 @@ pub(super) fn rewrite_streaming_block(
 
 /// Mask function tools as MCP tools in response for client
 pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
-    let mcp_tool = original_body
-        .tools
-        .iter()
-        .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some());
+    let mcp_tool = original_body.tools.as_ref().and_then(|tools| {
+        tools
+            .iter()
+            .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())
+    });
     let Some(t) = mcp_tool else {
         return;
     };

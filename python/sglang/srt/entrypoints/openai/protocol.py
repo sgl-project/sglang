@@ -17,7 +17,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, Optional, TypeAlias, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -37,6 +37,7 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
+from xgrammar import StructuralTag
 
 from sglang.utils import convert_json_schema_to_str
 
@@ -128,10 +129,21 @@ class StructuresResponseFormat(BaseModel):
     end: str
 
 
-class StructuralTagResponseFormat(BaseModel):
+# NOTE(dark): keep this for backward compatibility
+class LegacyStructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
     structures: List[StructuresResponseFormat]
     triggers: List[str]
+
+
+StructuralTagResponseFormat: TypeAlias = Union[
+    LegacyStructuralTagResponseFormat, StructuralTag
+]
+
+ToolCallConstraint: TypeAlias = Union[
+    Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
+    Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
+]
 
 
 class FileRequest(BaseModel):
@@ -192,7 +204,10 @@ class BatchResponse(BaseModel):
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str = DEFAULT_MODEL_NAME
+    model: str = Field(
+        default=DEFAULT_MODEL_NAME,
+        description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
+    )
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
     echo: bool = False
@@ -221,12 +236,15 @@ class CompletionRequest(BaseModel):
     ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
+    stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
+    custom_params: Optional[Dict] = None
+    custom_logit_processor: Optional[str] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -428,7 +446,10 @@ class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
-    model: str = DEFAULT_MODEL_NAME
+    model: str = Field(
+        default=DEFAULT_MODEL_NAME,
+        description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
+    )
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
@@ -474,6 +495,7 @@ class ChatCompletionRequest(BaseModel):
     ebnf: Optional[str] = None
     repetition_penalty: Optional[float] = None
     stop_token_ids: Optional[List[int]] = None
+    stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     continue_final_message: bool = False
@@ -483,6 +505,10 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+
+    # Custom logit processor for advanced sampling control
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
+    custom_params: Optional[Dict] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -581,7 +607,7 @@ class ChatCompletionRequest(BaseModel):
         self,
         stop: List[str],
         model_generation_config: Dict[str, Any],
-        tool_call_constraint: Optional[Any] = None,
+        tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
@@ -602,6 +628,7 @@ class ChatCompletionRequest(BaseModel):
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
+            "stop_regex": self.stop_regex,
             "top_p": get_param("top_p"),
             "top_k": get_param("top_k"),
             "min_p": get_param("min_p"),
@@ -615,6 +642,7 @@ class ChatCompletionRequest(BaseModel):
             "ignore_eos": self.ignore_eos,
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
+            "custom_params": self.custom_params,
         }
 
         if self.response_format and self.response_format.type == "json_schema":
@@ -646,7 +674,7 @@ class ChatCompletionRequest(BaseModel):
                 )
             elif constraint_type == "json_schema":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value
+                    constraint_value  # type: ignore
                 )
             else:
                 sampling_params[constraint_type] = constraint_value
@@ -758,6 +786,37 @@ class EmbeddingObject(BaseModel):
     object: str = "embedding"
 
 
+ClassifyInput = Union[str, List[str], List[int]]
+
+
+class ClassifyRequest(BaseModel):
+    # OpenAI-compatible classification request
+    model: str = DEFAULT_MODEL_NAME
+    input: ClassifyInput
+    user: Optional[str] = None
+
+    # The request id.
+    rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
+
+
+class ClassifyData(BaseModel):
+    index: int
+    label: str
+    probs: List[float]
+    num_classes: int
+
+
+class ClassifyResponse(BaseModel):
+    id: str
+    object: str = "list"
+    created: int
+    model: str
+    data: List[ClassifyData]
+    usage: UsageInfo
+
+
 class EmbeddingResponse(BaseModel):
     data: List[EmbeddingObject]
     model: str
@@ -841,6 +900,7 @@ OpenAIServingRequest = Union[
     ChatCompletionRequest,
     CompletionRequest,
     EmbeddingRequest,
+    ClassifyRequest,
     ScoringRequest,
     V1RerankReqInput,
     TokenizeRequest,
@@ -1052,7 +1112,7 @@ class ResponsesResponse(BaseModel):
                 Union[
                     ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall
                 ]
-            ]
+            ],
         ) -> bool:
             if not items:
                 return False
@@ -1142,7 +1202,7 @@ class MessageProcessingResult:
     video_data: Optional[Any]
     modalities: List[str]
     stop: List[str]
-    tool_call_constraint: Optional[Any] = None
+    tool_call_constraint: Optional[ToolCallConstraint] = None
 
 
 class ToolCallProcessingResult(NamedTuple):

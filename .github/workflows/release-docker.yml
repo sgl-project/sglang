@@ -16,6 +16,7 @@ jobs:
         variant:
           - cuda_version: "12.9.1"
             build_type: "all"
+            grace_blackwell: 0
     runs-on: x64-docker-build-node
     steps:
       - name: Delete huge unnecessary tools folder
@@ -55,6 +56,7 @@ jobs:
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
+            --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
@@ -66,7 +68,8 @@ jobs:
       matrix:
         variant:
           - cuda_version: "12.9.1"
-            build_type: "all_aarch64"
+            build_type: "all"
+            grace_blackwell: 1
     runs-on: arm-docker-build-node
     steps:
       - name: Delete huge unnecessary tools folder
@@ -95,6 +98,7 @@ jobs:
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
+            --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .

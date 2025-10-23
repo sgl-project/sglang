@@ -31,7 +31,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     direct_register_custom_op,
     is_cuda,
@@ -41,7 +41,6 @@ from sglang.srt.utils import (
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
-    next_power_of_2,
     round_up,
     set_weight_attrs,
 )
@@ -265,9 +264,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
-        self.flashinfer_mxfp4_moe_precision = global_server_args_dict[
-            "flashinfer_mxfp4_moe_precision"
-        ]
+        self.flashinfer_mxfp4_moe_precision = (
+            get_global_server_args().flashinfer_mxfp4_moe_precision
+        )
 
         self.triton_kernel_moe_forward = None
         self.triton_kernel_moe_with_bias_forward = None
@@ -597,30 +596,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
-    def _get_tile_tokens_dim(self, x: torch.Tensor, top_k: int):
-        # Number of tokens in the input tensor.
-        num_tokens = x.shape[0]
-        # Factor to account for the imbalance of the experts.
-        # factor equals to the
-        # max_real_num_tokens_per_expert / perfect_num_tokens_per_expert
-        # - 1.0 means perfect expert distribution.
-        # - > 1.0 means some experts have more
-        #     tokens than the perfect distribution.
-        # - < 1.0 does not make sense.
-        imbalance_factor = 1.3
-        # Calculate the number of tokens per expert
-        # assuming perfect distribution.
-        num_tokens_per_expert = (num_tokens * top_k) // self.num_experts
-        # Apply the imbalance factor.
-        num_tokens_per_expert = int(num_tokens_per_expert * imbalance_factor)
-        # And pad the number to the next power of 2.
-        tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
-        # Cap to 8-64 tokens per CTA tile
-        # as it's the range supported by the kernel.
-        tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-
-        return tile_tokens_dim
-
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -696,7 +671,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
                 None,
-                self._get_tile_tokens_dim(x, top_k),
+                None,  # tile_tokens_dim
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
             )[0]

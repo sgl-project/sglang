@@ -79,7 +79,7 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
 USE_CUTLASS_BACKEND_FOR_FP4_GEMM = get_bool_env_var(
-    "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM"
+    "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM", "true"
 )
 # TODO make it true by default when the DeepEP PR is merged
 CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
@@ -110,6 +110,11 @@ class ModelOptFp8Config(QuantizationConfig):
             logger.warning(
                 "Detected ModelOpt FP8 checkpoint. The format is experimental and subject to change."
             )
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_config, user_quant):
+        """Override quantization method based on the model's config."""
+        return cls._modelopt_override_quantization_method(hf_quant_config, user_quant)
 
     @classmethod
     def get_name(cls) -> str:
@@ -528,6 +533,11 @@ class ModelOptFp4Config(QuantizationConfig):
         self.exclude_modules = exclude_modules
 
     @classmethod
+    def override_quantization_method(cls, hf_quant_config, user_quant):
+        """Override quantization method based on the model's config."""
+        return cls._modelopt_override_quantization_method(hf_quant_config, user_quant)
+
+    @classmethod
     def get_name(cls) -> str:
         return "modelopt_fp4"
 
@@ -608,7 +618,16 @@ class ModelOptFp4Config(QuantizationConfig):
                 else:
                     kv_cache_quant_algo = "auto"
 
-            group_size = ModelOptFp4Config.common_group_size(config)
+            group_size = config.get("group_size")
+            # If group_size is not at top level, try to extract from config_groups
+            if group_size is None:
+                config_groups = config.get("config_groups", {})
+                if config_groups:
+                    # Get group_size from the first group's weights config
+                    first_group = next(iter(config_groups.values()), {})
+                    weights_config = first_group.get("weights", {})
+                    group_size = weights_config.get("group_size")
+
             exclude_modules = config.get("ignore", [])
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
@@ -634,15 +653,15 @@ class ModelOptFp4Config(QuantizationConfig):
             )
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
 
-        if not (group_size and kv_cache_quant_algo) or exclude_modules is None:
+        if group_size is None or exclude_modules is None:
             logger.warning(
                 f"group_size: {group_size},"
                 f"kv_cache_quant_algo: {kv_cache_quant_algo},"
                 f"exclude_modules: {exclude_modules}"
             )
             raise ValueError(
-                "NVFP4 quantization requires group size and "
-                "kv_cache_quant_algo specified in the quantization config"
+                "NVFP4 quantization requires group_size and exclude_modules "
+                "specified in the quantization config"
             )
         return cls(
             is_checkpoint_nvfp4_serialized,
@@ -852,25 +871,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
-        if USE_CUTLASS_BACKEND_FOR_FP4_GEMM:
-            out = fp4_gemm(
-                x_fp4,
-                w,
-                x_scale_interleaved,
-                w_scale_interleaved,
-                layer.alpha,
-                output_dtype,
-                backend="cutlass",
-            )
-        else:
-            out = fp4_gemm(
-                x_fp4,
-                w,
-                x_scale_interleaved,
-                w_scale_interleaved,
-                layer.alpha,
-                output_dtype,
-            )
+        out = fp4_gemm(
+            x_fp4,
+            w,
+            x_scale_interleaved,
+            w_scale_interleaved,
+            layer.alpha,
+            output_dtype,
+            **(dict(backend="cutlass") if USE_CUTLASS_BACKEND_FOR_FP4_GEMM else dict()),
+        )
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
@@ -1069,19 +1078,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         intermediate_size,
         num_experts,
     ):
-        from flashinfer import (
-            RoutingMethodType,
-            e2m1_and_ufp8sf_scale_to_float,
-            fp4_quantize,
-            next_positive_power_of_2,
-            nvfp4_block_scale_interleave,
-            reorder_rows_for_gated_act_gemm,
-            shuffle_matrix_a,
-            shuffle_matrix_sf_a,
-        )
+        from flashinfer import nvfp4_block_scale_interleave
         from flashinfer.fused_moe.core import (
-            _maybe_get_cached_w2_permute_indices,
             _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
         )
 
         """Prepare quantized weights for kernel (done offline with weights)."""
@@ -1142,7 +1142,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             )
 
-            permute_indices = _maybe_get_cached_w2_permute_indices(
+            permute_indices = get_w2_permute_indices_with_cache(
                 self._cache_permute_indices,
                 gemm2_weights_fp4[i].view(torch.uint8),
                 epilogue_tile_m,
@@ -1153,7 +1153,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 .contiguous()
             )
 
-            permute_sf_indices = _maybe_get_cached_w2_permute_indices(
+            permute_sf_indices = get_w2_permute_indices_with_cache(
                 self._cache_permute_indices,
                 gemm2_scales_linear_fp4[i].view(torch.uint8),
                 epilogue_tile_m,
@@ -1263,6 +1263,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32), requires_grad=False
         )
 
+        layer.dispatcher.set_quant_config(
+            {"input_global_scale": layer.w13_input_scale_quant}
+        )
+
         # Validate weight scales
         for name, weight_scale in [
             ("w13", layer.w13_weight_scale),
@@ -1366,6 +1370,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self,
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
+        forward_shared_experts=None,
+        alt_stream=None,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -1437,9 +1443,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )[0]
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 output, global_output = get_local_dp_buffer(), output
+
+                if forward_shared_experts is not None:
+                    alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(alt_stream):
+                        forward_shared_experts()
+
                 get_tp_group().reduce_scatterv(
                     global_output, output=output, sizes=get_dp_global_num_tokens()
                 )
+
+                if forward_shared_experts is not None:
+                    torch.cuda.current_stream().wait_stream(alt_stream)
+
             return StandardCombineInput(hidden_states=output)
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
