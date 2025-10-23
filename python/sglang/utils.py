@@ -500,7 +500,7 @@ class TypeBasedDispatcher:
     def __call__(self, obj: Any):
         obj_type = type(obj)
 
-        # 1. Frist try exact match(o(1))
+        # 1. First try exact match(o(1))
         fn = self._mapping.get(obj_type)
         if fn is not None:
             return fn(obj)

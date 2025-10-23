@@ -20,7 +20,7 @@ def create_test_mapping(num_types=30):
 
     def create_handler(i):
         def handler(req):
-            return f"hanlder{i}"
+            return f"handler{i}"
         return handler
     handlers = [create_handler(i) for i in range(num_types)]
 
@@ -125,7 +125,7 @@ def benchmark_dispatchers():
 
         print(f"for list: {list_time:.4f} s")
         print(f"for dict: {dict_time:.4f} s")
-        print(f"improvment: {list_time/dict_time:.2f}x")
+        print(f"improvement: {list_time/dict_time:.2f}x")
         print(f"time reduce: {(1-dict_time/list_time) * 100:.1f} %")
 
 
@@ -220,7 +220,7 @@ def simulate_real_workload():
 
     print(f"list version: {list_time:.4f} s")
     print(f"dict version: {dict_time:.4f} s")
-    print(f"improvment: {list_time/dict_time:.2f} x")
+    print(f"improvement: {list_time/dict_time:.2f} x")
 if __name__ == "__main__":
     benchmark_dispatchers()
     test_memory_usage()
