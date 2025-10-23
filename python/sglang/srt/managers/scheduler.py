@@ -1018,6 +1018,9 @@ class Scheduler(
             self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
+            if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
+                self._check_runtime_mem_leak()
+
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 

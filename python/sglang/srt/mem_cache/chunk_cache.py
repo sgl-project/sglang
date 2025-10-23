@@ -65,11 +65,10 @@ class ChunkCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]
-        old_prefix_len = len(req.prefix_indices)
+        self.protected_size_ += len(kv_indices) - len(req.prefix_indices)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
-        self.protected_size_ += len(req.prefix_indices) - old_prefix_len
 
     def evict(self, num_tokens: int):
         pass
