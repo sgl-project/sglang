@@ -56,7 +56,6 @@ class DispatchOutputChecker:
 class DispatchOutputFormat(Enum):
 
     STANDARD = "standard"
-    TRITON_KERNELS = "triton_kernel"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
 
