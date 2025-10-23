@@ -583,8 +583,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             use_nvfp4 = True
         elif not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"):
             use_fp8 = True
-        elif get_moe_runner_backend().is_cutlass():
-            use_fp8 = False
 
         buffer = self._get_buffer()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
