@@ -22,6 +22,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
+use uuid::Uuid;
 
 use super::{
     conversions,
@@ -29,8 +30,6 @@ use super::{
     tool_loop::{create_mcp_manager_from_request, execute_tool_loop, execute_tool_loop_streaming},
     types::BackgroundTaskInfo,
 };
-use uuid::Uuid;
-
 use crate::{
     data_connector::{
         ConversationId, ResponseId, SharedConversationItemStorage, SharedConversationStorage,

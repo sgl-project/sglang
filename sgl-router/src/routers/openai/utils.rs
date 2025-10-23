@@ -230,7 +230,6 @@ pub fn generate_id(prefix: &str) -> String {
     format!("{}_{}", prefix, hex_string)
 }
 
-
 // ============================================================================
 // Re-export FunctionCallInProgress from mcp module
 // ============================================================================
