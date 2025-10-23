@@ -1008,13 +1008,20 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     param = existing_params[param_name]
                     # Bind method to parameter if it's a function
                     if callable(loader):
-                        setattr(
-                            param,
-                            k,
-                            QuantizedRLModelLoader._bond_method_to_cls(
-                                loader, param
-                            ),
-                        )
+                        # If the loader is already a bound method (to a module, not the parameter),
+                        # keep it as is. Only rebind if it's an unbound function or needs rebinding to param.
+                        if hasattr(loader, "__self__"):
+                            # Already bound (likely to the module), keep as is
+                            setattr(param, k, loader)
+                        else:
+                            # Unbound function, bind to parameter
+                            setattr(
+                                param,
+                                k,
+                                QuantizedRLModelLoader._bond_method_to_cls(
+                                    loader, param
+                                ),
+                            )
                     else:
                         setattr(param, k, loader)
 
