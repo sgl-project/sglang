@@ -630,20 +630,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             # Pre-quantize activations to FP8 per-tensor using provided input scale
             x_fp8, _ = scaled_fp8_quant(x, layer.w13_input_scale)
 
-            # Use precomputed per-expert output scales
-            assert (
-                hasattr(layer, "output1_scales_scalar")
-                and layer.output1_scales_scalar is not None
-            )
-            assert (
-                hasattr(layer, "output1_scales_gate_scalar")
-                and layer.output1_scales_gate_scalar is not None
-            )
-            assert (
-                hasattr(layer, "output2_scales_scalar")
-                and layer.output2_scales_scalar is not None
-            )
-
             use_routing_scales_on_input = True
             routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
 
