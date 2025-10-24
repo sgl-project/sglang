@@ -565,17 +565,44 @@ async fn execute_harmony_internal_single(
         "Processing {} output tokens through Harmony parser",
         output_token_ids.len()
     );
+    debug!("Output token IDs: {:?}", output_token_ids);
 
     // Feed tokens to parser
-    for &token_id in output_token_ids {
-        parser
-            .process(token_id)
-            .map_err(|e| format!("Failed to process token: {}", e))?;
+    for (idx, &token_id) in output_token_ids.iter().enumerate() {
+        debug!(
+            "Processing token {}/{}: id={}, parser_state: role={:?}, channel={:?}, recipient={:?}",
+            idx + 1,
+            output_token_ids.len(),
+            token_id,
+            parser.current_role(),
+            parser.current_channel(),
+            parser.current_recipient()
+        );
+
+        if let Err(e) = parser.process(token_id) {
+            error!(
+                "Failed to process token at index {}: token_id={}, error={}, parser_state: role={:?}, channel={:?}, recipient={:?}",
+                idx,
+                token_id,
+                e,
+                parser.current_role(),
+                parser.current_channel(),
+                parser.current_recipient()
+            );
+            return Err(format!("Failed to process token {}: {}", token_id, e));
+        }
     }
 
     // 10. Extract completed messages and convert to ResponseOutputItems
     // Note: We only want messages generated from output tokens, not any pre-existing messages
     // Since we created a fresh parser with no context, all messages are new
+    debug!(
+        "Parser finished processing. Total messages: {}, current_role: {:?}, current_channel: {:?}",
+        parser.messages().len(),
+        parser.current_role(),
+        parser.current_channel()
+    );
+
     let mut output_items = parse_all_messages(&parser)?;
 
     // Parse remaining state for incomplete generation
@@ -593,6 +620,9 @@ async fn execute_harmony_internal_single(
         output_items.len(),
         output_token_ids.len()
     );
+    for (idx, item) in output_items.iter().enumerate() {
+        debug!("Output item {}: {:?}", idx, item);
+    }
 
     // 11. Build ResponsesResponse
     let response_id = Uuid::new_v4().simple().to_string();
