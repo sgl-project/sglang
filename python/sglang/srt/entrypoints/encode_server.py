@@ -82,7 +82,7 @@ class ImageEncoder:
             )
         
         context = zmq.asyncio.Context(2)
-        self.send_to_prefill = get_zmq_socket(context, zmq.PUSH, f"tcp://localhost:{server_args.embedding_port}", False)
+        self.send_to_prefill = get_zmq_socket(context, zmq.PUSH, f"tcp://{server_args.prefill_server_ip}:{server_args.embedding_port}", False)
         
         self.wait_queue = deque()
         
