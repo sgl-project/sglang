@@ -74,7 +74,6 @@ impl BucketPolicy {
     }
 }
 
-
 impl LoadBalancingPolicy for BucketPolicy {
     fn select_worker(
         &self,
@@ -108,7 +107,7 @@ impl LoadBalancingPolicy for BucketPolicy {
 
         //Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold.
         // balance_abs_threshold = 1
-        let is_imbalanced = 
+        let is_imbalanced =
             abs_diff > self.config.balance_abs_threshold && max_load as f32 > rel_threshold;
         info!(
             "Current PD instance status | is_imbalanced={}",
@@ -177,7 +176,6 @@ impl LoadBalancingPolicy for BucketPolicy {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct Bucket {
     l_max: usize,
@@ -191,7 +189,6 @@ pub struct Bucket {
     t_req_loads: HashMap<String, usize>,
     pub chars_per_url: Arc<Mutex<HashMap<String, usize>>>,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct SequencerRequest {
@@ -632,8 +629,8 @@ mod tests {
             .select_worker(&prefill_workers, Some(&*"a".repeat(5)))
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(10))).
-            unwrap();
+            .select_worker(&prefill_workers, Some(&*"a".repeat(10)))
+            .unwrap();
         policy
             .select_worker(&prefill_workers, Some(&*"a".repeat(15)))
             .unwrap();
@@ -791,8 +788,8 @@ mod tests {
             .select_worker(&prefill_workers, Some(&*"a".repeat(5)))
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(10))).
-            unwrap();
+            .select_worker(&prefill_workers, Some(&*"a".repeat(10)))
+            .unwrap();
         policy
             .select_worker(&prefill_workers, Some(&*"a".repeat(15)))
             .unwrap();
