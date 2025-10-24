@@ -145,6 +145,7 @@ def generate_markdown_report(trace_dir, results: List["BenchmarkResult"]) -> str
             "PERFETTO_RELAY_URL",
             "",
         ).rstrip("/")
+        print(f"{relay_base=}")
         summary += result.to_markdown_row(trace_dir, base_url, relay_base)
 
     return summary
