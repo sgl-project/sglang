@@ -223,7 +223,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         )  # draft logits processor has it's own vocab size
         self.logits_processor = LogitsProcessor(config_)
 
-        self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
 
