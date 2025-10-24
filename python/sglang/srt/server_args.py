@@ -257,7 +257,8 @@ class ServerArgs:
     # Encode prefill disaggregation
     mm_only: bool = False
     language_only: bool = False
-    embedding_port:int = None
+    embedding_port: Optional[int] = None
+    prefill_server_ip: str = 'localhost'
 
     # Quantization and data type
     dtype: str = "auto"
@@ -2245,16 +2246,25 @@ class ServerArgs:
         # Encode prefill disaggregation
         parser.add_argument(
             "--mm-only",
-            action='store_true'
+            action='store_true',
+            help="For VLM, launch encode server only for multimodal part."
         )
         parser.add_argument(
             "--language-only",
-            action='store_true'
+            action='store_true',
+            help="For VLM, load weights for the language model only."
         )
         parser.add_argument(
             "--embedding-port",
             type=int,
-            default=54213
+            default=54213,
+            help="The port for multimodal embedding transmission."
+        )
+        parser.add_argument(
+            "--prefill-server-ip",
+            type=str,
+            default=ServerArgs.prefill_server_ip,
+            help="The IP for prefill instance when launching encode server."
         )
 
         # Quantization and data type

@@ -316,7 +316,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         # Recv embedding from encoding server
         if (self.disaggregation_mode == DisaggregationMode.PREFILL and 
-            self.model_config.is_multimodal):
+            self.model_config.is_multimodal and self.server_args.language_only):
             self.recv_from_encoder = get_zmq_socket(
                 context, zmq.PULL, f"tcp://*:{server_args.embedding_port}", True
             )
@@ -731,7 +731,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
             
-            while self.disaggregation_mode == DisaggregationMode.PREFILL:
+            while self.disaggregation_mode == DisaggregationMode.PREFILL and self.server_args.language_only:
                 if obj.bootstrap_room not in self.received_embeddings:
                     await self.handle_embedding()
                     continue

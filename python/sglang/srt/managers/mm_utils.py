@@ -352,6 +352,9 @@ def _get_precomputed_embedding(
     """
     precomputed_embeddings = []
     for idx,item in enumerate(items):
+        if item.precomputed_embeddings is None:
+            precomputed_embeddings.append(None)
+            continue
         seq_start_idx = prefix_length[idx]
         seq_end_idx = seq_start_idx + extend_length[idx] - 1
         prefix_embedding_length = []
