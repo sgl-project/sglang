@@ -74,6 +74,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_BLOCK_NONZERO_RANK_CHILDREN` | Control blocking of non-zero rank children processes | `1` |
 | `SGL_IS_FIRST_RANK_ON_NODE` | Indicates if the current process is the first rank on its node | `"true"` |
 | `SGLANG_PP_LAYER_PARTITION` | Pipeline parallel layer partition specification | Not set |
+| `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` | Set one visible device per process for distributed computing | `false` |
 
 ## Testing & Debugging (Internal/CI)
 
@@ -99,4 +100,5 @@ SGLang supports various environment variables that can be used to configure its 
 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
+| `SGLANG_WAIT_WEIGHTS_READY_TIMEOUT` | Timeout period for waiting on weights | `120` |
 | `SGLANG_DISABLE_OUTLINES_DISK_CACHE` | Disable Outlines disk cache | `true` |
