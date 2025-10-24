@@ -1213,6 +1213,65 @@ def set_mla_kv_buffer_triton(
     )
 
 
+@triton.jit
+def get_mla_kv_buffer_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+):
+    pid_loc = tl.program_id(0)
+    loc = tl.load(loc_ptr + pid_loc)
+    loc_src_ptr = kv_buffer_ptr + loc * buffer_stride
+
+    nope_offs = tl.arange(0, nope_dim)
+    nope_src_ptr = loc_src_ptr + nope_offs
+    nope_src = tl.load(nope_src_ptr)
+
+    tl.store(
+        cache_k_nope_ptr + pid_loc * nope_stride + nope_offs,
+        nope_src,
+    )
+
+    rope_offs = tl.arange(0, rope_dim)
+    rope_src_ptr = loc_src_ptr + nope_dim + rope_offs
+    rope_src = tl.load(rope_src_ptr)
+    tl.store(
+        cache_k_rope_ptr + pid_loc * rope_stride + rope_offs,
+        rope_src,
+    )
+
+
+def get_mla_kv_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+):
+    # The source data type will be implicitly converted to the target data type.
+    nope_dim = cache_k_nope.shape[-1]  # 512
+    rope_dim = cache_k_rope.shape[-1]  # 64
+    n_loc = loc.numel()
+    grid = (n_loc,)
+
+    get_mla_kv_buffer_kernel[grid](
+        kv_buffer,
+        cache_k_nope,
+        cache_k_rope,
+        loc,
+        kv_buffer.stride(0),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
+        nope_dim,
+        rope_dim,
+    )
+
+
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -1362,6 +1421,29 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope,
                 cache_k_rope,
             )
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
+        layer_id = layer.layer_id
+        kv_buffer = self.get_key_buffer(layer_id)
+        dst_dtype = dst_dtype or self.dtype
+        cache_k_nope = torch.empty(
+            (loc.shape[0], 1, self.kv_lora_rank),
+            dtype=dst_dtype,
+            device=kv_buffer.device,
+        )
+        cache_k_rope = torch.empty(
+            (loc.shape[0], 1, self.qk_rope_head_dim),
+            dtype=dst_dtype,
+            device=kv_buffer.device,
+        )
+        get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
+        return cache_k_nope, cache_k_rope
 
     def get_cpu_copy(self, indices):
         torch.cuda.synchronize()

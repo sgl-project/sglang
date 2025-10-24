@@ -63,6 +63,8 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -169,6 +171,9 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_tensor_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.update_weights_from_ipc_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -234,6 +239,10 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromTensorReqOutput,
                     self.update_weights_from_tensor_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromIPCReqOutput,
+                    self.update_weights_from_ipc_communicator.handle_recv,
                 ),
                 (
                     GetWeightsByNameReqOutput,
@@ -445,6 +454,28 @@ class TokenizerCommunicatorMixin:
         async with self.model_update_lock.writer_lock:
             result = (await self.update_weights_from_tensor_communicator(obj))[0]
             return result.success, result.message
+
+    async def update_weights_from_ipc(
+        self,
+        obj: UpdateWeightsFromIPCReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Update weights via IPC for checkpoint-engine integration."""
+        self.auto_create_handle_loop()
+        try:
+            # For now, we only support single data parallel instance
+            assert (
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
+            logger.info("Starting IPC weight update")
+            # This means that weight sync cannot run while requests are in progress.
+            async with self.model_update_lock.writer_lock:
+                result = (await self.update_weights_from_ipc_communicator(obj))[0]
+                return result.success, result.message
+        except Exception as e:
+            error_msg = f"IPC weight update failed: {str(e)}"
+            logger.error(error_msg)
+            return False, error_msg
 
     async def load_lora_adapter(
         self: TokenizerManager,

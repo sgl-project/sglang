@@ -114,7 +114,6 @@ class Envs:
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
-    SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
@@ -128,6 +127,11 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
+
+    # Scheduler: memory leak test
+    SGLANG_TEST_RETRACT = EnvBool(False)
+    SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
+    SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK = EnvBool(False)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
@@ -159,6 +163,7 @@ class Envs:
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -237,6 +242,9 @@ class Envs:
     SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
     SGLANG_KT_AMX_METHOD = EnvStr(None)
     SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
+
+    # Sparse Embeddings
+    SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
     # fmt: on
 
