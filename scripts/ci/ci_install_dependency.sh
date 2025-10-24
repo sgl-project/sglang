@@ -42,23 +42,17 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
 else
     # In normal cases, we use uv, which is much faster than pip.
-    # Detect if running as non-root user
-    if [ "$(id -u)" -ne 0 ]; then
-        # Non-root: install pip and uv to user directory
-        pip install --upgrade pip --user
-        pip install uv --user
-        USER_INSTALL_SUFFIX="--user"
-    else
-        # Root: install system-wide
-        pip install --upgrade pip
-        pip install uv
-        USER_INSTALL_SUFFIX=""
-    fi
-
+    pip install --upgrade pip
+    pip install uv
     export UV_SYSTEM_PYTHON=true
 
+    # For non-root users, allow uv to modify system packages
+    if [ "$(id -u)" -ne 0 ]; then
+        export UV_BREAK_SYSTEM_PACKAGES=1
+    fi
+
     PIP_CMD="uv pip"
-    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match${USER_INSTALL_SUFFIX:+ }${USER_INSTALL_SUFFIX}"
+    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
     # Clean up existing installations
     $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
