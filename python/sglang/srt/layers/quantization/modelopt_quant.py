@@ -18,8 +18,6 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -609,6 +607,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
 
         # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
         if should_use_flashinfer_trtllm_moe() and TopKOutputChecker.format_is_bypassed(
             topk_output
         ):
@@ -672,6 +672,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 tile_tokens_dim=None,
                 routing_method_type=routing_method_type,
             )
+
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
             return StandardCombineInput(hidden_states=output)
 
@@ -1543,6 +1545,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # Check if this is a FlashInferFP4MoE layer that should handle its own forward
         if hasattr(layer, "gemm1_weights_fp4_shuffled"):
             # This layer was processed with flashinfer TRTLLM - delegate to its own forward
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
             return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
 
         if self.enable_flashinfer_cutlass_moe:
@@ -1611,6 +1615,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 if forward_shared_experts is not None:
                     torch.cuda.current_stream().wait_stream(alt_stream)
 
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
             return StandardCombineInput(hidden_states=output)
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
@@ -1632,6 +1638,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
         return StandardCombineInput(hidden_states=output)
 
     def apply_without_routing_weights(
