@@ -279,8 +279,20 @@ async fn test_openai_router_responses_with_mock() {
         .await
         .unwrap()
         .expect("first response missing");
-    assert_eq!(stored1.input, "Say hi");
-    assert_eq!(stored1.output, "mock_output_1");
+    // Input is now stored as a JSON array of items
+    assert!(stored1.input.is_array());
+    let input_items = stored1.input.as_array().unwrap();
+    assert_eq!(input_items.len(), 1);
+    assert_eq!(input_items[0]["type"], "message");
+    assert_eq!(input_items[0]["role"], "user");
+    assert_eq!(input_items[0]["content"][0]["text"], "Say hi");
+
+    // Output is now stored as a JSON array of items
+    assert!(stored1.output.is_array());
+    let output_items = stored1.output.as_array().unwrap();
+    assert_eq!(output_items.len(), 1);
+    assert_eq!(output_items[0]["content"][0]["text"], "mock_output_1");
+
     assert!(stored1.previous_response_id.is_none());
 
     let stored2 = storage
@@ -289,7 +301,12 @@ async fn test_openai_router_responses_with_mock() {
         .unwrap()
         .expect("second response missing");
     assert_eq!(stored2.previous_response_id.unwrap().0, resp1_id);
-    assert_eq!(stored2.output, "mock_output_2");
+
+    // Output is now stored as a JSON array
+    assert!(stored2.output.is_array());
+    let output_items2 = stored2.output.as_array().unwrap();
+    assert_eq!(output_items2.len(), 1);
+    assert_eq!(output_items2[0]["content"][0]["text"], "mock_output_2");
 
     let get1 = router
         .get_response(None, &stored1.id.0, &ResponsesGetParams::default())
@@ -481,12 +498,10 @@ async fn test_openai_router_responses_streaming_with_mock() {
     let storage = Arc::new(MemoryResponseStorage::new());
 
     // Seed a previous response so previous_response_id logic has data to pull from.
-    let mut previous = StoredResponse::new(
-        "Earlier bedtime question".to_string(),
-        "Earlier answer".to_string(),
-        None,
-    );
+    let mut previous = StoredResponse::new(None);
     previous.id = ResponseId::from("resp_prev_chain");
+    previous.input = serde_json::json!("Earlier bedtime question");
+    previous.output = serde_json::json!("Earlier answer");
     storage.store_response(previous).await.unwrap();
 
     let router = OpenAIRouter::new(
@@ -541,8 +556,25 @@ async fn test_openai_router_responses_streaming_with_mock() {
         sleep(Duration::from_millis(10)).await;
     };
 
-    assert_eq!(stored.input, "Tell me a bedtime story.");
-    assert_eq!(stored.output, "Once upon a streamed unicorn adventure.");
+    // Input is now stored as a JSON array of items
+    assert!(stored.input.is_array());
+    let input_items = stored.input.as_array().unwrap();
+    assert_eq!(input_items.len(), 1);
+    assert_eq!(input_items[0]["type"], "message");
+    assert_eq!(input_items[0]["role"], "user");
+    assert_eq!(
+        input_items[0]["content"][0]["text"],
+        "Tell me a bedtime story."
+    );
+
+    // Output is now stored as a JSON array of items
+    assert!(stored.output.is_array());
+    let output_items = stored.output.as_array().unwrap();
+    assert_eq!(output_items.len(), 1);
+    assert_eq!(
+        output_items[0]["content"][0]["text"],
+        "Once upon a streamed unicorn adventure."
+    );
     assert_eq!(
         stored
             .previous_response_id
@@ -902,17 +934,10 @@ async fn test_openai_router_models_auth_forwarding() {
 
 #[test]
 fn oracle_config_validation_requires_config_when_enabled() {
-    let config = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec!["https://api.openai.com".to_string()],
-        },
-        history_backend: HistoryBackend::Oracle,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-        ..Default::default()
-    };
+    let config = RouterConfig::builder()
+        .openai_mode(vec!["https://api.openai.com".to_string()])
+        .history_backend(HistoryBackend::Oracle)
+        .build_unchecked();
 
     let err =
         ConfigValidator::validate(&config).expect_err("config should fail without oracle details");
@@ -927,13 +952,9 @@ fn oracle_config_validation_requires_config_when_enabled() {
 
 #[test]
 fn oracle_config_validation_accepts_dsn_only() {
-    let config = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec!["https://api.openai.com".to_string()],
-        },
-        history_backend: HistoryBackend::Oracle,
-        oracle: Some(OracleConfig {
+    let config = RouterConfig::builder()
+        .openai_mode(vec!["https://api.openai.com".to_string()])
+        .oracle_history(OracleConfig {
             wallet_path: None,
             connect_descriptor: "tcps://db.example.com:1522/service".to_string(),
             username: "scott".to_string(),
@@ -941,22 +962,17 @@ fn oracle_config_validation_accepts_dsn_only() {
             pool_min: 1,
             pool_max: 4,
             pool_timeout_secs: 30,
-        }),
-        ..Default::default()
-    };
+        })
+        .build_unchecked();
 
     ConfigValidator::validate(&config).expect("dsn-based config should validate");
 }
 
 #[test]
 fn oracle_config_validation_accepts_wallet_alias() {
-    let config = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec!["https://api.openai.com".to_string()],
-        },
-        history_backend: HistoryBackend::Oracle,
-        oracle: Some(OracleConfig {
+    let config = RouterConfig::builder()
+        .openai_mode(vec!["https://api.openai.com".to_string()])
+        .oracle_history(OracleConfig {
             wallet_path: Some("/etc/sglang/oracle-wallet".to_string()),
             connect_descriptor: "db_low".to_string(),
             username: "app_user".to_string(),
@@ -964,9 +980,8 @@ fn oracle_config_validation_accepts_wallet_alias() {
             pool_min: 1,
             pool_max: 8,
             pool_timeout_secs: 45,
-        }),
-        ..Default::default()
-    };
+        })
+        .build_unchecked();
 
     ConfigValidator::validate(&config).expect("wallet-based config should validate");
 }

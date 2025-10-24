@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock};
 use axum::Router;
 use reqwest::Client;
 use sglang_router_rs::{
+    app_context::AppContext,
     config::RouterConfig,
     core::{LoadMonitor, WorkerRegistry},
     data_connector::{
@@ -11,7 +12,7 @@ use sglang_router_rs::{
     middleware::{AuthConfig, TokenBucket},
     policies::PolicyRegistry,
     routers::RouterTrait,
-    server::{build_app, AppContext, AppState},
+    server::{build_app, AppState},
 };
 
 /// Create a test Axum application using the actual server's build_app function
@@ -57,23 +58,26 @@ pub fn create_test_app(
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engine = Arc::new(OnceLock::new());
 
-    // Create AppContext
-    let app_context = Arc::new(AppContext::new(
-        router_config.clone(),
-        client,
-        rate_limiter,
-        None, // tokenizer
-        None, // reasoning_parser_factory
-        None, // tool_parser_factory
-        worker_registry,
-        policy_registry,
-        response_storage,
-        conversation_storage,
-        conversation_item_storage,
-        load_monitor,
-        worker_job_queue,
-        workflow_engine,
-    ));
+    // Create AppContext using builder pattern
+    let app_context = Arc::new(
+        AppContext::builder()
+            .router_config(router_config.clone())
+            .client(client)
+            .rate_limiter(rate_limiter)
+            .tokenizer(None) // tokenizer
+            .reasoning_parser_factory(None) // reasoning_parser_factory
+            .tool_parser_factory(None) // tool_parser_factory
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .load_monitor(load_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engine(workflow_engine)
+            .build()
+            .unwrap(),
+    );
 
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {

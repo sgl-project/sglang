@@ -21,13 +21,13 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::{
+    app_context::AppContext,
     core::{
         workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
         DPAwareWorkerBuilder, HealthConfig, Worker, WorkerType,
     },
     grpc_client::SglangSchedulerClient,
     protocols::worker_spec::WorkerConfigRequest,
-    server::AppContext,
 };
 
 // HTTP client for metadata fetching
@@ -123,16 +123,29 @@ fn strip_protocol(url: &str) -> String {
 }
 
 /// Helper: Try HTTP health check
-async fn try_http_health_check(url: &str, timeout_secs: u64) -> Result<(), String> {
+///
+/// Uses the provided client (from app_context) which supports both HTTP and HTTPS.
+/// For HTTPS URLs, the client's TLS configuration (mTLS, CA certs) is used.
+/// For plain HTTP URLs, the client handles them normally without TLS overhead.
+async fn try_http_health_check(
+    url: &str,
+    timeout_secs: u64,
+    client: &Client,
+) -> Result<(), String> {
+    // Preserve the protocol (http or https) from the original URL
+    let is_https = url.starts_with("https://");
+    let protocol = if is_https { "https" } else { "http" };
     let clean_url = strip_protocol(url);
-    let health_url = format!("http://{}/health", clean_url);
+    let health_url = format!("{}://{}/health", protocol, clean_url);
 
-    HTTP_CLIENT
+    // Use the AppContext client for both HTTP and HTTPS
+    // The rustls backend handles both protocols correctly
+    client
         .get(&health_url)
         .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
-        .map_err(|e| format!("HTTP health check failed: {}", e))?;
+        .map_err(|e| format!("Health check failed: {}", e))?;
 
     Ok(())
 }
@@ -235,6 +248,9 @@ impl StepExecutor for DetectConnectionModeStep {
         let config: Arc<WorkerConfigRequest> = context
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
+        let app_context: Arc<AppContext> = context
+            .get("app_context")
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
         debug!(
             "Detecting connection mode for {} (timeout: {}s, max_attempts: {})",
@@ -242,10 +258,12 @@ impl StepExecutor for DetectConnectionModeStep {
         );
 
         // Try both protocols in parallel using configured timeout
+        // Use the AppContext client which has TLS configuration (CA certs, client identity)
         let url = config.url.clone();
         let timeout = config.health_check_timeout_secs;
+        let client = &app_context.client;
         let (http_result, grpc_result) = tokio::join!(
-            try_http_health_check(&url, timeout),
+            try_http_health_check(&url, timeout, client),
             try_grpc_health_check(&url, timeout)
         );
 

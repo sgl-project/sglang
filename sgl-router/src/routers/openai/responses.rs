@@ -8,7 +8,7 @@ use tracing::warn;
 use super::utils::event_types;
 use crate::{
     data_connector::{ResponseId, StoredResponse},
-    protocols::responses::{ResponseInput, ResponseToolType, ResponsesRequest},
+    protocols::responses::{ResponseToolType, ResponsesRequest},
 };
 
 // ============================================================================
@@ -20,14 +20,11 @@ pub(super) fn build_stored_response(
     response_json: &Value,
     original_body: &ResponsesRequest,
 ) -> StoredResponse {
-    let input_text = match &original_body.input {
-        ResponseInput::Text(text) => text.clone(),
-        ResponseInput::Items(_) => "complex input".to_string(),
-    };
+    let mut stored_response = StoredResponse::new(None);
 
-    let output_text = extract_primary_output_text(response_json).unwrap_or_default();
-
-    let mut stored_response = StoredResponse::new(input_text, output_text, None);
+    // Initialize empty arrays - will be populated by persist_items_with_storages
+    stored_response.input = Value::Array(vec![]);
+    stored_response.output = Value::Array(vec![]);
 
     stored_response.instructions = response_json
         .get("instructions")
@@ -312,32 +309,4 @@ pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesReque
         obj.entry("tool_choice")
             .or_insert(Value::String("auto".to_string()));
     }
-}
-
-// ============================================================================
-// Output Text Extraction
-// ============================================================================
-
-/// Extract primary output text from response JSON
-pub(super) fn extract_primary_output_text(response_json: &Value) -> Option<String> {
-    if let Some(items) = response_json.get("output").and_then(|v| v.as_array()) {
-        for item in items {
-            if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
-                for part in content {
-                    if part
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .map(|t| t == "output_text")
-                        .unwrap_or(false)
-                    {
-                        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                            return Some(text.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
 }

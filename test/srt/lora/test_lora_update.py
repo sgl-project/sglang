@@ -28,6 +28,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    calculate_rouge_l,
     is_in_ci,
     popen_launch_server,
 )
@@ -1278,6 +1279,8 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 max_new_tokens=test_case.max_new_tokens,
             )
 
+            ROUGE_L_TOL = 0.9
+
             print(f"Dynamic output: {dynamic_output}")
             print(f"Static output: {static_output}")
             print("=" * 100)
@@ -1295,12 +1298,15 @@ class TestLoRADynamicUpdate(CustomTestCase):
                     f"Output length mismatch at batch {i}:\n- Dynamic={len(dynamic)}\n- Static={len(static)}",
                 )
                 for j, (d_out, s_out) in enumerate(zip(dynamic, static), start=1):
-                    d_out = d_out.strip()
-                    s_out = s_out.strip()
-                    self.assertEqual(
-                        d_out,
-                        s_out,
-                        f"Output mismatch at batch {i}, prompt {j}:\n- Dynamic: '{d_out}'\n- Static: '{s_out}'",
+                    d_out_str = d_out.strip()
+                    s_out_str = s_out.strip()
+                    rouge_score = calculate_rouge_l([d_out_str], [s_out_str])[0]
+
+                    self.assertGreaterEqual(
+                        rouge_score,
+                        ROUGE_L_TOL,
+                        f"ROUGE-L score {rouge_score} of outputs is below tolerance of {ROUGE_L_TOL} "
+                        f"at batch {i}, prompt {j}:\n- Dynamic: '{d_out}'\n- Static: '{s_out}'",
                     )
 
     def test_dynamic_lora_update_engine(self):

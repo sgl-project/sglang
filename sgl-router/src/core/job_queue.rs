@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::workflow::{
         steps::WorkerRemovalRequest, WorkflowContext, WorkflowEngine, WorkflowId,
@@ -21,7 +22,6 @@ use crate::{
     },
     metrics::RouterMetrics,
     protocols::worker_spec::{JobStatus, WorkerConfigRequest},
-    server::AppContext,
 };
 
 /// Job types for control plane operations

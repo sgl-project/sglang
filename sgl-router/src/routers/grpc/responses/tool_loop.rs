@@ -414,7 +414,10 @@ pub(super) async fn execute_tool_loop(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
-                ResponseInput::Items(items) => items.clone(),
+                ResponseInput::Items(items) => items
+                    .iter()
+                    .map(crate::protocols::responses::normalize_input_item)
+                    .collect(),
             };
 
             // Append all conversation history (function calls and outputs)
@@ -608,11 +611,7 @@ async fn execute_tool_loop_streaming_internal(
 
     // Create response event emitter
     let response_id = format!("resp_{}", Uuid::new_v4());
-    let model = if current_request.model.is_empty() {
-        "default".to_string()
-    } else {
-        current_request.model.clone()
-    };
+    let model = current_request.model.clone();
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -871,13 +870,14 @@ async fn execute_tool_loop_streaming_internal(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
-                ResponseInput::Items(items) => items.clone(),
+                ResponseInput::Items(items) => items
+                    .iter()
+                    .map(crate::protocols::responses::normalize_input_item)
+                    .collect(),
             };
 
-            // Append all conversation history
             input_items.extend_from_slice(&state.conversation_history);
 
-            // Build new request for next iteration
             current_request = ResponsesRequest {
                 input: ResponseInput::Items(input_items),
                 model: current_request.model.clone(),
@@ -886,8 +886,8 @@ async fn execute_tool_loop_streaming_internal(
                 max_output_tokens: current_request.max_output_tokens,
                 temperature: current_request.temperature,
                 top_p: current_request.top_p,
-                stream: Some(true), // Keep streaming enabled
-                store: Some(false), // Don't store intermediate responses
+                stream: Some(true),
+                store: Some(false),
                 background: Some(false),
                 max_tool_calls: current_request.max_tool_calls,
                 tool_choice: current_request.tool_choice.clone(),

@@ -324,11 +324,7 @@ async fn route_responses_background(
         incomplete_details: None,
         instructions: request.instructions.clone(),
         max_output_tokens: request.max_output_tokens,
-        model: if request.model.is_empty() {
-            "default".to_string()
-        } else {
-            request.model.clone()
-        },
+        model: request.model.clone(),
         output: Vec::new(),
         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
         previous_response_id: request.previous_response_id.clone(),
@@ -623,11 +619,7 @@ async fn process_and_transform_sse_stream(
 
     // Create event emitter for OpenAI-compatible streaming
     let response_id = format!("resp_{}", Uuid::new_v4());
-    let model = if original_request.model.is_empty() {
-        "default".to_string()
-    } else {
-        original_request.model.clone()
-    };
+    let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
 
@@ -965,25 +957,36 @@ async fn load_conversation_history(
             Ok(chain) => {
                 let mut items = Vec::new();
                 for stored in chain.responses.iter() {
-                    // Convert input to conversation item
-                    items.push(ResponseInputOutputItem::Message {
-                        id: format!("msg_u_{}", stored.id.0.trim_start_matches("resp_")),
-                        role: "user".to_string(),
-                        content: vec![ResponseContentPart::InputText {
-                            text: stored.input.clone(),
-                        }],
-                        status: Some("completed".to_string()),
-                    });
+                    // Convert input items from stored input (which is now a JSON array)
+                    if let Some(input_arr) = stored.input.as_array() {
+                        for item in input_arr {
+                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
+                                Ok(input_item) => {
+                                    items.push(input_item);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to deserialize stored input item: {}. Item: {}",
+                                        e, item
+                                    );
+                                }
+                            }
+                        }
+                    }
 
-                    // Convert output to conversation items
-                    if let Some(output_arr) =
-                        stored.raw_response.get("output").and_then(|v| v.as_array())
-                    {
+                    // Convert output items from stored output (which is now a JSON array)
+                    if let Some(output_arr) = stored.output.as_array() {
                         for item in output_arr {
-                            if let Ok(output_item) =
-                                serde_json::from_value::<ResponseInputOutputItem>(item.clone())
-                            {
-                                items.push(output_item);
+                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
+                                Ok(output_item) => {
+                                    items.push(output_item);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to deserialize stored output item: {}. Item: {}",
+                                        e, item
+                                    );
+                                }
                             }
                         }
                     }
@@ -1065,7 +1068,12 @@ async fn load_conversation_history(
                         });
                     }
                     ResponseInput::Items(current_items) => {
-                        items.extend_from_slice(current_items);
+                        // Process all item types, converting SimpleInputMessage to Message
+                        for item in current_items.iter() {
+                            let normalized =
+                                crate::protocols::responses::normalize_input_item(item);
+                            items.push(normalized);
+                        }
                     }
                 }
 
@@ -1096,7 +1104,11 @@ async fn load_conversation_history(
                 });
             }
             ResponseInput::Items(current_items) => {
-                items.extend_from_slice(current_items);
+                // Process all item types, converting SimpleInputMessage to Message
+                for item in current_items.iter() {
+                    let normalized = crate::protocols::responses::normalize_input_item(item);
+                    items.push(normalized);
+                }
             }
         }
 

@@ -41,14 +41,14 @@ pub struct StoredResponse {
     /// ID of the previous response in the chain (if any)
     pub previous_response_id: Option<ResponseId>,
 
-    /// The user input for this response
-    pub input: String,
+    /// Input items as JSON array
+    pub input: Value,
 
     /// System instructions used
     pub instructions: Option<String>,
 
-    /// The model's output
-    pub output: String,
+    /// Output items as JSON array
+    pub output: Value,
 
     /// Tool calls made by the model (if any)
     pub tool_calls: Vec<Value>,
@@ -75,13 +75,13 @@ pub struct StoredResponse {
 }
 
 impl StoredResponse {
-    pub fn new(input: String, output: String, previous_response_id: Option<ResponseId>) -> Self {
+    pub fn new(previous_response_id: Option<ResponseId>) -> Self {
         Self {
             id: ResponseId::new(),
             previous_response_id,
-            input,
+            input: Value::Array(vec![]),
             instructions: None,
-            output,
+            output: Value::Array(vec![]),
             tool_calls: Vec::new(),
             metadata: HashMap::new(),
             created_at: chrono::Utc::now(),
@@ -128,7 +128,7 @@ impl ResponseChain {
     }
 
     /// Build context from the chain for the next request
-    pub fn build_context(&self, max_responses: Option<usize>) -> Vec<(String, String)> {
+    pub fn build_context(&self, max_responses: Option<usize>) -> Vec<(Value, Value)> {
         let responses = if let Some(max) = max_responses {
             let start = self.responses.len().saturating_sub(max);
             &self.responses[start..]
@@ -197,6 +197,6 @@ pub type SharedResponseStorage = Arc<dyn ResponseStorage>;
 
 impl Default for StoredResponse {
     fn default() -> Self {
-        Self::new(String::new(), String::new(), None)
+        Self::new(None)
     }
 }

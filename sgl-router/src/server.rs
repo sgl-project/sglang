@@ -20,6 +20,7 @@ use tokio::{net::TcpListener, signal, spawn};
 use tracing::{error, info, warn, Level};
 
 use crate::{
+    app_context::AppContext,
     config::{HistoryBackend, RouterConfig, RoutingMode},
     core::{
         worker_to_info,
@@ -61,72 +62,6 @@ use crate::{
     },
     tool_parser::ParserFactory as ToolParserFactory,
 };
-
-//
-
-#[derive(Clone)]
-pub struct AppContext {
-    pub client: Client,
-    pub router_config: RouterConfig,
-    pub rate_limiter: Option<Arc<TokenBucket>>,
-    pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    pub reasoning_parser_factory: Option<ReasoningParserFactory>,
-    pub tool_parser_factory: Option<ToolParserFactory>,
-    pub worker_registry: Arc<WorkerRegistry>,
-    pub policy_registry: Arc<PolicyRegistry>,
-    pub router_manager: Option<Arc<RouterManager>>,
-    pub response_storage: SharedResponseStorage,
-    pub conversation_storage: SharedConversationStorage,
-    pub conversation_item_storage: SharedConversationItemStorage,
-    pub load_monitor: Option<Arc<LoadMonitor>>,
-    pub configured_reasoning_parser: Option<String>,
-    pub configured_tool_parser: Option<String>,
-    pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
-    pub workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
-}
-
-impl AppContext {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        router_config: RouterConfig,
-        client: Client,
-        rate_limiter: Option<Arc<TokenBucket>>,
-        tokenizer: Option<Arc<dyn Tokenizer>>,
-        reasoning_parser_factory: Option<ReasoningParserFactory>,
-        tool_parser_factory: Option<ToolParserFactory>,
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
-        response_storage: SharedResponseStorage,
-        conversation_storage: SharedConversationStorage,
-        conversation_item_storage: SharedConversationItemStorage,
-        load_monitor: Option<Arc<LoadMonitor>>,
-        worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
-        workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
-    ) -> Self {
-        let configured_reasoning_parser = router_config.reasoning_parser.clone();
-        let configured_tool_parser = router_config.tool_call_parser.clone();
-
-        Self {
-            client,
-            router_config,
-            rate_limiter,
-            tokenizer,
-            reasoning_parser_factory,
-            tool_parser_factory,
-            worker_registry,
-            policy_registry,
-            router_manager: None,
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
-            load_monitor,
-            configured_reasoning_parser,
-            configured_tool_parser,
-            worker_job_queue,
-            workflow_engine,
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -690,7 +625,7 @@ pub fn build_app(
         )
         .route("/v1/responses/{response_id}", delete(v1_responses_delete))
         .route(
-            "/v1/responses/{response_id}/input",
+            "/v1/responses/{response_id}/input_items",
             get(v1_responses_list_input_items),
         )
         .route("/v1/conversations", post(v1_conversations_create))
@@ -799,13 +734,59 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
-    let client = Client::builder()
+    // FIXME: Current implementation creates a single HTTP client for all workers.
+    // This works well for single security domain deployments where all workers share
+    // the same CA and can accept the same client certificate.
+    //
+    // For multi-domain deployments (e.g., different model families with different CAs),
+    // this architecture needs significant refactoring:
+    // 1. Move client creation into worker registration workflow (per-worker clients)
+    // 2. Store client per worker in WorkerRegistry
+    // 3. Update PDRouter and other routers to fetch client from worker
+    // 4. Add per-worker TLS spec in WorkerConfigRequest
+    //
+    // Current single-domain approach is sufficient for most deployments.
+    //
+    // Use rustls TLS backend when TLS/mTLS is configured (client cert or CA certs provided).
+    // This ensures proper PKCS#8 key format support. For plain HTTP workers, use default
+    // backend to avoid unnecessary TLS initialization overhead.
+    let has_tls_config = config.router_config.client_identity.is_some()
+        || !config.router_config.ca_certificates.is_empty();
+
+    let mut client_builder = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(50)))
         .pool_max_idle_per_host(500)
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .tcp_nodelay(true)
-        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .tcp_keepalive(Some(Duration::from_secs(30)));
+
+    // Force rustls backend when TLS is configured
+    if has_tls_config {
+        client_builder = client_builder.use_rustls_tls();
+        info!("Using rustls TLS backend for TLS/mTLS connections");
+    }
+
+    // Configure mTLS client identity if provided (certificates already loaded during config creation)
+    if let Some(identity_pem) = &config.router_config.client_identity {
+        let identity = reqwest::Identity::from_pem(identity_pem)?;
+        client_builder = client_builder.identity(identity);
+        info!("mTLS client authentication enabled");
+    }
+
+    // Add CA certificates for verifying worker TLS (certificates already loaded during config creation)
+    for ca_cert in &config.router_config.ca_certificates {
+        let cert = reqwest::Certificate::from_pem(ca_cert)?;
+        client_builder = client_builder.add_root_certificate(cert);
+    }
+    if !config.router_config.ca_certificates.is_empty() {
+        info!(
+            "Added {} CA certificate(s) for worker verification",
+            config.router_config.ca_certificates.len()
+        );
+    }
+
+    let client = client_builder
         .build()
         .expect("Failed to create HTTP client");
 
@@ -948,25 +929,26 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engine = Arc::new(OnceLock::new());
 
-    // Create AppContext with all initialized components
-    let app_context = AppContext::new(
-        config.router_config.clone(),
-        client.clone(),
-        rate_limiter,
-        tokenizer,
-        reasoning_parser_factory,
-        tool_parser_factory,
-        worker_registry,
-        policy_registry,
-        response_storage,
-        conversation_storage,
-        conversation_item_storage,
-        load_monitor,
-        worker_job_queue,
-        workflow_engine,
+    // Create AppContext with all initialized components using builder pattern
+    let app_context = Arc::new(
+        AppContext::builder()
+            .router_config(config.router_config.clone())
+            .client(client.clone())
+            .rate_limiter(rate_limiter)
+            .tokenizer(tokenizer)
+            .reasoning_parser_factory(reasoning_parser_factory)
+            .tool_parser_factory(tool_parser_factory)
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .load_monitor(load_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engine(workflow_engine)
+            .build()
+            .map_err(|e| e.to_string())?,
     );
-
-    let app_context = Arc::new(app_context);
 
     let weak_context = Arc::downgrade(&app_context);
     let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
