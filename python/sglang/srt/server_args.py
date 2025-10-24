@@ -208,6 +208,7 @@ class ServerArgs:
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
+    checkpoint_engine_wait_weights_before_ready: bool = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -891,14 +892,19 @@ class ServerArgs:
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
                     )
-                if (
-                    self.quantization == "modelopt_fp4"
-                    and self.moe_runner_backend == "auto"
-                ):
+                if self.moe_runner_backend == "auto":
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
-                        "Use flashinfer_trtllm as moe runner backend on sm100 for DeepseekV3ForCausalLM"
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
+                    if self.quantization is None:
+                        # Default DeepSeek V3/R1 native FP8 when not explicitly set,
+                        # Because we need this condition for an assertion in
+                        # flashinfer_trtllm MoE runner backend.
+                        self.quantization = "fp8"
+                        logger.info(
+                            "Quantization not specified, default to fp8 for DeepSeek on sm100"
+                        )
 
         elif model_arch in ["GptOssForCausalLM"]:
             if (
@@ -965,7 +971,13 @@ class ServerArgs:
                 "fa3",
                 "aiter",
                 "triton",
-            }, "fa3, aiter, or triton is required for Llama4 model"
+                "trtllm_mha",
+            }, "fa3, aiter, triton, or trtllm_mha is required for Llama4 model"
+            if is_sm100_supported() and self.attention_backend is None:
+                self.attention_backend = "trtllm_mha"
+                logger.warning(
+                    "Use trtllm_mha as attention backend on sm100 for Llama4 model"
+                )
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
@@ -1703,6 +1715,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.nccl_port,
             help="The port for NCCL distributed environment setup. Defaults to a random port.",
+        )
+        parser.add_argument(
+            "--checkpoint-engine-wait-weights-before-ready",
+            action="store_true",
+            help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
+            "before serving inference requests.",
         )
 
         # Quantization and data type
