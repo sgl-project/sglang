@@ -1,4 +1,4 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/backend.py
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/backends.py
 
 
 import ast
@@ -15,7 +15,8 @@ import torch
 import torch.fx as fx
 from torch._dispatch.python import enable_python_dispatcher
 
-from sglang.srt.compilation.compilation_config import CompilationConfig
+from python.sglang.srt.configs.compilation_config import CompilationConfig
+from python.sglang.srt.configs.sglang_config import SGLangConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdaptor
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
@@ -102,6 +103,7 @@ class CompilerManager:
         graph: fx.GraphModule,
         example_inputs,
         inductor_config: dict[str, Any],
+        compilation_config: CompilationConfig,
         graph_index: int = 0,
         num_graphs: int = 1,
         runtime_shape: Optional[int] = None,
@@ -115,7 +117,29 @@ class CompilerManager:
 
         compiled_graph = None
 
-        # TODO(Yuwei): support cache loading
+        # try to load from the cache
+        compiled_graph = self.load(graph, example_inputs, graph_index, runtime_shape)
+        if compiled_graph is not None:
+            if graph_index == num_graphs - 1:
+                # after loading the last graph for this shape, record the time.
+                # there can be multiple graphs due to piecewise compilation.
+                now = time.time()
+                elapsed = now - compilation_start_time
+                compilation_config.compilation_time += elapsed
+                if runtime_shape is None:
+                    logger.info(
+                        "Directly load the compiled graph(s) for dynamic shape "
+                        "from the cache, took %.3f s",
+                        elapsed,
+                    )
+                else:
+                    logger.info(
+                        "Directly load the compiled graph(s) for shape %s "
+                        "from the cache, took %.3f s",
+                        str(runtime_shape),
+                        elapsed,
+                    )
+            return compiled_graph
 
         # no compiler cached the graph, or the cache is disabled,
         # we need to compile it
@@ -162,6 +186,7 @@ class CompilerManager:
         if graph_index == num_graphs - 1:
             now = time.time()
             elapsed = now - compilation_start_time
+            compilation_config.compilation_time += elapsed
             if runtime_shape is None:
                 logger.info("Compiling a graph for dynamic shape takes %.2f s", elapsed)
             else:
@@ -235,13 +260,24 @@ compilation_start_time = 0.0
 
 
 class PiecewiseCompileInterpreter(torch.fx.Interpreter):
+    """Code adapted from `torch.fx.passes.shape_prop.ShapeProp`.
+    It runs the given graph with fake inputs, and compile some
+    submodules specified by `compile_submod_names` with the given
+    compilation configs.
+
+    NOTE: the order in `compile_submod_names` matters, because
+    it will be used to determine the order of the compiled piecewise
+    graphs. The first graph will handle logging, and the last graph
+    has some special cudagraph output handling.
+    """
+
     def __init__(
         self,
         module: torch.fx.GraphModule,
         compile_submod_names: list[str],
         inductor_config: dict[str, Any],
         graph_pool,
-        compile_config: CompilationConfig,
+        sglang_config: SGLangConfig,
         sglang_backend: "SGLangBackend",
     ):
         super().__init__(module)
@@ -253,8 +289,10 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         self.sglang_backend = sglang_backend
         # When True, it annoyingly dumps the torch.fx.Graph on errors.
         self.extra_traceback = False
+        # TODO(yuan-luo): move induct_config into sglang_config
         self.inductor_config = inductor_config
-        self.compile_config = compile_config
+        self.sglang_config = sglang_config
+        self.compilation_config = sglang_config.compile_config
 
     def run(self, *args):
         fake_args = [
@@ -285,6 +323,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                     submod,
                     args,
                     self.inductor_config,
+                    self.compilation_config,
                     graph_index=index,
                     num_graphs=len(self.compile_submod_names),
                     runtime_shape=None,
@@ -293,7 +332,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
 
             self.module.__dict__[target] = CUDAPiecewiseBackend(
                 submod,
-                self.compile_config,
+                self.compilation_config,
                 self.inductor_config,
                 self.graph_pool,
                 index,
@@ -327,7 +366,18 @@ def set_model_tag(tag: str):
 
 
 class SGLangBackend:
+    """The compilation backend for `torch.compile` with SGLang.
+    It is used for compilation mode of `CompilationMode.SGLANG_COMPILE`,
+    where we customize the compilation.
 
+    The major work of this backend is to split the graph into
+    piecewise graphs, and pass them to the piecewise backend.
+
+    This backend also adds the PostGradPassManager to Inductor config,
+    which handles the post-grad passes.
+    """
+
+    sglang_config: SGLangConfig
     graph_pool: Any
     _called: bool = False
     # the graph we compiled
@@ -344,7 +394,7 @@ class SGLangBackend:
 
     def __init__(
         self,
-        config: CompilationConfig,
+        sglang_config: SGLangConfig,
         graph_pool: Any,
     ):
         assert graph_pool is not None
@@ -354,11 +404,11 @@ class SGLangBackend:
         self.sym_tensor_indices = []
         self.input_buffers = []
 
-        self.compiler_manager = CompilerManager(config)
+        self.compiler_manager = CompilerManager(sglang_config.compilation_config)
         self.inductor_config = {
             "enable_auto_functionalized_v2": False,
         }
-        self.compile_config = config
+        self.sglang_config = sglang_config
 
     def configure_post_pass(self):
         self.post_grad_pass_manager.configure()
@@ -415,7 +465,7 @@ class SGLangBackend:
             submod_names_to_compile,
             self.inductor_config,
             self.graph_pool,
-            self.compile_config,
+            self.sglang_config,
             self,
         ).run(*example_inputs)
 
