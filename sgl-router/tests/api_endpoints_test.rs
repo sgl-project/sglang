@@ -11,8 +11,8 @@ use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType
 use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::{
-    config::{CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode},
-    core::{ConnectionMode, Job},
+    config::{RouterConfig, RoutingMode},
+    core::Job,
     routers::{RouterFactory, RouterTrait},
     server::AppContext,
 };
@@ -1005,45 +1005,19 @@ mod responses_endpoint_tests {
     async fn test_v1_responses_input_items() {
         // This test uses OpenAI mode because the input_items endpoint
         // is only implemented in OpenAIRouter and reads from storage (no workers needed)
-        let config = RouterConfig {
-            chat_template: None,
-            mode: RoutingMode::OpenAI {
-                worker_urls: vec!["http://dummy.local".to_string()], // Dummy URL (won't be called)
-            },
-            policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
-            port: 3002,
-            max_payload_size: 256 * 1024 * 1024,
-            request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            discovery: None,
-            dp_aware: false,
-            api_key: None,
-            metrics: None,
-            log_dir: None,
-            log_level: None,
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            queue_size: 0,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
-            enable_igw: false,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-        };
+        let config = RouterConfig::builder()
+            .openai_mode(vec!["http://dummy.local".to_string()]) // Dummy URL (won't be called)
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3002)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_size(0)
+            .queue_timeout_secs(60)
+            .build_unchecked();
 
         let ctx = TestContext::new_with_config(
             config,
