@@ -46,12 +46,12 @@ else
     pip install uv
     export UV_SYSTEM_PYTHON=true
 
-    # For non-root users, allow uv to modify system packages
-    if [ "$(id -u)" -ne 0 ]; then
-        export UV_BREAK_SYSTEM_PACKAGES=1
+    # For non-root users, use sudo to run uv pip commands
+    if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+        PIP_CMD="sudo -E uv pip"
+    else
+        PIP_CMD="uv pip"
     fi
-
-    PIP_CMD="uv pip"
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
     # Clean up existing installations
