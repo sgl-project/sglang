@@ -27,6 +27,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.base_layer: nn.Module = base_layer
         self.set_lora: bool = False
         self.lora_backend: BaseLoRABackend = lora_backend
+        if hasattr(self.base_layer, "weight"):
+            self.weight = self.base_layer.weight
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
