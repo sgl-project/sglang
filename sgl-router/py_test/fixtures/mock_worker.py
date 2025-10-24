@@ -47,6 +47,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dp-size", type=int, default=1)
     p.add_argument("--crash-on-request", action="store_true")
     p.add_argument("--health-fail-after-ms", type=int, default=0)
+    # TLS/mTLS configuration
+    p.add_argument(
+        "--ssl-certfile", type=str, default=None, help="Path to SSL certificate file"
+    )
+    p.add_argument("--ssl-keyfile", type=str, default=None, help="Path to SSL key file")
+    p.add_argument(
+        "--ssl-ca-certs",
+        type=str,
+        default=None,
+        help="Path to CA certificates for client verification",
+    )
     return p.parse_args()
 
 
@@ -256,7 +267,18 @@ def main() -> None:
     app = create_app(args)
     # Handle SIGTERM gracefully for fast test teardown
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+
+    # Configure SSL if certificates are provided
+    ssl_config = {}
+    if args.ssl_certfile and args.ssl_keyfile:
+        ssl_config["ssl_certfile"] = args.ssl_certfile
+        ssl_config["ssl_keyfile"] = args.ssl_keyfile
+        # If CA certs provided, require client certificates (mTLS)
+        if args.ssl_ca_certs:
+            ssl_config["ssl_ca_certs"] = args.ssl_ca_certs
+            ssl_config["ssl_cert_reqs"] = 2  # ssl.CERT_REQUIRED
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", **ssl_config)
 
 
 if __name__ == "__main__":
