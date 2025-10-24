@@ -22,7 +22,6 @@ from sglang.srt.tracing.trace import (
     trace_get_remote_propagate_context,
     trace_req_finish,
     trace_req_start,
-    trace_set_remote_propagate_context,
     trace_slice_end,
     trace_slice_start,
 )
