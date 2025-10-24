@@ -193,6 +193,7 @@ class RadixCache(BasePrefixCache):
         disable: bool = False,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
+        enable_backup_priority: bool = False,
         is_eagle: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
@@ -201,6 +202,7 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
+        self.enable_backup_priority = enable_backup_priority
         self.is_eagle = is_eagle
 
         if self.token_to_kv_pool_allocator:
