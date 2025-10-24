@@ -96,6 +96,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
@@ -129,6 +130,7 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
 
 
 # Store global states
@@ -842,6 +844,27 @@ async def update_weights_from_distributed(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@app.post("/update_weights_from_ipc")
+async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
+    """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
+    success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
+        obj, request
+    )
+
+    # Update weight version if provided and weights update was successful
+    if success and obj.weight_version is not None:
+        _update_weight_version_if_provided(obj.weight_version)
+        message += f" Weight version updated to {obj.weight_version}."
+
+    content = {"success": success, "message": message}
+    if success:
+        if _global_state.tokenizer_manager.initial_weights_loaded is False:
+            _global_state.tokenizer_manager.initial_weights_loaded = True
+        return ORJSONResponse(content)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/update_weight_version")
 async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
     """Update the weight version. This operation requires no active requests."""
@@ -1534,6 +1557,8 @@ def _wait_and_warmup(
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
     launch_callback: Optional[Callable[[], None]] = None,
 ):
+    if server_args.checkpoint_engine_wait_weights_before_ready:
+        _wait_weights_ready()
     if not server_args.skip_server_warmup:
         if not _execute_server_warmup(
             server_args,
@@ -1556,3 +1581,24 @@ def _wait_and_warmup(
 
     if launch_callback is not None:
         launch_callback()
+
+
+def _wait_weights_ready():
+    """Wait for weights to be ready within the specified timeout."""
+    timeout = WAIT_WEIGHTS_READY_TIMEOUT
+    start_time = time.time()
+
+    for _ in range(timeout):
+        if _global_state.tokenizer_manager.initial_weights_loaded:
+            logger.info(
+                f"Weights are ready after {time.time() - start_time:.2f} seconds"
+            )
+            return
+        time.sleep(1)
+
+    # Timeout reached without weights being ready
+    logger.error(
+        f"Weights are not ready after waiting {timeout} seconds. "
+        f"Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT environment variable. "
+        f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
+    )

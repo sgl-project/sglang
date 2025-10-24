@@ -20,10 +20,15 @@ use tokio::{net::TcpListener, signal, spawn};
 use tracing::{error, info, warn, Level};
 
 use crate::{
-    config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
+    config::{HistoryBackend, RouterConfig, RoutingMode},
     core::{
-        worker_to_info, workflow::WorkflowEngine, Job, JobQueue, JobQueueConfig, LoadMonitor,
-        WorkerManager, WorkerRegistry, WorkerType,
+        worker_to_info,
+        workflow::{
+            create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
+            WorkflowEngine,
+        },
+        ConnectionMode, Job, JobQueue, JobQueueConfig, LoadMonitor, WorkerManager, WorkerRegistry,
+        WorkerType,
     },
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
@@ -439,51 +444,6 @@ async fn v1_conversations_delete_item(
         .await
 }
 
-#[derive(Deserialize)]
-struct AddWorkerQuery {
-    url: String,
-    api_key: Option<String>,
-}
-
-async fn add_worker(
-    State(state): State<Arc<AppState>>,
-    Query(AddWorkerQuery { url, api_key }): Query<AddWorkerQuery>,
-) -> Response {
-    // Warn if router has API key but worker is being added without one
-    if state.context.router_config.api_key.is_some() && api_key.is_none() {
-        warn!(
-            "Adding worker {} without API key while router has API key configured. \
-            Worker will be accessible without authentication. \
-            If the worker requires the same API key as the router, please specify it explicitly.",
-            url
-        );
-    }
-
-    let result = WorkerManager::add_worker(&url, &api_key, &state.context).await;
-
-    match result {
-        Ok(message) => (StatusCode::OK, message).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
-    }
-}
-
-async fn list_workers(State(state): State<Arc<AppState>>) -> Response {
-    let worker_list = WorkerManager::get_worker_urls(&state.context.worker_registry);
-    Json(json!({ "urls": worker_list })).into_response()
-}
-
-async fn remove_worker(
-    State(state): State<Arc<AppState>>,
-    Query(AddWorkerQuery { url, .. }): Query<AddWorkerQuery>,
-) -> Response {
-    let result = WorkerManager::remove_worker(&url, &state.context);
-
-    match result {
-        Ok(message) => (StatusCode::OK, message).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
-    }
-}
-
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
     match WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
         .await
@@ -565,6 +525,12 @@ async fn create_worker(
             config.url
         );
     }
+
+    // Populate dp_aware from router's configuration
+    let config = WorkerConfigRequest {
+        dp_aware: state.context.router_config.dp_aware,
+        ..config
+    };
 
     // Submit job for async processing
     let worker_url = config.url.clone();
@@ -724,7 +690,7 @@ pub fn build_app(
         )
         .route("/v1/responses/{response_id}", delete(v1_responses_delete))
         .route(
-            "/v1/responses/{response_id}/input",
+            "/v1/responses/{response_id}/input_items",
             get(v1_responses_list_input_items),
         )
         .route("/v1/conversations", post(v1_conversations_create))
@@ -761,9 +727,6 @@ pub fn build_app(
         .route("/get_server_info", get(get_server_info));
 
     let admin_routes = Router::new()
-        .route("/add_worker", post(add_worker))
-        .route("/remove_worker", post(remove_worker))
-        .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -836,13 +799,59 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
-    let client = Client::builder()
+    // FIXME: Current implementation creates a single HTTP client for all workers.
+    // This works well for single security domain deployments where all workers share
+    // the same CA and can accept the same client certificate.
+    //
+    // For multi-domain deployments (e.g., different model families with different CAs),
+    // this architecture needs significant refactoring:
+    // 1. Move client creation into worker registration workflow (per-worker clients)
+    // 2. Store client per worker in WorkerRegistry
+    // 3. Update PDRouter and other routers to fetch client from worker
+    // 4. Add per-worker TLS spec in WorkerConfigRequest
+    //
+    // Current single-domain approach is sufficient for most deployments.
+    //
+    // Use rustls TLS backend when TLS/mTLS is configured (client cert or CA certs provided).
+    // This ensures proper PKCS#8 key format support. For plain HTTP workers, use default
+    // backend to avoid unnecessary TLS initialization overhead.
+    let has_tls_config = config.router_config.client_identity.is_some()
+        || !config.router_config.ca_certificates.is_empty();
+
+    let mut client_builder = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(50)))
         .pool_max_idle_per_host(500)
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .tcp_nodelay(true)
-        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .tcp_keepalive(Some(Duration::from_secs(30)));
+
+    // Force rustls backend when TLS is configured
+    if has_tls_config {
+        client_builder = client_builder.use_rustls_tls();
+        info!("Using rustls TLS backend for TLS/mTLS connections");
+    }
+
+    // Configure mTLS client identity if provided (certificates already loaded during config creation)
+    if let Some(identity_pem) = &config.router_config.client_identity {
+        let identity = reqwest::Identity::from_pem(identity_pem)?;
+        client_builder = client_builder.identity(identity);
+        info!("mTLS client authentication enabled");
+    }
+
+    // Add CA certificates for verifying worker TLS (certificates already loaded during config creation)
+    for ca_cert in &config.router_config.ca_certificates {
+        let cert = reqwest::Certificate::from_pem(ca_cert)?;
+        client_builder = client_builder.add_root_certificate(cert);
+    }
+    if !config.router_config.ca_certificates.is_empty() {
+        info!(
+            "Added {} CA certificate(s) for worker verification",
+            config.router_config.ca_certificates.len()
+        );
+    }
+
+    let client = client_builder
         .build()
         .expect("Failed to create HTTP client");
 
@@ -863,11 +872,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     };
 
     // Initialize tokenizer and parser factories for gRPC mode
-    let (tokenizer, reasoning_parser_factory, tool_parser_factory) = if config
-        .router_config
-        .connection_mode
-        == ConnectionMode::Grpc
-    {
+    let (tokenizer, reasoning_parser_factory, tool_parser_factory) = if matches!(
+        config.router_config.connection_mode,
+        ConnectionMode::Grpc { .. }
+    ) {
         let tokenizer_path = config
             .router_config
             .tokenizer_path
@@ -1018,15 +1026,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     engine
         .event_bus()
-        .subscribe(Arc::new(crate::core::workflow::LoggingSubscriber))
+        .subscribe(Arc::new(LoggingSubscriber))
         .await;
 
-    engine.register_workflow(crate::core::workflow::create_worker_registration_workflow());
+    engine.register_workflow(create_worker_registration_workflow());
+    engine.register_workflow(create_worker_removal_workflow());
     app_context
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
-    info!("Workflow engine initialized with worker registration workflow");
+    info!("Workflow engine initialized with worker registration and removal workflows");
 
     info!(
         "Initializing workers for routing mode: {:?}",

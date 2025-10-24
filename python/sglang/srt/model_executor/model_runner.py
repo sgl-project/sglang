@@ -25,7 +25,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -53,6 +53,7 @@ from sglang.srt.distributed import (
     set_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
@@ -141,7 +142,6 @@ from sglang.srt.utils import (
     is_sm100_supported,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
-    monkey_patch_vllm_gguf_config,
     set_cuda_arch,
     slow_rank_detector,
     xpu_has_xmx_support,
@@ -383,6 +383,11 @@ class ModelRunner:
         )
         self.expert_location_updater = ExpertLocationUpdater()
 
+        (
+            ElasticEPStateManager.init(self.server_args)
+            if self.server_args.elastic_ep_backend
+            else None
+        )
         # Load the model
         self.sampler = Sampler()
         self.load_model()
@@ -898,6 +903,16 @@ class ModelRunner:
         set_cuda_arch()
 
         # Prepare the model config
+        from sglang.srt.configs.modelopt_config import ModelOptConfig
+
+        modelopt_config = ModelOptConfig(
+            quant=self.server_args.modelopt_quant,
+            checkpoint_restore_path=self.server_args.modelopt_checkpoint_restore_path,
+            checkpoint_save_path=self.server_args.modelopt_checkpoint_save_path,
+            export_path=self.server_args.modelopt_export_path,
+            quantize_and_serve=self.server_args.quantize_and_serve,
+        )
+
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
@@ -906,13 +921,12 @@ class ModelRunner:
             remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+            modelopt_config=modelopt_config,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
             )
-        if self.server_args.load_format == "gguf":
-            monkey_patch_vllm_gguf_config()
 
         if self.server_args.load_format == LoadFormat.REMOTE_INSTANCE:
             if self.tp_rank == 0:
@@ -1015,16 +1029,33 @@ class ModelRunner:
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        self.expert_location_updater.update(
-            self.model.routed_experts_weights_of_layer,
-            new_expert_location_metadata,
-            update_layer_ids=update_layer_ids,
-            nnodes=self.server_args.nnodes,
-            rank=self.tp_rank,
-        )
+        if ElasticEPStateManager.instance() is not None:
+            # TODO: refactor the weights update when elastic ep
+            old_expert_location_metadata = get_global_expert_location_metadata()
+            assert old_expert_location_metadata is not None
+            old_expert_location_metadata.update(
+                new_expert_location_metadata,
+                update_layer_ids=update_layer_ids,
+            )
+            self.update_weights_from_disk(
+                self.server_args.model_path,
+                self.server_args.load_format,
+                lambda name: "mlp.experts" in name and "mlp.shared_experts" not in name,
+            )
+        else:
+            self.expert_location_updater.update(
+                self.model.routed_experts_weights_of_layer,
+                new_expert_location_metadata,
+                update_layer_ids=update_layer_ids,
+                nnodes=self.server_args.nnodes,
+                rank=self.tp_rank,
+            )
 
     def update_weights_from_disk(
-        self, model_path: str, load_format: str
+        self,
+        model_path: str,
+        load_format: str,
+        weight_name_filter: Optional[Callable[[str], bool]] = None,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -1046,6 +1077,11 @@ class ModelRunner:
             iter = loader._get_weights_iterator(
                 DefaultModelLoader.Source.init_new(config, self.model)
             )
+            if weight_name_filter is not None:
+                iter = (
+                    (name, weight) for name, weight in iter if weight_name_filter(name)
+                )
+
             return iter
 
         def model_load_weights(model, iter):
@@ -1074,10 +1110,6 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
-
-        # Recapture device graph after model weight update.
-        if not self.server_args.disable_cuda_graph and self.device == "cuda":
-            self.init_device_graphs()
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
@@ -2423,6 +2455,23 @@ class ModelRunner:
             f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
+
+    def update_weights_from_ipc(self, recv_req):
+        """Update weights from IPC for checkpoint-engine integration."""
+        try:
+            from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
+                SGLangCheckpointEngineWorkerExtensionImpl,
+            )
+
+            # Create a worker extension that integrates with SGLang's model
+            worker = SGLangCheckpointEngineWorkerExtensionImpl(self)
+            worker.update_weights_from_ipc(recv_req.zmq_handles)
+            return True, "IPC weight update completed successfully"
+        except ImportError as e:
+            return False, f"IPC weight update failed: ImportError {e}"
+        except Exception as e:
+            logger.error(f"IPC weight update failed: {e}")
+            return False, str(e)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
