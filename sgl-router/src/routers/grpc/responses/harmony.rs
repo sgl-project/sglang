@@ -549,6 +549,8 @@ async fn execute_harmony_internal_single(
     }
 
     // 9. Extract completed messages and convert to ResponseOutputItems
+    // Note: We only want messages generated from output tokens, not any pre-existing messages
+    // Since we created a fresh parser with no context, all messages are new
     let mut output_items = parse_all_messages(&parser)?;
 
     // Parse remaining state for incomplete generation
@@ -2300,11 +2302,32 @@ pub fn parse_all_messages(parser: &StreamableParser) -> Result<Vec<ResponseOutpu
     let messages = parser.messages();
     let mut items = Vec::new();
 
-    for message in messages {
+    debug!(
+        "Parser returned {} messages, processing for output items",
+        messages.len()
+    );
+
+    for (idx, message) in messages.iter().enumerate() {
+        debug!(
+            "Message {}: role={:?}, channel={:?}, recipient={:?}, content_len={}",
+            idx,
+            message.author.role,
+            message.channel,
+            message.recipient,
+            message.parts.iter().map(|p| p.text_content().len()).sum::<usize>()
+        );
+
+        // Only process assistant messages (output)
+        if message.author.role != Role::Assistant {
+            debug!("  Skipping message {} (not Assistant role)", idx);
+            continue;
+        }
+
         let item = parse_output_message(message)?;
         items.push(item);
     }
 
+    debug!("Converted {} messages to {} output items", messages.len(), items.len());
     Ok(items)
 }
 
