@@ -467,6 +467,7 @@ async fn execute_harmony_internal_single(
     if let Some(max_tokens) = body.max_output_tokens {
         sampling_params.max_new_tokens = Some(max_tokens);
     }
+    sampling_params.skip_special_tokens = Option::from(false);
 
     let generate_request = Arc::new(GenerateRequest {
         text: None,
@@ -510,13 +511,37 @@ async fn execute_harmony_internal_single(
         .execute_generate(generate_request, headers, model_id, components)
         .await;
 
-    // 6. Extract response body
+    // 6. Check if pipeline returned an error response
+    if !generate_response.status().is_success() {
+        // Pipeline stage failed (e.g., no workers available)
+        let status = generate_response.status();
+        let (_, body_data) = generate_response.into_parts();
+        let body_bytes = to_bytes(body_data, usize::MAX)
+            .await
+            .map_err(|e| format!("Failed to read error response body: {}", e))?;
+
+        // Try to extract error message from response body
+        let error_msg = if let Ok(error_json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            error_json
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("Pipeline execution failed")
+                .to_string()
+        } else {
+            format!("Pipeline execution failed with status {}", status)
+        };
+
+        return Err(error_msg);
+    }
+
+    // 7. Extract response body
     let (_, body_data) = generate_response.into_parts();
     let body_bytes = to_bytes(body_data, usize::MAX)
         .await
         .map_err(|e| format!("Failed to read response body: {}", e))?;
 
-    // 7. Parse GenerateResponse (backend returns array with single response)
+    // 8. Parse GenerateResponse (backend returns array with single response)
     debug!(
         "Response body bytes: {}",
         String::from_utf8_lossy(&body_bytes)
@@ -529,7 +554,7 @@ async fn execute_harmony_internal_single(
         .next()
         .ok_or_else(|| "Backend returned empty response array".to_string())?;
 
-    // 8. Process output tokens through Harmony parser
+    // 9. Process output tokens through Harmony parser
     let mut parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
         .map_err(|e| format!("Failed to create Harmony parser: {}", e))?;
 
@@ -548,7 +573,7 @@ async fn execute_harmony_internal_single(
             .map_err(|e| format!("Failed to process token: {}", e))?;
     }
 
-    // 9. Extract completed messages and convert to ResponseOutputItems
+    // 10. Extract completed messages and convert to ResponseOutputItems
     // Note: We only want messages generated from output tokens, not any pre-existing messages
     // Since we created a fresh parser with no context, all messages are new
     let mut output_items = parse_all_messages(&parser)?;
@@ -569,7 +594,7 @@ async fn execute_harmony_internal_single(
         output_token_ids.len()
     );
 
-    // 10. Build ResponsesResponse
+    // 11. Build ResponsesResponse
     let response_id = Uuid::new_v4().simple().to_string();
     let response_id_full = format!("resp_{}", response_id);
 
@@ -1342,11 +1367,18 @@ async fn execute_harmony_streaming(
         )
         .await;
 
-    // 5. Extract body and create SSE channel
+    // 5. Check if pipeline returned an error response
+    let status = generate_response.status();
+    if !status.is_success() {
+        // Pipeline stage failed (e.g., no workers available) - return error immediately
+        return generate_response;
+    }
+
+    // 6. Extract body and create SSE channel
     let (parts, generate_body) = generate_response.into_parts();
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
 
-    // 6. Spawn background task to process stream
+    // 7. Spawn background task to process stream
     let body_clone = body.clone();
     let response_storage_clone = response_storage.clone();
     let conversation_storage_clone = conversation_storage.clone();
@@ -1379,7 +1411,7 @@ async fn execute_harmony_streaming(
         let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
     });
 
-    // 7. Build SSE response
+    // 8. Build SSE response
     let stream = UnboundedReceiverStream::new(rx);
     let response_body = Body::from_stream(stream);
 
@@ -2308,13 +2340,14 @@ pub fn parse_all_messages(parser: &StreamableParser) -> Result<Vec<ResponseOutpu
     );
 
     for (idx, message) in messages.iter().enumerate() {
+        let text = extract_text_from_message(message);
         debug!(
-            "Message {}: role={:?}, channel={:?}, recipient={:?}, content_len={}",
+            "Message {}: role={:?}, channel={:?}, recipient={:?}, text_len={}",
             idx,
             message.author.role,
             message.channel,
             message.recipient,
-            message.parts.iter().map(|p| p.text_content().len()).sum::<usize>()
+            text.len()
         );
 
         // Only process assistant messages (output)
