@@ -1,18 +1,19 @@
 # CPU Servers
 
 The document addresses how to set up the [SGLang](https://github.com/sgl-project/sglang) environment and run LLM inference on CPU servers.
-Specifically, SGLang is well optimized on the CPUs equipped with Intel® AMX® Instructions,
+SGLang is enabled and optimized on the CPUs equipped with Intel® AMX® Instructions,
 which are 4th generation or newer Intel® Xeon® Scalable Processors.
 
 ## Optimized Model List
 
 A list of popular LLMs are optimized and run efficiently on CPU,
 including the most notable open-source models like Llama series, Qwen series,
-and the phenomenal high-quality reasoning model DeepSeek-R1.
+and DeepSeek series like DeepSeek-R1 and DeepSeek-V3.1-Terminus.
 
-| Model Name | BF16 | w8a8_int8 | FP8 |
+| Model Name | BF16 | W8A8_INT8 | FP8 |
 |:---:|:---:|:---:|:---:|
 | DeepSeek-R1 |   | [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8) | [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1) |
+| DeepSeek-V3.1-Terminus |   | [IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8](https://huggingface.co/IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8) | [deepseek-ai/DeepSeek-V3.1-Terminus](https://huggingface.co/deepseek-ai/DeepSeek-V3.1-Terminus) |
 | Llama-3.2-3B | [meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) | [RedHatAI/Llama-3.2-3B-quantized.w8a8](https://huggingface.co/RedHatAI/Llama-3.2-3B-Instruct-quantized.w8a8) |   |
 | Llama-3.1-8B | [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) | [RedHatAI/Meta-Llama-3.1-8B-quantized.w8a8](https://huggingface.co/RedHatAI/Meta-Llama-3.1-8B-quantized.w8a8) |   |
 | QwQ-32B |   | [RedHatAI/QwQ-32B-quantized.w8a8](https://huggingface.co/RedHatAI/QwQ-32B-quantized.w8a8) |   |
@@ -36,7 +37,7 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
-docker build -t sglang-cpu:main -f Dockerfile.xeon .
+docker build -t sglang-cpu:latest -f Dockerfile.xeon .
 
 # Initiate a docker container
 docker run \
@@ -48,7 +49,7 @@ docker run \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     -p 30000:30000 \
     -e "HF_TOKEN=<secret>" \
-    sglang-cpu:main /bin/bash
+    sglang-cpu:latest /bin/bash
 ```
 
 ### Install From Source
@@ -121,9 +122,9 @@ Notes:
 
 2. The flag `--tp 6` specifies that tensor parallelism will be applied using 6 ranks (TP6).
     The number of TP specified is how many TP ranks will be used during the execution.
-    In a CPU platform, a TP rank means a sub-NUMA cluster (SNC).
-    Usually we can get the SNC information (How many available) from Operation System.
-    User can specify TP to be no more than the total available SNCs in current system.
+    On a CPU platform, a TP rank means a sub-NUMA cluster (SNC).
+    Usually we can get the SNC information (How many available) from the Operating System.
+    Users can specify TP to be no more than the total available SNCs in current system.
 
     If the specified TP rank number differs from the total SNC count,
     the system will automatically utilize the first `n` SNCs.
@@ -175,29 +176,29 @@ Additionally, the requests can be formed with
 [OpenAI Completions API](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
 and sent via the command line (e.g. using `curl`) or via your own script.
 
-## Example: Running DeepSeek-R1
+## Example: Running DeepSeek-V3.1-Terminus
 
-An example command to launch service for W8A8 DeepSeek-R1 on a Xeon® 6980P server
+An example command to launch service for W8A8_INT8 DeepSeek-V3.1-Terminus on a Xeon® 6980P server:
 
 ```bash
-python -m sglang.launch_server                 \
-    --model meituan/DeepSeek-R1-Channel-INT8   \
-    --trust-remote-code                        \
-    --disable-overlap-schedule                 \
-    --device cpu                               \
-    --quantization w8a8_int8                   \
-    --host 0.0.0.0                             \
-    --mem-fraction-static 0.8                  \
-    --enable-torch-compile                     \
-    --torch-compile-max-bs 4                   \
+python -m sglang.launch_server                                   \
+    --model IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8   \
+    --trust-remote-code                                          \
+    --disable-overlap-schedule                                   \
+    --device cpu                                                 \
+    --quantization w8a8_int8                                     \
+    --host 0.0.0.0                                               \
+    --mem-fraction-static 0.8                                    \
+    --enable-torch-compile                                       \
+    --torch-compile-max-bs 4                                     \
     --tp 6
 ```
 
-Similarly, an example command to launch service for FP8 DeepSeek-R1 would be
+Similarly, an example command to launch service for FP8 DeepSeek-V3.1-Terminus would be:
 
 ```bash
 python -m sglang.launch_server                 \
-    --model deepseek-ai/DeepSeek-R1            \
+    --model deepseek-ai/DeepSeek-V3.1-Terminus \
     --trust-remote-code                        \
     --disable-overlap-schedule                 \
     --device cpu                               \

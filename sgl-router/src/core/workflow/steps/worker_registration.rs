@@ -16,13 +16,14 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::{
     core::{
         workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
-        DPAwareWorkerBuilder, DpInfo, HealthConfig, Worker, WorkerManager, WorkerType,
+        DPAwareWorkerBuilder, HealthConfig, Worker, WorkerType,
     },
     grpc_client::SglangSchedulerClient,
     protocols::worker_spec::WorkerConfigRequest,
@@ -36,6 +37,82 @@ static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .build()
         .expect("Failed to create HTTP client")
 });
+
+/// Server information returned from worker endpoints
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ServerInfo {
+    #[serde(alias = "model")]
+    model_id: Option<String>,
+    model_path: Option<String>,
+    dp_size: Option<usize>,
+    version: Option<String>,
+    max_batch_size: Option<usize>,
+    max_total_tokens: Option<usize>,
+    max_prefill_tokens: Option<usize>,
+    max_running_requests: Option<usize>,
+    max_num_reqs: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DpInfo {
+    pub dp_size: usize,
+    pub model_id: String,
+}
+
+/// Parse server info from JSON response using serde
+fn parse_server_info(json: Value) -> Result<ServerInfo, String> {
+    serde_json::from_value(json).map_err(|e| format!("Failed to parse server info: {}", e))
+}
+
+/// Get server info from /get_server_info endpoint
+async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerInfo, String> {
+    let base_url = url.trim_end_matches('/');
+    let server_info_url = format!("{}/get_server_info", base_url);
+
+    let mut req = HTTP_CLIENT.get(&server_info_url);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to {}: {}", server_info_url, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Server returned status {} from {}",
+            response.status(),
+            server_info_url
+        ));
+    }
+
+    let json = response
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("Failed to parse response from {}: {}", server_info_url, e))?;
+
+    parse_server_info(json)
+}
+
+/// Get DP info for a worker URL
+async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, String> {
+    let info = get_server_info(url, api_key).await?;
+
+    let dp_size = info
+        .dp_size
+        .ok_or_else(|| format!("No dp_size in response from {}", url))?;
+
+    let model_id = info
+        .model_id
+        .or_else(|| {
+            info.model_path
+                .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Ok(DpInfo { dp_size, model_id })
+}
 
 /// Helper: Strip protocol prefix from URL
 fn strip_protocol(url: &str) -> String {
@@ -81,49 +158,6 @@ async fn try_grpc_health_check(url: &str, timeout_secs: u64) -> Result<(), Strin
         .map_err(|e| format!("gRPC health check failed: {}", e))?;
 
     Ok(())
-}
-
-/// Helper: Fetch HTTP metadata
-async fn fetch_http_metadata(
-    url: &str,
-    api_key: Option<&str>,
-) -> Result<HashMap<String, String>, String> {
-    let clean_url = strip_protocol(url);
-    let info_url = if clean_url.starts_with("http://") || clean_url.starts_with("https://") {
-        format!("{}/get_server_info", clean_url)
-    } else {
-        format!("http://{}/get_server_info", clean_url)
-    };
-
-    let mut request = HTTP_CLIENT.get(&info_url);
-    if let Some(key) = api_key {
-        request = request.header("Authorization", format!("Bearer {}", key));
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch HTTP metadata: {}", e))?;
-
-    let server_info: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse HTTP metadata: {}", e))?;
-
-    let mut labels = HashMap::new();
-
-    if let Some(model_path) = server_info.get("model_path").and_then(|v| v.as_str()) {
-        if !model_path.is_empty() {
-            labels.insert("model_path".to_string(), model_path.to_string());
-        }
-    }
-    if let Some(tokenizer_path) = server_info.get("tokenizer_path").and_then(|v| v.as_str()) {
-        if !tokenizer_path.is_empty() {
-            labels.insert("tokenizer_path".to_string(), tokenizer_path.to_string());
-        }
-    }
-
-    Ok(labels)
 }
 
 /// Helper: Fetch gRPC metadata
@@ -266,7 +300,18 @@ impl StepExecutor for DiscoverMetadataStep {
 
         let discovered_labels = match connection_mode.as_ref() {
             ConnectionMode::Http => {
-                fetch_http_metadata(&config.url, config.api_key.as_deref()).await
+                match get_server_info(&config.url, config.api_key.as_deref()).await {
+                    Ok(server_info) => {
+                        let mut labels = HashMap::new();
+                        if let Some(model_path) = server_info.model_path {
+                            if !model_path.is_empty() {
+                                labels.insert("model_path".to_string(), model_path);
+                            }
+                        }
+                        Ok(labels)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             ConnectionMode::Grpc { .. } => fetch_grpc_metadata(&config.url).await,
         }
@@ -314,7 +359,7 @@ impl StepExecutor for DiscoverDPInfoStep {
         debug!("Discovering DP info for {} (DP-aware)", config.url);
 
         // Get DP info from worker
-        let dp_info = WorkerManager::get_dp_info(&config.url, config.api_key.as_deref())
+        let dp_info = get_dp_info(&config.url, config.api_key.as_deref())
             .await
             .map_err(|e| WorkflowError::StepFailed {
                 step_id: StepId::new("discover_dp_info"),
@@ -327,7 +372,7 @@ impl StepExecutor for DiscoverDPInfoStep {
         );
 
         // Store DP info in context
-        context.set("dp_info", Arc::new(dp_info));
+        context.set("dp_info", dp_info);
 
         Ok(StepResult::Success)
     }
@@ -522,7 +567,7 @@ impl StepExecutor for CreateWorkerStep {
             }
 
             // Store workers (plural) and labels in context
-            context.set("workers", Arc::new(workers));
+            context.set("workers", workers);
             context.set("labels", final_labels);
 
             Ok(StepResult::Success)
@@ -595,7 +640,7 @@ impl StepExecutor for RegisterWorkerStep {
                 );
             }
 
-            context.set("worker_ids", Arc::new(worker_ids));
+            context.set("worker_ids", worker_ids);
             Ok(StepResult::Success)
         } else {
             // Non-DP-aware path: Register single worker

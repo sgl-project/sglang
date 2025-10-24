@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::ConnectionMode;
 
 /// Configuration validator
 pub struct ConfigValidator;
@@ -165,18 +166,14 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::OpenAI { worker_urls } => {
-                // Require exactly one worker URL for OpenAI router
-                if worker_urls.len() != 1 {
+                // Require at least one worker URL for OpenAI router
+                if worker_urls.is_empty() {
                     return Err(ConfigError::ValidationFailed {
-                        reason: "OpenAI mode requires exactly one --worker-urls entry".to_string(),
+                        reason: "OpenAI mode requires at least one --worker-urls entry".to_string(),
                     });
                 }
-                // Validate URL format
-                if let Err(e) = url::Url::parse(&worker_urls[0]) {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: format!("Invalid OpenAI worker URL '{}': {}", &worker_urls[0], e),
-                    });
-                }
+                // Validate URLs
+                Self::validate_urls(worker_urls)?;
             }
         }
         Ok(())
@@ -480,7 +477,7 @@ impl ConfigValidator {
         }
 
         // Validate gRPC connection mode requires tokenizer configuration
-        if config.connection_mode == ConnectionMode::Grpc
+        if matches!(config.connection_mode, ConnectionMode::Grpc { .. })
             && config.tokenizer_path.is_none()
             && config.model_path.is_none()
         {
@@ -836,7 +833,7 @@ mod tests {
         );
 
         // Set connection mode to gRPC without tokenizer config
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.tokenizer_path = None;
         config.model_path = None;
 
@@ -856,7 +853,7 @@ mod tests {
             PolicyConfig::Random,
         );
 
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.model_path = Some("meta-llama/Llama-3-8B".to_string());
 
         let result = ConfigValidator::validate(&config);
@@ -872,7 +869,7 @@ mod tests {
             PolicyConfig::Random,
         );
 
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.tokenizer_path = Some("/path/to/tokenizer.json".to_string());
 
         let result = ConfigValidator::validate(&config);

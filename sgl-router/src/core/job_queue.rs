@@ -15,11 +15,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::{RouterConfig, RoutingMode},
-    core::{
-        workflow::{
-            WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus,
-        },
-        WorkerManager,
+    core::workflow::{
+        steps::WorkerRemovalRequest, WorkflowContext, WorkflowEngine, WorkflowId,
+        WorkflowInstanceId, WorkflowStatus,
     },
     metrics::RouterMetrics,
     protocols::worker_spec::{JobStatus, WorkerConfigRequest},
@@ -320,11 +318,29 @@ impl JobQueue {
                 .await
             }
             Job::RemoveWorker { url } => {
-                let result = WorkerManager::remove_worker(url, context);
+                let engine = context
+                    .workflow_engine
+                    .get()
+                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+
+                let instance_id = Self::start_worker_removal_workflow(engine, url, context).await?;
+
+                debug!(
+                    "Started worker removal workflow for {} (instance: {})",
+                    url, instance_id
+                );
+
+                let timeout_duration = Duration::from_secs(30);
+
+                let result =
+                    Self::wait_for_workflow_completion(engine, instance_id, url, timeout_duration)
+                        .await;
+
                 // Clean up job status when removing worker
                 if let Some(queue) = context.worker_job_queue.get() {
                     queue.remove_status(url);
                 }
+
                 result
             }
             Job::InitializeWorkersFromConfig { router_config } => {
@@ -422,6 +438,27 @@ impl JobQueue {
             .start_workflow(WorkflowId::new("worker_registration"), workflow_context)
             .await
             .map_err(|e| format!("Failed to start worker registration workflow: {:?}", e))
+    }
+
+    /// Start worker removal workflow
+    async fn start_worker_removal_workflow(
+        engine: &Arc<WorkflowEngine>,
+        url: &str,
+        context: &Arc<AppContext>,
+    ) -> Result<WorkflowInstanceId, String> {
+        let removal_request = WorkerRemovalRequest {
+            url: url.to_string(),
+            dp_aware: context.router_config.dp_aware,
+        };
+
+        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
+        workflow_context.set("removal_request", removal_request);
+        workflow_context.set_arc("app_context", Arc::clone(context));
+
+        engine
+            .start_workflow(WorkflowId::new("worker_removal"), workflow_context)
+            .await
+            .map_err(|e| format!("Failed to start worker removal workflow: {:?}", e))
     }
 
     /// Wait for workflow completion with adaptive polling

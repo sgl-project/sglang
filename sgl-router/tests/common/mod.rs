@@ -66,7 +66,7 @@ pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engine = Arc::new(OnceLock::new());
 
-    Arc::new(AppContext::new(
+    let app_context = Arc::new(AppContext::new(
         config,
         client,
         rate_limiter,
@@ -81,7 +81,32 @@ pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         load_monitor,
         worker_job_queue,
         workflow_engine,
-    ))
+    ));
+
+    // Initialize JobQueue after AppContext is created
+    let weak_context = Arc::downgrade(&app_context);
+    let job_queue = sglang_router_rs::core::JobQueue::new(
+        sglang_router_rs::core::JobQueueConfig::default(),
+        weak_context,
+    );
+    app_context
+        .worker_job_queue
+        .set(job_queue)
+        .expect("JobQueue should only be initialized once");
+
+    // Initialize WorkflowEngine and register workflows
+    use sglang_router_rs::core::workflow::{
+        create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
+    };
+    let engine = Arc::new(WorkflowEngine::new());
+    engine.register_workflow(create_worker_registration_workflow());
+    engine.register_workflow(create_worker_removal_workflow());
+    app_context
+        .workflow_engine
+        .set(engine)
+        .expect("WorkflowEngine should only be initialized once");
+
+    app_context
 }
 
 // Tokenizer download configuration
