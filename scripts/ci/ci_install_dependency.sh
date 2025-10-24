@@ -48,13 +48,10 @@ else
     # Clean up existing installations
     $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
 
-    # Install the main package without deps
-    $PIP_CMD install -e "python[dev]" --no-deps --prerelease=allow $PIP_INSTALL_SUFFIX --force-reinstall
-
     # Install flashinfer-python 0.4.1 dependency that requires prerelease (This should be removed when flashinfer fixes this issue)
     $PIP_CMD install flashinfer-python==0.4.1 --prerelease=allow $PIP_INSTALL_SUFFIX
 
-    # Install the main package
+    # Install the main package (includes nvidia-cutlass-dsl==4.3.0.dev0 from pyproject.toml)
     $PIP_CMD install -e "python[dev]" --prerelease=allow --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --upgrade
 fi
 
