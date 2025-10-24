@@ -115,7 +115,7 @@ suites = {
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_request_queue_validation.py", 30),
-        TestFile("test_retract_decode.py", 54),
+        TestFile("test_retract_decode.py", 90),
         TestFile("test_score_api.py", 310),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
@@ -197,7 +197,7 @@ suites = {
         TestFile("test_bnb.py", 5),
         TestFile("test_gptqmodel_dynamic.py", 102),
         TestFile("test_vllm_dependency.py", 185),
-        # TestFile("test_gguf.py", 96),
+        TestFile("test_gguf.py", 96),
     ],
     # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
     "nightly-1-gpu": [],
