@@ -112,6 +112,9 @@ def _infer_dynamic_arg_dims_from_annotations(forward_fn):
             for a in getattr(ann, "__args__", [])
         ):
             dyn[name] = 0
+        elif ann == "torch.Tensor" or ann == "Optional[torch.Tensor]":
+            # For future import annotations (e.g. from __future__ import annotations), the annotation is a string
+            dyn[name] = 0
     if not dyn:
         raise ValueError("No dynamic dims inferred; pass dynamic_arg_dims explicitly.")
     return dyn
