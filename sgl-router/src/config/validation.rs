@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::ConnectionMode;
 
 /// Configuration validator
 pub struct ConfigValidator;
@@ -504,7 +505,7 @@ impl ConfigValidator {
         }
 
         // Validate gRPC connection mode requires tokenizer configuration
-        if config.connection_mode == ConnectionMode::Grpc
+        if matches!(config.connection_mode, ConnectionMode::Grpc { .. })
             && config.tokenizer_path.is_none()
             && config.model_path.is_none()
         {
@@ -924,7 +925,7 @@ mod tests {
         );
 
         // Set connection mode to gRPC without tokenizer config
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.tokenizer_path = None;
         config.model_path = None;
 
@@ -944,7 +945,7 @@ mod tests {
             PolicyConfig::Random,
         );
 
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.model_path = Some("meta-llama/Llama-3-8B".to_string());
 
         let result = ConfigValidator::validate(&config);
@@ -960,7 +961,7 @@ mod tests {
             PolicyConfig::Random,
         );
 
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.tokenizer_path = Some("/path/to/tokenizer.json".to_string());
 
         let result = ConfigValidator::validate(&config);
