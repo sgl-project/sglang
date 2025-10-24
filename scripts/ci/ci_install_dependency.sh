@@ -5,6 +5,17 @@ set -euxo pipefail
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 RUN_DEEPSEEK_V32=${RUN_DEEPSEEK_V32:-0}
 CU_VERSION="cu129"
+ORIGINAL_USER="${SUDO_USER:-$(whoami)}"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Setup trap to fix file ownership on exit (even if script fails)
+cleanup() {
+    if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+        echo "Fixing file ownership to ${ORIGINAL_USER}..."
+        sudo chown -R "${ORIGINAL_USER}:${ORIGINAL_USER}" "${SCRIPT_DIR}/../.." || true
+    fi
+}
+trap cleanup EXIT
 
 if [ "$CU_VERSION" = "cu130" ]; then
     NVRTC_SPEC="nvidia-cuda-nvrtc"
@@ -13,7 +24,6 @@ else
 fi
 
 # Kill existing processes
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../killall_sglang.sh"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
@@ -46,11 +56,11 @@ else
     pip install uv
     export UV_SYSTEM_PYTHON=true
 
-    # For non-root users, use sudo to run uv pip commands
+    # Use sudo if available and not running as root
     if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
-        PIP_CMD="sudo -E uv pip"
+        PIP_CMD="sudo -E $(which uv) pip"
     else
-        PIP_CMD="uv pip"
+        PIP_CMD="$(which uv) pip"
     fi
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
