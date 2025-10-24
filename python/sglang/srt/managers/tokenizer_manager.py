@@ -321,6 +321,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 context, zmq.PULL, f"tcp://*:{server_args.embedding_port}", True
             )
             self.received_embeddings = dict()
+            self.embeddings_lock = asyncio.Lock()
 
         # Request states
         self._chosen_loop = None
@@ -731,19 +732,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
             
-            while self.disaggregation_mode == DisaggregationMode.PREFILL and self.server_args.language_only:
-                if obj.bootstrap_room not in self.received_embeddings:
-                    await self.handle_embedding()
-                    continue
-                if not self.received_embeddings[obj.bootstrap_room].ready:
-                    await self.handle_embedding()
-                    continue
-                for mm_item in mm_inputs["mm_items"]:
-                    if mm_item.modality == Modality.IMAGE:
-                        mm_item.precomputed_embeddings = self.received_embeddings[
-                            obj.bootstrap_room].get()
-                del self.received_embeddings[obj.bootstrap_room]
-                break
+            if self.disaggregation_mode == DisaggregationMode.PREFILL and self.server_args.language_only:
+                # Use async lock to avoid race condition
+                async with self.embeddings_lock:
+                    while (obj.bootstrap_room not in self.received_embeddings or 
+                            not self.received_embeddings[obj.bootstrap_room].ready):
+                        await self.handle_embedding()
+                    for mm_item in mm_inputs["mm_items"]:
+                        if mm_item.modality == Modality.IMAGE:
+                            mm_item.precomputed_embeddings = self.received_embeddings[
+                                obj.bootstrap_room].get()
+                    del self.received_embeddings[obj.bootstrap_room]
         else:
             mm_inputs = None
 
