@@ -456,9 +456,8 @@ def main(args: argparse.Namespace):
             2 * intermediate_size // (args.tp_size // args.ep_size)
         )
     elif config.architectures[0] == "Llama4ForConditionalGeneration":
-        E = (
-            config.text_config.num_local_experts // args.ep_size
-            + (0 if args.disable_shared_experts_fusion else 1) 
+        E = config.text_config.num_local_experts // args.ep_size + (
+            0 if args.disable_shared_experts_fusion else 1
         )
         topk = config.text_config.num_experts_per_tok
         intermediate_size = config.text_config.intermediate_size
