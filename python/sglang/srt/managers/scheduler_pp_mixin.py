@@ -319,7 +319,7 @@ class SchedulerPPMixin:
                             pp_outputs,
                         )
                     )
-
+                self._pp_commit_comm_work(send_proxy_work)
                 if self.cur_batch:
                     result, event = self._pp_launch_batch(
                         mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
@@ -347,7 +347,6 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(event)
-                        self._pp_commit_comm_work(send_proxy_work)
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
                         ):
