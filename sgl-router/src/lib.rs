@@ -207,6 +207,9 @@ struct Router {
     backend: BackendType,
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
+    ca_cert_paths: Vec<String>,
 }
 
 impl Router {
@@ -302,7 +305,7 @@ impl Router {
             None
         };
 
-        let builder = config::RouterConfig::builder()
+        config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
             .host(&self.host)
@@ -359,9 +362,13 @@ impl Router {
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
-            .igw(self.enable_igw);
-
-        builder.build()
+            .igw(self.enable_igw)
+            .maybe_client_cert_and_key(
+                self.client_cert_path.as_ref(),
+                self.client_key_path.as_ref(),
+            )
+            .add_ca_certificates(self.ca_cert_paths.clone())
+            .build()
     }
 }
 
@@ -435,6 +442,9 @@ impl Router {
         backend = BackendType::Sglang,
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
+        client_cert_path = None,
+        client_key_path = None,
+        ca_cert_paths = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -504,6 +514,9 @@ impl Router {
         backend: BackendType,
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
+        client_cert_path: Option<String>,
+        client_key_path: Option<String>,
+        ca_cert_paths: Vec<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -587,6 +600,9 @@ impl Router {
             backend,
             history_backend,
             oracle_config,
+            client_cert_path,
+            client_key_path,
+            ca_cert_paths,
         })
     }
 
