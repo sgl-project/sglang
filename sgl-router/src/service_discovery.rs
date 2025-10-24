@@ -18,7 +18,7 @@ use rustls;
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
-use crate::{core::Job, protocols::worker_spec::WorkerConfigRequest, server::AppContext};
+use crate::{app_context::AppContext, core::Job, protocols::worker_spec::WorkerConfigRequest};
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
