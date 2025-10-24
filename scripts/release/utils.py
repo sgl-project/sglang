@@ -106,7 +106,9 @@ def replace_in_file(file_path: Path, old_version: str, new_version: str) -> bool
 
             # Check if [project] section exists and has version field
             if "project" not in toml_data or "version" not in toml_data["project"]:
-                print(f"Warning: {file_path} does not have [project] version field, skipping")
+                print(
+                    f"Warning: {file_path} does not have [project] version field, skipping"
+                )
                 return False
 
             # Use regex to replace only the version field in [project] section
@@ -114,10 +116,7 @@ def replace_in_file(file_path: Path, old_version: str, new_version: str) -> bool
             # and before any other section marker
             pattern = r'(\[project\].*?version\s*=\s*)["\']([^"\']+)["\']'
             new_content = re.sub(
-                pattern,
-                rf'\g<1>"{new_version}"',
-                content,
-                flags=re.DOTALL
+                pattern, rf'\g<1>"{new_version}"', content, flags=re.DOTALL
             )
         except Exception as e:
             print(f"Warning: Failed to parse {file_path} as TOML: {e}")
