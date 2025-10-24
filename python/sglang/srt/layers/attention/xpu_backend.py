@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache, flash_attn_decode, flash_attn_extend
 
 
 class XPUAttentionBackend(AttentionBackend):
@@ -496,8 +496,8 @@ class XPUAttentionBackend(AttentionBackend):
                 cache_seqlens = metadata.encoder_lens_int32
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
-
-            result = flash_attn_with_kvcache(
+            
+            result = flash_attn_extend(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
                 v_cache=value_cache,
@@ -518,7 +518,7 @@ class XPUAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                o_expand, softmax_lse_expand, *rest_expand = flash_attn_extend(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -619,7 +619,7 @@ class XPUAttentionBackend(AttentionBackend):
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
-                result = flash_attn_with_kvcache(
+                result = flash_attn_extend(
                     q=q_rope,
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,
@@ -639,7 +639,7 @@ class XPUAttentionBackend(AttentionBackend):
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
+                        flash_attn_extend(
                             q=q_rope,
                             k_cache=k_rope_cache,
                             v_cache=c_kv_cache,
@@ -758,7 +758,7 @@ class XPUAttentionBackend(AttentionBackend):
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
-                o = flash_attn_with_kvcache(
+                o = flash_attn_decode(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -777,7 +777,7 @@ class XPUAttentionBackend(AttentionBackend):
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
-                o = flash_attn_with_kvcache(
+                o = flash_attn_decode(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -804,7 +804,7 @@ class XPUAttentionBackend(AttentionBackend):
                 )
 
                 # Default: single-token self-attention
-                result = flash_attn_with_kvcache(
+                result = flash_attn_decode(
                     q=q_reshaped,
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -825,7 +825,7 @@ class XPUAttentionBackend(AttentionBackend):
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
+                        flash_attn_decode(
                             q=q_reshaped,
                             k_cache=key_cache,
                             v_cache=value_cache,
@@ -880,7 +880,7 @@ class XPUAttentionBackend(AttentionBackend):
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
-            result = flash_attn_with_kvcache(
+            result = flash_attn_decode(
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
@@ -899,7 +899,7 @@ class XPUAttentionBackend(AttentionBackend):
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                o_expand, softmax_lse_expand, *rest_expand = flash_attn_decode(
                     q=q_rope,
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,
