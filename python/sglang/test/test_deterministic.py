@@ -17,7 +17,7 @@ import dataclasses
 import json
 import os
 import random
-from typing import List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -78,6 +78,7 @@ class BenchArgs:
                 "single",
                 "prefix",
                 "radix_cache",
+                "p_vs_d",
             ],
         )
         parser.add_argument("--profile", action="store_true")
@@ -94,18 +95,21 @@ class BenchArgs:
 
 def send_single(
     args,
-    batch_size: int = 1,
     profile: bool = False,
     profile_steps: int = 3,
     profile_by_stage: bool = False,
     return_full_response: bool = False,
     input_ids: List[int] = None,
+    prompt: List[str] = None,
     max_new_tokens: int = None,
+    extra_params: Optional[Dict[str, Any]] = None,
+    pick_first_result: bool = True,
 ):
     base_url = f"http://{args.host}:{args.port}"
 
     # Use input_ids if provided, otherwise use text prompts
     if input_ids is not None:
+        assert prompt is None
         json_data = {
             "input_ids": input_ids,
             "sampling_params": {
@@ -120,9 +124,10 @@ def send_single(
             },
             "return_logprob": args.return_logprob,
             "stream": args.stream,
+            **(extra_params or {}),
         }
     else:
-        prompt = [PROMPT_1] * batch_size
+        assert input_ids is None
         json_data = {
             "text": prompt,
             "sampling_params": {
@@ -137,6 +142,7 @@ def send_single(
             },
             "return_logprob": args.return_logprob,
             "stream": args.stream,
+            **(extra_params or {}),
         }
 
     if args.sampling_seed is not None:
@@ -169,7 +175,8 @@ def send_single(
     else:
         ret = response.json()
 
-    ret = ret[0] if isinstance(ret, list) else ret
+    if pick_first_result:
+        ret = ret[0] if isinstance(ret, list) else ret
 
     if return_full_response:
         return ret
@@ -219,13 +226,134 @@ def send_prefix(args, batch_size: int, prompts: List[str]):
     return ret_dict
 
 
+def _test_mode_p_vs_d(args, batch_size):
+    print()
+    print(f"Execute: test p_vs_d {batch_size=}")
+
+    random.seed(42)
+    args.return_logprob = True
+    query_extra_params = {
+        "logprob_start_len": 0,
+        "return_text_in_logprobs": True,
+    }
+
+    def _create_prompts():
+        ans = [PROMPT_1, PROMPT_2]
+        for i in range(batch_size - len(ans)):
+            end = random.randrange(1, 4096)
+            if random.random() < 0.5:
+                begin = 0
+            else:
+                begin = random.randrange(0, end)
+            ans.append(LONG_PROMPT[begin:end])
+        return ans[:batch_size]
+
+    # warmup + flush
+    send_single(args, input_ids=[1] * 64, max_new_tokens=65, return_full_response=True)
+    requests.post(f"http://{args.host}:{args.port}/flush_cache")
+
+    prompts = _create_prompts()
+
+    resp_a = send_single(
+        args,
+        prompt=prompts,
+        max_new_tokens=args.max_new_tokens,
+        return_full_response=True,
+        pick_first_result=False,
+        extra_params=query_extra_params,
+    )
+    info_a = _extract_ids_and_logprobs(resp_a)
+
+    requests.post(f"http://{args.host}:{args.port}/flush_cache")
+
+    resp_b = send_single(
+        args,
+        input_ids=[x["io"].token_ids for x in info_a],
+        max_new_tokens=1,
+        return_full_response=True,
+        pick_first_result=False,
+        extra_params=query_extra_params,
+    )
+    info_b = _extract_ids_and_logprobs(resp_b)
+
+    ans = []
+    for i, (info_a_item, info_b_item) in enumerate(zip(info_a, info_b, strict=True)):
+        print(f"Compare sequence {i} in batch...")
+        correct = TokenIdsAndLogprobs.compare(info_a_item["io"], info_b_item["input"])
+        ans.append(int(correct))
+
+    return ans
+
+
+@dataclasses.dataclass
+class TokenIdsAndLogprobs:
+    token_ids: List[int]
+    logprobs: List[float]
+
+    def __add__(self, other):
+        return TokenIdsAndLogprobs(
+            token_ids=self.token_ids + other.token_ids,
+            logprobs=self.logprobs + other.logprobs,
+        )
+
+    @classmethod
+    def compare(cls, a: "TokenIdsAndLogprobs", b: "TokenIdsAndLogprobs"):
+        assert len(a.token_ids) == len(b.token_ids)
+        token_match = a.token_ids == b.token_ids
+        logprobs_match = a.logprobs == b.logprobs
+
+        if token_match:
+            print(f"Token match: {a.token_ids}")
+        else:
+            print(f"❗Token mismatch: {a.token_ids=} {b.token_ids=}")
+
+        if logprobs_match:
+            print(f"Logprobs match:", a.logprobs)
+        else:
+            print(f"❗Logprobs mismatch")
+            print(
+                "    A:   ",
+                [f"{x:.10f}" if x is not None else "None" for x in a.logprobs],
+            )
+            print(
+                "    B:   ",
+                [f"{x:.10f}" if x is not None else "None" for x in b.logprobs],
+            )
+            diff = [
+                abs(x - y) if x is not None else float("nan")
+                for x, y in zip(a.logprobs, b.logprobs)
+            ]
+            print("    Diff:", [f"{x:.10e}" for x in diff])
+
+        return token_match and logprobs_match
+
+
+def _extract_ids_and_logprobs(responses):
+    def _extract_part(response, name):
+        token_ids, logprobs = [], []
+        for item in response["meta_info"][name]:
+            logprob, token_id, text = item
+            token_ids.append(token_id)
+            logprobs.append(logprob)
+        return TokenIdsAndLogprobs(token_ids=token_ids, logprobs=logprobs)
+
+    def _extract_one_response(response):
+        input = _extract_part(response, "input_token_logprobs")
+        output = _extract_part(response, "output_token_logprobs")
+        return dict(input=input, output=output, io=input + output)
+
+    if not isinstance(responses, list):
+        responses = [responses]
+    return [_extract_one_response(x) for x in responses]
+
+
 def test_deterministic(args):
     if args.test_mode == "single":
         # In single mode, we test the deterministic behavior by sending the same prompt in batch sizes ranging from 1 to n_trials.
         texts = []
         for i in range(1, args.n_trials + 1):
             batch_size = i
-            text = send_single(args, batch_size, args.profile)
+            text = send_single(args, args.profile, prompt=[PROMPT_1] * batch_size)
             text = text.replace("\n", " ")
             print(f"Trial {i} with batch size {batch_size}: {text}")
             texts.append(text)
@@ -414,6 +542,13 @@ def test_deterministic(args):
         else:
             print("✗✗✗ TEST FAILED - Radix cache produces different results! ✗✗✗")
             return [0]
+
+    elif args.test_mode == "p_vs_d":
+        # TODO also extract other modes to functions
+        ans = []
+        for i in range(1, args.n_trials + 1):
+            ans += _test_mode_p_vs_d(args, batch_size=i)
+        return ans
 
     else:
         raise ValueError(f"Invalid test mode: {args.test_mode}")
