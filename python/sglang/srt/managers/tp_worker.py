@@ -230,7 +230,6 @@ class TpModelWorker(BaseTpWorker):
                 else server_args.speculative_draft_model_revision
             ),
             is_draft_model=is_draft_worker,
-            
         )
 
         self._model_runner = ModelRunner(

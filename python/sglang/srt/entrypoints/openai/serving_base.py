@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-import torch
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
