@@ -5,9 +5,8 @@
 // conversation_item_storage was missing/incorrect in server.rs.
 
 use std::sync::Arc;
-use tracing::info;
 
-use crate::config::{HistoryBackend, OracleConfig, RouterConfig};
+use tracing::info;
 
 use super::{
     core::{SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage},
@@ -15,6 +14,7 @@ use super::{
     noop::{NoOpConversationItemStorage, NoOpConversationStorage, NoOpResponseStorage},
     oracle::{OracleConversationItemStorage, OracleConversationStorage, OracleResponseStorage},
 };
+use crate::config::{HistoryBackend, OracleConfig, RouterConfig};
 
 /// Create all three storage backends based on router configuration.
 ///

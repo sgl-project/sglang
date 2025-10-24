@@ -1,21 +1,21 @@
 //! Oracle storage implementation using OracleStore helper.
-//! 
+//!
 //! Structure:
 //! 1. OracleStore helper and common utilities
 //! 2. OracleConversationStorage
 //! 3. OracleConversationItemStorage
 //! 4. OracleResponseStorage
 
-
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool::managed::{Manager, Metrics, Pool, RecycleError, RecycleResult};
-use oracle::{sql_type::{OracleType, ToSql}, Connection, Row};
+use oracle::{
+    sql_type::{OracleType, ToSql},
+    Connection, Row,
+};
 use serde_json::Value;
-
-use crate::config::OracleConfig;
 
 use super::core::{
     make_item_id, Conversation, ConversationId, ConversationItem, ConversationItemId,
@@ -24,6 +24,7 @@ use super::core::{
     NewConversationItem, ResponseChain, ResponseId, ResponseStorage, ResponseStorageError,
     SortOrder, StoredResponse,
 };
+use crate::config::OracleConfig;
 
 // ============================================================================
 // PART 1: OracleStore Helper + Common Utilities
@@ -232,9 +233,7 @@ pub struct OracleConversationStorage {
 }
 
 impl OracleConversationStorage {
-    pub fn new(
-        config: OracleConfig,
-    ) -> Result<Self, ConversationStorageError> {
+    pub fn new(config: OracleConfig) -> Result<Self, ConversationStorageError> {
         let store = OracleStore::new(&config, |conn| {
             // Check if table exists
             let exists: i64 = conn
@@ -331,8 +330,7 @@ impl ConversationStorage for OracleConversationStorage {
                     let id: String = row.get(0).map_err(map_oracle_error)?;
                     let created_at: DateTime<Utc> = row.get(1).map_err(map_oracle_error)?;
                     let metadata_raw: Option<String> = row.get(2).map_err(map_oracle_error)?;
-                    let metadata = Self::parse_metadata(metadata_raw)
-                        .map_err(|e| e.to_string())?;
+                    let metadata = Self::parse_metadata(metadata_raw).map_err(|e| e.to_string())?;
                     Ok(Some(Conversation::with_parts(
                         ConversationId(id),
                         created_at,
@@ -378,9 +376,9 @@ impl ConversationStorage for OracleConversationStorage {
 
                 let mut created_at: Vec<DateTime<Utc>> =
                     stmt.returned_values(3).map_err(map_oracle_error)?;
-                let created_at = created_at.pop().ok_or_else(|| {
-                    "Oracle update did not return created_at".to_string()
-                })?;
+                let created_at = created_at
+                    .pop()
+                    .ok_or_else(|| "Oracle update did not return created_at".to_string())?;
 
                 Ok(Some(Conversation::with_parts(
                     conversation_id,
@@ -406,9 +404,10 @@ impl ConversationStorage for OracleConversationStorage {
             .await
             .map_err(ConversationStorageError::StorageError)?;
 
-        Ok(res.row_count().map_err(|e| {
-            ConversationStorageError::StorageError(map_oracle_error(e))
-        })? > 0)
+        Ok(res
+            .row_count()
+            .map_err(|e| ConversationStorageError::StorageError(map_oracle_error(e)))?
+            > 0)
     }
 }
 
@@ -422,9 +421,7 @@ pub struct OracleConversationItemStorage {
 }
 
 impl OracleConversationItemStorage {
-    pub fn new(
-        config: OracleConfig,
-    ) -> Result<Self, ConversationItemStorageError> {
+    pub fn new(config: OracleConfig) -> Result<Self, ConversationItemStorageError> {
         let store = OracleStore::new(&config, |conn| {
             // Create conversation_items table
             let exists_items: i64 = conn
@@ -653,8 +650,9 @@ impl ConversationItemStorage for OracleConversationItemStorage {
             .map(
                 |(id, resp_id, item_type, role, content_raw, status, created_at)| {
                     let content = match content_raw {
-                        Some(s) => serde_json::from_str(&s)
-                            .map_err(ConversationItemStorageError::from)?,
+                        Some(s) => {
+                            serde_json::from_str(&s).map_err(ConversationItemStorageError::from)?
+                        }
                         None => Value::Null,
                     };
                     Ok(ConversationItem {

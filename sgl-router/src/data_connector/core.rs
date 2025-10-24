@@ -124,10 +124,8 @@ pub enum ConversationStorageError {
 /// Trait describing the CRUD interface for conversation storage backends
 #[async_trait]
 pub trait ConversationStorage: Send + Sync + 'static {
-    async fn create_conversation(
-        &self,
-        input: NewConversation,
-    ) -> ConversationResult<Conversation>;
+    async fn create_conversation(&self, input: NewConversation)
+        -> ConversationResult<Conversation>;
 
     async fn get_conversation(
         &self,

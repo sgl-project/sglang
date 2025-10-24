@@ -16,10 +16,9 @@ mod oracle;
 // Re-export all core types
 pub use core::*;
 
+// Re-export factory function
+pub use factory::create_storage;
 // Re-export all storage implementations
 pub use memory::*;
 pub use noop::*;
 pub use oracle::*;
-
-// Re-export factory function
-pub use factory::create_storage;

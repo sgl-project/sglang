@@ -7,7 +7,6 @@
 //! 2. NoOpConversationItemStorage
 //! 3. NoOpResponseStorage
 
-
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
