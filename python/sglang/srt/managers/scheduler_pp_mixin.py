@@ -202,11 +202,11 @@ class SchedulerPPMixin:
 
         if mbs[next_mb_id] is not None:
             with self.copy_stream_ctx:
+                self.copy_stream.wait_stream(self.default_stream)
                 with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                     next_pp_outputs = PPProxyTensors(
                         self._pp_recv_dict_from_prev_stage()
                     )
-                self.copy_stream.wait_stream(self.default_stream)
                 batch_result = self._pp_prep_batch_result(
                     mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
                 )
