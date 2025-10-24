@@ -12,7 +12,6 @@ try:
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
     from vllm.model_executor.layers.quantization.deepspeedfp import DeepSpeedFPConfig
     from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
-    from vllm.model_executor.layers.quantization.gguf import GGUFConfig
     from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
         GPTQMarlin24Config,
     )
@@ -32,9 +31,7 @@ except ImportError as e:
 
     AQLMConfig = BitsAndBytesConfig = CompressedTensorsConfig = DeepSpeedFPConfig = (
         ExpertsInt8Config
-    ) = GGUFConfig = GPTQMarlin24Config = MarlinConfig = QQQConfig = Int8TpuConfig = (
-        DummyConfig
-    )
+    ) = GPTQMarlin24Config = MarlinConfig = QQQConfig = Int8TpuConfig = DummyConfig
 
 
 from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
@@ -45,6 +42,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
+from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -75,6 +73,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "w8a8_fp8": W8A8Fp8Config,
     "awq": AWQConfig,
     "awq_marlin": AWQMarlinConfig,
+    "gguf": GGUFConfig,
     "gptq": GPTQConfig,
     "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
@@ -108,7 +107,6 @@ VLLM_QUANTIZATION_METHODS = {
     "deepspeedfp": DeepSpeedFPConfig,
     "tpu_int8": Int8TpuConfig,
     "marlin": MarlinConfig,
-    "gguf": GGUFConfig,
     "gptq_marlin_24": GPTQMarlin24Config,
     "bitsandbytes": BitsAndBytesConfig,
     "qqq": QQQConfig,
