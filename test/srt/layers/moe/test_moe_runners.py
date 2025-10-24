@@ -27,6 +27,8 @@ class TestMoERunnerTriton(CustomTestCase):
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "triton",
+                "--tp",
+                "2",
             ],
         )
 
