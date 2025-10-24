@@ -184,6 +184,7 @@ suites = {
     ],
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
+        TestFile("test_eagle_dp_attention.py", 300),
     ],
     "per-commit-8-gpu-h200-deepseek-v32": [
         TestFile("test_deepseek_v32_basic.py", 275),
