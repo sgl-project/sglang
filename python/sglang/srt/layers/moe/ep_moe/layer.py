@@ -16,7 +16,6 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
-    silu_and_mul_masked_post_quant_fwd,
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
@@ -25,7 +24,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
-    sglang_per_token_group_quant_fp8,
+    sglang_per_token_group_quant_8bit,
 )
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
@@ -462,32 +461,17 @@ class DeepEPMoE(FusedMoE):
         dispose_tensor(hidden_states)
 
         # Act
-        down_input = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2,
-            ),
-            device=gateup_output.device,
-            dtype=self.fp8_dtype,
-        )
         scale_block_size = 128
-        down_input_scale = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2 // scale_block_size,
-            ),
-            device=gateup_output.device,
-            dtype=torch.float32,
-        )
-        silu_and_mul_masked_post_quant_fwd(
-            gateup_output,
-            down_input,
-            down_input_scale,
-            scale_block_size,
-            masked_m,
+        down_input, down_input_scale = sglang_per_token_group_quant_8bit(
+            x=gateup_output,
+            dst_dtype=self.fp8_dtype,
+            group_size=scale_block_size,
+            masked_m=masked_m,
+            column_major_scales=True,
+            scale_tma_aligned=True,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            fuse_silu_and_mul=True,
+            enable_v2=True,
         )
         del gateup_output
 
