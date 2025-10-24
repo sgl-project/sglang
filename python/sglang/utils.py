@@ -13,13 +13,11 @@ import time
 import traceback
 import urllib.request
 import weakref
-from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
-import numpy as np
 import pybase64
 import requests
 from IPython.display import HTML, display
