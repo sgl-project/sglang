@@ -12,8 +12,8 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
-    RoundRobinPolicy, BucketConfig, BucketPolicy,
+    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::{config::types::PolicyConfig, core::Worker};
 
@@ -217,7 +217,7 @@ impl PolicyRegistry {
                     bucket_adjust_interval_secs: *bucket_adjust_interval_secs,
                 };
                 Arc::new(BucketPolicy::with_config(config))
-            },
+            }
         }
     }
 
@@ -373,9 +373,7 @@ impl PolicyRegistry {
         }
         if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
             if prefill_policy.name() == "bucket" {
-                if let Some(bucket) =
-                    prefill_policy.as_any().downcast_ref::<BucketPolicy>()
-                {
+                if let Some(bucket) = prefill_policy.as_any().downcast_ref::<BucketPolicy>() {
                     if !prefill_workers.is_empty() {
                         debug!(
                             "Initializing prefill bucket policy with {} workers",

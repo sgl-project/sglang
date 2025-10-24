@@ -111,7 +111,10 @@ mod test_pd_routing {
                 } => {
                     assert!(*cache_threshold >= 0.0 && *cache_threshold <= 1.0);
                 }
-                PDSelectionPolicy::Bucket{ balance_rel_threshold, .. } => {
+                PDSelectionPolicy::Bucket{
+                    balance_rel_threshold,
+                    ..
+                } => {
                     assert!(*balance_rel_threshold >= 1.0);
                 }
             }

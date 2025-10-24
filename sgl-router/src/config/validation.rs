@@ -238,7 +238,7 @@ impl ConfigValidator {
             PolicyConfig::Bucket {
                 balance_abs_threshold: _,
                 balance_rel_threshold,
-                bucket_adjust_interval_secs
+                bucket_adjust_interval_secs,
             } => {
                 if *balance_rel_threshold < 1.0 {
                     return Err(ConfigError::InvalidValue {
@@ -563,9 +563,7 @@ impl ConfigValidator {
                 // Check bucket for decode
                 if let Some(PolicyConfig::Bucket { .. }) = decode_policy {
                     return Err(ConfigError::IncompatibleConfig {
-                        reason:
-                            "Decode policy should not be allowed to be bucket"
-                                .to_string(),
+                        reason: "Decode policy should not be allowed to be bucket".to_string(),
                     });
                 }
             }
@@ -885,7 +883,10 @@ mod tests {
         );
 
         let result = ConfigValidator::validate(&config);
-        assert!(result.is_ok(), "Prefill policy should be allowed to be bucket");
+        assert!(
+            result.is_ok(),
+            "Prefill policy should be allowed to be bucket"
+        );
 
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
@@ -912,7 +913,10 @@ mod tests {
         );
 
         let result = ConfigValidator::validate(&config);
-        assert!(result.is_err(), "Decode policy should not be allowed to be bucket");
+        assert!(
+            result.is_err(),
+            "Decode policy should not be allowed to be bucket"
+        );
     }
 
     #[test]

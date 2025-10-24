@@ -33,7 +33,7 @@ impl PolicyFactory {
                     max_tree_size: *max_tree_size,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
-            },
+            }
             PolicyConfig::Bucket {
                 balance_abs_threshold,
                 balance_rel_threshold,
@@ -88,7 +88,7 @@ mod tests {
         });
         assert_eq!(policy.name(), "cache_aware");
 
-        let policy = PolicyFactory::create_from_config(&PolicyConfig::Bucket{
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::Bucket {
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
             bucket_adjust_interval_secs: 5,

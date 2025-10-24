@@ -7,21 +7,21 @@ use std::{fmt::Debug, sync::Arc};
 
 use crate::core::Worker;
 
+mod bucket;
 mod cache_aware;
 mod factory;
 mod power_of_two;
 mod random;
 mod registry;
 mod round_robin;
-mod bucket;
 
+pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
-pub use bucket::BucketPolicy;
 
 /// Core trait for load balancing policies
 ///
@@ -122,7 +122,7 @@ impl Default for BucketConfig {
         Self {
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.0001,
-            bucket_adjust_interval_secs: 5
+            bucket_adjust_interval_secs: 5,
         }
     }
 }
