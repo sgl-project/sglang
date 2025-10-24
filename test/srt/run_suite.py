@@ -290,7 +290,6 @@ suite_amd = {
         # TestFile("rl/test_update_weights_from_tensor.py", 48),
         # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
-        # TestFile("test_wave_attention_backend.py", 150),
     ],
     "per-commit-amd-mi35x": [
         TestFile("test_gpt_oss_1gpu.py", 750),
