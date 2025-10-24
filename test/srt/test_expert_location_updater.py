@@ -205,7 +205,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
         new_physical_to_logical_map = _create_physical_to_logical_map()
         expect_new_weights = _create_routed_experts_weights(new_physical_to_logical_map)
 
-        output_logs = expert_location_updater.update_expert_weights_single_layer(
+        output_logs, _ = expert_location_updater.update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights,
             temp_buffers=expert_location_updater.create_temp_buffers(
                 routed_experts_weights

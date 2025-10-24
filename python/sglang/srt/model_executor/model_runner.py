@@ -962,27 +962,14 @@ class ModelRunner:
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        if ElasticEPStateManager.instance() is not None:
-            # TODO: refactor the weights update when elastic ep
-            old_expert_location_metadata = get_global_expert_location_metadata()
-            assert old_expert_location_metadata is not None
-            old_expert_location_metadata.update(
-                new_expert_location_metadata,
-                update_layer_ids=update_layer_ids,
-            )
-            self.update_weights_from_disk(
-                self.server_args.model_path,
-                self.server_args.load_format,
-                lambda name: "mlp.experts" in name and "mlp.shared_experts" not in name,
-            )
-        else:
-            self.expert_location_updater.update(
-                self.model.routed_experts_weights_of_layer,
-                new_expert_location_metadata,
-                update_layer_ids=update_layer_ids,
-                nnodes=self.server_args.nnodes,
-                rank=self.tp_rank,
-            )
+        self.expert_location_updater.update(
+            self.model.routed_experts_weights_of_layer,
+            new_expert_location_metadata,
+            update_layer_ids=update_layer_ids,
+            nnodes=self.server_args.nnodes,
+            rank=self.tp_rank,
+            model_runner=self,
+        )
 
     def update_weights_from_disk(
         self,
