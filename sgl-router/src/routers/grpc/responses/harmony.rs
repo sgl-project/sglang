@@ -516,13 +516,18 @@ async fn execute_harmony_internal_single(
         .await
         .map_err(|e| format!("Failed to read response body: {}", e))?;
 
-    // 7. Parse GenerateResponse
+    // 7. Parse GenerateResponse (backend returns array with single response)
     debug!(
         "Response body bytes: {}",
         String::from_utf8_lossy(&body_bytes)
     );
-    let generate_resp: GenerateResponse = serde_json::from_slice(&body_bytes)
-        .map_err(|e| format!("Failed to parse generate response: {}", e))?;
+    let generate_resps: Vec<GenerateResponse> = serde_json::from_slice(&body_bytes)
+        .map_err(|e| format!("Failed to parse generate response array: {}", e))?;
+
+    let generate_resp = generate_resps
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Backend returned empty response array".to_string())?;
 
     // 8. Process output tokens through Harmony parser
     let mut parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
