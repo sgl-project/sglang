@@ -1,4 +1,9 @@
-use std::{borrow::Cow, collections::HashMap, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::Arc,
+    time::Duration,
+};
 
 use backoff::ExponentialBackoffBuilder;
 use dashmap::DashMap;
@@ -64,6 +69,9 @@ pub struct McpClientManager {
 impl McpClientManager {
     /// Create a new manager and connect to all configured servers
     pub async fn new(config: McpConfig) -> McpResult<Self> {
+        // Get the globally shared HTTP client (lazily initialized if needed)
+        let http_client = crate::mcp::http_client::client();
+
         let mut mgr = Self {
             clients: HashMap::new(),
             tools: DashMap::new(),
@@ -72,7 +80,7 @@ impl McpClientManager {
         };
 
         for server_config in config.servers {
-            match Self::connect_server(&server_config).await {
+            match Self::connect_server(&server_config, &http_client).await {
                 Ok(client) => {
                     mgr.load_server_inventory(&server_config.name, &client)
                         .await;
@@ -161,21 +169,25 @@ impl McpClientManager {
     }
 
     /// Connect to a single MCP server with retry logic for remote transports
-    async fn connect_server(config: &McpServerConfig) -> McpResult<RunningService<RoleClient, ()>> {
+    async fn connect_server(
+        config: &McpServerConfig,
+        shared_client: &Arc<reqwest::Client>,
+    ) -> McpResult<RunningService<RoleClient, ()>> {
         let needs_retry = matches!(
             &config.transport,
             McpTransport::Sse { .. } | McpTransport::Streamable { .. }
         );
         if needs_retry {
-            Self::connect_server_with_retry(config).await
+            Self::connect_server_with_retry(config, shared_client).await
         } else {
-            Self::connect_server_impl(config).await
+            Self::connect_server_impl(config, shared_client).await
         }
     }
 
     /// Connect with exponential backoff retry for remote servers
     async fn connect_server_with_retry(
         config: &McpServerConfig,
+        shared_client: &Arc<reqwest::Client>,
     ) -> McpResult<RunningService<RoleClient, ()>> {
         let backoff = ExponentialBackoffBuilder::new()
             .with_initial_interval(Duration::from_secs(1))
@@ -184,7 +196,7 @@ impl McpClientManager {
             .build();
 
         backoff::future::retry(backoff, || async {
-            match Self::connect_server_impl(config).await {
+            match Self::connect_server_impl(config, shared_client).await {
                 Ok(client) => Ok(client),
                 Err(e) => {
                     if Self::is_permanent_error(&e) {
@@ -226,6 +238,7 @@ impl McpClientManager {
     /// Internal implementation of server connection
     async fn connect_server_impl(
         config: &McpServerConfig,
+        shared_client: &Arc<reqwest::Client>,
     ) -> McpResult<RunningService<RoleClient, ()>> {
         tracing::info!(
             "Connecting to MCP server '{}' via {:?}",
@@ -257,34 +270,31 @@ impl McpClientManager {
             }
 
             McpTransport::Sse { url, token } => {
-                let transport = if let Some(tok) = token {
-                    let client = reqwest::Client::builder()
-                        .default_headers({
-                            let mut headers = reqwest::header::HeaderMap::new();
-                            headers.insert(
-                                reqwest::header::AUTHORIZATION,
-                                format!("Bearer {}", tok).parse().map_err(|e| {
-                                    McpError::Transport(format!("auth token: {}", e))
-                                })?,
-                            );
-                            headers
-                        })
-                        .build()
-                        .map_err(|e| McpError::Transport(format!("build HTTP client: {}", e)))?;
+                let client = if let Some(tok) = token {
+                    // SSE with token: build client with auth headers, inheriting global proxy config
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bearer {}", tok)
+                            .parse()
+                            .map_err(|e| McpError::Transport(format!("auth token: {}", e)))?,
+                    );
 
-                    let cfg = SseClientConfig {
-                        sse_endpoint: url.clone().into(),
-                        ..Default::default()
-                    };
-
-                    SseClientTransport::start_with_client(client, cfg)
-                        .await
-                        .map_err(|e| McpError::Transport(format!("create SSE transport: {}", e)))?
+                    crate::mcp::http_client::build_with_headers(headers)
+                        .map_err(|e| McpError::Transport(e))?
                 } else {
-                    SseClientTransport::start(url.as_str())
-                        .await
-                        .map_err(|e| McpError::Transport(format!("create SSE transport: {}", e)))?
+                    // SSE without token: use shared client
+                    (**shared_client).clone()
                 };
+
+                let cfg = SseClientConfig {
+                    sse_endpoint: url.clone().into(),
+                    ..Default::default()
+                };
+
+                let transport = SseClientTransport::start_with_client(client, cfg)
+                    .await
+                    .map_err(|e| McpError::Transport(format!("create SSE transport: {}", e)))?;
 
                 let client = ().serve(transport).await.map_err(|e| {
                     McpError::ConnectionFailed(format!("initialize SSE client: {}", e))
@@ -295,13 +305,14 @@ impl McpClientManager {
             }
 
             McpTransport::Streamable { url, token } => {
-                let transport = if let Some(tok) = token {
-                    let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                // Streamable: use shared client (token passed via config.auth_header)
+                let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                if let Some(tok) = token {
                     cfg.auth_header = Some(format!("Bearer {}", tok));
-                    StreamableHttpClientTransport::from_config(cfg)
-                } else {
-                    StreamableHttpClientTransport::from_uri(url.as_str())
-                };
+                }
+
+                let transport =
+                    StreamableHttpClientTransport::with_client((**shared_client).clone(), cfg);
 
                 let client = ().serve(transport).await.map_err(|e| {
                     McpError::ConnectionFailed(format!("initialize streamable client: {}", e))

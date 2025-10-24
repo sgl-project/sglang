@@ -93,6 +93,9 @@ pub struct RouterConfig {
     /// Loaded from ca_cert_paths during config creation
     #[serde(default)]
     pub ca_certificates: Vec<Vec<u8>>,
+    /// Global MCP proxy configuration for outbound MCP client traffic
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_proxy: Option<McpProxyConfig>,
 }
 
 /// Tokenizer cache configuration
@@ -214,6 +217,37 @@ impl std::fmt::Debug for OracleConfig {
             .field("pool_max", &self.pool_max)
             .field("pool_timeout_secs", &self.pool_timeout_secs)
             .finish()
+    }
+}
+
+/// Proxy configuration applied to all MCP clients
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpProxyConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_proxy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub https_proxy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+}
+
+impl McpProxyConfig {
+    /// Create a new McpProxyConfig if at least one proxy setting is provided.
+    /// Returns None if all proxy settings are None.
+    pub fn new(
+        http_proxy: Option<String>,
+        https_proxy: Option<String>,
+        no_proxy: Option<String>,
+    ) -> Option<Self> {
+        if http_proxy.is_some() || https_proxy.is_some() || no_proxy.is_some() {
+            Some(Self {
+                http_proxy,
+                https_proxy,
+                no_proxy,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -508,6 +542,7 @@ impl Default for RouterConfig {
             tokenizer_cache: TokenizerCacheConfig::default(),
             client_identity: None,
             ca_certificates: vec![],
+            mcp_proxy: None,
         }
     }
 }
@@ -592,6 +627,7 @@ mod tests {
         assert!(config.metrics.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+        assert!(config.mcp_proxy.is_none());
     }
 
     #[test]
@@ -615,6 +651,7 @@ mod tests {
         assert!(matches!(config.policy, PolicyConfig::RoundRobin));
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 3001);
+        assert!(config.mcp_proxy.is_none());
     }
 
     #[test]
@@ -638,6 +675,7 @@ mod tests {
         assert_eq!(config.log_level, deserialized.log_level);
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
+        assert!(deserialized.mcp_proxy.is_none());
     }
 
     #[test]
@@ -1227,5 +1265,34 @@ mod tests {
             PolicyConfig::RoundRobin => {}
             _ => panic!("Expected RoundRobin for regular mode"),
         }
+    }
+
+    #[test]
+    fn test_mcp_proxy_config_new_returns_none_when_all_empty() {
+        let cfg = McpProxyConfig::new(None, None, None);
+        assert!(cfg.is_none());
+    }
+
+    #[test]
+    fn test_mcp_proxy_config_new_populates_single_field() {
+        let cfg = McpProxyConfig::new(Some("http://127.0.0.1:8080".into()), None, None)
+            .expect("expected Some config");
+        assert_eq!(cfg.http_proxy.as_deref(), Some("http://127.0.0.1:8080"));
+        assert!(cfg.https_proxy.is_none());
+        assert!(cfg.no_proxy.is_none());
+    }
+
+    #[test]
+    fn test_mcp_proxy_config_new_keeps_all_fields() {
+        let cfg = McpProxyConfig::new(
+            Some("http://127.0.0.1:8080".into()),
+            Some("http://127.0.0.1:8443".into()),
+            Some("localhost,example.com".into()),
+        )
+        .expect("expected Some config");
+
+        assert_eq!(cfg.http_proxy.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(cfg.https_proxy.as_deref(), Some("http://127.0.0.1:8443"));
+        assert_eq!(cfg.no_proxy.as_deref(), Some("localhost,example.com"));
     }
 }

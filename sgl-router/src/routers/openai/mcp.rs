@@ -161,6 +161,7 @@ pub async fn mcp_manager_from_request_tools(
     };
     let cfg = crate::mcp::McpConfig {
         servers: vec![crate::mcp::McpServerConfig { name, transport }],
+        proxy: None, // Proxy is configured globally via http_client module
     };
     match McpClientManager::new(cfg).await {
         Ok(mgr) => Some(Arc::new(mgr)),

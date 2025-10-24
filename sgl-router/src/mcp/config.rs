@@ -2,9 +2,14 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::types::McpProxyConfig;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpConfig {
     pub servers: Vec<McpServerConfig>,
+    /// Global proxy configuration for all MCP servers
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<McpProxyConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

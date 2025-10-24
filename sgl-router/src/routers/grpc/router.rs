@@ -98,13 +98,18 @@ impl GrpcRouter {
         let mcp_manager = match std::env::var("SGLANG_MCP_CONFIG").ok() {
             Some(path) if !path.trim().is_empty() => {
                 match crate::mcp::McpConfig::from_file(&path).await {
-                    Ok(cfg) => match crate::mcp::McpClientManager::new(cfg).await {
-                        Ok(mgr) => Some(Arc::new(mgr)),
-                        Err(err) => {
-                            tracing::warn!("Failed to initialize MCP manager: {}", err);
-                            None
+                    Ok(mut cfg) => {
+                        if let Some(proxy_override) = ctx.router_config.mcp_proxy.clone() {
+                            cfg.proxy = Some(proxy_override);
                         }
-                    },
+                        match crate::mcp::McpClientManager::new(cfg).await {
+                            Ok(mgr) => Some(Arc::new(mgr)),
+                            Err(err) => {
+                                tracing::warn!("Failed to initialize MCP manager: {}", err);
+                                None
+                            }
+                        }
+                    }
                     Err(err) => {
                         tracing::warn!("Failed to load MCP config from '{}': {}", path, err);
                         None

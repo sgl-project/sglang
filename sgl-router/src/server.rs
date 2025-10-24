@@ -855,6 +855,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .build()
         .expect("Failed to create HTTP client");
 
+    // Initialize global MCP HTTP client
+    if let Err(e) = crate::mcp::http_client::init(config.router_config.mcp_proxy.clone()) {
+        warn!("Failed to initialize MCP HTTP client: {}", e);
+    }
+
     // Initialize rate limiter
     let rate_limiter = match config.router_config.max_concurrent_requests {
         n if n <= 0 => None,

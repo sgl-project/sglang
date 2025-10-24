@@ -10,6 +10,7 @@
 pub mod client_manager;
 pub mod config;
 pub mod error;
+pub mod http_client;
 pub mod oauth;
 
 // Re-export the main types for convenience

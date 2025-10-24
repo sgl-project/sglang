@@ -138,6 +138,48 @@ impl PyOracleConfig {
 }
 
 #[pyclass]
+#[derive(Clone, PartialEq, Debug)]
+pub struct PyMcpProxy {
+    #[pyo3(get, set)]
+    pub http_proxy: Option<String>,
+    #[pyo3(get, set)]
+    pub https_proxy: Option<String>,
+    #[pyo3(get, set)]
+    pub no_proxy: Option<String>,
+}
+
+#[pymethods]
+impl PyMcpProxy {
+    #[new]
+    #[pyo3(signature = (
+        http_proxy = None,
+        https_proxy = None,
+        no_proxy = None,
+    ))]
+    fn new(
+        http_proxy: Option<String>,
+        https_proxy: Option<String>,
+        no_proxy: Option<String>,
+    ) -> PyResult<Self> {
+        Ok(PyMcpProxy {
+            http_proxy,
+            https_proxy,
+            no_proxy,
+        })
+    }
+}
+
+impl PyMcpProxy {
+    fn to_config_mcp_proxy(&self) -> Option<config::types::McpProxyConfig> {
+        config::types::McpProxyConfig::new(
+            self.http_proxy.clone(),
+            self.https_proxy.clone(),
+            self.no_proxy.clone(),
+        )
+    }
+}
+
+#[pyclass]
 #[derive(Debug, Clone, PartialEq)]
 struct Router {
     host: String,
@@ -210,6 +252,7 @@ struct Router {
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
+    mcp_proxy: Option<PyMcpProxy>,
 }
 
 impl Router {
@@ -305,6 +348,11 @@ impl Router {
             None
         };
 
+        let mcp_proxy = self
+            .mcp_proxy
+            .as_ref()
+            .and_then(|cfg| cfg.to_config_mcp_proxy());
+
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -357,6 +405,7 @@ impl Router {
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
             .maybe_oracle(oracle)
+            .maybe_mcp_proxy(mcp_proxy)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .dp_aware(self.dp_aware)
@@ -445,6 +494,7 @@ impl Router {
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
+        mcp_proxy = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -517,6 +567,7 @@ impl Router {
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
+        mcp_proxy: Option<PyMcpProxy>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -603,6 +654,7 @@ impl Router {
             client_cert_path,
             client_key_path,
             ca_cert_paths,
+            mcp_proxy,
         })
     }
 

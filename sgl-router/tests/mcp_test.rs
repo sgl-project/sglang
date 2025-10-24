@@ -9,11 +9,14 @@
 
 mod common;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, process::Command, time::Duration};
 
-use common::mock_mcp_server::MockMCPServer;
+use common::{mock_mcp_server::MockMCPServer, test_proxy::TestProxy};
 use serde_json::json;
-use sglang_router_rs::mcp::{McpClientManager, McpConfig, McpError, McpServerConfig, McpTransport};
+use sglang_router_rs::{
+    config::McpProxyConfig,
+    mcp::{McpClientManager, McpConfig, McpError, McpServerConfig, McpTransport},
+};
 
 /// Create a new mock server for testing (each test gets its own)
 async fn create_mock_server() -> MockMCPServer {
@@ -26,7 +29,10 @@ async fn create_mock_server() -> MockMCPServer {
 
 #[tokio::test]
 async fn test_mcp_server_initialization() {
-    let config = McpConfig { servers: vec![] };
+    let config = McpConfig {
+        servers: vec![],
+        proxy: None,
+    };
 
     // Should fail with no servers
     let result = McpClientManager::new(config).await;
@@ -45,6 +51,7 @@ async fn test_server_connection_with_mock() {
                 token: None,
             },
         }],
+        proxy: None,
     };
 
     let result = McpClientManager::new(config).await;
@@ -77,6 +84,7 @@ async fn test_tool_availability_checking() {
                 token: None,
             },
         }],
+        proxy: None,
     };
 
     let mut manager = McpClientManager::new(config).await.unwrap();
@@ -128,6 +136,7 @@ async fn test_multi_server_connection() {
                 },
             },
         ],
+        proxy: None,
     };
 
     // Note: This will fail to connect to both servers in the current implementation
@@ -157,6 +166,7 @@ async fn test_tool_execution_with_mock() {
                 token: None,
             },
         }],
+        proxy: None,
     };
 
     let mut manager = McpClientManager::new(config).await.unwrap();
@@ -208,6 +218,7 @@ async fn test_concurrent_tool_execution() {
                 token: None,
             },
         }],
+        proxy: None,
     };
 
     let mut manager = McpClientManager::new(config).await.unwrap();
@@ -245,6 +256,7 @@ async fn test_tool_execution_errors() {
                 token: None,
             },
         }],
+        proxy: None,
     };
 
     let mut manager = McpClientManager::new(config).await.unwrap();
@@ -276,6 +288,7 @@ async fn test_connection_without_server() {
                 envs: HashMap::new(),
             },
         }],
+        proxy: None,
     };
 
     let result = McpClientManager::new(config).await;
@@ -308,6 +321,7 @@ async fn test_tool_info_structure() {
                 token: None,
             },
         }],
+        proxy: None,
     };
 
     let manager = McpClientManager::new(config).await.unwrap();
@@ -338,6 +352,7 @@ async fn test_sse_connection() {
                 envs: HashMap::new(),
             },
         }],
+        proxy: None,
     };
 
     // This will fail immediately without retry
@@ -396,6 +411,7 @@ async fn test_complete_workflow() {
                 token: None,
             },
         }],
+        proxy: None,
     };
 
     // 2. Connect to server
@@ -452,4 +468,157 @@ async fn test_complete_workflow() {
     ];
 
     assert_eq!(capabilities.len(), 8);
+}
+
+// Proxy Configuration Tests
+
+fn run_test_in_subprocess(test_name: &str) {
+    const ENV_KEY: &str = "MCP_PROXY_TEST_IN_SUBPROCESS";
+
+    // If we're inside the subprocess, run the actual test
+    if std::env::var(ENV_KEY).is_ok() {
+        std::env::remove_var(ENV_KEY);
+        return; // Let the actual test function run
+    }
+
+    // Otherwise, spawn a subprocess to run this test in isolation
+    let status = Command::new(std::env::current_exe().expect("current exe"))
+        .env(ENV_KEY, "1")
+        .args([test_name, "--exact"])
+        .status()
+        .expect("failed to spawn test subprocess");
+
+    assert!(status.success(), "subprocess test failed");
+}
+
+#[tokio::test]
+async fn test_mcp_client_with_http_proxy() {
+    const ENV_KEY: &str = "MCP_PROXY_TEST_IN_SUBPROCESS";
+    if std::env::var(ENV_KEY).is_err() {
+        run_test_in_subprocess("test_mcp_client_with_http_proxy");
+        return;
+    }
+
+    let mut proxy = TestProxy::start().await;
+
+    // Initialize HTTP client with proxy configuration
+    let _ = sglang_router_rs::mcp::http_client::init(McpProxyConfig::new(Some(proxy.url()), None, None));
+
+    let mut mock_server = create_mock_server().await;
+
+    let config = McpConfig {
+        servers: vec![McpServerConfig {
+            name: "mock_server".to_string(),
+            transport: McpTransport::Streamable {
+                url: mock_server.url(),
+                token: None,
+            },
+        }],
+        proxy: None, // Proxy is configured globally
+    };
+
+    let manager_result = McpClientManager::new(config).await;
+
+    assert!(
+        proxy.wait_for_hits(1, Duration::from_secs(10)).await,
+        "Proxy should receive requests when http_proxy is configured"
+    );
+
+    if let Ok(mut manager) = manager_result {
+        assert!(manager.has_tool("brave_web_search"));
+        manager.shutdown().await;
+    }
+
+    proxy.shutdown().await;
+    mock_server.stop().await;
+}
+
+#[tokio::test]
+async fn test_mcp_client_with_http_and_https_proxy() {
+    const ENV_KEY: &str = "MCP_PROXY_TEST_IN_SUBPROCESS";
+    if std::env::var(ENV_KEY).is_err() {
+        run_test_in_subprocess("test_mcp_client_with_http_and_https_proxy");
+        return;
+    }
+
+    let mut proxy = TestProxy::start().await;
+
+    // Initialize HTTP client with proxy configuration
+    let url = proxy.url();
+    let _ = sglang_router_rs::mcp::http_client::init(McpProxyConfig::new(Some(url.clone()), Some(url), None));
+
+    let mut mock_server = create_mock_server().await;
+
+    let config = McpConfig {
+        servers: vec![McpServerConfig {
+            name: "mock_server".to_string(),
+            transport: McpTransport::Streamable {
+                url: mock_server.url(),
+                token: None,
+            },
+        }],
+        proxy: None, // Proxy is configured globally
+    };
+
+    let manager_result = McpClientManager::new(config).await;
+
+    assert!(
+        proxy.wait_for_hits(1, Duration::from_secs(10)).await,
+        "Proxy should receive requests when https_proxy is configured"
+    );
+
+    if let Ok(mut manager) = manager_result {
+        assert!(manager.has_tool("brave_web_search"));
+        manager.shutdown().await;
+    }
+
+    proxy.shutdown().await;
+    mock_server.stop().await;
+}
+
+#[tokio::test]
+async fn test_mcp_client_respects_no_proxy() {
+    const ENV_KEY: &str = "MCP_PROXY_TEST_IN_SUBPROCESS";
+    if std::env::var(ENV_KEY).is_err() {
+        run_test_in_subprocess("test_mcp_client_respects_no_proxy");
+        return;
+    }
+
+    let mut proxy = TestProxy::start().await;
+
+    // Initialize HTTP client with proxy and no_proxy configuration
+    let _ = sglang_router_rs::mcp::http_client::init(McpProxyConfig::new(
+        Some(proxy.url()),
+        None,
+        Some("127.0.0.1,localhost".to_string()),
+    ));
+
+    let mut mock_server = create_mock_server().await;
+
+    let config = McpConfig {
+        servers: vec![McpServerConfig {
+            name: "mock_server".to_string(),
+            transport: McpTransport::Streamable {
+                url: mock_server.url(),
+                token: None,
+            },
+        }],
+        proxy: None, // Proxy is configured globally
+    };
+
+    let manager_result = McpClientManager::new(config).await;
+
+    assert!(manager_result.is_ok(), "Should connect without proxy");
+    let mut manager = manager_result.unwrap();
+
+    assert!(
+        !proxy.wait_for_hits(1, Duration::from_millis(500)).await,
+        "Proxy should not receive requests when no_proxy matches"
+    );
+    assert_eq!(proxy.hit_count(), 0);
+    assert!(manager.has_tool("brave_web_search"));
+
+    manager.shutdown().await;
+    proxy.shutdown().await;
+    mock_server.stop().await;
 }
