@@ -198,7 +198,7 @@ def get_config(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
         if (
-            getattr(config, 'auto_map', None) is not None
+            getattr(config, "auto_map", None) is not None
             and config.auto_map.get("AutoModel")
             == "modeling_deepseekocr.DeepseekOCRForCausalLM"
         ):
