@@ -100,6 +100,7 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
+        moe_router_dtype: str = "float32",
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -126,6 +127,8 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
+        if getattr(self.hf_config, "moe_router_dtype", None) is None:
+            setattr(self.hf_config, "moe_router_dtype", moe_router_dtype)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
@@ -156,18 +159,6 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
-        self.is_hybrid_swa = is_hybrid_model(
-            self.hf_config.architectures,
-            hybrid_kvcache_ratio=hybrid_kvcache_ratio,
-            context_length=context_length,
-            attention_chunk_size=self.attention_chunk_size,
-        )
-        if self.is_hybrid_swa is not None:
-            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
-                get_hybrid_layer_ids(
-                    self.hf_config.architectures, self.hf_text_config.num_hidden_layers
-                )
-            )
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
@@ -201,6 +192,40 @@ class ModelConfig:
         # Derive context length and model shapes
         self._derive_context_length(context_length)
         self._derive_model_shapes()
+
+        # Update hybrid model
+        # Use self.context_len after it has been initialized to prevent using context_len which may be None.
+        self.is_hybrid_swa = is_hybrid_model(
+            self.hf_config.architectures,
+            hybrid_kvcache_ratio=hybrid_kvcache_ratio,
+            context_length=self.context_len,
+            attention_chunk_size=self.attention_chunk_size,
+        )
+        if self.is_hybrid_swa is not None:
+            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
+                get_hybrid_layer_ids(
+                    self.hf_config.architectures,
+                    self.hf_text_config.num_hidden_layers,
+                    getattr(self.hf_text_config, "hybrid_layer_pattern", None),
+                )
+            )
+        self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
+            "HybridSWACompressedForCausalLM",
+            "HybridSWACompressedForCausalLMNextN",
+        ]
+        if self.is_hybrid_swa_compress:
+            self.attention_chunk_size = self.hf_text_config.sliding_window_size
+            # TODO(yingchun): seems useless, keep is_hybrid_swa as True is enough, the swa / full ratio
+            #  will be calculated automatically before allocating KV cache.
+            self.is_hybrid_swa = (
+                (
+                    self.hf_text_config.attention_chunk_size
+                    * len(self.swa_attention_layer_ids)
+                    / (self.context_len * len(self.full_attention_layer_ids))
+                )
+                if len(self.full_attention_layer_ids) > 0
+                else True
+            )
 
         # Verify quantization
         self._verify_quantization()
@@ -248,6 +273,7 @@ class ModelConfig:
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
+            moe_router_dtype=server_args.moe_router_dtype,
             **kwargs,
         )
 
@@ -272,6 +298,11 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "HybridSWACompressedForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "HybridSWACompressedForCausalLMNextN"
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -327,6 +358,11 @@ class ModelConfig:
             self.hf_text_config,
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
+        )
+        self.v_head_dim = getattr(
+            self.hf_text_config,
+            "v_head_dim",
+            self.head_dim,
         )
 
         # FIXME: temporary special judge for MLA architecture
@@ -1083,6 +1119,11 @@ def is_hybrid_model(
     context_length: Optional[int],
     attention_chunk_size: Optional[int],
 ):
+    if model_architectures[0] in [
+        "HybridSWACompressedForCausalLM",
+        "HybridSWACompressedForCausalLMNextN",
+    ]:
+        return 1
     if hybrid_kvcache_ratio is None:
         return None
     elif (
@@ -1095,7 +1136,11 @@ def is_hybrid_model(
         return None
 
 
-def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int):
+def get_hybrid_layer_ids(
+    model_architectures: List[str],
+    num_hidden_layers: int,
+    hybrid_layer_pattern: Optional[List[int]] = None,
+):
     if "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
@@ -1103,6 +1148,15 @@ def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int)
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
+    elif "HybridSWACompressedForCausalLM" in model_architectures:
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
+        ]
+    elif "HybridSWACompressedForCausalLMNextN" in model_architectures:
+        return [0], []
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

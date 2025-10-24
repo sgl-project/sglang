@@ -109,6 +109,7 @@ suites = {
         TestFile("test_start_profile.py", 41),
         TestFile("test_profile_merger.py", 8),
         TestFile("test_profile_merger_http_api.py", 9),
+        TestFile("test_swa_offload_unit.py", 10),
         TestFile("test_swa_unittest.py", 8),
         TestFile("test_torch_compile.py", 190),
         TestFile("test_torch_compile_moe.py", 210),

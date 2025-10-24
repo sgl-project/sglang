@@ -531,6 +531,10 @@ class MHATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        v_head_dim: Optional[int] = None,
+        swa_head_num: Optional[int] = None,
+        swa_head_dim: Optional[int] = None,
+        swa_v_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
@@ -546,8 +550,13 @@ class MHATokenToKVPool(KVCache):
             start_layer,
             end_layer,
         )
-        self.head_num = head_num
-        self.head_dim = head_dim
+        self.head_num = swa_head_num if swa_head_num is not None else head_num
+        self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
+        self.v_head_dim = (
+            swa_v_head_dim
+            if swa_v_head_dim is not None
+            else v_head_dim if v_head_dim is not None else head_dim
+        )
 
         self._create_buffers()
 
@@ -625,7 +634,7 @@ class MHATokenToKVPool(KVCache):
                 ]
                 self.v_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        (self.size + self.page_size, self.head_num, self.v_head_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -1199,6 +1208,9 @@ class SWAKVPool(KVCache):
             layer_num=self.swa_layer_nums,
             **kwargs,
         )
+        kwargs.pop("swa_head_num", None)
+        kwargs.pop("swa_head_dim", None)
+        kwargs.pop("swa_v_head_dim", None)
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
             dtype=dtype,
@@ -1216,7 +1228,7 @@ class SWAKVPool(KVCache):
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
         logger.info(
-            f"SWAKVPool mem usage: {self.mem_usage} GB, swa size: {self.size_swa}, full size: {self.size}"
+            f"SWAKVPool mem usage: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
         )
 
     def get_kv_size_bytes(self):

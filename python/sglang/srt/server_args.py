@@ -253,6 +253,7 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
+    moe_router_dtype: str = "float32"
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -2307,6 +2308,13 @@ class ServerArgs:
             "--trust-remote-code",
             action="store_true",
             help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+        )
+        parser.add_argument(
+            "--moe-router-dtype",
+            type=str,
+            default=ServerArgs.moe_router_dtype,
+            choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
+            help="Data type for moe router. 'auto' will use model data type.",
         )
         parser.add_argument(
             "--context-length",
