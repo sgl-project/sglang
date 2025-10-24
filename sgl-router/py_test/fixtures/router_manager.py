@@ -101,6 +101,10 @@ class RouterManager:
                 "queue_size": "--queue-size",
                 "queue_timeout_secs": "--queue-timeout-secs",
                 "rate_limit_tokens_per_second": "--rate-limit-tokens-per-second",
+                # mTLS configuration
+                "client_cert_path": "--client-cert-path",
+                "client_key_path": "--client-key-path",
+                "ca_cert_paths": "--ca-cert-paths",
             }
             for k, v in extra.items():
                 if v is None:
@@ -111,6 +115,11 @@ class RouterManager:
                 if isinstance(v, bool):
                     if v:
                         cmd.append(flag)
+                elif isinstance(v, list):
+                    # Handle list arguments (e.g., ca_cert_paths)
+                    if v:  # Only add if list is not empty
+                        cmd.append(flag)
+                        cmd.extend([str(item) for item in v])
                 else:
                     cmd.extend([flag, str(v)])
 
