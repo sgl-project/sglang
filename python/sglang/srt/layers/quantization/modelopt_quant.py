@@ -18,6 +18,8 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -25,6 +27,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
@@ -466,8 +469,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             # Fp8 moe kernel needs single weight scale for w13 per expert.
             # We take the max of the w1 and w3 scales then dequant and requant each expert.
             if layer.w13_weight_scale.dim() == 2:  # Shape: (num_experts, 2)
-                from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-
                 # Get the maximum scale across w1 and w3 for each expert
                 max_w13_scales = layer.w13_weight_scale.max(dim=1).values
 
@@ -558,32 +559,40 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
 
         # Precompute and register per-expert output scaling factors for FI MoE
-        # Note: w13_input_scale and w2_input_scale are scalar Parameters post-reduction
-        assert hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
-        assert hasattr(layer, "w2_input_scale") and layer.w2_input_scale is not None
-        assert hasattr(layer, "w13_weight_scale") and layer.w13_weight_scale is not None
-        assert hasattr(layer, "w2_weight_scale") and layer.w2_weight_scale is not None
+        if should_use_flashinfer_trtllm_moe():
+            # Note: w13_input_scale and w2_input_scale are scalar Parameters post-reduction
+            assert (
+                hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
+            )
+            assert hasattr(layer, "w2_input_scale") and layer.w2_input_scale is not None
+            assert (
+                hasattr(layer, "w13_weight_scale")
+                and layer.w13_weight_scale is not None
+            )
+            assert (
+                hasattr(layer, "w2_weight_scale") and layer.w2_weight_scale is not None
+            )
 
-        input_scale = layer.w13_input_scale.to(torch.float32)
-        activation_scale = layer.w2_input_scale.to(torch.float32)
-        w13_weight_scale = layer.w13_weight_scale.to(torch.float32)
-        w2_weight_scale = layer.w2_weight_scale.to(torch.float32)
+            input_scale = layer.w13_input_scale.to(torch.float32)
+            activation_scale = layer.w2_input_scale.to(torch.float32)
+            w13_weight_scale = layer.w13_weight_scale.to(torch.float32)
+            w2_weight_scale = layer.w2_weight_scale.to(torch.float32)
 
-        output1_scales_scalar = (
-            w13_weight_scale * input_scale * (1.0 / activation_scale)
-        )
-        output1_scales_gate_scalar = w13_weight_scale * input_scale
-        output2_scales_scalar = activation_scale * w2_weight_scale
+            output1_scales_scalar = (
+                w13_weight_scale * input_scale * (1.0 / activation_scale)
+            )
+            output1_scales_gate_scalar = w13_weight_scale * input_scale
+            output2_scales_scalar = activation_scale * w2_weight_scale
 
-        layer.output1_scales_scalar = Parameter(
-            output1_scales_scalar, requires_grad=False
-        )
-        layer.output1_scales_gate_scalar = Parameter(
-            output1_scales_gate_scalar, requires_grad=False
-        )
-        layer.output2_scales_scalar = Parameter(
-            output2_scales_scalar, requires_grad=False
-        )
+            layer.output1_scales_scalar = Parameter(
+                output1_scales_scalar, requires_grad=False
+            )
+            layer.output1_scales_gate_scalar = Parameter(
+                output1_scales_gate_scalar, requires_grad=False
+            )
+            layer.output2_scales_scalar = Parameter(
+                output2_scales_scalar, requires_grad=False
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -596,9 +605,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        from sglang.srt.layers.moe.topk import TopKOutputChecker
-
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
@@ -621,10 +627,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 if topk_config.correction_bias is None
                 else topk_config.correction_bias
             )
-
             # Pre-quantize activations to FP8 per-tensor using provided input scale
-            from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-
             x_fp8, _ = scaled_fp8_quant(x, layer.w13_input_scale)
 
             # Use precomputed per-expert output scales
@@ -1541,8 +1544,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         forward_shared_experts=None,
         alt_stream=None,
     ) -> CombineInput:
-
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
