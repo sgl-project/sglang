@@ -799,13 +799,59 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
-    let client = Client::builder()
+    // FIXME: Current implementation creates a single HTTP client for all workers.
+    // This works well for single security domain deployments where all workers share
+    // the same CA and can accept the same client certificate.
+    //
+    // For multi-domain deployments (e.g., different model families with different CAs),
+    // this architecture needs significant refactoring:
+    // 1. Move client creation into worker registration workflow (per-worker clients)
+    // 2. Store client per worker in WorkerRegistry
+    // 3. Update PDRouter and other routers to fetch client from worker
+    // 4. Add per-worker TLS spec in WorkerConfigRequest
+    //
+    // Current single-domain approach is sufficient for most deployments.
+    //
+    // Use rustls TLS backend when TLS/mTLS is configured (client cert or CA certs provided).
+    // This ensures proper PKCS#8 key format support. For plain HTTP workers, use default
+    // backend to avoid unnecessary TLS initialization overhead.
+    let has_tls_config = config.router_config.client_identity.is_some()
+        || !config.router_config.ca_certificates.is_empty();
+
+    let mut client_builder = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(50)))
         .pool_max_idle_per_host(500)
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .tcp_nodelay(true)
-        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .tcp_keepalive(Some(Duration::from_secs(30)));
+
+    // Force rustls backend when TLS is configured
+    if has_tls_config {
+        client_builder = client_builder.use_rustls_tls();
+        info!("Using rustls TLS backend for TLS/mTLS connections");
+    }
+
+    // Configure mTLS client identity if provided (certificates already loaded during config creation)
+    if let Some(identity_pem) = &config.router_config.client_identity {
+        let identity = reqwest::Identity::from_pem(identity_pem)?;
+        client_builder = client_builder.identity(identity);
+        info!("mTLS client authentication enabled");
+    }
+
+    // Add CA certificates for verifying worker TLS (certificates already loaded during config creation)
+    for ca_cert in &config.router_config.ca_certificates {
+        let cert = reqwest::Certificate::from_pem(ca_cert)?;
+        client_builder = client_builder.add_root_certificate(cert);
+    }
+    if !config.router_config.ca_certificates.is_empty() {
+        info!(
+            "Added {} CA certificate(s) for worker verification",
+            config.router_config.ca_certificates.len()
+        );
+    }
+
+    let client = client_builder
         .build()
         .expect("Failed to create HTTP client");
 
