@@ -362,8 +362,10 @@ def _get_precomputed_embedding(
             if seq_start_idx > mm_start_idx:
                 prefix_embedding_length.append(min(seq_start_idx - mm_start_idx, mm_end_idx - mm_start_idx + 1))
             if mm_end_idx >= seq_start_idx:
-                extend_embedding_length.append(min(mm_end_idx - seq_start_idx + 1, seq_end_idx - mm_start_idx + 1, mm_end_idx - mm_start_idx + 1))
-        
+                extend_embedding_length.append(min(mm_end_idx - seq_start_idx + 1, 
+                                                   seq_end_idx - mm_start_idx + 1, 
+                                                   mm_end_idx - mm_start_idx + 1,
+                                                   seq_end_idx - seq_start_idx + 1))
         prefix_embedding_length = int(np.sum(prefix_embedding_length))
         extend_embedding_length = int(np.sum(extend_embedding_length))
         precomputed_embeddings.append(
