@@ -197,10 +197,6 @@ def get_config(
         config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-        if "deepseek-ai/DeepSeek-OCR" in model:
-            config.model_type = "deepseek-ocr"
-            # Due to an unknown reason, Hugging Face’s AutoConfig mistakenly recognizes the configuration of deepseek-ocr as deepseekvl2.
-            # This is a temporary workaround and will require further optimization.
 
     except ValueError as e:
         if not "deepseek_v32" in str(e):
@@ -237,7 +233,15 @@ def get_config(
                 setattr(config, key, val)
 
     if config.model_type in _CONFIG_REGISTRY:
-        config_class = _CONFIG_REGISTRY[config.model_type]
+        model_type = config.model_type
+        if model_type == "deepseek_vl_v2":
+            if (
+                getattr(config, "auto_map", None) is not None
+                and config.auto_map.get("AutoModel")
+                == "modeling_deepseekocr.DeepseekOCRForCausalLM"
+            ):
+                model_type = "deepseek-ocr"
+        config_class = _CONFIG_REGISTRY[model_type]
         config = config_class.from_pretrained(model, revision=revision)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
