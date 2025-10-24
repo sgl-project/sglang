@@ -95,7 +95,7 @@ from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -1067,32 +1067,6 @@ def monkey_patch_p2p_access_check():
     )
 
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
-
-
-def monkey_patch_vllm_gguf_config():
-    try:
-        from vllm.model_executor.layers.quantization.gguf import (
-            GGUFConfig,
-            GGUFEmbeddingMethod,
-            GGUFLinearMethod,
-        )
-    except ImportError:
-        return
-
-    from sglang.srt.layers.linear import LinearBase
-    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-
-    def get_quant_method_with_embedding_replaced(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[QuantizeMethodBase]:
-        if isinstance(layer, LinearBase):
-            return GGUFLinearMethod(self)
-        elif isinstance(layer, VocabParallelEmbedding):
-            # patch to own VocabParallelEmbedding
-            return GGUFEmbeddingMethod(self)
-        return None
-
-    setattr(GGUFConfig, "get_quant_method", get_quant_method_with_embedding_replaced)
 
 
 def set_ulimit(target_soft_limit=65535):
@@ -2125,7 +2099,78 @@ class MultiprocessingSerializer:
             # Decode base64 string to bytes
             data = pybase64.b64decode(data, validate=True)
 
-        return ForkingPickler.loads(data)
+        class SafeUnpickler(pickle.Unpickler):
+            ALLOWED_MODULE_PREFIXES = {
+                # --- Python types ---
+                "builtins.",
+                "collections.",
+                "copyreg.",
+                "functools.",
+                "itertools.",
+                "operator.",
+                "types.",
+                "weakref.",
+                # --- PyTorch types ---
+                "torch.",
+                "torch._tensor.",
+                "torch.storage.",
+                "torch.nn.parameter.",
+                "torch.autograd.function.",
+                # --- torch distributed ---
+                "torch.distributed.",
+                "torch.distributed._shard.",
+                "torch.distributed._composable.",
+                "torch._C._distributed_c10d.",
+                "torch._C._distributed_fsdp.",
+                "torch.distributed.optim.",
+                # --- multiprocessing ---
+                "multiprocessing.resource_sharer.",
+                "multiprocessing.reduction.",
+                "pickletools.",
+                # --- PEFT / LoRA ---
+                "peft.",
+                "transformers.",
+                "huggingface_hub.",
+                # --- SGLang & Unitest ---
+                "sglang.srt.weight_sync.tensor_bucket.",
+                "sglang.srt.model_executor.model_runner.",
+                "sglang.srt.layers.",
+                "sglang.srt.utils.",
+            }
+
+            DENY_CLASSES = {
+                ("builtins", "eval"),
+                ("builtins", "exec"),
+                ("builtins", "compile"),
+                ("os", "system"),
+                ("subprocess", "Popen"),
+                ("subprocess", "run"),
+                ("codecs", "decode"),
+                ("types", "CodeType"),
+                ("types", "FunctionType"),
+            }
+
+            def find_class(self, module, name):
+                # Block deterministic attacks
+                if (module, name) in self.DENY_CLASSES:
+                    raise RuntimeError(
+                        f"Blocked unsafe class loading ({module}.{name}), "
+                        f"to prevent exploitation of CVE-2025-10164"
+                    )
+                # Allowlist of safe-to-load modules.
+                if any(
+                    (module + ".").startswith(prefix)
+                    for prefix in self.ALLOWED_MODULE_PREFIXES
+                ):
+                    return super().find_class(module, name)
+
+                # Block everything else. (Potential attack surface)
+                raise RuntimeError(
+                    f"Blocked unsafe class loading ({module}.{name}), "
+                    f"to prevent exploitation of CVE-2025-10164"
+                )
+
+        return SafeUnpickler(io.BytesIO(data)).load()
 
 
 def debug_timing(func):
