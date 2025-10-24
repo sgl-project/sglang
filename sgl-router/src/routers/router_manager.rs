@@ -18,6 +18,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::{
+    app_context::AppContext,
     config::RoutingMode,
     core::{ConnectionMode, WorkerRegistry, WorkerType},
     protocols::{
@@ -30,7 +31,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::RouterTrait,
-    server::{AppContext, ServerConfig},
+    server::ServerConfig,
 };
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
