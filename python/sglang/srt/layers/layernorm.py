@@ -47,6 +47,7 @@ if _is_cuda or _is_xpu:
     if _is_flashinfer_available:
         try:
             from flashinfer.norm import layernorm
+
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
             _flashinfer_layernorm_available = False
@@ -279,7 +280,7 @@ class LayerNorm(CustomOp):
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
         self.elementwise_affine = elementwise_affine
-        
+
         if self.elementwise_affine:
             self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
             if bias:
@@ -296,12 +297,10 @@ class LayerNorm(CustomOp):
     ) -> torch.Tensor:
         if not self.elementwise_affine:
             return self.forward_native(x)
-        
+
         if _flashinfer_layernorm_available:
             beta = self.bias if self.bias is not None else torch.zeros_like(self.weight)
-            return layernorm(
-                x, self.weight, beta, self.variance_epsilon
-            )
+            return layernorm(x, self.weight, beta, self.variance_epsilon)
         else:
             return self.forward_native(x)
 
@@ -311,16 +310,16 @@ class LayerNorm(CustomOp):
     ) -> torch.Tensor:
         orig_dtype = x.dtype
         x = x.to(torch.float32)
-        
+
         mean = x.mean(dim=-1, keepdim=True)
         variance = (x - mean).pow(2).mean(dim=-1, keepdim=True)
         x = (x - mean) * torch.rsqrt(variance + self.variance_epsilon)
-        
+
         if self.elementwise_affine:
             x = x * self.weight.to(torch.float32)
             if self.bias is not None:
                 x = x + self.bias.to(torch.float32)
-        
+
         return x.to(orig_dtype)
 
     def forward_hip(
