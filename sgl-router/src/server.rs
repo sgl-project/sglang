@@ -20,7 +20,7 @@ use tokio::{net::TcpListener, signal, spawn};
 use tracing::{error, info, warn, Level};
 
 use crate::{
-    config::{HistoryBackend, RouterConfig, RoutingMode},
+    config::{RouterConfig, RoutingMode},
     core::{
         worker_to_info,
         workflow::{
@@ -31,10 +31,8 @@ use crate::{
         WorkerType,
     },
     data_connector::{
-        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-        NoOpConversationStorage, NoOpResponseStorage, OracleConversationItemStorage,
-        OracleConversationStorage, OracleResponseStorage, SharedConversationItemStorage,
-        SharedConversationStorage, SharedResponseStorage,
+        create_storage, SharedConversationItemStorage, SharedConversationStorage,
+        SharedResponseStorage,
     },
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
@@ -927,60 +925,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(config.router_config.policy.clone()));
 
-    // Initialize storage backends
-    let (response_storage, conversation_storage): (
-        SharedResponseStorage,
-        SharedConversationStorage,
-    ) = match config.router_config.history_backend {
-        HistoryBackend::Memory => {
-            info!("Initializing data connector: Memory");
-            (
-                Arc::new(MemoryResponseStorage::new()),
-                Arc::new(MemoryConversationStorage::new()),
-            )
-        }
-        HistoryBackend::None => {
-            info!("Initializing data connector: None (no persistence)");
-            (
-                Arc::new(NoOpResponseStorage::new()),
-                Arc::new(NoOpConversationStorage::new()),
-            )
-        }
-        HistoryBackend::Oracle => {
-            let oracle_cfg = config.router_config.oracle.clone().ok_or_else(|| {
-                "oracle configuration is required when history_backend=oracle".to_string()
-            })?;
-            info!(
-                "Initializing data connector: Oracle ATP (pool: {}-{})",
-                oracle_cfg.pool_min, oracle_cfg.pool_max
-            );
-
-            let response_storage = OracleResponseStorage::new(oracle_cfg.clone())
-                .map_err(|err| format!("failed to initialize Oracle response storage: {err}"))?;
-
-            let conversation_storage =
-                OracleConversationStorage::new(oracle_cfg.clone()).map_err(|err| {
-                    format!("failed to initialize Oracle conversation storage: {err}")
-                })?;
-            info!("Data connector initialized successfully: Oracle ATP");
-
-            (Arc::new(response_storage), Arc::new(conversation_storage))
-        }
-    };
-
-    // Initialize conversation items storage
-    let conversation_item_storage: SharedConversationItemStorage =
-        match config.router_config.history_backend {
-            HistoryBackend::Oracle => {
-                let oracle_cfg = config.router_config.oracle.clone().ok_or_else(|| {
-                    "oracle configuration is required when history_backend=oracle".to_string()
-                })?;
-                Arc::new(OracleConversationItemStorage::new(oracle_cfg).map_err(|e| {
-                    format!("failed to initialize Oracle conversation item storage: {e}")
-                })?)
-            }
-            _ => Arc::new(MemoryConversationItemStorage::new()),
-        };
+    // Initialize storage backends using factory
+    let (response_storage, conversation_storage, conversation_item_storage) =
+        create_storage(&config.router_config)?;
 
     // Initialize load monitor
     let load_monitor = Some(Arc::new(LoadMonitor::new(
