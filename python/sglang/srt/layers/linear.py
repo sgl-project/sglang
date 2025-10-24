@@ -800,9 +800,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         load_presharded_attn: bool = False,
+        v_head_size: Optional[int] = None,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
+        self.v_head_size = v_head_size if v_head_size is not None else head_size
         self.total_num_heads = total_num_heads
         if total_num_kv_heads is None:
             total_num_kv_heads = total_num_heads
@@ -821,15 +823,18 @@ class QKVParallelLinear(ColumnParallelLinear):
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
         self.q_proj_shard_size = self.num_heads * self.head_size
-        self.kv_proj_shard_size = self.num_kv_heads * self.head_size
+        self.k_proj_shard_size = self.num_kv_heads * self.head_size
+        self.v_proj_shard_size = self.num_kv_heads * self.v_head_size
         input_size = self.hidden_size
         output_size = (
-            (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_size
-        )
+            self.num_heads * self.head_size
+            + self.num_kv_heads * self.head_size
+            + self.num_kv_heads * self.v_head_size
+        ) * tp_size
         self.output_sizes = [
             self.num_heads * self.head_size * tp_size,  # q_proj
             self.num_kv_heads * self.head_size * tp_size,  # k_proj
-            self.num_kv_heads * self.head_size * tp_size,  # v_proj
+            self.num_kv_heads * self.v_head_size * tp_size,  # v_proj
         ]
         self.use_presharded_weights = load_presharded_attn
         quant_config = None if _disable_hip_linear_quant else quant_config
@@ -853,7 +858,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             "q": 0,
             "k": self.num_heads * self.head_size,
             "v": (self.num_heads + self.num_kv_heads) * self.head_size,
-            "total": (self.num_heads + 2 * self.num_kv_heads) * self.head_size,
+            "total": (self.num_heads + self.num_kv_heads) * self.head_size
+            + self.num_kv_heads * self.v_head_size,
         }
         return shard_offset_mapping.get(loaded_shard_id)
 
@@ -861,7 +867,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         shard_size_mapping = {
             "q": self.num_heads * self.head_size,
             "k": self.num_kv_heads * self.head_size,
-            "v": self.num_kv_heads * self.head_size,
+            "v": self.num_kv_heads * self.v_head_size,
         }
         return shard_size_mapping.get(loaded_shard_id)
 
@@ -888,7 +894,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             (
                 "v",
                 (self.total_num_heads + self.total_num_kv_heads) * self.head_size,
-                self.total_num_kv_heads * self.head_size,
+                self.total_num_kv_heads * self.v_head_size,
             ),
         ]
 
@@ -1039,7 +1045,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 (
                     "v",
                     (self.total_num_heads + self.total_num_kv_heads) * self.head_size,
-                    self.total_num_kv_heads * self.head_size,
+                    self.total_num_kv_heads * self.v_head_size,
                 ),
             ]
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
@@ -1073,11 +1079,12 @@ class QKVParallelLinear(ColumnParallelLinear):
                         "v": (
                             (self.total_num_heads + self.total_num_kv_heads)
                             * self.head_size,
-                            self.total_num_kv_heads * self.head_size,
+                            self.total_num_kv_heads * self.v_head_size,
                         ),
                         "total": (
-                            (self.total_num_heads + 2 * self.total_num_kv_heads)
-                            * self.head_size,
+                            (self.total_num_heads + self.total_num_kv_heads)
+                            * self.head_size
+                            + self.total_num_kv_heads * self.v_head_size,
                             0,
                         ),
                     }
@@ -1105,7 +1112,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_size = self.num_kv_heads * self.head_size
             elif loaded_shard_id == "v":
                 shard_offset = (self.num_heads + self.num_kv_heads) * self.head_size
-                shard_size = self.num_kv_heads * self.head_size
+                shard_size = self.num_kv_heads * self.v_head_size
             # Special case for Quantized Weights.
             # If quantized, we need to adjust the offset and size to account
             # for the packing.
@@ -1129,10 +1136,11 @@ class QKVParallelLinear(ColumnParallelLinear):
                     ),
                     "v": (
                         (self.num_heads + self.num_kv_heads) * self.head_size,
-                        self.num_kv_heads * self.head_size,
+                        self.num_kv_heads * self.v_head_size,
                     ),
                     "total": (
-                        (self.num_heads + 2 * self.num_kv_heads) * self.head_size,
+                        (self.num_heads + self.num_kv_heads) * self.head_size
+                        + self.num_kv_heads * self.v_head_size,
                         0,
                     ),
                 }

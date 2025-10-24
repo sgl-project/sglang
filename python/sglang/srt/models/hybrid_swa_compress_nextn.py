@@ -1,0 +1,347 @@
+import logging
+from typing import Iterable, Optional, Tuple
+
+import torch
+from torch import nn
+from transformers import PretrainedConfig
+
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.hybrid_swa_compress import (
+    HybridSWACompressedAttention,
+    HybridSWACompressedForCausalLM,
+    HybridSWACompressedMLP,
+)
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix
+
+HybridSWACompressedConfig = None
+
+logger = logging.getLogger(__name__)
+
+
+class HybridSWACompressedMTPLayer(nn.Module):
+    def __init__(
+        self,
+        config: HybridSWACompressedConfig,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+
+        rope_theta = getattr(config, "rope_theta", 1000000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+
+        self.layer_id = layer_id
+        self.self_attn = HybridSWACompressedAttention(
+            hidden_size=self.hidden_size,
+            num_heads=config.compression_softmax_num_q_heads,
+            num_kv_heads=config.compression_softmax_num_kv_heads,
+            head_dim=config.compression_softmax_qk_head_dim,
+            v_head_dim=getattr(config, "compression_softmax_v_head_dim", None),
+            v_scale=getattr(config, "attention_value_scale", None),
+            sliding_window_size=config.sliding_window_size,
+            attention_bias=config.attention_bias,
+            add_swa_attention_sink_bias=getattr(
+                config, "add_swa_attention_sink_bias", False
+            ),
+            layer_id=layer_id,
+            rope_theta=getattr(config, "swa_rope_theta", rope_theta),
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
+            quant_config=quant_config,
+            partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+            prefix=add_prefix("self_attn", prefix),
+        )
+        self.is_layer_sparse = False
+        # TODO: 这里只有第一层MTP是Ture，后续应该都是False
+        is_previous_layer_sparse = True
+        mlp_tp_rank, mlp_tp_size = None, None
+        self.mlp = HybridSWACompressedMLP(
+            hidden_size=self.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+            tp_rank=mlp_tp_rank,
+            tp_size=mlp_tp_size,
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.layernorm_epsilon
+        )
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=1,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+        )
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
+        return hidden_states, residual
+
+
+class HybridSWACompressedModelNextN(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            logger.warning(
+                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
+            )
+            quant_config = None
+
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            enable_tp=not is_dp_attention_enabled(),
+            prefix=add_prefix("embed_tokens", prefix),
+        )
+
+        self.enorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+        self.hnorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+
+        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+
+        self.mtp_block = HybridSWACompressedMTPLayer(
+            config,
+            0,
+            quant_config=quant_config,
+            prefix=add_prefix("decoder", prefix),
+        )
+        self.final_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+        hidden_states[positions == 0] = 0
+        if hidden_states.shape[0] > 0:
+            hidden_states = self.eh_proj(
+                torch.cat(
+                    (
+                        self.enorm(hidden_states),
+                        self.hnorm(forward_batch.spec_info.hidden_states),
+                    ),
+                    dim=-1,
+                )
+            )
+        hidden_states, residual = self.mtp_block(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            residual=None,
+        )
+        hidden_states = residual + hidden_states
+        hidden_states = self.final_layernorm(hidden_states)
+        return hidden_states
+
+
+class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.config = config
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.quant_config = quant_config
+        # self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
+
+        self.model = HybridSWACompressedModelNextN(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+        )
+        self.logits_processor = LogitsProcessor(config)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        hidden_states = self.model(input_ids, positions, forward_batch)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        expert_params_mapping = []
+
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name or "projector" in name:
+                continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
+            if name.startswith("model.vision_tower") and name not in params_dict:
+                continue
+            name = self.map_model_name_to_mtp_param_name(name)
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if (
+                    "compression_attention" in name
+                    or "hybrid_softmax_attention" in name
+                    or "compressed_softmax_attn" in name
+                ):
+                    continue
+                if weight_name not in name:
+                    continue
+                if "mtp_block" not in name:
+                    break
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if "mtp_block" not in name and (
+                    "embed_tokens" not in name
+                    and "lm_head" not in name
+                    and "enorm" not in name
+                    and "hnorm" not in name
+                    and "eh_proj" not in name
+                    and "final_layernorm" not in name
+                ):
+                    continue
+                if name in params_dict.keys():
+                    param = params_dict[name]
+                    if "attention_sink_bias" in name:
+                        start = get_attention_tp_rank() * param.numel()
+                        param.data.copy_(loaded_weight[start : start + param.numel()])
+                    else:
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                else:
+                    logger.warning(f"Parameter {name} not found in params_dict")
+
+    def map_model_name_to_mtp_param_name(self, name: str) -> str:
+        import re
+
+        name_without_prefix = [
+            "enorm",
+            "hnorm",
+            "eh_proj",
+            "final_layernorm",
+        ]
+        pattern = r"model.mtp.layers.(\d+)."
+        pattern_norm = r"pre_mlp_layernorm"
+        group_norm = re.search(pattern_norm, name)
+        if group_norm is not None:
+            name = name.replace(group_norm.group(), "post_attention_layernorm")
+        group = re.match(pattern, name)
+        if group is not None:
+            for sub_name in name_without_prefix:
+                if sub_name in name:
+                    name = name.replace(group.group(), "model.")
+                    return name
+            name = name.replace(group.group(), "model.mtp_block.")
+        return name
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+EntryClass = HybridSWACompressedForCausalLMNextN

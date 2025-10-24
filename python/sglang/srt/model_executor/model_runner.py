@@ -87,6 +87,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.mem_cache.allocator import (
@@ -282,10 +283,12 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = model_config.is_hybrid
+        self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
         self.init_new_workspace = False
+        self.kv_cache_memory = 0
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -424,6 +427,12 @@ class ModelRunner:
                 self.model_config.num_attention_layers,
             )
         )
+        # TODO 在config.json里加num_nextn_predict_layers字段，复用上面的逻辑
+        if (
+            self.model_config.hf_config.architectures[0]
+            == "HybridSWACompressedForCausalLMNextN"
+        ):
+            model_num_layers = 1
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
@@ -1309,9 +1318,8 @@ class ModelRunner:
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * self.model_config.head_dim
+                * (self.model_config.head_dim + self.model_config.v_head_dim)
                 * num_layers
-                * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         rest_memory = available_gpu_memory - total_gpu_memory * (
@@ -1319,7 +1327,9 @@ class ModelRunner:
         )
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
-        max_num_token = int(rest_memory * (1 << 30) // cell_size)
+        self.kv_cache_memory = int(rest_memory * (1 << 30))
+        max_num_token = int(self.kv_cache_memory // cell_size)
+        logger.info(f"The available memory for KV cache is {rest_memory:.2f} GB.")
         return max_num_token
 
     def handle_max_mamba_cache(self, total_rest_memory):
@@ -1425,6 +1435,11 @@ class ModelRunner:
                 * self.server_args.page_size
             )
             self.max_total_num_tokens = self.full_max_total_num_tokens
+        elif (
+            "HybridSWACompressedForCausalLMNextN"
+            in self.model_config.hf_config.architectures
+        ):
+            return
         else:
             assert self.sliding_window_size is not None and self.sliding_window_size > 0
             full_attention_layer_ids = []
@@ -1443,6 +1458,9 @@ class ModelRunner:
                         return
 
             for layer in layers:
+                if isinstance(layer, PPMissingLayer):
+                    continue
+
                 if (
                     layer.self_attn.attn.sliding_window_size is None
                     or layer.self_attn.attn.sliding_window_size == -1
@@ -1452,30 +1470,75 @@ class ModelRunner:
                     swa_attention_layer_ids.append(layer.layer_id)
             self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
             self.model_config.full_attention_layer_ids = full_attention_layer_ids
-
-            # Algorithm:
-            # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
-            # - Find total # of tokens available across layers.
-            # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
-            total_tokens = (
-                self.max_total_num_tokens * self.model_config.num_hidden_layers
-            )
             full_layers_num = len(full_attention_layer_ids)
             swa_layers_num = len(swa_attention_layer_ids)
-            swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
-            # Solve the equations:
-            # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
-            # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
-            denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
-            self.full_max_total_num_tokens = int(total_tokens / denominator)
-            self.swa_max_total_num_tokens = int(
-                self.full_max_total_num_tokens * swa_full_tokens_ratio
-            )
-            self.max_total_num_tokens = self.full_max_total_num_tokens
+            if self.model_config.hf_config.architectures[0] in [
+                "HybridSWACompressedForCausalLM",
+            ]:
+                # SWA KV cache size per pass
+                swa_cell_size = (
+                    self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    * (self.model_config.head_dim + self.model_config.v_head_dim)
+                    * swa_layers_num
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
+                # Full KV cache size per pass
+                full_cell_size = (
+                    self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    * (self.model_config.head_dim + self.model_config.v_head_dim)
+                    * full_layers_num
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
+                # swa_kv_cache_size / full_kv_cache_size ratio per request
+                swa_full_kv_cache_ratio = (
+                    self.model_config.attention_chunk_size
+                    * swa_cell_size
+                    / (self.model_config.context_len * full_cell_size)
+                )
+                # Total full KV cache tokens
+                self.full_max_total_num_tokens = int(
+                    self.kv_cache_memory
+                    / (1 + swa_full_kv_cache_ratio)
+                    / full_cell_size
+                )
+                # Total SWA KV cache tokens
+                self.swa_max_total_num_tokens = int(
+                    self.kv_cache_memory
+                    * swa_full_kv_cache_ratio
+                    / (1 + swa_full_kv_cache_ratio)
+                    / swa_cell_size
+                )
+                self.max_total_num_tokens = max(
+                    self.full_max_total_num_tokens, self.swa_max_total_num_tokens
+                )
+                logger.info(
+                    f"The swa / full KV cache size ratio is {swa_full_kv_cache_ratio:.2f}"
+                )
+            else:
+                # Algorithm:
+                # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
+                # - Find total # of tokens available across layers.
+                # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
+                total_tokens = (
+                    self.max_total_num_tokens * self.model_config.num_hidden_layers
+                )
+                full_layers_num = len(full_attention_layer_ids)
+                swa_layers_num = len(swa_attention_layer_ids)
+                swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
+
+                # Solve the equations:
+                # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
+                # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
+                denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+                self.full_max_total_num_tokens = int(total_tokens / denominator)
+                self.swa_max_total_num_tokens = int(
+                    self.full_max_total_num_tokens * swa_full_tokens_ratio
+                )
+                self.max_total_num_tokens = self.full_max_total_num_tokens
 
             logger.info(
-                f"Use Sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
+                f"Use sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
             )
 
     def can_run_piecewise_cuda_graph(self):
@@ -1572,29 +1635,6 @@ class ModelRunner:
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
 
-        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
-            if self.is_draft_worker:
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                max_num_reqs = self.server_args.max_num_reqs
-            else:
-                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
-                # can be concurrently allocated, so we should give a headroom for it.
-                self.server_args.draft_runner_cache_size = (
-                    self.max_total_num_tokens
-                    # draft
-                    + max_num_reqs
-                    * self.server_args.speculative_num_steps
-                    * self.server_args.speculative_eagle_topk
-                    # verify
-                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
-                    # buffer
-                    + 100
-                )
-                # Target worker and draft worker shares the same indices for the
-                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                self.server_args.max_num_reqs = max_num_reqs
-
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(
@@ -1622,6 +1662,59 @@ class ModelRunner:
         # create token size for hybrid cache
         if self.is_hybrid:
             self.set_num_token_hybrid()
+
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            if self.is_draft_worker:
+                # Use parameters passed from target worker
+                if (
+                    self.model_config.hf_config.architectures[0]
+                    == "HybridSWACompressedForCausalLMNextN"
+                ):
+                    # HybridSWACompressedForCausalLMNextN uses SWA, so set full KV cache to 0
+                    self.swa_max_total_num_tokens = (
+                        self.server_args.draft_runner_cache_size_swa
+                    )
+                    self.full_max_total_num_tokens = 0
+                    self.max_total_num_tokens = self.swa_max_total_num_tokens
+                else:
+                    self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+                max_num_reqs = self.server_args.max_num_reqs
+
+                logger.info(
+                    f"Draft worker, using draft runner cache size: {self.max_total_num_tokens}"
+                )
+            else:
+                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
+                # can be concurrently allocated, so we should give a headroom for it.
+                extra_tokens = (
+                    # draft
+                    max_num_reqs
+                    * self.server_args.speculative_num_steps
+                    * self.server_args.speculative_eagle_topk
+                    # verify
+                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
+                    # buffer
+                    + 100
+                )
+
+                # Target worker and draft worker shares the same indices for the
+                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
+                self.max_total_num_tokens += extra_tokens
+                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+                if (
+                    self.model_config.hf_config.architectures[0]
+                    == "HybridSWACompressedForCausalLM"
+                ):
+                    self.full_max_total_num_tokens += extra_tokens
+                    self.swa_max_total_num_tokens += extra_tokens
+                    self.server_args.draft_runner_cache_size_swa = (
+                        self.swa_max_total_num_tokens
+                    )
+                self.server_args.max_num_reqs = max_num_reqs
+
+                logger.info(
+                    f"Target worker, using draft runner cache size: {self.max_total_num_tokens}"
+                )
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
@@ -1764,6 +1857,19 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid:
+                if self.is_hybrid_swa_compress:
+                    kwargs = {
+                        "swa_head_num": max(
+                            1,
+                            self.model_config.hf_text_config.compression_softmax_num_kv_heads
+                            // get_attention_tp_size(),
+                        ),
+                        "swa_head_dim": self.model_config.hf_text_config.compression_softmax_qk_head_dim,
+                        "swa_v_head_dim": self.model_config.hf_text_config.compression_softmax_v_head_dim,
+                        "v_head_dim": self.model_config.hf_text_config.v_head_dim,
+                    }
+                else:
+                    kwargs = {}
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -1776,6 +1882,7 @@ class ModelRunner:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    **kwargs,
                 )
             elif config := self.mambaish_config:
                 extra_args = {}
@@ -1868,6 +1975,14 @@ class ModelRunner:
                     )
         else:
             assert self.is_draft_worker
+            if self.is_hybrid:
+                assert (
+                    self.token_to_kv_pool_allocator.__class__
+                    == SWATokenToKVPoolAllocator
+                )
+                self.token_to_kv_pool.full_to_swa_index_mapping = (
+                    self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+                )
 
         logger.info(
             f"Memory pool end. "
