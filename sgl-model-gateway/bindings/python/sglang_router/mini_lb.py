@@ -162,7 +162,7 @@ class MiniLoadBalancer:
             await asyncio.gather(*tasks)
 
     async def generate(
-        self, pd_request, prefill_server, decode_server, endpoint
+        self, modified_request, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
@@ -183,8 +183,8 @@ class MiniLoadBalancer:
                 headers = {"trace_context": trace_context}
 
             tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=pd_request),
-                session.post(f"{decode_server}/{endpoint}", json=pd_request),
+                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                session.post(f"{decode_server}/{endpoint}", json=modified_request),
             ]
 
             for bootstrap_room in bootstrap_room_list:
@@ -193,7 +193,7 @@ class MiniLoadBalancer:
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
-            if "return_logprob" in pd_request:
+            if "return_logprob" in modified_request:
 
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
@@ -222,7 +222,7 @@ class MiniLoadBalancer:
             )
 
     async def generate_stream(
-        self, pd_request, prefill_server, decode_server, endpoint="generate"
+        self, modified_request, prefill_server, decode_server, endpoint="generate"
     ):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
@@ -247,8 +247,8 @@ class MiniLoadBalancer:
                     headers = {"trace_context": trace_context}
 
                 tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=pd_request),
-                    session.post(f"{decode_server}/{endpoint}", json=pd_request),
+                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
                 ]
 
                 for bootstrap_room in bootstrap_room_list:
@@ -258,7 +258,7 @@ class MiniLoadBalancer:
                 # Wait for both responses to complete. Since this is streaming, they return immediately.
                 prefill_response, decode_response = await asyncio.gather(*tasks)
 
-                if pd_request.get("return_logprob", False):
+                if modified_request.get("return_logprob", False):
                     prefill_chunks = []
                     async for chunk in prefill_response.content:
                         prefill_chunks.append(chunk)
@@ -473,8 +473,8 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-    pd_request = encode_request.copy()
-    pd_request.update(
+    modified_request = encode_request.copy()
+    modified_request.update(
         {
             "bootstrap_host": hostname,
             "bootstrap_port": bootstrap_port,
@@ -483,14 +483,14 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
-            pd_request,
+            modified_request,
             prefill_server,
             decode_server,
             endpoint=endpoint_name,
         )
     else:
         return await lb.generate(
-            pd_request,
+            modified_request,
             prefill_server,
             decode_server,
             endpoint=endpoint_name,

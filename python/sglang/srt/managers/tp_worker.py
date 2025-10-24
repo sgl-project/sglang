@@ -237,7 +237,6 @@ class TpModelWorker(BaseTpWorker):
                 else server_args.speculative_draft_model_revision
             ),
             is_draft_model=is_draft_worker,
-            
         )
 
         if server_args.dllm_algorithm is not None:
