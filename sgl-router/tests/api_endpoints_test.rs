@@ -248,7 +248,6 @@ mod health_tests {
         let resp = app.oneshot(req).await.unwrap();
         // With no workers, readiness should return SERVICE_UNAVAILABLE
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-
         ctx.shutdown().await;
     }
 
