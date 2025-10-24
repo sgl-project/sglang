@@ -65,6 +65,19 @@ docker run --rm \
    ${DOCKER_IMAGE} \
    bash -c "
    set -e
+
+   # Setup trap to fix ownership on exit (success or failure)
+   cleanup() {
+      echo \"\"
+      echo \"==================================\"
+      echo \"Setting file ownership\"
+      echo \"==================================\"
+      echo \"Changing ownership to \${HOST_UID}:\${HOST_GID}\"
+      chown -R \"\${HOST_UID}:\${HOST_GID}\" /sgl-kernel/dist /sgl-kernel/build /cmake-downloads /ccache 2>/dev/null || true
+      echo \"Ownership updated successfully\"
+   }
+   trap cleanup EXIT
+
    # Install CMake (version >= 3.26) - Robust Installation with caching
    echo \"==================================\"
    echo \"Installing CMake\"
@@ -234,14 +247,5 @@ docker run --rm \
    echo \"ccache Statistics\"
    echo \"==================================\"
    ccache -s
-   echo \"\"
-
-   # Fix ownership of generated files to match host user
-   echo \"==================================\"
-   echo \"Setting file ownership\"
-   echo \"==================================\"
-   echo \"Changing ownership to \${HOST_UID}:\${HOST_GID}\"
-   chown -R \"\${HOST_UID}:\${HOST_GID}\" /sgl-kernel/dist /sgl-kernel/build /cmake-downloads /ccache
-   echo \"Ownership updated successfully\"
    echo \"\"
    "
