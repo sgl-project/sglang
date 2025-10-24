@@ -29,6 +29,7 @@ dependencies = [
   "decord",
   "einops",
   "fastapi",
+  "gguf",
   "hf_transfer",
   "huggingface_hub",
   "interegular",

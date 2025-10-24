@@ -469,6 +469,29 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate mTLS certificate configuration
+    fn validate_mtls(config: &RouterConfig) -> ConfigResult<()> {
+        // Validate that if we have client_identity, it's not empty
+        if let Some(identity) = &config.client_identity {
+            if identity.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "Client identity cannot be empty".to_string(),
+                });
+            }
+        }
+
+        // Validate CA certificates are not empty
+        for (idx, ca_cert) in config.ca_certificates.iter().enumerate() {
+            if ca_cert.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!("CA certificate at index {} cannot be empty", idx),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         // IGW mode is independent - skip other compatibility checks when enabled
@@ -485,6 +508,9 @@ impl ConfigValidator {
                 reason: "gRPC connection mode requires either --tokenizer-path or --model-path to be specified".to_string(),
             });
         }
+
+        // Validate mTLS configuration
+        Self::validate_mtls(config)?;
 
         // All policies are now supported for both router types thanks to the unified trait design
         // No mode/policy restrictions needed anymore
