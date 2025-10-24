@@ -377,10 +377,11 @@ python -m sglang.launch_server --model novita/Deepseek-V3-0324-W4AFP8 --mem-frac
 
 Other variants of pre-quantized DeepSeek models are also available:
 
-
 - [novita/Deepseek-V3.1-W4AFP8](https://huggingface.co/novita/Deepseek-V3.1-W4AFP8)
 - [novita/Deepseek-R1-0528-W4AFP8](https://huggingface.co/novita/Deepseek-R1-0528-W4AFP8)
 - [novita/Deepseek-R1-W4AFP8](https://huggingface.co/novita/Deepseek-R1-W4AFP8)
+- [novita/Deepseek-V3-0324-W4AFP8](https://huggingface.co/novita/Deepseek-V3-0324-W4AFP8)
+
 
 ## DeepSeek V3 Optimization Plan
 
