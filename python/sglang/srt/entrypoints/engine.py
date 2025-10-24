@@ -59,6 +59,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
@@ -75,6 +76,7 @@ from sglang.srt.utils import (
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
+    maybe_reindex_device_id,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
@@ -648,6 +650,21 @@ class Engine(EngineBase):
             request=None,
         )
 
+    def update_weights_from_ipc(
+        self,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+    ):
+        """Update weights from IPC for checkpoint-engine integration."""
+        obj = UpdateWeightsFromIPCReqInput(
+            zmq_handles=zmq_handles,
+            flush_cache=flush_cache,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_ipc(obj, None)
+        )
+
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
@@ -684,7 +701,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.4.0",
+            "0.4.1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -692,7 +709,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.15",
+            "0.3.16.post3",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -782,22 +799,24 @@ def _launch_subprocesses(
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-                proc = mp.Process(
-                    target=run_scheduler_process,
-                    args=(
-                        server_args,
-                        port_args,
-                        gpu_id,
-                        tp_rank,
-                        moe_ep_rank,
-                        pp_rank,
-                        None,
-                        writer,
-                    ),
-                )
 
-                with memory_saver_adapter.configure_subprocess():
-                    proc.start()
+                with maybe_reindex_device_id(gpu_id) as gpu_id:
+                    proc = mp.Process(
+                        target=run_scheduler_process,
+                        args=(
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                        ),
+                    )
+                    with memory_saver_adapter.configure_subprocess():
+                        proc.start()
+
                 scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
     else:
