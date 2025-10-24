@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import einops
 import torch
@@ -27,6 +27,10 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 
 logger = logging.getLogger(__name__)
 
