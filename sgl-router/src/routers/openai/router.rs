@@ -744,25 +744,37 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 Ok(chain) => {
                     let mut items = Vec::new();
                     for stored in chain.responses.iter() {
-                        // Convert input to conversation item
-                        items.push(ResponseInputOutputItem::Message {
-                            id: format!("msg_u_{}", stored.id.0.trim_start_matches("resp_")),
-                            role: "user".to_string(),
-                            content: vec![ResponseContentPart::InputText {
-                                text: stored.input.clone(),
-                            }],
-                            status: Some("completed".to_string()),
-                        });
+                        // Convert input items from stored input (which is now a JSON array)
+                        if let Some(input_arr) = stored.input.as_array() {
+                            for item in input_arr {
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.clone(),
+                                ) {
+                                    Ok(input_item) => {
+                                        items.push(input_item);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to deserialize stored input item: {}. Item: {}",
+                                            e, item
+                                        );
+                                    }
+                                }
+                            }
+                        }
 
-                        // Convert output to conversation items directly from stored response
-                        if let Some(output_arr) =
-                            stored.raw_response.get("output").and_then(|v| v.as_array())
-                        {
+                        // Convert output items from stored output (which is now a JSON array)
+                        if let Some(output_arr) = stored.output.as_array() {
                             for item in output_arr {
-                                if let Ok(output_item) =
-                                    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
-                                {
-                                    items.push(output_item);
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.clone(),
+                                ) {
+                                    Ok(output_item) => {
+                                        items.push(output_item);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to deserialize stored output item: {}. Item: {}", e, item);
+                                    }
                                 }
                             }
                         }
@@ -838,7 +850,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             });
                         }
                         ResponseInput::Items(current_items) => {
-                            items.extend_from_slice(current_items);
+                            // Process all item types, converting SimpleInputMessage to Message
+                            for item in current_items.iter() {
+                                let normalized =
+                                    crate::protocols::responses::normalize_input_item(item);
+                                items.push(normalized);
+                            }
                         }
                     }
 
@@ -868,7 +885,11 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     });
                 }
                 ResponseInput::Items(current_items) => {
-                    items.extend_from_slice(current_items);
+                    // Process all item types, converting SimpleInputMessage to Message
+                    for item in current_items.iter() {
+                        let normalized = crate::protocols::responses::normalize_input_item(item);
+                        items.push(normalized);
+                    }
                 }
             }
 
@@ -1021,6 +1042,78 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             "Cancel response not implemented for OpenAI router",
         )
             .into_response()
+    }
+
+    async fn list_response_input_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        response_id: &str,
+    ) -> Response {
+        let resp_id = ResponseId::from(response_id);
+
+        match self.response_storage.get_response(&resp_id).await {
+            Ok(Some(stored)) => {
+                // Extract items from input field (which is a JSON array)
+                let items = match &stored.input {
+                    Value::Array(arr) => arr.clone(),
+                    _ => vec![],
+                };
+
+                // Generate IDs for items if they don't have them
+                let items_with_ids: Vec<Value> = items
+                    .into_iter()
+                    .map(|mut item| {
+                        if item.get("id").is_none() {
+                            // Generate ID if not present using centralized utility
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert(
+                                    "id".to_string(),
+                                    json!(super::utils::generate_id("msg")),
+                                );
+                            }
+                        }
+                        item
+                    })
+                    .collect();
+
+                let response_body = json!({
+                    "object": "list",
+                    "data": items_with_ids,
+                    "first_id": items_with_ids.first().and_then(|v| v.get("id").and_then(|i| i.as_str())),
+                    "last_id": items_with_ids.last().and_then(|v| v.get("id").and_then(|i| i.as_str())),
+                    "has_more": false
+                });
+
+                (StatusCode::OK, Json(response_body)).into_response()
+            }
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "message": format!("No response found with id '{}'", response_id),
+                        "type": "invalid_request_error",
+                        "param": Value::Null,
+                        "code": "not_found"
+                    }
+                })),
+            )
+                .into_response(),
+            Err(e) => {
+                warn!("Failed to retrieve input items for {}: {}", response_id, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": {
+                            "message": format!("Failed to retrieve input items: {}", e),
+                            "type": "internal_error",
+                            "param": Value::Null,
+                            "code": "storage_error"
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+        }
     }
 
     async fn route_embeddings(

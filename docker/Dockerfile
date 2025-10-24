@@ -39,7 +39,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     software-properties-common netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
     build-essential cmake \
-    libopenmpi-dev libnuma1 libnuma-dev \
+    libopenmpi-dev libnuma1 libnuma-dev numactl \
     libibverbs-dev libibverbs1 libibumad3 \
     librdmacm1 libnl-3-200 libnl-route-3-200 libnl-route-3-dev libnl-3-dev \
     ibverbs-providers infiniband-diags perftest \

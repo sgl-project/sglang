@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class SchedulerProfilerMixin:
     def init_profiler(self):
         self.torch_profiler = None
-        self.torch_profiler_output_dir: Optional[str] = None
+        self.torch_profiler_output_dir: Optional[Path] = None
         self.profiler_activities: Optional[List[str]] = None
         self.profile_id: Optional[str] = None
         self.profiler_start_forward_ct: Optional[int] = None
@@ -69,7 +69,7 @@ class SchedulerProfilerMixin:
         if activities is None:
             activities = ["CPU", "GPU"]
 
-        self.torch_profiler_output_dir = output_dir
+        self.torch_profiler_output_dir = Path(output_dir).expanduser()
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
@@ -213,8 +213,7 @@ class SchedulerProfilerMixin:
                 message="Profiling is not in progress. Call /start_profile first.",
             )
 
-        if not Path(self.torch_profiler_output_dir).exists():
-            Path(self.torch_profiler_output_dir).mkdir(parents=True, exist_ok=True)
+        self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
 
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
