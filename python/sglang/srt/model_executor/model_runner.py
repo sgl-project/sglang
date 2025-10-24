@@ -140,7 +140,6 @@ from sglang.srt.utils import (
     is_sm100_supported,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
-    monkey_patch_vllm_gguf_config,
     set_cuda_arch,
     slow_rank_detector,
     xpu_has_xmx_support,
@@ -858,8 +857,6 @@ class ModelRunner:
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
             )
-        if self.server_args.load_format == "gguf":
-            monkey_patch_vllm_gguf_config()
 
         if self.server_args.load_format == LoadFormat.REMOTE_INSTANCE:
             if self.tp_rank == 0:
