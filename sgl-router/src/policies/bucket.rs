@@ -315,7 +315,7 @@ impl Bucket {
 
         self.request_list.push_back(SequencerRequest {
             id,
-            char_cnt: char_cnt,
+            char_cnt,
             timestamp: now,
             prefill_worker_url: prefill_url,
         });
@@ -730,7 +730,7 @@ mod tests {
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(24))).unwrap();
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(26))).unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         {
             let bucket_guard = policy.bucket.read().unwrap();
             assert_eq!(bucket_guard.boundary[0].range[1], 20);
