@@ -35,7 +35,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     software-properties-common netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
     build-essential cmake \
-    libopenmpi-dev libnuma1 libnuma-dev \
+    libopenmpi-dev libnuma1 libnuma-dev numactl \
     libibverbs-dev libibverbs1 libibumad3 \
     librdmacm1 libnl-3-200 libnl-route-3-200 libnl-route-3-dev libnl-3-dev \
     ibverbs-providers infiniband-diags perftest \
@@ -141,16 +141,14 @@ RUN cd /sgl-workspace/DeepEP && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
 
 # Install flashmla
-RUN if [ "$TARGETARCH" = "amd64" ]; then \
-      git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
+RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
       cd flash-mla && \
       git checkout ${FLASHMLA_COMMIT} && \
       git submodule update --init --recursive && \
       if [ "$CUDA_VERSION" = "12.6.1" ]; then \
         export FLASH_MLA_DISABLE_SM100=1; \
       fi && \
-      pip install -v . ; \
-    fi
+      pip install -v . ;
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
