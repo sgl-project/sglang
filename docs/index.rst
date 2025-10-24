@@ -98,3 +98,9 @@ Its core features include:
    references/custom_chat_template.md
    references/frontend/frontend_index.rst
    references/learn_more.md
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Security Acknowledgement
+
+   security/acknowledgements.md

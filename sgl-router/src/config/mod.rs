@@ -1,6 +1,8 @@
+pub mod builder;
 pub mod types;
 pub mod validation;
 
+pub use builder::*;
 pub use types::*;
 pub use validation::*;
 
