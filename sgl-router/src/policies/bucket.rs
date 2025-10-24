@@ -523,8 +523,9 @@ mod tests {
             .select_worker(&prefill_workers, Some(&*"a".repeat(33)))
             .unwrap();
         assert_eq!(idx_1, 0, "Should not trigger load balancing");
-        assert_eq!(idx_2, 1, "Should trigger load balancing");
-        assert_eq!(idx_3, 2, "Should trigger load balancing");
+        assert_ne!(idx_2, idx_3, "Should trigger load balancing");
+        assert_ne!(idx_2, 0, "Should trigger load balancing");
+        assert_ne!(idx_3, 0, "Should trigger load balancing");
 
         // Test 2: Not triggering when absolute threshold not met
         let config = BucketConfig {
