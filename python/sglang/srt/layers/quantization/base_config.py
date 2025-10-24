@@ -178,6 +178,9 @@ class QuantizationConfig(ABC):
                 return "modelopt_fp8"
             elif "NVFP4" in quant_algo or "FP4" in quant_algo:
                 return "modelopt_fp4"
+        
+        if hf_quant_config.get("quant_method", "") == "modelopt_fp8":
+            return "modelopt_fp8"
 
         return None
 
