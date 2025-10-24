@@ -199,7 +199,7 @@ inline int getMultiProcessorCount() {
   return multi_processor_count;  // Return the cached value on subsequent calls
 }
 
-void scaled_fp4_quant_sm100_sm120(
+void scaled_fp4_quant_sm100a_sm120a(
     torch::Tensor const& output,
     torch::Tensor const& input,
     torch::Tensor const& output_sf,
