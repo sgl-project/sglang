@@ -45,13 +45,20 @@ logger = logging.getLogger(__name__)
 
 
 def _get_plan_stream(
-    device: str,
+    device: str, phase: str
 ) -> Tuple[Optional[CudaStream], contextlib.AbstractContextManager]:
-    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+    if (
+        phase == "verify"
+        and envs.SGLANG_ENABLE_VERIFY_PLAN_STREAM.get()
+        or phase == "draft_extend"
+        and envs.SGLANG_ENABLE_DRAFT_EXTEND_PLAN_STREAM.get()
+    ):
+        logger.info(f"[Overlap Spec]: Enable {str.upper(phase)} plan stream.")
         plan_stream: CudaStream = torch.get_device_module(device).Stream()
         plan_stream_ctx = torch.cuda.stream(plan_stream)
         return plan_stream, plan_stream_ctx
     else:
+        logger.info(f"[Overlap Spec]: Disable {str.upper(phase)} plan stream.")
         return None, contextlib.nullcontext()
 
 
@@ -131,7 +138,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(
+            self.device, "draft_extend"
+        )
 
     def init_token_map(self):
         # Load hot token ids
@@ -529,7 +538,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device, "verify")
 
     @property
     def target_worker(self):
@@ -630,6 +639,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.cuda.Event()
         verify_done.record()
+
+        # Debug
+        torch.cuda._sleep(int(1e9))
 
         all_verified_id = predict[accept_index]
         verified_id = torch.empty_like(accept_length, dtype=torch.int32)
