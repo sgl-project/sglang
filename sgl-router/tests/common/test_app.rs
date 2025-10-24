@@ -1,3 +1,5 @@
+use std::sync::{Arc, OnceLock};
+
 use axum::Router;
 use reqwest::Client;
 use sglang_router_rs::{
@@ -11,7 +13,6 @@ use sglang_router_rs::{
     routers::RouterTrait,
     server::{build_app, AppContext, AppState},
 };
-use std::sync::{Arc, OnceLock};
 
 /// Create a test Axum application using the actual server's build_app function
 #[allow(dead_code)]
@@ -52,8 +53,9 @@ pub fn create_test_app(
         router_config.worker_startup_check_interval_secs,
     )));
 
-    // Create empty OnceLock for worker job queue
+    // Create empty OnceLock for worker job queue and workflow engine
     let worker_job_queue = Arc::new(OnceLock::new());
+    let workflow_engine = Arc::new(OnceLock::new());
 
     // Create AppContext
     let app_context = Arc::new(AppContext::new(
@@ -70,6 +72,7 @@ pub fn create_test_app(
         conversation_item_storage,
         load_monitor,
         worker_job_queue,
+        workflow_engine,
     ));
 
     // Create AppState with the test router and context

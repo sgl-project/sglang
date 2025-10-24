@@ -1,6 +1,9 @@
-use super::ConfigResult;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use super::ConfigResult;
+use crate::core::ConnectionMode;
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +82,61 @@ pub struct RouterConfig {
     pub reasoning_parser: Option<String>,
     /// Parser for handling tool-call interactions
     pub tool_call_parser: Option<String>,
+    /// Tokenizer cache configuration
+    #[serde(default)]
+    pub tokenizer_cache: TokenizerCacheConfig,
+    /// mTLS client identity (combined certificate + key in PEM format)
+    /// This is loaded from client_cert_path and client_key_path during config creation
+    #[serde(skip)]
+    pub client_identity: Option<Vec<u8>>,
+    /// CA certificates for verifying worker TLS certificates (PEM format)
+    /// Loaded from ca_cert_paths during config creation
+    #[serde(default)]
+    pub ca_certificates: Vec<Vec<u8>>,
+}
+
+/// Tokenizer cache configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenizerCacheConfig {
+    /// Enable L0 cache (whole-string exact match)
+    #[serde(default = "default_enable_l0")]
+    pub enable_l0: bool,
+    /// Maximum number of entries in L0 cache
+    #[serde(default = "default_l0_max_entries")]
+    pub l0_max_entries: usize,
+    /// Enable L1 cache (prefix matching at fixed boundaries)
+    #[serde(default = "default_enable_l1")]
+    pub enable_l1: bool,
+    /// Maximum memory for L1 cache in bytes
+    #[serde(default = "default_l1_max_memory")]
+    pub l1_max_memory: usize,
+}
+
+fn default_enable_l0() -> bool {
+    false
+}
+
+fn default_l0_max_entries() -> usize {
+    10_000
+}
+
+fn default_enable_l1() -> bool {
+    false
+}
+
+fn default_l1_max_memory() -> usize {
+    50 * 1024 * 1024 // 50MB
+}
+
+impl Default for TokenizerCacheConfig {
+    fn default() -> Self {
+        Self {
+            enable_l0: default_enable_l0(),
+            l0_max_entries: default_l0_max_entries(),
+            enable_l1: default_enable_l1(),
+            l1_max_memory: default_l1_max_memory(),
+        }
+    }
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -157,16 +215,6 @@ impl std::fmt::Debug for OracleConfig {
             .field("pool_timeout_secs", &self.pool_timeout_secs)
             .finish()
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(tag = "type")]
-pub enum ConnectionMode {
-    #[default]
-    #[serde(rename = "http")]
-    Http,
-    #[serde(rename = "grpc")]
-    Grpc,
 }
 
 /// Routing mode configuration
@@ -457,6 +505,9 @@ impl Default for RouterConfig {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: TokenizerCacheConfig::default(),
+            client_identity: None,
+            ca_certificates: vec![],
         }
     }
 }
@@ -568,17 +619,14 @@ mod tests {
 
     #[test]
     fn test_router_config_serialization() {
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec!["http://worker1".to_string()],
-            },
-            policy: PolicyConfig::Random,
-            host: "0.0.0.0".to_string(),
-            port: 8080,
-            log_dir: Some("/var/log".to_string()),
-            log_level: Some("debug".to_string()),
-            ..Default::default()
-        };
+        let config = RouterConfig::builder()
+            .regular_mode(vec!["http://worker1".to_string()])
+            .random_policy()
+            .host("0.0.0.0")
+            .port(8080)
+            .log_dir("/var/log")
+            .log_level("debug")
+            .build_unchecked();
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
@@ -825,23 +873,14 @@ mod tests {
 
     #[test]
     fn test_mode_type() {
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            ..Default::default()
-        };
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .build_unchecked();
         assert_eq!(config.mode_type(), "regular");
 
-        let config = RouterConfig {
-            mode: RoutingMode::PrefillDecode {
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                prefill_policy: None,
-                decode_policy: None,
-            },
-            ..Default::default()
-        };
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(vec![], vec![])
+            .build_unchecked();
         assert_eq!(config.mode_type(), "prefill_decode");
     }
 
@@ -850,22 +889,15 @@ mod tests {
         let config = RouterConfig::default();
         assert!(!config.has_service_discovery());
 
-        let config = RouterConfig {
-            discovery: Some(DiscoveryConfig {
+        let config = RouterConfig::builder()
+            .discovery_config(DiscoveryConfig {
                 enabled: false,
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
+            })
+            .build_unchecked();
         assert!(!config.has_service_discovery());
 
-        let config = RouterConfig {
-            discovery: Some(DiscoveryConfig {
-                enabled: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let config = RouterConfig::builder().enable_discovery().build_unchecked();
         assert!(config.has_service_discovery());
     }
 
@@ -874,10 +906,9 @@ mod tests {
         let config = RouterConfig::default();
         assert!(!config.has_metrics());
 
-        let config = RouterConfig {
-            metrics: Some(MetricsConfig::default()),
-            ..Default::default()
-        };
+        let config = RouterConfig::builder()
+            .metrics_config(MetricsConfig::default())
+            .build_unchecked();
         assert!(config.has_metrics());
     }
 
@@ -885,16 +916,11 @@ mod tests {
     fn test_large_worker_lists() {
         let large_urls: Vec<String> = (0..1000).map(|i| format!("http://worker{}", i)).collect();
 
-        let mode = RoutingMode::Regular {
-            worker_urls: large_urls.clone(),
-        };
+        let config = RouterConfig::builder()
+            .regular_mode(large_urls.clone())
+            .build_unchecked();
 
-        assert_eq!(mode.worker_count(), 1000);
-
-        let config = RouterConfig {
-            mode,
-            ..Default::default()
-        };
+        assert_eq!(config.mode.worker_count(), 1000);
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
@@ -909,13 +935,13 @@ mod tests {
 
     #[test]
     fn test_unicode_in_config() {
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec!["http://работник1".to_string(), "http://工作者2".to_string()],
-            },
-            log_dir: Some("/日志/目录".to_string()),
-            ..Default::default()
-        };
+        let config = RouterConfig::builder()
+            .regular_mode(vec![
+                "http://работник1".to_string(),
+                "http://工作者2".to_string(),
+            ])
+            .log_dir("/日志/目录")
+            .build_unchecked();
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
@@ -933,12 +959,11 @@ mod tests {
 
     #[test]
     fn test_empty_string_fields() {
-        let config = RouterConfig {
-            host: "".to_string(),
-            log_dir: Some("".to_string()),
-            log_level: Some("".to_string()),
-            ..Default::default()
-        };
+        let config = RouterConfig::builder()
+            .host("")
+            .log_dir("")
+            .log_level("")
+            .build_unchecked();
 
         assert_eq!(config.host, "");
         assert_eq!(config.log_dir, Some("".to_string()));
@@ -947,62 +972,34 @@ mod tests {
 
     #[test]
     fn test_full_pd_mode_config() {
-        let config = RouterConfig {
-            mode: RoutingMode::PrefillDecode {
-                prefill_urls: vec![
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![
                     ("http://prefill1:8000".to_string(), Some(8001)),
                     ("http://prefill2:8000".to_string(), None),
                 ],
-                decode_urls: vec![
+                vec![
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
                 ],
-                prefill_policy: None,
-                decode_policy: None,
-            },
-            policy: PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 30,
-            },
-            host: "0.0.0.0".to_string(),
-            port: 3000,
-            max_payload_size: 1048576,
-            request_timeout_secs: 120,
-            worker_startup_timeout_secs: 60,
-            worker_startup_check_interval_secs: 5,
-            dp_aware: false,
-            api_key: None,
-            discovery: Some(DiscoveryConfig {
+            )
+            .power_of_two_policy(30)
+            .host("0.0.0.0")
+            .port(3000)
+            .max_payload_size(1048576)
+            .request_timeout_secs(120)
+            .worker_startup_timeout_secs(60)
+            .worker_startup_check_interval_secs(5)
+            .discovery_config(DiscoveryConfig {
                 enabled: true,
                 namespace: Some("sglang".to_string()),
                 ..Default::default()
-            }),
-            metrics: Some(MetricsConfig {
-                port: 9090,
-                host: "0.0.0.0".to_string(),
-            }),
-            log_dir: Some("/var/log/sglang".to_string()),
-            log_level: Some("info".to_string()),
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: HealthCheckConfig::default(),
-            enable_igw: false,
-            queue_size: 100,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            chat_template: None,
-            history_backend: default_history_backend(),
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-        };
+            })
+            .enable_metrics("0.0.0.0", 9090)
+            .log_dir("/var/log/sglang")
+            .log_level("info")
+            .max_concurrent_requests(64)
+            .build_unchecked();
 
         assert!(config.mode.is_pd_mode());
         assert_eq!(config.mode.worker_count(), 4);
@@ -1016,61 +1013,31 @@ mod tests {
         let mut selector = HashMap::new();
         selector.insert("app".to_string(), "sglang".to_string());
 
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec![
-                    "http://worker1:8000".to_string(),
-                    "http://worker2:8000".to_string(),
-                    "http://worker3:8000".to_string(),
-                ],
-            },
-            policy: PolicyConfig::CacheAware {
-                cache_threshold: 0.9,
-                balance_abs_threshold: 5,
-                balance_rel_threshold: 1.2,
-                eviction_interval_secs: 600,
-                max_tree_size: 10000,
-            },
-            host: "0.0.0.0".to_string(),
-            port: 3001,
-            max_payload_size: 536870912,
-            request_timeout_secs: 300,
-            worker_startup_timeout_secs: 180,
-            worker_startup_check_interval_secs: 15,
-            dp_aware: false,
-            api_key: None,
-            discovery: Some(DiscoveryConfig {
+        let config = RouterConfig::builder()
+            .regular_mode(vec![
+                "http://worker1:8000".to_string(),
+                "http://worker2:8000".to_string(),
+                "http://worker3:8000".to_string(),
+            ])
+            .cache_aware_policy(0.9, 5, 1.2, 600, 10000)
+            .host("0.0.0.0")
+            .port(3001)
+            .max_payload_size(536870912)
+            .request_timeout_secs(300)
+            .worker_startup_timeout_secs(180)
+            .worker_startup_check_interval_secs(15)
+            .discovery_config(DiscoveryConfig {
                 enabled: true,
                 namespace: None,
                 port: 8080,
                 check_interval_secs: 45,
                 selector,
                 ..Default::default()
-            }),
-            metrics: Some(MetricsConfig::default()),
-            log_dir: None,
-            log_level: Some("debug".to_string()),
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: HealthCheckConfig::default(),
-            enable_igw: false,
-            queue_size: 100,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            chat_template: None,
-            history_backend: default_history_backend(),
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-        };
+            })
+            .metrics_config(MetricsConfig::default())
+            .log_level("debug")
+            .max_concurrent_requests(64)
+            .build_unchecked();
 
         assert!(!config.mode.is_pd_mode());
         assert_eq!(config.mode.worker_count(), 3);
@@ -1085,20 +1052,16 @@ mod tests {
         selectors.insert("env".to_string(), "prod".to_string());
         selectors.insert("version".to_string(), "v1".to_string());
 
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec!["http://worker1".to_string()],
-            },
-            policy: PolicyConfig::RoundRobin,
-            host: "::1".to_string(), // IPv6
-            port: 8888,
-            max_payload_size: 1024 * 1024 * 512, // 512MB
-            request_timeout_secs: 900,
-            worker_startup_timeout_secs: 600,
-            worker_startup_check_interval_secs: 20,
-            dp_aware: false,
-            api_key: None,
-            discovery: Some(DiscoveryConfig {
+        let config = RouterConfig::builder()
+            .regular_mode(vec!["http://worker1".to_string()])
+            .round_robin_policy()
+            .host("::1") // IPv6
+            .port(8888)
+            .max_payload_size(1024 * 1024 * 512) // 512MB
+            .request_timeout_secs(900)
+            .worker_startup_timeout_secs(600)
+            .worker_startup_check_interval_secs(20)
+            .discovery_config(DiscoveryConfig {
                 enabled: true,
                 namespace: Some("production".to_string()),
                 port: 8443,
@@ -1107,34 +1070,12 @@ mod tests {
                 prefill_selector: selectors.clone(),
                 decode_selector: selectors,
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
-            }),
-            metrics: Some(MetricsConfig {
-                port: 9999,
-                host: "::".to_string(), // IPv6 any
-            }),
-            log_dir: Some("/opt/logs/sglang".to_string()),
-            log_level: Some("trace".to_string()),
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: HealthCheckConfig::default(),
-            enable_igw: false,
-            queue_size: 100,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            chat_template: None,
-            history_backend: default_history_backend(),
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-        };
+            })
+            .enable_metrics("::", 9999) // IPv6 any
+            .log_dir("/opt/logs/sglang")
+            .log_level("trace")
+            .max_concurrent_requests(64)
+            .build_unchecked();
 
         assert!(config.has_service_discovery());
         assert!(config.has_metrics());

@@ -4,7 +4,13 @@ set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 RUN_DEEPSEEK_V32=${RUN_DEEPSEEK_V32:-0}
-CU_VERSION="cu128"
+CU_VERSION="cu129"
+
+if [ "$CU_VERSION" = "cu130" ]; then
+    NVRTC_SPEC="nvidia-cuda-nvrtc"
+else
+    NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
+fi
 
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -27,6 +33,9 @@ if [ "$IS_BLACKWELL" = "1" ]; then
 
     # Clean up existing installations
     $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
+
+    # Install the main package
+    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
@@ -38,10 +47,16 @@ else
 
     # Clean up existing installations
     $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
-fi
 
-# Install the main package
-$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
+    # Install the main package without deps
+    $PIP_CMD install -e "python[dev]" --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
+
+    # Install flashinfer-python 0.4.1 dependency that requires prerelease (This should be removed when flashinfer fixes this issue)
+    $PIP_CMD install flashinfer-python==0.4.1 --prerelease=allow $PIP_INSTALL_SUFFIX
+
+    # Install the main package
+    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --upgrade
+fi
 
 # Install router for pd-disagg test
 SGLANG_ROUTER_BUILD_NO_RUST=1 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
@@ -61,12 +76,11 @@ fi
 # Show current packages
 $PIP_CMD list
 
-# Install additional dependencies
-$PIP_CMD install mooncake-transfer-engine==0.3.6.post1 nvidia-cuda-nvrtc-cu12 py-spy scipy huggingface_hub[hf_xet] nixl $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.6.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] nixl $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
-    git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 
     # Install xformers
@@ -86,14 +100,6 @@ if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
     git checkout ${FLASHMLA_COMMIT}
     git submodule update --init --recursive
     FLASH_MLA_DISABLE_SM100=${FLASH_MLA_DISABLE_SM100} $PIP_CMD install -v . $PIP_INSTALL_SUFFIX --no-build-isolation
-    cd ..
-
-    # Install fast-hadamard-transform
-    FAST_HADAMARD_TRANSFORM_COMMIT="7fd811c2b47f63b0b08d2582619f939e14dad77c"
-    git clone https://github.com/Dao-AILab/fast-hadamard-transform
-    cd fast-hadamard-transform
-    git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT}
-    $PIP_CMD install . $PIP_INSTALL_SUFFIX --no-build-isolation
     cd ..
 fi
 
