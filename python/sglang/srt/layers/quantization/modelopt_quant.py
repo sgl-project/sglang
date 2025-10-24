@@ -620,6 +620,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 self.moe_runner_config.activation == "silu"
             ), "Only silu is supported for flashinfer fp8 moe"
 
+            from flashinfer import RoutingMethodType
             from flashinfer.fused_moe import trtllm_fp8_per_tensor_scale_moe
 
             correction_bias = (
@@ -633,7 +634,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             use_routing_scales_on_input = True
             routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
 
-            # Enforce Llama4 routing for ModelOpt FP8 MoE
+            # Enforce Llama4 routing for ModelOpt FP8 MoE for now.
+            # TODO(brayden): support other routing methods
             assert topk_config.top_k == 1, "ModelOpt FP8 MoE requires top_k==1"
             assert (
                 not topk_config.num_expert_group
@@ -641,7 +643,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             assert (
                 not topk_config.topk_group
             ), "ModelOpt FP8 MoE does not support grouped top-k"
-            routing_method_type = 3  # Llama4 routing
+            routing_method_type = RoutingMethodType.Llama4
 
             # FlashInfer TRTLLM requires routing_logits (and bias) to be bfloat16
             routing_logits_cast = router_logits.to(torch.bfloat16)
