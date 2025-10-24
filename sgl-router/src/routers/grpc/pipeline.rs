@@ -587,7 +587,6 @@ impl PipelineStage for DispatchMetadataStage {
                     .unwrap_or_else(|| "default".to_string())
             }
             RequestType::Responses(req) => {
-                // Responses requests have model field (with default)
                 req.model.clone()
             }
         };

@@ -160,15 +160,7 @@ impl ResponseProcessor {
             );
 
             let mut parser = pooled_parser.lock().await;
-            let parse_result = if parser.supports_token_parsing() {
-                // Use token-based parsing for parsers like Harmony
-                parser.detect_and_parse_reasoning_from_tokens(&complete.output_ids)
-            } else {
-                // Use text-based parsing for traditional parsers
-                parser.detect_and_parse_reasoning(&processed_text)
-            };
-
-            match parse_result {
+            match parser.detect_and_parse_reasoning(&processed_text) {
                 Ok(result) => {
                     if !result.reasoning_text.is_empty() {
                         reasoning_text = Some(result.reasoning_text);
