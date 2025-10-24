@@ -515,6 +515,76 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_input_scale.max(), requires_grad=False
             )
 
+        # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
+        if should_use_flashinfer_trtllm_moe():
+            from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
+
+            # 1) Swap W13 halves: [Up, Gate] -> [Gate, Up] expected by FI
+            num_experts, two_n, hidden = layer.w13_weight.shape
+            inter = two_n // 2
+            w13_swapped = (
+                layer.w13_weight.reshape(num_experts, 2, inter, hidden)
+                .flip(dims=[1])
+                .reshape(num_experts, two_n, hidden)
+            )
+
+            # 2) Reorder rows for fused gated activation (W13)
+            w13_interleaved = [
+                reorder_rows_for_gated_act_gemm(w13_swapped[i])
+                for i in range(num_experts)
+            ]
+            w13_interleaved = torch.stack(w13_interleaved).reshape(
+                num_experts, two_n, hidden
+            )
+
+            # 3) Shuffle weights for transposed MMA output (both W13, W2)
+            epilogue_tile_m = 128
+            w13_shuffled = [
+                shuffle_matrix_a(w13_interleaved[i].view(torch.uint8), epilogue_tile_m)
+                for i in range(num_experts)
+            ]
+            w2_shuffled = [
+                shuffle_matrix_a(layer.w2_weight[i].view(torch.uint8), epilogue_tile_m)
+                for i in range(num_experts)
+            ]
+
+            layer.w13_weight = Parameter(
+                torch.stack(w13_shuffled).view(torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            layer.w2_weight = Parameter(
+                torch.stack(w2_shuffled).view(torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+
+        # Precompute and register per-expert output scaling factors for FI MoE
+        # Note: w13_input_scale and w2_input_scale are scalar Parameters post-reduction
+        assert hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
+        assert hasattr(layer, "w2_input_scale") and layer.w2_input_scale is not None
+        assert hasattr(layer, "w13_weight_scale") and layer.w13_weight_scale is not None
+        assert hasattr(layer, "w2_weight_scale") and layer.w2_weight_scale is not None
+
+        input_scale = layer.w13_input_scale.to(torch.float32)
+        activation_scale = layer.w2_input_scale.to(torch.float32)
+        w13_weight_scale = layer.w13_weight_scale.to(torch.float32)
+        w2_weight_scale = layer.w2_weight_scale.to(torch.float32)
+
+        output1_scales_scalar = (
+            w13_weight_scale * input_scale * (1.0 / activation_scale)
+        )
+        output1_scales_gate_scalar = w13_weight_scale * input_scale
+        output2_scales_scalar = activation_scale * w2_weight_scale
+
+        layer.output1_scales_scalar = Parameter(
+            output1_scales_scalar, requires_grad=False
+        )
+        layer.output1_scales_gate_scalar = Parameter(
+            output1_scales_gate_scalar, requires_grad=False
+        )
+        layer.output2_scales_scalar = Parameter(
+            output2_scales_scalar, requires_grad=False
+        )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -526,6 +596,95 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
+        if should_use_flashinfer_trtllm_moe() and TopKOutputChecker.format_is_bypassed(
+            topk_output
+        ):
+            router_logits = topk_output.router_logits
+            topk_config = topk_output.topk_config
+
+            # Constraints
+            assert (
+                self.moe_runner_config.activation == "silu"
+            ), "Only silu is supported for flashinfer fp8 moe"
+
+            from flashinfer.fused_moe import trtllm_fp8_per_tensor_scale_moe
+
+            correction_bias = (
+                None
+                if topk_config.correction_bias is None
+                else topk_config.correction_bias
+            )
+
+            # Pre-quantize activations to FP8 per-tensor using provided input scale
+            from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+
+            x_fp8, _ = scaled_fp8_quant(x, layer.w13_input_scale)
+
+            # Use precomputed per-expert output scales
+            assert (
+                hasattr(layer, "output1_scales_scalar")
+                and layer.output1_scales_scalar is not None
+            )
+            assert (
+                hasattr(layer, "output1_scales_gate_scalar")
+                and layer.output1_scales_gate_scalar is not None
+            )
+            assert (
+                hasattr(layer, "output2_scales_scalar")
+                and layer.output2_scales_scalar is not None
+            )
+
+            use_routing_scales_on_input = True
+            routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
+
+            # Enforce Llama4 routing for ModelOpt FP8 MoE
+            assert topk_config.top_k == 1, "ModelOpt FP8 MoE requires top_k==1"
+            assert (
+                not topk_config.num_expert_group
+            ), "ModelOpt FP8 MoE does not support expert grouping"
+            assert (
+                not topk_config.topk_group
+            ), "ModelOpt FP8 MoE does not support grouped top-k"
+            routing_method_type = 3  # Llama4 routing
+
+            # FlashInfer TRTLLM requires routing_logits (and bias) to be bfloat16
+            routing_logits_cast = router_logits.to(torch.bfloat16)
+            routing_bias_cast = (
+                None if correction_bias is None else correction_bias.to(torch.bfloat16)
+            )
+
+            output = trtllm_fp8_per_tensor_scale_moe(
+                routing_logits=routing_logits_cast,
+                routing_bias=routing_bias_cast,
+                hidden_states=x_fp8,
+                gemm1_weights=layer.w13_weight,
+                output1_scales_scalar=layer.output1_scales_scalar,
+                output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
+                gemm2_weights=layer.w2_weight,
+                output2_scales_scalar=layer.output2_scales_scalar,
+                num_experts=layer.num_experts,
+                top_k=topk_config.top_k,
+                n_group=0,
+                topk_group=0,
+                intermediate_size=layer.w2_weight.shape[2],
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                local_num_experts=layer.num_local_experts,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                ),
+                use_routing_scales_on_input=use_routing_scales_on_input,
+                tile_tokens_dim=None,
+                routing_method_type=routing_method_type,
+            )
+
+            return StandardCombineInput(hidden_states=output)
 
         quant_info = TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,

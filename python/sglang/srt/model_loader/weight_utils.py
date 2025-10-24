@@ -238,7 +238,7 @@ def get_quant_config(
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path
         elif model_config.quantization.startswith("modelopt") and (
-            config["producer"]["name"].startswith("modelopt")
+            config.get("producer", {}).get("name", "").startswith("modelopt")
         ):
             quant_algo = config["quantization"]["quant_algo"]
             if quant_algo is None:
