@@ -146,34 +146,28 @@ class TestMoERunnerTriton(CustomTestCase):
         model = config.get("model", self.DEFAULT_MODEL)
         other_args = config.get("other_args", [])
         eval_kwargs = self.DEFAULT_EVAL_KWARGS | config.get("eval_kwargs", {})
-        env_overrides = config.get("env", {}) or {}
 
-        saved_env = {}
+        env_overrides = config.get("env", {})
+        saved_env = {k: os.environ.get(k) for k in env_overrides}
+        os.environ.update(env_overrides)
+
+        process = popen_launch_server(
+            model,
+            self.BASE_URL,
+            timeout=self.TIMEOUT,
+            other_args=other_args,
+        )
         try:
-            for key, value in env_overrides.items():
-                saved_env[key] = os.environ.get(key)
-                os.environ[key] = value
-
-            process = None
-            try:
-                process = popen_launch_server(
-                    model,
-                    self.BASE_URL,
-                    timeout=self.TIMEOUT,
-                    other_args=other_args,
-                )
-                args = SimpleNamespace(
-                    base_url=self.BASE_URL,
-                    model=model,
-                    **eval_kwargs,
-                )
-                metrics = run_eval(args)
-                print(f"{metrics=}")
-                self.assertGreaterEqual(metrics["score"], 0.0)
-            finally:
-                if process is not None:
-                    kill_process_tree(process.pid)
+            args = SimpleNamespace(
+                base_url=self.BASE_URL,
+                model=model,
+                **eval_kwargs,
+            )
+            metrics = run_eval(args)
+            print(f"{metrics=}")
+            self.assertGreaterEqual(metrics["score"], 0.0)
         finally:
+            kill_process_tree(process.pid)
             for key, previous in saved_env.items():
                 if previous is None:
                     os.environ.pop(key, None)
