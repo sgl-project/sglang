@@ -69,17 +69,21 @@ class VLMInputTestBase:
                 {
                     "role": "user",
                     "content": [
-                                   {"type": "image_url", "image_url": {"url": self.image_url}}
-                               ] * image_count + [
-                                   {"type": "text", "text": "What's in this picture?"},
-                               ],
+                        {"type": "image_url", "image_url": {"url": self.image_url}}
+                    ]
+                    * image_count
+                    + [
+                        {"type": "text", "text": "What's in this picture?"},
+                    ],
                 }
             ],
         }
         json_str = json.dumps(json_structure)
         return ChatCompletionRequest.model_validate_json(json_str)
 
-    def get_processor_output(self, req: Optional[ChatCompletionRequest] = None, image_count = 1):
+    def get_processor_output(
+        self, req: Optional[ChatCompletionRequest] = None, image_count=1
+    ):
         if req is None:
             req = self.get_completion_request()
         conv = generate_chat_conv(req, template_name=self.chat_template)
@@ -122,7 +126,7 @@ class VLMInputTestBase:
     async def test_understands_pixel_values(self):
         image_count = 2
         req = self.get_completion_request(image_count=image_count)
-        processor_output = self.get_processor_output(req=req, image_count = image_count)
+        processor_output = self.get_processor_output(req=req, image_count=image_count)
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
             image_data=[self._pixel_values_image_data(processor_output)],
