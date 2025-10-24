@@ -22,13 +22,17 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.quantization.int8_kernel import (
+    per_token_quant_int8,
+    w8a8_per_channel_per_token_matmul,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     apply_module_patch,
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hip,
     is_npu,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -46,7 +50,7 @@ _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 _is_npu = is_npu()
-
+_is_hip = is_hip()
 if _is_npu:
     import torch_npu
 
@@ -349,7 +353,9 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 _is_cpu_amx_available
             ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["weight"])
-        else:
+        elif _is_hip:
+            layer.weight = Parameter(layer.weight.data, requires_grad=False)
+        elif _is_cuda:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
@@ -400,6 +406,16 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 True,  # is_vnni
             )
         x_q, x_scale = per_token_quant_int8(x)
+
+        if _is_hip:
+            return w8a8_per_channel_per_token_matmul(
+                x_q,
+                layer.weight,
+                x_scale,
+                layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=bias,
+            )
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
