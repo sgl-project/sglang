@@ -718,15 +718,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return False
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFP4MoE
-
-        Moe = (
-            FlashInferFP4MoE  # FlashInferFP4MoE needs the same quantization method but with compatible attribute handling
-            if isinstance(layer, FlashInferFP4MoE)
-            else ModelOptNvFp4FusedMoEMethod
-        )
         return self._get_quant_method(
-            layer, prefix, Linear=ModelOptFp4LinearMethod, Moe=Moe
+            layer,
+            prefix,
+            Linear=ModelOptFp4LinearMethod,
+            Moe=ModelOptNvFp4FusedMoEMethod,  # FlashInferFP4MoE needs the same quantization method but with compatible attribute handling
         )
 
 

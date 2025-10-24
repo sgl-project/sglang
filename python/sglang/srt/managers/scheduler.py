@@ -109,6 +109,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
@@ -194,7 +195,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
-TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
+TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
+TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
@@ -529,6 +531,7 @@ class Scheduler(
                     self.update_weights_from_distributed,
                 ),
                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
+                (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
@@ -1016,6 +1019,9 @@ class Scheduler(
 
             self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
+
+            if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
+                self._check_runtime_mem_leak()
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
@@ -1833,7 +1839,7 @@ class Scheduler(
 
         # Check if decode out of memory
         if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
-            TEST_RETRACT and batch.batch_size() > 10
+            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(

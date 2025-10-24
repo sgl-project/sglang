@@ -32,7 +32,6 @@ class MCPTests(ResponseAPIBaseTest):
         self.assertEqual(resp.status_code, 200)
 
         data = resp.json()
-        print(f"MCP response: {data}")
 
         # Basic response structure
         self.assertIn("id", data)

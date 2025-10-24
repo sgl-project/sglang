@@ -4,7 +4,7 @@ pytest configuration for e2e_response_api tests.
 This configures pytest to not collect base test classes that are meant to be inherited.
 """
 
-import pytest
+import pytest  # noqa: F401
 
 
 def pytest_collection_modifyitems(config, items):

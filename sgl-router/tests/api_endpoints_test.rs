@@ -11,8 +11,8 @@ use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType
 use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::{
-    config::{CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode},
-    core::{ConnectionMode, Job},
+    config::{RouterConfig, RoutingMode},
+    core::Job,
     routers::{RouterFactory, RouterTrait},
     server::AppContext,
 };
@@ -30,45 +30,18 @@ struct TestContext {
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         // Create default router config
-        let config = RouterConfig {
-            chat_template: None,
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
-            port: 3002,
-            max_payload_size: 256 * 1024 * 1024,
-            request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            discovery: None,
-            dp_aware: false,
-            api_key: None,
-            metrics: None,
-            log_dir: None,
-            log_level: None,
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            queue_size: 0,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
-            enable_igw: false,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-        };
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3002)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
 
         Self::new_with_config(config, worker_configs).await
     }
@@ -1182,45 +1155,18 @@ mod error_tests {
     #[tokio::test]
     async fn test_payload_too_large() {
         // Create context with small payload limit
-        let config = RouterConfig {
-            chat_template: None,
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
-            port: 3010,
-            max_payload_size: 1024, // 1KB limit
-            request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            dp_aware: false,
-            api_key: None,
-            discovery: None,
-            metrics: None,
-            log_dir: None,
-            log_level: None,
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            queue_size: 0,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
-            enable_igw: false,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-        };
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3010)
+            .max_payload_size(1024) // 1KB limit
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
 
         let ctx = TestContext::new_with_config(
             config,
@@ -1509,48 +1455,18 @@ mod pd_mode_tests {
             .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
             .unwrap_or(9000);
 
-        let config = RouterConfig {
-            chat_template: None,
-            mode: RoutingMode::PrefillDecode {
-                prefill_urls: vec![(prefill_url, Some(prefill_port))],
-                decode_urls: vec![decode_url],
-                prefill_policy: None,
-                decode_policy: None,
-            },
-            policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
-            port: 3011,
-            max_payload_size: 256 * 1024 * 1024,
-            request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            discovery: None,
-            metrics: None,
-            log_dir: None,
-            dp_aware: false,
-            api_key: None,
-            log_level: None,
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            queue_size: 0,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
-            enable_igw: false,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-        };
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(vec![(prefill_url, Some(prefill_port))], vec![decode_url])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3011)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
 
         // Create app context
         let app_context = common::create_test_context(config);
@@ -1676,45 +1592,19 @@ mod request_id_tests {
     #[tokio::test]
     async fn test_request_id_with_custom_headers() {
         // Create config with custom request ID headers
-        let config = RouterConfig {
-            chat_template: None,
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
-            port: 3002,
-            max_payload_size: 256 * 1024 * 1024,
-            request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            discovery: None,
-            metrics: None,
-            dp_aware: false,
-            api_key: None,
-            log_dir: None,
-            log_level: None,
-            request_id_headers: Some(vec!["custom-id".to_string(), "trace-id".to_string()]),
-            max_concurrent_requests: 64,
-            queue_size: 0,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
-            enable_igw: false,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-        };
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3002)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .request_id_headers(vec!["custom-id".to_string(), "trace-id".to_string()])
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
 
         let ctx = TestContext::new_with_config(
             config,

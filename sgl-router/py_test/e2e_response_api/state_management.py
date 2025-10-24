@@ -49,11 +49,6 @@ class StateManagementTests(ResponseAPIBaseTest):
         resp = self.create_response(
             "Test", previous_response_id="resp_invalid123", max_output_tokens=50
         )
-        # Should return 404 or 400 for invalid response ID
-        if resp.status_code != 200:
-            print(f"\n❌ Response creation failed!")
-            print(f"Status: {resp.status_code}")
-            print(f"Response: {resp.text}")
         self.assertIn(resp.status_code, [400, 404])
 
     def test_conversation_with_multiple_turns(self):

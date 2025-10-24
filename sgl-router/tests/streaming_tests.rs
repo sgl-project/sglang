@@ -20,16 +20,12 @@ struct TestContext {
 
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
-        let mut config = RouterConfig {
-            chat_template: None,
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            port: 3004,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            ..Default::default()
-        };
+        let mut config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .port(3004)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .build_unchecked();
 
         let mut workers = Vec::new();
         let mut worker_urls = Vec::new();

@@ -1,4 +1,4 @@
-name: PR Test (Rust)
+name: PR Test (SMG)
 
 on:
   push:
