@@ -19,10 +19,14 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
 # Clear torch compilation cache
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
-rm -rf /root/.cache/flashinfer
+rm -rf ${HOME}/.cache/flashinfer
 
 # Install apt packages
-apt install -y git libnuma-dev
+if command -v sudo >/dev/null 2>&1; then
+    sudo apt install -y git libnuma-dev
+else
+    apt install -y git libnuma-dev
+fi
 
 # Install uv
 if [ "$IS_BLACKWELL" = "1" ]; then
