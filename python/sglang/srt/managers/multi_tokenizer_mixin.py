@@ -520,19 +520,6 @@ class MultiDetokenizerRouter:
         self.ipc_name_index = 0
         self.detokenizer_worker_num = len(ipc_name_list)
 
-    async def _distribute_result_to_workers(self, recv_obj):
-        # Distribute result to each worker
-        if isinstance(recv_obj, BaseReq):
-            ipc_names = [recv_obj.http_worker_ipc]
-        elif isinstance(recv_obj, BaseBatchReq):
-            ipc_names = recv_obj.http_worker_ipcs
-        else:
-            raise ValueError(f"Unknown recv_obj type: {type(recv_obj)}")
-
-        for i, ipc_name in enumerate(ipc_names):
-            new_recv_obj = _handle_output_by_index(recv_obj, i)
-            self.socket_mapping.send_output(ipc_name, new_recv_obj, is_tokenizer=False)
-
     def event_loop(self):
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
