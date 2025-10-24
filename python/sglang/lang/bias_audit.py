@@ -384,6 +384,24 @@ class BiasAuditor:
         """
         period_size = len(self.history) // time_periods
         
+        # First, collect all unique numerical constraint keys across entire history
+        # This ensures consistent matrix shape even if keys vary across time periods
+        all_constraint_keys = set()
+        for record in self.history:
+            for key, value in record['constraints'].items():
+                if isinstance(value, (int, float)):
+                    all_constraint_keys.add(key)
+        
+        # Sort for consistent ordering
+        sorted_keys = sorted(all_constraint_keys)
+        
+        if not sorted_keys:
+            warnings.warn(
+                "No numerical constraints found in history. "
+                "Using default constraint matrix."
+            )
+            sorted_keys = ['_default_']
+        
         perf_matrix = []
         const_matrix = []
         
@@ -392,6 +410,12 @@ class BiasAuditor:
             end_idx = start_idx + period_size if t < time_periods - 1 else len(self.history)
             
             period_history = self.history[start_idx:end_idx]
+            
+            if not period_history:
+                warnings.warn(f"Empty time period {t}, using default values")
+                perf_matrix.append([0.5])
+                const_matrix.append([0.0] * len(sorted_keys))
+                continue
             
             # Aggregate performance for this period
             period_perfs = [
@@ -405,12 +429,9 @@ class BiasAuditor:
             
             perf_matrix.append([np.mean(period_perfs)])
             
-            # Extract constraint values
-            # Use first record's constraints as template
-            template_constraints = period_history[0]['constraints']
+            # Extract constraint values using complete key set
             constraint_values = []
-            
-            for key in sorted(template_constraints.keys()):
+            for key in sorted_keys:
                 # Average this constraint across the period
                 values = []
                 for h in period_history:
@@ -421,11 +442,20 @@ class BiasAuditor:
                 if values:
                     constraint_values.append(np.mean(values))
                 else:
-                    constraint_values.append(0.0)
+                    # Use NaN for missing constraints, then fill with 0.0
+                    # This distinguishes between "not present" and "present but zero"
+                    constraint_values.append(np.nan)
             
             const_matrix.append(constraint_values)
         
-        return np.array(perf_matrix), np.array(const_matrix)
+        # Convert to arrays and handle missing values
+        perf_array = np.array(perf_matrix)
+        const_array = np.array(const_matrix)
+        
+        # Replace NaN with 0.0 (or could use mean/median of that column)
+        const_array = np.nan_to_num(const_array, nan=0.0)
+        
+        return perf_array, const_array
     
     def _compute_performance_score(self, output: str) -> float:
         """

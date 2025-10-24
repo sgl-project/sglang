@@ -537,7 +537,7 @@ If you use this bias detection framework in your research, please cite:
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/[username]/circular-bias-detection/issues)
+- **Issues**: [GitHub Issues](https://github.com/hongping-zh/circular-bias-detection/issues)
 - **Discussions**: [SGLang Discussions](https://github.com/sgl-project/sglang/discussions)
 - **Documentation**: [Full Docs](https://circular-bias-detection.readthedocs.io)
 
