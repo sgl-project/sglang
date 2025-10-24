@@ -20,6 +20,7 @@ use tokio::{net::TcpListener, signal, spawn};
 use tracing::{error, info, warn, Level};
 
 use crate::{
+    app_context::AppContext,
     config::{HistoryBackend, RouterConfig, RoutingMode},
     core::{
         worker_to_info,
@@ -61,72 +62,6 @@ use crate::{
     },
     tool_parser::ParserFactory as ToolParserFactory,
 };
-
-//
-
-#[derive(Clone)]
-pub struct AppContext {
-    pub client: Client,
-    pub router_config: RouterConfig,
-    pub rate_limiter: Option<Arc<TokenBucket>>,
-    pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    pub reasoning_parser_factory: Option<ReasoningParserFactory>,
-    pub tool_parser_factory: Option<ToolParserFactory>,
-    pub worker_registry: Arc<WorkerRegistry>,
-    pub policy_registry: Arc<PolicyRegistry>,
-    pub router_manager: Option<Arc<RouterManager>>,
-    pub response_storage: SharedResponseStorage,
-    pub conversation_storage: SharedConversationStorage,
-    pub conversation_item_storage: SharedConversationItemStorage,
-    pub load_monitor: Option<Arc<LoadMonitor>>,
-    pub configured_reasoning_parser: Option<String>,
-    pub configured_tool_parser: Option<String>,
-    pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
-    pub workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
-}
-
-impl AppContext {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        router_config: RouterConfig,
-        client: Client,
-        rate_limiter: Option<Arc<TokenBucket>>,
-        tokenizer: Option<Arc<dyn Tokenizer>>,
-        reasoning_parser_factory: Option<ReasoningParserFactory>,
-        tool_parser_factory: Option<ToolParserFactory>,
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
-        response_storage: SharedResponseStorage,
-        conversation_storage: SharedConversationStorage,
-        conversation_item_storage: SharedConversationItemStorage,
-        load_monitor: Option<Arc<LoadMonitor>>,
-        worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
-        workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
-    ) -> Self {
-        let configured_reasoning_parser = router_config.reasoning_parser.clone();
-        let configured_tool_parser = router_config.tool_call_parser.clone();
-
-        Self {
-            client,
-            router_config,
-            rate_limiter,
-            tokenizer,
-            reasoning_parser_factory,
-            tool_parser_factory,
-            worker_registry,
-            policy_registry,
-            router_manager: None,
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
-            load_monitor,
-            configured_reasoning_parser,
-            configured_tool_parser,
-            worker_job_queue,
-            workflow_engine,
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -994,25 +929,26 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engine = Arc::new(OnceLock::new());
 
-    // Create AppContext with all initialized components
-    let app_context = AppContext::new(
-        config.router_config.clone(),
-        client.clone(),
-        rate_limiter,
-        tokenizer,
-        reasoning_parser_factory,
-        tool_parser_factory,
-        worker_registry,
-        policy_registry,
-        response_storage,
-        conversation_storage,
-        conversation_item_storage,
-        load_monitor,
-        worker_job_queue,
-        workflow_engine,
+    // Create AppContext with all initialized components using builder pattern
+    let app_context = Arc::new(
+        AppContext::builder()
+            .router_config(config.router_config.clone())
+            .client(client.clone())
+            .rate_limiter(rate_limiter)
+            .tokenizer(tokenizer)
+            .reasoning_parser_factory(reasoning_parser_factory)
+            .tool_parser_factory(tool_parser_factory)
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .load_monitor(load_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engine(workflow_engine)
+            .build()
+            .map_err(|e| e.to_string())?,
     );
-
-    let app_context = Arc::new(app_context);
 
     let weak_context = Arc::downgrade(&app_context);
     let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
