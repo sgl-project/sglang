@@ -1045,7 +1045,14 @@ fn create_index_if_missing(conn: &Connection, index_name: &str, ddl: &str) -> Re
 
     if count == 0 {
         if let Err(err) = conn.execute(ddl, &[]) {
-            if err.db_error().map(|db| db.code()) != Some(1408) {
+            if let Some(db_err) = err.db_error() {
+                // ORA-00955: name is already used by an existing object
+                // ORA-01408: such column list already indexed
+                // Both errors indicate the index already exists (race condition)
+                if db_err.code() != 955 && db_err.code() != 1408 {
+                    return Err(map_oracle_error(err));
+                }
+            } else {
                 return Err(map_oracle_error(err));
             }
         }
