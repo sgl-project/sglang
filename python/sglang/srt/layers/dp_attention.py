@@ -364,7 +364,6 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
         # Select metadata source based on context
         if (
             type(forward_batch).__name__ == "LogitsMetadata"
-            and hasattr(forward_batch, "global_num_tokens_for_logprob_gpu")
             and forward_batch.global_num_tokens_for_logprob_gpu is not None
         ):
             global_num_tokens_source = forward_batch.global_num_tokens_for_logprob_gpu
