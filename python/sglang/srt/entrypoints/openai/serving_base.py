@@ -4,7 +4,6 @@ import json
 import logging
 import time
 import uuid
-import torch
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
