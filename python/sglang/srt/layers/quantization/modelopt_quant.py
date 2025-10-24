@@ -227,10 +227,13 @@ class ModelOptFp8Config(ModelOptQuantConfig):
             exclude_modules=exclude_modules,
             packed_modules_mapping=config.get("packed_modules_mapping"),
         )
-        
+
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        if user_quant == "modelopt" and hf_quant_cfg.get("quant_method", "") == "modelopt_fp8":
+        if (
+            user_quant == "modelopt"
+            and hf_quant_cfg.get("quant_method", "") == "modelopt_fp8"
+        ):
             return cls.get_name()
         return None
 
