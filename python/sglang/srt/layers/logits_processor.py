@@ -579,7 +579,6 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.gathered_buffer,
                 hidden_states,
             )
-            
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
         if hasattr(lm_head, "weight"):

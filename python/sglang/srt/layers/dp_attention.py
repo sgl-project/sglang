@@ -362,13 +362,15 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
 
     if forward_batch.dp_local_start_pos is None:
         # Select metadata source based on context
-        if type(forward_batch).__name__ == 'LogitsMetadata' and \
-           hasattr(forward_batch, 'global_num_tokens_for_logprob_gpu') and \
-           forward_batch.global_num_tokens_for_logprob_gpu is not None:
+        if (
+            type(forward_batch).__name__ == "LogitsMetadata"
+            and hasattr(forward_batch, "global_num_tokens_for_logprob_gpu")
+            and forward_batch.global_num_tokens_for_logprob_gpu is not None
+        ):
             global_num_tokens_source = forward_batch.global_num_tokens_for_logprob_gpu
         else:
             global_num_tokens_source = forward_batch.global_num_tokens_gpu
-        
+
         cumtokens = torch.cumsum(global_num_tokens_source, dim=0)
         if dp_rank == 0:
             local_start_pos = torch.zeros_like(cumtokens[0])
@@ -430,12 +432,14 @@ def _dp_gather_via_all_reduce(
     is_partial: bool,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
-    
+
     # Fix potential metadata mismatch: scheduler's num_tokens_for_logprob may not account
     # for pruning done by logits_processor. Use actual tensor size as authoritative source.
     actual_local_size = local_tokens.shape[0]
     if isinstance(local_num_tokens, torch.Tensor):
-        local_num_tokens.fill_(actual_local_size)  # In-place update for CUDA graph compatibility
+        local_num_tokens.fill_(
+            actual_local_size
+        )  # CUDA graph compatibility
     else:
         local_num_tokens = actual_local_size
 
