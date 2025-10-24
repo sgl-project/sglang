@@ -355,27 +355,16 @@ def disable_dp_size():
 
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Compute local token range for current DP rank.
-    # For LogitsMetadata, use global_num_tokens_for_logprob_gpu (pruned tokens needing logits).
-    # For ForwardBatch (MLP/Attention), use global_num_tokens_gpu (all tokens in batch).
+    # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
     dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
-        # Select metadata source based on context
-        if (
-            type(forward_batch).__name__ == "LogitsMetadata"
-            and forward_batch.global_num_tokens_for_logprob_gpu is not None
-        ):
-            global_num_tokens_source = forward_batch.global_num_tokens_for_logprob_gpu
-        else:
-            global_num_tokens_source = forward_batch.global_num_tokens_gpu
-
-        cumtokens = torch.cumsum(global_num_tokens_source, dim=0)
+        cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
         if dp_rank == 0:
             local_start_pos = torch.zeros_like(cumtokens[0])
         else:
             local_start_pos = cumtokens[dp_rank - 1]
-        local_num_tokens = global_num_tokens_source[dp_rank]
+        local_num_tokens = forward_batch.global_num_tokens_gpu[dp_rank]
 
         forward_batch.dp_local_start_pos = local_start_pos
         forward_batch.dp_local_num_tokens = local_num_tokens
@@ -430,13 +419,22 @@ def _dp_gather_via_all_reduce(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    # LogitsMetadata should have dp_local_start_pos set by compute_dp_attention_metadata().
+    # Avoid calling get_dp_local_info() to maintain separation of concerns.
+    if type(forward_batch).__name__ == "LogitsMetadata":
+        assert (
+            forward_batch.dp_local_start_pos is not None
+        ), "LogitsMetadata.dp_local_start_pos should be set by compute_dp_attention_metadata()"
+        local_start_pos = forward_batch.dp_local_start_pos
+        local_num_tokens = forward_batch.dp_local_num_tokens
+    else:
+        # ForwardBatch: compute position info using global_num_tokens_gpu
+        local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    # Fix potential metadata mismatch: scheduler's num_tokens_for_logprob may not account
-    # for pruning done by logits_processor. Use actual tensor size as authoritative source.
+    # Use actual tensor size for correctness (scheduler's estimate may not account for pruning)
     actual_local_size = local_tokens.shape[0]
     if isinstance(local_num_tokens, torch.Tensor):
-        local_num_tokens.fill_(actual_local_size)  # CUDA graph compatibility
+        local_num_tokens.fill_(actual_local_size)
     else:
         local_num_tokens = actual_local_size
 
