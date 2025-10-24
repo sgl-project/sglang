@@ -21,6 +21,14 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.metrics.collector import StorageMetricsCollector
+from sglang.srt.tracing.trace import (
+    trace_event,
+    trace_req_finish,
+    trace_req_start,
+    trace_set_thread_info,
+    trace_slice_end,
+    trace_slice_start,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -424,6 +432,9 @@ class HiRadixCache(RadixCache):
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
+        # Create a unique request ID for load back operations
+        load_back_req_id = f"load_back_{node.id}_{time.monotonic_ns()}"
+        trace_req_start(load_back_req_id, None)
 
         last_hit_node = node
         nodes_to_load = []
@@ -446,6 +457,7 @@ class HiRadixCache(RadixCache):
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancester_node)
+            trace_req_finish(load_back_req_id)
             return None
 
         device_indices = self.cache_controller.load(
@@ -459,6 +471,7 @@ class HiRadixCache(RadixCache):
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
+            trace_req_finish(load_back_req_id)
             return None
 
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
@@ -469,6 +482,7 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
+        trace_req_finish(load_back_req_id)
         return device_indices
 
     def init_load_back(
@@ -671,9 +685,15 @@ class HiRadixCache(RadixCache):
         return True
 
     def match_prefix(self, key: RadixKey, **kwargs):
+        trace_slice_start("hicache_match_prefix", str(kwargs.get('rid', 'unknown')))
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key.token_ids = self.key_convert_fn(key.token_ids)
         if self.disable or len(key) == 0:
+            trace_slice_end("hicache_match_prefix", str(kwargs.get('rid', 'unknown')), attrs={
+                "cache_disabled": self.disable,
+                "key_length": len(key),
+                "host_hit_length": 0,
+            })
             return MatchResult(
                 device_indices=empty_value,
                 last_device_node=self.root_node,
@@ -699,6 +719,11 @@ class HiRadixCache(RadixCache):
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
+        trace_slice_end("hicache_match_prefix", str(kwargs.get('rid', 'unknown')), attrs={
+            "key_length": len(key),
+            "host_hit_length": host_hit_length,
+            "device_hit_length": len(value),
+        })
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
