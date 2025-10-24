@@ -27,6 +27,7 @@ dependencies = [
   "einops",
   "fastapi",
   "flashinfer_python==0.4.1",
+  "gguf",
   "hf_transfer",
   "huggingface_hub",
   "interegular",
