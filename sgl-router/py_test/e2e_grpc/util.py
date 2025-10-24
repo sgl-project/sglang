@@ -8,6 +8,7 @@ Extracted and adapted from:
 - sglang.test.test_utils (constants and CustomTestCase)
 """
 
+import logging
 import os
 import signal
 import threading
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import Optional, Union
 
 import psutil
+
+logger = logging.getLogger(__name__)
 
 try:
     from transformers import (
@@ -204,8 +207,8 @@ def get_tokenizer(
         raise RuntimeError(err_msg) from e
 
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
-        print(
-            f"Warning: Using a slow tokenizer. This might cause a performance "
+        logger.warning(
+            f"Using a slow tokenizer. This might cause a performance "
             f"degradation. Consider using a fast tokenizer instead."
         )
 
@@ -245,14 +248,10 @@ class CustomTestCase(unittest.TestCase):
                 return super(CustomTestCase, self)._callTestMethod(method)
             except Exception as e:
                 if attempt < max_retry:
-                    print(
+                    logger.info(
                         f"Test failed on attempt {attempt + 1}/{max_retry + 1}, retrying..."
                     )
                     continue
                 else:
                     # Last attempt, re-raise the exception
                     raise
-
-    def setUp(self):
-        """Print test method name at the start of each test."""
-        print(f"[Test Method] {self._testMethodName}", flush=True)
