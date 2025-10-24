@@ -586,7 +586,7 @@ async fn execute_harmony_internal_single(
     // 9. Process output tokens through Harmony parser
     // Use None for role to allow parser to detect role from token stream
     // This is needed for gpt-oss models that use channel-first format
-    let mut parser = StreamableParser::new(encoding.clone(), None)
+    let mut parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
         .map_err(|e| format!("Failed to create Harmony parser: {}", e))?;
 
     // Extract output token IDs directly from backend response
@@ -1601,7 +1601,7 @@ async fn process_harmony_stream(
     let encoding = get_harmony_encoding();
     // Use None for role to allow parser to detect role from token stream
     // This is needed for gpt-oss models that use channel-first format
-    let mut parser = StreamableParser::new(encoding.clone(), None)
+    let mut parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
         .map_err(|e| format!("Failed to create parser: {}", e))?;
 
     // Track streaming state for granular events
