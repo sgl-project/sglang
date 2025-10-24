@@ -517,6 +517,10 @@ async fn execute_harmony_internal_single(
         .map_err(|e| format!("Failed to read response body: {}", e))?;
 
     // 7. Parse GenerateResponse
+    debug!(
+        "Response body bytes: {}",
+        String::from_utf8_lossy(&body_bytes)
+    );
     let generate_resp: GenerateResponse = serde_json::from_slice(&body_bytes)
         .map_err(|e| format!("Failed to parse generate response: {}", e))?;
 
