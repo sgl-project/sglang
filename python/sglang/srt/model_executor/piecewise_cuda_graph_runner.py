@@ -262,9 +262,14 @@ class PiecewiseCudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         num_tokens = len(forward_batch.input_ids)
-        # TODO(yuwei): support return logprob
+        # TODO(yuwei): support return input_ids' logprob
         if forward_batch.return_logprob:
-            return False
+            for start_len, seq_len in zip(
+                forward_batch.extend_logprob_start_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            ):
+                if start_len is not None and start_len < seq_len:
+                    return False
         if num_tokens <= self.max_num_tokens:
             return True
         return False
@@ -438,7 +443,7 @@ class PiecewiseCudaGraphRunner:
             out_cache_loc=out_cache_loc,
             seq_lens_sum=forward_batch.seq_lens_sum,
             encoder_lens=forward_batch.encoder_lens,
-            return_logprob=forward_batch.return_logprob,
+            return_logprob=False,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             extend_start_loc=forward_batch.extend_start_loc,

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -76,13 +77,26 @@ class SchedulerOutputProcessorMixin:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if req.is_retracted:
+                if self.enable_overlap and req.is_retracted and len(req.output_ids) > 0:
+                    req_idx = batch.req_pool_indices[i]
+                    seq_len = len(req.origin_input_ids) + len(req.output_ids)
+                    pos = batch.req_to_token_pool.req_to_token[req_idx][
+                        seq_len - 1 : seq_len
+                    ]
+                    self.token_to_kv_pool_allocator.free(pos)
                     continue
 
-                if self.is_mixed_chunk and self.enable_overlap and req.finished():
+                if (
+                    self.is_mixed_chunk
+                    and self.enable_overlap
+                    and (req.finished() or req.is_retracted)
+                ):
                     # Free the one delayed token for the mixed decode batch
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
+                    continue
+
+                if req.is_retracted:
                     continue
 
                 if req.is_chunked <= 0:
@@ -175,7 +189,21 @@ class SchedulerOutputProcessorMixin:
                             logprob_pt += num_input_logprobs
 
         else:  # embedding or reward model
-            embeddings = result.embeddings.tolist()
+            is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+
+            embeddings = result.embeddings
+
+            if is_sparse:
+                batch_ids, token_ids = embeddings.indices()
+                values = embeddings.values()
+
+                embeddings = [{} for _ in range(embeddings.size(0))]
+                for i in range(batch_ids.shape[0]):
+                    embeddings[batch_ids[i].item()][token_ids[i].item()] = values[
+                        i
+                    ].item()
+            else:
+                embeddings = embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -254,10 +282,8 @@ class SchedulerOutputProcessorMixin:
         # We should ignore using next_token_ids for spec decoding cases.
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
-            if req.is_retracted:
-                continue
 
-            if self.enable_overlap and req.finished():
+            if self.enable_overlap and (req.finished() or req.is_retracted):
                 indices_to_free = None
                 if batch.spec_algorithm.is_eagle():
                     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -284,6 +310,9 @@ class SchedulerOutputProcessorMixin:
 
                 if indices_to_free is not None:
                     self.token_to_kv_pool_allocator.free(indices_to_free)
+                continue
+
+            if req.is_retracted:
                 continue
 
             new_accepted_len = 1
