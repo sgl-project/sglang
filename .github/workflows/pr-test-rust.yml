@@ -48,6 +48,7 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
+          cargo clean
           cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run fmt
