@@ -311,12 +311,19 @@ async fn execute_harmony_with_mcp_loop(
 
         debug!("Harmony MCP loop iteration {}", iteration);
         debug!(
-            "Current request input: {} items",
+            "Current request input: {}",
             match &current_request.input {
-                ResponseInput::Text(t) => format!("Text({})", t.chars().take(100).collect::<String>()),
+                ResponseInput::Text(t) => format!("Text({})", t),
                 ResponseInput::Items(items) => format!("{} items", items.len()),
             }
         );
+
+        // Log detailed input items
+        if let ResponseInput::Items(items) = &current_request.input {
+            for (idx, item) in items.iter().enumerate() {
+                debug!("  Input item {}: {:?}", idx, item);
+            }
+        }
 
         // Execute generation (with MCP manager for tool descriptions)
         let responses_response = execute_harmony_internal_single(
