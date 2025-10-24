@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -6,6 +7,7 @@ from typing import Iterable, List, Optional, Tuple
 import pytest
 import requests
 
+from ..fixtures.generate_test_certs import generate_all_certificates
 from ..fixtures.ports import find_free_port
 from ..fixtures.router_manager import RouterManager
 
@@ -106,3 +108,21 @@ def mock_workers():
                     p.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     p.kill()
+
+
+@pytest.fixture(scope="session")
+def test_certificates():
+    """Generate test certificates for mTLS tests, clean up after session."""
+    # Get the test_certs directory path
+    fixtures_dir = Path(__file__).parent.parent / "fixtures"
+    certs_dir = fixtures_dir / "test_certs"
+
+    # Generate certificates
+    generate_all_certificates(certs_dir)
+
+    # Yield the path to the certificates directory
+    yield certs_dir
+
+    # Cleanup: remove the generated certificates
+    if certs_dir.exists():
+        shutil.rmtree(certs_dir)
