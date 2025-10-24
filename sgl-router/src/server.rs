@@ -20,14 +20,15 @@ use tokio::{net::TcpListener, signal, spawn};
 use tracing::{error, info, warn, Level};
 
 use crate::{
-    config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
+    config::{HistoryBackend, RouterConfig, RoutingMode},
     core::{
         worker_to_info,
         workflow::{
             create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
             WorkflowEngine,
         },
-        Job, JobQueue, JobQueueConfig, LoadMonitor, WorkerManager, WorkerRegistry, WorkerType,
+        ConnectionMode, Job, JobQueue, JobQueueConfig, LoadMonitor, WorkerManager, WorkerRegistry,
+        WorkerType,
     },
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
@@ -825,11 +826,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     };
 
     // Initialize tokenizer and parser factories for gRPC mode
-    let (tokenizer, reasoning_parser_factory, tool_parser_factory) = if config
-        .router_config
-        .connection_mode
-        == ConnectionMode::Grpc
-    {
+    let (tokenizer, reasoning_parser_factory, tool_parser_factory) = if matches!(
+        config.router_config.connection_mode,
+        ConnectionMode::Grpc { .. }
+    ) {
         let tokenizer_path = config
             .router_config
             .tokenizer_path

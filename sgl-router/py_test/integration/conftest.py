@@ -1,8 +1,7 @@
-import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import pytest
 import requests
