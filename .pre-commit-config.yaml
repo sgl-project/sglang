@@ -42,7 +42,8 @@ repos:
         exclude: |
           (?x)^(
             test/srt/test_reasoning_parser\.py|
-            docs/advanced_features/vlm_query\.ipynb
+            docs/advanced_features/vlm_query\.ipynb|
+            python/sglang/srt/sparse_attention/kernels/attention/.*\.py
           )$
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.8

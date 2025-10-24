@@ -1,14 +1,20 @@
 # Copyright (c) 2025, Tri Dao.
 
 # import math
-from typing import Optional
 from dataclasses import dataclass
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, Int32, if_generate
-from cutlass.pipeline import PipelineAsync, PipelineState, CooperativeGroup, pipeline_init_wait
-from cutlass.pipeline import PipelineUserType, PipelineOp
+from cutlass.pipeline import (
+    CooperativeGroup,
+    PipelineAsync,
+    PipelineOp,
+    PipelineState,
+    PipelineUserType,
+    pipeline_init_wait,
+)
 
 
 class PipelineStateSimple:
@@ -84,7 +90,9 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
     elif type is PipelineUserType.Consumer:
         return PipelineStateSimple(stages, Int32(0))
     else:
-        assert False, "Error: invalid PipelineUserType specified for make_pipeline_state."
+        assert (
+            False
+        ), "Error: invalid PipelineUserType specified for make_pipeline_state."
 
 
 @dataclass(frozen=True)
@@ -144,7 +152,9 @@ class PipelineTmaAsyncNoCluster(PipelineAsync):
             dst_rank,
         )
 
-    def producer_acquire(self, state: PipelineState, try_acquire_token: Optional[Boolean] = None):
+    def producer_acquire(
+        self, state: PipelineState, try_acquire_token: Optional[Boolean] = None
+    ):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
         """

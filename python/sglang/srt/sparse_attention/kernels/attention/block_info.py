@@ -1,11 +1,12 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-from typing import Tuple, Optional
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 
 from sglang.srt.sparse_attention.kernels.attention.seqlen_info import SeqlenInfoQK
+
 
 @dataclass(frozen=True)
 class BlockInfo:
@@ -29,8 +30,14 @@ class BlockInfo:
             if cutlass.const_expr(self.qhead_per_kvhead_packgqa > 1):
                 m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
-            n_idx_right = n_idx if cutlass.const_expr(self.is_causal) else n_idx + self.window_size_right
-            n_block_max = min(n_block_max, cute.ceil_div(n_idx_right, self.n_block_size))
+            n_idx_right = (
+                n_idx
+                if cutlass.const_expr(self.is_causal)
+                else n_idx + self.window_size_right
+            )
+            n_block_max = min(
+                n_block_max, cute.ceil_div(n_idx_right, self.n_block_size)
+            )
         n_block_min = 0
         if cutlass.const_expr(self.is_local and self.window_size_left is not None):
             m_idx_min = m_block * self.m_block_size
@@ -76,4 +83,6 @@ class BlockInfo:
                 m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_left = n_idx - self.window_size_left
-            return cutlass.max(n_block_min, cute.ceil_div(n_idx_left, self.n_block_size))
+            return cutlass.max(
+                n_block_min, cute.ceil_div(n_idx_left, self.n_block_size)
+            )
