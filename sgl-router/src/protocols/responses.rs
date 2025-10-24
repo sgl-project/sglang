@@ -8,8 +8,8 @@ use serde_json::Value;
 
 // Import shared types from common module
 use super::common::{
-    default_true, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo, StringOrArray, ToolChoice,
-    UsageInfo,
+    default_model, default_true, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo,
+    StringOrArray, ToolChoice, UsageInfo,
 };
 
 // ============================================================================
@@ -411,6 +411,14 @@ fn default_repetition_penalty() -> f32 {
     1.0
 }
 
+fn default_temperature() -> Option<f32> {
+    Some(1.0)
+}
+
+fn default_top_p() -> Option<f32> {
+    Some(1.0)
+}
+
 // ============================================================================
 // Request/Response Types
 // ============================================================================
@@ -444,9 +452,9 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, Value>>,
 
-    /// Model to use (optional to match vLLM)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    /// Model to use
+    #[serde(default = "default_model")]
+    pub model: String,
 
     /// Optional conversation id to persist input/output as items
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -477,7 +485,10 @@ pub struct ResponsesRequest {
     pub stream: Option<bool>,
 
     /// Temperature for sampling
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "default_temperature",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub temperature: Option<f32>,
 
     /// Tool choice behavior
@@ -493,7 +504,7 @@ pub struct ResponsesRequest {
     pub top_logprobs: Option<u32>,
 
     /// Top-p sampling parameter
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_top_p", skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
     /// Truncation behavior
@@ -554,7 +565,7 @@ impl Default for ResponsesRequest {
             max_output_tokens: None,
             max_tool_calls: None,
             metadata: None,
-            model: None,
+            model: default_model(),
             conversation: None,
             parallel_tool_calls: None,
             previous_response_id: None,
@@ -587,7 +598,7 @@ impl GenerationRequest for ResponsesRequest {
     }
 
     fn get_model(&self) -> Option<&str> {
-        self.model.as_deref()
+        Some(self.model.as_str())
     }
 
     fn extract_text_for_routing(&self) -> String {

@@ -83,6 +83,7 @@ QUANTIZATION_CHOICES = [
     "bitsandbytes",
     "gguf",
     "modelopt",
+    "modelopt_fp8",
     "modelopt_fp4",
     "petit_nvfp4",
     "w8a8_int8",
@@ -128,7 +129,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
-NSA_CHOICES = ["flashmla_prefill", "flashmla_decode", "fa3", "tilelang", "aiter"]
+NSA_CHOICES = ["flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "aiter"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
@@ -192,6 +193,8 @@ class ServerArgs:
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
     modelopt_checkpoint_save_path: Optional[str] = None
+    modelopt_export_path: Optional[str] = None
+    quantize_and_serve: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -205,6 +208,7 @@ class ServerArgs:
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
+    checkpoint_engine_wait_weights_before_ready: bool = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -324,8 +328,8 @@ class ServerArgs:
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
-    nsa_prefill: str = "flashmla_prefill"
-    nsa_decode: str = "fa3"
+    nsa_prefill_backend: str = "flashmla_sparse"
+    nsa_decode_backend: str = "fa3"
 
     # Speculative decoding
     enable_beta_spec: bool = False
@@ -430,6 +434,7 @@ class ServerArgs:
     enable_symm_mem: bool = False
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
     enable_tokenizer_batch_encode: bool = False
+    disable_tokenizer_batch_decode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
@@ -596,6 +601,9 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+        # Handle elastic expert parallelism.
+        self._handle_elastic_ep()
 
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
@@ -884,14 +892,19 @@ class ServerArgs:
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
                     )
-                if (
-                    self.quantization == "modelopt_fp4"
-                    and self.moe_runner_backend == "auto"
-                ):
+                if self.moe_runner_backend == "auto":
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
-                        "Use flashinfer_trtllm as moe runner backend on sm100 for DeepseekV3ForCausalLM"
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
+                    if self.quantization is None:
+                        # Default DeepSeek V3/R1 native FP8 when not explicitly set,
+                        # Because we need this condition for an assertion in
+                        # flashinfer_trtllm MoE runner backend.
+                        self.quantization = "fp8"
+                        logger.info(
+                            "Quantization not specified, default to fp8 for DeepSeek on sm100"
+                        )
 
         elif model_arch in ["GptOssForCausalLM"]:
             if (
@@ -958,7 +971,13 @@ class ServerArgs:
                 "fa3",
                 "aiter",
                 "triton",
-            }, "fa3, aiter, or triton is required for Llama4 model"
+                "trtllm_mha",
+            }, "fa3, aiter, triton, or trtllm_mha is required for Llama4 model"
+            if is_sm100_supported() and self.attention_backend is None:
+                self.attention_backend = "trtllm_mha"
+                logger.warning(
+                    "Use trtllm_mha as attention backend on sm100 for Llama4 model"
+                )
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
@@ -1024,10 +1043,10 @@ class ServerArgs:
                     logger.warning("Setting KV cache dtype to fp8.")
 
                 if self.kv_cache_dtype == "fp8_e4m3":
-                    self.nsa_prefill = "flashmla_decode"
-                    self.nsa_decode = "flashmla_decode"
+                    self.nsa_prefill_backend = "flashmla_kv"
+                    self.nsa_decode_backend = "flashmla_kv"
                     logger.warning(
-                        "Setting NSA backend to flashmla_decode for FP8 KV Cache."
+                        "Setting NSA backend to flashmla_kv for FP8 KV Cache."
                     )
 
                 # Logging env vars for NSA
@@ -1221,6 +1240,15 @@ class ServerArgs:
 
         if self.enable_eplb:
             assert self.ep_size > 1
+
+    def _handle_elastic_ep(self):
+        if self.elastic_ep_backend is not None:
+            if self.enable_eplb:
+                if self.eplb_algorithm == "auto":
+                    self.eplb_algorithm = "elasticity_aware"
+                assert (
+                    self.eplb_algorithm == "elasticity_aware"
+                ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -1688,6 +1716,12 @@ class ServerArgs:
             default=ServerArgs.nccl_port,
             help="The port for NCCL distributed environment setup. Defaults to a random port.",
         )
+        parser.add_argument(
+            "--checkpoint-engine-wait-weights-before-ready",
+            action="store_true",
+            help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
+            "before serving inference requests.",
+        )
 
         # Quantization and data type
         parser.add_argument(
@@ -1742,6 +1776,22 @@ class ServerArgs:
             default=ServerArgs.modelopt_checkpoint_save_path,
             help="Path to save the ModelOpt quantized checkpoint after quantization. "
             "This allows reusing the quantized model in future runs.",
+        )
+        parser.add_argument(
+            "--modelopt-export-path",
+            type=str,
+            default=ServerArgs.modelopt_export_path,
+            help="Path to export the quantized model in HuggingFace format after ModelOpt quantization. "
+            "The exported model can then be used directly with SGLang for inference. "
+            "If not provided, the model will not be exported.",
+        )
+        parser.add_argument(
+            "--quantize-and-serve",
+            action="store_true",
+            default=ServerArgs.quantize_and_serve,
+            help="Quantize the model with ModelOpt and immediately serve it without exporting. "
+            "This is useful for development and prototyping. For production, it's recommended "
+            "to use separate quantization and deployment steps.",
         )
         parser.add_argument(
             "--kv-cache-dtype",
@@ -2356,14 +2406,14 @@ class ServerArgs:
             help="Set multimodal attention backend.",
         )
         parser.add_argument(
-            "--nsa-prefill",
-            default=ServerArgs.nsa_prefill,
+            "--nsa-prefill-backend",
+            default=ServerArgs.nsa_prefill_backend,
             type=str,
             choices=NSA_CHOICES,
         )
         parser.add_argument(
-            "--nsa-decode",
-            default=ServerArgs.nsa_decode,
+            "--nsa-decode-backend",
+            default=ServerArgs.nsa_decode_backend,
             type=str,
             choices=NSA_CHOICES,
         )
@@ -2866,6 +2916,11 @@ class ServerArgs:
             "--enable-tokenizer-batch-encode",
             action="store_true",
             help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
+        )
+        parser.add_argument(
+            "--disable-tokenizer-batch-decode",
+            action="store_true",
+            help="Disable batch decoding when decoding multiple completions.",
         )
         parser.add_argument(
             "--disable-outlines-disk-cache",
