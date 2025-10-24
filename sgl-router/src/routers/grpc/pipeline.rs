@@ -587,11 +587,8 @@ impl PipelineStage for DispatchMetadataStage {
                     .unwrap_or_else(|| "default".to_string())
             }
             RequestType::Responses(req) => {
-                // Responses requests have optional model field
-                req.model
-                    .clone()
-                    .or_else(|| ctx.input.model_id.clone())
-                    .unwrap_or_else(|| "default".to_string())
+                // Responses requests have model field (with default)
+                req.model.clone()
             }
         };
 

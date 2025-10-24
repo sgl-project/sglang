@@ -268,7 +268,7 @@ impl RouterTrait for GrpcRouter {
         model_id: Option<&str>,
     ) -> Response {
         // Determine model name for Harmony detection
-        let model_name = body.model.as_deref().or(model_id).unwrap_or("default");
+        let model_name = model_id.unwrap_or(body.model.as_str());
 
         // Branch based on model type
         if responses::is_harmony_model(model_name) {

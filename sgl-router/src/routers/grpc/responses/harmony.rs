@@ -96,7 +96,7 @@ pub async fn route_harmony_responses(
 ) -> Response {
     debug!(
         "Processing Harmony responses request for model: {:?}",
-        model_id.as_deref().or(body.model.as_deref())
+        model_id.as_deref().unwrap_or(&body.model)
     );
 
     // 1. Validate request parameters (same as non-Harmony)
@@ -605,7 +605,7 @@ async fn execute_harmony_internal_single(
         incomplete_details: None,
         instructions: body.instructions.clone(),
         max_output_tokens: body.max_output_tokens,
-        model: body.model.clone().unwrap_or_else(|| "gpt-oss".to_string()),
+        model: body.model.clone(),
         output: output_items,
         parallel_tool_calls: body.parallel_tool_calls.unwrap_or(true),
         previous_response_id: body.previous_response_id.clone(),
@@ -1113,6 +1113,61 @@ fn convert_input_to_harmony_messages(
                         content_type: Some("json".to_string()),
                     });
                 }
+            }
+
+            ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
+                // Simple input message: Convert to Harmony message
+                use crate::protocols::responses::StringOrContentParts;
+
+                // Extract text from content (string or array of parts)
+                let text = match content {
+                    StringOrContentParts::String(s) => s.clone(),
+                    StringOrContentParts::Array(parts) => {
+                        parts
+                            .iter()
+                            .filter_map(|c| match c {
+                                ResponseContentPart::InputText { text } => Some(text.as_str()),
+                                ResponseContentPart::OutputText { text, .. } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("")
+                    }
+                };
+
+                // Convert role to Harmony Role
+                let (harmony_role, text_prefix) = match role.as_str() {
+                    "user" => (Role::User, ""),
+                    "assistant" => (Role::Assistant, ""),
+                    "system" => {
+                        // System messages from user become developer messages
+                        // with "Instructions:\n" prefix
+                        (Role::Developer, "Instructions:\n")
+                    }
+                    "developer" => (Role::Developer, ""),
+                    _ => (Role::User, ""), // Default to user
+                };
+
+                // Create Harmony Message
+                let mut msg = HarmonyMessage {
+                    author: Author {
+                        role: harmony_role,
+                        name: None,
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent {
+                        text: format!("{}{}", text_prefix, text),
+                    })],
+                    channel: None,
+                    content_type: None,
+                };
+
+                // Set channel="final" for assistant messages
+                if role == "assistant" {
+                    msg.channel = Some("final".to_string());
+                }
+
+                messages.push(msg);
             }
         }
     }
@@ -1797,8 +1852,7 @@ async fn process_harmony_stream(
         max_output_tokens: original_request.max_output_tokens,
         model: original_request
             .model
-            .clone()
-            .unwrap_or_else(|| "gpt-oss".to_string()),
+            .clone(),
         output: all_output_items,
         parallel_tool_calls: original_request.parallel_tool_calls.unwrap_or(true),
         previous_response_id: original_request.previous_response_id.clone(),

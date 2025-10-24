@@ -39,39 +39,66 @@ pub trait GenerationRequest: Send + Sync {
 // String/Array Utilities
 // ============================================================================
 
-/// A type that can be either a single string or an array of strings
+/// Generic type that can be either a single string or an array of T
+///
+/// This type provides a flexible way to accept JSON inputs that can be either:
+/// - A simple string value
+/// - An array of typed elements
+///
+/// # Examples
+///
+/// For simple string arrays (e.g., stop tokens):
+/// ```rust
+/// type StringOrArray = StringOr<String>;
+/// // Accepts: "stop" or ["stop1", "stop2"]
+/// ```
+///
+/// For structured content arrays:
+/// ```rust
+/// type StringOrContentParts = StringOr<ContentPart>;
+/// // Accepts: "text" or [{"type": "text", "text": "hello"}]
+/// ```
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum StringOrArray {
+pub enum StringOr<T> {
     String(String),
-    Array(Vec<String>),
+    Array(Vec<T>),
 }
 
-impl StringOrArray {
-    /// Get the number of items in the StringOrArray
+impl<T> StringOr<T>
+where
+    T: Clone,
+{
+    /// Get the number of items
     pub fn len(&self) -> usize {
         match self {
-            StringOrArray::String(_) => 1,
-            StringOrArray::Array(arr) => arr.len(),
+            StringOr::String(_) => 1,
+            StringOr::Array(arr) => arr.len(),
         }
     }
 
-    /// Check if the StringOrArray is empty
+    /// Check if empty
     pub fn is_empty(&self) -> bool {
         match self {
-            StringOrArray::String(s) => s.is_empty(),
-            StringOrArray::Array(arr) => arr.is_empty(),
-        }
-    }
-
-    /// Convert to a vector of strings
-    pub fn to_vec(&self) -> Vec<String> {
-        match self {
-            StringOrArray::String(s) => vec![s.clone()],
-            StringOrArray::Array(arr) => arr.clone(),
+            StringOr::String(s) => s.is_empty(),
+            StringOr::Array(arr) => arr.is_empty(),
         }
     }
 }
+
+impl StringOr<String> {
+    /// Convert to a vector of strings (only available for StringOr<String>)
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            StringOr::String(s) => vec![s.clone()],
+            StringOr::Array(arr) => arr.clone(),
+        }
+    }
+}
+
+/// Type alias for backward compatibility: string or array of strings
+/// Common use case: stop tokens, which can be a single string or multiple strings
+pub type StringOrArray = StringOr<String>;
 
 // ============================================================================
 // Content Parts (for multimodal messages)
@@ -92,6 +119,12 @@ pub struct ImageUrl {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
 }
+
+/// Type alias for message content that can be either a simple string or array of structured ContentPart objects
+/// Use case: OpenAI message content field which accepts either:
+/// - Simple text: "Hello world"
+/// - Structured content: [{"type": "text", "text": "Hello"}, {"type": "image_url", "image_url": {...}}]
+pub type StringOrContentParts = StringOr<ContentPart>;
 
 // ============================================================================
 // Response Format (for structured outputs)
