@@ -90,6 +90,7 @@ class SchedulerOutputProcessorMixin:
                     self.is_mixed_chunk
                     and self.enable_overlap
                     and (req.finished() or req.is_retracted)
+                    and not self.server_args.use_mem_cache_v2
                 ):
                     # Free the one delayed token for the mixed decode batch
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
@@ -105,11 +106,18 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        self.tree_cache.cache_finished_req(req)
+                        if self.server_args.use_mem_cache_v2:
+                            self.memory_manager.update_cache(req)
+                            self.memory_manager.release_req(req)
+                        else:
+                            self.tree_cache.cache_finished_req(req)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
-                        self.tree_cache.cache_unfinished_req(req)
+                        if self.server_args.use_mem_cache_v2:
+                            self.memory_manager.update_cache(req)
+                        else:
+                            self.tree_cache.cache_unfinished_req(req)
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
@@ -283,7 +291,11 @@ class SchedulerOutputProcessorMixin:
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
-            if self.enable_overlap and (req.finished() or req.is_retracted):
+            if (
+                self.enable_overlap
+                and (req.finished() or req.is_retracted)
+                and not self.server_args.use_mem_cache_v2
+            ):
                 indices_to_free = None
                 if batch.spec_algorithm.is_eagle():
                     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -341,12 +353,16 @@ class SchedulerOutputProcessorMixin:
                     ][start_p:end_p]
                     self.token_to_kv_pool_allocator.free(indices_to_free)
 
-                if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                    # Asynchronously offload KV cache; cache_finished_req will be called after Device->Host transfer completes
-                    if not self.decode_offload_manager.offload_kv_cache(req):
-                        self.tree_cache.cache_finished_req(req)
+                if self.server_args.use_mem_cache_v2:
+                    self.memory_manager.update_cache(req)
+                    self.memory_manager.release_req(req)
                 else:
-                    self.tree_cache.cache_finished_req(req)
+                    if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                        # Asynchronously offload KV cache; cache_finished_req will be called after Device->Host transfer completes
+                        if not self.decode_offload_manager.offload_kv_cache(req):
+                            self.tree_cache.cache_finished_req(req)
+                    else:
+                        self.tree_cache.cache_finished_req(req)
 
                 req.time_stats.completion_time = time.perf_counter()
 

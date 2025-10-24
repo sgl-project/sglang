@@ -78,6 +78,20 @@ class CacheIndex(ABC):
         """
         pass
 
+    @abstractmethod
+    def evictable_size(self) -> int:
+        """
+        Get the evictable size of the cache.
+        """
+        pass
+
+    @abstractmethod
+    def protected_size(self) -> int:
+        """
+        Get the protected size of the cache.
+        """
+        pass
+
 
 class ReqPool:
     def __init__(self, size: int, max_context_len: int, device: str):

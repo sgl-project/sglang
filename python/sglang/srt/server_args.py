@@ -606,6 +606,9 @@ class ServerArgs:
         # Handle elastic expert parallelism.
         self._handle_elastic_ep()
 
+        # Handle memory cache v2.
+        self._handle_mem_cache_v2()
+
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
@@ -1239,6 +1242,15 @@ class ServerArgs:
                 assert (
                     self.eplb_algorithm == "elasticity_aware"
                 ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
+
+    def _handle_mem_cache_v2(self):
+        if not self.use_mem_cache_v2:
+            return
+        assert self.speculative_algorithm is None
+        assert self.disaggregation_mode == "null"
+        assert self.enable_hierarchical_cache is False
+        assert self.attention_backend == "flashinfer"
+        assert self.enable_mixed_chunk is False
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (

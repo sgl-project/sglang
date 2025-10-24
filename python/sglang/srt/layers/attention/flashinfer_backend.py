@@ -138,6 +138,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        # Enable mem-cache v2 integration path
+        self.use_mem_cache_v2 = model_runner.server_args.use_mem_cache_v2
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -400,6 +402,15 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # In v2, set req_to_token from forward_batch.token_to_kv_pool (CacheView)
+        if self.use_mem_cache_v2:
+            self.indices_updater_decode.req_to_token = (
+                forward_batch.token_to_kv_pool.req_to_token
+            )
+            self.indices_updater_prefill.req_to_token = (
+                forward_batch.token_to_kv_pool.req_to_token
+            )
+
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -705,9 +716,19 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                    if self.use_mem_cache_v2:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer.layer_id,
+                            cache_loc,
+                            k,
+                            v,
+                            layer.k_scale,
+                            layer.v_scale,
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
 
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -776,9 +797,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
+                if self.use_mem_cache_v2:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer.layer_id, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -803,9 +829,14 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
+                if self.use_mem_cache_v2:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer.layer_id, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
 
         # Call the wrapped function
         o = decode_wrapper.forward(
@@ -846,12 +877,18 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.use_mem_cache_v2 = model_runner.server_args.use_mem_cache_v2
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        # In v1, use model_runner's req_to_token; in v2, will use token_to_kv_pool.req_to_token
+        if not self.use_mem_cache_v2:
+            self.req_to_token = model_runner.req_to_token_pool.req_to_token
+            self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        else:
+            self.req_to_token = None  # Will be set from forward_batch.token_to_kv_pool
+            self.token_to_kv_pool_allocator = None
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1106,13 +1143,19 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.use_mem_cache_v2 = model_runner.server_args.use_mem_cache_v2
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        # In v1, use model_runner's req_to_token; in v2, will use token_to_kv_pool.req_to_token
+        if not self.use_mem_cache_v2:
+            self.req_to_token = model_runner.req_to_token_pool.req_to_token
+            self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        else:
+            self.req_to_token = None  # Will be set from forward_batch.token_to_kv_pool
+            self.token_to_kv_pool_allocator = None
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
         # Dispatch the update function

@@ -716,6 +716,51 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
+        if self.server_args.use_mem_cache_v2:
+            assert self.model_config.is_generation
+            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+            from sglang.srt.mem_cache_v2.chunk_cache import ChunkCache as ChunkCache_V2
+            from sglang.srt.mem_cache_v2.memory_manager import MemoryManager
+            from sglang.srt.mem_cache_v2.memory_pool import MHAMemoryPool
+
+            token_to_kv_pool = self.tp_worker.model_runner.token_to_kv_pool
+            assert isinstance(
+                token_to_kv_pool, MHATokenToKVPool
+            ), "Token to kv pool should be an instance of MHATokenToKVPool"
+            num_layers = token_to_kv_pool.layer_num
+            memory_pool = MHAMemoryPool(
+                token_to_kv_pool.size,
+                token_to_kv_pool.page_size,
+                num_layers,
+                token_to_kv_pool.head_num,
+                token_to_kv_pool.head_dim,
+                token_to_kv_pool.dtype,
+                str(self.device),
+            )
+            # create v2 style memory pool
+
+            page_size = self.server_args.page_size if self.server_args.page_size else 1
+            cache_index = ChunkCache_V2(page_size=page_size)
+            size = int(self.tp_worker.model_runner.max_total_num_tokens)
+            max_ctx = self.tp_worker.model_runner.model_config.context_len
+            self.memory_manager = MemoryManager(
+                cache_index=cache_index,
+                memory_pools={tuple(range(num_layers)): memory_pool},
+                page_size=page_size,
+                size=size,
+                max_ctx=max_ctx,
+                device=str(self.device),
+            )
+            # remove v1 objects
+            self.req_to_token_pool = None
+            self.token_to_kv_pool_allocator = None
+            self.tp_worker.model_runner.token_to_kv_pool_allocator = None
+            self.tp_worker.model_runner.req_to_token_pool = None
+            self.tp_worker.model_runner.token_to_kv_pool = None
+            # inject the memory manager into the model runner
+            self.tp_worker.model_runner.memory_manager = self.memory_manager
+            return
+
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
@@ -1806,7 +1851,11 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        new_batch.prepare_for_extend(
+            memory_manager=(
+                self.memory_manager if self.server_args.use_mem_cache_v2 else None
+            )
+        )
 
         # Mixed-style chunked prefill
         if (
@@ -1871,7 +1920,11 @@ class Scheduler(
             batch.batch_is_full = False
 
         # Update batch tensors
-        batch.prepare_for_decode()
+        batch.prepare_for_decode(
+            memory_manager=(
+                self.memory_manager if self.server_args.use_mem_cache_v2 else None
+            )
+        )
         return batch
 
     # placeholder for override

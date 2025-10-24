@@ -26,11 +26,59 @@ class CacheView:
     req_to_token: (
         torch.Tensor
     )  # this req_to_token pool is on gpu and will be populated in model_runner.forward_* or cuda_graph_runner.replay_prepare
-    memory_pool: Any
+    memory_pools: dict[tuple[int, ...], MemoryPool]
     ready_event: Any  # event to wait for the transfer of this view to be ready
+
+    def _find_pool(self, layer_id: int) -> MemoryPool:
+        for layers, pool in self.memory_pools.items():
+            if layer_id in layers:
+                return pool
+        raise ValueError(f"Layer {layer_id} not found in memory pools")
+
+    # Expose the same API surface as legacy KVCache so attention code can stay unchanged
+    def get_kv_buffer(self, layer_id: int):
+        pool = self._find_pool(layer_id)
+        return pool.get_kv_buffer(layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+    ) -> None:
+        pool = self._find_pool(layer_id)
+        kbuf, vbuf = pool.get_kv_buffer(layer_id)
+        kk, vv = cache_k, cache_v
+        if kk.dtype != kbuf.dtype:
+            if k_scale is not None:
+                kk = kk / k_scale
+            if v_scale is not None:
+                vv = vv / v_scale
+            kk = kk.to(kbuf.dtype)
+            vv = vv.to(vbuf.dtype)
+        kbuf[loc] = kk
+        vbuf[loc] = vv
+
+    def transform_indices(
+        self, indices: torch.Tensor, *, layer_id: int
+    ) -> torch.Tensor:
+        # Allow attention updaters or forward paths to transform (e.g., SWA mapping) when needed
+        pool = self._find_pool(layer_id)
+        return pool.transform_indices(indices)
+
+    def is_ready(self, layer_id: int) -> bool:
+        """Check if the memory pool for this layer is ready (e.g., async transfers complete)."""
+        _ = self._find_pool(layer_id)
+        # For now, always ready; extend later for async transfer support
+        return True
 
 
 class Allocator:
+    """Allocator is just a glorified free list."""
+
     def __init__(self, size: int, page_size: int):
         self.size = size
         self.page_size = page_size
@@ -176,7 +224,7 @@ class MemoryManager:
         )
 
         return AllocationResult(
-            allocated_indices=allocated_indices.to(self.device),
+            allocated_indices=allocated_indices,
             req_pool_idx=req_pool_idx,
         )
 
@@ -197,7 +245,7 @@ class MemoryManager:
         req_info.allocated_len += num_token
         req_info.last_loc = new_indices[-1]
         return AllocationResult(
-            allocated_indices=new_indices_tensor.to(self.device),
+            allocated_indices=new_indices_tensor,
             req_pool_idx=req_info.req_pool_idx,
         )
 
@@ -234,8 +282,8 @@ class MemoryManager:
         ] = matched_indices[req_info.cached_len : matched_len]
 
         req_info.allocation_key = allocation_key
-        # After insert, aligned_len tokens are now in the tree
-        req_info.cached_len = aligned_len
+        # After insert, matched_len tokens are now in the tree
+        req_info.cached_len = matched_len
 
     def release_req(self, req: Req):
         """
@@ -289,3 +337,31 @@ class MemoryManager:
                     ready_event=None,  # for cpu -> gpu loading
                 )
         raise ValueError(f"Layer {layer_id} not found in memory pools")
+
+    def get_available_size(self):
+        return len(self.allocator.free_list) * self.page_size
+
+    def check(self):
+        """checking the integrity of the memory cache."""
+        num_free_pages = len(self.allocator.free_list)
+        allcoated_pages = 0
+        for req_info in self.req_info.values():
+            allcoated_pages += req_info.allocated_len // self.page_size
+            if req_info.last_loc % self.page_size != 0:
+                allcoated_pages += 1
+        if (
+            num_free_pages + allcoated_pages + self.cache_index.evictable_size()
+            != self.page_num
+        ):
+            raise RuntimeError(
+                f"Memory cache is corrupted: num_free_pages={num_free_pages}, allcoated_pages={allcoated_pages}, evictable_size={self.cache_index.evictable_size()}"
+            )
+
+        if len(self.req_info) == 0:  # no active requests
+            assert (
+                self.cache_index.protected_size() == 0
+            ), f"Protected size should be 0 when no active requests, but got {self.cache_index.protected_size()}"
+            assert (
+                self.cache_index.evictable_size() == num_free_pages * self.page_size
+            ), f"Evictable size should be equal to the number of free pages, but got {self.cache_index.evictable_size()}"
+            return

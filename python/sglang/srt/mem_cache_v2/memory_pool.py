@@ -56,7 +56,13 @@ class MemoryPool(ABC):
         pass
 
     def set_kv_buffer(
-        self, layer_id: int, tgt_loc: torch.Tensor, src_loc: torch.Tensor
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> None:
         pass
 
@@ -138,11 +144,26 @@ class MHAMemoryPool(MemoryPool):
         return self.k_buffers[layer_id], self.v_buffers[layer_id]
 
     def set_kv_buffer(
-        self, layer_id: int, tgt_loc: torch.Tensor, src_loc: torch.Tensor
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> None:
-        k_buffer, v_buffer = self.get_kv_buffer(layer_id)
-        k_buffer[tgt_loc] = k_buffer[src_loc]
-        v_buffer[tgt_loc] = v_buffer[src_loc]
+        """Write new KV data to the cache at the specified locations."""
+        kbuf, vbuf = self.get_kv_buffer(layer_id)
+        kk, vv = cache_k, cache_v
+        if kk.dtype != kbuf.dtype:
+            if k_scale is not None:
+                kk = kk / k_scale
+            if v_scale is not None:
+                vv = vv / v_scale
+            kk = kk.to(kbuf.dtype)
+            vv = vv.to(vbuf.dtype)
+        kbuf[loc] = kk
+        vbuf[loc] = vv
 
     def transform_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return indices

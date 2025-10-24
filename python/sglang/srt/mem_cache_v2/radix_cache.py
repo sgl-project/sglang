@@ -30,6 +30,8 @@ class RadixCache(CacheIndex):
             key=tuple(), value=torch.empty(0, dtype=torch.int32), parent=None
         )
         self.page_size = page_size
+        self._evictable_size = 0
+        self._protected_size = 0
 
     def _get_child_key(self, key: tuple[int, ...]):
         return key[: self.page_size]
@@ -135,41 +137,21 @@ class RadixCache(CacheIndex):
         candidates = [n for n in self._collect_leaves() if n.ref_count == 0]
         heapq.heapify(candidates)
 
-        print(
-            f"[DEBUG] evict: need {num_tokens} tokens, found {len(candidates)} leaf candidates"
-        )
-        for i, c in enumerate(candidates[:5]):
-            print(
-                f"  candidate {i}: len={len(c.value)}, ref_count={c.ref_count}, key={c.key[:3]}..."
-            )
-
         while num_evicted < num_tokens and candidates:
             node = heapq.heappop(candidates)
-            print(
-                f"[DEBUG] evicting node: len={len(node.value)}, num_evicted={num_evicted}"
-            )
             evicted.append(node)
             num_evicted += len(node.value)
 
             assert node.parent, "Trying to evict root node"
             parent = node.parent
             parent.children.pop(self._get_child_key(node.key))
-            print(
-                f"[DEBUG]   parent now has {len(parent.children)} children, ref_count={parent.ref_count}"
-            )
             if (
                 len(parent.children) == 0
                 and parent != self.root
                 and parent.ref_count == 0
             ):
-                print(
-                    f"[DEBUG]   adding parent to candidates (len={len(parent.value)})"
-                )
                 heapq.heappush(candidates, parent)
 
-        print(
-            f"[DEBUG] evict done: evicted {num_evicted} tokens in {len(evicted)} nodes"
-        )
         if evicted:
             return torch.cat([node.value for node in evicted])
         return torch.empty(0, dtype=torch.int32)
@@ -179,6 +161,9 @@ class RadixCache(CacheIndex):
 
         current = allocation_key
         while current:
+            if current.ref_count == 0:
+                self._evictable_size -= len(current.value)
+                self._protected_size += len(current.value)
             if not current.is_ready:
                 not_ready.append(current)
             current.ref_count += 1
@@ -194,6 +179,9 @@ class RadixCache(CacheIndex):
         current = allocation_key
         while current:
             current.ref_count -= 1
+            if current.ref_count == 0:
+                self._evictable_size += len(current.value)
+                self._protected_size -= len(current.value)
             num_unlocked += len(current.value)
             current = current.parent
         return num_unlocked

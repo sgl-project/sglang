@@ -69,6 +69,7 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.mem_cache_v2.memory_manager import MemoryManager
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -685,7 +686,9 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+    def init_next_round_input(
+        self, tree_cache: Optional[BasePrefixCache | MemoryManager] = None
+    ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         input_len = len(self.fill_ids)
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
@@ -696,19 +699,27 @@ class Req:
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
-                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                **(
-                    {"req": self, "cow_mamba": True}
-                    if isinstance(tree_cache, MambaRadixCache)
-                    else {}
-                ),
-            )
+            if get_global_server_args().use_mem_cache_v2:
+                from sglang.srt.mem_cache_v2.cache_index import MatchResult
+
+                tree_cache: MemoryManager
+                match_result: MatchResult = tree_cache.match_prefix(token_ids)
+                self.prefix_indices = match_result.matched_indices
+                self.match_result = match_result
+            else:
+                (
+                    self.prefix_indices,
+                    self.last_node,
+                    self.last_host_node,
+                    self.host_hit_length,
+                ) = tree_cache.match_prefix(
+                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                    **(
+                        {"req": self, "cow_mamba": True}
+                        if isinstance(tree_cache, MambaRadixCache)
+                        else {}
+                    ),
+                )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
@@ -1175,7 +1186,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
-    def prepare_for_extend(self):
+    def prepare_for_extend(self, memory_manager: MemoryManager | None = None):
         self.forward_mode = ForwardMode.EXTEND
 
         # Init tensors
@@ -1216,9 +1227,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
-        )
+        if get_global_server_args().use_mem_cache_v2:
+            assert memory_manager is not None
+            req_pool_indices = []
+            out_cache_loc = []
+            for req in reqs:
+                alloc_result = memory_manager.allocate_request(
+                    req, include_last=True, match_result=req.match_result
+                )
+                req_pool_indices.append(alloc_result.req_pool_idx)
+                out_cache_loc.append(alloc_result.allocated_indices)
+            req_pool_indices_tensor = torch.tensor(
+                req_pool_indices, dtype=torch.int32
+            )  # make it on cpu for testing
+            out_cache_loc = torch.cat(out_cache_loc)  # make it on cpu for testing
+        else:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
+                self
+            )
 
         # Set fields
         input_embeds = []
@@ -1527,7 +1553,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME: finally deprecate is_v2_eagle
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
-    def prepare_for_decode(self):
+    def prepare_for_decode(self, memory_manager: MemoryManager | None = None):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
@@ -1572,7 +1598,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.prepare_encoder_info_decode()
 
         # Allocate memory
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        if get_global_server_args().use_mem_cache_v2:
+            assert memory_manager is not None
+            out_cache_loc = []
+            for req in self.reqs:
+                alloc_result = memory_manager.allocate_tokens(req, 1)
+                out_cache_loc.append(alloc_result.allocated_indices)
+            self.out_cache_loc = torch.cat(out_cache_loc)  # make it on cpu for testing
+        else:
+            self.out_cache_loc, self.req_pool_indices = alloc_for_decode(
+                self, token_per_req=1
+            )
 
         # Update seq_lens after allocation
         if self.enable_overlap:
