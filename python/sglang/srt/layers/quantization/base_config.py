@@ -183,6 +183,8 @@ class QuantizationConfig(ABC):
         # quant_method.
         if hf_quant_config.get("quant_method", "") == "modelopt_fp8":
             return "modelopt_fp8"
+        elif hf_quant_config.get("quant_method", "") == "modelopt_fp4":
+            return "modelopt_fp4"
 
         return None
 
