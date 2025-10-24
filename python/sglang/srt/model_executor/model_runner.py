@@ -353,6 +353,7 @@ class ModelRunner:
         if hasattr(self.attn_backend, "sparse_cache_updater"):
             if not self.server_args.disable_cuda_graph:
                 self.attn_backend.sparse_cache_updater.cache_manager.init_cuda_graph()
+                self.attn_backend.sparse_cache_updater.cache_manager.call_after_init_cuda_graph()
             self.attn_backend.sparse_cache_updater.cache_manager.start_retrive_loop()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?

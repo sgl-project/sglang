@@ -5,12 +5,19 @@ import triton.language as tl
 
 @triton.jit
 def _compute_average_score_kernel(
-    Q, K, Out, kv_pages_per_seq,kv_pages_num_per_seq,
+    Q,
+    K,
+    Out,
+    kv_pages_per_seq,
+    kv_pages_num_per_seq,
     # Strides
     kv_pages_per_seq_stride_b,
-    q_stride_b, q_stride_h,
-    k_stride_p, k_stride_h,
-    scores_stride_b, scores_stride_h,
+    q_stride_b,
+    q_stride_h,
+    k_stride_p,
+    k_stride_h,
+    scores_stride_b,
+    scores_stride_h,
     # Dimensions
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -20,7 +27,7 @@ def _compute_average_score_kernel(
     num_sink_pages: tl.constexpr,
     num_local_pages: tl.constexpr,
     # Block sizes and padding
-    BLOCK_SIZE_P: tl.constexpr, 
+    BLOCK_SIZE_P: tl.constexpr,
     PADDED_GROUP_SIZE: tl.constexpr,
     PADDED_HEAD_DIM: tl.constexpr,
 ):
@@ -33,84 +40,97 @@ def _compute_average_score_kernel(
     out_ptrs = Out + bid * scores_stride_b + kv_hid * scores_stride_h + page_offsets
     store_mask = page_offsets < num_pages
     if pid_block * BLOCK_SIZE_P >= num_valid_pages:
-        neg_inf_scores = tl.full([BLOCK_SIZE_P], -float('inf'), dtype=tl.float32)
+        neg_inf_scores = tl.full([BLOCK_SIZE_P], -float("inf"), dtype=tl.float32)
         tl.store(out_ptrs, neg_inf_scores, mask=store_mask)
         return
 
     q_head_start_idx = kv_hid * GROUP_SIZE
     q_head_offsets = tl.arange(0, PADDED_GROUP_SIZE)
     dim_offsets = tl.arange(0, PADDED_HEAD_DIM)
-    q_ptrs = (Q + bid * q_stride_b + 
-              (q_head_start_idx + q_head_offsets[:, None]) * q_stride_h + 
-              dim_offsets[None, :])
-    q_load_mask = (q_head_offsets[:, None] < GROUP_SIZE) & \
-                  (dim_offsets[None, :] < HEAD_DIM)
-    q_matrix = tl.load(q_ptrs, mask=q_load_mask, other=0.0) # [PADDED_GROUP_SIZE, HEAD_DIM]
-    
-    
+    q_ptrs = (
+        Q
+        + bid * q_stride_b
+        + (q_head_start_idx + q_head_offsets[:, None]) * q_stride_h
+        + dim_offsets[None, :]
+    )
+    q_load_mask = (q_head_offsets[:, None] < GROUP_SIZE) & (
+        dim_offsets[None, :] < HEAD_DIM
+    )
+    q_matrix = tl.load(
+        q_ptrs, mask=q_load_mask, other=0.0
+    )  # [PADDED_GROUP_SIZE, HEAD_DIM]
+
     page_ptr = kv_pages_per_seq + bid * kv_pages_per_seq_stride_b + page_offsets
     page_indices = tl.load(page_ptr, mask=store_mask, other=0)
-    k_ptrs = K + page_indices[:, None] * k_stride_p + kv_hid * k_stride_h + dim_offsets[None, :]
+    k_ptrs = (
+        K
+        + page_indices[:, None] * k_stride_p
+        + kv_hid * k_stride_h
+        + dim_offsets[None, :]
+    )
 
-    # k_ptrs = (K + page_offsets[:, None] * k_stride_p + 
-    #           kv_hid * k_stride_h + 
-    #           dim_offsets[None, :])
-    k_load_mask = (page_offsets[:, None] < num_pages) & \
-                  (dim_offsets[None, :] < HEAD_DIM)
-    k_matrix = tl.load(k_ptrs, mask=k_load_mask, other=0.0) # [PAGE_OFFSET, HEAD_DIM]
+    k_load_mask = (page_offsets[:, None] < num_pages) & (
+        dim_offsets[None, :] < HEAD_DIM
+    )
+    k_matrix = tl.load(k_ptrs, mask=k_load_mask, other=0.0)  # [PAGE_OFFSET, HEAD_DIM]
 
-    scores_matrix = tl.dot(q_matrix, tl.trans(k_matrix), out_dtype=tl.float32, allow_tf32=False) # [PADDED_GROUP_SIZE, PAGE_OFFSET]
-    final_scores = tl.sum(scores_matrix, axis=0) # [PAGE_OFFSET]
-    
+    scores_matrix = tl.dot(
+        q_matrix, tl.trans(k_matrix), out_dtype=tl.float32, allow_tf32=False
+    )  # [PADDED_GROUP_SIZE, PAGE_OFFSET]
+    final_scores = tl.sum(scores_matrix, axis=0)  # [PAGE_OFFSET]
+
     is_valid = page_offsets >= num_sink_pages
     local_bound = num_valid_pages - num_local_pages
     is_valid = is_valid & (page_offsets < local_bound)
-    
-    final_scores_with_inf = tl.where(is_valid, final_scores, -float('inf'))
+
+    final_scores_with_inf = tl.where(is_valid, final_scores, -float("inf"))
     tl.store(out_ptrs, final_scores_with_inf, mask=store_mask)
 
 
-def compute_average_score(q: torch.Tensor,
-                           k: torch.Tensor,
-                           out: torch.Tensor,
-                           kv_pages_per_seq: torch.Tensor = None,
-                           kv_pages_num_per_seq: torch.Tensor = None,
-                           num_sink_pages: int = 0,
-                           num_local_pages: int = 0,
-                           ):
+def compute_average_score(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    out: torch.Tensor,
+    kv_pages_per_seq: torch.Tensor = None,
+    kv_pages_num_per_seq: torch.Tensor = None,
+    num_sink_pages: int = 0,
+    num_local_pages: int = 0,
+):
 
     bs = q.shape[0]
     num_pages = out.shape[-1]
     NUM_KV_HEADS = k.shape[2]
     HEAD_DIM = k.shape[-1]
-    
+
     q = q.view(bs, -1, HEAD_DIM)
     k = k.squeeze(1)
-    
+
     NUM_Q_HEADS = q.shape[1]
     GROUP_SIZE = NUM_Q_HEADS // NUM_KV_HEADS
 
     PADDED_GROUP_SIZE = max(16, triton.next_power_of_2(GROUP_SIZE))
     PADDED_HEAD_DIM = max(16, triton.next_power_of_2(HEAD_DIM))
 
-    
-    grid = lambda meta: (
-        bs, 
-        NUM_KV_HEADS, 
-        triton.cdiv(num_pages, 32)
-    )
+    grid = lambda meta: (bs, NUM_KV_HEADS, triton.cdiv(num_pages, 32))
     _compute_average_score_kernel[grid](
-        q, k, out, kv_pages_per_seq, kv_pages_num_per_seq,
+        q,
+        k,
+        out,
+        kv_pages_per_seq,
+        kv_pages_num_per_seq,
         # Strides
         kv_pages_per_seq.stride(0),
-        q.stride(0), q.stride(1),
-        k.stride(0), k.stride(1),
-        out.stride(0), out.stride(1),
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        out.stride(0),
+        out.stride(1),
         # Dimensions
         NUM_KV_HEADS=NUM_KV_HEADS,
         HEAD_DIM=HEAD_DIM,
         num_pages=num_pages,
-        GROUP_SIZE=GROUP_SIZE, 
+        GROUP_SIZE=GROUP_SIZE,
         # Sink and local pages
         num_sink_pages=num_sink_pages,
         num_local_pages=num_local_pages,
