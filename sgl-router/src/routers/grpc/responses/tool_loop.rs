@@ -608,10 +608,11 @@ async fn execute_tool_loop_streaming_internal(
 
     // Create response event emitter
     let response_id = format!("resp_{}", Uuid::new_v4());
-    let model = current_request
-        .model
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
+    let model = if current_request.model.is_empty() {
+        "default".to_string()
+    } else {
+        current_request.model.clone()
+    };
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
