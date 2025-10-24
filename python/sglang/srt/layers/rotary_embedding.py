@@ -425,10 +425,14 @@ class RotaryEmbedding(CustomOp):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
-        # TODO: make a wrapper, and XPU will implement this kernel later.
-        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
-        return self.forward_native(
-            positions, query, key, offsets, fused_set_kv_buffer_arg
+        positions = torch.add(positions, offsets) if offsets is not None else positions
+        return torch.ops.sgl_kernel.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
         )
 
 
