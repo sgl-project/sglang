@@ -323,7 +323,7 @@ def main():
     print("For more information:")
     print("  • Documentation: docs/bias_detection.md")
     print("  • Paper: Zhang et al. (2024), JOSS (under review)")
-    print("  • Repository: https://github.com/[username]/circular-bias-detection")
+    print("  • Repository: https://github.com/hongping-zh/circular-bias-detection")
     print()
 
 
