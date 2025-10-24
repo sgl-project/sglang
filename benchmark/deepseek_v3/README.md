@@ -375,7 +375,7 @@ There are mixed-precision quantization methods where MoE layers are computed usi
 python -m sglang.launch_server --model novita/Deepseek-V3-0324-W4AFP8 --mem-fraction-static 0.85 --disable-shared-experts-fusion --tp-size 4
 ```
 
-Other variants of pre-quantized DeepSeek models are available:
+Other variants of pre-quantized DeepSeek models are also available:
 
 - [novita/Deepseek-V3.1-W4AFP8](https://huggingface.co/novita/Deepseek-V3.1-W4AFP8)
 - [novita/Deepseek-R1-0528-W4AFP8](https://huggingface.co/novita/Deepseek-R1-0528-W4AFP8)
