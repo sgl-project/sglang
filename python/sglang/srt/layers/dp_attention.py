@@ -436,9 +436,7 @@ def _dp_gather_via_all_reduce(
     # for pruning done by logits_processor. Use actual tensor size as authoritative source.
     actual_local_size = local_tokens.shape[0]
     if isinstance(local_num_tokens, torch.Tensor):
-        local_num_tokens.fill_(
-            actual_local_size
-        )  # CUDA graph compatibility
+        local_num_tokens.fill_(actual_local_size)  # CUDA graph compatibility
     else:
         local_num_tokens = actual_local_size
 
