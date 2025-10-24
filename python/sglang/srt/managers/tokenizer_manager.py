@@ -1445,6 +1445,51 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
 
+    def add_logprob_to_meta_info(
+        self,
+        meta_info: dict,
+        state: ReqState,
+        top_logprobs_num: int,
+        token_ids_logprob: List[int],
+        return_text_in_logprobs: bool,
+    ):
+        meta_info["input_token_logprobs"] = self.detokenize_logprob_tokens(
+            state.input_token_logprobs_val,
+            state.input_token_logprobs_idx,
+            return_text_in_logprobs,
+        )
+        meta_info["output_token_logprobs"] = self.detokenize_logprob_tokens(
+            state.output_token_logprobs_val,
+            state.output_token_logprobs_idx,
+            return_text_in_logprobs,
+        )
+
+        if top_logprobs_num > 0:
+            meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
+                state.input_top_logprobs_val,
+                state.input_top_logprobs_idx,
+                return_text_in_logprobs,
+            )
+            meta_info["output_top_logprobs"] = self.detokenize_top_logprobs_tokens(
+                state.output_top_logprobs_val,
+                state.output_top_logprobs_idx,
+                return_text_in_logprobs,
+            )
+
+        if token_ids_logprob is not None:
+            meta_info["input_token_ids_logprobs"] = self.detokenize_top_logprobs_tokens(
+                state.input_token_ids_logprobs_val,
+                state.input_token_ids_logprobs_idx,
+                return_text_in_logprobs,
+            )
+            meta_info["output_token_ids_logprobs"] = (
+                self.detokenize_top_logprobs_tokens(
+                    state.output_token_ids_logprobs_val,
+                    state.output_token_ids_logprobs_idx,
+                    return_text_in_logprobs,
+                )
+            )
+
     def convert_logprob_style(
         self,
         meta_info: dict,
@@ -1471,16 +1516,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         state.output_token_logprobs_idx.extend(
             recv_obj.output_token_logprobs_idx[recv_obj_index]
         )
-        meta_info["input_token_logprobs"] = self.detokenize_logprob_tokens(
-            state.input_token_logprobs_val,
-            state.input_token_logprobs_idx,
-            return_text_in_logprobs,
-        )
-        meta_info["output_token_logprobs"] = self.detokenize_logprob_tokens(
-            state.output_token_logprobs_val,
-            state.output_token_logprobs_idx,
-            return_text_in_logprobs,
-        )
 
         if top_logprobs_num > 0:
             if len(recv_obj.input_top_logprobs_val) > 0:
@@ -1495,16 +1530,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
             state.output_top_logprobs_idx.extend(
                 recv_obj.output_top_logprobs_idx[recv_obj_index]
-            )
-            meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
-                state.input_top_logprobs_val,
-                state.input_top_logprobs_idx,
-                return_text_in_logprobs,
-            )
-            meta_info["output_top_logprobs"] = self.detokenize_top_logprobs_tokens(
-                state.output_top_logprobs_val,
-                state.output_top_logprobs_idx,
-                return_text_in_logprobs,
             )
 
         if token_ids_logprob is not None:
@@ -1521,18 +1546,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             state.output_token_ids_logprobs_idx.extend(
                 recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
             )
-            meta_info["input_token_ids_logprobs"] = self.detokenize_top_logprobs_tokens(
-                state.input_token_ids_logprobs_val,
-                state.input_token_ids_logprobs_idx,
-                return_text_in_logprobs,
-            )
-            meta_info["output_token_ids_logprobs"] = (
-                self.detokenize_top_logprobs_tokens(
-                    state.output_token_ids_logprobs_val,
-                    state.output_token_ids_logprobs_idx,
-                    return_text_in_logprobs,
-                )
-            )
+
+        self.add_logprob_to_meta_info(
+            meta_info,
+            state,
+            state.obj.top_logprobs_num,
+            state.obj.token_ids_logprob,
+            return_text_in_logprobs,
+        )
 
     def detokenize_logprob_tokens(
         self,
@@ -1708,26 +1729,33 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             return
         state = self.rid_to_state[recv_obj.rid]
         state.finished = True
+
+        abort_message = recv_obj.abort_reason or "Abort in waiting queue"
+        finish_reason = {
+            "type": "abort",
+            "message": abort_message,
+        }
         if recv_obj.finished_reason:
-            out = {
-                "meta_info": {
-                    "id": recv_obj.rid,
-                    "finish_reason": recv_obj.finished_reason,
-                },
-            }
-        else:
-            out = {
-                "text": "",
-                "meta_info": {
-                    "id": recv_obj.rid,
-                    "finish_reason": {
-                        "type": "abort",
-                        "message": "Abort before prefill",
-                    },
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                },
-            }
+            finish_reason = recv_obj.finished_reason
+        meta_info = {"id": recv_obj.rid, "finish_reason": finish_reason}
+        is_stream = getattr(state.obj, "stream", False)
+        if getattr(state.obj, "return_logprob", False):
+            self.add_logprob_to_meta_info(
+                meta_info,
+                state,
+                state.obj.top_logprobs_num,
+                state.obj.token_ids_logprob,
+                state.obj.return_text_in_logprobs
+                and not self.server_args.skip_tokenizer_init,
+            )
+
+        output_ids = state.output_ids
+        meta_info["completion_tokens"] = len(output_ids)
+        out = {
+            "text": state.text,
+            "output_ids": [output_ids[-1]] if is_stream else output_ids,
+            "meta_info": meta_info,
+        }
         state.out_list.append(out)
         state.event.set()
 

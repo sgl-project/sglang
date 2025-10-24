@@ -133,6 +133,7 @@ class Envs:
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
+    SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
     SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK = EnvBool(False)
 
     # Scheduler: new token ratio hyperparameters
