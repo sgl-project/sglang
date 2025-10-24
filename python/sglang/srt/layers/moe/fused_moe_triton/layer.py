@@ -232,7 +232,7 @@ class FusedMoE(torch.nn.Module):
             self.quant_method, ModelOptNvFp4FusedMoEMethod
         ) or (
             isinstance(self.quant_method, Fp8MoEMethod)
-            and self.quant_method.use_cutlass_fused_experts_fp8
+            and self.quant_method._should_use_cutlass_fused_experts()
         )
 
     def _load_per_tensor_weight_scale(
