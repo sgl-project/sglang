@@ -32,7 +32,11 @@ from sglang.lang.ir import (
     SglVarScopeEnd,
     SglVideo,
 )
-from sglang.utils import encode_image_base64, get_exception_traceback
+from sglang.utils import (
+    encode_image_base64,
+    encode_video_base64,
+    get_exception_traceback,
+)
 
 
 def run_internal(state, program, func_args, func_kwargs, sync):
@@ -282,7 +286,6 @@ class StreamExecutor:
         # For vision
         self.images_ = []
         self.cur_images = []
-        self.videos_ = []
 
         # For fork/join
         self.fork_start_text_pos = None
@@ -369,7 +372,6 @@ class StreamExecutor:
             exes[i].cur_role_begin_pos = self.cur_role_begin_pos
             exes[i].fork_start_text_pos = len(self.text_)
             exes[i].images_ = list(self.images_)
-            exes[i].videos_ = list(self.videos_)
 
             # TODO(ying): handle API speculative execution
 
@@ -506,9 +508,13 @@ class StreamExecutor:
 
     def _execute_video(self, expr: SglVideo):
         path = expr.path
+        num_frames = expr.num_frames
 
-        self.videos_.append(path)
-        self.text_ += self.chat_template.video_token
+        base64_data = encode_video_base64(path, num_frames)
+
+        self.images_.append((path, base64_data))
+        self.cur_images.append((path, base64_data))
+        self.text_ += self.chat_template.image_token
 
     def _spec_gen(self, sampling_params):
         stop = sampling_params.stop

@@ -21,6 +21,7 @@ from sglang.bench_serving import (
 )
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
+from sglang.utils import encode_video_base64
 
 # type of content fields, can be only prompts or with images/videos
 MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
@@ -324,9 +325,15 @@ def sample_nextqa_requests(
             prompt_len = len(prompt_token_ids)
             output_len = fixed_output_len  # max output len, not real output len
 
+            # video input
+            base64_data = encode_video_base64(video.path, video.num_frames)
+
+            # NOTE: This will be replaced by the expanded length from the server
+            prompt_len += video.num_frames
+
             # add to content
             content = [
-                {"type": "video_url", "video_url": {"url": video}},
+                {"type": "image_url", "image_url": {"url": base64_data}},
                 {"type": "text", "text": prompt},
             ]
 
