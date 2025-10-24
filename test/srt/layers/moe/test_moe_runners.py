@@ -1,9 +1,13 @@
+import os
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
+    DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+    DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -23,7 +27,7 @@ class TestMoERunnerTriton(CustomTestCase):
     }
 
     CONFIGS = {
-        "tp2_torch_native": {
+        "moe_runner_triton_unquant_standard": {
             "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
                 "--trust-remote-code",
@@ -31,13 +35,96 @@ class TestMoERunnerTriton(CustomTestCase):
                 "triton",
                 "--tp",
                 "2",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
                 "--max-total-tokens",
                 "2048",
             ],
+        },
+        "moe_runner_triton_kernel_unquant_standard": {
+            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "triton_kernel",
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "2048",
+            ],
+        },
+        "moe_runner_deep_gemm_awq_quantization": {
+            "model": DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "deep_gemm",
+                "--quantization",
+                "awq",
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "2048",
+            ],
+            "eval_kwargs": {"num_examples": 3},
+        },
+        "moe_runner_flashinfer_trtllm_mxfp4_quantization": {
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "flashinfer_trtllm",
+                "--quantization",
+                "mxfp4",
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "2048",
+            ],
+            "eval_kwargs": {"num_examples": 2},
+        },
+        "moe_runner_flashinfer_mxfp4_fp8_quantization": {
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "flashinfer_mxfp4",
+                "--quantization",
+                "mxfp4",
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "2048",
+            ],
+            "eval_kwargs": {"num_examples": 2},
+        },
+        "moe_runner_flashinfer_cutedsl_fp8_quantization": {
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "flashinfer_cutedsl",
+                "--quantization",
+                "fp8",
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "2048",
+            ],
+            "eval_kwargs": {"num_examples": 2},
+        },
+        "moe_runner_cutlass_w8a8_quantization": {
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "cutlass",
+                "--quantization",
+                "w8a8",
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "2048",
+            ],
+            "eval_kwargs": {"num_examples": 2},
         },
     }
 
@@ -45,24 +132,39 @@ class TestMoERunnerTriton(CustomTestCase):
         model = config.get("model", self.DEFAULT_MODEL)
         other_args = config.get("other_args", [])
         eval_kwargs = self.DEFAULT_EVAL_KWARGS | config.get("eval_kwargs", {})
+        env_overrides = config.get("env", {}) or {}
 
-        process = popen_launch_server(
-            model,
-            self.BASE_URL,
-            timeout=self.TIMEOUT,
-            other_args=other_args,
-        )
+        saved_env = {}
         try:
-            args = SimpleNamespace(
-                base_url=self.BASE_URL,
-                model=model,
-                **eval_kwargs,
-            )
-            metrics = run_eval(args)
-            print(f"{metrics=}")
-            self.assertGreaterEqual(metrics["score"], 0.0)
+            for key, value in env_overrides.items():
+                saved_env[key] = os.environ.get(key)
+                os.environ[key] = value
+
+            process = None
+            try:
+                process = popen_launch_server(
+                    model,
+                    self.BASE_URL,
+                    timeout=self.TIMEOUT,
+                    other_args=other_args,
+                )
+                args = SimpleNamespace(
+                    base_url=self.BASE_URL,
+                    model=model,
+                    **eval_kwargs,
+                )
+                metrics = run_eval(args)
+                print(f"{metrics=}")
+                self.assertGreaterEqual(metrics["score"], 0.0)
+            finally:
+                if process is not None:
+                    kill_process_tree(process.pid)
         finally:
-            kill_process_tree(process.pid)
+            for key, previous in saved_env.items():
+                if previous is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = previous
 
 
 def _make_test(config_name: str, config: dict):
