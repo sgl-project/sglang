@@ -118,11 +118,10 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = None
 
         # Init draft worker
-        tp_group = None
-        ctx = empty_context()
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-            tp_group = get_attention_tp_group()
-            ctx = draft_tp_context(tp_group)
+            ctx = draft_tp_context(get_attention_tp_group())
+        else:
+            ctx = empty_context()
         with ctx:
             super().__init__(
                 server_args=server_args,
