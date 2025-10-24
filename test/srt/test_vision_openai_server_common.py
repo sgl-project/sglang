@@ -1,15 +1,20 @@
-import base64
 import io
 import os
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import openai
+import pybase64
 import requests
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
 
 # image
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
@@ -24,12 +29,21 @@ AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-fi
 
 
 class TestOpenAIMLLMServerBase(CustomTestCase):
+    model: str
+    extra_args: list = []
+    fixed_args: list = ["--trust-remote-code", "--enable-multimodal"]
+
     @classmethod
     def setUpClass(cls):
-        cls.model = ""
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.process = None
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=cls.extra_args + cls.fixed_args,
+        )
         cls.base_url += "/v1"
 
     @classmethod
@@ -372,7 +386,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             pil_img = Image.fromarray(frame)
             buff = io.BytesIO()
             pil_img.save(buff, format="JPEG")
-            base64_str = base64.b64encode(buff.getvalue()).decode("utf-8")
+            base64_str = pybase64.b64encode(buff.getvalue()).decode("utf-8")
             base64_frames.append(base64_str)
 
         messages = [{"role": "user", "content": []}]
@@ -421,7 +435,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             or "device" in video_response
             or "microphone" in video_response
         ), f"""
-        ====================== video_response =====================
+        ====================== video_images response =====================
         {video_response}
         ===========================================================
         should contain 'iPod' or 'device' or 'microphone'
@@ -435,7 +449,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             or "Steve" in video_response
             or "hand" in video_response
         ), f"""
-        ====================== video_response =====================
+        ====================== video_images response =====================
         {video_response}
         ===========================================================
         should contain 'man' or 'person' or 'individual' or 'speaker' or 'presenter' or 'Steve' or 'hand'
@@ -446,7 +460,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             or "display" in video_response
             or "hold" in video_response
         ), f"""
-        ====================== video_response =====================
+        ====================== video_images response =====================
         {video_response}
         ===========================================================
         should contain 'present' or 'examine' or 'display' or 'hold'
