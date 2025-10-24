@@ -111,10 +111,10 @@ class TopKOutputChecker:
         return topk_output.format.is_standard()
 
     @staticmethod
-    def format_is_triton_kernel(
+    def format_is_triton_kernels(
         topk_output: TopKOutput,
     ) -> TypeGuard[TritonKernelTopKOutput]:
-        return topk_output.format.is_triton_kernel()
+        return topk_output.format.is_triton_kernels()
 
     @staticmethod
     def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
@@ -129,7 +129,7 @@ class TopKOutputFormat(Enum):
     def is_standard(self) -> bool:
         return self == TopKOutputFormat.STANDARD
 
-    def is_triton_kernel(self) -> bool:
+    def is_triton_kernels(self) -> bool:
         return self == TopKOutputFormat.TRITON_KERNEL
 
     def is_bypassed(self) -> bool:
@@ -254,7 +254,7 @@ class TopK(CustomOp):
     ) -> TopKOutput:
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
-        elif get_moe_runner_backend().is_triton_kernel():
+        elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif (
             should_use_flashinfer_trtllm_moe()

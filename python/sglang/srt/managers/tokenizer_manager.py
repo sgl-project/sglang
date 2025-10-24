@@ -284,6 +284,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
 
+        # Initial weights status
+        self.initial_weights_loaded = True
+        if server_args.checkpoint_engine_wait_weights_before_ready:
+            self.initial_weights_loaded = False
+
         # Dumping
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000

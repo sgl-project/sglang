@@ -114,7 +114,6 @@ class Envs:
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
-    SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
@@ -127,6 +126,11 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
+
+    # Scheduler: memory leak test
+    SGLANG_TEST_RETRACT = EnvBool(False)
+    SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
+    SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK = EnvBool(False)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)

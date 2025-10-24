@@ -59,6 +59,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
@@ -647,6 +648,21 @@ class Engine(EngineBase):
             apply_softmax=apply_softmax,
             item_first=item_first,
             request=None,
+        )
+
+    def update_weights_from_ipc(
+        self,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+    ):
+        """Update weights from IPC for checkpoint-engine integration."""
+        obj = UpdateWeightsFromIPCReqInput(
+            zmq_handles=zmq_handles,
+            flush_cache=flush_cache,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_ipc(obj, None)
         )
 
 

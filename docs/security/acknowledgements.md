@@ -1,0 +1,3 @@
+| Time       | CVE ID       | Credit to        | Affected Versions         | Severity   | Impact               | Description |
+|------------|--------------|------------------|---------------------------|------------|----------------------|-------------|
+| 2025-09-09 | CVE-2025-10164 | Simon Huang, pjf | ≥ 0.4.6 & ≤ 0.5.3          | Critical   | Remote Code Execution | A security flaw exists in lmsys sglang versions ≥ 0.4.6 and ≤ 0.5.3. The vulnerability arises from the use of unsafe pickle deserialization of the `serialized_named_tensors` parameter in the `/update_weights_from_tensor` API endpoint, which could allow a remote attacker to execute arbitrary code on the server by sending a specially crafted payload. |
