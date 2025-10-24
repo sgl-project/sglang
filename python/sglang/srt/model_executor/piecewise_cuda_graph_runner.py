@@ -38,6 +38,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
@@ -261,9 +262,14 @@ class PiecewiseCudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         num_tokens = len(forward_batch.input_ids)
-        # TODO(yuwei): support return logprob
+        # TODO(yuwei): support return input_ids' logprob
         if forward_batch.return_logprob:
-            return False
+            for start_len, seq_len in zip(
+                forward_batch.extend_logprob_start_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            ):
+                if start_len is not None and start_len < seq_len:
+                    return False
         if num_tokens <= self.max_num_tokens:
             return True
         return False
@@ -377,6 +383,9 @@ class PiecewiseCudaGraphRunner:
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
+            # It is True in this context but we need to set it to use low latency deepep mode.
+            set_is_extend_in_batch(False)
 
             kwargs = {}
             with set_forward_context(forward_batch, self.attention_layers):
@@ -434,7 +443,7 @@ class PiecewiseCudaGraphRunner:
             out_cache_loc=out_cache_loc,
             seq_lens_sum=forward_batch.seq_lens_sum,
             encoder_lens=forward_batch.encoder_lens,
-            return_logprob=forward_batch.return_logprob,
+            return_logprob=False,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             extend_start_loc=forward_batch.extend_start_loc,

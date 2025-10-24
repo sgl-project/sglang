@@ -39,7 +39,7 @@ pub(super) fn build_stored_response(
         .get("model")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| original_body.model.clone());
+        .or_else(|| Some(original_body.model.clone()));
 
     stored_response.user = response_json
         .get("user")
@@ -143,9 +143,10 @@ pub(super) fn patch_streaming_response_json(
             .map(|s| s.is_empty())
             .unwrap_or(true)
         {
-            if let Some(model) = &original_body.model {
-                obj.insert("model".to_string(), Value::String(model.clone()));
-            }
+            obj.insert(
+                "model".to_string(),
+                Value::String(original_body.model.clone()),
+            );
         }
 
         if obj.get("user").map(|v| v.is_null()).unwrap_or(false) {
@@ -156,7 +157,7 @@ pub(super) fn patch_streaming_response_json(
 
         // Attach conversation id for client response if present (final aggregated JSON)
         if let Some(conv_id) = original_body.conversation.clone() {
-            obj.insert("conversation".to_string(), json!({"id": conv_id}));
+            obj.insert("conversation".to_string(), json!({ "id": conv_id }));
         }
     }
 }
@@ -234,7 +235,7 @@ pub(super) fn rewrite_streaming_block(
 
         // Attach conversation id into streaming event response content with ordering
         if let Some(conv_id) = original_body.conversation.clone() {
-            response_obj.insert("conversation".to_string(), json!({"id": conv_id}));
+            response_obj.insert("conversation".to_string(), json!({ "id": conv_id }));
             changed = true;
         }
     }

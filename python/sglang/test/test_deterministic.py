@@ -94,18 +94,19 @@ class BenchArgs:
 
 def send_single(
     args,
-    batch_size: int = 1,
     profile: bool = False,
     profile_steps: int = 3,
     profile_by_stage: bool = False,
     return_full_response: bool = False,
     input_ids: List[int] = None,
+    prompt: List[str] = None,
     max_new_tokens: int = None,
 ):
     base_url = f"http://{args.host}:{args.port}"
 
     # Use input_ids if provided, otherwise use text prompts
     if input_ids is not None:
+        assert prompt is None
         json_data = {
             "input_ids": input_ids,
             "sampling_params": {
@@ -122,7 +123,7 @@ def send_single(
             "stream": args.stream,
         }
     else:
-        prompt = [PROMPT_1] * batch_size
+        assert input_ids is None
         json_data = {
             "text": prompt,
             "sampling_params": {
@@ -225,7 +226,7 @@ def test_deterministic(args):
         texts = []
         for i in range(1, args.n_trials + 1):
             batch_size = i
-            text = send_single(args, batch_size, args.profile)
+            text = send_single(args, args.profile, prompt=[PROMPT_1] * batch_size)
             text = text.replace("\n", " ")
             print(f"Trial {i} with batch size {batch_size}: {text}")
             texts.append(text)
@@ -423,5 +424,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args()
+
+    if args.sampling_seed is None:
+        args.sampling_seed = 42
 
     test_deterministic(args)

@@ -52,6 +52,9 @@ pub type ConversationMetadata = JsonMap<String, Value>;
 /// Input payload for creating a conversation
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NewConversation {
+    /// Optional conversation ID (if None, a random ID will be generated)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<ConversationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ConversationMetadata>,
 }
@@ -68,7 +71,7 @@ pub struct Conversation {
 impl Conversation {
     pub fn new(new_conversation: NewConversation) -> Self {
         Self {
-            id: ConversationId::new(),
+            id: new_conversation.id.unwrap_or_default(),
             created_at: Utc::now(),
             metadata: new_conversation.metadata,
         }

@@ -59,6 +59,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
@@ -649,6 +650,21 @@ class Engine(EngineBase):
             request=None,
         )
 
+    def update_weights_from_ipc(
+        self,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+    ):
+        """Update weights from IPC for checkpoint-engine integration."""
+        obj = UpdateWeightsFromIPCReqInput(
+            zmq_handles=zmq_handles,
+            flush_cache=flush_cache,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_ipc(obj, None)
+        )
+
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
@@ -685,7 +701,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.4.0",
+            "0.4.1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -693,7 +709,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.15",
+            "0.3.16.post3",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
