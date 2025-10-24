@@ -795,7 +795,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM, group=get_world_group().device_group
+            logical_count_of_buffered_step,
+            op=torch.distributed.ReduceOp.SUM,
+            group=get_world_group().device_group,
         )
 
         output = dict(

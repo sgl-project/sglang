@@ -68,7 +68,9 @@ class ExpertLocationUpdater:
         )
 
         if len(all_missing_logical_experts) > 0:
-            logger.info(f"[ExpertLocationUpdater] All missing logical experts: {all_missing_logical_experts}")
+            logger.info(
+                f"[ExpertLocationUpdater] All missing logical experts: {all_missing_logical_experts}"
+            )
 
             # Load the missing expert weights from disk
             def missing_experts_name_filter(name: str) -> bool:
@@ -77,6 +79,7 @@ class ExpertLocationUpdater:
                         if f"layers.{layer}.mlp.experts.{expert}." in name:
                             return True
                 return False
+
             model_runner.update_weights_from_disk(
                 model_runner.server_args.model_path,
                 model_runner.server_args.load_format,
@@ -237,7 +240,8 @@ def update_expert_weights_single_layer(
         active_ranks = [1] * torch.distributed.get_world_size()
     else:
         active_ranks = elastic_ep_state.active_ranks_cpu
-    missing_logical_experts : List[int] = []
+
+    missing_logical_experts: List[int] = []
 
     def _entrypoint():
         # List[Tuple[logical_expert_id, List[P2POp]]]
@@ -422,7 +426,8 @@ def update_expert_weights_single_layer(
                         ),
                         peer=dst_rank,
                     )
-                    for dst_rank in all_dst_ranks if active_ranks[dst_rank]
+                    for dst_rank in all_dst_ranks
+                    if active_ranks[dst_rank]
                     for i in range(num_tensors)
                 ],
             )
