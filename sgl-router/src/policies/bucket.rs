@@ -15,7 +15,13 @@ pub struct BucketPolicy{
     bucket: Arc<RwLock<Bucket>>,
 }
 
-impl BucketPolicy{
+impl Default for BucketPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BucketPolicy {
     pub fn new() -> Self{
         Self::with_config(BucketConfig::default())
     }
@@ -71,7 +77,11 @@ impl LoadBalancingPolicy for BucketPolicy {
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
     ) -> Option<usize> {
-        let prefill_list = workers;
+        let healthy_indices = get_healthy_worker_indices(workers);
+
+        if healthy_indices.is_empty() {
+            return None;
+        }
 
         let char_count = match request_text {
             None => 0,
@@ -104,8 +114,8 @@ impl LoadBalancingPolicy for BucketPolicy {
                 .min_by_key(|(_, &chars)| chars)
                 .map(|(url, _)| url.clone())
                 .unwrap_or_else(|| {
-                    let prefill_idx = rng.random_range(0..prefill_list.len());
-                    let url = prefill_list[prefill_idx].url();
+                    let prefill_idx = rng.random_range(0..healthy_indices.len());
+                    let url = workers[prefill_idx].url();
                     warn!("No URL found, randomly selecting: {}", url);
                     url.to_string()
                 });
@@ -113,8 +123,8 @@ impl LoadBalancingPolicy for BucketPolicy {
         } else {
             info!("select prefill instance by Bucket policy");
             if choiced_url_snapshot.is_empty() {
-                let prefill_idx = rng.random_range(0..prefill_list.len());
-                let selected_url = prefill_list[prefill_idx].url();
+                let prefill_idx = rng.random_range(0..healthy_indices.len());
+                let selected_url = workers[prefill_idx].url();
                 warn!("Boundary not found, randomly selection: {}", selected_url);
                 selected_url.to_string()
             } else {
@@ -127,8 +137,8 @@ impl LoadBalancingPolicy for BucketPolicy {
             buc.post_process_request(char_count, prefill_url.clone());
         }
 
-        let prefill_idx = prefill_list.iter().position(|w| w.url() == prefill_url)?;
-        return Some(prefill_idx);
+        let prefill_idx = workers.iter().position(|w| w.url() == prefill_url)?;
+        Some(prefill_idx)
     }
 
     fn select_worker_pair(
@@ -137,63 +147,15 @@ impl LoadBalancingPolicy for BucketPolicy {
         decode_workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
     ) -> Option<(usize, usize)> {
-        let prefill_list = prefill_workers;
-        let decode_list = decode_workers;
+        let prefill_idx = self.select_worker(prefill_workers, request_text)?;
 
-        let char_count = match request_text {
-            None => 0,
-            Some(text) => text.chars().count()
-        };
-
-        let buc_arc = Arc::clone(&self.bucket);
-        let choiced_url_snapshot;
-        let chars_per_url_snapshot;
-        {
-            let buc = buc_arc.read().unwrap();
-            choiced_url_snapshot = buc.find_boundary(char_count);
-            chars_per_url_snapshot = buc.chars_per_url.lock().unwrap().clone();
+        let healthy_decode = get_healthy_worker_indices(decode_workers);
+        if healthy_decode.is_empty() {
+            return None;
         }
-
-        let max_load = chars_per_url_snapshot.values().copied().max().unwrap_or(0);
-        let min_load = chars_per_url_snapshot.values().copied().min().unwrap_or(0);
-        let abs_diff = max_load.saturating_sub(min_load);
-        let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
-
-        //Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold.
-        let is_imbalanced = abs_diff > self.config.balance_abs_threshold && max_load as f32 > rel_threshold;
 
         let mut rng = rand::rng();
-        let prefill_url = if is_imbalanced {
-            let min_url = chars_per_url_snapshot
-                .iter()
-                .min_by_key(|(_, &chars)| chars)
-                .map(|(url, _)| url.clone())
-                .unwrap_or_else(|| {
-                    let prefill_idx = rng.random_range(0..prefill_list.len());
-                    let url = prefill_list[prefill_idx].url();
-                    warn!("No URL found, randomly selecting: {}", url);
-                    url.to_string()
-                });
-            min_url
-        } else {
-            if choiced_url_snapshot.is_empty() {
-                let prefill_idx = rng.random_range(0..prefill_list.len());
-                let selected_url = prefill_list[prefill_idx].url();
-                warn!("Boundary not found, randomly selection: {}", selected_url);
-                selected_url.to_string()
-            } else {
-                choiced_url_snapshot
-            }
-        };
-
-        {
-            let mut buc = buc_arc.write().unwrap();
-            buc.post_process_request(char_count, prefill_url.clone());
-        }
-
-        let prefill_idx = prefill_list.iter().position(|w| w.url() == prefill_url)?;
-        let decode_idx = rng.random_range(0..decode_list.len());
-
+        let decode_idx = rng.random_range(0..healthy_decode.len());
 
         Some((prefill_idx, decode_idx))
     }
@@ -292,17 +254,17 @@ impl Bucket {
         let boundary = if worker_cnt == 0 {
             Vec::new()
         } else {
-            let gap = self.l_max / worker_cnt as usize;
+            let gap = self.l_max / worker_cnt;
             self.l_max = usize::MAX;
             prefill_worker_urls
                 .iter()
                 .enumerate()
                 .map(|(i, url)| {
-                    let min = i as usize * gap;
+                    let min = i * gap;
                     let max = if i == worker_cnt - 1 {
                         self.l_max
                     } else {
-                        (i + 1) as usize * gap - 1
+                        (i + 1) * gap - 1
                     };
                     Boundary::new(url.clone(), [min, max])
                 })
@@ -349,16 +311,16 @@ impl Bucket {
 
         let id = Uuid::new_v4().to_string();
 
-        self.t_req_loads.insert(id.clone(), char_cnt.try_into().unwrap());
+        self.t_req_loads.insert(id.clone(), char_cnt);
 
         self.request_list.push_back(SequencerRequest {
             id,
-            char_cnt: char_cnt.try_into().unwrap(),
+            char_cnt: char_cnt,
             timestamp: now,
             prefill_worker_url: prefill_url,
         });
 
-        self.load_total = self.load_total.saturating_add(char_cnt.try_into().unwrap());
+        self.load_total = self.load_total.saturating_add(char_cnt);
     }
 
 
@@ -450,7 +412,7 @@ impl Bucket {
             }
             let mut load_accumulator = 0;
             let mut break_flag = false;
-            for (i, &load) in hist_load[last_load_index..].iter().enumerate() {
+            for &load in hist_load[last_load_index..].iter() {
                 load_accumulator += load;
                 if load_accumulator >= new_single_bucket_load {
                     if iter.peek().is_none() {
@@ -458,8 +420,8 @@ impl Bucket {
                         break_flag = true;
                         break;
                     }
-                    let mut real_load = upper_bound + new_single_bucket_load;
-                    if (load <= upper_bound) {
+                    let real_load = upper_bound + new_single_bucket_load;
+                    if load <= upper_bound {
                         new_boundary.push(Boundary::new(url.clone(), [upper_bound, real_load]));
                         upper_bound = real_load + 1;
                     } else {
@@ -486,84 +448,6 @@ impl Bucket {
         }
         self.boundary = new_boundary;
         info!("After adjusting boundary | {:?}",self.boundary);
-    }
-
-    pub fn adjust_boundary_v2(&mut self) {
-        if self.t_req_loads.is_empty() {
-            return;
-        }
-
-        if self.bucket_cnt == 0 {
-            return;
-        }
-
-        self.update_workers_cnt();
-
-        let worker_cnt = self.bucket_cnt;
-        let latest_buc_load_avg = self.get_total_load()/worker_cnt;
-        let earlier_buc_load_avg = self.bucket_load;
-
-        if latest_buc_load_avg <= 2 * earlier_buc_load_avg
-            && (earlier_buc_load_avg <= 2 * latest_buc_load_avg && earlier_buc_load_avg != 0)
-        {
-            info!("No need to adjust the bucket boundaries.");
-            return;
-        }
-
-        info!("Bucket boundaries before adjustment | {:?}", self.boundary);
-        self.bucket_load = latest_buc_load_avg;
-        let mut new_boundaries = Vec::new();
-
-        let mut hist_loads: Vec<usize> = self.t_req_loads.values().cloned().collect();
-        hist_loads.sort();
-
-        let max_value = usize::MAX;
-
-        let worker_urls = {
-            let guard = self.prefill_worker_urls.lock().unwrap();
-            (*guard).clone()
-        };
-
-        let mut boundary;
-        let mut left_bound: usize = 0;
-        let mut right_bound = 0;
-
-        let hist_loads_len = hist_loads.len();
-        let worker_urls_len = worker_urls.len();
-        let mut hist_load_idx = 0;
-        for (worker_url_idx, worker_url) in worker_urls.iter().enumerate() {
-            if worker_url_idx == worker_urls_len - 1 {
-                boundary = Boundary::new(worker_url.clone(), [left_bound, max_value]);
-                new_boundaries.push(boundary);
-                break;
-            }
-
-            let mut load_sum = 0;
-            let mut load = 0;
-            while hist_load_idx < hist_loads_len {
-                load = hist_loads[hist_load_idx];  // 通过当前索引获取元素
-                hist_load_idx += 1;
-
-                load_sum += load;
-                right_bound = load;
-
-                if load_sum >= latest_buc_load_avg {
-                    break;
-                }
-            }
-            if (hist_load_idx >= hist_loads_len && load_sum < latest_buc_load_avg) {
-                right_bound = left_bound + latest_buc_load_avg;
-            }
-            if (right_bound - left_bound <= 0) {
-                right_bound = left_bound + latest_buc_load_avg;
-            }
-            boundary = Boundary::new(worker_url.clone(), [left_bound, right_bound]);
-            new_boundaries.push(boundary);
-            left_bound = right_bound + 1;
-        }
-
-        self.boundary = new_boundaries;
-        info!("Bucket boundaries after adjustment | {:?}",self.boundary);
     }
 }
 
@@ -602,15 +486,6 @@ mod tests {
             ),
         ];
 
-        let decode_workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w4:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .build(),
-            ),
-        ];
-
         // Initialize the policy with prefill_workers
         policy.init_prefill_worker_urls(&prefill_workers);
 
@@ -622,7 +497,7 @@ mod tests {
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(34))).unwrap();
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(34))).unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
         {
             let bucket_guard = policy.bucket.read().unwrap();
             // Expected Boundary: [0, 33] [34, 67] [68, MAX]
@@ -724,7 +599,7 @@ mod tests {
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(24))).unwrap();
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(26))).unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         // Verify boundaries adjusted to: [0, 20], [21, 26], [27, MAX]
         {
             let bucket_guard = policy.bucket.read().unwrap();
@@ -741,7 +616,7 @@ mod tests {
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(45))).unwrap();
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(57))).unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         // Verify boundaries adjusted to: [0, 40], [41, 57], [58, MAX]
         {
             let bucket_guard = policy.bucket.read().unwrap();
@@ -792,7 +667,7 @@ mod tests {
         // Send requests with char_count 20
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(20))).unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         {
             let bucket_guard = policy.bucket.read().unwrap();
             assert_eq!(bucket_guard.boundary[0].range[1], 20);
@@ -801,7 +676,7 @@ mod tests {
 
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(7))).unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         {
             let bucket_guard = policy.bucket.read().unwrap();
             assert_eq!(bucket_guard.boundary[0].range[1], 7);
@@ -869,7 +744,7 @@ mod tests {
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(45))).unwrap();
         policy.select_worker(&prefill_workers, Some(&*"a".repeat(55))).unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         {
             let bucket_guard = policy.bucket.read().unwrap();
             assert_eq!(bucket_guard.boundary[0].range[1], 20);
