@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::ConnectionMode;
 
 /// Configuration validator
 pub struct ConfigValidator;
@@ -165,18 +166,14 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::OpenAI { worker_urls } => {
-                // Require exactly one worker URL for OpenAI router
-                if worker_urls.len() != 1 {
+                // Require at least one worker URL for OpenAI router
+                if worker_urls.is_empty() {
                     return Err(ConfigError::ValidationFailed {
-                        reason: "OpenAI mode requires exactly one --worker-urls entry".to_string(),
+                        reason: "OpenAI mode requires at least one --worker-urls entry".to_string(),
                     });
                 }
-                // Validate URL format
-                if let Err(e) = url::Url::parse(&worker_urls[0]) {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: format!("Invalid OpenAI worker URL '{}': {}", &worker_urls[0], e),
-                    });
-                }
+                // Validate URLs
+                Self::validate_urls(worker_urls)?;
             }
         }
         Ok(())
@@ -472,6 +469,29 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate mTLS certificate configuration
+    fn validate_mtls(config: &RouterConfig) -> ConfigResult<()> {
+        // Validate that if we have client_identity, it's not empty
+        if let Some(identity) = &config.client_identity {
+            if identity.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "Client identity cannot be empty".to_string(),
+                });
+            }
+        }
+
+        // Validate CA certificates are not empty
+        for (idx, ca_cert) in config.ca_certificates.iter().enumerate() {
+            if ca_cert.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!("CA certificate at index {} cannot be empty", idx),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         // IGW mode is independent - skip other compatibility checks when enabled
@@ -480,7 +500,7 @@ impl ConfigValidator {
         }
 
         // Validate gRPC connection mode requires tokenizer configuration
-        if config.connection_mode == ConnectionMode::Grpc
+        if matches!(config.connection_mode, ConnectionMode::Grpc { .. })
             && config.tokenizer_path.is_none()
             && config.model_path.is_none()
         {
@@ -488,6 +508,9 @@ impl ConfigValidator {
                 reason: "gRPC connection mode requires either --tokenizer-path or --model-path to be specified".to_string(),
             });
         }
+
+        // Validate mTLS configuration
+        Self::validate_mtls(config)?;
 
         // All policies are now supported for both router types thanks to the unified trait design
         // No mode/policy restrictions needed anymore
@@ -836,7 +859,7 @@ mod tests {
         );
 
         // Set connection mode to gRPC without tokenizer config
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.tokenizer_path = None;
         config.model_path = None;
 
@@ -856,7 +879,7 @@ mod tests {
             PolicyConfig::Random,
         );
 
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.model_path = Some("meta-llama/Llama-3-8B".to_string());
 
         let result = ConfigValidator::validate(&config);
@@ -872,7 +895,7 @@ mod tests {
             PolicyConfig::Random,
         );
 
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.tokenizer_path = Some("/path/to/tokenizer.json".to_string());
 
         let result = ConfigValidator::validate(&config);
