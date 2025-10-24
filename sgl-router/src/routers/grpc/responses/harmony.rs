@@ -310,6 +310,13 @@ async fn execute_harmony_with_mcp_loop(
         iteration += 1;
 
         debug!("Harmony MCP loop iteration {}", iteration);
+        debug!(
+            "Current request input: {} items",
+            match &current_request.input {
+                ResponseInput::Text(t) => format!("Text({})", t.chars().take(100).collect::<String>()),
+                ResponseInput::Items(items) => format!("{} items", items.len()),
+            }
+        );
 
         // Execute generation (with MCP manager for tool descriptions)
         let responses_response = execute_harmony_internal_single(
@@ -325,11 +332,19 @@ async fn execute_harmony_with_mcp_loop(
         )
         .await?;
 
+        debug!(
+            "Response output: {} items",
+            responses_response.output.len()
+        );
+        for (idx, item) in responses_response.output.iter().enumerate() {
+            debug!("  Output item {}: {:?}", idx, item);
+        }
+
         // Check for pending built-in tool calls
         if let Some((tool_name, arguments)) =
             find_pending_builtin_tool_call(&responses_response.output)
         {
-            debug!("Found pending tool call: {}", tool_name);
+            debug!("Found pending tool call: {} with arguments: {:?}", tool_name, arguments);
 
             // Execute tool via MCP
             let tool_result_message =
@@ -400,10 +415,13 @@ async fn execute_harmony_with_mcp_loop(
             };
 
             // Continue loop
+            debug!("Continuing MCP loop to process tool result");
             continue;
         } else {
             // No pending tool calls, return final response
-            debug!("No pending tool calls, returning final response");
+            debug!("No pending tool calls found in response output");
+            debug!("Returning final response with {} output items after {} iterations",
+                   responses_response.output.len(), iteration);
             return Ok(responses_response);
         }
     }
@@ -555,7 +573,9 @@ async fn execute_harmony_internal_single(
         .ok_or_else(|| "Backend returned empty response array".to_string())?;
 
     // 9. Process output tokens through Harmony parser
-    let mut parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
+    // Use None for role to allow parser to detect role from token stream
+    // This is needed for gpt-oss models that use channel-first format
+    let mut parser = StreamableParser::new(encoding.clone(), None)
         .map_err(|e| format!("Failed to create Harmony parser: {}", e))?;
 
     // Extract output token IDs directly from backend response
@@ -1550,7 +1570,9 @@ async fn process_harmony_stream(
 
     // Create parser for incremental processing
     let encoding = get_harmony_encoding();
-    let mut parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
+    // Use None for role to allow parser to detect role from token stream
+    // This is needed for gpt-oss models that use channel-first format
+    let mut parser = StreamableParser::new(encoding.clone(), None)
         .map_err(|e| format!("Failed to create parser: {}", e))?;
 
     // Track streaming state for granular events
@@ -2057,7 +2079,21 @@ const MAX_MCP_ITERATIONS: usize = 100;
 fn find_pending_builtin_tool_call(
     output_items: &[ResponseOutputItem],
 ) -> Option<(String, serde_json::Map<String, serde_json::Value>)> {
-    for item in output_items {
+    use tracing::debug;
+
+    debug!("Checking {} output items for pending tool calls", output_items.len());
+    for (idx, item) in output_items.iter().enumerate() {
+        let item_type = match item {
+            ResponseOutputItem::Message { .. } => "Message",
+            ResponseOutputItem::WebSearchCall { .. } => "WebSearchCall",
+            ResponseOutputItem::CodeInterpreterCall { .. } => "CodeInterpreterCall",
+            ResponseOutputItem::FunctionToolCall { .. } => "FunctionToolCall",
+            ResponseOutputItem::Reasoning { .. } => "Reasoning",
+            ResponseOutputItem::McpListTools { .. } => "McpListTools",
+            ResponseOutputItem::McpCall { .. } => "McpCall",
+        };
+        debug!("  Item {}: type={}", idx, item_type);
+
         match item {
             ResponseOutputItem::WebSearchCall { action, status, .. } => {
                 if status == "pending" || status == "in_progress" {
