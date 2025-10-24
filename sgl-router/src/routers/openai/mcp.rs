@@ -129,7 +129,7 @@ impl FunctionCallInProgress {
 // ============================================================================
 
 /// Build a request-scoped MCP manager from request tools, if present.
-pub(super) async fn mcp_manager_from_request_tools(
+pub async fn mcp_manager_from_request_tools(
     tools: &[ResponseTool],
 ) -> Option<Arc<McpClientManager>> {
     let tool = tools

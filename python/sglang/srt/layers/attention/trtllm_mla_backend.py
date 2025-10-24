@@ -17,13 +17,14 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.utils import (
-    TRITON_PAD_NUM_PAGE_PER_BLOCK,
     create_flashmla_kv_indices_triton,
+    get_num_page_per_block_flashmla,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_flashinfer_available
+from sglang.srt.utils.common import cached_triton_kernel
 
 if is_flashinfer_available():
     import flashinfer
@@ -50,6 +51,7 @@ DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
 TRTLLM_BLOCK_CONSTRAINT = 128
 
 
+@cached_triton_kernel(lambda _, kwargs: (kwargs["BLOCK_SIZE"]))
 @triton.jit
 def pad_draft_extend_query_kernel(
     q_ptr,  # Input query tensor [total_seq_len, num_heads, head_dim]
@@ -123,6 +125,7 @@ def pad_draft_extend_query_kernel(
     )
 
 
+@cached_triton_kernel(lambda _, kwargs: (kwargs["BLOCK_SIZE"]))
 @triton.jit
 def unpad_draft_extend_output_kernel(
     raw_out_ptr,  # Input raw output tensor (batch_size, token_per_batch, tp_q_head_num, v_head_dim)
@@ -295,9 +298,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Apply dual constraints (take LCM to satisfy both):
         # 1. TRT-LLM: block_num % (128 / page_size) == 0
-        # 2. Triton: page table builder uses 64-index bursts, needs multiple of 64
+        # 2. Triton: number of pages per block
         trtllm_constraint = TRTLLM_BLOCK_CONSTRAINT // self.page_size
-        constraint_lcm = math.lcm(trtllm_constraint, TRITON_PAD_NUM_PAGE_PER_BLOCK)
+        triton_constraint = get_num_page_per_block_flashmla(self.page_size)
+        constraint_lcm = math.lcm(trtllm_constraint, triton_constraint)
 
         if blocks % constraint_lcm != 0:
             blocks = triton.cdiv(blocks, constraint_lcm) * constraint_lcm
@@ -336,7 +340,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices,
             self.req_to_token.stride(0),
             max_blocks,
-            NUM_PAGE_PER_BLOCK=TRITON_PAD_NUM_PAGE_PER_BLOCK,
             PAGED_SIZE=self.page_size,
         )
 
@@ -389,7 +392,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             not forward_mode.is_decode_or_idle()
             and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend()
+            and not forward_mode.is_draft_extend(include_v2=True)
         ):
             return super().init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -417,7 +420,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices,
             self.req_to_token.stride(0),
             max_blocks_per_seq,
-            NUM_PAGE_PER_BLOCK=TRITON_PAD_NUM_PAGE_PER_BLOCK,
             PAGED_SIZE=self.page_size,
         )
 
@@ -430,7 +432,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices,
             max_seq_len_val,
         )
-        if forward_mode.is_draft_extend():
+        if forward_mode.is_draft_extend(include_v2=True):
             num_tokens_per_bs = num_tokens // bs
             metadata.max_seq_len_q = num_tokens_per_bs + 1
             metadata.sum_seq_lens_q = num_tokens_per_bs * bs
@@ -463,7 +465,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             not forward_mode.is_decode_or_idle()
             and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend()
+            and not forward_mode.is_draft_extend(include_v2=True)
         ):
             return super().init_forward_metadata_replay_cuda_graph(
                 bs,
@@ -482,7 +484,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         metadata = self.decode_cuda_graph_metadata[bs]
 
-        if forward_mode.is_draft_extend():
+        if forward_mode.is_draft_extend(include_v2=True):
             accept_length = spec_info.accept_length[:bs]
             if spec_info.accept_length_cpu:
                 metadata.max_seq_len_q = max(spec_info.accept_length_cpu[:bs])
@@ -504,7 +506,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.block_kv_indices,
             self.req_to_token.stride(0),
             metadata.block_kv_indices.shape[1],
-            NUM_PAGE_PER_BLOCK=TRITON_PAD_NUM_PAGE_PER_BLOCK,
             PAGED_SIZE=self.page_size,
         )
 
@@ -525,8 +526,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
-            and not forward_batch.forward_mode.is_draft_extend()
-            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             if self.disable_chunked_prefix_cache:
                 super().init_forward_metadata(forward_batch)
@@ -547,7 +547,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             bs = forward_batch.batch_size
 
@@ -576,7 +576,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_decode_metadata = TRTLLMMLADecodeMetadata(
                 block_kv_indices, max_seq_len_val
             )
-            if forward_batch.forward_mode.is_draft_extend():
+            if forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 max_seq = forward_batch.seq_lens_cpu.max().item()
 
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
@@ -925,7 +925,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             metadata = (
                 getattr(forward_batch, "decode_trtllm_mla_metadata", None)
@@ -997,7 +997,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             # Reshape output directly without slicing
 
-            if forward_batch.forward_mode.is_draft_extend():
+            if forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 raw_out = self.unpad_draft_extend_output(
                     raw_out,
                     metadata.cu_seqlens_q,
