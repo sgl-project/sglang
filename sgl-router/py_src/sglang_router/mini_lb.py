@@ -113,7 +113,7 @@ class MiniLoadBalancer:
         self, request_data, encode_urls, endpoint
     ):
         messages = request_data.get('messages')
-        if messages is None:
+        if messages is None or len(encode_urls) == 0:
             return
         
         # Extract mm_items
