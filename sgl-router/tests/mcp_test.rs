@@ -26,7 +26,13 @@ async fn create_mock_server() -> MockMCPServer {
 
 #[tokio::test]
 async fn test_mcp_server_initialization() {
-    let config = McpConfig { servers: vec![] };
+    let config = McpConfig {
+        servers: vec![],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
+    };
 
     // Should fail with no servers
     let result = McpClientManager::new(config).await;
@@ -44,7 +50,13 @@ async fn test_server_connection_with_mock() {
                 url: mock_server.url(),
                 token: None,
             },
+            proxy: None,
+            required: false,
         }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
     };
 
     let result = McpClientManager::new(config).await;
@@ -76,7 +88,13 @@ async fn test_tool_availability_checking() {
                 url: mock_server.url(),
                 token: None,
             },
+            proxy: None,
+            required: false,
         }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
     };
 
     let mut manager = McpClientManager::new(config).await.unwrap();
@@ -119,6 +137,8 @@ async fn test_multi_server_connection() {
                     url: mock_server1.url(),
                     token: None,
                 },
+                proxy: None,
+                required: false,
             },
             McpServerConfig {
                 name: "mock_server_2".to_string(),
@@ -126,8 +146,14 @@ async fn test_multi_server_connection() {
                     url: mock_server2.url(),
                     token: None,
                 },
+                proxy: None,
+                required: false,
             },
         ],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
     };
 
     // Note: This will fail to connect to both servers in the current implementation
@@ -156,7 +182,13 @@ async fn test_tool_execution_with_mock() {
                 url: mock_server.url(),
                 token: None,
             },
+            proxy: None,
+            required: false,
         }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
     };
 
     let mut manager = McpClientManager::new(config).await.unwrap();
@@ -207,7 +239,13 @@ async fn test_concurrent_tool_execution() {
                 url: mock_server.url(),
                 token: None,
             },
+            proxy: None,
+            required: false,
         }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
     };
 
     let mut manager = McpClientManager::new(config).await.unwrap();
@@ -244,7 +282,13 @@ async fn test_tool_execution_errors() {
                 url: mock_server.url(),
                 token: None,
             },
+            proxy: None,
+            required: false,
         }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
     };
 
     let mut manager = McpClientManager::new(config).await.unwrap();
@@ -275,7 +319,13 @@ async fn test_connection_without_server() {
                 args: vec![],
                 envs: HashMap::new(),
             },
+            proxy: None,
+            required: false,
         }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
     };
 
     let result = McpClientManager::new(config).await;
@@ -307,7 +357,13 @@ async fn test_tool_info_structure() {
                 url: mock_server.url(),
                 token: None,
             },
+            proxy: None,
+            required: false,
         }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
     };
 
     let manager = McpClientManager::new(config).await.unwrap();
@@ -337,7 +393,13 @@ async fn test_sse_connection() {
                 args: vec!["--sse".to_string()],
                 envs: HashMap::new(),
             },
+            proxy: None,
+            required: false,
         }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
     };
 
     // This will fail immediately without retry
@@ -356,6 +418,8 @@ async fn test_transport_types() {
             url: "http://localhost:8080/mcp".to_string(),
             token: Some("auth_token".to_string()),
         },
+        proxy: None,
+        required: false,
     };
     assert_eq!(http_config.name, "http_server");
 
@@ -366,6 +430,8 @@ async fn test_transport_types() {
             url: "http://localhost:8081/sse".to_string(),
             token: None,
         },
+        proxy: None,
+        required: false,
     };
     assert_eq!(sse_config.name, "sse_server");
 
@@ -377,6 +443,8 @@ async fn test_transport_types() {
             args: vec!["--port".to_string(), "8082".to_string()],
             envs: HashMap::new(),
         },
+        proxy: None,
+        required: false,
     };
     assert_eq!(stdio_config.name, "stdio_server");
 }
@@ -395,7 +463,13 @@ async fn test_complete_workflow() {
                 url: mock_server.url(),
                 token: None,
             },
+            proxy: None,
+            required: false,
         }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
     };
 
     // 2. Connect to server

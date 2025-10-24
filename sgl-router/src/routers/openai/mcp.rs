@@ -160,7 +160,16 @@ pub async fn mcp_manager_from_request_tools(
         }
     };
     let cfg = crate::mcp::McpConfig {
-        servers: vec![crate::mcp::McpServerConfig { name, transport }],
+        servers: vec![crate::mcp::McpServerConfig {
+            name,
+            transport,
+            proxy: None,
+            required: false,
+        }],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
     };
     match McpClientManager::new(cfg).await {
         Ok(mgr) => Some(Arc::new(mgr)),

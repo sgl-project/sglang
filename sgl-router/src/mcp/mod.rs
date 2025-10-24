@@ -11,8 +11,13 @@ pub mod client_manager;
 pub mod config;
 pub mod error;
 pub mod oauth;
+pub mod proxy;
 
 // Re-export the main types for convenience
 pub use client_manager::{McpClientManager, PromptInfo, ResourceInfo, ToolInfo};
-pub use config::{McpConfig, McpServerConfig, McpTransport};
+pub use config::{
+    InventoryConfig, McpConfig, McpPoolConfig, McpProxyConfig, McpServerConfig, McpTransport,
+    WarmupServer,
+};
 pub use error::{McpError, McpResult};
+pub use proxy::{create_http_client, resolve_proxy_config};
