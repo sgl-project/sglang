@@ -54,29 +54,6 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
-# Debug helper for one-time exception logging
-class _DebugOnce:
-    fired = False
-
-
-def _debug_dump_once(tag, **kw):
-    """Print debug information only once on first exception."""
-    if _DebugOnce.fired:
-        return
-    _DebugOnce.fired = True
-    # Format values safely - avoid .item() on tensors
-    parts = []
-    for k, v in kw.items():
-        if isinstance(v, torch.Tensor):
-            # Show tensor metadata without triggering GPU-CPU sync
-            parts.append(f"{k}=Tensor(shape={tuple(v.shape)}, dtype={v.dtype}, device={v.device})")
-        else:
-            parts.append(f"{k}={v}")
-    msg = f"[DBG:{tag}] " + " ".join(parts)
-    logger.error(msg)
-    print(msg, flush=True)
-
-
 @dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -603,26 +580,7 @@ class LogitsProcessor(nn.Module):
                 hidden_states,
             )
             
-            # Debug wrapper for dp_gather_replicate
-            try:
-                dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
-            except Exception as e:
-                # Only print debug info on first exception to avoid log flooding
-                # Pass tensors directly to _debug_dump_once - it will handle formatting safely
-                _debug_dump_once(
-                    "dp_gather",
-                    hs_shape=tuple(hidden_states.shape),
-                    lhs_shape=tuple(local_hidden_states.shape),
-                    hs_dtype=hidden_states.dtype,
-                    lhs_dtype=local_hidden_states.dtype,
-                    hs_device=hidden_states.device,
-                    lhs_device=local_hidden_states.device,
-                    global_dp_buffer_len=getattr(logits_metadata, "global_dp_buffer_len", None),
-                    dp_local_start_pos=getattr(logits_metadata, "dp_local_start_pos", None),
-                    dp_local_num_tokens=getattr(logits_metadata, "dp_local_num_tokens", None),
-                    global_num_tokens_gpu=getattr(logits_metadata, "global_num_tokens_gpu", None),
-                )
-                raise
+            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
         if hasattr(lm_head, "weight"):
             if self.use_fp32_lm_head:

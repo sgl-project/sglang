@@ -355,23 +355,18 @@ def disable_dp_size():
 
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
-    # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
-    # NOTE: This function is called in two different contexts:
-    # 1. Attention/MLP stage (ForwardBatch): uses global_num_tokens_gpu
-    # 2. Logits stage (LogitsMetadata): should use values set by compute_dp_attention_metadata()
+    # Compute local token range for current DP rank.
+    # For LogitsMetadata, use global_num_tokens_for_logprob_gpu (pruned tokens needing logits).
+    # For ForwardBatch (MLP/Attention), use global_num_tokens_gpu (all tokens in batch).
     dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
-        # Choose the correct metadata source based on batch type
-        # For LogitsMetadata: prefer global_num_tokens_for_logprob_gpu (logits stage)
-        # For ForwardBatch: use global_num_tokens_gpu (attention/MLP stage)
+        # Select metadata source based on context
         if type(forward_batch).__name__ == 'LogitsMetadata' and \
            hasattr(forward_batch, 'global_num_tokens_for_logprob_gpu') and \
            forward_batch.global_num_tokens_for_logprob_gpu is not None:
-            # Logits stage: use tokens that need logits computed
             global_num_tokens_source = forward_batch.global_num_tokens_for_logprob_gpu
         else:
-            # Attention/MLP stage: use total tokens
             global_num_tokens_source = forward_batch.global_num_tokens_gpu
         
         cumtokens = torch.cumsum(global_num_tokens_source, dim=0)
@@ -383,22 +378,6 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
 
         forward_batch.dp_local_start_pos = local_start_pos
         forward_batch.dp_local_num_tokens = local_num_tokens
-
-    # Debug: check if returned value will mismatch with global_num_tokens_for_logprob_gpu
-    if __debug__ and not torch.cuda.is_current_stream_capturing():
-        if hasattr(forward_batch, 'global_num_tokens_for_logprob_gpu') and \
-           forward_batch.global_num_tokens_for_logprob_gpu is not None:
-            logprob_num_tokens = forward_batch.global_num_tokens_for_logprob_gpu[dp_rank].item()
-            returned_num_tokens = forward_batch.dp_local_num_tokens.item() if isinstance(forward_batch.dp_local_num_tokens, torch.Tensor) else forward_batch.dp_local_num_tokens
-            
-            # If they differ AND this is LogitsMetadata type, something is wrong
-            if logprob_num_tokens != returned_num_tokens and type(forward_batch).__name__ == 'LogitsMetadata':
-                assert False, (
-                    f"get_dp_local_info: Returning WRONG value! "
-                    f"global_num_tokens_for_logprob_gpu[{dp_rank}]={logprob_num_tokens}, "
-                    f"but returning dp_local_num_tokens={returned_num_tokens}. "
-                    f"compute_dp_attention_metadata() should have set dp_local_num_tokens to {logprob_num_tokens}!"
-                )
 
     return forward_batch.dp_local_start_pos, forward_batch.dp_local_num_tokens
 
@@ -441,63 +420,6 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     BLOCK_SIZE = 8192
     grid = (triton.cdiv(max_size, BLOCK_SIZE),)
 
-    # Debug assertions - only active when __debug__ is True
-    if __debug__:
-        # Validate offset and size types
-        assert isinstance(offset, (int, torch.Tensor)), (
-            f"offset type invalid: {type(offset)}"
-        )
-        assert isinstance(sz, (int, torch.Tensor)), f"sz type invalid: {type(sz)}"
-        
-        # Check tensor contiguity (safe during CUDA graph capture)
-        assert dst.is_contiguous(), (
-            f"dst not contiguous: shape={tuple(dst.shape)}, stride={dst.stride()}"
-        )
-        assert src.is_contiguous(), (
-            f"src not contiguous: shape={tuple(src.shape)}, stride={src.stride()}"
-        )
-        
-        # Validate BLOCK_SIZE and chunk_size (safe - Python scalars)
-        assert BLOCK_SIZE > 0 and chunk_size > 0, (
-            f"BLOCK_SIZE/chunk_size invalid: {BLOCK_SIZE}/{chunk_size}"
-        )
-        
-        # Enhanced bounds checking - only when NOT capturing CUDA graph
-        # torch.cuda.is_current_stream_capturing() returns True during capture
-        is_capturing = torch.cuda.is_current_stream_capturing()
-        if not is_capturing:
-            # Safe to call .item() outside of CUDA graph capture
-            offset_val = offset.item() if isinstance(offset, torch.Tensor) else offset
-            sz_val = sz.item() if isinstance(sz, torch.Tensor) else sz
-            
-            assert offset_val >= 0 and sz_val >= 0, (
-                f"negative offset/size: offset={offset_val}, sz={sz_val}"
-            )
-            
-            # Check bounds (in elements)
-            dst_numel = dst.numel()
-            src_numel = src.numel()
-            if offset_src:
-                # offset on src side
-                assert offset_val * chunk_size + sz_val * chunk_size <= src_numel, (
-                    f"src OOB: offset={offset_val}, sz={sz_val}, chunk_size={chunk_size}, "
-                    f"required={(offset_val + sz_val) * chunk_size}, src.numel={src_numel}"
-                )
-                assert sz_val * chunk_size <= dst_numel, (
-                    f"dst OOB: sz={sz_val}, chunk_size={chunk_size}, "
-                    f"required={sz_val * chunk_size}, dst.numel={dst_numel}"
-                )
-            else:
-                # offset on dst side
-                assert offset_val * chunk_size + sz_val * chunk_size <= dst_numel, (
-                    f"dst OOB: offset={offset_val}, sz={sz_val}, chunk_size={chunk_size}, "
-                    f"required={(offset_val + sz_val) * chunk_size}, dst.numel={dst_numel}"
-                )
-                assert sz_val * chunk_size <= src_numel, (
-                    f"src OOB: sz={sz_val}, chunk_size={chunk_size}, "
-                    f"required={sz_val * chunk_size}, src.numel={src_numel}"
-                )
-
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
@@ -509,16 +431,12 @@ def _dp_gather_via_all_reduce(
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
     
-    # WORKAROUND: Use actual tensor size to avoid metadata mismatch
-    # The scheduler's calculation of num_tokens_for_logprob is based on extend_len calculations
-    # which doesn't account for pruning done by logits_processor.
-    # Using local_tokens.shape[0] is safe and matches the actual data.
+    # Fix potential metadata mismatch: scheduler's num_tokens_for_logprob may not account
+    # for pruning done by logits_processor. Use actual tensor size as authoritative source.
     actual_local_size = local_tokens.shape[0]
     if isinstance(local_num_tokens, torch.Tensor):
-        # Replace tensor value in-place to avoid creating new tensors during CUDA graph capture
-        local_num_tokens.fill_(actual_local_size)
+        local_num_tokens.fill_(actual_local_size)  # In-place update for CUDA graph compatibility
     else:
-        # If it's an int, convert to match the actual size (should not happen normally)
         local_num_tokens = actual_local_size
 
     global_tokens.fill_(0)
@@ -529,27 +447,6 @@ def _dp_gather_via_all_reduce(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
-
-        # Debug validation before memcpy
-        if __debug__:
-            # Type validation (always safe)
-            assert isinstance(local_start_pos, (int, torch.Tensor)), (
-                f"_dp_gather_via_all_reduce: invalid local_start_pos type={type(local_start_pos)}"
-            )
-            
-            # Simplified validation without .item() calls during CUDA graph capture
-            if not torch.cuda.is_current_stream_capturing():
-                start_pos_val = (
-                    local_start_pos.item()
-                    if isinstance(local_start_pos, torch.Tensor)
-                    else local_start_pos
-                )
-                assert start_pos_val >= 0, (
-                    f"_dp_gather_via_all_reduce: negative start_pos={start_pos_val}"
-                )
-                assert local_num_tokens >= 0, (
-                    f"_dp_gather_via_all_reduce: negative num_tokens={local_num_tokens}"
-                )
 
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
@@ -618,33 +515,6 @@ def dp_gather_replicate(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
 ):
-    # Debug validation at entry
-    if __debug__:
-        assert isinstance(global_tokens, torch.Tensor), (
-            f"dp_gather_replicate: global_tokens type={type(global_tokens)}"
-        )
-        assert isinstance(local_tokens, torch.Tensor), (
-            f"dp_gather_replicate: local_tokens type={type(local_tokens)}"
-        )
-        assert global_tokens.shape[0] >= 0 and local_tokens.shape[0] >= 0, (
-            f"dp_gather_replicate: invalid shapes - global={tuple(global_tokens.shape)}, "
-            f"local={tuple(local_tokens.shape)}"
-        )
-        
-        # Validate metadata if available
-        if hasattr(forward_batch, "global_num_tokens_gpu") and forward_batch.global_num_tokens_gpu is not None:
-            # Basic check (always safe)
-            assert forward_batch.global_num_tokens_gpu.numel() > 0, (
-                f"dp_gather_replicate: global_num_tokens_gpu is empty"
-            )
-            
-            # Value validation (only when not capturing CUDA graph)
-            if not torch.cuda.is_current_stream_capturing():
-                global_num_tokens_sum = forward_batch.global_num_tokens_gpu.sum().item()
-                assert global_num_tokens_sum >= 0, (
-                    f"dp_gather_replicate: negative global_num_tokens sum={global_num_tokens_sum}"
-                )
-    
     _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=False)
 
 
