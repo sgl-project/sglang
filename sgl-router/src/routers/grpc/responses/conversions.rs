@@ -8,7 +8,10 @@
 //! without requiring Python backend changes.
 
 use crate::protocols::{
-    chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, UserMessageContent},
+    chat::{
+        ChatCompletionRequest, ChatCompletionResponse, ChatMessage, TextMessageContent,
+        UserMessageContent,
+    },
     common::{FunctionCallResponse, StreamOptions, ToolCall, UsageInfo},
     responses::{
         ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
@@ -30,7 +33,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
     // 1. Add system message if instructions provided
     if let Some(instructions) = &req.instructions {
         messages.push(ChatMessage::System {
-            content: instructions.clone(),
+            content: TextMessageContent::Text(instructions.clone()),
             name: None,
         });
     }
@@ -69,7 +72,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                             }
                             "system" => {
                                 messages.push(ChatMessage::System {
-                                    content: text,
+                                    content: TextMessageContent::Text(text),
                                     name: None,
                                 });
                             }

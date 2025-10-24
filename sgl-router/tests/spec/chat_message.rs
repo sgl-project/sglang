@@ -1,5 +1,6 @@
 use serde_json::json;
-use sglang_router_rs::protocols::chat::{ChatMessage, UserMessageContent};
+use sglang_router_rs::protocols::chat::{ChatMessage, TextMessageContent, UserMessageContent};
+use sglang_router_rs::protocols::common::{ContentPart, TextContentPart};
 
 #[test]
 fn test_chat_message_tagged_by_role_system() {
@@ -10,9 +11,67 @@ fn test_chat_message_tagged_by_role_system() {
 
     let msg: ChatMessage = serde_json::from_value(json).unwrap();
     match msg {
-        ChatMessage::System { content, .. } => {
-            assert_eq!(content, "You are a helpful assistant");
-        }
+        ChatMessage::System { content, .. } => match content {
+            TextMessageContent::Text(text) => assert_eq!(text, "You are a helpful assistant"),
+            _ => panic!("Expected Text variant"),
+        },
+        _ => panic!("Expected System variant"),
+    }
+}
+
+#[test]
+fn test_chat_message_tagged_by_role_system_content_is_list() {
+    let json = json!({
+        "role": "system",
+        "content":
+        [{
+            "type": "text",
+            "text": "You are a helpful assistant"
+        }]
+    });
+
+    let msg: ChatMessage = serde_json::from_value(json).unwrap();
+    match msg {
+        ChatMessage::System { content, .. } => match content {
+            TextMessageContent::Parts(parts) => {
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    TextContentPart::Text { text } => {
+                        assert_eq!(text, "You are a helpful assistant");
+                    }
+                }
+            }
+            _ => panic!("Expected Parts variant"),
+        },
+        _ => panic!("Expected System variant"),
+    }
+}
+
+#[test]
+fn test_chat_message_tagged_by_role_user_content_is_list() {
+    let json = json!({
+        "role": "user",
+        "content":
+        [{
+            "type": "text",
+            "text": "You are a helpful assistant"
+        }]
+    });
+
+    let msg: ChatMessage = serde_json::from_value(json).unwrap();
+    match msg {
+        ChatMessage::User { content, .. } => match content {
+            UserMessageContent::Parts(parts) => {
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    ContentPart::Text { text } => {
+                        assert_eq!(text, "You are a helpful assistant");
+                    }
+                    _ => panic!("Expected Text variant"),
+                }
+            }
+            _ => panic!("Expected Parts variant"),
+        },
         _ => panic!("Expected System variant"),
     }
 }
