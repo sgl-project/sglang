@@ -39,6 +39,7 @@ else:
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -52,6 +53,7 @@ class BaseReq(ABC):
 @dataclass
 class BaseBatchReq(ABC):
     rids: Optional[List[str]] = field(default=None, kw_only=True)
+    http_worker_ipcs: Optional[List[str]] = field(default=None, kw_only=True)
 
     def regenerate_rids(self):
         """Generate new request IDs and return them."""
@@ -823,6 +825,7 @@ class BatchTokenIDOutput(BaseBatchReq):
     completion_tokens: List[int]
     cached_tokens: List[int]
     spec_verify_ct: List[int]
+    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -878,6 +881,8 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    return_bytes: List[bool]
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -896,6 +901,7 @@ class BatchStrOutput(BaseBatchReq):
     completion_tokens: List[int]
     cached_tokens: List[int]
     spec_verify_ct: List[int]
+    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -955,7 +961,7 @@ class BatchEmbeddingOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
-    embeddings: List[List[float]]
+    embeddings: Union[List[List[float]], List[Dict[int, float]]]
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]
@@ -1072,6 +1078,24 @@ class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     group_name: str = "weight_send_group"
     # The backend
     backend: str = "nccl"
+
+
+# Now UpdateWeightsFromIPCReqInput and UpdateWeightsFromIPCReqOutput
+# are only used by Checkpoint Engine (https://github.com/MoonshotAI/checkpoint-engine)
+@dataclass
+class UpdateWeightsFromIPCReqInput(BaseReq):
+    # ZMQ socket paths for each device UUID
+    zmq_handles: Dict[str, str]
+    # Whether to flush cache after weight update
+    flush_cache: bool = True
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+
+
+@dataclass
+class UpdateWeightsFromIPCReqOutput(BaseReq):
+    success: bool
+    message: str
 
 
 @dataclass
@@ -1230,6 +1254,8 @@ class ProfileReqInput(BaseReq):
     profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
 
 
 class ProfileReqType(Enum):
@@ -1248,6 +1274,8 @@ class ProfileReq(BaseReq):
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
 
 
 @dataclass
@@ -1397,18 +1425,6 @@ class LoRAUpdateOutput(BaseReq):
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateOutput
-
-
-@dataclass
-class MultiTokenizerRegisterReq(BaseBatchReq):
-    ipc_name: Optional[str] = None
-
-
-@dataclass
-class MultiTokenizerWrapper:
-    # FIXME(lsyin): remove this
-    worker_id: int
-    obj: Optional[Any] = None
 
 
 class BlockReqType(Enum):

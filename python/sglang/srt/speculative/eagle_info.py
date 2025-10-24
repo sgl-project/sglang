@@ -11,7 +11,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
@@ -245,7 +246,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         # Apply penalty
-        if sampling_info.penalizer_orchestrator.is_required:
+        if (
+            sampling_info.penalizer_orchestrator.is_required
+            or sampling_info.logit_bias is not None
+        ):
             # This is a relaxed version of penalties for speculative decoding.
             linear_penalty = torch.zeros(
                 (bs, logits_output.next_token_logits.shape[1]),
@@ -332,12 +336,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
-                threshold_single=global_server_args_dict[
-                    "speculative_accept_threshold_single"
-                ],
-                threshold_acc=global_server_args_dict[
-                    "speculative_accept_threshold_acc"
-                ],
+                threshold_single=get_global_server_args().speculative_accept_threshold_single,
+                threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
                 deterministic=True,
             )
 
@@ -387,6 +387,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 else:
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
+            req.spec_accepted_tokens += (
+                sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
@@ -574,6 +577,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 @dataclass
 class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+    # Constant: alloc length per decode step
+    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
+
     # The inputs for decode
     # shape: (b, topk)
     topk_p: torch.Tensor = None
@@ -608,9 +614,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     allocate_lens: Optional[torch.Tensor] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
-
-    # FIXME(lsyin): remove this hack
-    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)

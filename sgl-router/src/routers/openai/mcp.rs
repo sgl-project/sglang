@@ -8,17 +8,20 @@
 //! - Payload transformation for MCP tool interception
 //! - Metadata injection for MCP operations
 
-use crate::mcp::McpClientManager;
-use crate::protocols::spec::{ResponseInput, ResponseToolType, ResponsesRequest};
-use crate::routers::header_utils::apply_request_headers;
+use std::{io, sync::Arc};
+
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde_json::{json, to_value, Value};
-use std::{io, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::utils::event_types;
+use crate::{
+    mcp::McpClientManager,
+    protocols::responses::{ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
+    routers::header_utils::apply_request_headers,
+};
 
 // ============================================================================
 // Configuration and State Types
@@ -126,8 +129,8 @@ impl FunctionCallInProgress {
 // ============================================================================
 
 /// Build a request-scoped MCP manager from request tools, if present.
-pub(super) async fn mcp_manager_from_request_tools(
-    tools: &[crate::protocols::spec::ResponseTool],
+pub async fn mcp_manager_from_request_tools(
+    tools: &[ResponseTool],
 ) -> Option<Arc<McpClientManager>> {
     let tool = tools
         .iter()

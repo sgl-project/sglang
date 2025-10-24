@@ -39,10 +39,12 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_int_env_var,
+    get_local_ip_auto,
     is_cpu,
     is_cuda_alike,
     is_hip,
@@ -56,8 +58,6 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _supports_custom_op = supports_custom_op()
-
-IS_ONE_DEVICE_PER_PROCESS = get_bool_env_var("SGLANG_ONE_DEVICE_PER_PROCESS")
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -241,6 +241,7 @@ class GroupCoordinator:
         use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        pynccl_use_current_stream: bool = False,
         torch_compile: Optional[bool] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
     ):
@@ -260,11 +261,14 @@ class GroupCoordinator:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
             )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            cpu_group = torch.distributed.new_group(
-                ranks, backend="gloo", timeout=gloo_timeout
-            )
+            # a cpu_group to allow direct coordination between processes through
+            # the CPU. The backend is chosen based on `torch_distributed_backend`
+            if "mooncake" in torch_distributed_backend:
+                cpu_group = torch.distributed.new_group(ranks, backend="mooncake-cpu")
+            else:
+                cpu_group = torch.distributed.new_group(
+                    ranks, backend="gloo", timeout=gloo_timeout
+                )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -275,17 +279,20 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
-        device_id = 0 if IS_ONE_DEVICE_PER_PROCESS else local_rank
         if is_cuda_alike():
+            device_id = (
+                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
+            )
             self.device = torch.device(f"cuda:{device_id}")
         elif _is_npu:
-            self.device = torch.device(f"npu:{device_id}")
+            self.device = torch.device(f"npu:{local_rank}")
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
         # Import communicators
         self.use_pynccl = use_pynccl
+        self.pynccl_use_current_stream = pynccl_use_current_stream
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
@@ -319,6 +326,7 @@ class GroupCoordinator:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                use_current_stream=pynccl_use_current_stream,
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
@@ -339,7 +347,6 @@ class GroupCoordinator:
             else:
                 ca_max_size = 8 * 1024 * 1024
             try:
-                # print(f"ca_max_size: {ca_max_size}")
                 self.ca_comm = CustomAllreduce(
                     group=self.cpu_group,
                     device=self.device,
@@ -447,10 +454,13 @@ class GroupCoordinator:
 
     @contextmanager
     def graph_capture(
-        self, graph_capture_context: Optional[GraphCaptureContext] = None
+        self,
+        graph_capture_context: Optional[GraphCaptureContext] = None,
+        stream: Optional[torch.cuda.Stream] = None,
     ):
         if graph_capture_context is None:
-            stream = self.device_module.Stream()
+            if stream is None:
+                stream = self.device_module.Stream()
             graph_capture_context = GraphCaptureContext(stream)
         else:
             stream = graph_capture_context.stream
@@ -617,8 +627,11 @@ class GroupCoordinator:
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
         pynccl_comm = self.pynccl_comm
+        symm_mem_comm = self.symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
+        elif symm_mem_comm is not None and not symm_mem_comm.disabled:
+            symm_mem_comm.all_reduce(input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
@@ -683,7 +696,7 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or not _supports_custom_op:
+        if _is_npu or _is_xpu or not _supports_custom_op:
             self._all_gather_into_tensor(output, input)
         else:
             torch.ops.sglang.reg_all_gather_into_tensor(
@@ -1273,6 +1286,7 @@ def init_model_parallel_group(
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
     use_mscclpp_allreduce: Optional[bool] = None,
+    pynccl_use_current_stream: bool = True,
     use_symm_mem_allreduce: Optional[bool] = None,
     torch_compile: Optional[bool] = None,
 ) -> GroupCoordinator:
@@ -1286,7 +1300,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=not _is_npu,
+        use_pynccl=not (_is_npu or _is_xpu),
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem=use_symm_mem_allreduce,
@@ -1295,6 +1309,7 @@ def init_model_parallel_group(
         use_npu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        pynccl_use_current_stream=pynccl_use_current_stream,
         torch_compile=torch_compile,
     )
 
@@ -1352,7 +1367,7 @@ get_pipeline_model_parallel_group = get_pp_group
 
 
 @contextmanager
-def graph_capture():
+def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     """
     `graph_capture` is a context manager which should surround the code that
     is capturing the CUDA graph. Its main purpose is to ensure that the
@@ -1366,9 +1381,9 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
-        context
-    ):
+    with get_tp_group().graph_capture(
+        stream=stream
+    ) as context, get_pp_group().graph_capture(context):
         yield context
 
 
@@ -1410,6 +1425,17 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
+    if "mooncake" in backend:
+        try:
+            from mooncake import ep as mooncake_ep
+        except ImportError as e:
+            raise ImportError(
+                "Please install mooncake by following the instructions at "
+                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+                "to run SGLang with Mooncake Backend."
+            ) from e
+        mooncake_ep.set_host_ip(get_local_ip_auto())
+
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
@@ -1511,6 +1537,7 @@ def initialize_model_parallel(
             "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
         ),
         group_name="tp",
+        pynccl_use_current_stream=duplicate_tp_group,
         torch_compile=torch_compile,
     )
 
@@ -1527,10 +1554,12 @@ def initialize_model_parallel(
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
             ),
             group_name="pdmux_prefill_tp",
+            pynccl_use_current_stream=True,
             torch_compile=torch_compile,
         )
-        _TP.pynccl_comm.disabled = False
-        _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
+        if _TP.pynccl_comm:
+            _TP.pynccl_comm.disabled = False
+            _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
 
     moe_ep_size = expert_model_parallel_size
     moe_tp_size = tensor_model_parallel_size // moe_ep_size
@@ -1720,6 +1749,11 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _PDMUX_PREFILL_TP_GROUP
+    if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
+        _PDMUX_PREFILL_TP_GROUP.destroy()
+    _PDMUX_PREFILL_TP_GROUP = None
 
 
 def destroy_distributed_environment():

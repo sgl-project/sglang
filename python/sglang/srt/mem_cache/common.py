@@ -10,18 +10,15 @@ import triton.language as tl
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 logger = logging.getLogger(__name__)
-
-GLOBAL_SERVER_ARGS_KEYS = ["attention_backend"]
-
-global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
 
 
 @triton.jit
@@ -88,7 +85,7 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(global_server_args_dict.get("attention_backend")):
+    if support_triton(get_global_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
@@ -129,8 +126,8 @@ def get_last_loc(
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
     if (
-        global_server_args_dict["attention_backend"] != "ascend"
-        and global_server_args_dict["attention_backend"] != "torch_native"
+        get_global_server_args().attention_backend != "ascend"
+        and get_global_server_args().attention_backend != "torch_native"
     ):
         impl = get_last_loc_triton
     else:
@@ -296,9 +293,15 @@ def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     num_reqs: int,
     reqs: list[Req] | None,
+    tree_cache: BasePrefixCache | None,
 ) -> list[int]:
     """Allocate request slots from the pool."""
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
+        mamba_available_size = req_to_token_pool.mamba_pool.available_size()
+        if mamba_available_size < num_reqs:
+            if tree_cache is not None and isinstance(tree_cache, MambaRadixCache):
+                mamba_num = max(0, num_reqs - mamba_available_size)
+                tree_cache.evict_mamba(mamba_num)
         req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
     else:
         req_pool_indices = req_to_token_pool.alloc(num_reqs)
@@ -341,7 +344,9 @@ def alloc_for_extend(
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots
-    req_pool_indices = alloc_req_slots(batch.req_to_token_pool, bs, batch.reqs)
+    req_pool_indices = alloc_req_slots(
+        batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
+    )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
@@ -351,11 +356,7 @@ def alloc_for_extend(
     else:
         # Paged allocation - build last_loc
         last_loc = [
-            (
-                t[-1:]
-                if len(t) > 0
-                else torch.tensor([-1], device=batch.tree_cache.device)
-            )
+            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
         ]
         out_cache_loc = alloc_paged_token_slots_extend(

@@ -19,7 +19,6 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
-import json
 import logging
 import multiprocessing as multiprocessing
 import os
@@ -51,6 +50,7 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ClassifyRequest,
     CompletionRequest,
     DetokenizeRequest,
     EmbeddingRequest,
@@ -63,6 +63,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     V1RerankReqInput,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
@@ -95,6 +96,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
@@ -128,6 +130,7 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
 
 
 # Store global states
@@ -148,15 +151,14 @@ def set_global_state(global_state: _GlobalState):
 
 async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
-    pid = os.getpid()
-    main_pid = get_main_process_id()
-    logger.info(f"current worker_id: {pid}, main processID: {main_pid}")
 
     # Read configuration from shared memory
+    main_pid = get_main_process_id()
     port_args, server_args, scheduler_info = read_from_shared_memory(
         f"multi_tokenizer_args_{main_pid}"
     )
     server_args: ServerArgs
+    port_args: PortArgs
 
     # API key authentication is not supported in multi-tokenizer mode
     assert (
@@ -165,6 +167,10 @@ async def init_multi_tokenizer() -> ServerArgs:
 
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+    )
+    logger.info(
+        f"Start multi-tokenizer worker process {os.getpid()}, "
+        f"ipc_name={port_args.tokenizer_ipc_name}"
     )
 
     # Launch multi-tokenizer manager process
@@ -176,8 +182,6 @@ async def init_multi_tokenizer() -> ServerArgs:
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
-    # Register this tokenizer with the main tokenizer manager
-    await tokenizer_manager.register_to_main_tokenizer_manager()
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     set_global_state(
@@ -227,6 +231,9 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
@@ -634,6 +641,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         with_stack=obj.with_stack,
         record_shapes=obj.record_shapes,
         profile_by_stage=obj.profile_by_stage,
+        merge_profiles=obj.merge_profiles,
     )
     return Response(
         content="Start profiling.\n",
@@ -828,6 +836,27 @@ async def update_weights_from_distributed(
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_weights_from_ipc")
+async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
+    """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
+    success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
+        obj, request
+    )
+
+    # Update weight version if provided and weights update was successful
+    if success and obj.weight_version is not None:
+        _update_weight_version_if_provided(obj.weight_version)
+        message += f" Weight version updated to {obj.weight_version}."
+
+    content = {"success": success, "message": message}
+    if success:
+        if _global_state.tokenizer_manager.initial_weights_loaded is False:
+            _global_state.tokenizer_manager.initial_weights_loaded = True
+        return ORJSONResponse(content)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
@@ -1078,6 +1107,18 @@ async def openai_v1_chat_completions(
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
     return await raw_request.app.state.openai_serving_embedding.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/classify",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
+    """OpenAI-compatible classification endpoint."""
+    return await raw_request.app.state.openai_serving_classify.handle_request(
         request, raw_request
     )
 
@@ -1512,6 +1553,8 @@ def _wait_and_warmup(
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
     launch_callback: Optional[Callable[[], None]] = None,
 ):
+    if server_args.checkpoint_engine_wait_weights_before_ready:
+        _wait_weights_ready()
     if not server_args.skip_server_warmup:
         if not _execute_server_warmup(
             server_args,
@@ -1534,3 +1577,24 @@ def _wait_and_warmup(
 
     if launch_callback is not None:
         launch_callback()
+
+
+def _wait_weights_ready():
+    """Wait for weights to be ready within the specified timeout."""
+    timeout = WAIT_WEIGHTS_READY_TIMEOUT
+    start_time = time.time()
+
+    for _ in range(timeout):
+        if _global_state.tokenizer_manager.initial_weights_loaded:
+            logger.info(
+                f"Weights are ready after {time.time() - start_time:.2f} seconds"
+            )
+            return
+        time.sleep(1)
+
+    # Timeout reached without weights being ready
+    logger.error(
+        f"Weights are not ready after waiting {timeout} seconds. "
+        f"Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT environment variable. "
+        f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
+    )

@@ -29,6 +29,12 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
+    def format_is_triton_kernels(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[StandardDispatchOutput]:
+        return dispatch_output.format.is_standard()
+
+    @staticmethod
     def format_is_deepep_normal(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[DeepEPNormalOutput]:
@@ -73,7 +79,7 @@ class DispatchOutputFormat(Enum):
 class DispatchOutput(Protocol):
     """Protocol for dispatch outputs in different formats."""
 
-    # TODO: add hidden_states to the protocol
+    hidden_states: torch.Tensor
 
     @property
     def format(self) -> DispatchOutputFormat: ...

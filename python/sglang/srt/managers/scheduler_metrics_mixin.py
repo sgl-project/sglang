@@ -3,13 +3,10 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
-
-import torch
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
@@ -126,7 +123,7 @@ class SchedulerMetricsMixin:
             token_usage_msg = f"token usage: {token_usage:.2f}, "
 
         f = (
-            f"Prefill batch. "
+            f"Prefill batch [{self.forward_ct + 1}], "
             f"#new-seq: {len(can_run_list)}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
@@ -138,6 +135,7 @@ class SchedulerMetricsMixin:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
         logger.info(f)
 
@@ -248,18 +246,28 @@ class SchedulerMetricsMixin:
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        msg = f"Decode batch. #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = f"Decode batch [{self.forward_ct}], #running-req: {num_running_reqs}, {token_usage_msg}"
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
+            spec_accept_rate = 0
         else:
             spec_accept_length = (
                 self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
             )
+            # Calculate acceptance rate: accepted tokens / total draft tokens
+            total_draft_tokens = self.spec_num_total_forward_ct * (
+                (self.server_args.speculative_num_steps or 0) + 1
+            )
+            spec_accept_rate = (
+                self.spec_num_total_accepted_tokens / total_draft_tokens
+                if total_draft_tokens > 0
+                else 0
+            )
             self.cum_spec_accept_length += self.spec_num_total_accepted_tokens
             self.cum_spec_accept_count += self.spec_num_total_forward_ct
             self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
-            msg += f"accept len: {spec_accept_length:.2f}, "
+            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
         cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -287,6 +295,9 @@ class SchedulerMetricsMixin:
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            # Speculative decoding
+            self.stats.spec_accept_rate = spec_accept_rate
             self.stats.spec_accept_length = spec_accept_length
 
             # Retract

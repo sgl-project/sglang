@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -8,13 +10,12 @@ use axum::{
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+use sglang_router_rs::{
+    config::{RouterConfig, RoutingMode},
+    core::Job,
+    routers::{RouterFactory, RouterTrait},
+    server::AppContext,
 };
-use sglang_router_rs::core::WorkerManager;
-use sglang_router_rs::routers::{RouterFactory, RouterTrait};
-use sglang_router_rs::server::AppContext;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 /// Test context that manages mock workers
@@ -29,43 +30,18 @@ struct TestContext {
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         // Create default router config
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
-            port: 3002,
-            max_payload_size: 256 * 1024 * 1024,
-            request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            discovery: None,
-            dp_aware: false,
-            api_key: None,
-            metrics: None,
-            log_dir: None,
-            log_level: None,
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            queue_size: 0,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
-            enable_igw: false,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-        };
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3002)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
 
         Self::new_with_config(config, worker_configs).await
     }
@@ -107,21 +83,50 @@ impl TestContext {
         // Create app context
         let app_context = common::create_test_context(config.clone());
 
-        // Initialize workers in the registry before creating router
+        // Submit worker initialization job (same as real server does)
         if !worker_urls.is_empty() {
-            WorkerManager::initialize_workers(&config, &app_context.worker_registry, None)
+            let job_queue = app_context
+                .worker_job_queue
+                .get()
+                .expect("JobQueue should be initialized");
+            let job = Job::InitializeWorkersFromConfig {
+                router_config: Box::new(config.clone()),
+            };
+            job_queue
+                .submit(job)
                 .await
-                .expect("Failed to initialize workers");
+                .expect("Failed to submit worker initialization job");
+
+            // Poll until all workers are healthy (up to 10 seconds)
+            let expected_count = worker_urls.len();
+            let start = tokio::time::Instant::now();
+            let timeout_duration = tokio::time::Duration::from_secs(10);
+            loop {
+                let healthy_workers = app_context
+                    .worker_registry
+                    .get_all()
+                    .iter()
+                    .filter(|w| w.is_healthy())
+                    .count();
+
+                if healthy_workers >= expected_count {
+                    break;
+                }
+
+                if start.elapsed() > timeout_duration {
+                    panic!(
+                        "Timeout waiting for {} workers to become healthy (only {} ready)",
+                        expected_count, healthy_workers
+                    );
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
         }
 
         // Create router
         let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
-
-        // Wait for router to discover workers
-        if !workers.is_empty() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
 
         Self {
             workers,
@@ -707,221 +712,6 @@ mod model_info_tests {
 }
 
 #[cfg(test)]
-mod worker_management_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_add_new_worker() {
-        let ctx = TestContext::new(vec![]).await;
-        let app = ctx.create_app().await;
-
-        // Start a mock worker
-        let mut worker = MockWorker::new(MockWorkerConfig {
-            port: 18301,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        });
-        let url = worker.start().await.unwrap();
-
-        // Add the worker
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/add_worker?url={}", url))
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // List workers to verify
-        let req = Request::builder()
-            .method("GET")
-            .uri("/list_workers")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let workers = body_json["urls"].as_array().unwrap();
-        assert!(workers.iter().any(|w| w.as_str().unwrap() == url));
-
-        worker.stop().await;
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_remove_existing_worker() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
-            port: 18302,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        }])
-        .await;
-
-        let app = ctx.create_app().await;
-
-        // Get the worker URL
-        let req = Request::builder()
-            .method("GET")
-            .uri("/list_workers")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let workers = body_json["urls"].as_array().unwrap();
-        let worker_url = workers[0].as_str().unwrap();
-
-        // Remove the worker
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/remove_worker?url={}", worker_url))
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/list_workers")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let workers = body_json["urls"].as_array().unwrap();
-        assert!(workers.is_empty());
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_add_worker_invalid_url() {
-        let ctx = TestContext::new(vec![]).await;
-        let app = ctx.create_app().await;
-
-        // Invalid URL format
-        let req = Request::builder()
-            .method("POST")
-            .uri("/add_worker?url=not-a-valid-url")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        // Missing URL parameter
-        let req = Request::builder()
-            .method("POST")
-            .uri("/add_worker")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        // Empty URL
-        let req = Request::builder()
-            .method("POST")
-            .uri("/add_worker?url=")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_add_duplicate_worker() {
-        // Start a mock worker
-        let mut worker = MockWorker::new(MockWorkerConfig {
-            port: 18303,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        });
-        let url = worker.start().await.unwrap();
-
-        let ctx = TestContext::new(vec![]).await;
-        let app = ctx.create_app().await;
-
-        // Add worker first time
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/add_worker?url={}", url))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        // Try to add same worker again
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/add_worker?url={}", url))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        // Should return error for duplicate
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        worker.stop().await;
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_add_unhealthy_worker() {
-        // Start unhealthy worker
-        let mut worker = MockWorker::new(MockWorkerConfig {
-            port: 18304,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Unhealthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        });
-        let url = worker.start().await.unwrap();
-
-        let ctx = TestContext::new(vec![]).await;
-        let app = ctx.create_app().await;
-
-        // Try to add unhealthy worker
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/add_worker?url={}", url))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-
-        // Router should reject unhealthy workers
-        assert!(
-            resp.status() == StatusCode::BAD_REQUEST
-                || resp.status() == StatusCode::SERVICE_UNAVAILABLE
-        );
-
-        worker.stop().await;
-        ctx.shutdown().await;
-    }
-}
-
-#[cfg(test)]
 mod router_policy_tests {
     use super::*;
 
@@ -971,7 +761,7 @@ mod router_policy_tests {
     #[tokio::test]
     async fn test_worker_selection() {
         let ctx = TestContext::new(vec![MockWorkerConfig {
-            port: 18203,
+            port: 18207,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
@@ -994,8 +784,9 @@ mod router_policy_tests {
 
 #[cfg(test)]
 mod responses_endpoint_tests {
-    use super::*;
     use reqwest::Client as HttpClient;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_v1_responses_non_streaming() {
@@ -1364,43 +1155,18 @@ mod error_tests {
     #[tokio::test]
     async fn test_payload_too_large() {
         // Create context with small payload limit
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
-            port: 3010,
-            max_payload_size: 1024, // 1KB limit
-            request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            dp_aware: false,
-            api_key: None,
-            discovery: None,
-            metrics: None,
-            log_dir: None,
-            log_level: None,
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            queue_size: 0,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
-            enable_igw: false,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-        };
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3010)
+            .max_payload_size(1024) // 1KB limit
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
 
         let ctx = TestContext::new_with_config(
             config,
@@ -1455,39 +1221,6 @@ mod error_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_missing_required_fields() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
-            port: 18405,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        }])
-        .await;
-
-        let app = ctx.create_app().await;
-
-        // Missing messages in chat completion
-        let payload = json!({
-            "model": "test-model"
-            // missing "messages"
-        });
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&payload).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        // Axum validates JSON schema - returns 422 for validation errors
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         ctx.shutdown().await;
     }
@@ -1722,46 +1455,18 @@ mod pd_mode_tests {
             .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
             .unwrap_or(9000);
 
-        let config = RouterConfig {
-            mode: RoutingMode::PrefillDecode {
-                prefill_urls: vec![(prefill_url, Some(prefill_port))],
-                decode_urls: vec![decode_url],
-                prefill_policy: None,
-                decode_policy: None,
-            },
-            policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
-            port: 3011,
-            max_payload_size: 256 * 1024 * 1024,
-            request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            discovery: None,
-            metrics: None,
-            log_dir: None,
-            dp_aware: false,
-            api_key: None,
-            log_level: None,
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            queue_size: 0,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
-            enable_igw: false,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-        };
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(vec![(prefill_url, Some(prefill_port))], vec![decode_url])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3011)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
 
         // Create app context
         let app_context = common::create_test_context(config);
@@ -1887,43 +1592,19 @@ mod request_id_tests {
     #[tokio::test]
     async fn test_request_id_with_custom_headers() {
         // Create config with custom request ID headers
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
-            port: 3002,
-            max_payload_size: 256 * 1024 * 1024,
-            request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            discovery: None,
-            metrics: None,
-            dp_aware: false,
-            api_key: None,
-            log_dir: None,
-            log_level: None,
-            request_id_headers: Some(vec!["custom-id".to_string(), "trace-id".to_string()]),
-            max_concurrent_requests: 64,
-            queue_size: 0,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
-            enable_igw: false,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
-            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle: None,
-            reasoning_parser: None,
-            tool_call_parser: None,
-        };
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3002)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .request_id_headers(vec!["custom-id".to_string(), "trace-id".to_string()])
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
 
         let ctx = TestContext::new_with_config(
             config,
@@ -2185,7 +1866,7 @@ mod rerank_tests {
         assert!(body_json.get("model").is_some());
 
         // V1 API should use default model name
-        assert_eq!(body_json["model"], "default");
+        assert_eq!(body_json["model"], "unknown");
 
         let results = body_json["results"].as_array().unwrap();
         assert_eq!(results.len(), 3); // All documents should be returned

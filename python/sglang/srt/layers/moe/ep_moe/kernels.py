@@ -1,12 +1,9 @@
 import logging
-from typing import List, Optional
 
 import torch
 import triton
 
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import ceil_div, dispose_tensor, is_cuda
-from sglang.utils import is_in_ci
+from sglang.srt.utils import ceil_div, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -569,7 +566,9 @@ def ep_scatter(
         scale_hidden_size = ceil_div(scale_hidden_size, 4)
 
     assert m_indices.shape[0] % BLOCK_E == 0
-    assert recv_x_scale.dtype == output_tensor_scale.dtype
+    assert (
+        recv_x_scale.dtype == output_tensor_scale.dtype
+    ), f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
     assert recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
 
     _fwd_kernel_ep_scatter_1[(grid,)](

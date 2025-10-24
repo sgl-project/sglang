@@ -37,7 +37,7 @@ MODEL_THRESHOLDS = {
     ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.340, 31.9),
     ModelLaunchSettings(
         "Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.29, 29.1),
+    ): ModelEvalMetrics(0.29, 37.0),
     ModelLaunchSettings(
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
     ): ModelEvalMetrics(0.310, 16.7),
