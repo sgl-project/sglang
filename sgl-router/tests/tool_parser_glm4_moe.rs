@@ -167,3 +167,75 @@ async fn test_glm4_nested_json_in_arg_values() {
     assert!(args["data"].is_object());
     assert!(args["list"].is_array());
 }
+
+#[tokio::test]
+async fn test_glm4_streaming_tool_call_arguments() {
+    let mut parser = Glm4MoeParser::new();
+    let tools = create_test_tools();
+
+    // Test streaming tool call arguments incrementally
+    let chunks = vec![
+        "Let me help you with that.\n<tool_call>get_weather\n",
+        "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n",
+        "<arg_key>date</arg_key>\n<arg_value>2024-12-25</arg_value>\n",
+        "</tool_call>"
+    ];
+
+    let mut all_calls = Vec::new();
+    let mut normal_text = String::new();
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        normal_text.push_str(&result.normal_text);
+        all_calls.extend(result.calls);
+    }
+
+    // Should have received tool name first, then arguments incrementally
+    assert_eq!(all_calls.len(), 3); // name + 2 argument chunks
+
+    // First call should be tool name
+    assert_eq!(all_calls[0].name, Some("get_weather".to_string()));
+    assert_eq!(all_calls[0].parameters, "");
+
+    // Second call should be first argument
+    assert_eq!(all_calls[1].name, None);
+    assert!(all_calls[1].parameters.contains("Beijing"));
+
+    // Third call should be second argument
+    assert_eq!(all_calls[2].name, None);
+    assert!(all_calls[2].parameters.contains("2024-12-25"));
+
+    assert_eq!(normal_text, "Let me help you with that.\n");
+}
+
+#[tokio::test]
+async fn test_glm4_streaming_partial_arguments() {
+    let mut parser = Glm4MoeParser::new();
+    let tools = create_test_tools();
+
+    // Test streaming with partial arguments
+    let chunks = vec![
+        "<tool_call>get_weather\n",
+        "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n",
+        "<arg_key>date</arg_key>\n<arg_value>2024-12-25</arg_value>\n",
+        "</tool_call>"
+    ];
+
+    let mut all_calls = Vec::new();
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        all_calls.extend(result.calls);
+    }
+
+    // Should have received tool name first, then arguments incrementally
+    assert_eq!(all_calls.len(), 3); // name + 2 argument chunks
+
+    // First call should be tool name
+    assert_eq!(all_calls[0].name, Some("get_weather".to_string()));
+    assert_eq!(all_calls[0].parameters, "");
+
+    // Subsequent calls should be argument chunks
+    assert_eq!(all_calls[1].name, None);
+    assert_eq!(all_calls[2].name, None);
+}
