@@ -522,6 +522,9 @@ class DeepEPMoE(FusedMoE):
     ):
         assert self.moe_runner_config.activation == "silu"
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
+        assert get_bool_env_var(
+            "SGLANG_DEEPEP_BF16_DISPATCH"
+        ), "W4AFP8 does not support FP8 dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
         return self.quant_method.apply_deepep_ll(
             layer=self,
             dispatch_output=dispatch_output,
