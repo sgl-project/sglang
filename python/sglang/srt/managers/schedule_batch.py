@@ -1892,8 +1892,5 @@ class ModelWorkerBatch:
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
-    # Overlap scheduler related
-    delay_sample_launch: bool = False
-
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
