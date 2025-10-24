@@ -29,7 +29,7 @@ def logit_capping_mod(logit_capping_method, logit_cap):
     if logit_capping_method == "tanh":
         return logit_cap
     else:
-        raise ValueError()
+        raise ValueError(f"Unsupported logit capping method: {logit_capping_method}")
 
 
 @dataclass
