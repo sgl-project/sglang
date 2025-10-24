@@ -4,8 +4,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use sglang_router_rs::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig, RouterConfig,
-        RoutingMode, TokenizerCacheConfig,
+        HistoryBackend, McpProxyConfig, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig,
+        RouterConfig, RoutingMode, TokenizerCacheConfig,
     },
     core::ConnectionMode,
     metrics::PrometheusConfig,
@@ -310,6 +310,15 @@ struct CliArgs {
     #[arg(long, env = "ATP_POOL_TIMEOUT_SECS")]
     oracle_pool_timeout_secs: Option<u64>,
 
+    #[arg(long, env = "MCP_HTTP_PROXY")]
+    mcp_http_proxy: Option<String>,
+
+    #[arg(long, env = "MCP_HTTPS_PROXY")]
+    mcp_https_proxy: Option<String>,
+
+    #[arg(long, env = "MCP_NO_PROXY")]
+    mcp_no_proxy: Option<String>,
+
     #[arg(long)]
     reasoning_parser: Option<String>,
 
@@ -538,6 +547,12 @@ impl CliArgs {
             None
         };
 
+        let mcp_proxy = McpProxyConfig::new(
+            self.mcp_http_proxy.clone(),
+            self.mcp_https_proxy.clone(),
+            self.mcp_no_proxy.clone(),
+        );
+
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -592,6 +607,7 @@ impl CliArgs {
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
             .maybe_oracle(oracle)
+            .maybe_mcp_proxy(mcp_proxy)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .dp_aware(self.dp_aware)

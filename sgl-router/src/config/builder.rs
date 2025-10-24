@@ -1,7 +1,7 @@
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig, RouterConfig,
-    RoutingMode, TokenizerCacheConfig,
+    HistoryBackend, McpProxyConfig, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig,
+    RouterConfig, RoutingMode, TokenizerCacheConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -413,6 +413,14 @@ impl RouterConfigBuilder {
         self
     }
 
+    // ==================== MCP Proxy Configuration ====================
+
+    /// Set MCP proxy configuration
+    pub fn mcp_proxy(mut self, proxy: McpProxyConfig) -> Self {
+        self.config.mcp_proxy = Some(proxy);
+        self
+    }
+
     // ==================== Parsers Configuration ====================
 
     /// Set reasoning parser
@@ -563,6 +571,12 @@ impl RouterConfigBuilder {
             self.config.history_backend = HistoryBackend::Oracle;
             self.config.oracle = Some(cfg);
         }
+        self
+    }
+
+    /// Set MCP proxy configuration if Some
+    pub fn maybe_mcp_proxy(mut self, proxy: Option<McpProxyConfig>) -> Self {
+        self.config.mcp_proxy = proxy;
         self
     }
 

@@ -310,6 +310,7 @@ python -m sglang_router.launch_router \
 - Tool-call parsers cover JSON, Pythonic, XML, and custom schemas with streaming/non-streaming execution loops.
 - Reasoning parsers ship for DeepSeek-R1, Qwen3, Step-3, GLM4, Llama families, Kimi K2, GPT-OSS, Mistral, and more (`src/reasoning_parser`).
 - Tokenizer factory accepts HuggingFace IDs, local directories, and explicit `tokenizer.json` files with chat template overrides (`src/tokenizer`).
+- Configure a global MCP proxy with `--mcp-http-proxy`, `--mcp-https-proxy`, and `--mcp-no-proxy` (or the `MCP_HTTP_PROXY`, `MCP_HTTPS_PROXY`, `MCP_NO_PROXY` environment variables). The settings apply to every MCP client transport, including SSE and Streamable HTTP.
 
 Use CLI flags to select parsers:
 ```bash
@@ -367,6 +368,14 @@ Use CLI flags to select parsers:
 | `--balance-rel-threshold`  | float | 1.5      | Relative load ratio.        |
 | `--eviction-interval-secs` | int   | 120      | Cache eviction cadence.     |
 | `--max-tree-size`          | int   | 67108864 | Max nodes in cache tree.    |
+
+### MCP Proxy Settings
+
+| Parameter           | Type | Default | Description                                             |
+|---------------------|------|---------|----------------------------------------------------------|
+| `--mcp-http-proxy`  | str  | None    | Global HTTP proxy applied to every MCP transport.       |
+| `--mcp-https-proxy` | str  | None    | Global HTTPS proxy applied to every MCP transport.      |
+| `--mcp-no-proxy`    | str  | None    | Comma-separated host list that bypasses the MCP proxy.  |
 
 ### Fault Tolerance
 

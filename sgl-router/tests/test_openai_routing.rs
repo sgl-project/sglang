@@ -104,6 +104,7 @@ async fn test_openai_router_creation() {
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
+        None,
     )
     .await;
 
@@ -123,6 +124,7 @@ async fn test_openai_router_server_info() {
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
+        None,
     )
     .await
     .unwrap();
@@ -154,6 +156,7 @@ async fn test_openai_router_models() {
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
+        None,
     )
     .await
     .unwrap();
@@ -234,6 +237,7 @@ async fn test_openai_router_responses_with_mock() {
         storage.clone(),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
+        None,
     )
     .await
     .unwrap();
@@ -495,6 +499,7 @@ async fn test_openai_router_responses_streaming_with_mock() {
         storage.clone(),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
+        None,
     )
     .await
     .unwrap();
@@ -600,6 +605,7 @@ async fn test_unsupported_endpoints() {
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
+        None,
     )
     .await
     .unwrap();
@@ -665,6 +671,7 @@ async fn test_openai_router_chat_completion_with_mock() {
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
+        None,
     )
     .await
     .unwrap();
@@ -707,6 +714,7 @@ async fn test_openai_e2e_with_server() {
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
+        None,
     )
     .await
     .unwrap();
@@ -778,6 +786,7 @@ async fn test_openai_router_chat_streaming_with_mock() {
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
+        None,
     )
     .await
     .unwrap();
@@ -832,6 +841,7 @@ async fn test_openai_router_circuit_breaker() {
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
+        None,
     )
     .await
     .unwrap();
@@ -861,6 +871,7 @@ async fn test_openai_router_models_auth_forwarding() {
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
+        None,
     )
     .await
     .unwrap();

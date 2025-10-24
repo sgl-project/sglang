@@ -1,4 +1,9 @@
-use std::{borrow::Cow, collections::HashMap, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use backoff::ExponentialBackoffBuilder;
 use dashmap::DashMap;
@@ -16,10 +21,16 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::mcp::{
-    config::{McpConfig, McpServerConfig, McpTransport},
-    error::{McpError, McpResult},
+use crate::{
+    config::types::McpProxyConfig,
+    mcp::{
+        config::{McpConfig, McpServerConfig, McpTransport},
+        error::{McpError, McpResult},
+    },
 };
+
+/// Globally shared HTTP client for MCP connections (initialized once with proxy config)
+static SHARED_MCP_HTTP_CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
 
 /// Information about an available tool
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,8 +73,43 @@ pub struct McpClientManager {
 }
 
 impl McpClientManager {
+    /// Get or create the globally shared HTTP client with proxy configuration.
+    /// This client is reused across all McpClientManager instances.
+    fn get_or_create_shared_client(
+        proxy_config: Option<&McpProxyConfig>,
+    ) -> McpResult<Arc<reqwest::Client>> {
+        // Try to get existing client
+        if let Some(client) = SHARED_MCP_HTTP_CLIENT.get() {
+            return Ok(client.clone());
+        }
+
+        // Build new client with proxy config
+        let mut builder = reqwest::Client::builder();
+        builder = Self::apply_proxy_config(builder, proxy_config)?;
+        let client = builder
+            .build()
+            .map_err(|e| McpError::Transport(format!("build shared HTTP client: {}", e)))?;
+
+        let client = Arc::new(client);
+
+        // Try to store it (may fail if another thread already initialized)
+        match SHARED_MCP_HTTP_CLIENT.set(client.clone()) {
+            Ok(_) => {
+                tracing::info!("Initialized shared MCP HTTP client with proxy config");
+                Ok(client)
+            }
+            Err(_) => {
+                // Another thread won the race, use their client
+                Ok(SHARED_MCP_HTTP_CLIENT.get().unwrap().clone())
+            }
+        }
+    }
+
     /// Create a new manager and connect to all configured servers
     pub async fn new(config: McpConfig) -> McpResult<Self> {
+        // Initialize shared HTTP client with proxy config
+        let http_client = Self::get_or_create_shared_client(config.proxy.as_ref())?;
+
         let mut mgr = Self {
             clients: HashMap::new(),
             tools: DashMap::new(),
@@ -71,8 +117,10 @@ impl McpClientManager {
             resources: DashMap::new(),
         };
 
+        let proxy_config_ref = config.proxy.as_ref();
+
         for server_config in config.servers {
-            match Self::connect_server(&server_config).await {
+            match Self::connect_server(&server_config, proxy_config_ref, &http_client).await {
                 Ok(client) => {
                     mgr.load_server_inventory(&server_config.name, &client)
                         .await;
@@ -161,21 +209,27 @@ impl McpClientManager {
     }
 
     /// Connect to a single MCP server with retry logic for remote transports
-    async fn connect_server(config: &McpServerConfig) -> McpResult<RunningService<RoleClient, ()>> {
+    async fn connect_server(
+        config: &McpServerConfig,
+        proxy_config: Option<&McpProxyConfig>,
+        shared_client: &Arc<reqwest::Client>,
+    ) -> McpResult<RunningService<RoleClient, ()>> {
         let needs_retry = matches!(
             &config.transport,
             McpTransport::Sse { .. } | McpTransport::Streamable { .. }
         );
         if needs_retry {
-            Self::connect_server_with_retry(config).await
+            Self::connect_server_with_retry(config, proxy_config, shared_client).await
         } else {
-            Self::connect_server_impl(config).await
+            Self::connect_server_impl(config, proxy_config, shared_client).await
         }
     }
 
     /// Connect with exponential backoff retry for remote servers
     async fn connect_server_with_retry(
         config: &McpServerConfig,
+        proxy_config: Option<&McpProxyConfig>,
+        shared_client: &Arc<reqwest::Client>,
     ) -> McpResult<RunningService<RoleClient, ()>> {
         let backoff = ExponentialBackoffBuilder::new()
             .with_initial_interval(Duration::from_secs(1))
@@ -184,7 +238,7 @@ impl McpClientManager {
             .build();
 
         backoff::future::retry(backoff, || async {
-            match Self::connect_server_impl(config).await {
+            match Self::connect_server_impl(config, proxy_config, shared_client).await {
                 Ok(client) => Ok(client),
                 Err(e) => {
                     if Self::is_permanent_error(&e) {
@@ -226,6 +280,8 @@ impl McpClientManager {
     /// Internal implementation of server connection
     async fn connect_server_impl(
         config: &McpServerConfig,
+        proxy_config: Option<&McpProxyConfig>,
+        shared_client: &Arc<reqwest::Client>,
     ) -> McpResult<RunningService<RoleClient, ()>> {
         tracing::info!(
             "Connecting to MCP server '{}' via {:?}",
@@ -257,34 +313,36 @@ impl McpClientManager {
             }
 
             McpTransport::Sse { url, token } => {
-                let transport = if let Some(tok) = token {
-                    let client = reqwest::Client::builder()
-                        .default_headers({
-                            let mut headers = reqwest::header::HeaderMap::new();
-                            headers.insert(
-                                reqwest::header::AUTHORIZATION,
-                                format!("Bearer {}", tok).parse().map_err(|e| {
-                                    McpError::Transport(format!("auth token: {}", e))
-                                })?,
-                            );
-                            headers
-                        })
+                let client = if let Some(tok) = token {
+                    // SSE with token: must rebuild client with custom headers
+                    let mut builder = reqwest::Client::builder();
+                    builder = Self::apply_proxy_config(builder, proxy_config)?;
+
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bearer {}", tok)
+                            .parse()
+                            .map_err(|e| McpError::Transport(format!("auth token: {}", e)))?,
+                    );
+                    builder = builder.default_headers(headers);
+
+                    builder
                         .build()
-                        .map_err(|e| McpError::Transport(format!("build HTTP client: {}", e)))?;
-
-                    let cfg = SseClientConfig {
-                        sse_endpoint: url.clone().into(),
-                        ..Default::default()
-                    };
-
-                    SseClientTransport::start_with_client(client, cfg)
-                        .await
-                        .map_err(|e| McpError::Transport(format!("create SSE transport: {}", e)))?
+                        .map_err(|e| McpError::Transport(format!("build HTTP client: {}", e)))?
                 } else {
-                    SseClientTransport::start(url.as_str())
-                        .await
-                        .map_err(|e| McpError::Transport(format!("create SSE transport: {}", e)))?
+                    // SSE without token: use shared client
+                    (**shared_client).clone()
                 };
+
+                let cfg = SseClientConfig {
+                    sse_endpoint: url.clone().into(),
+                    ..Default::default()
+                };
+
+                let transport = SseClientTransport::start_with_client(client, cfg)
+                    .await
+                    .map_err(|e| McpError::Transport(format!("create SSE transport: {}", e)))?;
 
                 let client = ().serve(transport).await.map_err(|e| {
                     McpError::ConnectionFailed(format!("initialize SSE client: {}", e))
@@ -295,13 +353,14 @@ impl McpClientManager {
             }
 
             McpTransport::Streamable { url, token } => {
-                let transport = if let Some(tok) = token {
-                    let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                // Streamable: use shared client (token passed via config.auth_header)
+                let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                if let Some(tok) = token {
                     cfg.auth_header = Some(format!("Bearer {}", tok));
-                    StreamableHttpClientTransport::from_config(cfg)
-                } else {
-                    StreamableHttpClientTransport::from_uri(url.as_str())
-                };
+                }
+
+                let transport =
+                    StreamableHttpClientTransport::with_client((**shared_client).clone(), cfg);
 
                 let client = ().serve(transport).await.map_err(|e| {
                     McpError::ConnectionFailed(format!("initialize streamable client: {}", e))
@@ -315,6 +374,75 @@ impl McpClientManager {
                 Ok(client)
             }
         }
+    }
+
+    /// Helper function to build a proxy with optional no_proxy configuration
+    fn build_proxy(
+        proxy_url: &str,
+        proxy_type: &str,
+        no_proxy: Option<&reqwest::NoProxy>,
+    ) -> McpResult<reqwest::Proxy> {
+        let proxy = match proxy_type {
+            "http" => reqwest::Proxy::http(proxy_url),
+            "https" => reqwest::Proxy::https(proxy_url),
+            _ => unreachable!("Invalid proxy type"),
+        }
+        .map_err(|e| {
+            McpError::Config(format!(
+                "invalid {}_proxy '{}': {}",
+                proxy_type, proxy_url, e
+            ))
+        })?;
+
+        let proxy = if let Some(no_proxy_cfg) = no_proxy {
+            proxy.no_proxy(Some(no_proxy_cfg.clone()))
+        } else {
+            proxy
+        };
+
+        Ok(proxy)
+    }
+
+    fn apply_proxy_config(
+        builder: reqwest::ClientBuilder,
+        proxy_config: Option<&McpProxyConfig>,
+    ) -> McpResult<reqwest::ClientBuilder> {
+        let Some(proxy_config) = proxy_config else {
+            return Ok(builder);
+        };
+
+        let mut builder = builder;
+        let no_proxy_entry_count = proxy_config
+            .no_proxy
+            .as_ref()
+            .map(|raw| raw.split(',').filter(|s| !s.trim().is_empty()).count())
+            .unwrap_or(0);
+        tracing::info!(
+            http_enabled = proxy_config.http_proxy.is_some(),
+            https_enabled = proxy_config.https_proxy.is_some(),
+            no_proxy_entries = no_proxy_entry_count,
+            "Applying MCP proxy configuration"
+        );
+
+        let no_proxy = proxy_config.no_proxy.as_ref().and_then(|raw| {
+            let result = reqwest::NoProxy::from_string(raw);
+            if result.is_none() {
+                tracing::warn!("Invalid MCP no_proxy value '{}'. Ignoring no_proxy.", raw);
+            }
+            result
+        });
+
+        if let Some(http_proxy) = &proxy_config.http_proxy {
+            let proxy = Self::build_proxy(http_proxy, "http", no_proxy.as_ref())?;
+            builder = builder.proxy(proxy);
+        }
+
+        if let Some(https_proxy) = &proxy_config.https_proxy {
+            let proxy = Self::build_proxy(https_proxy, "https", no_proxy.as_ref())?;
+            builder = builder.proxy(proxy);
+        }
+
+        Ok(builder)
     }
 
     fn client_for(&self, server_name: &str) -> McpResult<&RunningService<RoleClient, ()>> {
@@ -552,5 +680,57 @@ impl McpClientManager {
         self.tools.clear();
         self.prompts.clear();
         self.resources.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::McpClientManager;
+    use crate::{config::types::McpProxyConfig, mcp::error::McpError};
+
+    fn build_client_with_proxy(cfg: &McpProxyConfig) -> Result<reqwest::Client, McpError> {
+        let builder = McpClientManager::apply_proxy_config(reqwest::Client::builder(), Some(cfg))?;
+        builder
+            .build()
+            .map_err(|e| McpError::Transport(format!("build client: {}", e)))
+    }
+
+    #[test]
+    fn apply_proxy_config_accepts_http_proxy() {
+        let cfg = McpProxyConfig::new(Some("http://127.0.0.1:18080".into()), None, None).unwrap();
+        build_client_with_proxy(&cfg).expect("HTTP proxy should be accepted");
+    }
+
+    #[test]
+    fn apply_proxy_config_accepts_https_proxy() {
+        let cfg = McpProxyConfig::new(None, Some("https://127.0.0.1:18443".into()), None).unwrap();
+        build_client_with_proxy(&cfg).expect("HTTPS proxy should be accepted");
+    }
+
+    #[test]
+    fn apply_proxy_config_supports_no_proxy_list() {
+        let cfg = McpProxyConfig::new(
+            Some("http://127.0.0.1:18080".into()),
+            Some("https://127.0.0.1:18443".into()),
+            Some("localhost,example.com".into()),
+        )
+        .unwrap();
+        build_client_with_proxy(&cfg).expect("no_proxy entries should be accepted");
+    }
+
+    #[test]
+    fn apply_proxy_config_rejects_invalid_http_proxy() {
+        let cfg = McpProxyConfig::new(Some("http://[::1".into()), None, None).unwrap();
+        let err = McpClientManager::apply_proxy_config(reqwest::Client::builder(), Some(&cfg))
+            .expect_err("Expected invalid proxy to be rejected");
+        match err {
+            McpError::Config(msg) => {
+                assert!(
+                    msg.contains("invalid http_proxy"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected McpError::Config, got {other:?}"),
+        }
     }
 }
