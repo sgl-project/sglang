@@ -96,7 +96,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
     # cpu torch compile only speeds up decoding by
     # reducing python overhead when bs is small
-    capture_bs = list(range(1, 9)) + list(range(10, 17, 2)) + list([20, 24, 28, 32, 36, 40, 44, 48, 64, 126, 132, 140, 148, 152, 156, 160])
+    capture_bs = list(range(1, 9)) + list(range(10, 17, 2)) + list([20, 24, 28, 32, 36, 40, 50, 64, 80, 100, 120, 140, 160, 180, 200, 220, 236, 240, 242, 244, 246, 248, 250, 256, 260, 280, 300, 320, 360])
 
     capture_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
