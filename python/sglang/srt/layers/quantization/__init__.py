@@ -15,7 +15,6 @@ try:
     from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
         GPTQMarlin24Config,
     )
-    from vllm.model_executor.layers.quantization.marlin import MarlinConfig
     from vllm.model_executor.layers.quantization.qqq import QQQConfig
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
@@ -29,11 +28,12 @@ except ImportError as e:
         def override_quantization_method(self, *args, **kwargs):
             return None
 
-    AQLMConfig = BitsAndBytesConfig = CompressedTensorsConfig = DeepSpeedFPConfig = (
+    AQLMConfig = BitsAndBytesConfig = DeepSpeedFPConfig = (
         ExpertsInt8Config
-    ) = GPTQMarlin24Config = MarlinConfig = QQQConfig = Int8TpuConfig = DummyConfig
+    ) = QQQConfig = Int8TpuConfig = DummyConfig
 
 
+from sglang.srt.layers.quantization.marlin_utils import MarlinConfig
 from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -71,6 +71,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "modelopt_fp4": ModelOptFp4Config,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
+    "marlin": MarlinConfig,
     "awq": AWQConfig,
     "awq_marlin": AWQMarlinConfig,
     "gguf": GGUFConfig,
@@ -106,7 +107,6 @@ VLLM_QUANTIZATION_METHODS = {
     "aqlm": AQLMConfig,
     "deepspeedfp": DeepSpeedFPConfig,
     "tpu_int8": Int8TpuConfig,
-    "marlin": MarlinConfig,
     "gptq_marlin_24": GPTQMarlin24Config,
     "bitsandbytes": BitsAndBytesConfig,
     "qqq": QQQConfig,
@@ -169,3 +169,4 @@ def monkey_patch_isinstance_for_vllm_base_layer(reverse: bool = False):
         return original_isinstance(obj, classinfo)
 
     builtins.isinstance = patched_isinstance
+    
