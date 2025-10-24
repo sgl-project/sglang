@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
+    is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
     is_hip,
@@ -930,7 +931,7 @@ class ServerArgs:
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-            if is_sm100_supported():
+            if is_blackwell_supported():
                 if not self.enable_dp_attention:
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
@@ -942,7 +943,7 @@ class ServerArgs:
                 and quantization_config.get("quant_method") == "mxfp4"
             )
 
-            if is_sm100_supported() and is_mxfp4_quant_format:
+            if is_blackwell_supported() and is_mxfp4_quant_format:
                 self.moe_runner_backend = "flashinfer_mxfp4"
                 logger.warning(
                     "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
@@ -1106,7 +1107,7 @@ class ServerArgs:
             self.attention_backend == "trtllm_mla"
             or self.decode_attention_backend == "trtllm_mla"
         ):
-            if not is_sm100_supported():
+            if not is_blackwell_supported():
                 raise ValueError(
                     "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
                 )
