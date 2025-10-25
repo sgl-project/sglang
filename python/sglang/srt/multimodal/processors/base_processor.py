@@ -1,3 +1,4 @@
+import asyncio
 import concurrent
 import concurrent.futures
 import dataclasses
@@ -12,10 +13,26 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
+from sglang.srt.managers.schedule_batch import (
+    MM_FEATURE_CACHE_SIZE,
+    MM_ITEM_VERIFY_BYTES,
+    CudaIpcTensorTransportProxy,
+    MmItemMemoryPool,
+    Modality,
+    MultimodalDataItem,
+)
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_npu,
+    load_audio,
+    load_image,
+    load_video,
+    logger,
+)
 
 _is_npu = is_npu()
+
+SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 
 @dataclasses.dataclass
@@ -209,6 +226,10 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
+        if SGL_USE_CUDA_IPC:
+            self.cudaipc_mmfeature_pool = MmItemMemoryPool(MM_FEATURE_CACHE_SIZE)
+            self._cache_lock = asyncio.Lock()
+
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
     ) -> dict:
@@ -253,10 +274,13 @@ class BaseMultimodalProcessor(ABC):
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if feature_name in result and isinstance(
-                    result[feature_name], torch.Tensor
-                ):
-                    result[feature_name] = result[feature_name].to("cpu")
+                if SGL_USE_CUDA_IPC:
+                    pass
+                else:
+                    if feature_name in result and isinstance(
+                        result[feature_name], torch.Tensor
+                    ):
+                        result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
@@ -661,5 +685,44 @@ class BaseMultimodalProcessor(ABC):
                 input_ids=input_ids,
                 mm_token_id=mm_token_id,
             )
+
+        """
+        solution for cuda-ipc memory-leak:
+        1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
+        2. if can not get a slice , transport normal tensor
+        3. copy tensor in scheduler and release it (use position mark)
+        4. copy
+        """
+
+        if SGL_USE_CUDA_IPC:
+            # post-process
+            for item in all_collected_items:
+                if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+                    available_slice = self.cudaipc_mmfeature_pool.return_a_slice_tensor(
+                        item.feature
+                    )
+                    if isinstance(available_slice, torch.Tensor):
+                        available_slice[:-MM_ITEM_VERIFY_BYTES].copy_(
+                            item.feature.view(torch.int8).view(-1), non_blocking=True
+                        )
+                        item.feature = CudaIpcTensorTransportProxy(
+                            data=available_slice, info_data=item.feature
+                        )
+                elif (
+                    isinstance(item.precomputed_embeddings, torch.Tensor)
+                    and item.precomputed_embeddings.is_cuda
+                ):
+
+                    available_slice = self.cudaipc_mmfeature_pool.return_a_slice_tensor(
+                        item.precomputed_embeddings
+                    )
+                    if isinstance(available_slice, torch.Tensor):
+                        available_slice[:-MM_ITEM_VERIFY_BYTES].copy_(
+                            item.precomputed_embeddings.view(torch.int8),
+                            non_blocking=True,
+                        )
+                        item.precomputed_embeddings = CudaIpcTensorTransportProxy(
+                            data=available_slice, info_data=item.precomputed_embeddings
+                        )
 
         return all_collected_items, input_ids, ret

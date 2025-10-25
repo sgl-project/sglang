@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
+    CudaIpcTensorTransportProxy,
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -33,7 +34,6 @@ _is_npu = is_npu()
 # TODO(mick): nccl
 # cuda_ipc: for intranode tensor sharing
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
-
 
 class TransportProxyTensor(torch.Tensor):
     """
@@ -77,7 +77,6 @@ class TransportProxyTensor(torch.Tensor):
             "tensor_data": None,
             "ipc_extra": None,
         }
-
         transport_mode = self._metadata.get("transport_mode", "default")
 
         if transport_mode == "cuda_ipc" and self.is_cuda:
@@ -91,6 +90,7 @@ class TransportProxyTensor(torch.Tensor):
                     "dtype": self.dtype,
                     "stride": self.stride(),
                     "device_index": self.device.index,
+                    "storage_offset": self.storage_offset(),
                 }
                 state["tensor_data"] = None
             except Exception as e:
@@ -113,12 +113,13 @@ class TransportProxyTensor(torch.Tensor):
 
         if transport_mode == "cuda_ipc" and state["ipc_extra"] is not None:
             ipc_extra = state["ipc_extra"]
-            handle, shape, dtype, stride, source_device_index = (
+            handle, shape, dtype, stride, source_device_index, s_offset  = (
                 ipc_extra["handle"],
                 ipc_extra["shape"],
                 ipc_extra["dtype"],
                 ipc_extra["stride"],
                 ipc_extra["device_index"],
+                ipc_extra["storage_offset"]
             )
 
             try:
@@ -127,7 +128,7 @@ class TransportProxyTensor(torch.Tensor):
                     storage = torch.UntypedStorage._new_shared_cuda(*handle)
                     reconstructed_tensor = torch.empty(
                         0, dtype=dtype, device=target_device
-                    ).set_(storage, storage_offset=0, size=shape, stride=stride)
+                    ).set_(storage, storage_offset=s_offset, size=shape, stride=stride)
                     self.set_(reconstructed_tensor)
             except Exception as e:
                 print(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
@@ -811,4 +812,7 @@ def hash_feature(f):
         return data_hash(arr_bytes)
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
+    elif isinstance(f, CudaIpcTensorTransportProxy):
+        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
+        return tensor_hash([reconstruct_t])
     return data_hash(f)
