@@ -394,6 +394,42 @@ def handle_attention_aiter(attn, forward_batch):
 
 
 def handle_attention_nsa(attn, forward_batch):
+    """
+    Select MHA or MLA based on sequence length for optimal performance.
+
+    - Decode: MLA (avoids per-token decompression)
+    - Prefill < 2048: MHA_CHUNKED_KV (topk ineffective, MHA has lower FLOPs)
+    - Prefill >= 2048: MLA (topk filtering reduces computation significantly)
+    """
+    if forward_batch.forward_mode.is_decode_or_idle():
+        return AttnForwardMethod.MLA
+
+    if _is_extend_without_speculative(forward_batch):
+        NSA_THRESHOLD = getattr(attn, "nsa_seq_len_threshold", 2048)
+
+        if (
+            forward_batch.extend_prefix_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            # Compute max_kv_len = max(prefix_len + extend_len) using CPU data
+            max_kv_len = max(
+                p + e
+                for p, e in zip(
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_seq_lens_cpu,
+                )
+            )
+        elif forward_batch.seq_lens_cpu is not None:
+            max_kv_len = forward_batch.seq_lens_cpu.max().item()
+        else:
+            max_kv_len = 0
+
+        return (
+            AttnForwardMethod.MHA_CHUNKED_KV
+            if max_kv_len < NSA_THRESHOLD
+            else AttnForwardMethod.MLA
+        )
+
     return AttnForwardMethod.MLA
 
 
@@ -1145,6 +1181,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 layer_id=layer_id,
                 alt_stream=alt_stream,
             )
+            # Threshold for MHA/MLA selection: MHA for short (<2048), MLA+NSA for long sequences
+            self.nsa_seq_len_threshold = getattr(config, "nsa_seq_len_threshold", 2048)
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
