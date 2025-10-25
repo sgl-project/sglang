@@ -11,6 +11,9 @@ from sglang.multimodal_gen.test.test_utils import is_mp4, is_png, wait_for_port
 
 
 class TestVideoHttpServer(unittest.TestCase):
+    model_name = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+    timeout = 120
+    extra_args = []
 
     def _create_wait_and_download(
         self, client: OpenAI, prompt: str, size: str
@@ -22,9 +25,11 @@ class TestVideoHttpServer(unittest.TestCase):
 
         video = client.videos.retrieve(video_id)
 
+        start = time.time()
         while video.status != "completed":
             time.sleep(3)
             video = client.videos.retrieve(video_id)
+            assert time.time() - start < self.timeout, "video generate timeout"
 
         response = client.videos.download_content(
             video_id=video_id,
@@ -38,13 +43,13 @@ class TestVideoHttpServer(unittest.TestCase):
             "sglang",
             "serve",
             "--model-path",
-            "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            f"{cls.model_name}",
             "--port",
             "30010",
         ]
 
         process = subprocess.Popen(
-            cls.base_command,
+            cls.base_command + cls.extra_args,
             # stdout=subprocess.PIPE,
             # stderr=subprocess.PIPE,
             text=True,
@@ -90,6 +95,18 @@ class TestVideoHttpServer(unittest.TestCase):
             await asyncio.gather(*tasks)
 
         asyncio.run(send_concurrent_requests())
+
+
+class TestFastWan2_1HttpServer(TestVideoHttpServer):
+    model_name = "FastVideo/FastWan2.1-T2V-1.3B-Diffusers"
+    extra_args = [
+        "--attention-backend",
+        "video_sparse_attn",
+    ]
+
+
+class TestFastWan2_2HttpServer(TestVideoHttpServer):
+    model_name = "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers"
 
 
 class TestImageHttpServer(unittest.TestCase):

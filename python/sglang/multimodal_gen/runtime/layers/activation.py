@@ -26,6 +26,9 @@ class SiluAndMul(CustomOp):
     def __init__(self) -> None:
         super().__init__()
 
+    def forward_cuda(self, *args, **kwargs) -> Any:
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         d = x.shape[-1] // 2
@@ -48,6 +51,9 @@ class GeluAndMul(CustomOp):
         self.approximate = approximate
         if approximate not in ("none", "tanh"):
             raise ValueError(f"Unknown approximate mode: {approximate}")
+
+    def forward_cuda(self, *args, **kwargs) -> Any:
+        return self.forward_native(*args, **kwargs)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
