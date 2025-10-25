@@ -24,8 +24,8 @@ use crate::{
     core::{
         worker_to_info,
         workflow::{
-            create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
-            WorkflowEngine,
+            create_mcp_registration_workflow, create_worker_registration_workflow,
+            create_worker_removal_workflow, LoggingSubscriber, WorkflowEngine,
         },
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
@@ -739,11 +739,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     engine.register_workflow(create_worker_registration_workflow());
     engine.register_workflow(create_worker_removal_workflow());
+    engine.register_workflow(create_mcp_registration_workflow());
     app_context
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
-    info!("Workflow engine initialized with worker registration and removal workflows");
+    info!("Workflow engine initialized with worker and MCP registration workflows");
 
     info!(
         "Initializing workers for routing mode: {:?}",
