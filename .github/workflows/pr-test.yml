@@ -757,9 +757,6 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepseek-v32
 
   unit-test-backend-4-gpu-b200:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-b200
     strategy:
       fail-fast: false
@@ -777,7 +774,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 45
