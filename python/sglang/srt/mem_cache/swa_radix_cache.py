@@ -105,6 +105,7 @@ def get_last_access_time() -> float64:
     TreeNode.last_access_time_counter_float += 1.0
     return ret
 
+
 class LRUList:
     def __init__(self, swa: bool = False):
         self.swa = swa

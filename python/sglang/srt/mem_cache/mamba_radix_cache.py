@@ -96,6 +96,7 @@ def get_last_access_time() -> float64:
     TreeNode.last_access_time_counter_float += 1.0
     return ret
 
+
 class LRUList:
     def __init__(self, mamba: bool = False):
         self.mamba = mamba
@@ -875,7 +876,7 @@ class MambaRadixCache(BasePrefixCache):
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
-        else: # mamba value already exists
+        else:  # mamba value already exists
             mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.reset_node_mru(node)
