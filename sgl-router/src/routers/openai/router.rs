@@ -222,13 +222,17 @@ impl OpenAIRouter {
         original_previous_response_id: Option<String>,
     ) -> Response {
         // Check if MCP is active for this request
-        // Get dynamic MCP client from request tools if manager is available
-        let req_mcp_manager = if let Some(ref tools) = original_body.tools {
-            mcp_manager_from_request_tools(&self.mcp_manager, tools.as_slice()).await
-        } else {
+        // Ensure dynamic client is created if needed
+        if let Some(ref tools) = original_body.tools {
+            mcp_manager_from_request_tools(&self.mcp_manager, tools.as_slice()).await;
+        }
+
+        // Use the tool loop if the manager has any tools available (static or dynamic).
+        let active_mcp = if self.mcp_manager.list_tools().is_empty() {
             None
+        } else {
+            Some(&self.mcp_manager)
         };
-        let active_mcp = req_mcp_manager.as_ref();
 
         let mut response_json: Value;
 
