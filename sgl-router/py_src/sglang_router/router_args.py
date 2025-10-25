@@ -94,6 +94,8 @@ class RouterArgs:
     tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    # MCP server configuration
+    mcp_config_path: Optional[str] = None
     # Backend selection
     backend: str = "sglang"
     # History backend configuration
@@ -511,6 +513,13 @@ class RouterArgs:
             type=str,
             default=None,
             help="Specify the parser for handling tool-call interactions",
+        )
+        # MCP server configuration
+        parser.add_argument(
+            f"--{prefix}mcp-config-path",
+            type=str,
+            default=None,
+            help="Path to MCP (Model Context Protocol) server configuration file",
         )
         # Backend selection
         parser.add_argument(

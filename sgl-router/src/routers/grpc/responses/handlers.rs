@@ -65,6 +65,7 @@ pub async fn route_responses(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 ) -> Response {
     // 1. Validate mutually exclusive parameters
@@ -113,6 +114,7 @@ pub async fn route_responses(
             response_storage,
             conversation_storage,
             conversation_item_storage,
+            mcp_manager,
         )
         .await
     } else if is_background {
@@ -125,6 +127,7 @@ pub async fn route_responses(
             response_storage,
             conversation_storage,
             conversation_item_storage,
+            mcp_manager,
             background_tasks,
         )
         .await
@@ -138,6 +141,7 @@ pub async fn route_responses(
             response_storage,
             conversation_storage,
             conversation_item_storage,
+            mcp_manager,
             None, // No response_id for sync
             None, // No background_tasks for sync
         )
@@ -167,6 +171,7 @@ async fn route_responses_sync(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     response_id: Option<String>,
     background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Response {
@@ -179,6 +184,7 @@ async fn route_responses_sync(
         response_storage,
         conversation_storage,
         conversation_item_storage,
+        mcp_manager,
         response_id,
         background_tasks,
     )
@@ -209,6 +215,7 @@ async fn route_responses_internal(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     response_id: Option<String>,
     background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Result<ResponsesResponse, String> {
@@ -223,7 +230,10 @@ async fn route_responses_internal(
 
     // 2. Check if request has MCP tools - if so, use tool loop
     let responses_response = if let Some(tools) = &request.tools {
-        if let Some(mcp_manager) = create_mcp_manager_from_request(tools).await {
+        // Try to create dynamic MCP client from request tools using the manager
+        if let Some(request_mcp_manager) =
+            create_mcp_manager_from_request(&mcp_manager, tools).await
+        {
             debug!("MCP tools detected, using tool loop");
 
             // Execute with MCP tool loop
@@ -234,13 +244,14 @@ async fn route_responses_internal(
                 headers,
                 model_id,
                 components,
-                mcp_manager,
+                request_mcp_manager,
                 response_id.clone(),
                 background_tasks,
             )
             .await?
         } else {
-            // No MCP manager, execute normally
+            debug!("Failed to create MCP client from request tools");
+            // Fall through to non-MCP execution
             execute_without_mcp(
                 pipeline,
                 &modified_request,
@@ -303,6 +314,7 @@ async fn route_responses_background(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 ) -> Response {
     // Generate response_id for background tracking
@@ -365,6 +377,7 @@ async fn route_responses_background(
     let response_storage_clone = response_storage.clone();
     let conversation_storage_clone = conversation_storage.clone();
     let conversation_item_storage_clone = conversation_item_storage.clone();
+    let mcp_manager_clone = mcp_manager.clone();
     let response_id_clone = response_id.clone();
     let background_tasks_clone = background_tasks.clone();
 
@@ -382,6 +395,7 @@ async fn route_responses_background(
             response_storage_clone,
             conversation_storage_clone,
             conversation_item_storage_clone,
+            mcp_manager_clone,
             Some(response_id_clone.clone()),
             Some(background_tasks_clone.clone()),
         )
@@ -434,6 +448,7 @@ async fn route_responses_streaming(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Arc<crate::mcp::McpManager>,
 ) -> Response {
     // 1. Load conversation history
     let modified_request = match load_conversation_history(
@@ -461,7 +476,10 @@ async fn route_responses_streaming(
 
     // 2. Check if request has MCP tools - if so, use streaming tool loop
     if let Some(tools) = &request.tools {
-        if let Some(mcp_manager) = create_mcp_manager_from_request(tools).await {
+        // Try to create dynamic MCP client from request tools using the manager
+        if let Some(request_mcp_manager) =
+            create_mcp_manager_from_request(&mcp_manager, tools).await
+        {
             debug!("MCP tools detected in streaming mode, using streaming tool loop");
 
             return execute_tool_loop_streaming(
@@ -471,7 +489,7 @@ async fn route_responses_streaming(
                 headers,
                 model_id,
                 components,
-                mcp_manager,
+                request_mcp_manager,
                 response_storage,
                 conversation_storage,
                 conversation_item_storage,

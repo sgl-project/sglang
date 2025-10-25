@@ -24,8 +24,8 @@ use crate::{
     core::{
         worker_to_info,
         workflow::{
-            create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
-            WorkflowEngine,
+            create_mcp_registration_workflow, create_worker_registration_workflow,
+            create_worker_removal_workflow, LoggingSubscriber, WorkflowEngine,
         },
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
@@ -739,11 +739,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     engine.register_workflow(create_worker_registration_workflow());
     engine.register_workflow(create_worker_removal_workflow());
+    engine.register_workflow(create_mcp_registration_workflow());
     app_context
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
-    info!("Workflow engine initialized with worker registration and removal workflows");
+    info!("Workflow engine initialized with worker and MCP registration workflows");
 
     info!(
         "Initializing workers for routing mode: {:?}",
@@ -762,6 +763,27 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .submit(job)
         .await
         .map_err(|e| format!("Failed to submit worker initialization job: {}", e))?;
+
+    if let Some(mcp_config) = &config.router_config.mcp_config {
+        info!("Found {} MCP server(s) in config", mcp_config.servers.len());
+        let mcp_job = Job::InitializeMcpServers {
+            mcp_config: Box::new(mcp_config.clone()),
+        };
+        job_queue
+            .submit(mcp_job)
+            .await
+            .map_err(|e| format!("Failed to submit MCP initialization job: {}", e))?;
+    } else {
+        info!("No MCP config provided, skipping MCP server initialization");
+    }
+
+    // Start background refresh for all registered static MCP servers
+    if let Some(mcp_manager) = app_context.mcp_manager.get() {
+        let refresh_interval = Duration::from_secs(300); // 5 minutes, matches default TTL
+        let _refresh_handle =
+            Arc::clone(mcp_manager).spawn_background_refresh_all(refresh_interval);
+        info!("Started background refresh for all static MCP servers");
+    }
 
     let worker_stats = app_context.worker_registry.stats();
     info!(

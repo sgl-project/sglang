@@ -9,6 +9,7 @@ use sglang_router_rs::{
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
+    mcp::{McpConfig, McpManager},
     middleware::{AuthConfig, TokenBucket},
     policies::PolicyRegistry,
     routers::RouterTrait,
@@ -151,5 +152,60 @@ pub fn create_test_app_with_context(
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
+    )
+}
+
+/// Create a minimal test AppContext for unit tests
+#[allow(dead_code)]
+pub async fn create_test_app_context() -> Arc<AppContext> {
+    let router_config = RouterConfig::default();
+    let client = Client::new();
+
+    // Initialize empty OnceLocks
+    let worker_job_queue = Arc::new(OnceLock::new());
+    let workflow_engine = Arc::new(OnceLock::new());
+
+    // Initialize MCP manager with empty config
+    let mcp_manager_lock = Arc::new(OnceLock::new());
+    let empty_config = McpConfig {
+        servers: vec![],
+        pool: Default::default(),
+        proxy: None,
+        warmup: vec![],
+        inventory: Default::default(),
+    };
+    let mcp_manager = McpManager::with_defaults(empty_config)
+        .await
+        .expect("Failed to create MCP manager");
+    mcp_manager_lock.set(Arc::new(mcp_manager)).ok();
+
+    // Initialize registries
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+
+    // Initialize storage backends
+    let response_storage = Arc::new(MemoryResponseStorage::new());
+    let conversation_storage = Arc::new(MemoryConversationStorage::new());
+    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+
+    Arc::new(
+        AppContext::builder()
+            .router_config(router_config)
+            .client(client)
+            .rate_limiter(None)
+            .tokenizer(None)
+            .reasoning_parser_factory(None)
+            .tool_parser_factory(None)
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .load_monitor(None)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engine(workflow_engine)
+            .mcp_manager(mcp_manager_lock)
+            .build()
+            .unwrap(),
     )
 }

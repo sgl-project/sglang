@@ -93,6 +93,10 @@ pub struct RouterConfig {
     /// Loaded from ca_cert_paths during config creation
     #[serde(default)]
     pub ca_certificates: Vec<Vec<u8>>,
+    /// MCP server configuration (loaded from mcp_config_path during config creation)
+    /// This is loaded from the config file path and stored here for runtime use
+    #[serde(skip)]
+    pub mcp_config: Option<crate::mcp::McpConfig>,
 }
 
 /// Tokenizer cache configuration
@@ -508,6 +512,7 @@ impl Default for RouterConfig {
             tokenizer_cache: TokenizerCacheConfig::default(),
             client_identity: None,
             ca_certificates: vec![],
+            mcp_config: None,
         }
     }
 }

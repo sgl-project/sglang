@@ -24,6 +24,7 @@ use crate::{
     data_connector::{
         SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
     },
+    mcp::McpManager,
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
@@ -60,8 +61,7 @@ pub struct GrpcRouter {
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
-    // Optional MCP manager for tool execution (enabled via SGLANG_MCP_CONFIG env var)
-    mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    mcp_manager: Arc<McpManager>,
     // Background task handles for cancellation support (includes gRPC client for Python abort)
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 }
@@ -94,25 +94,12 @@ impl GrpcRouter {
         let conversation_storage = ctx.conversation_storage.clone();
         let conversation_item_storage = ctx.conversation_item_storage.clone();
 
-        // Optional MCP manager activation via env var path (config-driven gate)
-        let mcp_manager = match std::env::var("SGLANG_MCP_CONFIG").ok() {
-            Some(path) if !path.trim().is_empty() => {
-                match crate::mcp::McpConfig::from_file(&path).await {
-                    Ok(cfg) => match crate::mcp::McpClientManager::new(cfg).await {
-                        Ok(mgr) => Some(Arc::new(mgr)),
-                        Err(err) => {
-                            tracing::warn!("Failed to initialize MCP manager: {}", err);
-                            None
-                        }
-                    },
-                    Err(err) => {
-                        tracing::warn!("Failed to load MCP config from '{}': {}", path, err);
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
+        // Get MCP manager from app context
+        let mcp_manager = ctx
+            .mcp_manager
+            .get()
+            .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
+            .clone();
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
@@ -285,6 +272,7 @@ impl RouterTrait for GrpcRouter {
             self.response_storage.clone(),
             self.conversation_storage.clone(),
             self.conversation_item_storage.clone(),
+            self.mcp_manager.clone(),
             self.background_tasks.clone(),
         )
         .await
