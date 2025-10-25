@@ -9,6 +9,7 @@
 
 pub mod client_manager;
 pub mod config;
+pub mod connection_pool;
 pub mod error;
 pub mod inventory;
 pub mod oauth;
@@ -20,6 +21,7 @@ pub use config::{
     InventoryConfig, McpConfig, McpPoolConfig, McpProxyConfig, McpServerConfig, McpTransport,
     WarmupServer,
 };
+pub use connection_pool::{CachedConnection, McpConnectionPool, PoolStats};
 pub use error::{McpError, McpResult};
 pub use inventory::ToolInventory;
 pub use proxy::{create_http_client, resolve_proxy_config};
