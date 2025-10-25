@@ -213,12 +213,12 @@ The SGL Model Gateway provides native Model Context Protocol (MCP) client integr
 ```bash
 # Rust binary
 ./target/release/sglang-router \
-  --mcp-config /path/to/mcp-config.json \
+  --mcp-config-path /path/to/mcp-config.json \
   --worker-urls http://worker1:8000
 
 # Python launcher
 python3 -m sglang_router.launch_router \
-  --mcp-config /path/to/mcp-config.json \
+  --mcp-config-path /path/to/mcp-config.json \
   --worker-urls http://worker1:8000
 ```
 

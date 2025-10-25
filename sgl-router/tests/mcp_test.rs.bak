@@ -9,7 +9,7 @@
 
 mod common;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::collections::HashMap;
 
 use common::mock_mcp_server::MockMCPServer;
 use serde_json::json;
@@ -35,13 +35,7 @@ async fn test_mcp_server_initialization() {
     };
 
     // Should fail with no servers
-    let result = McpClientManager::new(
-        config,
-        Arc::new(sglang_router_rs::mcp::ToolInventory::new(
-            Duration::from_secs(3600),
-        )),
-    )
-    .await;
+    let result = McpClientManager::new(config).await;
     assert!(result.is_err(), "Should fail with no servers configured");
 }
 
@@ -65,13 +59,7 @@ async fn test_server_connection_with_mock() {
         inventory: Default::default(),
     };
 
-    let result = McpClientManager::new(
-        config,
-        Arc::new(sglang_router_rs::mcp::ToolInventory::new(
-            Duration::from_secs(3600),
-        )),
-    )
-    .await;
+    let result = McpClientManager::new(config).await;
     assert!(result.is_ok(), "Should connect to mock server");
 
     let mut manager = result.unwrap();
@@ -109,14 +97,7 @@ async fn test_tool_availability_checking() {
         inventory: Default::default(),
     };
 
-    let mut manager = McpClientManager::new(
-        config,
-        Arc::new(sglang_router_rs::mcp::ToolInventory::new(
-            Duration::from_secs(3600),
-        )),
-    )
-    .await
-    .unwrap();
+    let mut manager = McpClientManager::new(config).await.unwrap();
 
     let test_tools = vec!["brave_web_search", "brave_local_search", "calculator"];
     for tool in test_tools {
@@ -177,13 +158,7 @@ async fn test_multi_server_connection() {
 
     // Note: This will fail to connect to both servers in the current implementation
     // since they return the same tools. The manager will connect to the first one.
-    let result = McpClientManager::new(
-        config,
-        Arc::new(sglang_router_rs::mcp::ToolInventory::new(
-            Duration::from_secs(3600),
-        )),
-    )
-    .await;
+    let result = McpClientManager::new(config).await;
 
     if let Ok(mut manager) = result {
         let servers = manager.list_servers();
@@ -216,14 +191,7 @@ async fn test_tool_execution_with_mock() {
         inventory: Default::default(),
     };
 
-    let mut manager = McpClientManager::new(
-        config,
-        Arc::new(sglang_router_rs::mcp::ToolInventory::new(
-            Duration::from_secs(3600),
-        )),
-    )
-    .await
-    .unwrap();
+    let mut manager = McpClientManager::new(config).await.unwrap();
 
     let result = manager
         .call_tool(
@@ -280,14 +248,7 @@ async fn test_concurrent_tool_execution() {
         inventory: Default::default(),
     };
 
-    let mut manager = McpClientManager::new(
-        config,
-        Arc::new(sglang_router_rs::mcp::ToolInventory::new(
-            Duration::from_secs(3600),
-        )),
-    )
-    .await
-    .unwrap();
+    let mut manager = McpClientManager::new(config).await.unwrap();
 
     // Execute tools sequentially (true concurrent execution would require Arc<Mutex>)
     let tool_calls = vec![
@@ -330,14 +291,7 @@ async fn test_tool_execution_errors() {
         inventory: Default::default(),
     };
 
-    let mut manager = McpClientManager::new(
-        config,
-        Arc::new(sglang_router_rs::mcp::ToolInventory::new(
-            Duration::from_secs(3600),
-        )),
-    )
-    .await
-    .unwrap();
+    let mut manager = McpClientManager::new(config).await.unwrap();
 
     // Try to call unknown tool
     let result = manager
@@ -374,13 +328,7 @@ async fn test_connection_without_server() {
         inventory: Default::default(),
     };
 
-    let result = McpClientManager::new(
-        config,
-        Arc::new(sglang_router_rs::mcp::ToolInventory::new(
-            Duration::from_secs(3600),
-        )),
-    )
-    .await;
+    let result = McpClientManager::new(config).await;
     assert!(result.is_err(), "Should fail when no server is running");
 
     if let Err(e) = result {
@@ -418,14 +366,7 @@ async fn test_tool_info_structure() {
         inventory: Default::default(),
     };
 
-    let manager = McpClientManager::new(
-        config,
-        Arc::new(sglang_router_rs::mcp::ToolInventory::new(
-            Duration::from_secs(3600),
-        )),
-    )
-    .await
-    .unwrap();
+    let manager = McpClientManager::new(config).await.unwrap();
 
     let tools = manager.list_tools();
     let brave_search = tools
@@ -462,13 +403,7 @@ async fn test_sse_connection() {
     };
 
     // This will fail immediately without retry
-    let result = McpClientManager::new(
-        config,
-        Arc::new(sglang_router_rs::mcp::ToolInventory::new(
-            Duration::from_secs(3600),
-        )),
-    )
-    .await;
+    let result = McpClientManager::new(config).await;
     assert!(result.is_err(), "Should fail for non-existent SSE server");
 }
 
@@ -538,14 +473,9 @@ async fn test_complete_workflow() {
     };
 
     // 2. Connect to server
-    let mut manager = McpClientManager::new(
-        config,
-        Arc::new(sglang_router_rs::mcp::ToolInventory::new(
-            Duration::from_secs(3600),
-        )),
-    )
-    .await
-    .expect("Should connect to mock server");
+    let mut manager = McpClientManager::new(config)
+        .await
+        .expect("Should connect to mock server");
 
     // 3. Verify server connection
     let servers = manager.list_servers();

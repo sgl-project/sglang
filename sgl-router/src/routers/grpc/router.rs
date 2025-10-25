@@ -1,6 +1,6 @@
 // gRPC Router Implementation
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
@@ -98,13 +98,19 @@ impl GrpcRouter {
         let mcp_manager = match std::env::var("SGLANG_MCP_CONFIG").ok() {
             Some(path) if !path.trim().is_empty() => {
                 match crate::mcp::McpConfig::from_file(&path).await {
-                    Ok(cfg) => match crate::mcp::McpClientManager::new(cfg).await {
-                        Ok(mgr) => Some(Arc::new(mgr)),
-                        Err(err) => {
-                            tracing::warn!("Failed to initialize MCP manager: {}", err);
-                            None
+                    Ok(cfg) => {
+                        // Create temporary inventory for legacy MCP initialization
+                        let inventory = Arc::new(crate::mcp::ToolInventory::new(
+                            Duration::from_secs(3600), // 1 hour TTL
+                        ));
+                        match crate::mcp::McpClientManager::new(cfg, inventory).await {
+                            Ok(mgr) => Some(Arc::new(mgr)),
+                            Err(err) => {
+                                tracing::warn!("Failed to initialize MCP manager: {}", err);
+                                None
+                            }
                         }
-                    },
+                    }
                     Err(err) => {
                         tracing::warn!("Failed to load MCP config from '{}': {}", path, err);
                         None

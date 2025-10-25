@@ -44,33 +44,51 @@ impl StepExecutor for ConnectMcpServerStep {
         let config_request: Arc<McpServerConfigRequest> = context
             .get("mcp_server_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
-        let _app_context: Arc<AppContext> = context
+        let app_context: Arc<AppContext> = context
             .get("app_context")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
         debug!("Connecting to MCP server: {}", config_request.name);
 
+        // Get shared ToolInventory from McpManager
+        let mcp_manager =
+            app_context
+                .mcp_manager
+                .get()
+                .ok_or_else(|| WorkflowError::StepFailed {
+                    step_id: StepId::new("connect_mcp_server"),
+                    message: "MCP manager not initialized".to_string(),
+                })?;
+
+        let inventory = mcp_manager.inventory();
+
+        // Get proxy config from router_config if available, otherwise fall back to env
+        let proxy_config = app_context
+            .router_config
+            .mcp_config
+            .as_ref()
+            .and_then(|cfg| cfg.proxy.clone())
+            .or_else(crate::mcp::McpProxyConfig::from_env);
+
         // Create MCP config with single server
-        // TODO(Phase 6): Get proxy config from router_config when mcp_config field is added
         let mcp_config = crate::mcp::McpConfig {
             servers: vec![config_request.config.clone()],
             pool: Default::default(),
-            proxy: crate::mcp::McpProxyConfig::from_env(), // Use environment proxy for now
+            proxy: proxy_config,
             warmup: Vec::new(),
             inventory: Default::default(),
         };
 
-        // Connect to MCP server
-        let client_manager =
-            McpClientManager::new(mcp_config)
-                .await
-                .map_err(|e| WorkflowError::StepFailed {
-                    step_id: StepId::new("connect_mcp_server"),
-                    message: format!(
-                        "Failed to connect to MCP server {}: {}",
-                        config_request.name, e
-                    ),
-                })?;
+        // Connect to MCP server with shared inventory
+        let client_manager = McpClientManager::new(mcp_config, inventory)
+            .await
+            .map_err(|e| WorkflowError::StepFailed {
+                step_id: StepId::new("connect_mcp_server"),
+                message: format!(
+                    "Failed to connect to MCP server {}: {}",
+                    config_request.name, e
+                ),
+            })?;
 
         info!(
             "Successfully connected to MCP server: {}",
