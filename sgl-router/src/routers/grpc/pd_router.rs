@@ -13,11 +13,13 @@ use tracing::debug;
 
 use super::{context::SharedComponents, pipeline::RequestPipeline};
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
     core::{ConnectionMode, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -26,7 +28,6 @@ use crate::{
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::RouterTrait,
-    server::AppContext,
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
 };
@@ -251,6 +252,15 @@ impl RouterTrait for GrpcPDRouter {
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 

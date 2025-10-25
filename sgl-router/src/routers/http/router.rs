@@ -24,6 +24,7 @@ use crate::{
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
         common::GenerationRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
@@ -47,7 +48,7 @@ pub struct Router {
 
 impl Router {
     /// Create a new router with injected policy and client
-    pub async fn new(ctx: &Arc<crate::server::AppContext>) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
         let workers = ctx.worker_registry.get_workers_filtered(
             None, // any model
             Some(WorkerType::Regular),
@@ -744,6 +745,30 @@ impl RouterTrait for Router {
         } else {
             let error_type = format!("http_{}", res.status().as_u16());
             RouterMetrics::record_embeddings_error(&error_type);
+        }
+
+        res
+    }
+
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        // Record classification-specific metrics in addition to general request metrics
+        let start = Instant::now();
+        let res = self
+            .route_typed_request(headers, body, "/v1/classify", model_id)
+            .await;
+
+        // Classification specific metrics
+        if res.status().is_success() {
+            RouterMetrics::record_classify_request();
+            RouterMetrics::record_classify_duration(start.elapsed());
+        } else {
+            let error_type = format!("http_{}", res.status().as_u16());
+            RouterMetrics::record_classify_error(&error_type);
         }
 
         res

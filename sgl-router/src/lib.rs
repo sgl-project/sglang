@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+pub mod app_context;
 pub mod config;
 pub mod logging;
 use std::collections::HashMap;
@@ -194,26 +195,33 @@ struct Router {
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
-    connection_mode: config::ConnectionMode,
+    connection_mode: core::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
     chat_template: Option<String>,
+    tokenizer_cache_enable_l0: bool,
+    tokenizer_cache_l0_max_entries: usize,
+    tokenizer_cache_enable_l1: bool,
+    tokenizer_cache_l1_max_memory: usize,
     reasoning_parser: Option<String>,
     tool_call_parser: Option<String>,
     backend: BackendType,
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
+    ca_cert_paths: Vec<String>,
 }
 
 impl Router {
     /// Determine connection mode from worker URLs
-    fn determine_connection_mode(worker_urls: &[String]) -> config::ConnectionMode {
+    fn determine_connection_mode(worker_urls: &[String]) -> core::ConnectionMode {
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-                return config::ConnectionMode::Grpc;
+                return core::ConnectionMode::Grpc { port: None };
             }
         }
-        config::ConnectionMode::Http
+        core::ConnectionMode::Http
     }
 
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
@@ -298,59 +306,70 @@ impl Router {
             None
         };
 
-        Ok(config::RouterConfig {
-            mode,
-            policy,
-            host: self.host.clone(),
-            port: self.port,
-            connection_mode: self.connection_mode.clone(),
-            max_payload_size: self.max_payload_size,
-            request_timeout_secs: self.request_timeout_secs,
-            worker_startup_timeout_secs: self.worker_startup_timeout_secs,
-            worker_startup_check_interval_secs: self.worker_startup_check_interval,
-            dp_aware: self.dp_aware,
-            api_key: self.api_key.clone(),
-            discovery,
-            metrics,
-            log_dir: self.log_dir.clone(),
-            log_level: self.log_level.clone(),
-            request_id_headers: self.request_id_headers.clone(),
-            max_concurrent_requests: self.max_concurrent_requests,
-            queue_size: self.queue_size,
-            queue_timeout_secs: self.queue_timeout_secs,
-            rate_limit_tokens_per_second: self.rate_limit_tokens_per_second,
-            cors_allowed_origins: self.cors_allowed_origins.clone(),
-            retry: config::RetryConfig {
+        config::RouterConfig::builder()
+            .mode(mode)
+            .policy(policy)
+            .host(&self.host)
+            .port(self.port)
+            .connection_mode(self.connection_mode.clone())
+            .max_payload_size(self.max_payload_size)
+            .request_timeout_secs(self.request_timeout_secs)
+            .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
+            .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .max_concurrent_requests(self.max_concurrent_requests)
+            .queue_size(self.queue_size)
+            .queue_timeout_secs(self.queue_timeout_secs)
+            .cors_allowed_origins(self.cors_allowed_origins.clone())
+            .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
                 initial_backoff_ms: self.retry_initial_backoff_ms,
                 max_backoff_ms: self.retry_max_backoff_ms,
                 backoff_multiplier: self.retry_backoff_multiplier,
                 jitter_factor: self.retry_jitter_factor,
-            },
-            circuit_breaker: config::CircuitBreakerConfig {
+            })
+            .circuit_breaker_config(config::CircuitBreakerConfig {
                 failure_threshold: self.cb_failure_threshold,
                 success_threshold: self.cb_success_threshold,
                 timeout_duration_secs: self.cb_timeout_duration_secs,
                 window_duration_secs: self.cb_window_duration_secs,
-            },
-            disable_retries: self.disable_retries,
-            disable_circuit_breaker: self.disable_circuit_breaker,
-            health_check: config::HealthCheckConfig {
+            })
+            .health_check_config(config::HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
-            },
-            enable_igw: self.enable_igw,
-            model_path: self.model_path.clone(),
-            tokenizer_path: self.tokenizer_path.clone(),
-            chat_template: self.chat_template.clone(),
-            history_backend,
-            oracle,
-            reasoning_parser: self.reasoning_parser.clone(),
-            tool_call_parser: self.tool_call_parser.clone(),
-        })
+            })
+            .tokenizer_cache(config::TokenizerCacheConfig {
+                enable_l0: self.tokenizer_cache_enable_l0,
+                l0_max_entries: self.tokenizer_cache_l0_max_entries,
+                enable_l1: self.tokenizer_cache_enable_l1,
+                l1_max_memory: self.tokenizer_cache_l1_max_memory,
+            })
+            .history_backend(history_backend)
+            .maybe_api_key(self.api_key.as_ref())
+            .maybe_discovery(discovery)
+            .maybe_metrics(metrics)
+            .maybe_log_dir(self.log_dir.as_ref())
+            .maybe_log_level(self.log_level.as_ref())
+            .maybe_request_id_headers(self.request_id_headers.clone())
+            .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .maybe_model_path(self.model_path.as_ref())
+            .maybe_tokenizer_path(self.tokenizer_path.as_ref())
+            .maybe_chat_template(self.chat_template.as_ref())
+            .maybe_oracle(oracle)
+            .maybe_reasoning_parser(self.reasoning_parser.as_ref())
+            .maybe_tool_call_parser(self.tool_call_parser.as_ref())
+            .dp_aware(self.dp_aware)
+            .retries(!self.disable_retries)
+            .circuit_breaker(!self.disable_circuit_breaker)
+            .igw(self.enable_igw)
+            .maybe_client_cert_and_key(
+                self.client_cert_path.as_ref(),
+                self.client_key_path.as_ref(),
+            )
+            .add_ca_certificates(self.ca_cert_paths.clone())
+            .build()
     }
 }
 
@@ -415,11 +434,18 @@ impl Router {
         model_path = None,
         tokenizer_path = None,
         chat_template = None,
+        tokenizer_cache_enable_l0 = false,
+        tokenizer_cache_l0_max_entries = 10000,
+        tokenizer_cache_enable_l1 = false,
+        tokenizer_cache_l1_max_memory = 52428800,
         reasoning_parser = None,
         tool_call_parser = None,
         backend = BackendType::Sglang,
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
+        client_cert_path = None,
+        client_key_path = None,
+        ca_cert_paths = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -480,11 +506,18 @@ impl Router {
         model_path: Option<String>,
         tokenizer_path: Option<String>,
         chat_template: Option<String>,
+        tokenizer_cache_enable_l0: bool,
+        tokenizer_cache_l0_max_entries: usize,
+        tokenizer_cache_enable_l1: bool,
+        tokenizer_cache_l1_max_memory: usize,
         reasoning_parser: Option<String>,
         tool_call_parser: Option<String>,
         backend: BackendType,
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
+        client_cert_path: Option<String>,
+        client_key_path: Option<String>,
+        ca_cert_paths: Vec<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -559,11 +592,18 @@ impl Router {
             model_path,
             tokenizer_path,
             chat_template,
+            tokenizer_cache_enable_l0,
+            tokenizer_cache_l0_max_entries,
+            tokenizer_cache_enable_l1,
+            tokenizer_cache_l1_max_memory,
             reasoning_parser,
             tool_call_parser,
             backend,
             history_backend,
             oracle_config,
+            client_cert_path,
+            client_key_path,
+            ca_cert_paths,
         })
     }
 

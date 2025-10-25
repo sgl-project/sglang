@@ -24,6 +24,7 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        classify::ClassifyRequest,
         common::{InputIds, StringOrArray},
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
@@ -126,7 +127,7 @@ impl PDRouter {
         }
     }
 
-    pub async fn new(ctx: &Arc<crate::server::AppContext>) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -1186,6 +1187,19 @@ impl RouterTrait for PDRouter {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Responses cancel endpoint not implemented for PD router",
+        )
+            .into_response()
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Classify endpoint not implemented for PD router",
         )
             .into_response()
     }

@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
+    classify::ClassifyRequest,
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
@@ -122,6 +123,14 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         headers: Option<&HeaderMap>,
         body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response;
+
+    /// Route classification requests (OpenAI-compatible /v1/classify)
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response;
 
