@@ -27,7 +27,6 @@
 from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
 from transformers import LlamaConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
