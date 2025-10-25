@@ -6,6 +6,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import fnmatch
+import gc
 import glob
 import json
 import logging
@@ -111,6 +112,8 @@ if TYPE_CHECKING:
 _is_npu = is_npu()
 # ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
 # which contains the complete mapping of quantization config choices
+
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -686,6 +689,467 @@ class LayeredModelLoader(DefaultModelLoader):
             model.torchao_applied = True
 
         return model.eval()
+
+
+class QuantizedRLModelLoader(DefaultModelLoader):
+    """
+    Model loader designed for RL training with quantized models.
+    
+    This loader addresses the key challenge in RL training with quantized models:
+    during RL training, model weights are updated via gradients, and these updated
+    weights need to be reloaded into the inference engine for the next rollout.
+    
+    The problem: quantization transforms weights (e.g., FP8, INT8) and creates new
+    tensors, losing critical metadata like:
+    - Original parameter shapes/strides
+    - Weight loader functions  
+    - Memory locations
+    
+    This loader solves this by:
+    1. Recording original parameter state before quantization
+    2. Recording weight loader functions
+    3. Supporting efficient weight reload with proper re-quantization
+    4. Preserving memory locations for efficient GPU operations
+    
+    Inspired by FlashRL's approach for vLLM, adapted for SGLang's architecture.
+    """
+
+    # Keys to record from parameters for weight reloading
+    RECORDED_LOADER_KEYS = [
+        "weight_loader",
+        "load_qkv_weight",
+        "load_row_parallel_weight",
+        "load_column_parallel_weight",
+        "load_merged_column_weight",
+        "output_dim",
+        "input_dim",
+        "_assert_and_load",
+    ]
+
+    # Preserved module attributes that need to be restored after weight reloading
+    PRESERVED_MODULE_ATTRIBUTES = [
+        # TODO: Maybe more attributes to preserve?
+        "workspace",
+    ]
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        logger.info("QuantizedRL Model Loader: Fast weight reloading enabled for RL training")
+
+    def _prepare_weights(
+        self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+    ):
+        """Override to handle LoadFormat.QUANTIZED_RL by treating it as AUTO."""
+        # QUANTIZED_RL uses the same weight loading as AUTO, difference is in processing
+        temp_config = LoadConfig(load_format=LoadFormat.AUTO)
+        temp_loader = DefaultModelLoader(temp_config)
+        return temp_loader._prepare_weights(
+            model_name_or_path, revision, fall_back_to_pt
+        )
+
+    @staticmethod
+    def _bond_method_to_cls(func, obj):
+        """Bind a function to an object instance, following FlashRL's bond_method_to_cls approach."""
+        import types
+
+        if hasattr(func, "__self__") or not callable(func):
+            # If the function is already bound to an instance or not callable, return it as is
+            return func
+        else:
+            # Bind the function to the object instance
+            return types.MethodType(func, obj)
+
+    @staticmethod
+    def load_weights_and_postprocess(model, weights, target_device):
+        """
+        Override of DefaultModelLoader's load_weights_and_postprocess.
+        
+        This method:
+        1. Records original parameter state (shape, stride, dtype, size)
+        2. Records weight loader functions and metadata
+        3. Loads weights normally
+        4. Processes weights (quantization, etc.)
+        5. Marks model as ready for RL weight reloading
+        """
+
+        # Check if already called to prevent duplicate processing
+        if getattr(model, "process_weights_after_loading_already_called", False):
+            logger.warning(
+                "[QuantizedRL] process_weights_after_loading already called for model"
+            )
+            return
+
+        # Step 1: Record original weight state BEFORE loading/quantization
+        if not hasattr(model, "original_weights_rebuild_keys"):
+            logger.info("Recording parameter state for RL training (290 params expected)")
+            model.original_weights_rebuild_keys = {}
+            param_count = 0
+
+            for name, p in model.named_parameters():
+                model.original_weights_rebuild_keys[name] = {
+                    "shape": p.shape,
+                    "stride": p.stride(),
+                    "dtype": p.dtype,
+                    "nbytes": p.untyped_storage().nbytes(),
+                }
+                param_count += 1
+
+        # Step 2: Record weight loader functions and metadata
+        recorded_loader = {
+            k: dict() for k in QuantizedRLModelLoader.RECORDED_LOADER_KEYS
+        }
+        param_count = 0
+        params_with_loaders = 0
+
+        for name, p in model.named_parameters():
+            param_count += 1
+            param_has_loader = False
+
+            for key in QuantizedRLModelLoader.RECORDED_LOADER_KEYS:
+                if hasattr(p, key):
+                    param_has_loader = True
+                    attr = getattr(p, key)
+                    if not callable(attr):
+                        # Non-callable attributes (like dimensions)
+                        recorded_loader[key][name] = attr
+                    elif hasattr(attr, "__self__") and p is attr.__self__:
+                        # Bound method - store the unbound function for later rebinding
+                        recorded_loader[key][name] = attr.__func__
+                    else:
+                        # Regular function or callable - store as is
+                        recorded_loader[key][name] = attr
+
+            if param_has_loader:
+                params_with_loaders += 1
+
+        total_recorded = sum(len(loader_k) for loader_k in recorded_loader.values())
+        logger.debug(f"Recorded {total_recorded} loader functions for {params_with_loaders} parameters")
+
+        model.recorded_loader = recorded_loader
+
+        # Step 3: Load weights
+        model.load_weights(weights)
+
+        # Step 4: Process weights after loading (quantization, etc.)
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
+        # Step 5: Store quantization type for fast path use during reloads
+        quant_config = getattr(model, "quant_config", None)
+        if quant_config:
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+            if isinstance(quant_config, Fp8Config):
+                model.quantized_rl_quant_type = "fp8"
+                logger.info("FP8 quantization detected - fast path enabled")
+            else:
+                model.quantized_rl_quant_type = "other"
+                logger.debug(f"Quantization type: {type(quant_config).__name__}")
+        else:
+            model.quantized_rl_quant_type = None
+
+        # Mark as already called
+        model.process_weights_after_loading_already_called = True
+        logger.info("Model ready for RL training with fast weight reloading")
+
+    @staticmethod
+    def is_reload_scenario(model):
+        """Check if this is a true reload scenario (not initial loading)."""
+        return (
+            hasattr(model, "original_weights_rebuild_keys")
+            and hasattr(model, "recorded_loader")
+            and getattr(model, "process_weights_after_loading_already_called", False)
+        )
+
+    @staticmethod
+    def _fast_path_process_weights(model, target_device, quant_type):
+        """
+        Fast path weight processing that performs efficient quantization during RL training reloads.
+        
+        This method is inspired by FlashRL's fast path optimization. During RL training,
+        we reload weights frequently. The standard process_weights_after_loading() is
+        expensive because it:
+        - Recomputes quantization scales
+        - Repacks weights (e.g., for Marlin format)
+        - Runs full quantization kernels
+        
+        The fast path optimization performs lightweight quantization while skipping:
+        1. Expensive weight repacking/permutation
+        2. Complex preprocessing operations
+        3. Full module-level processing pipeline
+        
+        For FP8 quantization: Use fast CUDA kernel to quantize BF16/FP32 → FP8
+        and compute scales dynamically, but skip expensive Marlin repacking.
+        
+        Args:
+            model: The model being reloaded
+            target_device: Device to process weights on
+            quant_type: Type of quantization ('fp8', 'other', or None)
+        """
+        try:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+        except ImportError:
+            Fp8LinearMethod = None
+            scaled_fp8_quant = None
+        
+        modules_skipped = 0
+        modules_quantized = 0
+        modules_processed = 0
+        
+        for name, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is None:
+                continue
+            
+            # FP8 fast path: use fast quantization kernel instead of full processing
+            if Fp8LinearMethod and isinstance(quant_method, Fp8LinearMethod) and quant_type == "fp8" and scaled_fp8_quant is not None:
+                # Get the weight parameter
+                weight_param = getattr(module, "weight", None)
+                if weight_param is None:
+                    modules_skipped += 1
+                    continue
+                
+                # Check if weight needs quantization (is in BF16/FP32, not FP8)
+                if weight_param.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                    # Weight is in BF16/FP32, needs quantization to FP8
+                    scale_param = getattr(module, "weight_scale", None)
+                    
+                    if scale_param is not None:
+                        try:
+                            # Use SGLang's fast FP8 quantization function
+                            # This is much faster than full process_weights_after_loading
+                            
+                            # Reshape weight to 2D for quantization (required by scaled_fp8_quant)
+                            original_shape = weight_param.shape
+                            if weight_param.ndim > 2:
+                                weight_2d = weight_param.view(original_shape[0], -1)
+                            else:
+                                weight_2d = weight_param
+                            
+                            # Perform fast FP8 quantization with dynamic scale computation
+                            # scaled_fp8_quant returns (quantized_tensor, scale)
+                            quantized_weight, computed_scale = scaled_fp8_quant(
+                                weight_2d,
+                                scale=None,  # None means dynamic scaling
+                                use_per_token_if_dynamic=False  # Use per-tensor scaling
+                            )
+                            
+                            # Reshape back to original shape if needed
+                            if weight_param.ndim > 2:
+                                quantized_weight = quantized_weight.view(original_shape)
+                            
+                            # Update parameters in-place
+                            weight_param.data = quantized_weight
+                            # Scale should be shape (1,) for per-tensor quantization
+                            if scale_param.numel() == 1:
+                                scale_param.data.copy_(computed_scale.squeeze())
+                            else:
+                                # Per-channel scaling - fill with the scalar value
+                                scale_param.data.fill_(computed_scale.item())
+                            
+                            modules_quantized += 1
+                            logger.debug(
+                                f"[QuantizedRL Fast Path] Quantized FP8 for module: {name}"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"[QuantizedRL Fast Path] Failed to quantize {name}: {e}. "
+                                f"Falling back to full processing."
+                            )
+                            # Fall back to full processing if fast path fails
+                            with device_loading_context(module, target_device):
+                                quant_method.process_weights_after_loading(module)
+                            modules_processed += 1
+                    else:
+                        # No scale parameter, use full processing
+                        logger.debug(
+                            f"[QuantizedRL Fast Path] No scale param for {name}, using full processing"
+                        )
+                        with device_loading_context(module, target_device):
+                            quant_method.process_weights_after_loading(module)
+                        modules_processed += 1
+                else:
+                    # Weight is already in FP8 format, skip
+                    modules_skipped += 1
+                    logger.debug(
+                        f"[QuantizedRL Fast Path] Skipping already-FP8 module: {name}"
+                    )
+                
+                continue
+            
+            # For other quantization methods or non-fast-path quants, process normally
+            modules_processed += 1
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
+        
+        logger.debug(
+            f"Fast path complete: "
+            f"quantized {modules_quantized} FP8 modules, "
+            f"skipped {modules_skipped} already-FP8, "
+            f"processed {modules_processed} others"
+        )
+
+    @staticmethod
+    def rebinding_and_load_weights(model, first_time_load_weights, weights):
+        """
+        Reload weights with FAST PATH optimization for RL training.
+        
+        This method is only called during RL training iterations, so we always
+        use optimized fast path processing to minimize reload time.
+        
+        This method:
+        1. Preserves critical module attributes (RoPE caches, workspace, etc.)
+        2. Resets parameters to pre-quantization state
+        3. Restores weight loader functions
+        4. Loads updated weights
+        5. Re-quantizes weights using FAST PATH (skips expensive operations)
+        6. Copies quantized weights back to original memory locations
+        7. Restores preserved module attributes
+        
+        Args:
+            model: The model to reload weights into
+            first_time_load_weights: The model's load_weights function
+            weights: Iterator of (name, tensor) tuples with updated weights
+            
+        Returns:
+            Set of parameter names that were updated
+        """
+        logger.info("Weight reload started")
+
+        # Step 1: Preserve critical module attributes (RoPE caches, workspace, etc.)
+        preserved_attributes = {}
+        for module_name, module in model.named_modules():
+            for attr_name in QuantizedRLModelLoader.PRESERVED_MODULE_ATTRIBUTES:
+                attr_value = getattr(module, attr_name, None)
+                if attr_value is not None:
+                    preserve_key = f"{module_name}.{attr_name}"
+                    if torch.is_tensor(attr_value):
+                        # Clone tensor attributes to preserve them
+                        preserved_attributes[preserve_key] = attr_value.clone()
+                    else:
+                        # Preserve non-tensor attributes as-is
+                        preserved_attributes[preserve_key] = attr_value
+
+        # Step 2: Save current parameter data (quantized state)
+        # Don't keep references to old data to avoid memory leak
+        existing_params = dict(model.named_parameters())
+        current_param_data = {}
+        for name, p in existing_params.items():
+            # Just save the shape/dtype info, not the actual data tensor
+            # This avoids keeping references to large tensors
+            current_param_data[name] = {
+                'data': p.data,
+                'shape': p.data.shape,
+                'dtype': p.data.dtype,
+                'device': p.data.device,
+            }
+
+        # Step 3: Reset parameters to pre-quantization state
+        for name, rebuild_info in model.original_weights_rebuild_keys.items():
+            if name in existing_params:
+                existing_params[name].data = torch.empty(
+                    rebuild_info["shape"],
+                    dtype=rebuild_info["dtype"],
+                    device=existing_params[name].device,
+                )
+
+        # Step 4: Restore weight loader functions
+        # Always restore, even if attribute exists, to ensure correct binding after parameter reset
+        for k, loader_dict in model.recorded_loader.items():
+            for param_name, loader in loader_dict.items():
+                if param_name in existing_params:
+                    param = existing_params[param_name]
+                    # Bind method to parameter if it's a function
+                    if callable(loader):
+                        # If the loader is already a bound method (to a module, not the parameter),
+                        # keep it as is. Only rebind if it's an unbound function or needs rebinding to param.
+                        if hasattr(loader, "__self__"):
+                            # Already bound (likely to the module), keep as is
+                            setattr(param, k, loader)
+                        else:
+                            # Unbound function, bind to parameter
+                            setattr(
+                                param,
+                                k,
+                                QuantizedRLModelLoader._bond_method_to_cls(
+                                    loader, param
+                                ),
+                            )
+                    else:
+                        setattr(param, k, loader)
+
+        # Step 5: Load updated weights (this will call the weight loaders)
+        updated_params = first_time_load_weights(weights)
+
+        # Step 6: FAST PATH re-quantization - selectively process weights
+        # Skip expensive operations that don't need to be repeated on reload
+        target_device = next(model.parameters()).device
+        quant_type = getattr(model, "quantized_rl_quant_type", None)
+            
+        QuantizedRLModelLoader._fast_path_process_weights(
+            model, target_device, quant_type
+        )
+
+        # Step 7: Copy quantized weights back to original memory locations
+        params_copied = 0
+        for name, p in model.named_parameters():
+            if name not in current_param_data:
+                logger.warning(f"New parameter {name} appeared during reload")
+                continue
+
+            old_info = current_param_data[name]
+            old_data = old_info['data']
+
+            # Verify shapes match
+            if old_data.dtype != p.data.dtype:
+                logger.debug(
+                    f"Parameter {name} dtype changed: {old_data.dtype} -> {p.data.dtype}"
+                )
+
+            if old_data.numel() != p.data.numel():
+                logger.warning(
+                    f"Parameter {name} size changed: {old_data.numel()} -> {p.data.numel()}"
+                )
+                continue
+
+            # Copy to original location if this parameter was updated
+            if name in updated_params:
+                try:
+                    # Create strided view matching original layout
+                    strided_data = torch.as_strided(
+                        p.data, old_data.shape, old_data.stride()
+                    )
+                    old_data.copy_(strided_data)
+                    params_copied += 1
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to copy parameter {name} to original location: {e}"
+                    )
+                    # Fall back to direct clone
+                    old_data = p.data.clone()
+
+            # Restore original data pointer
+            p.data = old_data
+
+        # Clean up temporary references immediately to avoid memory leak
+        del current_param_data
+        del existing_params
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Step 8: Restore preserved module attributes
+        if preserved_attributes:
+            for module_name, module in model.named_modules():
+                for attr_name in QuantizedRLModelLoader.PRESERVED_MODULE_ATTRIBUTES:
+                    preserve_key = f"{module_name}.{attr_name}"
+                    if preserve_key in preserved_attributes:
+                        setattr(module, attr_name, preserved_attributes[preserve_key])
+
+        logger.info(f"Weight reload completed: {len(updated_params)} parameters updated")
+        return updated_params
 
 
 class DummyModelLoader(BaseModelLoader):
@@ -2085,6 +2549,10 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.LAYERED:
         return LayeredModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.QUANTIZED_RL:
+        logger.info("Using QuantizedRLModelLoader for RL training with quantized models.")
+        return QuantizedRLModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.REMOTE:
         return RemoteModelLoader(load_config)
