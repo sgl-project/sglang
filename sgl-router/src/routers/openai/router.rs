@@ -39,9 +39,8 @@ use crate::{
     config::CircuitBreakerConfig,
     core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
     data_connector::{
-        conversation_items::{ListParams, SortOrder},
-        ConversationId, ResponseId, SharedConversationItemStorage, SharedConversationStorage,
-        SharedResponseStorage,
+        ConversationId, ListParams, ResponseId, SharedConversationItemStorage,
+        SharedConversationStorage, SharedResponseStorage, SortOrder,
     },
     protocols::{
         chat::ChatCompletionRequest,
