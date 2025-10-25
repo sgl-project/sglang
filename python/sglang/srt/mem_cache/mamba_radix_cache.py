@@ -21,6 +21,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 
 import heapq
 import time
+from functools import partial
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -32,6 +33,7 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
+    _key_match_paged,
     get_child_key,
 )
 
@@ -320,11 +322,9 @@ class MambaRadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
     ):
-        assert isinstance(token_to_kv_pool_allocator, TokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
-        assert page_size == 1, "Only support page_size=1 in mamba radix cache now."
         self.page_size = page_size
         self.disable = disable
 
@@ -333,8 +333,13 @@ class MambaRadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
-        self.key_match_fn = _key_match_page_size1
-        self.get_child_key_fn = get_child_key
+        if self.page_size == 1:
+            self.key_match_fn = _key_match_page_size1
+            self.get_child_key_fn = get_child_key
+        else:
+            self.key_match_fn = partial(_key_match_paged, page_size=page_size)
+            self.get_child_key_fn = partial(get_child_key, page_size=page_size)
+        
         self.reset()
 
     ##### Public API #####
