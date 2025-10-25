@@ -12,6 +12,11 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache_v2.req_to_token import ReqToTokenPool as ReqToTokenPoolV2
+from sglang.srt.mem_cache_v2.triton_kernels import (
+    get_req_to_token_ptrs,
+    write_req_to_token_pool_triton_v2,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 
@@ -90,17 +95,32 @@ def write_cache_indices(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
         )
-        # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
-        write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
-            req_to_token_pool.req_to_token,
-            req_pool_indices_tensor,
-            prefix_pointers,
-            prefix_lens_tensor,
-            seq_lens_tensor,
-            extend_lens_tensor,
-            out_cache_loc,
-            req_to_token_pool.req_to_token.shape[1],
-        )
+        if isinstance(req_to_token_pool, ReqToTokenPoolV2):
+            # Use V2 kernel that works with both sparse dict and dense tensor
+            req_to_token_ptrs = get_req_to_token_ptrs(
+                req_to_token_pool, req_pool_indices_tensor, req_to_token_pool.device
+            )
+            write_req_to_token_pool_triton_v2[(req_pool_indices_tensor.shape[0],)](
+                req_to_token_ptrs,
+                prefix_pointers,
+                prefix_lens_tensor,
+                seq_lens_tensor,
+                extend_lens_tensor,
+                out_cache_loc,
+            )
+        else:
+            # Use V1 kernel (only works with dense tensor)
+            # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
+            write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
+                req_to_token_pool.req_to_token,
+                req_pool_indices_tensor,
+                prefix_pointers,
+                prefix_lens_tensor,
+                seq_lens_tensor,
+                extend_lens_tensor,
+                out_cache_loc,
+                req_to_token_pool.req_to_token.shape[1],
+            )
     else:
         pt = 0
         for i in range(req_pool_indices_cpu.shape[0]):
@@ -384,7 +404,10 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
-    return out_cache_loc, req_pool_indices_device, req_pool_indices
+    if isinstance(batch.req_to_token_pool, ReqToTokenPoolV2):
+        return out_cache_loc, req_pool_indices_cpu, req_pool_indices
+    else:
+        return out_cache_loc, req_pool_indices_device, req_pool_indices
 
 
 def alloc_paged_token_slots_decode(
@@ -436,9 +459,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, batch.seq_lens - 1
-        ]
+        last_loc = batch.req_to_token_pool.read(
+            ([r.req_pool_idx for r in batch.reqs], (batch.seq_lens_cpu - 1).tolist())
+        )
         seq_lens_next = batch.seq_lens + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
@@ -455,7 +478,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         locs = batch.seq_lens.clone()
 
     batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        ([r.req_pool_idx for r in batch.reqs], locs), out_cache_loc.to(torch.int32)
     )
 
     return out_cache_loc

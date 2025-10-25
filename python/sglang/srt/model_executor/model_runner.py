@@ -101,6 +101,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sglang.srt.mem_cache_v2.req_to_token import ReqToTokenPool as ReqToTokenPoolV2
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -1766,7 +1767,12 @@ class ModelRunner:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
-                self.req_to_token_pool = ReqToTokenPool(
+                ReqToTokenPoolClass = (
+                    ReqToTokenPoolV2
+                    if self.server_args.use_mem_cache_v2
+                    else ReqToTokenPool
+                )
+                self.req_to_token_pool = ReqToTokenPoolClass(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,

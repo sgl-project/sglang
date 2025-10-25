@@ -215,9 +215,10 @@ class RadixCacheCpp(BasePrefixCache):
         if old_prefix_len < new_prefix_len:
             self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
             reused_indices = new_indices[old_prefix_len:new_prefix_len]
-            self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, old_prefix_len:new_prefix_len
-            ] = reused_indices
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(old_prefix_len, new_prefix_len)),
+                reused_indices,
+            )
 
         if req.last_node != new_last_node:
             self.dec_lock_ref(req.last_node)

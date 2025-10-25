@@ -606,6 +606,17 @@ class ServerArgs:
         # Handle elastic expert parallelism.
         self._handle_elastic_ep()
 
+        # Handle mem cache v2.
+        self._handle_mem_cache_v2()
+
+    def _handle_mem_cache_v2(self):
+        if not self.use_mem_cache_v2:
+            return
+
+        assert self.attention_backend == "flashinfer"
+        assert self.disaggregation_mode == "null"
+        assert self.speculative_algorithm == None
+
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}

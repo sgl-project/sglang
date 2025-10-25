@@ -372,6 +372,8 @@ class CudaGraphRunner:
                 device=self.device,
             )
 
+        if self.model_runner.server_args.use_mem_cache_v2:
+            self.req_pool_indices = self.req_pool_indices.to("cpu")
         # Capture
         try:
             with model_capture_mode():

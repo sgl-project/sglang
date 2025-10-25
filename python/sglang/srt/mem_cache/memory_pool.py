@@ -91,6 +91,10 @@ class ReqToTokenPool:
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
+    def read(self, indices):
+        """Read from req_to_token pool. V1 just uses tensor indexing directly."""
+        return self.req_to_token[indices]
+
     def available_size(self):
         return len(self.free_slots)
 

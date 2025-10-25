@@ -22,7 +22,12 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache_v2.triton_kernels import (
+    create_flashinfer_kv_indices_triton_v2,
+    get_req_to_token_ptrs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
@@ -859,7 +864,11 @@ class FlashInferIndicesUpdaterDecode:
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        # Keep V1 path for backwards compatibility
+        self.req_to_token = getattr(
+            model_runner.req_to_token_pool, "req_to_token", None
+        )
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
 
         # Dispatch the update function
@@ -1023,15 +1032,28 @@ class FlashInferIndicesUpdaterDecode:
                     paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
                 )
 
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
+            # Use V2 kernel if flag is set
+            if get_global_server_args().use_mem_cache_v2:
+                req_to_token_ptrs = get_req_to_token_ptrs(
+                    self.req_to_token_pool, req_pool_indices, "cuda"
+                )
+                create_flashinfer_kv_indices_triton_v2[(bs,)](
+                    req_to_token_ptrs,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                )
+            else:
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
@@ -1120,7 +1142,11 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        # Keep V1 path for backwards compatibility
+        self.req_to_token = getattr(
+            model_runner.req_to_token_pool, "req_to_token", None
+        )
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
@@ -1309,15 +1335,28 @@ class FlashInferIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
+            # Use V2 kernel if flag is set
+            if get_global_server_args().use_mem_cache_v2:
+                req_to_token_ptrs = get_req_to_token_ptrs(
+                    self.req_to_token_pool, req_pool_indices, req_pool_indices.device
+                )
+                create_flashinfer_kv_indices_triton_v2[(bs,)](
+                    req_to_token_ptrs,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                )
+            else:
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
