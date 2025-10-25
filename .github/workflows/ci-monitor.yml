@@ -3,7 +3,6 @@ name: CI Monitor
 on:
   schedule:
     - cron: '0 */12 * * *'  # Every 12 hours for main analysis
-    - cron: '0 6 * * *'     # Daily at 6:00 AM UTC for balance analysis
   workflow_dispatch:
     inputs:
       limit:
