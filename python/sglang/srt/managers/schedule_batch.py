@@ -1868,8 +1868,8 @@ class ModelWorkerBatch:
     multimodal_inputs: Optional[List[MultimodalInputs]]
 
     # For mamba copy
-    mamba_pool_copy_indices: Optional[torch.Tensor] = None  # shape: [b], int64
-    mamba_copy_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+    mamba_pool_copy_indices: Optional[torch.Tensor]  # shape: [b], int64
+    mamba_copy_mask: Optional[torch.Tensor]  # shape: [b], bool
 
     # For encoder-decoder
     encoder_cached: Optional[List[bool]]

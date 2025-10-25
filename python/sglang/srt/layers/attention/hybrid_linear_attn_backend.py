@@ -53,9 +53,6 @@ elif is_npu():
     causal_conv1d_update = causal_conv1d_update_npu
 
 
-from sglang.xai.srt.utils import rank0_log
-
-
 # Kernel to copy mamba states based on copy mask
 @triton.jit
 def mamba_state_copy_kernel(

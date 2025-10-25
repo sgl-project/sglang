@@ -250,7 +250,7 @@ class MambaPool:
         self.free_slots = self.free_slots[need_size:]
 
         # clear at alloc time. If clear at free time, may cause race with ping pong buffer freeing
-        self.mamba_cache[0][:, select_index] = self.mamba_cache[1][:, select_index] = 0
+        self.mamba_cache.conv[:, select_index] = self.mamba_cache.temporal[:, select_index] = 0
 
         return select_index
 
