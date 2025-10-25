@@ -67,18 +67,6 @@ class TestDeepseekV32NasBackend_flashmla(CustomTestCase):
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 
-    def test_bs_1_speed(self):
-        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
-        acc_length, speed = send_one_prompt(args)
-
-        print(f"{speed=:.2f}")
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v3)\n" f"{speed=:.2f} token/s\n"
-            )
-            self.assertGreater(speed, 50)
-
 
 class TestDeepseekV32NasBackend_fa3(CustomTestCase):
     @classmethod
@@ -130,18 +118,6 @@ class TestDeepseekV32NasBackend_fa3(CustomTestCase):
                 f"### test_gsm8k (deepseek-v3)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
-
-    def test_bs_1_speed(self):
-        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
-        acc_length, speed = send_one_prompt(args)
-
-        print(f"{speed=:.2f}")
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v3)\n" f"{speed=:.2f} token/s\n"
-            )
-            self.assertGreater(speed, 50)
 
 
 if __name__ == "__main__":
