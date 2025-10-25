@@ -1,5 +1,24 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+# Modeling from:
+# ./llama.py and
+# https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm4/modular_glm4.py
+"""Inference-only GLM-4.1V model compatible with HuggingFace weights."""
+
 import logging
-from functools import lru_cache, partial
+from functools import lru_cache
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -383,7 +402,6 @@ class Glm4vVisionModel(nn.Module):
     def __init__(
         self,
         vision_config: Glm4vVisionConfig,
-        norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -418,7 +436,7 @@ class Glm4vVisionModel(nn.Module):
                     num_heads=self.num_heads,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
-                    rms_norm_eps=norm_eps,
+                    rms_norm_eps=vision_config.rms_norm_eps,
                 )
                 for layer_idx in range(depth)
             ]
@@ -537,7 +555,6 @@ class Glm4vForConditionalGeneration(nn.Module):
         self.config = config
         self.visual = Glm4vVisionModel(
             config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-5),
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
         )
@@ -545,8 +562,8 @@ class Glm4vForConditionalGeneration(nn.Module):
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
 
         self.model = Glm4Model(
-            config,
-            quant_config,
+            config.text_config,
+            quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
 
@@ -624,14 +641,14 @@ class Glm4vForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
     ):
-        """Run forward pass for Qwen2_5-VL.
+        """Run forward pass for GLM-4.1V.
 
         Args:
             input_ids: Flattened (concatenated) input_ids corresponding to a
                 batch.
             positions: Flattened (concatenated) position ids corresponding to a
                 batch.
-                **NOTE**: If mrope is enabled (default setting for Qwen2-VL
+                **NOTE**: If mrope is enabled (default setting for GLM-4.1V
                 opensource models), the shape will be `(3, seq_len)`,
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
@@ -752,5 +769,15 @@ class Glm4vForConditionalGeneration(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        if self.config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            del self.lm_head.weight
+            self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 EntryClass = [Glm4vForConditionalGeneration]
