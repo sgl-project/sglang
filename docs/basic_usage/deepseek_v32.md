@@ -60,7 +60,7 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
   - B200: `flashmla_kv` prefill attention, `flashmla_kv` decode attention, `fp8_e4m3` kv cache dtype.
   - Currently we don't enable `prefill=flashmla_sparse` with `decode=flashmla_kv` due to latency caused by kv cache quantization operations. In the future we might shift to this setting after attention/quantization kernels are optimized.
 
-### Multi-token Prediction
+## Multi-token Prediction
 SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
 
 Example usage:
@@ -71,10 +71,10 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp
 - The default value of  `--max-running-requests` is set to `48` for MTP. For larger batch sizes, this value should be increased beyond the default value.
 
 
-# Function Calling and Reasoning Parser
+## Function Calling and Reasoning Parser
 The usage of function calling and reasoning parser is the same as DeepSeek V3.1. Please refer to [Reasoning Parser](https://docs.sglang.ai/advanced_features/separate_reasoning.html) and [Tool Parser](https://docs.sglang.ai/advanced_features/tool_parser.html) documents.
 
-# PD Disaggregation
+## PD Disaggregation
 
 Prefill Command:
 ```bash
