@@ -222,7 +222,7 @@ class DeepEPMoE(FusedMoE):
                     dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
                 )
             elif self.use_w4afp8:
-                return self.forward_cutlass_w4afp8_masked(dispatch_output)
+                output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
 
