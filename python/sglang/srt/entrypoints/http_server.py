@@ -1331,21 +1331,16 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    if server_args.tokenizer_worker_num > 1:
-        port_args = PortArgs.init_new(server_args)
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-            server_args=server_args, port_args=port_args
-        )
-    else:
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-            server_args=server_args,
-        )
+    tokenizer_manager, template_manager, scheduler_info, port_args = (
+        _launch_subprocesses(server_args=server_args)
+    )
 
-        if server_args.enable_trace:
-            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-            if server_args.disaggregation_mode == "null":
-                thread_label = "Tokenizer"
-                trace_set_thread_info(thread_label)
+    if server_args.enable_trace and server_args.tokenizer_worker_num == 1:
+        # TODO: merge this with the other case where tokenizer_worker_num > 1
+        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "null":
+            thread_label = "Tokenizer"
+            trace_set_thread_info(thread_label)
 
     set_global_state(
         _GlobalState(

@@ -100,8 +100,8 @@ class Engine(EngineBase):
         3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
-    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
-    2. Inter-process communication (IPC) is handled via the ZMQ library, with each process using a different port.
+    1. The HTTP server, Engine, and TokenizerManager both run in the main process.
+    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
 
     def __init__(self, **kwargs):
@@ -109,6 +109,8 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/server_args.py::ServerArgs`.
         Please refer to `ServerArgs` for the documentation.
         """
+
+        # Parse server_args
         if "server_args" in kwargs:
             # Directly load server_args
             server_args = kwargs["server_args"]
@@ -118,29 +120,28 @@ class Engine(EngineBase):
                 # Do not print logs by default
                 kwargs["log_level"] = "error"
             server_args = ServerArgs(**kwargs)
+        self.server_args = server_args
+        logger.info(f"{server_args=}")
 
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
-        # Allocate ports for inter-process communications
-        self.port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
-
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-            server_args=server_args,
-            port_args=self.port_args,
+        tokenizer_manager, template_manager, scheduler_info, port_args = (
+            _launch_subprocesses(server_args=server_args)
         )
-        self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
+        self.port_args = port_args
 
+        # Initialize ZMQ sockets
         context = zmq.Context(2)
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
 
+        # Enable tracing
         if server_args.enable_trace:
             process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
             if server_args.disaggregation_mode == "null":
@@ -672,15 +673,17 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if not server_args.enable_symm_mem:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
-    # flashinfer uses this environment variable for various kernels from MoE to quant kernels
+
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
+        # flashinfer uses this environment variable for various kernels from MoE to quant kernels
         os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
     if os.environ.get("CUTE_DSL_LOG_LEVEL") is None:
         # Default to warning level, to avoid too many logs
         os.environ["CUTE_DSL_LOG_LEVEL"] = "30"
+
     if os.environ.get("CUTE_DSL_LOG_TO_CONSOLE") is None:
         # Need to set log to console, otherwise the log level won't take effect
         os.environ["CUTE_DSL_LOG_TO_CONSOLE"] = "1"
