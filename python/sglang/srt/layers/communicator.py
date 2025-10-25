@@ -337,6 +337,7 @@ class LayerCommunicator:
         static_conditions_met = (
             (not self.is_last_layer)
             and (self._context.tp_size > 1)
+            and not is_dp_attention_enabled()
             and get_global_server_args().enable_flashinfer_allreduce_fusion
             and _is_flashinfer_available
         )
