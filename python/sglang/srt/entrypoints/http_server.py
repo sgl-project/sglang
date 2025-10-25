@@ -1335,13 +1335,6 @@ def launch_server(
         _launch_subprocesses(server_args=server_args)
     )
 
-    if server_args.enable_trace and server_args.tokenizer_worker_num == 1:
-        # TODO: merge this with the other case where tokenizer_worker_num > 1
-        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-        if server_args.disaggregation_mode == "null":
-            thread_label = "Tokenizer"
-            trace_set_thread_info(thread_label)
-
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
@@ -1350,13 +1343,14 @@ def launch_server(
         )
     )
 
-    if server_args.tokenizer_worker_num > 1:
-        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args,
-            server_args,
-            scheduler_info,
-        )
-    else:
+    if server_args.enable_trace and server_args.tokenizer_worker_num == 1:
+        # TODO: merge this with the other case where tokenizer_worker_num > 1
+        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "null":
+            thread_label = "Tokenizer"
+            trace_set_thread_info(thread_label)
+
+    if server_args.tokenizer_worker_num == 1:
         # Add api key authorization
         if server_args.api_key:
             add_api_key_middleware(app, server_args.api_key)
@@ -1377,6 +1371,12 @@ def launch_server(
             ),
         )
         app.warmup_thread = warmup_thread
+    else:
+        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+            port_args,
+            server_args,
+            scheduler_info,
+        )
 
     try:
         # Update logging configs
