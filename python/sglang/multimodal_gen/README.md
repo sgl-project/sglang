@@ -78,6 +78,6 @@ All contributions are welcome.
 
 We learnt and reused code from the following projects:
 
-- [FastVideo](https://github.com/hao-ai-lab/FastVideo.git)
-- [xDiT](https://github.com/xdit-project/xDiT)
-- [diffusers](https://github.com/huggingface/diffusers)
+- [FastVideo](https://github.com/hao-ai-lab/FastVideo.git). The major components of this repo are based on a fork of FastVide on Sept. 24, 2025.
+- [xDiT](https://github.com/xdit-project/xDiT). We used the a parallelism library from it.
+- [diffusers](https://github.com/huggingface/diffusers) We used the pipeline design from it.
