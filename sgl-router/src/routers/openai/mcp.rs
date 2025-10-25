@@ -16,7 +16,7 @@ use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use super::utils::event_types;
+use super::utils::{event_types, generate_id};
 use crate::{
     mcp::McpClientManager,
     protocols::responses::{ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
@@ -338,7 +338,7 @@ pub(super) fn build_resume_payload(
             input_array.push(user_item);
         }
         ResponseInput::Items(items) => {
-            // Items are already structured ResponseInputOutputItem, convert to JSON
+            // Items are ResponseInputOutputItem (including SimpleInputMessage), convert to JSON
             if let Ok(items_value) = to_value(items) {
                 if let Some(items_arr) = items_value.as_array() {
                     input_array.extend_from_slice(items_arr);
@@ -836,17 +836,6 @@ pub(super) fn build_incomplete_response(
 // Output Item Builders
 // ============================================================================
 
-/// Generate a unique ID for MCP output items (similar to OpenAI format)
-pub(super) fn generate_mcp_id(prefix: &str) -> String {
-    use rand::RngCore;
-    let mut rng = rand::rng();
-    // Generate exactly 50 hex characters (25 bytes) for the part after the underscore
-    let mut bytes = [0u8; 25];
-    rng.fill_bytes(&mut bytes);
-    let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("{}_{}", prefix, hex_string)
-}
-
 /// Build an mcp_list_tools output item
 pub(super) fn build_mcp_list_tools_item(mcp: &Arc<McpClientManager>, server_label: &str) -> Value {
     let tools = mcp.list_tools();
@@ -869,7 +858,7 @@ pub(super) fn build_mcp_list_tools_item(mcp: &Arc<McpClientManager>, server_labe
         .collect();
 
     json!({
-        "id": generate_mcp_id("mcpl"),
+        "id": generate_id("mcpl"),
         "type": event_types::ITEM_TYPE_MCP_LIST_TOOLS,
         "server_label": server_label,
         "tools": tools_json
@@ -886,7 +875,7 @@ pub(super) fn build_mcp_call_item(
     error: Option<&str>,
 ) -> Value {
     json!({
-        "id": generate_mcp_id("mcp"),
+        "id": generate_id("mcp"),
         "type": event_types::ITEM_TYPE_MCP_CALL,
         "status": if success { "completed" } else { "failed" },
         "approval_request_id": Value::Null,

@@ -13,8 +13,7 @@ from triton_kernels.matmul_ogs import (
     PrecisionConfig,
     matmul_ogs,
 )
-from triton_kernels.numerics import InFlexData, MicroscalingCtx
-from triton_kernels.quantization import downcast_to_mxfp
+from triton_kernels.numerics import InFlexData
 from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
 
@@ -26,30 +25,6 @@ if TYPE_CHECKING:
 def quantize(w, dtype, dev, **opt):
     if dtype == "bf16":
         return w.to(torch.bfloat16), InFlexData()
-    elif dtype == "fp8":
-        wq = w.to(torch.float8_e4m3fn).transpose(-1, -2).contiguous().transpose(-1, -2)
-        return (
-            wq,
-            InFlexData(dtype=wq.dtype, scale=w.abs().max().unsqueeze(0)),
-            MicroscalingCtx(),
-        )
-    else:
-        assert dtype == "mx4", f"{dtype=}"
-        swizzle_mx_scale = opt["swizzle_mx_scale"]
-        swizzle_axis = 2 if swizzle_mx_scale else None
-        w = w.to(torch.bfloat16)
-        w, mx_scales, weight_scale_shape = downcast_to_mxfp(
-            w, torch.uint8, axis=1, swizzle_axis=swizzle_axis
-        )
-        return (
-            w,
-            InFlexData(),
-            MicroscalingCtx(
-                weight_scale=mx_scales,
-                swizzle_mx=swizzle_mx_scale,
-                actual_weight_scale_shape=weight_scale_shape,
-            ),
-        )
 
 
 def triton_kernel_moe_forward(
@@ -72,7 +47,7 @@ def triton_kernel_moe_forward(
 
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    assert TopKOutputChecker.format_is_triton_kernel(topk_output)
+    assert TopKOutputChecker.format_is_triton_kernels(topk_output)
 
     routing_data, gather_idx, scatter_idx = topk_output
 
@@ -197,6 +172,7 @@ def triton_kernel_moe_with_bias_forward(
     b2: torch.Tensor,
     topk_output: TopKOutput,
     moe_runner_config: MoeRunnerConfig,
+    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
@@ -209,7 +185,7 @@ def triton_kernel_moe_with_bias_forward(
 ) -> torch.Tensor:
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    assert TopKOutputChecker.format_is_triton_kernel(topk_output)
+    assert TopKOutputChecker.format_is_triton_kernels(topk_output)
 
     routing_data, gather_idx, scatter_idx = topk_output
 
@@ -226,6 +202,7 @@ def triton_kernel_moe_with_bias_forward(
         scatter_indx=scatter_idx,
         inplace=False,  # triton kernel doesn't support inplace
         activation=moe_runner_config.activation,
+        apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         per_channel_quant=per_channel_quant,
         global_num_experts=global_num_experts,
@@ -253,6 +230,7 @@ def triton_kernel_fused_experts_with_bias(
     scatter_indx: ScatterIndx,
     inplace: bool = False,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
@@ -321,7 +299,7 @@ def triton_kernel_fused_experts_with_bias(
         routing_data,
         gather_indx=gather_indx,
         precision_config=w1_pcg,
-        gammas=None,
+        gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
         fused_activation=act,
     )
 
@@ -332,5 +310,5 @@ def triton_kernel_fused_experts_with_bias(
         routing_data,
         scatter_indx=scatter_indx,
         precision_config=w2_pcg,
-        gammas=routing_data.gate_scal,
+        gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
     )

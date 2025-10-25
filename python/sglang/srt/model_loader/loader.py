@@ -77,6 +77,7 @@ from sglang.srt.model_loader.utils import (
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -179,11 +180,12 @@ def _get_quantization_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
     packed_modules_mapping: Dict[str, List[str]],
+    remap_prefix: Dict[str, str] | None = None,
 ) -> Optional[QuantizationConfig]:
     """Get the quantization config."""
     if model_config.quantization is not None:
         quant_config = get_quant_config(
-            model_config, load_config, packed_modules_mapping
+            model_config, load_config, packed_modules_mapping, remap_prefix
         )
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
@@ -219,6 +221,7 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
+    remap_prefix = getattr(model_class, "remap_prefix", None)
     if _is_npu:
         packed_modules_mapping.update(
             {
@@ -242,12 +245,21 @@ def _initialize_model(
         )
 
     quant_config = _get_quantization_config(
-        model_config, load_config, packed_modules_mapping
+        model_config, load_config, packed_modules_mapping, remap_prefix
     )
-    return model_class(
-        config=model_config.hf_config,
-        quant_config=quant_config,
-    )
+
+    # Build kwargs conditionally
+    kwargs = {
+        "config": model_config.hf_config,
+        "quant_config": quant_config,
+    }
+
+    # Only add sparse head kwargs if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+    if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
+        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.value
+        kwargs["model_path"] = model_config.model_path
+
+    return model_class(**kwargs)
 
 
 class BaseModelLoader(ABC):
@@ -600,6 +612,8 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+                if _is_npu:
+                    torch.npu.empty_cache()
 
 
 class LayeredModelLoader(DefaultModelLoader):

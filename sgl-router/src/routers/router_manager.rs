@@ -18,8 +18,9 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::{ConnectionMode, RoutingMode},
-    core::{WorkerRegistry, WorkerType},
+    app_context::AppContext,
+    config::RoutingMode,
+    core::{ConnectionMode, WorkerRegistry, WorkerType},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -30,7 +31,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::RouterTrait,
-    server::{AppContext, ServerConfig},
+    server::ServerConfig,
 };
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -148,13 +149,13 @@ impl RouterManager {
             (ConnectionMode::Http, RoutingMode::OpenAI { .. }) => {
                 RouterId::new("http-openai".to_string())
             }
-            (ConnectionMode::Grpc, RoutingMode::Regular { .. }) => {
+            (ConnectionMode::Grpc { .. }, RoutingMode::Regular { .. }) => {
                 RouterId::new("grpc-regular".to_string())
             }
-            (ConnectionMode::Grpc, RoutingMode::PrefillDecode { .. }) => {
+            (ConnectionMode::Grpc { .. }, RoutingMode::PrefillDecode { .. }) => {
                 RouterId::new("grpc-pd".to_string())
             }
-            (ConnectionMode::Grpc, RoutingMode::OpenAI { .. }) => {
+            (ConnectionMode::Grpc { .. }, RoutingMode::OpenAI { .. }) => {
                 RouterId::new("grpc-regular".to_string())
             }
         }
@@ -410,7 +411,7 @@ impl RouterTrait for RouterManager {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let selected_model = body.model.as_deref().or(model_id);
+        let selected_model = model_id.or(Some(body.model.as_str()));
         let router = self.select_router_for_request(headers, selected_model);
 
         if let Some(router) = router {
@@ -434,14 +435,21 @@ impl RouterTrait for RouterManager {
 
     async fn list_response_input_items(
         &self,
-        _headers: Option<&HeaderMap>,
-        _response_id: &str,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "responses api not yet implemented in inference gateway mode",
-        )
-            .into_response()
+        // Delegate to the default router (typically http-regular)
+        // Response storage is shared across all routers via AppContext
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.list_response_input_items(headers, response_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to list response input items",
+            )
+                .into_response()
+        }
     }
 
     async fn get_response(
