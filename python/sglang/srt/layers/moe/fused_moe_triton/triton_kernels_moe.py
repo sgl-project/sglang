@@ -47,7 +47,7 @@ def triton_kernel_moe_forward(
 
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    assert TopKOutputChecker.format_is_triton_kernel(topk_output)
+    assert TopKOutputChecker.format_is_triton_kernels(topk_output)
 
     routing_data, gather_idx, scatter_idx = topk_output
 
@@ -172,6 +172,7 @@ def triton_kernel_moe_with_bias_forward(
     b2: torch.Tensor,
     topk_output: TopKOutput,
     moe_runner_config: MoeRunnerConfig,
+    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
@@ -184,7 +185,7 @@ def triton_kernel_moe_with_bias_forward(
 ) -> torch.Tensor:
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    assert TopKOutputChecker.format_is_triton_kernel(topk_output)
+    assert TopKOutputChecker.format_is_triton_kernels(topk_output)
 
     routing_data, gather_idx, scatter_idx = topk_output
 
@@ -201,6 +202,7 @@ def triton_kernel_moe_with_bias_forward(
         scatter_indx=scatter_idx,
         inplace=False,  # triton kernel doesn't support inplace
         activation=moe_runner_config.activation,
+        apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         per_channel_quant=per_channel_quant,
         global_num_experts=global_num_experts,
@@ -228,6 +230,7 @@ def triton_kernel_fused_experts_with_bias(
     scatter_indx: ScatterIndx,
     inplace: bool = False,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
@@ -296,7 +299,7 @@ def triton_kernel_fused_experts_with_bias(
         routing_data,
         gather_indx=gather_indx,
         precision_config=w1_pcg,
-        gammas=None,
+        gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
         fused_activation=act,
     )
 
@@ -307,5 +310,5 @@ def triton_kernel_fused_experts_with_bias(
         routing_data,
         scatter_indx=scatter_indx,
         precision_config=w2_pcg,
-        gammas=routing_data.gate_scal,
+        gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
     )

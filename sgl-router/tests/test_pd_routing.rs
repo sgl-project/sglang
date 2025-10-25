@@ -2,8 +2,9 @@
 mod test_pd_routing {
     use serde_json::json;
     use sglang_router_rs::{
-        config::{CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode},
-        core::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType},
+        app_context::AppContext,
+        config::{PolicyConfig, RouterConfig, RoutingMode},
+        core::{BasicWorkerBuilder, Worker, WorkerType},
         routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
     };
 
@@ -162,42 +163,24 @@ mod test_pd_routing {
         ];
 
         for (mode, policy) in test_cases {
-            let config = RouterConfig {
-                chat_template: None,
-                mode,
-                policy,
-                host: "127.0.0.1".to_string(),
-                port: 3001,
-                max_payload_size: 1024 * 1024,
-                request_timeout_secs: 60,
-                worker_startup_timeout_secs: 10,
-                worker_startup_check_interval_secs: 1,
-                dp_aware: false,
-                api_key: None,
-                discovery: None,
-                metrics: None,
-                log_dir: None,
-                log_level: None,
-                request_id_headers: None,
-                max_concurrent_requests: 64,
-                queue_size: 0,
-                queue_timeout_secs: 60,
-                cors_allowed_origins: vec![],
-                retry: RetryConfig::default(),
-                circuit_breaker: CircuitBreakerConfig::default(),
-                disable_retries: false,
-                disable_circuit_breaker: false,
-                health_check: sglang_router_rs::config::HealthCheckConfig::default(),
-                enable_igw: false,
-                rate_limit_tokens_per_second: None,
-                connection_mode: ConnectionMode::Http,
-                model_path: None,
-                tokenizer_path: None,
-                history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-                oracle: None,
-                reasoning_parser: None,
-                tool_call_parser: None,
-                tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
+            let config = match mode {
+                RoutingMode::PrefillDecode {
+                    prefill_urls,
+                    decode_urls,
+                    ..
+                } => RouterConfig::builder()
+                    .prefill_decode_mode(prefill_urls, decode_urls)
+                    .policy(policy)
+                    .host("127.0.0.1")
+                    .port(3001)
+                    .max_payload_size(1024 * 1024)
+                    .request_timeout_secs(60)
+                    .worker_startup_timeout_secs(10)
+                    .worker_startup_check_interval_secs(1)
+                    .max_concurrent_requests(64)
+                    .queue_timeout_secs(60)
+                    .build_unchecked(),
+                _ => panic!("Expected PrefillDecode mode"),
             };
 
             let app_context = {
@@ -239,22 +222,25 @@ mod test_pd_routing {
                 let worker_job_queue = Arc::new(OnceLock::new());
                 let workflow_engine = Arc::new(OnceLock::new());
 
-                Arc::new(sglang_router_rs::server::AppContext::new(
-                    config,
-                    client,
-                    rate_limiter,
-                    None, // tokenizer
-                    None, // reasoning_parser_factory
-                    None, // tool_parser_factory
-                    worker_registry,
-                    policy_registry,
-                    response_storage,
-                    conversation_storage,
-                    conversation_item_storage,
-                    load_monitor,
-                    worker_job_queue,
-                    workflow_engine,
-                ))
+                Arc::new(
+                    AppContext::builder()
+                        .router_config(config)
+                        .client(client)
+                        .rate_limiter(rate_limiter)
+                        .tokenizer(None) // tokenizer
+                        .reasoning_parser_factory(None) // reasoning_parser_factory
+                        .tool_parser_factory(None) // tool_parser_factory
+                        .worker_registry(worker_registry)
+                        .policy_registry(policy_registry)
+                        .response_storage(response_storage)
+                        .conversation_storage(conversation_storage)
+                        .conversation_item_storage(conversation_item_storage)
+                        .load_monitor(load_monitor)
+                        .worker_job_queue(worker_job_queue)
+                        .workflow_engine(workflow_engine)
+                        .build()
+                        .unwrap(),
+                )
             };
             let result = RouterFactory::create_router(&app_context).await;
             assert!(

@@ -18,6 +18,7 @@ use super::{
     responses::{self, BackgroundTaskInfo},
 };
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
     core::WorkerRegistry,
     data_connector::{
@@ -35,7 +36,6 @@ use crate::{
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::RouterTrait,
-    server::AppContext,
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
 };
