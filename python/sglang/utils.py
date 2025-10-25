@@ -373,25 +373,31 @@ def print_highlight(html_content: str):
 process_socket_map = weakref.WeakKeyDictionary()
 
 
-def reserve_port(host, start=30000, end=40000):
+def reserve_port(host="", start=30000, end=40000):
     """
     Reserve an available port by trying to bind a socket.
     Returns a tuple (port, lock_socket) where `lock_socket` is kept open to hold the lock.
     """
     candidates = list(range(start, end))
     random.shuffle(candidates)
+    rand_offset = (os.getpid() + int(time.time() * 1000000)) % len(candidates)
+    candidates = candidates[rand_offset:] + candidates[:rand_offset]
 
     for port in candidates:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             # Attempt to bind to the port on localhost
             sock.bind((host, port))
             return port, sock
         except socket.error:
             sock.close()  # Failed to bind, try next port
-            continue
-    raise RuntimeError("No free port available.")
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        try:
+            sock.bind((host, port))
+            return port, sock
+        except socket.error:
+            sock.close()  # Failed to bind, try next port
+    raise RuntimeError(f"No free port available in range {start}-{end}.")
 
 
 def release_port(lock_socket):

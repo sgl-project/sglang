@@ -93,6 +93,7 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.utils import release_port, reserve_port
 
 if TYPE_CHECKING:
     pass
@@ -691,29 +692,33 @@ def wait_port_available(
 
 def is_port_available(port):
     """Return whether a port is available."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("", port))
             s.listen(1)
             return True
-        except socket.error:
-            return False
-        except OverflowError:
-            return False
+    except OSError:
+        pass
+    except OverflowError:
+        return False
+    # Try IPv6 as fallback
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", port))
+            s.listen(1)
+            return True
+    except OSError:
+        return False
+    except OverflowError:
+        return False
 
 
 def get_free_port():
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+    port, lock_socket = reserve_port()
+    release_port(lock_socket)
+    return port
 
 
 def decode_video_base64(video_base64):

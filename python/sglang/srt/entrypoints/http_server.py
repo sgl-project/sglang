@@ -502,6 +502,7 @@ async def get_server_info():
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
+        "port_args": dataclasses.asdict(_global_state.tokenizer_manager.port_args),
         "internal_states": internal_states,
         "version": __version__,
     }
@@ -1331,6 +1332,7 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    port_args = None  # only used in multi-tokenizer mode
     if server_args.tokenizer_worker_num > 1:
         port_args = PortArgs.init_new(server_args)
         port_args.tokenizer_worker_ipc_name = (

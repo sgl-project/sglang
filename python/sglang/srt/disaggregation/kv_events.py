@@ -238,6 +238,7 @@ class ZmqEventPublisher(EventPublisher):
                 or self._endpoint.startswith("ipc://")
                 or self._endpoint.startswith("inproc://")
             ):
+                logger.debug(f"publisher_endpoint={self._endpoint}")
                 self._pub.bind(self._endpoint)
             else:
                 self._pub.connect(self._endpoint)
@@ -248,6 +249,7 @@ class ZmqEventPublisher(EventPublisher):
         # 3) works in our non‑blocking poll loop alongside PUB
         if self._replay_endpoint is not None:
             self._replay = self._ctx.socket(zmq.ROUTER)
+            logger.debug(f"replay_endpoint={self._replay_endpoint}")
             self._replay.bind(self._replay_endpoint)
 
     def _publisher_thread(self) -> None:
