@@ -250,6 +250,9 @@ class PiecewiseCudaGraphRunner:
                 lora_ids=None,
             )
 
+        # Attention backend
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
         with set_forward_context(forward_batch, self.attention_layers):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -374,9 +377,6 @@ class PiecewiseCudaGraphRunner:
 
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
-
-        # # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         # Run and capture
         def run_once():
