@@ -318,12 +318,48 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
 
+        capturing = torch.cuda.is_current_stream_capturing()
+
+        def debug_print(*args, **kwargs):
+            if not capturing:
+                print(*args, **kwargs)
+
+        debug_print(f"\n{'='*80}")
+        debug_print(f"[DEBUG draft_forward] ENTRY")
+        debug_print(
+            f"[DEBUG draft_forward] batch_size={forward_batch.batch_size}, topk={self.topk}, num_steps={self.speculative_num_steps}"
+        )
+        debug_print(
+            f"[DEBUG draft_forward] out_cache_loc (flat) shape={out_cache_loc.shape}"
+        )
+        debug_print(
+            f"[DEBUG draft_forward] out_cache_loc values[:20]={out_cache_loc[:min(20, len(out_cache_loc))]}"
+        )
+
         out_cache_loc = out_cache_loc.reshape(
             forward_batch.batch_size, self.topk, self.speculative_num_steps
         )
+        debug_print(
+            f"[DEBUG draft_forward] After reshape to (bs, topk, steps): shape={out_cache_loc.shape}"
+        )
+        if forward_batch.batch_size > 0:
+            debug_print(
+                f"[DEBUG draft_forward] out_cache_loc[0] (all topk/steps for seq 0):\n{out_cache_loc[0]}"
+            )
+
         out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
             self.speculative_num_steps, -1
         )
+        debug_print(
+            f"[DEBUG draft_forward] After permute to (steps, bs*topk): shape={out_cache_loc.shape}"
+        )
+        debug_print(
+            f"[DEBUG draft_forward] out_cache_loc[0] (step 0, all bs*topk)={out_cache_loc[0]}"
+        )
+        if out_cache_loc.shape[0] > 1:
+            debug_print(
+                f"[DEBUG draft_forward] out_cache_loc[1] (step 1, all bs*topk)={out_cache_loc[1]}"
+            )
 
         # Return values
         score_list: List[torch.Tensor] = []
@@ -332,9 +368,16 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
+        debug_print(
+            f"[DEBUG draft_forward] Starting {self.speculative_num_steps} forward steps\n"
+        )
         for i in range(self.speculative_num_steps):
+            debug_print(f"[DEBUG draft_forward] --- Step {i} ---")
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens_tmp(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            debug_print(
+                f"[DEBUG draft_forward] Step {i}: input_ids (selected tokens)={input_ids}"
             )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
@@ -342,12 +385,19 @@ class EagleDraftWorker(BaseDraftWorker):
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
+                debug_print(f"[DEBUG draft_forward] Skipping last forward pass\n")
                 break
 
             # Set inputs
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
+            debug_print(
+                f"[DEBUG draft_forward] Step {i}: out_cache_loc[{i}] (where to store KV)={out_cache_loc[i]}"
+            )
             forward_batch.positions.add_(1)
+            debug_print(
+                f"[DEBUG draft_forward] Step {i}: positions={forward_batch.positions}"
+            )
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
@@ -359,9 +409,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            debug_print(
+                f"[DEBUG draft_forward] Step {i}: After forward, topk_index={topk_index}"
+            )
+            debug_print(f"[DEBUG draft_forward] Step {i}: topk_p={topk_p}")
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            debug_print(f"[DEBUG draft_forward] Step {i} complete\n")
 
         # Organize the results
         score_list = torch.cat(score_list, dim=1).flatten(
