@@ -718,7 +718,7 @@ impl RouterConfigBuilder {
                 }
             })?;
             let mcp_config: crate::mcp::McpConfig =
-                serde_json::from_str(&contents).map_err(|e| ConfigError::ValidationFailed {
+                serde_yaml::from_str(&contents).map_err(|e| ConfigError::ValidationFailed {
                     reason: format!("Failed to parse MCP config from {}: {}", mcp_config_path, e),
                 })?;
             self.config.mcp_config = Some(mcp_config);

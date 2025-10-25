@@ -282,6 +282,7 @@ Create an MCP configuration file to define servers, transports, and connection s
 **Proxy Configuration** (`proxy`):
 - `http`/`https`: Proxy URLs for MCP server connections (not LLM traffic)
 - `no_proxy`: Comma-separated hosts to exclude from proxying (supports wildcards)
+- **Note**: Proxy settings are currently ignored for `streamable` transport. Use STDIO or SSE transports if proxy support is required.
 
 **Inventory Settings** (`inventory`):
 - `refresh_interval_secs`: Tool/prompt/resource inventory refresh interval (default: 300)

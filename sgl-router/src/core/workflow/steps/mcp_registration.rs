@@ -224,6 +224,6 @@ pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
                 Arc::new(RegisterMcpServerStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::ContinueNextStep), // Allow workflow to succeed even if registration fails
+            .with_failure_action(FailureAction::FailWorkflow), // Fail workflow if registration fails (server connected but not usable)
         )
 }
