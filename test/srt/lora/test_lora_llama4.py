@@ -16,7 +16,7 @@ MODELS = [
     ),
 ]
 
-
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestLlama4LoRA(CustomTestCase):
     @classmethod
     def setUpClass(cls):
