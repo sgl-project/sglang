@@ -1122,8 +1122,6 @@ class ServerArgs:
                     "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or auto."
                 )
 
-        # Validation logic for trtllm_mha moved to attention/attn_backend_support.py
-
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
                 "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
@@ -1334,8 +1332,6 @@ class ServerArgs:
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
-
-            # trtllm_mha speculative constraints are validated in attention/attn_backend_support.py
 
             if (
                 self.speculative_eagle_topk == 1
