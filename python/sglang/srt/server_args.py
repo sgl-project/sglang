@@ -472,6 +472,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
+    rl_on_policy_target: Optional[str] = None
     enable_deterministic_inference: bool = False
 
     # Dynamic batch tokenizer
@@ -1526,6 +1527,14 @@ class ServerArgs:
             )
 
     def _handle_deterministic_inference(self):
+        if self.rl_on_policy_target is not None:
+            logger.warning(
+                "Enable deterministic inference because of rl_on_policy_target."
+            )
+            self.enable_deterministic_inference = True
+            # TODO remove this environment variable as a whole
+            os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
+
         if self.enable_deterministic_inference:
             # Check sampling backend
             self.sampling_backend = "pytorch"
@@ -3300,6 +3309,13 @@ class ServerArgs:
         )
 
         # For deterministic inference
+        parser.add_argument(
+            "--rl-on-policy-target",
+            type=str,
+            default=ServerArgs.rl_on_policy_target,
+            choices=["fsdp"],
+            help="The training system that SGLang needs to match for true on-policy.",
+        )
         parser.add_argument(
             "--enable-deterministic-inference",
             action="store_true",

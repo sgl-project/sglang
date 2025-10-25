@@ -7,13 +7,11 @@ use reqwest::Client;
 use tracing::info;
 
 use crate::{
-    config::{HistoryBackend, RouterConfig},
+    config::RouterConfig,
     core::{workflow::WorkflowEngine, ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry},
     data_connector::{
-        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-        NoOpConversationStorage, NoOpResponseStorage, OracleConversationItemStorage,
-        OracleConversationStorage, OracleResponseStorage, SharedConversationItemStorage,
-        SharedConversationStorage, SharedResponseStorage,
+        create_storage, SharedConversationItemStorage, SharedConversationStorage,
+        SharedResponseStorage,
     },
     middleware::TokenBucket,
     policies::PolicyRegistry,
@@ -254,12 +252,7 @@ impl AppContextBuilder {
             .maybe_tool_parser_factory(&router_config)
             .with_worker_registry()
             .with_policy_registry(&router_config)
-            .with_response_storage(&router_config)
-            .await?
-            .with_conversation_storage(&router_config)
-            .await?
-            .with_conversation_item_storage(&router_config)
-            .await?
+            .with_storage(&router_config)?
             .with_load_monitor(&router_config)
             .with_worker_job_queue()
             .with_workflow_engine()
@@ -420,75 +413,15 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create response storage based on history_backend config
-    async fn with_response_storage(mut self, config: &RouterConfig) -> Result<Self, String> {
-        self.response_storage = Some(match config.history_backend {
-            HistoryBackend::Memory => {
-                info!("Initializing response storage: Memory");
-                Arc::new(MemoryResponseStorage::new())
-            }
-            HistoryBackend::None => {
-                info!("Initializing response storage: None (no persistence)");
-                Arc::new(NoOpResponseStorage::new())
-            }
-            HistoryBackend::Oracle => {
-                let oracle_cfg = config.oracle.clone().ok_or_else(|| {
-                    "oracle configuration is required when history_backend=oracle".to_string()
-                })?;
-                info!(
-                    "Initializing response storage: Oracle ATP (pool: {}-{})",
-                    oracle_cfg.pool_min, oracle_cfg.pool_max
-                );
-                Arc::new(OracleResponseStorage::new(oracle_cfg).map_err(|err| {
-                    format!("failed to initialize Oracle response storage: {err}")
-                })?)
-            }
-        });
-        Ok(self)
-    }
+    /// Create all storage backends using the factory function
+    fn with_storage(mut self, config: &RouterConfig) -> Result<Self, String> {
+        let (response_storage, conversation_storage, conversation_item_storage) =
+            create_storage(config)?;
 
-    /// Create conversation storage based on history_backend config
-    async fn with_conversation_storage(mut self, config: &RouterConfig) -> Result<Self, String> {
-        self.conversation_storage = Some(match config.history_backend {
-            HistoryBackend::Memory => Arc::new(MemoryConversationStorage::new()),
-            HistoryBackend::None => Arc::new(NoOpConversationStorage::new()),
-            HistoryBackend::Oracle => {
-                let oracle_cfg = config.oracle.clone().ok_or_else(|| {
-                    "oracle configuration is required when history_backend=oracle".to_string()
-                })?;
-                info!("Initializing conversation storage: Oracle ATP");
-                Arc::new(OracleConversationStorage::new(oracle_cfg).map_err(|err| {
-                    format!("failed to initialize Oracle conversation storage: {err}")
-                })?)
-            }
-        });
-        Ok(self)
-    }
+        self.response_storage = Some(response_storage);
+        self.conversation_storage = Some(conversation_storage);
+        self.conversation_item_storage = Some(conversation_item_storage);
 
-    /// Create conversation item storage based on history_backend config
-    async fn with_conversation_item_storage(
-        mut self,
-        config: &RouterConfig,
-    ) -> Result<Self, String> {
-        self.conversation_item_storage = Some(match config.history_backend {
-            HistoryBackend::Oracle => {
-                let oracle_cfg = config.oracle.clone().ok_or_else(|| {
-                    "oracle configuration is required when history_backend=oracle".to_string()
-                })?;
-                info!("Initializing conversation item storage: Oracle ATP");
-                Arc::new(OracleConversationItemStorage::new(oracle_cfg).map_err(|e| {
-                    format!("failed to initialize Oracle conversation item storage: {e}")
-                })?)
-            }
-            HistoryBackend::Memory => {
-                info!("Initializing conversation item storage: Memory");
-                Arc::new(MemoryConversationItemStorage::new())
-            }
-            HistoryBackend::None => {
-                info!("Initializing conversation item storage: Memory (no NoOp implementation available)");
-                Arc::new(MemoryConversationItemStorage::new())
-            }
-        });
         Ok(self)
     }
 
