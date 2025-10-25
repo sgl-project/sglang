@@ -228,6 +228,7 @@ class Envs:
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
     # Overlap Spec V2
+    SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # VLM
