@@ -1,7 +1,6 @@
 import ctypes
 import logging
 import os
-import platform
 import shutil
 from pathlib import Path
 
@@ -81,6 +80,8 @@ def _load_architecture_specific_ops():
     logger.debug(f"[sgl_kernel] Found files: {raw_matching_files}")
     logger.debug(f"[sgl_kernel] Prioritized files: {matching_files}")
 
+    previous_import_errors: List[Exception] = []
+
     # Try to load from the architecture-specific directory
     if matching_files:
         ops_path = Path(matching_files[0])  # Use the first prioritized file
@@ -102,6 +103,7 @@ def _load_architecture_specific_ops():
             return common_ops
 
         except Exception as e:
+            previous_import_errors.append(e)
             logger.debug(
                 f"[sgl_kernel] ✗ Failed to load from {ops_path}: {type(e).__name__}: {e}"
             )
@@ -138,6 +140,7 @@ def _load_architecture_specific_ops():
             return common_ops
 
         except Exception as e:
+            previous_import_errors.append(e)
             logger.debug(
                 f"[sgl_kernel] ✗ Failed to load fallback from {alt_path}: {type(e).__name__}: {e}"
             )
@@ -157,7 +160,12 @@ def _load_architecture_specific_ops():
         logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
         return common_ops
     except ImportError as e:
+        previous_import_errors.append(e)
         logger.debug(f"[sgl_kernel] ✗ Standard Python import failed: {e}")
+
+    attempt_error_msg = "\n".join(
+        f"- {type(err).__name__}: {err}" for err in previous_import_errors
+    )
 
     # All attempts failed
     error_msg = f"""
@@ -174,6 +182,9 @@ GPU Info:
 
 Please ensure sgl_kernel is properly installed with:
 pip install --upgrade sgl_kernel
+
+Error details from previous import attempts:
+{attempt_error_msg}
 """
     logger.debug(error_msg)
     raise ImportError(error_msg)
