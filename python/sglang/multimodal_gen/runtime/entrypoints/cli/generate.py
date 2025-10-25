@@ -22,6 +22,43 @@ from sglang.multimodal_gen.utils import FlexibleArgumentParser
 logger = init_logger(__name__)
 
 
+def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
+    """Add the arguments for the generate command."""
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="",
+        required=False,
+        help="Read CLI options from a config JSON or YAML file. If provided, --model-path and --prompt are optional.",
+    )
+
+    parser = ServerArgs.add_cli_args(parser)
+    parser = SamplingParams.add_cli_args(parser)
+
+    parser.add_argument(
+        "--text-encoder-configs",
+        action=RaiseNotImplementedAction,
+        help="JSON array of text encoder configurations (NOT YET IMPLEMENTED)",
+    )
+
+    return parser
+
+
+def generate_cmd(args: argparse.Namespace):
+    """The entry point for the generate command."""
+    # FIXME(mick): do not hard code
+    args.request_id = generate_request_id()
+
+    server_args = ServerArgs.from_cli_args(args)
+    sampling_params = SamplingParams.from_cli_args(args)
+    sampling_params.request_id = generate_request_id()
+    generator = DiffGenerator.from_pretrained(
+        model_path=server_args.model_path, server_args=server_args
+    )
+
+    generator.generate(prompt=sampling_params.prompt, sampling_params=sampling_params)
+
+
 class GenerateSubcommand(CLISubcommand):
     """The `generate` subcommand for the sgl-diffusion CLI"""
 
@@ -40,31 +77,7 @@ class GenerateSubcommand(CLISubcommand):
         return [field.name for field in dataclasses.fields(SamplingParams)]
 
     def cmd(self, args: argparse.Namespace) -> None:
-        excluded_args = ["subparser", "config", "dispatch_function"]
-
-        provided_args = {}
-        for k, v in vars(args).items():
-            if (
-                k not in excluded_args
-                and v is not None
-                and hasattr(args, "_provided")
-                and k in args._provided
-            ):
-                provided_args[k] = v
-        # FIXME(mick): do not hard code
-        args.request_id = generate_request_id()
-
-        server_args = ServerArgs.from_cli_args(args)
-        sampling_params = SamplingParams.from_cli_args(args)
-        sampling_params.request_id = generate_request_id()
-        generator = DiffGenerator.from_pretrained(
-            model_path=server_args.model_path, server_args=server_args
-        )
-
-        # Call generate_video - it handles both single and batch modes
-        generator.generate(
-            prompt=sampling_params.prompt, sampling_params=sampling_params
-        )
+        generate_cmd(args)
 
     def validate(self, args: argparse.Namespace) -> None:
         """Validate the arguments for this command"""
@@ -83,21 +96,6 @@ class GenerateSubcommand(CLISubcommand):
             usage="sgl_diffusion generate (--model-path MODEL_PATH_OR_ID --prompt PROMPT) | --config CONFIG_FILE [OPTIONS]",
         )
 
-        generate_parser.add_argument(
-            "--config",
-            type=str,
-            default="",
-            required=False,
-            help="Read CLI options from a config JSON or YAML file. If provided, --model-path and --prompt are optional.",
-        )
-
-        generate_parser = ServerArgs.add_cli_args(generate_parser)
-        generate_parser = SamplingParams.add_cli_args(generate_parser)
-
-        generate_parser.add_argument(
-            "--text-encoder-configs",
-            action=RaiseNotImplementedAction,
-            help="JSON array of text encoder configurations (NOT YET IMPLEMENTED)",
-        )
+        generate_parser = add_multimodal_gen_generate_args(generate_parser)
 
         return cast(FlexibleArgumentParser, generate_parser)

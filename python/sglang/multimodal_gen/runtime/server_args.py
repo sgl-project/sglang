@@ -6,11 +6,12 @@ import dataclasses
 import inspect
 import json
 import random
+import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from sglang.multimodal_gen.api.configs.configs import PreprocessConfig
 from sglang.multimodal_gen.api.configs.pipelines import FluxPipelineConfig
@@ -18,7 +19,6 @@ from sglang.multimodal_gen.api.configs.pipelines.base import PipelineConfig, STA
 from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
     QwenImagePipelineConfig,
 )
-from sglang.multimodal_gen.api.configs.utils import clean_cli_args
 from sglang.multimodal_gen.runtime.distributed.parallel_state import HAS_LONG_CTX_ATTN
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -664,57 +664,62 @@ class ServerArgs:
         self.port = self.settle_port(self.port)
 
     @classmethod
-    def from_cli_args(cls, args: argparse.Namespace) -> "ServerArgs":
-        provided_args = clean_cli_args(args)
-        # Get all fields from the dataclass
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+    def from_cli_args(
+        cls, args: argparse.Namespace, unknown_args: list[str] | None = None
+    ) -> "ServerArgs":
+        if unknown_args is None:
+            unknown_args = []
+        provided_args = cls.get_provided_args(args, unknown_args)
 
-        # Create a dictionary of attribute values, with defaults for missing attributes
-        kwargs: dict[str, Any] = {}
+        # Handle config file
+        config_file = provided_args.get("config")
+        if config_file:
+            config_args = cls.load_config_file(config_file)
+            # Provided args override config file args
+            provided_args = {**config_args, **provided_args}
+
+        # Handle special cases
+        if "tp_size" in provided_args:
+            provided_args["tp"] = provided_args.pop("tp_size")
+
+        return cls.from_dict(provided_args)
+
+    @classmethod
+    def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
+        """Create a ServerArgs object from a dictionary."""
+        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        server_args_kwargs: dict[str, Any] = {}
+
         for attr in attrs:
             if attr == "pipeline_config":
-                pipeline_config = PipelineConfig.from_kwargs(provided_args)
-                kwargs["pipeline_config"] = pipeline_config
+                pipeline_config = PipelineConfig.from_kwargs(kwargs)
+                server_args_kwargs["pipeline_config"] = pipeline_config
             elif attr == "preprocess_config":
-                preprocess_config = PreprocessConfig.from_kwargs(provided_args)
-                kwargs["preprocess_config"] = preprocess_config
-            elif attr == "mode":
-                # Convert string to ExecutionMode enum
-                mode_value = getattr(args, attr, ServerArgs.mode.value)
-                kwargs["mode"] = (
-                    ExecutionMode.from_string(mode_value)
-                    if isinstance(mode_value, str)
-                    else mode_value
-                )
-            elif attr == "workload_type":
-                # Convert string to WorkloadType enum
-                workload_type_value = getattr(
-                    args, "workload_type", ServerArgs.workload_type.value
-                )
-                kwargs["workload_type"] = (
-                    WorkloadType.from_string(workload_type_value)
-                    if isinstance(workload_type_value, str)
-                    else workload_type_value
-                )
-            # Use getattr with default value from the dataclass for potentially missing attributes
-            else:
-                # Get the field to check if it has a default_factory
-                field = dataclasses.fields(cls)[
-                    next(
-                        i
-                        for i, f in enumerate(dataclasses.fields(cls))
-                        if f.name == attr
-                    )
-                ]
-                if field.default_factory is not dataclasses.MISSING:
-                    # Use the default_factory to create the default value
-                    default_value = field.default_factory()
-                else:
-                    default_value = getattr(cls, attr, None)
-                value = getattr(args, attr, default_value)
-                kwargs[attr] = value  # type: ignore
+                preprocess_config = PreprocessConfig.from_kwargs(kwargs)
+                server_args_kwargs["preprocess_config"] = preprocess_config
+            elif attr in kwargs:
+                server_args_kwargs[attr] = kwargs[attr]
 
-        return cls(**kwargs)  # type: ignore
+        return cls(**server_args_kwargs)
+
+    @staticmethod
+    def load_config_file(config_file: str) -> dict[str, Any]:
+        """Load a config file."""
+        if config_file.endswith(".json"):
+            with open(config_file, "r") as f:
+                return json.load(f)
+        elif config_file.endswith((".yaml", ".yml")):
+            try:
+                import yaml
+            except ImportError:
+                raise ImportError(
+                    "Please install PyYAML to use YAML config files. "
+                    "`pip install pyyaml`"
+                )
+            with open(config_file, "r") as f:
+                return yaml.safe_load(f)
+        else:
+            raise ValueError(f"Unsupported config file format: {config_file}")
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
@@ -729,6 +734,32 @@ class ServerArgs:
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         kwargs["preprocess_config"] = PreprocessConfig.from_kwargs(kwargs)
         return cls(**kwargs)
+
+    @staticmethod
+    def get_provided_args(
+        args: argparse.Namespace, unknown_args: list[str]
+    ) -> dict[str, Any]:
+        """Get the arguments provided by the user."""
+        provided_args = {}
+        # We need to check against the raw command-line arguments to see what was
+        # explicitly provided by the user, vs. what's a default value from argparse.
+        raw_argv = sys.argv + unknown_args
+
+        # Create a set of argument names that were present on the command line.
+        # This handles both styles: '--arg=value' and '--arg value'.
+        provided_arg_names = set()
+        for arg in raw_argv:
+            if arg.startswith("--"):
+                # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
+                arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
+                provided_arg_names.add(arg_name)
+
+        # Populate provided_args if the argument from the namespace was on the command line.
+        for k, v in vars(args).items():
+            if k in provided_arg_names:
+                provided_args[k] = v
+
+        return provided_args
 
     def check_server_sp_args(self):
 

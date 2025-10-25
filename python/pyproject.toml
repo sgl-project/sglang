@@ -80,22 +80,17 @@ dependencies = [
 modelopt = ["nvidia-modelopt"]
 diffusion = [
 "diffusers==0.35.2",
-"accelerate==1.0.1",
-"yunchang",
+"yunchang==0.6.3.post1",
 "opencv-python==4.10.0.84",
 "imageio==2.36.0",
 "imageio-ffmpeg==0.5.1",
-"wandb>=0.21.0",
-"loguru",
 "PyYAML==6.0.1",
-"gradio==5.41.0",
 "moviepy>=2.0.0",
-"flask",
-"flask_restful",
 "cloudpickle",
 "remote-pdb",
 "torchcodec==0.5.0",
 ]
+
 test = [
 "accelerate",
 "expecttest",

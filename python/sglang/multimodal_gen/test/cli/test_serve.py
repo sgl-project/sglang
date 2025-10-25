@@ -35,7 +35,7 @@ class TestVideoHttpServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_command = [
-            "sgl-diffusion",
+            "sglang",
             "serve",
             "--model-path",
             "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
@@ -111,7 +111,7 @@ class TestImageHttpServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_command = [
-            "sgl-diffusion",
+            "sglang",
             "serve",
             "--model-path",
             "Qwen/Qwen-Image",

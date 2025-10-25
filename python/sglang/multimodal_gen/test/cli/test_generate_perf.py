@@ -22,7 +22,7 @@ class TestGenerateBase(TestCLIBase):
     output_path: str = "outputs"
 
     base_command = [
-        "sgl-diffusion",
+        "sglang",
         "generate",
         "--text-encoder-cpu-offload",
         "--pin-cpu-memory",

@@ -43,7 +43,7 @@ class TestGenerate(TestCLIBase):
 
     def test_generate_multiple_outputs(self):
         command = [
-            "sgl-diffusion",
+            "sglang",
             "generate",
             "--prompt='A curious raccoon'",
             "--output-path=outputs",
@@ -80,7 +80,7 @@ class TestWanGenerate(TestGenerate):
 
     def test_generate_multiple_outputs(self):
         command = [
-            "sgl-diffusion",
+            "sglang",
             "generate",
             "--prompt='A curious raccoon'",
             "--output-path=outputs",
