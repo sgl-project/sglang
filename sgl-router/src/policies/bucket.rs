@@ -171,6 +171,10 @@ impl LoadBalancingPolicy for BucketPolicy {
         "bucket"
     }
 
+    fn needs_request_text(&self) -> bool {
+        true // Bucket policy needs request text
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

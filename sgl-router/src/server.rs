@@ -750,6 +750,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.mode
     );
 
+    let router_manager = RouterManager::from_config(&config, &app_context).await?;
+
     // Submit worker initialization job to queue
     let job_queue = app_context
         .worker_job_queue
@@ -769,7 +771,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         worker_stats.total_workers, worker_stats.healthy_workers
     );
 
-    let router_manager = RouterManager::from_config(&config, &app_context).await?;
     let router: Arc<dyn RouterTrait> = router_manager.clone();
 
     let _health_checker = app_context

@@ -371,19 +371,6 @@ impl PolicyRegistry {
                 }
             }
         }
-        if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
-            if prefill_policy.name() == "bucket" {
-                if let Some(bucket) = prefill_policy.as_any().downcast_ref::<BucketPolicy>() {
-                    if !prefill_workers.is_empty() {
-                        debug!(
-                            "Initializing prefill bucket policy with {} workers",
-                            prefill_workers.len()
-                        );
-                        bucket.init_prefill_worker_urls(prefill_workers);
-                    }
-                }
-            }
-        }
 
         // Initialize decode policy if it's cache-aware
         if let Some(decode_policy) = self.decode_policy.read().unwrap().as_ref() {
@@ -396,6 +383,26 @@ impl PolicyRegistry {
                             decode_workers.len()
                         );
                         cache_aware.init_workers(decode_workers);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn init_pd_bucket_policies(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+    ) {
+        // Initialize prefill policy if it's bucket
+        if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
+            if prefill_policy.name() == "bucket" {
+                if let Some(bucket) = prefill_policy.as_any().downcast_ref::<BucketPolicy>() {
+                    if !prefill_workers.is_empty() {
+                        debug!(
+                            "Initializing prefill bucket policy with {} workers",
+                            prefill_workers.len()
+                        );
+                        bucket.init_prefill_worker_urls(prefill_workers);
                     }
                 }
             }
