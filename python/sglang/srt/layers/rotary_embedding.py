@@ -1194,10 +1194,11 @@ def _triton_mrope_forward(
         q_tile_1 = tl.load(q_ptr + even_q_offsets, mask=even_q_mask, other=0).to(
             sin_row.dtype
         )
-        q_tile_2 = tl.load(q_ptr + odd_q_offsets, mask=odd_q_mask, other=0).to(
+        k_tile_1 = tl.load(k_ptr + even_k_offsets, mask=even_k_mask, other=0).to(
             sin_row.dtype
         )
-        k_tile_1 = tl.load(k_ptr + even_k_offsets, mask=even_k_mask, other=0).to(
+
+        q_tile_2 = tl.load(q_ptr + odd_q_offsets, mask=odd_q_mask, other=0).to(
             sin_row.dtype
         )
         k_tile_2 = tl.load(k_ptr + odd_k_offsets, mask=odd_k_mask, other=0).to(
