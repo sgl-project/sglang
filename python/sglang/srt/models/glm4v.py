@@ -14,7 +14,7 @@
 
 # Modeling from:
 # ./llama.py and
-# https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm4/modular_glm4.py
+# https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm4v/modular_glm4v.py
 """Inference-only GLM-4.1V model compatible with HuggingFace weights."""
 
 import logging
@@ -562,7 +562,7 @@ class Glm4vForConditionalGeneration(nn.Module):
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
 
         self.model = Glm4Model(
-            config.text_config,
+            config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
