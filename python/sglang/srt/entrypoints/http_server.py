@@ -1333,9 +1333,6 @@ def launch_server(
     """
     if server_args.tokenizer_worker_num > 1:
         port_args = PortArgs.init_new(server_args)
-        port_args.tokenizer_worker_ipc_name = (
-            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        )
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args, port_args=port_args
         )
