@@ -127,11 +127,9 @@ class MiniMaxM2MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         quant_config: Optional[QuantizationConfig] = None,
-        layer_idx: int = True,
         prefix: str = "mlp",
     ) -> None:
         super().__init__()
-        self.layer_idx = layer_idx
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -853,9 +851,6 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
-                # if is_pp_missing_parameter(name, self):
-                #     continue
-
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -866,9 +861,6 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-
-                    # if is_pp_missing_parameter(name, self):
-                    #     continue
 
                     param = params_dict[name]
                     weight_loader = param.weight_loader
@@ -889,9 +881,6 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
-
-                    # if is_pp_missing_parameter(name, self):
-                    #     continue
 
                     param = params_dict[name]
                     weight_loader = getattr(
