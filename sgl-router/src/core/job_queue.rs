@@ -20,6 +20,7 @@ use crate::{
         steps::{McpServerConfigRequest, WorkerRemovalRequest},
         WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus,
     },
+    mcp::McpConfig,
     metrics::RouterMetrics,
     protocols::worker_spec::{JobStatus, WorkerConfigRequest},
 };
@@ -30,6 +31,7 @@ pub enum Job {
     AddWorker { config: Box<WorkerConfigRequest> },
     RemoveWorker { url: String },
     InitializeWorkersFromConfig { router_config: Box<RouterConfig> },
+    InitializeMcpServers { mcp_config: Box<McpConfig> },
     RegisterMcpServer { config: Box<McpServerConfigRequest> },
     RefreshMcpInventory { server_name: String },
 }
@@ -41,6 +43,7 @@ impl Job {
             Job::AddWorker { .. } => "AddWorker",
             Job::RemoveWorker { .. } => "RemoveWorker",
             Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
+            Job::InitializeMcpServers { .. } => "InitializeMcpServers",
             Job::RegisterMcpServer { .. } => "RegisterMcpServer",
             Job::RefreshMcpInventory { .. } => "RefreshMcpInventory",
         }
@@ -52,6 +55,7 @@ impl Job {
             Job::AddWorker { config } => &config.url,
             Job::RemoveWorker { url } => url,
             Job::InitializeWorkersFromConfig { .. } => "startup",
+            Job::InitializeMcpServers { .. } => "startup",
             Job::RegisterMcpServer { config } => &config.name,
             Job::RefreshMcpInventory { server_name } => server_name,
         }
@@ -426,6 +430,40 @@ impl JobQueue {
                 }
 
                 Ok(format!("Submitted {} AddWorker jobs", worker_count))
+            }
+            Job::InitializeMcpServers { mcp_config } => {
+                let mut server_count = 0;
+
+                debug!(
+                    "Creating RegisterMcpServer jobs for {} MCP servers from config",
+                    mcp_config.servers.len()
+                );
+
+                // Submit RegisterMcpServer jobs for each server in the config
+                for server_config in &mcp_config.servers {
+                    let mcp_server_request = McpServerConfigRequest {
+                        name: server_config.name.clone(),
+                        config: server_config.clone(),
+                    };
+
+                    let job = Job::RegisterMcpServer {
+                        config: Box::new(mcp_server_request),
+                    };
+
+                    if let Some(queue) = context.worker_job_queue.get() {
+                        queue.submit(job).await.map_err(|e| {
+                            format!(
+                                "Failed to submit RegisterMcpServer job for '{}': {}",
+                                server_config.name, e
+                            )
+                        })?;
+                        server_count += 1;
+                    } else {
+                        return Err("JobQueue not available".to_string());
+                    }
+                }
+
+                Ok(format!("Submitted {} RegisterMcpServer jobs", server_count))
             }
             Job::RegisterMcpServer { config } => {
                 let engine = context

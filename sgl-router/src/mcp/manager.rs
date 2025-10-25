@@ -100,12 +100,7 @@ impl McpManager {
                 Ok(client) => {
                     let client_arc = Arc::new(client);
                     // Load inventory for this server
-                    Self::load_server_inventory_static(
-                        &inventory,
-                        &server_config.name,
-                        &client_arc,
-                    )
-                        .await;
+                    Self::load_server_inventory(&inventory, &server_config.name, &client_arc).await;
                     clients.insert(server_config.name.clone(), client_arc);
                     info!("Connected to static server '{}'", server_config.name);
                 }
@@ -139,7 +134,7 @@ impl McpManager {
             Duration::from_secs(300),
             100,
         )
-            .await
+        .await
     }
 
     // ========================================================================
@@ -351,7 +346,8 @@ impl McpManager {
             .ok_or_else(|| McpError::ServerNotFound(server_name.to_string()))?;
 
         info!("Refreshing inventory for server: {}", server_name);
-        self.load_server_inventory(server_name, &client).await;
+        self.load_server_inventory_internal(server_name, &client)
+            .await;
         Ok(())
     }
 
@@ -509,7 +505,11 @@ impl McpManager {
     // ========================================================================
 
     /// Static helper for loading inventory (for new())
-    async fn load_server_inventory_static(
+    /// Discover and cache tools/prompts/resources for a connected server
+    ///
+    /// This method is public to allow workflow-based inventory loading.
+    /// It discovers all tools, prompts, and resources from the client and caches them in the inventory.
+    pub async fn load_server_inventory(
         inventory: &Arc<ToolInventory>,
         server_name: &str,
         client: &Arc<McpClient>,
@@ -576,8 +576,8 @@ impl McpManager {
         inventory.mark_refreshed(server_name);
     }
 
-    /// Discover and cache tools/prompts/resources for a connected server
-    async fn load_server_inventory(&self, server_name: &str, client: &McpClient) {
+    /// Discover and cache tools/prompts/resources for a connected server (internal wrapper)
+    async fn load_server_inventory_internal(&self, server_name: &str, client: &McpClient) {
         // Tools
         match client.peer().list_all_tools().await {
             Ok(ts) => {
@@ -652,8 +652,11 @@ impl McpManager {
     // Connection Logic (from client_manager.rs)
     // ========================================================================
 
-    /// Connect to a single MCP server with retry logic for remote transports
-    async fn connect_server(
+    /// Connect to an MCP server
+    ///
+    /// This method is public to allow workflow-based server registration at runtime.
+    /// It handles connection with automatic retry for network-based transports (SSE/Streamable).
+    pub async fn connect_server(
         config: &McpServerConfig,
         global_proxy: Option<&McpProxyConfig>,
     ) -> McpResult<McpClient> {
@@ -696,7 +699,7 @@ impl McpManager {
                 }
             }
         })
-            .await
+        .await
     }
 
     /// Determine if an error is permanent (should not retry) or transient
@@ -740,7 +743,7 @@ impl McpManager {
                             .stderr(std::process::Stdio::inherit());
                     }),
                 )
-                    .map_err(|e| McpError::Transport(format!("create stdio transport: {}", e)))?;
+                .map_err(|e| McpError::Transport(format!("create stdio transport: {}", e)))?;
 
                 let client = ().serve(transport).await.map_err(|e| {
                     McpError::ConnectionFailed(format!("initialize stdio client: {}", e))
@@ -878,8 +881,8 @@ mod tests {
             Duration::from_secs(300),
             100,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert_eq!(manager.list_static_servers().len(), 0);
     }
 }

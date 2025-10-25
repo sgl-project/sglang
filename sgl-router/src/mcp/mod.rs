@@ -7,11 +7,11 @@
 // - Resources: File/data access with subscription support
 // - OAuth: Secure authentication for remote servers
 
-pub mod manager;
 pub mod config;
 pub mod connection_pool;
 pub mod error;
 pub mod inventory;
+pub mod manager;
 pub mod oauth;
 pub mod proxy;
 

@@ -8,12 +8,7 @@ use tracing::info;
 
 use crate::{
     config::RouterConfig,
-    core::{
-        workflow::{steps::McpServerConfigRequest, WorkflowEngine},
-        ConnectionMode,
-        Job::RegisterMcpServer,
-        JobQueue, LoadMonitor, WorkerRegistry,
-    },
+    core::{workflow::WorkflowEngine, ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry},
     data_connector::{
         create_storage, SharedConversationItemStorage, SharedConversationStorage,
         SharedResponseStorage,
@@ -99,59 +94,6 @@ impl AppContext {
             .await?
             .build()
             .map_err(|e| e.to_string())
-    }
-
-    /// Register MCP servers from config
-    /// Submits MCP server registration jobs to the workflow queue
-    pub async fn register_mcp_servers(&self) -> Result<(), String> {
-        use tracing::{info, warn};
-
-        // Get the MCP config from router config
-        let Some(mcp_config) = &self.router_config.mcp_config else {
-            return Ok(());
-        };
-
-        // Get the job queue
-        let job_queue = self
-            .worker_job_queue
-            .get()
-            .ok_or("Worker job queue not initialized")?;
-
-        info!("Found {} MCP server(s) in config", mcp_config.servers.len());
-
-        // Submit registration jobs for each MCP server
-        for server_config in &mcp_config.servers {
-            let server_name = server_config.name.clone();
-            let is_required = server_config.required;
-
-            let job = RegisterMcpServer {
-                config: Box::new(McpServerConfigRequest {
-                    name: server_name.clone(),
-                    config: server_config.clone(),
-                }),
-            };
-
-            match job_queue.submit(job).await {
-                Ok(_) => {
-                    info!("Submitted MCP registration job for '{}'", server_name);
-                }
-                Err(e) => {
-                    if is_required {
-                        return Err(format!(
-                            "Failed to submit required MCP server '{}': {}",
-                            server_name, e
-                        ));
-                    } else {
-                        warn!(
-                            "Failed to submit optional MCP server '{}': {}",
-                            server_name, e
-                        );
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -326,7 +268,8 @@ impl AppContextBuilder {
             .with_load_monitor(&router_config)
             .with_worker_job_queue()
             .with_workflow_engine()
-            .with_mcp_manager()
+            .with_mcp_manager(&router_config)
+            .await?
             .router_config(router_config))
     }
 
@@ -529,10 +472,36 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create MCP manager OnceLock container
-    fn with_mcp_manager(mut self) -> Self {
-        self.mcp_manager = Some(Arc::new(OnceLock::new()));
-        self
+    /// Create and initialize MCP manager with empty config
+    ///
+    /// This initializes the MCP manager with an empty config and default settings.
+    /// MCP servers will be registered later via the InitializeMcpServers job.
+    async fn with_mcp_manager(mut self, _router_config: &RouterConfig) -> Result<Self, String> {
+        // Create OnceLock container
+        let mcp_manager_lock = Arc::new(OnceLock::new());
+
+        // Always create with empty config and defaults
+        info!("Initializing MCP manager with empty config and default settings (5 min TTL, 100 max connections)");
+
+        let empty_config = crate::mcp::McpConfig {
+            servers: Vec::new(),
+            pool: Default::default(),
+            proxy: None,
+            warmup: Vec::new(),
+            inventory: Default::default(),
+        };
+
+        let manager = McpManager::with_defaults(empty_config)
+            .await
+            .map_err(|e| format!("Failed to initialize MCP manager with defaults: {}", e))?;
+
+        // Store the initialized manager in the OnceLock
+        mcp_manager_lock
+            .set(Arc::new(manager))
+            .map_err(|_| "Failed to set MCP manager in OnceLock".to_string())?;
+
+        self.mcp_manager = Some(mcp_manager_lock);
+        Ok(self)
     }
 }
 

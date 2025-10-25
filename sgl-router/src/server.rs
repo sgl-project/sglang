@@ -746,14 +746,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .expect("WorkflowEngine should only be initialized once");
     info!("Workflow engine initialized with worker and MCP registration workflows");
 
-    // Initialize MCP manager with default settings (5 min TTL, 100 max connections)
-    let mcp_manager = Arc::new(crate::mcp::McpManager::with_defaults());
-    app_context
-        .mcp_manager
-        .set(mcp_manager)
-        .expect("McpManager should only be initialized once");
-    info!("MCP manager initialized with default settings");
-
     info!(
         "Initializing workers for routing mode: {:?}",
         config.router_config.mode
@@ -772,8 +764,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await
         .map_err(|e| format!("Failed to submit worker initialization job: {}", e))?;
 
-    // Register MCP servers from config (if provided)
-    app_context.register_mcp_servers().await?;
+    if let Some(mcp_config) = &config.router_config.mcp_config {
+        info!("Found {} MCP server(s) in config", mcp_config.servers.len());
+        let mcp_job = Job::InitializeMcpServers {
+            mcp_config: Box::new(mcp_config.clone()),
+        };
+        job_queue
+            .submit(mcp_job)
+            .await
+            .map_err(|e| format!("Failed to submit MCP initialization job: {}", e))?;
+    } else {
+        info!("No MCP config provided, skipping MCP server initialization");
+    }
 
     // Start background refresh for all registered static MCP servers
     if let Some(mcp_manager) = app_context.mcp_manager.get() {
