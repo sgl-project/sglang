@@ -165,6 +165,7 @@ async def init_multi_tokenizer() -> ServerArgs:
         server_args.api_key is None
     ), "API key is not supported in multi-tokenizer mode"
 
+    # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
@@ -184,6 +185,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
@@ -197,7 +199,19 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    server_args = fast_api_app.server_args
+    if getattr(fast_api_app, "is_single_tokenizer_mode", False):
+        server_args = fast_api_app.server_args
+        warmup_thread_args = fast_api_app.warmup_thread_args
+        thread_label = "Tokenizer"
+    else:
+        # Initialize multi-tokenizer support for worker processes
+        server_args = await init_multi_tokenizer()
+        warmup_thread_args = (
+            server_args,
+            None,
+            None,
+        )
+        thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
     # Add api key authorization
     if server_args.api_key:
@@ -211,10 +225,6 @@ async def lifespan(fast_api_app: FastAPI):
     # Init tracing
     if server_args.enable_trace:
         process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-        if server_args.tokenizer_worker_num == 1:
-            thread_label = "Tokenizer"
-        else:
-            thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
         if server_args.disaggregation_mode == "null":
             trace_set_thread_info(thread_label)
 
@@ -284,7 +294,7 @@ async def lifespan(fast_api_app: FastAPI):
     # Execute the general warmup
     warmup_thread = threading.Thread(
         target=_wait_and_warmup,
-        args=fast_api_app.warmup_thread_args,
+        args=warmup_thread_args,
     )
     warmup_thread.start()
 
@@ -1336,22 +1346,24 @@ def launch_server(
         )
     )
 
-    # Set warmup thread arguments, the thread will be launched in the lifespan function.
+    # Pass additional arguments to the lifespan function.
+    # They will be used for additional initialization setups.
     if server_args.tokenizer_worker_num == 1:
-        warmup_thread_args = (
+        # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
+        app.is_single_tokenizer_mode = True
+        app.server_args = server_args
+        app.warmup_thread_args = (
             server_args,
             pipe_finish_writer,
             launch_callback,
         )
     else:
-        warmup_thread_args = (server_args, None, None)
+        # If it is multi-tokenizer mode, we need to write the arguments to shared memory
+        # for other worker processes to read.
+        app.is_single_tokenizer_mode = False
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args,
-            server_args,
-            scheduler_info,
+            port_args, server_args, scheduler_info
         )
-    app.server_args = server_args
-    app.warmup_thread_args = warmup_thread_args
 
     try:
         # Update logging configs
