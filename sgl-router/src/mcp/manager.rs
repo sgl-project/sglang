@@ -14,10 +14,12 @@ use std::{sync::Arc, time::Duration};
 use dashmap::DashMap;
 
 use crate::mcp::{
-    client_manager::McpClientManager, connection_pool::McpConnectionPool, error::McpResult,
+    client_manager::McpClientManager,
+    connection_pool::McpConnectionPool,
+    error::McpResult,
     inventory::ToolInventory,
+    McpTransport::{Sse, Stdio, Streamable},
 };
-use crate::mcp::McpTransport::{Streamable, Stdio, Sse};
 
 /// Unified MCP manager handling both static and dynamic servers
 ///

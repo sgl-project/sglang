@@ -223,6 +223,7 @@ async fn route_responses_internal(
 
     // 2. Check if request has MCP tools - if so, use tool loop
     let responses_response = if let Some(tools) = &request.tools {
+        // TODO migrate mcp client to use connection pool and injected mcp manager
         if let Some(mcp_manager) = create_mcp_manager_from_request(tools).await {
             debug!("MCP tools detected, using tool loop");
 

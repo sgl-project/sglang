@@ -36,7 +36,6 @@ use super::{
     utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model},
 };
 use crate::{
-    config::CircuitBreakerConfig,
     core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
     data_connector::{
         ConversationId, ListParams, ResponseId, SharedConversationItemStorage,
@@ -86,8 +85,8 @@ pub struct OpenAIRouter {
     conversation_storage: SharedConversationStorage,
     /// Conversation item storage backend
     conversation_item_storage: SharedConversationItemStorage,
-    /// Optional MCP manager (enabled via config presence)
-    mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    /// Optional MCP manager (handles both static and dynamic servers)
+    mcp_manager: Option<Arc<crate::mcp::McpManager>>,
 }
 
 impl std::fmt::Debug for OpenAIRouter {
@@ -109,15 +108,10 @@ impl OpenAIRouter {
     /// Create a new OpenAI router
     pub async fn new(
         worker_urls: Vec<String>,
-        circuit_breaker_config: Option<CircuitBreakerConfig>,
-        response_storage: SharedResponseStorage,
-        conversation_storage: SharedConversationStorage,
-        conversation_item_storage: SharedConversationItemStorage,
+        ctx: &Arc<crate::app_context::AppContext>,
     ) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        // Use HTTP client from AppContext
+        let client = ctx.client.clone();
 
         // Normalize URLs (remove trailing slashes)
         let worker_urls: Vec<String> = worker_urls
@@ -125,43 +119,19 @@ impl OpenAIRouter {
             .map(|url| url.trim_end_matches('/').to_string())
             .collect();
 
-        // Convert circuit breaker config
-        let core_cb_config = circuit_breaker_config
-            .map(|cb| CoreCircuitBreakerConfig {
-                failure_threshold: cb.failure_threshold,
-                success_threshold: cb.success_threshold,
-                timeout_duration: Duration::from_secs(cb.timeout_duration_secs),
-                window_duration: Duration::from_secs(cb.window_duration_secs),
-            })
-            .unwrap_or_default();
+        // Convert circuit breaker config from AppContext
+        let cb = &ctx.router_config.circuit_breaker;
+        let core_cb_config = CoreCircuitBreakerConfig {
+            failure_threshold: cb.failure_threshold,
+            success_threshold: cb.success_threshold,
+            timeout_duration: Duration::from_secs(cb.timeout_duration_secs),
+            window_duration: Duration::from_secs(cb.window_duration_secs),
+        };
 
         let circuit_breaker = CircuitBreaker::with_config(core_cb_config);
 
-        // Optional MCP manager activation via env var path (config-driven gate)
-        let mcp_manager = match std::env::var("SGLANG_MCP_CONFIG").ok() {
-            Some(path) if !path.trim().is_empty() => {
-                match crate::mcp::McpConfig::from_file(&path).await {
-                    Ok(cfg) => {
-                        // Create temporary inventory for legacy MCP initialization
-                        let inventory = Arc::new(crate::mcp::ToolInventory::new(
-                            Duration::from_secs(3600), // 1 hour TTL
-                        ));
-                        match crate::mcp::McpClientManager::new(cfg, inventory).await {
-                            Ok(mgr) => Some(Arc::new(mgr)),
-                            Err(err) => {
-                                warn!("Failed to initialize MCP manager: {}", err);
-                                None
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        warn!("Failed to load MCP config from '{}': {}", path, err);
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
+        // Use MCP manager from AppContext (already initialized)
+        let mcp_manager = ctx.mcp_manager.get().map(Arc::clone);
 
         Ok(Self {
             client,
@@ -169,9 +139,9 @@ impl OpenAIRouter {
             model_cache: Arc::new(DashMap::new()),
             circuit_breaker,
             healthy: AtomicBool::new(true),
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
+            response_storage: ctx.response_storage.clone(),
+            conversation_storage: ctx.conversation_storage.clone(),
+            conversation_item_storage: ctx.conversation_item_storage.clone(),
             mcp_manager,
         })
     }
