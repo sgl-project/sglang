@@ -584,7 +584,10 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
-        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        elif (
+            forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
@@ -602,6 +605,17 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            elif forward_batch.forward_mode.is_draft_extend_v2():
+                accept_length = forward_batch.spec_info.accept_length[:batch_size]
+                if forward_batch.spec_info.accept_length_cpu:
+                    metadata.max_seq_len_q = (
+                        max(forward_batch.spec_info.accept_length_cpu) + 1
+                    )
+                else:
+                    metadata.max_seq_len_q = 1
+                metadata.cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(accept_length, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
                 metadata.max_seq_len_q = metadata.max_seq_len_k
@@ -826,7 +840,7 @@ class FlashAttentionBackend(AttentionBackend):
             if (
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
+                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
@@ -1686,7 +1700,7 @@ class FlashAttentionBackend(AttentionBackend):
                     self.target_verify_metadata_topk_swa[bs] = metadata_swa
                     metadata.swa_spec_metadata = metadata_swa
 
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
@@ -1932,7 +1946,7 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata, metadata_expand, metadata_swa
                     )
 
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
@@ -1940,15 +1954,16 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
-            else:
-                metadata.max_seq_len_q = 1
 
-            metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
-            )
+            if forward_mode.is_draft_extend_v2():
+                accept_length = spec_info.accept_length[:bs]
+                if spec_info.accept_length_cpu:
+                    metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
+                else:
+                    metadata.max_seq_len_q = 1
+                metadata.cu_seqlens_q[1:].copy_(
+                    torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+                )
 
             max_seq_pages = (
                 metadata.max_seq_len_k + self.page_size - 1
