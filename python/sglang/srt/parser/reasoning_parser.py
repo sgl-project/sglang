@@ -268,6 +268,8 @@ class ReasoningParser:
         "kimi": KimiDetector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
+        "minimax-m1": Qwen3Detector,
+        "minimax-m2": Qwen3Detector,
         "step3": DeepSeekR1Detector,
     }
 
