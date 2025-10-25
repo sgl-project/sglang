@@ -584,7 +584,10 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
-        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        elif (
+            forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
@@ -602,6 +605,17 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            elif forward_batch.forward_mode.is_draft_extend_v2():
+                accept_length = forward_batch.spec_info.accept_length[:batch_size]
+                if forward_batch.spec_info.accept_length_cpu:
+                    metadata.max_seq_len_q = (
+                        max(forward_batch.spec_info.accept_length_cpu) + 1
+                    )
+                else:
+                    metadata.max_seq_len_q = 1
+                metadata.cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(accept_length, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
                 metadata.max_seq_len_q = metadata.max_seq_len_k
