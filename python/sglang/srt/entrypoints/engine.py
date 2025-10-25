@@ -311,6 +311,7 @@ class Engine(EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        dimensions: Optional[int] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
@@ -321,6 +322,7 @@ class Engine(EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            dimensions=dimensions,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = self.loop.run_until_complete(generator.__anext__())
@@ -332,6 +334,7 @@ class Engine(EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        dimensions: Optional[int] = None,
     ) -> Dict:
         """
         Asynchronous version of encode method.
@@ -344,6 +347,7 @@ class Engine(EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            dimensions=dimensions,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
