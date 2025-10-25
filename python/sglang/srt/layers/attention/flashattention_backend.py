@@ -597,6 +597,7 @@ class FlashAttentionBackend(AttentionBackend):
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
                 or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
+                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2
             ):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -827,6 +828,7 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:

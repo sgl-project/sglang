@@ -90,11 +90,7 @@ class ForwardMode(IntEnum):
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
-            or (
-                self == ForwardMode.DRAFT_EXTEND_V2
-                if include_draft_extend_v2
-                else False
-            )
+            or self == ForwardMode.DRAFT_EXTEND_V2
             or self == ForwardMode.TARGET_VERIFY
         )
 
@@ -128,6 +124,7 @@ class ForwardMode(IntEnum):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.DRAFT_EXTEND
+            or self == ForwardMode.DRAFT_EXTEND_V2
             or self == ForwardMode.MIXED
             or self == ForwardMode.SPLIT_PREFILL
         )
