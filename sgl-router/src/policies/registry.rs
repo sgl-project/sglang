@@ -389,10 +389,7 @@ impl PolicyRegistry {
         }
     }
 
-    pub fn init_pd_bucket_policies(
-        &self,
-        prefill_workers: &[Arc<dyn Worker>],
-    ) {
+    pub fn init_pd_bucket_policies(&self, prefill_workers: &[Arc<dyn Worker>],) {
         // Initialize prefill policy if it's bucket
         if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
             if prefill_policy.name() == "bucket" {
