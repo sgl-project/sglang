@@ -172,7 +172,7 @@ suites = {
         TestFile("test_disaggregation_hybrid_attention.py", 200),
     ],
     "per-commit-8-gpu-h20": [
-        TestFile("quant/test_w4a8_deepseek_v3.py", 371),
+        TestFile("quant/test_w4a8_deepseek_v3.py", 520),
         TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_pp.py", 140),
     ],
@@ -197,7 +197,7 @@ suites = {
         TestFile("test_bnb.py", 5),
         TestFile("test_gptqmodel_dynamic.py", 102),
         TestFile("test_vllm_dependency.py", 185),
-        # TestFile("test_gguf.py", 96),
+        TestFile("test_gguf.py", 96),
     ],
     # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
     "nightly-1-gpu": [],
