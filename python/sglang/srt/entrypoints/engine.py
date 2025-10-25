@@ -843,7 +843,7 @@ def _launch_subprocesses(
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
-            return None, None, None
+            return None, None, None, port_args
 
         launch_dummy_health_check_server(
             server_args.host, server_args.port, server_args.enable_metrics
@@ -854,7 +854,7 @@ def _launch_subprocesses(
             logger.error(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
-        return None, None, None
+        return None, None, None, port_args
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -900,4 +900,4 @@ def _launch_subprocesses(
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
 
-    return tokenizer_manager, template_manager, scheduler_info
+    return tokenizer_manager, template_manager, scheduler_info, port_args
