@@ -74,6 +74,7 @@ dependencies = [
 "grpcio-tools==1.75.1",           # keep it align with compile_proto.py
 "grpcio-reflection==1.75.1",      # required by srt/entrypoints/grpc_server.py
 "grpcio-health-checking==1.75.1", # required for Kubernetes gRPC health probes
+"typer[all]>=0.12.3",
 ]
 
 [project.optional-dependencies]
@@ -139,6 +140,9 @@ blackwell_aarch64 = ["sglang[dev]"]
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.scripts]
+sglang = "sglang.cli.main:app"
 
 [tool.setuptools.package-data]
 "sglang" = [
