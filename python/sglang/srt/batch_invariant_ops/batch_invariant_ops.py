@@ -77,8 +77,6 @@ def matmul_kernel_persistent(
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
 
-    tile_id_c = start_pid - NUM_SMS
-
     offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
@@ -120,10 +118,6 @@ def matmul_kernel_persistent(
             )
             accumulator = tl.dot(a, b, accumulator)
 
-        tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(
-            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         if C_LARGE:
@@ -137,6 +131,10 @@ def matmul_kernel_persistent(
             accumulator += bias
         if c_ptr.dtype.element_ty == tl.float8e4nv:
             c = accumulator.to(tl.float8e4nv)
+        elif c_ptr.dtype.element_ty == tl.bfloat16:
+            c = accumulator.to(tl.bfloat16)
+        elif c_ptr.dtype.element_ty == tl.float32:
+            c = accumulator.to(tl.float32)
         else:
             c = accumulator.to(tl.float16)
         tl.store(c_ptrs, c, mask=c_mask)
@@ -497,8 +495,29 @@ def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = 
         return torch.sum(input, dim=dim, keepdim=keepdim, dtype=torch.float32) / n_elems
 
 
+def bmm_batch_invariant(a, b, *, out=None):
+    # Batched matrix multiply: (B, M, K) x (B, K, N) -> (B, M, N)
+    # Process each batch separately with our persistent kernel
+    if a.ndim == 3 and b.ndim == 3:
+        results = []
+        for i in range(a.shape[0]):
+            results.append(matmul_persistent(a[i], b[i]))
+        result = torch.stack(results, dim=0)
+
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+    else:
+        raise ValueError(
+            f"bmm_batch_invariant expects 3D tensors, "
+            f"got shapes {a.shape} and {b.shape}"
+        )
+
+
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
+_original_torch_bmm = None
 
 
 def is_batch_invariant_mode_enabled():
@@ -506,7 +525,7 @@ def is_batch_invariant_mode_enabled():
 
 
 def enable_batch_invariant_mode():
-    global _batch_invariant_MODE, _batch_invariant_LIB
+    global _batch_invariant_MODE, _batch_invariant_LIB, _original_torch_bmm
     if _batch_invariant_MODE:
         return
 
@@ -518,12 +537,20 @@ def enable_batch_invariant_mode():
         "aten::_log_softmax", _log_softmax_batch_invariant, "CUDA"
     )
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, "CUDA")
+    _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, "CUDA")
+
+    # Also monkeypatch torch.bmm directly as a fallback
+    _original_torch_bmm = torch.bmm
+    torch.bmm = bmm_batch_invariant
 
 
 def disable_batch_invariant_mode():
-    global _batch_invariant_MODE, _batch_invariant_LIB
+    global _batch_invariant_MODE, _batch_invariant_LIB, _original_torch_bmm
     if _batch_invariant_LIB is not None:
         _batch_invariant_LIB._destroy()
+    if _original_torch_bmm is not None:
+        torch.bmm = _original_torch_bmm
+        _original_torch_bmm = None
     _batch_invariant_MODE = False
     _batch_invariant_LIB = None
 

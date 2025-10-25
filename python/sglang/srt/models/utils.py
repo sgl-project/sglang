@@ -27,7 +27,11 @@ if _is_cuda:
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
-    return _is_cuda and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+    return (
+        _is_cuda
+        and hasattr(forward_batch.token_to_kv_pool, "dtype")
+        and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+    )
 
 
 def create_fused_set_kv_buffer_arg(
@@ -49,3 +53,9 @@ def create_fused_set_kv_buffer_arg(
         v_scale=layer.v_scale,
         cache_loc=forward_batch.out_cache_loc,
     )
+
+
+def permute_inv(perm: torch.Tensor) -> torch.Tensor:
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(perm.numel(), device=perm.device, dtype=perm.dtype)
+    return inv_perm

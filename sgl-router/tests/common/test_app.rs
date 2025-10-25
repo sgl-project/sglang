@@ -1,12 +1,19 @@
+use std::sync::{Arc, OnceLock};
+
 use axum::Router;
 use reqwest::Client;
 use sglang_router_rs::{
+    app_context::AppContext,
     config::RouterConfig,
-    middleware::AuthConfig,
+    core::{LoadMonitor, WorkerRegistry},
+    data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    },
+    middleware::{AuthConfig, TokenBucket},
+    policies::PolicyRegistry,
     routers::RouterTrait,
-    server::{build_app, AppContext, AppState},
+    server::{build_app, AppState},
 };
-use std::sync::Arc;
 
 /// Create a test Axum application using the actual server's build_app function
 #[allow(dead_code)]
@@ -15,15 +22,61 @@ pub fn create_test_app(
     client: Client,
     router_config: &RouterConfig,
 ) -> Router {
-    // Create AppContext
+    // Initialize rate limiter
+    let rate_limiter = match router_config.max_concurrent_requests {
+        n if n <= 0 => None,
+        n => {
+            let rate_limit_tokens = router_config
+                .rate_limit_tokens_per_second
+                .filter(|&t| t > 0)
+                .unwrap_or(n);
+            Some(Arc::new(TokenBucket::new(
+                n as usize,
+                rate_limit_tokens as usize,
+            )))
+        }
+    };
+
+    // Initialize registries
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+
+    // Initialize storage backends
+    let response_storage = Arc::new(MemoryResponseStorage::new());
+    let conversation_storage = Arc::new(MemoryConversationStorage::new());
+    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+
+    // Initialize load monitor
+    let load_monitor = Some(Arc::new(LoadMonitor::new(
+        worker_registry.clone(),
+        policy_registry.clone(),
+        client.clone(),
+        router_config.worker_startup_check_interval_secs,
+    )));
+
+    // Create empty OnceLock for worker job queue and workflow engine
+    let worker_job_queue = Arc::new(OnceLock::new());
+    let workflow_engine = Arc::new(OnceLock::new());
+
+    // Create AppContext using builder pattern
     let app_context = Arc::new(
-        AppContext::new(
-            router_config.clone(),
-            client,
-            router_config.max_concurrent_requests,
-            router_config.rate_limit_tokens_per_second,
-        )
-        .expect("Failed to create AppContext in test"),
+        AppContext::builder()
+            .router_config(router_config.clone())
+            .client(client)
+            .rate_limiter(rate_limiter)
+            .tokenizer(None) // tokenizer
+            .reasoning_parser_factory(None) // reasoning_parser_factory
+            .tool_parser_factory(None) // tool_parser_factory
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .load_monitor(load_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engine(workflow_engine)
+            .build()
+            .unwrap(),
     );
 
     // Create AppState with the test router and context

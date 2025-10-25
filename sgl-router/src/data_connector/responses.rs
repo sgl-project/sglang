@@ -1,8 +1,8 @@
+use std::{collections::HashMap, sync::Arc};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Response identifier
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -12,15 +12,23 @@ impl ResponseId {
     pub fn new() -> Self {
         Self(ulid::Ulid::new().to_string())
     }
-
-    pub fn from_string(s: String) -> Self {
-        Self(s)
-    }
 }
 
 impl Default for ResponseId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl From<String> for ResponseId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ResponseId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
     }
 }
 
@@ -33,20 +41,20 @@ pub struct StoredResponse {
     /// ID of the previous response in the chain (if any)
     pub previous_response_id: Option<ResponseId>,
 
-    /// The user input for this response
-    pub input: String,
+    /// Input items as JSON array
+    pub input: Value,
 
     /// System instructions used
     pub instructions: Option<String>,
 
-    /// The model's output
-    pub output: String,
+    /// Output items as JSON array
+    pub output: Value,
 
     /// Tool calls made by the model (if any)
-    pub tool_calls: Vec<serde_json::Value>,
+    pub tool_calls: Vec<Value>,
 
     /// Custom metadata
-    pub metadata: HashMap<String, serde_json::Value>,
+    pub metadata: HashMap<String, Value>,
 
     /// When this response was created
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -57,24 +65,29 @@ pub struct StoredResponse {
     /// Model used for generation
     pub model: Option<String>,
 
+    /// Conversation id if associated with a conversation
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+
     /// Raw OpenAI response payload
     #[serde(default)]
     pub raw_response: Value,
 }
 
 impl StoredResponse {
-    pub fn new(input: String, output: String, previous_response_id: Option<ResponseId>) -> Self {
+    pub fn new(previous_response_id: Option<ResponseId>) -> Self {
         Self {
             id: ResponseId::new(),
             previous_response_id,
-            input,
+            input: Value::Array(vec![]),
             instructions: None,
-            output,
+            output: Value::Array(vec![]),
             tool_calls: Vec::new(),
             metadata: HashMap::new(),
             created_at: chrono::Utc::now(),
             user: None,
             model: None,
+            conversation_id: None,
             raw_response: Value::Null,
         }
     }
@@ -87,7 +100,7 @@ pub struct ResponseChain {
     pub responses: Vec<StoredResponse>,
 
     /// Metadata about the chain
-    pub metadata: HashMap<String, serde_json::Value>,
+    pub metadata: HashMap<String, Value>,
 }
 
 impl Default for ResponseChain {
@@ -115,7 +128,7 @@ impl ResponseChain {
     }
 
     /// Build context from the chain for the next request
-    pub fn build_context(&self, max_responses: Option<usize>) -> Vec<(String, String)> {
+    pub fn build_context(&self, max_responses: Option<usize>) -> Vec<(Value, Value)> {
         let responses = if let Some(max) = max_responses {
             let start = self.responses.len().saturating_sub(max);
             &self.responses[start..]
@@ -184,6 +197,6 @@ pub type SharedResponseStorage = Arc<dyn ResponseStorage>;
 
 impl Default for StoredResponse {
     fn default() -> Self {
-        Self::new(String::new(), String::new(), None)
+        Self::new(None)
     }
 }

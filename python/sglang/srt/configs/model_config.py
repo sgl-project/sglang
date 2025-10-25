@@ -17,7 +17,7 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from typing import List, Optional, Set, Union
+from typing import Any, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -49,6 +49,34 @@ class ModelImpl(str, Enum):
     TRANSFORMERS = "transformers"
 
 
+def is_deepseek_nsa(config: PretrainedConfig) -> bool:
+    return (
+        config.architectures is not None
+        and config.architectures[0]
+        in [
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "DeepseekV3ForCausalLMNextN",
+        ]
+        and getattr(config, "index_topk", None) is not None
+    )
+
+
+def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_head_dim
+
+
+def get_nsa_index_topk(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_topk
+
+
+def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_n_heads
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -63,8 +91,12 @@ class ModelConfig:
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
-        hybrid_kvcache_ratio: Optional[float] = None,
+        hybrid_kvcache_ratio: Optional[
+            float
+        ] = None,  # TODO: remove this, it is not a model config
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        sampling_defaults: str = "openai",
+        quantize_and_serve: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -72,6 +104,11 @@ class ModelConfig:
         self.quantization = quantization
         self.is_draft_model = is_draft_model
         self.model_impl = model_impl
+        self.sampling_defaults = sampling_defaults
+        self.quantize_and_serve = quantize_and_serve
+
+        # Validate quantize_and_serve configuration
+        self._validate_quantize_and_serve_config()
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
@@ -187,6 +224,8 @@ class ModelConfig:
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
+            sampling_defaults=server_args.sampling_defaults,
+            quantize_and_serve=server_args.quantize_and_serve,
             **kwargs,
         )
 
@@ -271,6 +310,7 @@ class ModelConfig:
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
@@ -283,6 +323,11 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
+            self.index_head_dim = (
+                get_nsa_index_head_dim(self.hf_config)
+                if is_deepseek_nsa(self.hf_config)
+                else None
+            )
 
             # Handle rope scaling with yarn
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
@@ -447,31 +492,32 @@ class ModelConfig:
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
-            modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
                 import huggingface_hub
 
                 try:
-                    from huggingface_hub import HfApi
+                    from huggingface_hub import HfApi, hf_hub_download
 
                     hf_api = HfApi()
-
-                    def check_hf_quant_config():
-                        return hf_api.file_exists(
-                            self.model_path, "hf_quant_config.json"
-                        )
-
                     # Retry HF API call up to 3 times
                     file_exists = retry(
-                        check_hf_quant_config,
+                        lambda: hf_api.file_exists(
+                            self.model_path, "hf_quant_config.json"
+                        ),
                         max_retry=2,
                         initial_delay=1.0,
                         max_delay=5.0,
                     )
-
                     if file_exists:
-                        quant_cfg = modelopt_quant_config
-
+                        # Download and parse the quantization config for remote models
+                        quant_config_file = hf_hub_download(
+                            repo_id=self.model_path,
+                            filename="hf_quant_config.json",
+                            revision=self.revision,
+                        )
+                        with open(quant_config_file) as f:
+                            quant_config_dict = json.load(f)
+                        quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
                 except huggingface_hub.errors.OfflineModeIsEnabled:
                     logger.warning(
                         "Offline mode is enabled, skipping hf_quant_config.json check"
@@ -480,20 +526,79 @@ class ModelConfig:
                     logger.warning(
                         f"Failed to check hf_quant_config.json: {self.model_path} {e}"
                     )
-
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(
                     self.model_path, "hf_quant_config.json"
                 )
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
-                json_quant_configs = quant_config_dict["quantization"]
-                quant_algo = json_quant_configs.get("quant_algo", None)
-                if quant_algo == "MIXED_PRECISION":
-                    quant_cfg = {"quant_method": "w4afp8"}
-                else:
-                    quant_cfg = modelopt_quant_config
+                quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
         return quant_cfg
+
+    def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> dict:
+        """Parse ModelOpt quantization config and return the appropriate quant_method."""
+        json_quant_configs = quant_config_dict["quantization"]
+        quant_algo = json_quant_configs.get("quant_algo", None)
+
+        if quant_algo == "MIXED_PRECISION":
+            return {"quant_method": "w4afp8"}
+        elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
+            return {"quant_method": "modelopt_fp4"}
+        elif quant_algo and "FP8" in quant_algo:
+            return {"quant_method": "modelopt_fp8"}
+        else:
+            # Default to FP8 for backward compatibility
+            return {"quant_method": "modelopt_fp8"}
+
+    def _is_already_quantized(self) -> bool:
+        """Check if the model is already quantized based on config files."""
+        # Check for HuggingFace quantization config
+        from sglang.srt.utils import has_hf_quant_config
+
+        return has_hf_quant_config(self.model_path)
+
+    def _get_modelopt_quant_type(self) -> str:
+        """Extract ModelOpt quantization type from unified quantization flag."""
+        if self.quantization == "modelopt_fp8":
+            return "fp8"
+        elif self.quantization == "modelopt_fp4":
+            return "nvfp4"
+        elif self.quantization == "modelopt":
+            # Auto-detect from model config
+            quant_cfg = self._parse_quant_hf_config()
+            if quant_cfg:
+                quant_method = quant_cfg.get("quant_method", "").lower()
+                if "fp4" in quant_method:
+                    return "fp4"
+                elif "fp8" in quant_method:
+                    return "fp8"
+            # Default to fp8 if can't detect
+            return "fp8"
+        else:
+            return "fp8"  # Default fallback
+
+    def _validate_quantize_and_serve_config(self):
+        """Validate quantize_and_serve configuration."""
+        if not self.quantize_and_serve:
+            return
+
+        # Check if ModelOpt quantization is specified
+        modelopt_quantization_specified = self.quantization in [
+            "modelopt",
+            "modelopt_fp8",
+            "modelopt_fp4",
+        ]
+
+        if not modelopt_quantization_specified:
+            raise ValueError("quantize_and_serve requires ModelOpt quantization")
+
+        # quantize_and_serve is disabled due to compatibility issues
+        raise NotImplementedError(
+            "quantize_and_serve functionality is currently disabled due to compatibility issues. "
+            "Please use the separate quantize-then-deploy workflow instead. "
+            "Step 1: Quantize and export model. "
+            "Step 2: Deploy the exported model."
+        )
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
@@ -513,7 +618,8 @@ class ModelConfig:
         optimized_quantization_methods = [
             "fp8",
             "marlin",
-            "modelopt",
+            "modelopt_fp8",
+            "modelopt_fp4",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
@@ -626,6 +732,38 @@ class ModelConfig:
                 )
                 eos_ids = eos_ids | generation_eos_ids
         return eos_ids
+
+    def get_default_sampling_params(self) -> dict[str, Any]:
+        """
+        Get default sampling parameters from the model's generation config.
+
+        This method returns non-default sampling parameters from the model's
+        generation_config.json when sampling_defaults is set to "model".
+
+        Returns:
+            A dictionary containing the non-default sampling parameters.
+        """
+        if self.sampling_defaults != "model":
+            return {}
+
+        if self.hf_generation_config is None:
+            return {}
+
+        config = self.hf_generation_config.to_dict()
+
+        available_params = [
+            "repetition_penalty",
+            "temperature",
+            "top_k",
+            "top_p",
+            "min_p",
+        ]
+
+        default_sampling_params = {
+            p: config.get(p) for p in available_params if config.get(p) is not None
+        }
+
+        return default_sampling_params
 
     def _maybe_pull_model_tokenizer_from_remote(self) -> None:
         """
@@ -772,15 +910,18 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
+    "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
     "DotsOCRForCausalLM",
     "Sarashina2VisionForCausalLM",
+    "DeepseekOCRForCausalLM",
 ]
 
 

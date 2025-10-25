@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 from collections import defaultdict
 from typing import (
@@ -36,8 +37,11 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-from sglang.srt.utils import find_local_repo_dir, print_warning_once
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp8Config,
+)
+from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -109,6 +113,9 @@ def convert_bin_to_safetensor_file(
 
     dirname = os.path.dirname(sf_filename)
     os.makedirs(dirname, exist_ok=True)
+
+    from safetensors.torch import save_file
+
     save_file(loaded, sf_filename, metadata={"format": "pt"})
 
     # check file size
@@ -131,11 +138,26 @@ def convert_bin_to_safetensor_file(
             raise RuntimeError(f"The output tensors do not match for key {k}")
 
 
+def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
+    for prefix, new_prefix in prefix_mapping.items():
+        if key.startswith(prefix):
+            key = key.replace(prefix, new_prefix, 1)
+    return key
+
+
+def replace_substrings(key: str, substring_mapping: dict[str, str]) -> str:
+    for substr, new_substr in substring_mapping.items():
+        if substr in key:
+            key = key.replace(substr, new_substr)
+    return key
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
     packed_modules_mapping: Dict[str, List[str]],
+    remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
 
@@ -205,35 +227,33 @@ def get_quant_config(
     quant_config_file = quant_config_files[0]
     with open(quant_config_file) as f:
         config = json.load(f)
+        if remap_prefix is not None:
+            exclude_modules = [
+                replace_prefix(key, remap_prefix)
+                for key in config["quantization"]["exclude_modules"]
+            ]
+            config["quantization"]["exclude_modules"] = exclude_modules
+        config["packed_modules_mapping"] = packed_modules_mapping
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path
-        elif model_config.quantization == "modelopt":
-            if config["producer"]["name"] == "modelopt":
+        elif model_config.quantization.startswith("modelopt") and (
+            config["producer"]["name"].startswith("modelopt")
+        ):
+            quant_algo = config["quantization"]["quant_algo"]
+            if quant_algo is None:
                 # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
-                if config["quantization"]["quant_algo"] is None:
-                    if (
-                        model_config.hf_config.architectures[0]
-                        != "LlamaForCausalLMEagle3"
-                    ):
-                        raise ValueError(
-                            f"Invalid quant_config, quantization method: {model_config.quantization},"
-                            f"hf architectures: {model_config.hf_config.architectures[0]}. "
-                        )
-                    return None
-                if "FP4" in config["quantization"]["quant_algo"]:
-                    return ModelOptFp4Config.from_config(config)
-                else:
-                    return quant_cls.from_config(config)
-            else:
-                raise ValueError(
-                    f"Unsupported quantization config"
-                    f" found for {model_config.quantization} in {f}."
-                )
-        elif model_config.quantization == "w8a8_int8":
-            config["packed_modules_mapping"] = packed_modules_mapping
-
-    return quant_cls.from_config(config)
+                if model_config.hf_config.architectures[0] != "LlamaForCausalLMEagle3":
+                    raise ValueError(
+                        f"Invalid quant_config, quantization method: {model_config.quantization},"
+                        f"hf architectures: {model_config.hf_config.architectures[0]}. "
+                    )
+                return None
+            elif quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
+                return ModelOptFp8Config.from_config(config)
+            elif "FP4" in quant_algo:
+                return ModelOptFp4Config.from_config(config)
+        return quant_cls.from_config(config)
 
 
 def find_local_hf_snapshot_dir(
@@ -283,7 +303,24 @@ def find_local_hf_snapshot_dir(
         except Exception as e:
             logger.warning("Failed to find local snapshot in default HF cache: %s", e)
 
-    # If local snapshot exists, validate it contains at least one weight file
+    # if any incomplete file exists, force re-download by returning None
+    if found_local_snapshot_dir:
+        repo_folder = os.path.abspath(
+            os.path.join(found_local_snapshot_dir, "..", "..")
+        )
+        blobs_dir = os.path.join(repo_folder, "blobs")
+        if os.path.isdir(blobs_dir) and glob.glob(
+            os.path.join(blobs_dir, "*.incomplete")
+        ):
+            logger.info(
+                "Found .incomplete files in %s for %s. "
+                "Considering local snapshot incomplete.",
+                blobs_dir,
+                model_name_or_path,
+            )
+            return None
+
+    # if local snapshot exists, validate it contains at least one weight file
     # matching allow_patterns before skipping download.
     if found_local_snapshot_dir is None:
         return None
@@ -291,9 +328,12 @@ def find_local_hf_snapshot_dir(
     local_weight_files: List[str] = []
     try:
         for pattern in allow_patterns:
-            local_weight_files.extend(
-                glob.glob(os.path.join(found_local_snapshot_dir, pattern))
-            )
+            matched_files = glob.glob(os.path.join(found_local_snapshot_dir, pattern))
+            for f in matched_files:
+                # os.path.exists returns False for broken symlinks.
+                if not os.path.exists(f):
+                    continue
+                local_weight_files.append(f)
     except Exception as e:
         logger.warning(
             "Failed to scan local snapshot %s with patterns %s: %s",
@@ -302,6 +342,46 @@ def find_local_hf_snapshot_dir(
             e,
         )
         local_weight_files = []
+
+    # After we have a list of valid files, check for sharded model completeness.
+    # Check if all safetensors with name model-{i}-of-{n}.safetensors exists
+    checked_sharded_model = False
+    for f in local_weight_files:
+        if checked_sharded_model:
+            break
+        base_name = os.path.basename(f)
+        # Regex for files like model-00001-of-00009.safetensors
+        match = re.match(r"(.*?)-([0-9]+)-of-([0-9]+)\.(.*)", base_name)
+        if match:
+            prefix = match.group(1)
+            shard_id_str = match.group(2)
+            total_shards_str = match.group(3)
+            suffix = match.group(4)
+            total_shards = int(total_shards_str)
+
+            # Check if all shards are present
+            missing_shards = []
+            for i in range(1, total_shards + 1):
+                # Reconstruct shard name, preserving padding of original shard id
+                shard_name = (
+                    f"{prefix}-{i:0{len(shard_id_str)}d}-of-{total_shards_str}.{suffix}"
+                )
+                expected_path = os.path.join(found_local_snapshot_dir, shard_name)
+                # os.path.exists returns False for broken symlinks, which is desired.
+                if not os.path.exists(expected_path):
+                    missing_shards.append(shard_name)
+
+            if missing_shards:
+                logger.info(
+                    "Found incomplete sharded model %s. Missing shards: %s. "
+                    "Will attempt download.",
+                    model_name_or_path,
+                    missing_shards,
+                )
+                return None
+
+            # If we found and verified one set of shards, we are done.
+            checked_sharded_model = True
 
     if len(local_weight_files) > 0:
         logger.info(
@@ -365,7 +445,7 @@ def download_weights_from_hf(
                 allow_patterns = [pattern]
                 break
 
-    logger.info("Using model weights format %s", allow_patterns)
+    log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):

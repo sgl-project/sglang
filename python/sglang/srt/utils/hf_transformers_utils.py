@@ -16,9 +16,10 @@
 import contextlib
 import json
 import os
+import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
@@ -45,27 +46,37 @@ from sglang.srt.configs import (
     KimiVLConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
+    NemotronHConfig,
+    Olmo3Config,
     Qwen3NextConfig,
     Step3VLConfig,
 )
+from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 
-_CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
-    ChatGLMConfig.model_type: ChatGLMConfig,
-    DbrxConfig.model_type: DbrxConfig,
-    ExaoneConfig.model_type: ExaoneConfig,
-    DeepseekVL2Config.model_type: DeepseekVL2Config,
-    MultiModalityConfig.model_type: MultiModalityConfig,
-    KimiVLConfig.model_type: KimiVLConfig,
-    InternVLChatConfig.model_type: InternVLChatConfig,
-    Step3VLConfig.model_type: Step3VLConfig,
-    LongcatFlashConfig.model_type: LongcatFlashConfig,
-    Qwen3NextConfig.model_type: Qwen3NextConfig,
-    FalconH1Config.model_type: FalconH1Config,
-    DotsVLMConfig.model_type: DotsVLMConfig,
-    DotsOCRConfig.model_type: DotsOCRConfig,
+_CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
+    ChatGLMConfig,
+    DbrxConfig,
+    ExaoneConfig,
+    DeepseekVL2Config,
+    MultiModalityConfig,
+    KimiVLConfig,
+    InternVLChatConfig,
+    Step3VLConfig,
+    LongcatFlashConfig,
+    Olmo3Config,
+    Qwen3NextConfig,
+    FalconH1Config,
+    DotsVLMConfig,
+    DotsOCRConfig,
+    NemotronHConfig,
+    DeepseekVLV2Config,
+]
+
+_CONFIG_REGISTRY = {
+    config_cls.model_type: config_cls for config_cls in _CONFIG_REGISTRY
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -106,6 +117,12 @@ def get_hf_text_config(config: PretrainedConfig):
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
         return config.text_config
+
+    if hasattr(config, "llm_config"):
+        # PointsV1.5 Chat Model
+        assert hasattr(config.llm_config, "num_attention_heads")
+        return config.llm_config
+
     if hasattr(config, "language_config"):
         return config.language_config
     if hasattr(config, "thinker_config"):
@@ -121,6 +138,38 @@ def get_hf_text_config(config: PretrainedConfig):
         return thinker_config
     else:
         return config
+
+
+# Temporary hack for DeepSeek-V3.2 model
+def _load_deepseek_v32_model(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    # first get the local path
+    local_path = download_from_hf(model_path)
+    # then load the config file in json
+    config_file = os.path.join(local_path, "config.json")
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Can't find config file in {local_path}.")
+
+    with open(config_file, "r") as f:
+        config_json = json.load(f)
+
+    config_json["architectures"] = ["DeepseekV3ForCausalLM"]
+    config_json["model_type"] = "deepseek_v3"
+
+    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
+    os.makedirs(tmp_path, exist_ok=True)
+
+    unique_path = os.path.join(tmp_path, f"deepseek_v32_{os.getpid()}")
+    with open(unique_path, "w") as f:
+        json.dump(config_json, f)
+
+    return AutoConfig.from_pretrained(
+        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
 
 
 @lru_cache_frozenset(maxsize=32)
@@ -144,9 +193,26 @@ def get_config(
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()
 
-    config = AutoConfig.from_pretrained(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
+    try:
+        config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+        if (
+            getattr(config, "auto_map", None) is not None
+            and config.auto_map.get("AutoModel")
+            == "modeling_deepseekocr.DeepseekOCRForCausalLM"
+        ):
+            config.model_type = "deepseek-ocr"
+            # TODO: Remove this workaround when AutoConfig correctly identifies deepseek-ocr.
+            # Hugging Face's AutoConfig currently misidentifies it as deepseekvl2.
+
+    except ValueError as e:
+        if not "deepseek_v32" in str(e):
+            raise e
+        config = _load_deepseek_v32_model(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+
     if (
         config.architectures is not None
         and config.architectures[0] == "Phi4MMForCausalLM"
@@ -162,7 +228,8 @@ def get_config(
             "intermediate_size": 4304,
             "model_type": "siglip_vision_model",
             "num_attention_heads": 16,
-            "num_hidden_layers": 26,  # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
+            "num_hidden_layers": 26,
+            # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
             "patch_size": 14,
         }
         config.vision_config = SiglipVisionConfig(**vision_config)
