@@ -1021,7 +1021,7 @@ async fn load_conversation_history(
                     .collect::<serde_json::Map<String, serde_json::Value>>()
             });
 
-            let new_conv = crate::data_connector::conversations::NewConversation {
+            let new_conv = crate::data_connector::NewConversation {
                 id: Some(conv_id.clone()), // Use user-provided conversation ID
                 metadata,
             };
@@ -1033,9 +1033,9 @@ async fn load_conversation_history(
 
         // Load conversation history
         const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
-        let params = crate::data_connector::conversation_items::ListParams {
+        let params = crate::data_connector::ListParams {
             limit: MAX_CONVERSATION_HISTORY_ITEMS,
-            order: crate::data_connector::conversation_items::SortOrder::Asc,
+            order: crate::data_connector::SortOrder::Asc,
             after: None,
         };
 
