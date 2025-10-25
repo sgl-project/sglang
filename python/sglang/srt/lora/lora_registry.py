@@ -18,8 +18,8 @@ from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Union
 from uuid import uuid4
 
-from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.utils import ConcurrentCounter
+from sglang.srt.utils.aio_rwlock import RWLock
 
 
 @dataclass(frozen=True)

@@ -433,7 +433,7 @@ class Runtime:
         self.endpoint.cache_prefix(prefix)
 
     def get_tokenizer(self):
-        from sglang.srt.hf_transformers_utils import get_tokenizer
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(
             self.server_args.tokenizer_path,

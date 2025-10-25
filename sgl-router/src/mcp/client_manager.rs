@@ -1,3 +1,5 @@
+use std::{borrow::Cow, collections::HashMap, time::Duration};
+
 use backoff::ExponentialBackoffBuilder;
 use dashmap::DashMap;
 use rmcp::{
@@ -13,7 +15,6 @@ use rmcp::{
     RoleClient, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, collections::HashMap, time::Duration};
 
 use crate::mcp::{
     config::{McpConfig, McpServerConfig, McpTransport},
@@ -179,19 +180,47 @@ impl McpClientManager {
         let backoff = ExponentialBackoffBuilder::new()
             .with_initial_interval(Duration::from_secs(1))
             .with_max_interval(Duration::from_secs(30))
-            .with_max_elapsed_time(Some(Duration::from_secs(120)))
+            .with_max_elapsed_time(Some(Duration::from_secs(30)))
             .build();
 
         backoff::future::retry(backoff, || async {
             match Self::connect_server_impl(config).await {
                 Ok(client) => Ok(client),
                 Err(e) => {
-                    tracing::warn!("Failed to connect to '{}', retrying: {}", config.name, e);
-                    Err(backoff::Error::transient(e))
+                    if Self::is_permanent_error(&e) {
+                        tracing::error!(
+                            "Permanent error connecting to '{}': {} - not retrying",
+                            config.name,
+                            e
+                        );
+                        Err(backoff::Error::permanent(e))
+                    } else {
+                        tracing::warn!("Failed to connect to '{}', retrying: {}", config.name, e);
+                        Err(backoff::Error::transient(e))
+                    }
                 }
             }
         })
         .await
+    }
+
+    /// Determine if an error is permanent (should not retry) or transient (should retry)
+    fn is_permanent_error(error: &McpError) -> bool {
+        match error {
+            McpError::Config(_) => true,
+            McpError::Auth(_) => true,
+            McpError::ServerNotFound(_) => true,
+            McpError::Transport(_) => true,
+            McpError::ConnectionFailed(msg) => {
+                msg.contains("initialize")
+                    || msg.contains("connection closed")
+                    || msg.contains("connection refused")
+                    || msg.contains("invalid URL")
+                    || msg.contains("not found")
+            }
+            // Tool-related errors shouldn't occur during connection
+            _ => false,
+        }
     }
 
     /// Internal implementation of server connection
@@ -288,8 +317,6 @@ impl McpClientManager {
         }
     }
 
-    // ===== Helpers =====
-
     fn client_for(&self, server_name: &str) -> McpResult<&RunningService<RoleClient, ()>> {
         self.clients
             .get(server_name)
@@ -316,8 +343,6 @@ impl McpClientManager {
             .map(|e| e.value().clone())
             .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))
     }
-
-    // ===== Tool Methods =====
 
     /// Call a tool by name
     pub async fn call_tool(
@@ -380,8 +405,6 @@ impl McpClientManager {
         self.clients.keys().cloned().collect()
     }
 
-    // ===== Prompt Methods =====
-
     /// Get a prompt by name with arguments
     pub async fn get_prompt(
         &self,
@@ -438,8 +461,6 @@ impl McpClientManager {
             }
         })
     }
-
-    // ===== Resource Methods =====
 
     /// Read a resource by URI
     pub async fn read_resource(&self, uri: &str) -> McpResult<ReadResourceResult> {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::ConnectionMode;
 
 /// Configuration validator
 pub struct ConfigValidator;
@@ -28,6 +29,75 @@ impl ConfigValidator {
         let cb_cfg = config.effective_circuit_breaker_config();
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
+
+        // Validate Oracle configuration if enabled
+        if config.history_backend == HistoryBackend::Oracle {
+            if config.oracle.is_none() {
+                return Err(ConfigError::MissingRequired {
+                    field: "oracle".to_string(),
+                });
+            }
+            // Validate Oracle configuration details
+            if let Some(oracle) = &config.oracle {
+                Self::validate_oracle(oracle)?;
+            }
+        }
+
+        // Validate tokenizer cache configuration
+        Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+
+        Ok(())
+    }
+
+    /// Validate Oracle configuration
+    fn validate_oracle(oracle: &OracleConfig) -> ConfigResult<()> {
+        // Validate username is not empty
+        if oracle.username.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle.username".to_string(),
+            });
+        }
+
+        // Validate password is not empty
+        if oracle.password.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle.password".to_string(),
+            });
+        }
+
+        // Validate connect_descriptor is not empty
+        if oracle.connect_descriptor.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle_dsn or oracle_tns_alias".to_string(),
+            });
+        }
+
+        // Validate pool_min is at least 1
+        if oracle.pool_min < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_min".to_string(),
+                value: oracle.pool_min.to_string(),
+                reason: "Must be at least 1".to_string(),
+            });
+        }
+
+        // Validate pool_max is greater than or equal to pool_min
+        if oracle.pool_max < oracle.pool_min {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_max".to_string(),
+                value: oracle.pool_max.to_string(),
+                reason: "Must be >= oracle.pool_min".to_string(),
+            });
+        }
+
+        // Validate pool_timeout_secs is greater than 0
+        if oracle.pool_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_timeout_secs".to_string(),
+                value: oracle.pool_timeout_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
 
         Ok(())
     }
@@ -96,18 +166,14 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::OpenAI { worker_urls } => {
-                // Require exactly one worker URL for OpenAI router
-                if worker_urls.len() != 1 {
+                // Require at least one worker URL for OpenAI router
+                if worker_urls.is_empty() {
                     return Err(ConfigError::ValidationFailed {
-                        reason: "OpenAI mode requires exactly one --worker-urls entry".to_string(),
+                        reason: "OpenAI mode requires at least one --worker-urls entry".to_string(),
                     });
                 }
-                // Validate URL format
-                if let Err(e) = url::Url::parse(&worker_urls[0]) {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: format!("Invalid OpenAI worker URL '{}': {}", &worker_urls[0], e),
-                    });
-                }
+                // Validate URLs
+                Self::validate_urls(worker_urls)?;
             }
         }
         Ok(())
@@ -197,6 +263,24 @@ impl ConfigValidator {
                 value: config.request_timeout_secs.to_string(),
                 reason: "Must be > 0".to_string(),
             });
+        }
+
+        if config.queue_size > 0 && config.queue_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "queue_timeout_secs".to_string(),
+                value: config.queue_timeout_secs.to_string(),
+                reason: "Must be > 0 when queue_size > 0".to_string(),
+            });
+        }
+
+        if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
+            if tokens_per_second <= 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "rate_limit_tokens_per_second".to_string(),
+                    value: tokens_per_second.to_string(),
+                    reason: "Must be > 0 when specified".to_string(),
+                });
+            }
         }
 
         if config.worker_startup_timeout_secs == 0 {
@@ -362,6 +446,52 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate tokenizer cache configuration
+    fn validate_tokenizer_cache(cache: &TokenizerCacheConfig) -> ConfigResult<()> {
+        // Validate L0 max entries when L0 is enabled
+        if cache.enable_l0 && cache.l0_max_entries == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l0_max_entries".to_string(),
+                value: cache.l0_max_entries.to_string(),
+                reason: "Must be > 0 when L0 cache is enabled".to_string(),
+            });
+        }
+
+        // Validate L1 max memory when L1 is enabled
+        if cache.enable_l1 && cache.l1_max_memory == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l1_max_memory".to_string(),
+                value: cache.l1_max_memory.to_string(),
+                reason: "Must be > 0 when L1 cache is enabled".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Validate mTLS certificate configuration
+    fn validate_mtls(config: &RouterConfig) -> ConfigResult<()> {
+        // Validate that if we have client_identity, it's not empty
+        if let Some(identity) = &config.client_identity {
+            if identity.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "Client identity cannot be empty".to_string(),
+                });
+            }
+        }
+
+        // Validate CA certificates are not empty
+        for (idx, ca_cert) in config.ca_certificates.iter().enumerate() {
+            if ca_cert.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!("CA certificate at index {} cannot be empty", idx),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         // IGW mode is independent - skip other compatibility checks when enabled
@@ -370,7 +500,7 @@ impl ConfigValidator {
         }
 
         // Validate gRPC connection mode requires tokenizer configuration
-        if config.connection_mode == ConnectionMode::Grpc
+        if matches!(config.connection_mode, ConnectionMode::Grpc { .. })
             && config.tokenizer_path.is_none()
             && config.model_path.is_none()
         {
@@ -378,6 +508,9 @@ impl ConfigValidator {
                 reason: "gRPC connection mode requires either --tokenizer-path or --model-path to be specified".to_string(),
             });
         }
+
+        // Validate mTLS configuration
+        Self::validate_mtls(config)?;
 
         // All policies are now supported for both router types thanks to the unified trait design
         // No mode/policy restrictions needed anymore
@@ -664,7 +797,6 @@ mod tests {
 
     #[test]
     fn test_validate_pd_mode_with_separate_policies() {
-        // Test PD mode with different policies for prefill and decode
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![
@@ -695,7 +827,6 @@ mod tests {
 
     #[test]
     fn test_validate_pd_mode_power_of_two_insufficient_workers() {
-        // Test that power-of-two policy requires at least 2 workers
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
@@ -720,7 +851,6 @@ mod tests {
 
     #[test]
     fn test_validate_grpc_requires_tokenizer() {
-        // Test that gRPC connection mode requires tokenizer configuration
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
@@ -729,7 +859,7 @@ mod tests {
         );
 
         // Set connection mode to gRPC without tokenizer config
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.tokenizer_path = None;
         config.model_path = None;
 
@@ -742,7 +872,6 @@ mod tests {
 
     #[test]
     fn test_validate_grpc_with_model_path() {
-        // Test that gRPC works with model_path
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
@@ -750,7 +879,7 @@ mod tests {
             PolicyConfig::Random,
         );
 
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.model_path = Some("meta-llama/Llama-3-8B".to_string());
 
         let result = ConfigValidator::validate(&config);
@@ -759,7 +888,6 @@ mod tests {
 
     #[test]
     fn test_validate_grpc_with_tokenizer_path() {
-        // Test that gRPC works with tokenizer_path
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
@@ -767,7 +895,7 @@ mod tests {
             PolicyConfig::Random,
         );
 
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.tokenizer_path = Some("/path/to/tokenizer.json".to_string());
 
         let result = ConfigValidator::validate(&config);
