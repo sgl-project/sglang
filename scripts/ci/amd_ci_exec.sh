@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+# --- NumExpr threads (simple) ---
+# Use the runner's logical CPUs; let callers override with -e NUMEXPR_MAX_THREADS=...
+EFF="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN || echo 1)"
+: "${NUMEXPR_MAX_THREADS:=${EFF}}"
+export NUMEXPR_MAX_THREADS
+echo "EFF=$EFF"
+echo "NUMEXPR_MAX_THREADS=$NUMEXPR_MAX_THREADS"
+
 # Detect GPU family from hostname (e.g., linux-mi35x-gpu-1-xxxxx-runner-zzzzz)
 HOSTNAME_VALUE=$(hostname)
 GPU_FAMILY=""
@@ -18,6 +26,7 @@ declare -A ENV_MAP=(
   [SGLANG_IS_IN_CI_AMD]=1
   [SGLANG_IS_IN_CI]=1
   [SGLANG_USE_AITER]=1
+  [NUMEXPR_MAX_THREADS]="${NUMEXPR_MAX_THREADS}"
 )
 
 # Conditionally add GPU_ARCHS only for mi35x
