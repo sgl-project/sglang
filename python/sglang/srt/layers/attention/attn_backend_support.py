@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
 
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
@@ -17,12 +16,12 @@ from sglang.srt.utils.common import (
 @dataclass
 class AttentionCapabilities:
     # Supported hardware, subset of ["cuda", "hip", "cpu", "xpu", "npu", "hpu"]
-    hardware: List[str]
+    hardware: list[str]
     # List of supported major versions of SM capability if using Nvidia GPU
-    sm_capability_major: Optional[List[int]] = None
+    sm_capability_major: list[int] | None = None
     # Whether the backend supports page size > 1
     # If set as a list of int, it means the backend only supports the page sizes in the list
-    page_size_gt_1: Union[bool, List[int]] = False
+    page_size_gt_1: bool | list[int] = False
     # Cuda graph support
     cuda_graph: bool = False
     # Speculative decoding support (whether topk = 1 or topk > 1)
@@ -38,12 +37,12 @@ class AttentionCapabilities:
     # Chunked prefix cache support. This depends on the MLA support.
     chunked_prefix_cache: bool = False
     # Supported kv cache dtypes (< bf16 precision)
-    kv_cache_dtype: Optional[List[str]] = None
+    kv_cache_dtype: list[str] | None = None
     # Deterministic
     deterministic: bool = False
 
 
-ATTN_BACKEND_CAPS: Dict[str, AttentionCapabilities] = {
+ATTN_BACKEND_CAPS: dict[str, AttentionCapabilities] = {
     "trtllm_mha": AttentionCapabilities(
         hardware=["cuda"],
         sm_capability_major=[100],
@@ -80,7 +79,7 @@ def _validate_single_backend(
     role: str,
     server_args: ServerArgs,
     use_mla: bool,
-    sliding_window_size: Optional[int],
+    sliding_window_size: int | None,
 ):
     if backend_name is None:
         return
@@ -158,7 +157,7 @@ def _validate_single_backend(
 def validate_attention_backends(
     server_args: ServerArgs,
     use_mla: bool,
-    sliding_window_size: Optional[int],
+    sliding_window_size: int | None,
 ):
     prefill_backend, decode_backend = ServerArgs.get_attention_backends(server_args)
     _validate_single_backend(
