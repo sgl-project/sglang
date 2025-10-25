@@ -1862,6 +1862,9 @@ vllm_get_world_group = None
 
 
 def monkey_patch_vllm_parallel_state(reverse: bool = False):
+    if _is_xpu:
+        return
+
     try:
         import vllm.distributed.parallel_state as vllm_parrlel_state
     except ImportError:
