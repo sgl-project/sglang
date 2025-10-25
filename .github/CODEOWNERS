@@ -1,6 +1,6 @@
 .github @merrymercy @zhyncs
 /docker @zhyncs @HaiShaw @ByronHsu
-/docker/Dockerfile.npu @ping1jing2
+/docker/npu.Dockerfile @ping1jing2
 /python/pyproject.toml @merrymercy @zhyncs
 /python/sglang/* @merrymercy @Ying1123 @zhyncs @hnyls2002
 /python/sglang/srt/constrained @hnyls2002
