@@ -212,7 +212,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         global NSA_PREFILL_IMPL, NSA_DECODE_IMPL
         NSA_PREFILL_IMPL = model_runner.server_args.nsa_prefill_backend
         NSA_DECODE_IMPL = model_runner.server_args.nsa_decode_backend
-        self.original_prefill_impl = model_runner.server_args.nsa_prefill_backend
+        self.enable_auto_select_prefill_impl = NSA_PREFILL_IMPL == "flashmla_auto"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -267,10 +267,11 @@ class NativeSparseAttnBackend(AttentionBackend):
         page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
+
         page_table_1_flattened = None
         topk_indices_offset = None
-
         self.set_nsa_prefill_impl(forward_batch)
+        self.topk_transform_method = self.get_topk_transform_method(forward_batch)
 
         if forward_batch.forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
@@ -349,22 +350,23 @@ class NativeSparseAttnBackend(AttentionBackend):
                 ]
             )
 
-            page_table_1_flattened = torch.cat(
-                [
-                    page_table[i, :kv_len]
-                    for i, kv_len in enumerate(
-                        forward_batch.seq_lens_cpu.tolist(),
-                    )
-                ]
-            )
-            assert (
-                page_table_1_flattened.shape[0] == forward_batch.seq_lens_sum
-            ), f"{page_table_1_flattened.shape[0] = } must be the same as {forward_batch.seq_lens_sum = }"
+            if self.topk_transform_method == TopkTransformMethod.RAGGED:
+                page_table_1_flattened = torch.cat(
+                    [
+                        page_table[i, :kv_len]
+                        for i, kv_len in enumerate(
+                            forward_batch.seq_lens_cpu.tolist(),
+                        )
+                    ]
+                )
+                assert (
+                    page_table_1_flattened.shape[0] == forward_batch.seq_lens_sum
+                ), f"{page_table_1_flattened.shape[0] = } must be the same as {forward_batch.seq_lens_sum = }"
 
-            topk_indices_offset = torch.repeat_interleave(
-                cu_seqlens_k[:-1],
-                forward_batch.extend_seq_lens,
-            )
+                topk_indices_offset = torch.repeat_interleave(
+                    cu_seqlens_k[:-1],
+                    forward_batch.extend_seq_lens,
+                )
         else:
             assert False, f"Unsupported {forward_batch.forward_mode = }"
 
@@ -842,11 +844,11 @@ class NativeSparseAttnBackend(AttentionBackend):
             q_rope = q_all[:, :, layer.v_head_dim :]
 
         # NOTE(dark): here, we use page size = 1
-        topk_transform_method = self.get_topk_transform_method(forward_batch)
+
         if NSA_FUSE_TOPK:
             page_table_1 = topk_indices
         else:
-            if topk_transform_method == TopkTransformMethod.RAGGED:
+            if self.topk_transform_method == TopkTransformMethod.RAGGED:
                 mask = topk_indices != -1
                 topk_indices_offset = metadata.topk_indices_offset
                 topk_indices_offset = (
@@ -857,7 +859,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 topk_indices = torch.where(
                     mask, topk_indices + topk_indices_offset, topk_indices
                 )
-            elif topk_transform_method == TopkTransformMethod.PAGED:
+            elif self.topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.nsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
                     page_table=metadata.page_table_1,
@@ -882,7 +884,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
             # NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 has no effect here,
             # because the flashmla_prefill kernel doesn't support fp8 compute
-            if topk_transform_method == TopkTransformMethod.RAGGED:
+            if self.topk_transform_method == TopkTransformMethod.RAGGED:
                 if any(forward_batch.extend_prefix_lens_cpu):
                     page_table_1_flattened = (
                         self.forward_metadata.page_table_1_flattened
@@ -1214,10 +1216,8 @@ class NativeSparseAttnBackend(AttentionBackend):
     def set_nsa_prefill_impl(self, forward_batch: Optional[ForwardBatch] = None) -> str:
         from sglang.srt.utils import is_blackwell
 
-        original_prefill_impl = self.original_prefill_impl
-
         global NSA_PREFILL_IMPL
-        if original_prefill_impl == "flashmla_auto":
+        if self.enable_auto_select_prefill_impl:
             if self.nsa_kv_cache_store_fp8:
                 if (
                     # TODO(hlu1): enable MTP
