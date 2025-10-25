@@ -1,6 +1,8 @@
 from typing import Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -50,6 +52,107 @@ elif is_npu():
     causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
 
+
+from sglang.xai.srt.utils import rank0_log
+
+
+# Kernel to copy mamba states based on copy mask
+@triton.jit
+def mamba_state_copy_kernel(
+    conv_states_ptr,
+    ssm_states_ptr,
+    cache_indices_ptr,
+    mamba_copy_mask_ptr,
+    mamba_pool_copy_indices_ptr,
+    conv_state_stride_0,  # stride for first dimension (batch/pool index)
+    ssm_state_stride_0,  # stride for first dimension (batch/pool index)
+    conv_state_numel_per_row: tl.constexpr,  # total elements per row
+    ssm_state_numel_per_row: tl.constexpr,  # total elements per row
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Copy conv_states and ssm_states rows based on copy mask.
+    This kernel replaces a Python loop that copies state tensors for mamba attention.
+    For each batch element, if the copy mask is True, it copies the entire row from
+    the source index (cache_indices[i]) to the destination index (mamba_pool_copy_indices[i]).
+    Grid: (batch_size,)
+    Each block handles one batch element, using multiple threads to copy data in parallel.
+    """
+    batch_idx = tl.program_id(0)
+
+    # Load the copy mask for this batch element
+    copy_mask = tl.load(mamba_copy_mask_ptr + batch_idx)
+
+    # Early exit if we don't need to copy
+    if not copy_mask:
+        return
+
+    # Load source and destination indices
+    src_idx = tl.load(cache_indices_ptr + batch_idx)
+    dst_idx = tl.load(mamba_pool_copy_indices_ptr + batch_idx)
+
+    # Copy conv_states
+    # Each thread handles BLOCK_SIZE elements
+    for offset in range(0, conv_state_numel_per_row, BLOCK_SIZE):
+        element_indices = offset + tl.arange(0, BLOCK_SIZE)
+        mask = element_indices < conv_state_numel_per_row
+
+        src_ptr = conv_states_ptr + src_idx * conv_state_stride_0 + element_indices
+        dst_ptr = conv_states_ptr + dst_idx * conv_state_stride_0 + element_indices
+
+        data = tl.load(src_ptr, mask=mask, other=0.0)
+        tl.store(dst_ptr, data, mask=mask)
+
+    # Copy ssm_states
+    for offset in range(0, ssm_state_numel_per_row, BLOCK_SIZE):
+        element_indices = offset + tl.arange(0, BLOCK_SIZE)
+        mask = element_indices < ssm_state_numel_per_row
+
+        src_ptr = ssm_states_ptr + src_idx * ssm_state_stride_0 + element_indices
+        dst_ptr = ssm_states_ptr + dst_idx * ssm_state_stride_0 + element_indices
+
+        data = tl.load(src_ptr, mask=mask, other=0.0)
+        tl.store(dst_ptr, data, mask=mask)
+
+
+def copy_mamba_states_if_needed(
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    mamba_copy_mask: torch.Tensor,
+    mamba_pool_copy_indices: torch.Tensor,
+    batch_size: int,
+):
+    """
+    Copy mamba states using Triton kernel for better performance.
+    Args:
+        conv_states: Convolution states tensor [pool_size, ...]
+        ssm_states: SSM states tensor [pool_size, ...]
+        cache_indices: Source indices for each batch element [batch_size]
+        mamba_copy_mask: Boolean mask indicating which elements to copy [batch_size]
+        mamba_pool_copy_indices: Destination indices for each batch element [batch_size]
+        batch_size: Number of batch elements
+    """
+    conv_state_numel_per_row = conv_states[0].numel()
+    ssm_state_numel_per_row = ssm_states[0].numel()
+
+    # Choose BLOCK_SIZE based on the size of the data
+    BLOCK_SIZE = 1024
+
+    # Launch kernel with batch_size blocks
+    grid = (batch_size,)
+    mamba_state_copy_kernel[grid](
+        conv_states,
+        ssm_states,
+        cache_indices,
+        mamba_copy_mask,
+        mamba_pool_copy_indices,
+        conv_states.stride(0),
+        ssm_states.stride(0),
+        conv_state_numel_per_row,
+        ssm_state_numel_per_row,
+        BLOCK_SIZE,
+    )
 
 class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
@@ -301,6 +404,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             softplus_beta=1.0,
             softplus_threshold=20.0,
         )
+
+        # Copy mamba states using Triton kernel
+        if forward_batch.mamba_pool_copy_indices is not None:
+            copy_mamba_states_if_needed(
+                conv_states,
+                ssm_states,
+                cache_indices,
+                forward_batch.mamba_copy_mask,
+                forward_batch.mamba_pool_copy_indices,
+                forward_batch.batch_size,
+            )
 
         return core_attn_out
 

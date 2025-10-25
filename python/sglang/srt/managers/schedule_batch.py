@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
+MAMBA_COPY_MASK_MOD = 256 # TODO: pass in properly
 
 
 logger = logging.getLogger(__name__)
@@ -487,6 +488,11 @@ class Req:
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
+        self.mamba_pool_copy_ping_pong_idx: Optional[torch.Tensor] = None  # shape (2)
+        self.mamba_pool_copy_next_idx: Optional[int] = None  # 0 or 1
+        self.mamba_pool_copy_last_seqlen: Optional[int] = (
+            None  # seq len of the last cached mamba state
+        )
 
         # Check finish
         self.tokenizer = None
@@ -524,6 +530,7 @@ class Req:
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        self.actual_prefix_indices: torch.Tensor = [] # TODO: there should be a cleaner way to track this
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -710,6 +717,7 @@ class Req:
                 ),
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
+            self.actual_prefix_indices = self.prefix_indices.clone()
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -973,6 +981,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
 
+    # For hybrid GDN prefix cache
+    is_hybrid_gdn_cache: bool = False
+    mamba_pool_copy_indices: torch.Tensor = None  # shape: [b], int64
+    mamba_copy_mask: torch.Tensor = None  # shape: [b], bool
+
     # The sum of all sequence lengths
     seq_lens_sum: int = None
     # The original sequence lengths, Qwen-1M related
@@ -1056,6 +1069,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
+        is_hybrid_gdn_cache = False
+        if isinstance(tree_cache, MambaRadixCache) and not tree_cache.disable:
+            is_hybrid_gdn_cache = True
+
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
@@ -1072,6 +1089,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            is_hybrid_gdn_cache=is_hybrid_gdn_cache,
         )
 
     def batch_size(self):
@@ -1566,6 +1584,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
 
+        if self.is_hybrid_gdn_cache:
+            self.mamba_pool_copy_indices = torch.tensor(
+                [
+                    req.mamba_pool_copy_ping_pong_idx[req.mamba_pool_copy_next_idx]
+                    for req in self.reqs
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.mamba_copy_mask = torch.tensor(
+                [sl % MAMBA_COPY_MASK_MOD == 0 for sl in self.seq_lens],
+                dtype=torch.bool,
+                device=self.device,
+            )
+
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:
             draft_input: EagleDraftInput = self.spec_info
@@ -1754,6 +1787,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
+            mamba_pool_copy_indices=self.mamba_pool_copy_indices,
+            mamba_copy_mask=self.mamba_copy_mask,
         )
 
     def copy(self):
@@ -1831,6 +1866,10 @@ class ModelWorkerBatch:
 
     # For multimodal
     multimodal_inputs: Optional[List[MultimodalInputs]]
+
+    # For mamba copy
+    mamba_pool_copy_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_copy_mask: Optional[torch.Tensor] = None  # shape: [b], bool
 
     # For encoder-decoder
     encoder_cached: Optional[List[bool]]

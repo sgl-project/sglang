@@ -308,6 +308,18 @@ class CudaGraphRunner:
             self.out_cache_loc = torch.zeros(
                 (self.max_num_token,), dtype=self._cache_loc_dtype()
             )
+            self.mamba_pool_copy_indices = (
+                torch.zeros((self.max_bs,), dtype=torch.int64)
+                if model_runner.is_hybrid_gdn
+                and not model_runner.server_args.disable_radix_cache
+                else None
+            )
+            self.mamba_copy_mask = (
+                torch.zeros((self.max_bs,), dtype=torch.bool)
+                if model_runner.is_hybrid_gdn
+                and not model_runner.server_args.disable_radix_cache
+                else None
+            )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros(
                 (3, self.max_num_token), dtype=torch.int64
@@ -536,6 +548,14 @@ class CudaGraphRunner:
         seq_lens = self.seq_lens[:bs]
         seq_lens_cpu = self.seq_lens_cpu[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
+        mamba_pool_copy_indices = (
+            self.mamba_pool_copy_indices[:bs]
+            if self.mamba_pool_copy_indices is not None
+            else None
+        )
+        mamba_copy_mask = (
+            self.mamba_copy_mask[:bs] if self.mamba_copy_mask is not None else None
+        )
         positions = self.positions[:num_tokens]
         if self.is_encoder_decoder:
             encoder_lens = self.encoder_lens[:bs]
@@ -613,6 +633,8 @@ class CudaGraphRunner:
             attn_backend=self.model_runner.attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
+            mamba_pool_copy_indices=mamba_pool_copy_indices,
+            mamba_copy_mask=mamba_copy_mask,
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
