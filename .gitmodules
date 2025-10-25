@@ -1,0 +1,6 @@
+[submodule "3rdparty/python/sglang/multimodal_gen/csrc/attn/video_sparse_attn/tk"]
+	path = 3rdparty/python/sglang/multimodal_gen/csrc/attn/video_sparse_attn/tk
+	url = https://github.com/HazyResearch/ThunderKittens.git
+[submodule "3rdparty/python/sglang/multimodal_gen/csrc/attn/sliding_tile_attn/tk"]
+	path = 3rdparty/python/sglang/multimodal_gen/csrc/attn/sliding_tile_attn/tk
+	url = https://github.com/HazyResearch/ThunderKittens.git
