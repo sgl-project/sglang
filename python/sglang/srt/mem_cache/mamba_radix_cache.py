@@ -20,11 +20,11 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
 import heapq
-import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+from numpy import float64
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 class TreeNode:
 
     counter = 0
+    last_access_time_counter_float = float64(1.0)
 
     def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
@@ -61,7 +62,7 @@ class TreeNode:
         self.full_lock_ref = 0
         self.mamba_lock_ref = 0
         # last access time is only used for sanity check. LRU is maintained by the lru list.
-        self.last_access_time = time.monotonic()
+        self.last_access_time = get_last_access_time()
 
         self.hit_count = 0
         # store the host indices of KV cache
@@ -89,6 +90,11 @@ class TreeNode:
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
 
+
+def get_last_access_time() -> float64:
+    ret = TreeNode.last_access_time_counter_float
+    TreeNode.last_access_time_counter_float += 1.0
+    return ret
 
 class LRUList:
     def __init__(self, mamba: bool = False):
@@ -767,15 +773,18 @@ class MambaRadixCache(BasePrefixCache):
 
         # update time for matched nodes, and make nodes closer to root to be least recently used
         # this allows mamba to evict nodes closer to root first
-        self.full_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
-        self.mamba_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
+        node_update = best_last_node
+        self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+        self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
 
         # This last_access_time is for sanity check, can be deleted after validation in production
-        cur_time = time.monotonic()
-        while node:
-            node.last_access_time = cur_time
-            cur_time -= 0.0001
-            node = node.parent
+        cur_time = get_last_access_time()
+        while node_update:
+            node_update.last_access_time = cur_time
+            cur_time -= (
+                0.00001  # assuming less than 100000 nodes in a branch of the tree
+            )
+            node_update = node_update.parent
 
         return value[:best_value_len], best_last_node
 
@@ -791,7 +800,7 @@ class MambaRadixCache(BasePrefixCache):
         new_node.value = child.value[:split_len]
 
         # child time should be later than parent's time for mamba tombstone
-        child.last_access_time = time.monotonic()
+        child.last_access_time = get_last_access_time()
 
         self.full_lru_list.remove_node(child)
         if child.mamba_value is not None:
@@ -819,7 +828,7 @@ class MambaRadixCache(BasePrefixCache):
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first
         assert mamba_value is not None, "Mamba value should not be None here."
-        node.last_access_time = time.monotonic()
+        node.last_access_time = get_last_access_time()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
             if node.mamba_value is not None:
@@ -832,7 +841,7 @@ class MambaRadixCache(BasePrefixCache):
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = time.monotonic()
+            node.last_access_time = get_last_access_time()
             self.full_lru_list.reset_node_mru(node)
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
@@ -856,17 +865,21 @@ class MambaRadixCache(BasePrefixCache):
             new_node.value = value
             new_node.mamba_value = mamba_value
             self.full_lru_list.insert_mru(new_node)
-            self.full_evictable_size_ += len(value)
-            self.mamba_evictable_size_ += len(mamba_value)
             self.mamba_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
+            self.full_evictable_size_ += len(value)
+            self.mamba_evictable_size_ += len(mamba_value)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
-            self.mamba_evictable_size_ += len(mamba_value)
+            self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
-        else:
+            self.mamba_evictable_size_ += len(mamba_value)
+            node.last_access_time = get_last_access_time()
+        else: # mamba value already exists
             mamba_value_exist = True
+            self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.reset_node_mru(node)
+            node.last_access_time = get_last_access_time()
 
         return total_prefix_length, mamba_value_exist
 
