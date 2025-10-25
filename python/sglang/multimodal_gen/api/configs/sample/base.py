@@ -366,15 +366,15 @@ class SamplingParams:
             return
 
         # Get fields defined directly in the subclass (not inherited)
-        subclass_defined_fields = set(type(self).__annotations__.keys())
+        # subclass_defined_fields = set(type(self).__annotations__.keys())
 
-        # Create a default instance of the base class for comparison
-        default_params = SamplingParams()
+        # Compare against current instance to avoid constructing a default instance
+        current_params = self
 
         for field in dataclasses.fields(user_params):
             field_name = field.name
             user_value = getattr(user_params, field_name)
-            default_value = getattr(default_params, field_name)
+            default_value = getattr(current_params, field_name)
 
             # A field is considered user-modified if its value is different from
             # the default, with an exception for `output_file_name` which is
@@ -384,8 +384,7 @@ class SamplingParams:
                 if field_name != "output_file_name"
                 else user_params.output_file_path is not None
             )
-
-            if is_user_modified and field_name not in subclass_defined_fields:
+            if is_user_modified:
                 if hasattr(self, field_name):
                     setattr(self, field_name, user_value)
 

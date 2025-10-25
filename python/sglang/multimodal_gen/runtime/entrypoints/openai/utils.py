@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torchvision
 from einops import rearrange
+from fastapi import UploadFile
 
 from sglang.multimodal_gen.api.configs.sample.base import DataType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -63,3 +64,12 @@ def _parse_size(size: str) -> tuple[int, int]:
     except Exception:
         # Fallback to default portrait 720x1280
         return 720, 1280
+
+
+# Helpers
+async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    content = await upload.read()
+    with open(target_path, "wb") as f:
+        f.write(content)
+    return target_path

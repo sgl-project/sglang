@@ -1,6 +1,5 @@
 from sglang.multimodal_gen.api.configs.pipelines import PipelineConfig
 from sglang.multimodal_gen.api.configs.sample import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
-from sglang.multimodal_gen.version import __version__
 
-__all__ = ["DiffGenerator", "PipelineConfig", "SamplingParams", "__version__"]
+__all__ = ["DiffGenerator", "PipelineConfig", "SamplingParams"]

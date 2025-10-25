@@ -1,18 +1,35 @@
 import asyncio
+import json
 import os
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Path, Query
+import imageio
+import numpy as np
+import torch
+import torchvision
+from einops import rearrange
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from sglang.multimodal_gen.api.configs.sample.base import (
+    DataType,
     SamplingParams,
     generate_request_id,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
+    _save_upload_to_path,
     post_process_sample,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -47,6 +64,8 @@ class VideoGenerationsRequest(BaseModel):
     model: Optional[str] = None
     seconds: Optional[int] = 4
     size: Optional[str] = "720x1280"
+    fps: Optional[int] = None
+    num_frames: Optional[int] = None
 
 
 class VideoListResponse(BaseModel):
@@ -65,18 +84,25 @@ def _build_sampling_params_from_request(
 ) -> SamplingParams:
     width, height = _parse_size(request.size or "720x1280")
     seconds = request.seconds if request.seconds is not None else 4
-    fps = 24  # TODO: allow user control of fps
+    # Prefer user-provided fps/num_frames from request; fallback to defaults
+    fps_default = 24
+    fps = request.fps if request.fps is not None else fps_default
+    # If user provides num_frames, use it directly; otherwise derive from seconds * fps
+    derived_num_frames = fps * seconds
+    num_frames = (
+        request.num_frames if request.num_frames is not None else derived_num_frames
+    )
     server_args = get_global_server_args()
     # TODO: should we cache this sampling_params?
     sampling_params = SamplingParams.from_pretrained(server_args.model_path)
     user_params = SamplingParams(
         request_id=request_id,
         prompt=request.prompt,
-        num_frames=fps * seconds,
+        num_frames=num_frames,
         fps=fps,
         width=width,
         height=height,
-        output_file_name=request.input_reference,
+        image_path=request.input_reference,
         save_output=True,
     )
     sampling_params = sampling_params.from_user_sampling_params(user_params)
@@ -134,18 +160,84 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
 
 # TODO: support image to video generation
 @router.post("", response_model=VideoResponse)
-async def create_video(request: VideoGenerationsRequest):
-    logger.debug(f"Server received from create_video endpoint: {request=}")
-
+async def create_video(
+    request: Request,
+    # multipart/form-data fields (optional; used only when content-type is multipart)
+    prompt: Optional[str] = Form(None),
+    input_reference: Optional[UploadFile] = File(None),
+    model: Optional[str] = Form(None),
+    seconds: Optional[int] = Form(None),
+    size: Optional[str] = Form(None),
+    fps: Optional[int] = Form(None),
+    num_frames: Optional[int] = Form(None),
+    extra_body: Optional[str] = Form(None),
+):
+    content_type = request.headers.get("content-type", "").lower()
     request_id = generate_request_id()
-    sampling_params = _build_sampling_params_from_request(request_id, request)
-    job = _video_job_from_sampling(request_id, request, sampling_params)
+
+    if "multipart/form-data" in content_type:
+        if not prompt:
+            raise HTTPException(status_code=400, detail="prompt is required")
+        if input_reference is None:
+            raise HTTPException(
+                status_code=400, detail="input_reference file is required"
+            )
+
+        uploads_dir = os.path.join("outputs", "uploads")
+        os.makedirs(uploads_dir, exist_ok=True)
+        input_path = os.path.join(
+            uploads_dir, f"{request_id}_{input_reference.filename}"
+        )
+        await _save_upload_to_path(input_reference, input_path)
+
+        # Parse extra_body JSON (if provided in multipart form) to get fps/num_frames overrides
+        extra_from_form: Dict[str, Any] = {}
+        if extra_body:
+            try:
+                extra_from_form = json.loads(extra_body)
+            except Exception:
+                extra_from_form = {}
+
+        fps_val = fps if fps is not None else extra_from_form.get("fps")
+        num_frames_val = (
+            num_frames if num_frames is not None else extra_from_form.get("num_frames")
+        )
+
+        req = VideoGenerationsRequest(
+            prompt=prompt,
+            input_reference=input_path,
+            model=model,
+            seconds=seconds if seconds is not None else 4,
+            size=size or "720x1280",
+            fps=fps_val,
+            num_frames=num_frames_val,
+        )
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            # If client uses extra_body, merge it into the top-level payload
+            payload: Dict[str, Any] = dict(body or {})
+            extra = payload.pop("extra_body", None)
+            if isinstance(extra, dict):
+                # Shallow-merge: only keys like fps/num_frames are expected
+                payload.update(extra)
+            req = VideoGenerationsRequest(**payload)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+
+    logger.debug(f"Server received from create_video endpoint: req={req}")
+
+    sampling_params = _build_sampling_params_from_request(request_id, req)
+    job = _video_job_from_sampling(request_id, req, sampling_params)
     async with VIDEO_LOCK:
         VIDEO_JOBS[request_id] = job
 
     # Build Req for scheduler
     batch = prepare_request(
-        prompt=request.prompt,
+        prompt=req.prompt,
         server_args=get_global_server_args(),
         sampling_params=sampling_params,
     )
