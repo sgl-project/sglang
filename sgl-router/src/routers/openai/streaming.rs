@@ -1492,6 +1492,7 @@ pub(super) async fn handle_streaming_response(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,
     mcp_manager: Option<&Arc<crate::mcp::McpClientManager>>,
+    mcp_proxy_config: Option<crate::config::types::McpProxyConfig>,
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
@@ -1503,7 +1504,7 @@ pub(super) async fn handle_streaming_response(
 ) -> Response {
     // Check if MCP is active for this request
     let req_mcp_manager = if let Some(ref tools) = original_body.tools {
-        mcp_manager_from_request_tools(tools.as_slice()).await
+        mcp_manager_from_request_tools(tools.as_slice(), mcp_proxy_config).await
     } else {
         None
     };

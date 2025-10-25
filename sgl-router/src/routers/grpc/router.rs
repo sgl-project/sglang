@@ -62,6 +62,8 @@ pub struct GrpcRouter {
     conversation_item_storage: SharedConversationItemStorage,
     // Optional MCP manager for tool execution (enabled via SGLANG_MCP_CONFIG env var)
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    // MCP proxy configuration for request-scoped MCP managers
+    mcp_proxy_config: Option<crate::config::types::McpProxyConfig>,
     // Background task handles for cancellation support (includes gRPC client for Python abort)
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 }
@@ -98,13 +100,18 @@ impl GrpcRouter {
         let mcp_manager = match std::env::var("SGLANG_MCP_CONFIG").ok() {
             Some(path) if !path.trim().is_empty() => {
                 match crate::mcp::McpConfig::from_file(&path).await {
-                    Ok(cfg) => match crate::mcp::McpClientManager::new(cfg).await {
-                        Ok(mgr) => Some(Arc::new(mgr)),
-                        Err(err) => {
-                            tracing::warn!("Failed to initialize MCP manager: {}", err);
-                            None
+                    Ok(mut cfg) => {
+                        if let Some(proxy_override) = ctx.router_config.mcp_proxy.clone() {
+                            cfg.proxy = Some(proxy_override);
                         }
-                    },
+                        match crate::mcp::McpClientManager::new(cfg).await {
+                            Ok(mgr) => Some(Arc::new(mgr)),
+                            Err(err) => {
+                                tracing::warn!("Failed to initialize MCP manager: {}", err);
+                                None
+                            }
+                        }
+                    }
                     Err(err) => {
                         tracing::warn!("Failed to load MCP config from '{}': {}", path, err);
                         None
@@ -149,6 +156,7 @@ impl GrpcRouter {
             conversation_storage,
             conversation_item_storage,
             mcp_manager,
+            mcp_proxy_config: ctx.router_config.mcp_proxy.clone(),
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -286,6 +294,7 @@ impl RouterTrait for GrpcRouter {
             self.conversation_storage.clone(),
             self.conversation_item_storage.clone(),
             self.background_tasks.clone(),
+            self.mcp_proxy_config.clone(),
         )
         .await
     }

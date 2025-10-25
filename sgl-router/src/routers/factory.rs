@@ -133,6 +133,7 @@ impl RouterFactory {
             ctx.response_storage.clone(),
             ctx.conversation_storage.clone(),
             ctx.conversation_item_storage.clone(),
+            ctx.router_config.mcp_proxy.clone(),
         )
         .await?;
 

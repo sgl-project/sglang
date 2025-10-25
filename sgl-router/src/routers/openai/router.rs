@@ -89,6 +89,8 @@ pub struct OpenAIRouter {
     conversation_item_storage: SharedConversationItemStorage,
     /// Optional MCP manager (enabled via config presence)
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    /// MCP proxy configuration for request-scoped MCP managers
+    mcp_proxy_config: Option<crate::config::types::McpProxyConfig>,
 }
 
 impl std::fmt::Debug for OpenAIRouter {
@@ -114,6 +116,7 @@ impl OpenAIRouter {
         response_storage: SharedResponseStorage,
         conversation_storage: SharedConversationStorage,
         conversation_item_storage: SharedConversationItemStorage,
+        mcp_proxy_config: Option<crate::config::types::McpProxyConfig>,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
@@ -142,13 +145,18 @@ impl OpenAIRouter {
         let mcp_manager = match std::env::var("SGLANG_MCP_CONFIG").ok() {
             Some(path) if !path.trim().is_empty() => {
                 match crate::mcp::McpConfig::from_file(&path).await {
-                    Ok(cfg) => match crate::mcp::McpClientManager::new(cfg).await {
-                        Ok(mgr) => Some(Arc::new(mgr)),
-                        Err(err) => {
-                            warn!("Failed to initialize MCP manager: {}", err);
-                            None
+                    Ok(mut cfg) => {
+                        if let Some(proxy_override) = mcp_proxy_config.clone() {
+                            cfg.proxy = Some(proxy_override);
                         }
-                    },
+                        match crate::mcp::McpClientManager::new(cfg).await {
+                            Ok(mgr) => Some(Arc::new(mgr)),
+                            Err(err) => {
+                                warn!("Failed to initialize MCP manager: {}", err);
+                                None
+                            }
+                        }
+                    }
                     Err(err) => {
                         warn!("Failed to load MCP config from '{}': {}", path, err);
                         None
@@ -168,6 +176,7 @@ impl OpenAIRouter {
             conversation_storage,
             conversation_item_storage,
             mcp_manager,
+            mcp_proxy_config,
         })
     }
 
@@ -243,7 +252,7 @@ impl OpenAIRouter {
     ) -> Response {
         // Check if MCP is active for this request
         let req_mcp_manager = if let Some(ref tools) = original_body.tools {
-            mcp_manager_from_request_tools(tools.as_slice()).await
+            mcp_manager_from_request_tools(tools.as_slice(), self.mcp_proxy_config.clone()).await
         } else {
             None
         };
@@ -986,6 +995,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 &self.client,
                 &self.circuit_breaker,
                 self.mcp_manager.as_ref(),
+                self.mcp_proxy_config.clone(),
                 self.response_storage.clone(),
                 self.conversation_storage.clone(),
                 self.conversation_item_storage.clone(),

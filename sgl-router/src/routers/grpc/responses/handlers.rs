@@ -66,6 +66,7 @@ pub async fn route_responses(
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
+    mcp_proxy_config: Option<crate::config::types::McpProxyConfig>,
 ) -> Response {
     // 1. Validate mutually exclusive parameters
     if request.previous_response_id.is_some() && request.conversation.is_some() {
@@ -113,6 +114,7 @@ pub async fn route_responses(
             response_storage,
             conversation_storage,
             conversation_item_storage,
+            mcp_proxy_config,
         )
         .await
     } else if is_background {
@@ -126,6 +128,7 @@ pub async fn route_responses(
             conversation_storage,
             conversation_item_storage,
             background_tasks,
+            mcp_proxy_config,
         )
         .await
     } else {
@@ -140,6 +143,7 @@ pub async fn route_responses(
             conversation_item_storage,
             None, // No response_id for sync
             None, // No background_tasks for sync
+            mcp_proxy_config,
         )
         .await
     }
@@ -169,6 +173,7 @@ async fn route_responses_sync(
     conversation_item_storage: SharedConversationItemStorage,
     response_id: Option<String>,
     background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
+    mcp_proxy_config: Option<crate::config::types::McpProxyConfig>,
 ) -> Response {
     match route_responses_internal(
         pipeline,
@@ -181,6 +186,7 @@ async fn route_responses_sync(
         conversation_item_storage,
         response_id,
         background_tasks,
+        mcp_proxy_config,
     )
     .await
     {
@@ -211,6 +217,7 @@ async fn route_responses_internal(
     conversation_item_storage: SharedConversationItemStorage,
     response_id: Option<String>,
     background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
+    mcp_proxy_config: Option<crate::config::types::McpProxyConfig>,
 ) -> Result<ResponsesResponse, String> {
     // 1. Load conversation history and build modified request
     let modified_request = load_conversation_history(
@@ -223,7 +230,7 @@ async fn route_responses_internal(
 
     // 2. Check if request has MCP tools - if so, use tool loop
     let responses_response = if let Some(tools) = &request.tools {
-        if let Some(mcp_manager) = create_mcp_manager_from_request(tools).await {
+        if let Some(mcp_manager) = create_mcp_manager_from_request(tools, mcp_proxy_config).await {
             debug!("MCP tools detected, using tool loop");
 
             // Execute with MCP tool loop
@@ -304,6 +311,7 @@ async fn route_responses_background(
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
+    mcp_proxy_config: Option<crate::config::types::McpProxyConfig>,
 ) -> Response {
     // Generate response_id for background tracking
     let response_id = format!("resp_{}", Uuid::new_v4());
@@ -384,6 +392,7 @@ async fn route_responses_background(
             conversation_item_storage_clone,
             Some(response_id_clone.clone()),
             Some(background_tasks_clone.clone()),
+            mcp_proxy_config,
         )
         .await
         {
@@ -434,6 +443,7 @@ async fn route_responses_streaming(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
+    mcp_proxy_config: Option<crate::config::types::McpProxyConfig>,
 ) -> Response {
     // 1. Load conversation history
     let modified_request = match load_conversation_history(
@@ -461,7 +471,7 @@ async fn route_responses_streaming(
 
     // 2. Check if request has MCP tools - if so, use streaming tool loop
     if let Some(tools) = &request.tools {
-        if let Some(mcp_manager) = create_mcp_manager_from_request(tools).await {
+        if let Some(mcp_manager) = create_mcp_manager_from_request(tools, mcp_proxy_config).await {
             debug!("MCP tools detected in streaming mode, using streaming tool loop");
 
             return execute_tool_loop_streaming(

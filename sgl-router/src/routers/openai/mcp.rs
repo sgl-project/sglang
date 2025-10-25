@@ -131,6 +131,7 @@ impl FunctionCallInProgress {
 /// Build a request-scoped MCP manager from request tools, if present.
 pub async fn mcp_manager_from_request_tools(
     tools: &[ResponseTool],
+    proxy_config: Option<crate::config::types::McpProxyConfig>,
 ) -> Option<Arc<McpClientManager>> {
     let tool = tools
         .iter()
@@ -161,6 +162,7 @@ pub async fn mcp_manager_from_request_tools(
     };
     let cfg = crate::mcp::McpConfig {
         servers: vec![crate::mcp::McpServerConfig { name, transport }],
+        proxy: proxy_config,
     };
     match McpClientManager::new(cfg).await {
         Ok(mgr) => Some(Arc::new(mgr)),
