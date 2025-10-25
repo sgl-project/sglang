@@ -285,6 +285,8 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.enable_cudagraph_gc
         ), graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
+            old_ca_disable = self.model_runner.tp_group.ca_comm.disabled
+            self.model_runner.tp_group.ca_comm.disabled = True
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
@@ -312,6 +314,7 @@ class PiecewiseCudaGraphRunner:
 
                 # Save gemlite cache after each capture
                 save_gemlite_cache()
+            self.model_runner.tp_group.ca_comm.disabled = old_ca_disable
 
     def capture_one_batch_size(self, num_tokens: int):
         stream = self.stream
