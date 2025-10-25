@@ -4,9 +4,9 @@ from typing import Any
 
 import torch
 
-from sgl_diffusion.api.configs.models.base import ArchConfig, ModelConfig
-from sgl_diffusion.runtime.layers.quantization import QuantizationConfig
-from sgl_diffusion.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.api.configs.models.base import ArchConfig, ModelConfig
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 @dataclass

@@ -4,28 +4,20 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import (
-    APIRouter,
-    File,
-    Form,
-    HTTPException,
-    Path,
-    Query,
-    UploadFile,
-)
+from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from sgl_diffusion.api.configs.sample.base import (
+from sglang.multimodal_gen.api.configs.sample.base import (
     SamplingParams,
     generate_request_id,
 )
-from sgl_diffusion.runtime.entrypoints.openai.utils import _parse_size
-from sgl_diffusion.runtime.entrypoints.utils import prepare_request
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.scheduler_client import scheduler_client
-from sgl_diffusion.runtime.server_args import get_global_server_args
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import _parse_size
+from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
@@ -138,7 +130,7 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     return target_path
 
 
-from sgl_diffusion.runtime.entrypoints.openai.utils import post_process_sample
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import post_process_sample
 
 
 @router.post("/generations", response_model=ImageResponse)

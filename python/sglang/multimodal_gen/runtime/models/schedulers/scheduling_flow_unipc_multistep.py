@@ -16,7 +16,7 @@ from diffusers.schedulers.scheduling_utils import (
 )
 from diffusers.utils import deprecate
 
-from sgl_diffusion.runtime.models.schedulers.base import BaseScheduler
+from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
 
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):

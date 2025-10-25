@@ -9,16 +9,16 @@ from typing import cast
 
 import torch
 
-from sgl_diffusion.runtime.layers.attention.backends.attention_backend import (
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
 )
-from sgl_diffusion.runtime.platforms import (
+from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sgl_diffusion.runtime.server_args import get_global_server_args
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import STR_BACKEND_ENV_VAR, resolve_obj_by_qualname
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import STR_BACKEND_ENV_VAR, resolve_obj_by_qualname
 
 logger = init_logger(__name__)
 

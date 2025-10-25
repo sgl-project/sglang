@@ -15,17 +15,17 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 
-from sgl_diffusion.api.configs.models.encoders.qwen_image import Qwen2_5VLConfig
-from sgl_diffusion.runtime.layers.attention import LocalAttention
-from sgl_diffusion.runtime.layers.linear import (
+from sglang.multimodal_gen.api.configs.models.encoders.qwen_image import Qwen2_5VLConfig
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from sgl_diffusion.runtime.layers.quantization import QuantizationConfig
-from sgl_diffusion.runtime.loader.weight_utils import default_weight_loader
-from sgl_diffusion.runtime.models.encoders.base import TextEncoder
-from sgl_diffusion.runtime.platforms import AttentionBackendEnum
-from sgl_diffusion.runtime.utils.common import add_prefix
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
 # coding=utf-8
 # Adapted from
@@ -52,7 +52,7 @@ from sgl_diffusion.runtime.utils.common import add_prefix
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
-from typing import Callable, Iterable, List, Optional, Tuple, Union, Unpack
+from typing import Callable, Iterable, Optional, Tuple, Union, Unpack
 
 import torch
 import torch.nn as nn

@@ -19,7 +19,7 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torch import nn
 
-from sgl_diffusion.api.configs.models.vaes.flux import FluxVAEConfig
+from sglang.multimodal_gen.api.configs.models.vaes.flux import FluxVAEConfig
 
 
 class AutoencoderKL(nn.Module):

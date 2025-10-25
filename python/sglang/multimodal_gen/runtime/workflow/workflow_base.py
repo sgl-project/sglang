@@ -1,10 +1,10 @@
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
-from sgl_diffusion.runtime.pipelines import ComposedPipelineBase, build_pipeline
-from sgl_diffusion.runtime.pipelines.pipeline_registry import PipelineType
-from sgl_diffusion.runtime.server_args import ExecutionMode, ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.pipelines import ComposedPipelineBase, build_pipeline
+from sglang.multimodal_gen.runtime.pipelines.pipeline_registry import PipelineType
+from sglang.multimodal_gen.runtime.server_args import ExecutionMode, ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -175,7 +175,7 @@ class WorkflowBase(ABC):
             or None if no workflow is available for the given mode.
         """
         if server_args.mode == ExecutionMode.PREPROCESS:
-            from sgl_diffusion.runtime.workflow.preprocess.preprocess_workflow import (
+            from sglang.multimodal_gen.runtime.workflow.preprocess.preprocess_workflow import (
                 PreprocessWorkflow,
             )
 

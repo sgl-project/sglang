@@ -5,15 +5,15 @@ from typing import TypedDict
 
 import torch
 
-from sgl_diffusion.api.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sgl_diffusion.api.configs.models.dits import HunyuanVideoConfig
-from sgl_diffusion.api.configs.models.encoders import (
+from sglang.multimodal_gen.api.configs.models import DiTConfig, EncoderConfig, VAEConfig
+from sglang.multimodal_gen.api.configs.models.dits import HunyuanVideoConfig
+from sglang.multimodal_gen.api.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPTextConfig,
     LlamaConfig,
 )
-from sgl_diffusion.api.configs.models.vaes import HunyuanVAEConfig
-from sgl_diffusion.api.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.api.configs.models.vaes import HunyuanVAEConfig
+from sglang.multimodal_gen.api.configs.pipelines.base import PipelineConfig
 
 PROMPT_TEMPLATE_ENCODE_VIDEO = (
     "<|start_header_id|>system<|end_header_id|>\n\nDescribe the video by detailing the following aspects: "

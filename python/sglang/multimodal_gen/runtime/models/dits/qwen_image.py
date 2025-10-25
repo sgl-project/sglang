@@ -14,14 +14,14 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
-from sgl_diffusion.api.configs.models.dits.qwenimage import QwenImageDitConfig
-from sgl_diffusion.runtime.layers.attention import LocalAttention
-from sgl_diffusion.runtime.layers.layernorm import LayerNorm, RMSNorm
-from sgl_diffusion.runtime.layers.linear import ReplicatedLinear
-from sgl_diffusion.runtime.layers.triton_ops import apply_rotary_embedding
-from sgl_diffusion.runtime.models.dits.base import CachableDiT
-from sgl_diffusion.runtime.platforms import AttentionBackendEnum
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.api.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embedding
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 

@@ -32,8 +32,8 @@ from typing import Any
 import torch
 from torch.distributed import ReduceOp
 
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import find_nccl_library
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import find_nccl_library
 
 logger = init_logger(__name__)
 

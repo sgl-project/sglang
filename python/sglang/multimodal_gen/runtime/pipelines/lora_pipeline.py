@@ -7,19 +7,19 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import load_file
 
-from sgl_diffusion.runtime.distributed import get_local_torch_device
-from sgl_diffusion.runtime.layers.lora.linear import (
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
     get_lora_layer,
     replace_submodule,
 )
-from sgl_diffusion.runtime.loader.utils import get_param_names_mapping
-from sgl_diffusion.runtime.pipelines.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.hf_diffusers_utils import maybe_download_lora
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

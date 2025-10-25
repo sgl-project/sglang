@@ -18,28 +18,28 @@ from torch.distributed import init_device_mesh
 from transformers import AutoImageProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from sgl_diffusion.api.configs.models import EncoderConfig
-from sgl_diffusion.runtime.distributed import get_local_torch_device
-from sgl_diffusion.runtime.loader.fsdp_load import (
+from sglang.multimodal_gen.api.configs.models import EncoderConfig
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     maybe_load_fsdp_model,
     shard_model,
 )
-from sgl_diffusion.runtime.loader.utils import set_default_torch_dtype
-from sgl_diffusion.runtime.loader.weight_utils import (
+from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
-from sgl_diffusion.runtime.models.registry import ModelRegistry
-from sgl_diffusion.runtime.platforms import current_platform
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.hf_diffusers_utils import (
+from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_config,
     get_diffusers_config,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 

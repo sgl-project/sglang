@@ -11,7 +11,6 @@ Credits: OpenAI kernel team
 # ──────────────────────────── SPARSE ADDITION BEGIN ───────────────────────────
 import math  # small utility needed by the sparse wrapper
 
-import pytest
 import torch
 import triton
 import triton.language as tl

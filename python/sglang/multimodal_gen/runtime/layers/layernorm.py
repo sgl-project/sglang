@@ -7,13 +7,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sgl_diffusion.runtime.layers.custom_op import CustomOp
-from sgl_diffusion.runtime.layers.triton_ops import (
+from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fused_scale_shift,
     norm_infer,
     rms_norm_fn,
 )
-from sgl_diffusion.runtime.utils.common import (
+from sglang.multimodal_gen.runtime.utils.common import (
     get_bool_env_var,
     is_cpu,
     is_cuda,

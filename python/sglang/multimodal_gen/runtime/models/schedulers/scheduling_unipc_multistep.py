@@ -32,7 +32,7 @@ from diffusers.schedulers.scheduling_utils import (
 )
 from diffusers.utils import deprecate, is_scipy_available
 
-from sgl_diffusion.runtime.models.schedulers.base import BaseScheduler
+from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
 
 if is_scipy_available():
     import scipy.stats

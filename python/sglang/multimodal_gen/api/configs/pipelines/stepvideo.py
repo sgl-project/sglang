@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from sgl_diffusion.api.configs.models import DiTConfig, VAEConfig
-from sgl_diffusion.api.configs.models.dits import StepVideoConfig
-from sgl_diffusion.api.configs.models.vaes import StepVideoVAEConfig
-from sgl_diffusion.api.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.api.configs.models import DiTConfig, VAEConfig
+from sglang.multimodal_gen.api.configs.models.dits import StepVideoConfig
+from sglang.multimodal_gen.api.configs.models.vaes import StepVideoVAEConfig
+from sglang.multimodal_gen.api.configs.pipelines.base import PipelineConfig
 
 
 @dataclass

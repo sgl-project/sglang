@@ -3,28 +3,22 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-import imageio
-import numpy as np
-import torch
-import torchvision
-from einops import rearrange
 from fastapi import APIRouter, HTTPException, Path, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from sgl_diffusion.api.configs.sample.base import (
-    DataType,
+from sglang.multimodal_gen.api.configs.sample.base import (
     SamplingParams,
     generate_request_id,
 )
-from sgl_diffusion.runtime.entrypoints.openai.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     post_process_sample,
 )
-from sgl_diffusion.runtime.entrypoints.utils import prepare_request
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.server_args import get_global_server_args
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
@@ -112,7 +106,7 @@ def _video_job_from_sampling(
 
 
 async def _dispatch_job_async(job_id: str, batch: Req) -> None:
-    from sgl_diffusion.runtime.scheduler_client import scheduler_client
+    from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
 
     try:
         result = await scheduler_client.forward([batch])

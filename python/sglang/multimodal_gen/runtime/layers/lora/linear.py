@@ -12,14 +12,14 @@ from torch.distributed._composable.fsdp import (
 )
 from torch.distributed.tensor import DTensor
 
-from sgl_diffusion.runtime.distributed import (
+from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_rank,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sgl_diffusion.runtime.layers.linear import (
+from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
     MergedColumnParallelLinear,
@@ -27,10 +27,10 @@ from sgl_diffusion.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sgl_diffusion.runtime.layers.vocab_parallel_embedding import (
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from sgl_diffusion.utils import get_mixed_precision_state
+from sglang.multimodal_gen.utils import get_mixed_precision_state
 
 torch._dynamo.config.recompile_limit = 16
 

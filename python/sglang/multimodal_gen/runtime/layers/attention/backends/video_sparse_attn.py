@@ -12,14 +12,14 @@ except ImportError:
 
 from typing import Any
 
-from sgl_diffusion.runtime.distributed import get_sp_group
-from sgl_diffusion.runtime.layers.attention.backends.attention_backend import (
+from sglang.multimodal_gen.runtime.distributed import get_sp_group
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 VSA_TILE_SIZE = (4, 4, 4)

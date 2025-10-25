@@ -13,11 +13,11 @@ import math
 logging.getLogger("imageio").setLevel(logging.WARNING)
 logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
 
-from sgl_diffusion.api.configs.sample.base import DataType, SamplingParams
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import shallow_asdict
+from sglang.multimodal_gen.api.configs.sample.base import DataType, SamplingParams
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import shallow_asdict
 
 logger = init_logger(__name__)
 

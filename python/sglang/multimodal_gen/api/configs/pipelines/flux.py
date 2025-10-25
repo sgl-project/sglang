@@ -3,19 +3,19 @@ from typing import Callable
 
 import torch
 
-from sgl_diffusion.api.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sgl_diffusion.api.configs.models.dits.flux import FluxConfig
-from sgl_diffusion.api.configs.models.encoders import (
+from sglang.multimodal_gen.api.configs.models import DiTConfig, EncoderConfig, VAEConfig
+from sglang.multimodal_gen.api.configs.models.dits.flux import FluxConfig
+from sglang.multimodal_gen.api.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPTextConfig,
     T5Config,
 )
-from sgl_diffusion.api.configs.models.vaes.flux import FluxVAEConfig
-from sgl_diffusion.api.configs.pipelines.base import (
+from sglang.multimodal_gen.api.configs.models.vaes.flux import FluxVAEConfig
+from sglang.multimodal_gen.api.configs.pipelines.base import (
     PipelineConfig,
     preprocess_text,
 )
-from sgl_diffusion.api.configs.pipelines.hunyuan import (
+from sglang.multimodal_gen.api.configs.pipelines.hunyuan import (
     clip_postprocess_text,
     clip_preprocess_text,
 )

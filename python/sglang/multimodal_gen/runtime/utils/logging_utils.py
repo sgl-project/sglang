@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/logger.py
-"""Logging configuration for sgl_diffusion."""
+"""Logging configuration for sglang.multimodal_gen."""
 import argparse
 import datetime
 import json
@@ -15,7 +15,7 @@ from os import path
 from types import MethodType
 from typing import Any, cast
 
-import sgl_diffusion.envs as envs
+import sglang.multimodal_gen.envs as envs
 
 SGL_DIFFUSION_CONFIGURE_LOGGING = envs.SGL_DIFFUSION_CONFIGURE_LOGGING
 SGL_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGL_DIFFUSION_LOGGING_CONFIG_PATH
@@ -41,7 +41,7 @@ _DATE_FORMAT = "%m-%d %H:%M:%S"
 DEFAULT_LOGGING_CONFIG = {
     "formatters": {
         "sgl_diffusion": {
-            "class": "sgl_diffusion.runtime.utils.logging_utils.ColoredFormatter",
+            "class": "sglang.multimodal_gen.runtime.utils.logging_utils.ColoredFormatter",
             "datefmt": _DATE_FORMAT,
             "format": _FORMAT,
         },
@@ -265,8 +265,8 @@ def _configure_sgl_diffusion_root_logger() -> None:
 
     for formatter in logging_config.get("formatters", {}).values():
         # This provides backwards compatibility after #10134.
-        if formatter.get("class") == "sgl_diffusion.logging.NewLineFormatter":
-            formatter["class"] = "sgl_diffusion.logging_utils.NewLineFormatter"
+        if formatter.get("class") == "sglang.multimodal_gen.logging.NewLineFormatter":
+            formatter["class"] = "sglang.multimodal_gen.logging_utils.NewLineFormatter"
 
     if logging_config:
         dictConfig(logging_config)

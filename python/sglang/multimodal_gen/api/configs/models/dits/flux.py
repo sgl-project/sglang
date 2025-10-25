@@ -2,7 +2,7 @@
 from dataclasses import dataclass, field
 from typing import Tuple
 
-from sgl_diffusion.api.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.api.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 
 @dataclass

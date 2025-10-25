@@ -7,16 +7,16 @@ import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
 
-from sgl_diffusion.runtime.models.vision_utils import load_image, load_video
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.pipelines.stages.base import PipelineStage
-from sgl_diffusion.runtime.pipelines.stages.validators import (
+from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines.stages.validators import (
     StageValidators,
     VerificationResult,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import best_output_size
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import best_output_size
 
 logger = init_logger(__name__)
 

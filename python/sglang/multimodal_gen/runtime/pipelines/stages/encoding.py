@@ -5,17 +5,17 @@ Encoding stage for diffusion pipelines.
 
 import torch
 
-from sgl_diffusion.runtime.distributed import get_local_torch_device
-from sgl_diffusion.runtime.models.vaes.common import ParallelTiledVAE
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.pipelines.stages.base import PipelineStage
-from sgl_diffusion.runtime.pipelines.stages.validators import (
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines.stages.validators import (
     V,  # Import validators
 )
-from sgl_diffusion.runtime.pipelines.stages.validators import VerificationResult
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.pipelines.stages.validators import VerificationResult
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 

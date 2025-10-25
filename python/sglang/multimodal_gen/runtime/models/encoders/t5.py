@@ -27,25 +27,25 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sgl_diffusion.api.configs.models.encoders import (
+from sglang.multimodal_gen.api.configs.models.encoders import (
     BaseEncoderOutput,
     T5Config,
 )
-from sgl_diffusion.runtime.distributed import get_tp_rank, get_tp_world_size
-from sgl_diffusion.runtime.layers.activation import get_act_fn
-from sgl_diffusion.runtime.layers.layernorm import RMSNorm
-from sgl_diffusion.runtime.layers.linear import (
+from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
+from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sgl_diffusion.runtime.layers.quantization import QuantizationConfig
-from sgl_diffusion.runtime.layers.vocab_parallel_embedding import (
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from sgl_diffusion.runtime.loader.weight_utils import default_weight_loader
-from sgl_diffusion.runtime.models.encoders.base import TextEncoder
-from sgl_diffusion.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 class AttentionType:

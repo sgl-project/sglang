@@ -29,23 +29,23 @@ from diffusers.models.normalization import (
 )
 from torch.nn import LayerNorm as LayerNorm
 
-from sgl_diffusion.api.configs.models.dits.flux import FluxConfig
-from sgl_diffusion.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.api.configs.models.dits.flux import FluxConfig
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 
-# from sgl_diffusion.runtime.layers.layernorm import LayerNorm as LayerNorm
-from sgl_diffusion.runtime.layers.layernorm import RMSNorm
-from sgl_diffusion.runtime.layers.linear import ReplicatedLinear
-from sgl_diffusion.runtime.layers.mlp import MLP
-from sgl_diffusion.runtime.layers.rotary_embedding import (
+# from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm as LayerNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
 )
-from sgl_diffusion.runtime.models.dits.base import CachableDiT
-from sgl_diffusion.runtime.platforms import (
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 

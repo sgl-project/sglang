@@ -13,11 +13,11 @@ from enum import Enum, auto
 
 import torch
 
-import sgl_diffusion.envs as envs
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.pipelines.stages.validators import VerificationResult
-from sgl_diffusion.runtime.server_args import ServerArgs, get_global_server_args
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.stages.validators import VerificationResult
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -70,7 +70,7 @@ class PipelineStage(ABC):
         Verify the input for the stage.
 
         Example:
-            from sgl_diffusion.runtime.pipelines.stages.validators import V, VerificationResult
+            from sglang.multimodal_gen.runtime.pipelines.stages.validators import V, VerificationResult
 
             def verify_input(self, batch, server_args):
                 result = VerificationResult()

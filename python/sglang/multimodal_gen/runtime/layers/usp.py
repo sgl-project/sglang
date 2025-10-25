@@ -4,13 +4,13 @@ import torch
 import torch.distributed._functional_collectives as ft_c
 from packaging.version import parse
 
-from sgl_diffusion.runtime.distributed.parallel_state import (
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_ulysses_parallel_world_size,
 )
 
 if TYPE_CHECKING:
-    from sgl_diffusion.runtime.layers.attention.backends.attention_backend import (
+    from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
         AttentionImpl,
     )
 

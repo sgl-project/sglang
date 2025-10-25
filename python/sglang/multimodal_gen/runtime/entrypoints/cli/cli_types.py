@@ -3,7 +3,7 @@
 
 import argparse
 
-from sgl_diffusion.utils import FlexibleArgumentParser
+from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
 class CLISubcommand:

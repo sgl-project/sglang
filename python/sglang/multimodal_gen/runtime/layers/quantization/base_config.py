@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 if TYPE_CHECKING:
-    from sgl_diffusion.runtime.layers.quantization import QuantizationMethods
+    from sglang.multimodal_gen.runtime.layers.quantization import QuantizationMethods
 else:
     QuantizationMethods = str
 

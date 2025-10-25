@@ -1,19 +1,19 @@
-from sgl_diffusion.runtime.pipelines.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sgl_diffusion.runtime.pipelines.preprocess.preprocess_stages import (
+from sglang.multimodal_gen.runtime.pipelines.preprocess.preprocess_stages import (
     TextTransformStage,
     VideoTransformStage,
 )
-from sgl_diffusion.runtime.pipelines.stages import (
+from sglang.multimodal_gen.runtime.pipelines.stages import (
     EncodingStage,
     ImageEncodingStage,
     TextEncodingStage,
 )
-from sgl_diffusion.runtime.pipelines.stages.image_encoding import (
+from sglang.multimodal_gen.runtime.pipelines.stages.image_encoding import (
     ImageVAEEncodingStage,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class PreprocessPipelineI2V(ComposedPipelineBase):

@@ -1,10 +1,10 @@
-from sgl_diffusion.runtime.distributed import (
+from sglang.multimodal_gen.runtime.distributed import (
     maybe_init_distributed_environment_and_model_parallel,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.runtime.workflow.workflow_base import WorkflowBase
-from sgl_diffusion.utils import FlexibleArgumentParser
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.workflow.workflow_base import WorkflowBase
+from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 

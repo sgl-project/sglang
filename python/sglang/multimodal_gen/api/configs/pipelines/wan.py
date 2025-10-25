@@ -4,15 +4,15 @@ from dataclasses import dataclass, field
 
 import torch
 
-from sgl_diffusion.api.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sgl_diffusion.api.configs.models.dits import WanVideoConfig
-from sgl_diffusion.api.configs.models.encoders import (
+from sglang.multimodal_gen.api.configs.models import DiTConfig, EncoderConfig, VAEConfig
+from sglang.multimodal_gen.api.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.api.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPVisionConfig,
     T5Config,
 )
-from sgl_diffusion.api.configs.models.vaes import WanVAEConfig
-from sgl_diffusion.api.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.api.configs.models.vaes import WanVAEConfig
+from sglang.multimodal_gen.api.configs.pipelines.base import PipelineConfig
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:

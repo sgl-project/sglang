@@ -3,10 +3,7 @@
 import torch
 
 try:
-    from sgl_kernel.flash_attn import (
-        flash_attn_varlen_func,
-        flash_attn_with_kvcache,
-    )
+    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
     # from a import b
     # flash_attn 3 no longer have a different API, see following commit:
@@ -16,13 +13,13 @@ except ImportError as e:
     raise e
     # flash_attn_func = flash_attn_2_func
 
-from sgl_diffusion.runtime.layers.attention.backends.attention_backend import (
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

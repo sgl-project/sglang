@@ -30,31 +30,31 @@ import torch
 from torch import nn
 
 # from ..utils import (extract_layer_index)
-from sgl_diffusion.api.configs.models.encoders import (
+from sglang.multimodal_gen.api.configs.models.encoders import (
     BaseEncoderOutput,
     LlamaConfig,
 )
-from sgl_diffusion.runtime.distributed import get_tp_world_size
-from sgl_diffusion.runtime.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 
 # from vllm.model_executor.layers.quantization import QuantizationConfig
-from sgl_diffusion.runtime.layers.attention import LocalAttention
-from sgl_diffusion.runtime.layers.layernorm import RMSNorm
-from sgl_diffusion.runtime.layers.linear import (
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sgl_diffusion.runtime.layers.quantization import QuantizationConfig
-from sgl_diffusion.runtime.layers.rotary_embedding import get_rope
-from sgl_diffusion.runtime.layers.vocab_parallel_embedding import (
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from sgl_diffusion.runtime.loader.weight_utils import (
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sgl_diffusion.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 
 
 class LlamaMLP(nn.Module):

@@ -17,7 +17,7 @@ from typing import NoReturn, TypeVar, cast
 import cloudpickle
 from torch import nn
 
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -99,7 +99,7 @@ _SGL_DIFFUSION_MODELS = _discover_and_register_models()
 _SUBPROCESS_COMMAND = [
     sys.executable,
     "-m",
-    "sgl_diffusion.runtime.models.dits.registry",
+    "sglang.multimodal_gen.runtime.models.dits.registry",
 ]
 
 _T = TypeVar("_T")
@@ -204,7 +204,7 @@ def _try_load_model_cls(
     model_arch: str,
     model: _BaseRegisteredModel,
 ) -> type[nn.Module] | None:
-    from sgl_diffusion.runtime.platforms import current_platform
+    from sglang.multimodal_gen.runtime.platforms import current_platform
 
     current_platform.verify_model_arch(model_arch)
     try:
@@ -345,7 +345,7 @@ class _ModelRegistry:
 ModelRegistry = _ModelRegistry(
     {
         model_arch: _LazyRegisteredModel(
-            module_name=f"sgl_diffusion.runtime.models.{component_name}.{mod_relname}",
+            module_name=f"sglang.multimodal_gen.runtime.models.{component_name}.{mod_relname}",
             component_name=component_name,
             class_name=cls_name,
         )

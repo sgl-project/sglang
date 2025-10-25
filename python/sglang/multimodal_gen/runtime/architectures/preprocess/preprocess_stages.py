@@ -8,17 +8,17 @@ import torchvision
 from einops import rearrange
 from torchvision import transforms
 
-from sgl_diffusion.api.configs.configs import VideoLoaderType
-from sgl_diffusion.dataset.transform import (
+from sglang.multimodal_gen.api.configs.configs import VideoLoaderType
+from sglang.multimodal_gen.dataset.transform import (
     CenterCropResizeVideo,
     TemporalRandomCrop,
 )
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import (
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import (
     PreprocessBatch,
     Req,
 )
-from sgl_diffusion.runtime.pipelines.stages.base import PipelineStage
-from sgl_diffusion.runtime.server_args import ServerArgs, WorkloadType
+from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, WorkloadType
 
 
 class VideoTransformStage(PipelineStage):

@@ -2,13 +2,13 @@
 
 import torch
 
-from sgl_diffusion.runtime.platforms import AttentionBackendEnum
-from sgl_diffusion.runtime.platforms.interface import (
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import (
     DeviceCapability,
     Platform,
     PlatformEnum,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -62,12 +62,14 @@ class MpsPlatform(Platform):
     ) -> str:
         # MPS supports SDPA (Scaled Dot-Product Attention) which is the most compatible
         logger.info("Using Torch SDPA backend for MPS.")
-        return "sgl_diffusion.runtime.layers.attention.backends.sdpa.SDPABackend"
+        return (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+        )
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         # Use base communicator for MPS
-        return "sgl_diffusion.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"
+        return "sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"
 
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:

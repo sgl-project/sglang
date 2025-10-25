@@ -6,8 +6,8 @@ import unittest
 
 import torch
 
-from sgl_diffusion.runtime.entrypoints.diffusion_generator import DiffGenerator
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

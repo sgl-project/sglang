@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # TODO (will): remove this dependency
-from sgl_diffusion.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
 
 @CustomOp.register("silu_and_mul")

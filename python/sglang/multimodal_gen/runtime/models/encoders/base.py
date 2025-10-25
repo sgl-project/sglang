@@ -5,12 +5,12 @@ from dataclasses import field
 import torch
 from torch import nn
 
-from sgl_diffusion.api.configs.models.encoders import (
+from sglang.multimodal_gen.api.configs.models.encoders import (
     BaseEncoderOutput,
     ImageEncoderConfig,
     TextEncoderConfig,
 )
-from sgl_diffusion.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class TextEncoder(nn.Module, ABC):

@@ -3,26 +3,26 @@ from typing import cast
 
 from torch.utils.data import DataLoader
 
-from sgl_diffusion.api.configs.configs import PreprocessConfig
-from sgl_diffusion.dataset.dataloader.record_schema import (
+from sglang.multimodal_gen.api.configs.configs import PreprocessConfig
+from sglang.multimodal_gen.dataset.dataloader.record_schema import (
     basic_t2v_record_creator,
     i2v_record_creator,
 )
-from sgl_diffusion.dataset.dataloader.schema import (
+from sglang.multimodal_gen.dataset.dataloader.schema import (
     pyarrow_schema_i2v,
     pyarrow_schema_t2v,
 )
-from sgl_diffusion.runtime.distributed.parallel_state import get_world_rank
-from sgl_diffusion.runtime.pipelines.pipeline_registry import PipelineType
-from sgl_diffusion.runtime.server_args import ServerArgs, WorkloadType
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.runtime.workflow.preprocess.components import (
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
+from sglang.multimodal_gen.runtime.pipelines.pipeline_registry import PipelineType
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, WorkloadType
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.workflow.preprocess.components import (
     ParquetDatasetSaver,
     PreprocessingDataValidator,
     VideoForwardBatchBuilder,
     build_dataset,
 )
-from sgl_diffusion.runtime.workflow.workflow_base import WorkflowBase
+from sglang.multimodal_gen.runtime.workflow.workflow_base import WorkflowBase
 
 logger = init_logger(__name__)
 
@@ -124,13 +124,13 @@ class PreprocessWorkflow(WorkflowBase):
     @classmethod
     def get_workflow_cls(cls, server_args: ServerArgs) -> "PreprocessWorkflow":
         if server_args.workload_type == WorkloadType.T2V:
-            from sgl_diffusion.runtime.workflow.preprocess.preprocess_workflow_t2v import (
+            from sglang.multimodal_gen.runtime.workflow.preprocess.preprocess_workflow_t2v import (
                 PreprocessWorkflowT2V,
             )
 
             return cast(PreprocessWorkflow, PreprocessWorkflowT2V)
         elif server_args.workload_type == WorkloadType.I2V:
-            from sgl_diffusion.runtime.workflow.preprocess.preprocess_workflow_i2v import (
+            from sglang.multimodal_gen.runtime.workflow.preprocess.preprocess_workflow_i2v import (
                 PreprocessWorkflowI2V,
             )
 

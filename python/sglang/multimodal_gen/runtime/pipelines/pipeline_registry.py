@@ -9,12 +9,12 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 
-from sgl_diffusion.runtime.pipelines.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sgl_diffusion.runtime.pipelines.lora_pipeline import LoRAPipeline
-from sgl_diffusion.runtime.server_args import WorkloadType
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.pipelines.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.server_args import WorkloadType
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -138,7 +138,7 @@ def import_pipeline_classes(
         e.g., {"basic": {"wan": {"WanPipeline": WanPipeline}}}
     """
     type_to_pipeline_dict: dict[str, dict[str, type[ComposedPipelineBase] | None]] = {}
-    package_name: str = "sgl_diffusion.runtime.architectures"
+    package_name: str = "sglang.multimodal_gen.runtime.architectures"
 
     # Determine which pipeline types to scan
     if isinstance(pipeline_types, list):

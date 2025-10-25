@@ -21,15 +21,15 @@ from torch.distributed.fsdp import (
 )
 from torch.nn.modules.module import _IncompatibleKeys
 
-from sgl_diffusion.runtime.loader.utils import (
+from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     hf_to_custom_state_dict,
 )
-from sgl_diffusion.runtime.loader.weight_utils import (
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import set_mixed_precision_policy
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
 
@@ -101,7 +101,7 @@ def maybe_load_fsdp_model(
     use_fsdp = fsdp_inference
 
     # Disable FSDP for MPS as it's not compatible
-    from sgl_diffusion.runtime.platforms import current_platform
+    from sglang.multimodal_gen.runtime.platforms import current_platform
 
     if current_platform.is_mps():
         use_fsdp = False

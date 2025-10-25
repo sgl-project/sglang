@@ -16,19 +16,19 @@ import torch
 from einops import rearrange, repeat
 from torch import nn
 
-from sgl_diffusion.api.configs.models.dits import StepVideoConfig
-from sgl_diffusion.runtime.distributed.parallel_state import get_sp_world_size
-from sgl_diffusion.runtime.layers.attention import LocalAttention, USPAttention
-from sgl_diffusion.runtime.layers.layernorm import LayerNormScaleShift
-from sgl_diffusion.runtime.layers.linear import ReplicatedLinear
-from sgl_diffusion.runtime.layers.mlp import MLP
-from sgl_diffusion.runtime.layers.rotary_embedding import (
+from sglang.multimodal_gen.api.configs.models.dits import StepVideoConfig
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     get_rotary_pos_embed,
 )
-from sgl_diffusion.runtime.layers.visual_embedding import TimestepEmbedder
-from sgl_diffusion.runtime.models.dits.base import BaseDiT
-from sgl_diffusion.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.layers.visual_embedding import TimestepEmbedder
+from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class PatchEmbed2D(nn.Module):

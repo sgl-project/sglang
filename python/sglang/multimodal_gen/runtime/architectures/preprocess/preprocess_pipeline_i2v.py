@@ -11,17 +11,17 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sgl_diffusion.dataset.dataloader.schema import pyarrow_schema_i2v
-from sgl_diffusion.runtime.distributed import get_local_torch_device
-from sgl_diffusion.runtime.managers.forward_context import set_forward_context
-from sgl_diffusion.runtime.pipelines.preprocess.preprocess_pipeline_base import (
+from sglang.multimodal_gen.dataset.dataloader.schema import pyarrow_schema_i2v
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines.preprocess.preprocess_pipeline_base import (
     BasePreprocessPipeline,
 )
-from sgl_diffusion.runtime.pipelines.stages import (
+from sglang.multimodal_gen.runtime.pipelines.stages import (
     ImageEncodingStage,
     TextEncodingStage,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class PreprocessPipeline_I2V(BasePreprocessPipeline):

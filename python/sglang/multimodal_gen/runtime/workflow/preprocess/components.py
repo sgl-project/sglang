@@ -10,21 +10,22 @@ import pyarrow as pa
 import torch
 from datasets import Dataset, Video, load_dataset
 
-from sgl_diffusion.api.configs.configs import (
+from sglang.multimodal_gen.api.configs.configs import (
     DatasetType,
     PreprocessConfig,
     VideoLoaderType,
 )
-from sgl_diffusion.dataset.dataloader.parquet_io import (
+from sglang.multimodal_gen.api.configs.sample.base import DataType
+from sglang.multimodal_gen.dataset.dataloader.parquet_io import (
     ParquetDatasetWriter,
     records_to_table,
 )
-from sgl_diffusion.runtime.distributed.parallel_state import (
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_world_rank,
     get_world_size,
 )
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import PreprocessBatch
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import PreprocessBatch
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -167,7 +168,7 @@ class VideoForwardBatchBuilder:
             num_frames=[item["num_frames"] for item in batch],
             prompt=[item["caption"] for item in batch],
             prompt_attention_mask=[],
-            data_type=Datatype.VIDEO,
+            data_type=DataType.VIDEO,
             generator=torch.Generator("cpu").manual_seed(self.seed),
         )
         return forward_batch

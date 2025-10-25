@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from sgl_diffusion.api.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.api.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 
 def is_double_block(n: str, m) -> bool:

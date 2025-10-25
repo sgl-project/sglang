@@ -7,7 +7,7 @@ from typing import Generic, TypeVar
 import torch
 from transformers import PretrainedConfig
 
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

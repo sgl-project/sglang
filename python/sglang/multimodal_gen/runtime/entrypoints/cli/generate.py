@@ -4,21 +4,20 @@
 import argparse
 import dataclasses
 import os
-import sys
 from typing import cast
 
-from sgl_diffusion import DiffGenerator
-from sgl_diffusion.api.configs.sample.base import (
+from sglang.multimodal_gen import DiffGenerator
+from sglang.multimodal_gen.api.configs.sample.base import (
     SamplingParams,
     generate_request_id,
 )
-from sgl_diffusion.runtime.entrypoints.cli.cli_types import CLISubcommand
-from sgl_diffusion.runtime.entrypoints.cli.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
+from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
     RaiseNotImplementedAction,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import FlexibleArgumentParser
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 

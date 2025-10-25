@@ -1,17 +1,17 @@
-from sgl_diffusion.api.configs.pipelines.base import (
+from sglang.multimodal_gen.api.configs.pipelines.base import (
     PipelineConfig,
     SlidingTileAttnConfig,
 )
-from sgl_diffusion.api.configs.pipelines.flux import FluxPipelineConfig
-from sgl_diffusion.api.configs.pipelines.hunyuan import (
+from sglang.multimodal_gen.api.configs.pipelines.flux import FluxPipelineConfig
+from sglang.multimodal_gen.api.configs.pipelines.hunyuan import (
     FastHunyuanConfig,
     HunyuanConfig,
 )
-from sgl_diffusion.api.configs.pipelines.registry import (
+from sglang.multimodal_gen.api.configs.pipelines.registry import (
     get_pipeline_config_cls_from_name,
 )
-from sgl_diffusion.api.configs.pipelines.stepvideo import StepVideoT2VConfig
-from sgl_diffusion.api.configs.pipelines.wan import (
+from sglang.multimodal_gen.api.configs.pipelines.stepvideo import StepVideoT2VConfig
+from sglang.multimodal_gen.api.configs.pipelines.wan import (
     SelfForcingWanT2V480PConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,

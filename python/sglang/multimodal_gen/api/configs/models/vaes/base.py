@@ -6,8 +6,8 @@ from typing import Any
 
 import torch
 
-from sgl_diffusion.api.configs.models.base import ArchConfig, ModelConfig
-from sgl_diffusion.utils import StoreBoolean
+from sglang.multimodal_gen.api.configs.models.base import ArchConfig, ModelConfig
+from sglang.multimodal_gen.utils import StoreBoolean
 
 
 @dataclass

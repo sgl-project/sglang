@@ -8,31 +8,31 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 
-from sgl_diffusion.api.configs.models.encoders import (
+from sglang.multimodal_gen.api.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPTextConfig,
     CLIPVisionConfig,
 )
-from sgl_diffusion.runtime.distributed import divide, get_tp_world_size
-from sgl_diffusion.runtime.layers.activation import get_act_fn
+from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
+from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 
 # from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask, _prepare_4d_attention_mask
-from sgl_diffusion.runtime.layers.attention import LocalAttention
-from sgl_diffusion.runtime.layers.linear import (
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sgl_diffusion.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 
 # TODO: support quantization
 # from vllm.model_executor.layers.quantization import QuantizationConfig
-from sgl_diffusion.runtime.loader.weight_utils import default_weight_loader
-from sgl_diffusion.runtime.models.encoders.base import ImageEncoder, TextEncoder
-from sgl_diffusion.runtime.models.encoders.vision import (
+from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.models.encoders.base import ImageEncoder, TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.vision import (
     resolve_visual_encoder_outputs,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

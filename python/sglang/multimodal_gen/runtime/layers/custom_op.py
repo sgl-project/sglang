@@ -6,14 +6,14 @@ from typing import Any
 
 import torch.nn as nn
 
-from sgl_diffusion.runtime.utils.common import (
+from sglang.multimodal_gen.runtime.utils.common import (
     is_cpu,
     is_cuda,
     is_hip,
     is_npu,
     is_xpu,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

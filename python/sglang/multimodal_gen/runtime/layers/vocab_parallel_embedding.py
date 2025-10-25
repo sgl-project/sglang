@@ -7,20 +7,20 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-from sgl_diffusion.runtime.distributed import (
+from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_rank,
     get_tp_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sgl_diffusion.runtime.layers.quantization.base_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sgl_diffusion.runtime.models.parameter import BasevLLMParameter
-from sgl_diffusion.runtime.models.utils import set_weight_attrs
-from sgl_diffusion.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.models.parameter import BasevLLMParameter
+from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 

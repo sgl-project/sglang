@@ -4,7 +4,6 @@ from st_attn import sliding_tile_attention
 from torch.nn.attention.flex_attention import flex_attention
 
 # from flash_attn_interface import flash_attn_func
-from tqdm import tqdm
 
 flex_attention = torch.compile(flex_attention, dynamic=False)
 

@@ -1,22 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 import multiprocessing as mp
 import os
-from multiprocessing.connection import Connection
 from typing import List
 
 import torch
 from setproctitle import setproctitle
 
-from sgl_diffusion.runtime.distributed import (
+from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     maybe_init_distributed_environment_and_model_parallel,
 )
-from sgl_diffusion.runtime.distributed.parallel_state import get_cfg_group
-from sgl_diffusion.runtime.pipelines import build_pipeline
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
-from sgl_diffusion.runtime.server_args import PortArgs, ServerArgs
-from sgl_diffusion.runtime.utils.common import set_cuda_arch
-from sgl_diffusion.runtime.utils.logging_utils import (
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_cfg_group
+from sglang.multimodal_gen.runtime.pipelines import build_pipeline
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
+from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
     suppress_other_loggers,
@@ -145,7 +144,7 @@ def run_scheduler_process(
     # start the scheduler event loop
     assert task_pipes_to_slaves is not None
     assert result_pipes_from_slaves is not None
-    from sgl_diffusion.runtime.managers.scheduler import Scheduler
+    from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
     scheduler = Scheduler(
         server_args,

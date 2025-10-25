@@ -2,7 +2,7 @@
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict
 
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

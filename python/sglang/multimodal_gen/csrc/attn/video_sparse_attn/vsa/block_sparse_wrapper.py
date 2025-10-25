@@ -11,7 +11,7 @@ from vsa.block_sparse_attn_triton import (
 )
 
 assert torch.__version__ >= "2.4.0", "VSA requires PyTorch 2.4.0 or higher"
-from typing import Optional, Tuple
+from typing import Tuple
 
 from vsa.index import map_to_index
 

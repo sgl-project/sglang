@@ -10,8 +10,8 @@ from diffusers.models.autoencoders.vae import (
 )
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
-from sgl_diffusion.api.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.api.configs.models.vaes.qwenimage import QwenImageVAEConfig
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 

@@ -5,7 +5,7 @@ import sys
 import time
 import unittest
 
-from sgl_diffusion.api.configs.sample.base import DataType
+from sglang.multimodal_gen.api.configs.sample.base import DataType
 
 
 def run_command(command):

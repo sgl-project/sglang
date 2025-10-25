@@ -2,22 +2,22 @@ from typing import List
 
 import torch
 
-from sgl_diffusion.runtime.distributed import get_sp_group
-from sgl_diffusion.runtime.distributed.parallel_state import (
+from sglang.multimodal_gen.runtime.distributed import get_sp_group
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-from sgl_diffusion.runtime.pipelines import Req
-from sgl_diffusion.runtime.pipelines.executors.pipeline_executor import (
+from sglang.multimodal_gen.runtime.pipelines import Req
+from sglang.multimodal_gen.runtime.pipelines.executors.pipeline_executor import (
     PipelineExecutor,
     Timer,
 )
-from sgl_diffusion.runtime.pipelines.stages.base import (
+from sglang.multimodal_gen.runtime.pipelines.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.distributed import broadcast_pyobj
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 
 
 class ParallelExecutor(PipelineExecutor):

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from sgl_diffusion.runtime.distributed.communication_op import *
-from sgl_diffusion.runtime.distributed.group_coordinator import (
+from sglang.multimodal_gen.runtime.distributed.communication_op import *
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
     get_local_torch_device,
 )
-from sgl_diffusion.runtime.distributed.parallel_state import (
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     get_dp_group,
     get_dp_rank,
@@ -23,7 +23,7 @@ from sgl_diffusion.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
-from sgl_diffusion.runtime.distributed.utils import *
+from sglang.multimodal_gen.runtime.distributed.utils import *
 
 __all__ = [
     # Initialization

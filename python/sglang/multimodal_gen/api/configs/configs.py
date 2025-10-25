@@ -2,9 +2,9 @@ import dataclasses
 from enum import Enum
 from typing import Any, Optional
 
-from sgl_diffusion.api.configs.utils import update_config_from_args
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import FlexibleArgumentParser, StoreBoolean
+from sglang.multimodal_gen.api.configs.utils import update_config_from_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean
 
 logger = init_logger(__name__)
 

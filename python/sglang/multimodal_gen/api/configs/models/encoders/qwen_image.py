@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from transformers import Qwen2_5_VLModel
-
-from sgl_diffusion.api.configs.models.encoders.base import (
+from sglang.multimodal_gen.api.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )

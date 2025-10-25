@@ -78,7 +78,6 @@ class PackagesEnvChecker:
         Checks whether ROCm AITER library is installed
         """
         try:
-            import aiter
 
             logger.info("Using AITER as the attention library")
             return True

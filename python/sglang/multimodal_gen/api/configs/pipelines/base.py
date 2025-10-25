@@ -7,16 +7,16 @@ from typing import Any, cast
 
 import torch
 
-from sgl_diffusion.api.configs.models import (
+from sglang.multimodal_gen.api.configs.models import (
     DiTConfig,
     EncoderConfig,
     ModelConfig,
     VAEConfig,
 )
-from sgl_diffusion.api.configs.models.encoders import BaseEncoderOutput
-from sgl_diffusion.api.configs.utils import update_config_from_args
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import (
+from sglang.multimodal_gen.api.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.api.configs.utils import update_config_from_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
     shallow_asdict,
@@ -267,12 +267,12 @@ class PipelineConfig:
         )
 
         # Add VAE configuration arguments
-        from sgl_diffusion.api.configs.models.vaes.base import VAEConfig
+        from sglang.multimodal_gen.api.configs.models.vaes.base import VAEConfig
 
         VAEConfig.add_cli_args(parser, prefix=f"{prefix_with_dot}vae-config")
 
         # Add DiT configuration arguments
-        from sgl_diffusion.api.configs.models.dits.base import DiTConfig
+        from sglang.multimodal_gen.api.configs.models.dits.base import DiTConfig
 
         DiTConfig.add_cli_args(parser, prefix=f"{prefix_with_dot}dit-config")
 
@@ -293,7 +293,7 @@ class PipelineConfig:
         """
         use the pipeline class setting from model_path to match the pipeline config
         """
-        from sgl_diffusion.api.configs.pipelines.registry import (
+        from sglang.multimodal_gen.api.configs.pipelines.registry import (
             get_pipeline_config_cls_from_name,
         )
 
@@ -310,7 +310,7 @@ class PipelineConfig:
         kwargs: dictionary of kwargs
         config_cli_prefix: prefix of CLI arguments for this PipelineConfig instance
         """
-        from sgl_diffusion.api.configs.pipelines.registry import (
+        from sglang.multimodal_gen.api.configs.pipelines.registry import (
             get_pipeline_config_cls_from_name,
         )
 

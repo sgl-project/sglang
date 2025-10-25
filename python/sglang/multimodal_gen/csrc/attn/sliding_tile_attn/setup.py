@@ -12,7 +12,9 @@ PACKAGE_NAME = "st_attn"
 VERSION = "0.0.6"
 AUTHOR = "Hao AI Lab"
 DESCRIPTION = "Sliding Tile Atteniton Kernel Used in sgl-diffusion"
-URL = "https://github.com/hao-ai-lab/sgl-diffusion/tree/main/csrc/sliding_tile_attention"
+URL = (
+    "https://github.com/hao-ai-lab/sgl-diffusion/tree/main/csrc/sliding_tile_attention"
+)
 
 # Set environment variables
 tk_root = os.getenv(

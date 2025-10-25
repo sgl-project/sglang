@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from sgl_diffusion.test.test_utils import (
+from sglang.multimodal_gen.test.test_utils import (
     TestCLIBase,
     check_image_size,
     is_mp4,

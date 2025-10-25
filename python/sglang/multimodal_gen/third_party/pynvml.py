@@ -39,7 +39,6 @@ import threading
 # Python bindings for the NVML library
 ##
 from ctypes import *
-from ctypes.util import find_library
 from functools import wraps
 
 ## C Type mappings ##

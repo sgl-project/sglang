@@ -29,10 +29,10 @@ from typing import Any
 
 import torch
 
-from sgl_diffusion.runtime.distributed.parallel_state import get_sp_group
-from sgl_diffusion.runtime.layers.custom_op import CustomOp
-from sgl_diffusion.runtime.layers.triton_ops import apply_rotary_embedding
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
+from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embedding
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

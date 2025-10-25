@@ -7,14 +7,14 @@ adjusted to match the structure and interface of `cuda.py`.
 
 import torch
 
-import sgl_diffusion.envs as envs
-from sgl_diffusion.runtime.platforms.interface import (
+import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
     Platform,
     PlatformEnum,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -73,7 +73,7 @@ class RocmPlatform(Platform):
 
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
-            return "sgl_diffusion.runtime.layers.attention.backends.sdpa.SDPABackend"
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
         elif selected_backend in (AttentionBackendEnum.FLASH_ATTN, None):
             pass
@@ -102,7 +102,7 @@ class RocmPlatform(Platform):
             try:
                 import flash_attn  # noqa: F401
 
-                from sgl_diffusion.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
                     FlashAttentionBackend,
                 )
 
@@ -125,12 +125,12 @@ class RocmPlatform(Platform):
         if target_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
 
-            return "sgl_diffusion.runtime.layers.attention.backends.sdpa.SDPABackend"
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
         logger.info("Using Flash Attention backend.")
 
-        return "sgl_diffusion.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        return "sgl_diffusion.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # works for ROCm too
+        return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # works for ROCm too

@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import torch
 
-from sgl_diffusion.runtime.distributed import (
+from sglang.multimodal_gen.runtime.distributed import (
     cleanup_dist_env_and_memory,
     maybe_init_distributed_environment_and_model_parallel,
 )

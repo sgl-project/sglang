@@ -18,26 +18,26 @@ from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from sgl_diffusion.api.configs.sample import SamplingParams
-from sgl_diffusion.dataset import gettextdataset
-from sgl_diffusion.dataset.dataloader.parquet_io import (
+from sglang.multimodal_gen.api.configs.sample import SamplingParams
+from sglang.multimodal_gen.dataset import gettextdataset
+from sglang.multimodal_gen.dataset.dataloader.parquet_io import (
     ParquetDatasetWriter,
     records_to_table,
 )
-from sgl_diffusion.dataset.dataloader.record_schema import (
+from sglang.multimodal_gen.dataset.dataloader.record_schema import (
     ode_text_only_record_creator,
 )
-from sgl_diffusion.dataset.dataloader.schema import (
+from sglang.multimodal_gen.dataset.dataloader.schema import (
     pyarrow_schema_ode_trajectory_text_only,
 )
-from sgl_diffusion.runtime.models.schedulers.scheduling_self_forcing_flow_match import (
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_self_forcing_flow_match import (
     SelfForcingFlowMatchScheduler,
 )
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.pipelines.preprocess.preprocess_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.preprocess.preprocess_pipeline_base import (
     BasePreprocessPipeline,
 )
-from sgl_diffusion.runtime.pipelines.stages import (
+from sglang.multimodal_gen.runtime.pipelines.stages import (
     DecodingStage,
     DenoisingStage,
     InputValidationStage,
@@ -45,9 +45,9 @@ from sgl_diffusion.runtime.pipelines.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import save_decoded_latents_as_video, shallow_asdict
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import save_decoded_latents_as_video, shallow_asdict
 
 logger = init_logger(__name__)
 

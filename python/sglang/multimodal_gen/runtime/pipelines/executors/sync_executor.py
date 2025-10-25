@@ -4,14 +4,14 @@ Synchronous pipeline executor implementation.
 """
 from typing import List
 
-from sgl_diffusion.runtime.pipelines.executors.pipeline_executor import (
+from sglang.multimodal_gen.runtime.pipelines.executors.pipeline_executor import (
     PipelineExecutor,
     Timer,
     logger,
 )
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.pipelines.stages import PipelineStage
-from sgl_diffusion.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.stages import PipelineStage
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class SyncExecutor(PipelineExecutor):

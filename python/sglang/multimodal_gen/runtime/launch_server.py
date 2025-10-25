@@ -2,10 +2,10 @@ import multiprocessing as mp
 
 import uvicorn
 
-from sgl_diffusion.runtime.entrypoints.http_server import create_app
-from sgl_diffusion.runtime.managers.gpu_worker import run_scheduler_process
-from sgl_diffusion.runtime.server_args import ServerArgs, set_global_server_args
-from sgl_diffusion.runtime.utils.logging_utils import (
+from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
+from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     logger,
     suppress_other_loggers,

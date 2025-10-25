@@ -3,16 +3,16 @@ from typing import Any
 
 import zmq
 
-from sgl_diffusion.runtime.managers.gpu_worker import GPUWorker
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import OutputBatch
-from sgl_diffusion.runtime.server_args import (
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import OutputBatch
+from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
     set_global_server_args,
 )
-from sgl_diffusion.runtime.utils.common import get_zmq_socket
-from sgl_diffusion.runtime.utils.distributed import broadcast_pyobj
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
+from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

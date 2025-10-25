@@ -14,15 +14,15 @@ import torch.distributed
 from torch.cuda import synchronize
 from torch.distributed import Backend, ProcessGroup
 
-from sgl_diffusion import envs
-from sgl_diffusion.runtime.distributed.device_communicators.base_device_communicator import (
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
-from sgl_diffusion.runtime.distributed.device_communicators.cpu_communicator import (
+from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
     CpuCommunicator,
 )
-from sgl_diffusion.runtime.platforms import current_platform
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 try:
     import torch_musa
@@ -186,7 +186,7 @@ class GroupCoordinator:
         # TODO: fix it for other platforms
         self.device = get_local_torch_device()
 
-        from sgl_diffusion.runtime.platforms import current_platform
+        from sglang.multimodal_gen.runtime.platforms import current_platform
 
         self.use_device_communicator = use_device_communicator
 
@@ -194,7 +194,7 @@ class GroupCoordinator:
         if use_device_communicator and self.world_size > 1:
             # Platform-aware device communicator selection
             if current_platform.is_cuda_alike():
-                from sgl_diffusion.runtime.distributed.device_communicators.cuda_communicator import (
+                from sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator import (
                     CudaCommunicator,
                 )
 
@@ -284,7 +284,7 @@ class GroupCoordinator:
     @contextmanager
     def graph_capture(self, graph_capture_context: GraphCaptureContext | None = None):
         # Platform-aware graph capture
-        from sgl_diffusion.runtime.platforms import current_platform
+        from sglang.multimodal_gen.runtime.platforms import current_platform
 
         if current_platform.is_cuda_alike():
             if graph_capture_context is None:

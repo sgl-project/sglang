@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/entrypoints/cli/main.py
 
-from sgl_diffusion.runtime.entrypoints.cli.cli_types import CLISubcommand
-from sgl_diffusion.runtime.entrypoints.cli.generate import GenerateSubcommand
-from sgl_diffusion.runtime.entrypoints.cli.serve import ServeSubcommand
-from sgl_diffusion.utils import FlexibleArgumentParser
+from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
+from sglang.multimodal_gen.runtime.entrypoints.cli.generate import GenerateSubcommand
+from sglang.multimodal_gen.runtime.entrypoints.cli.serve import ServeSubcommand
+from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
 def generate_cmd_init() -> list[CLISubcommand]:

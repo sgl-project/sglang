@@ -2,21 +2,21 @@ from typing import TYPE_CHECKING, Optional
 
 from tqdm import tqdm
 
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import PreprocessBatch
-from sgl_diffusion.runtime.workflow.preprocess.components import (
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import PreprocessBatch
+from sglang.multimodal_gen.runtime.workflow.preprocess.components import (
     ParquetDatasetSaver,
 )
-from sgl_diffusion.runtime.workflow.preprocess.preprocess_workflow import (
+from sglang.multimodal_gen.runtime.workflow.preprocess.preprocess_workflow import (
     PreprocessWorkflow,
 )
 
 if TYPE_CHECKING:
     from torch.utils.data import DataLoader
 
-    from sgl_diffusion.runtime.pipelines.composed_pipeline_base import (
+    from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
         ComposedPipelineBase,
     )
-    from sgl_diffusion.runtime.workflow.preprocess.components import (
+    from sglang.multimodal_gen.runtime.workflow.preprocess.components import (
         VideoForwardBatchBuilder,
     )
 

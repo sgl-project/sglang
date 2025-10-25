@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-import argparse
 import json
 import os
 
@@ -8,7 +7,7 @@ import torch
 from pytorch_msssim import ms_ssim, ssim
 from torchvision.io import read_video
 
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

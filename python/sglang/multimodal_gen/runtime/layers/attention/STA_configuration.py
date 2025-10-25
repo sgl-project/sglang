@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from sgl_diffusion.utils import dict_to_3d_list
+from sglang.multimodal_gen.utils import dict_to_3d_list
 
 
 def configure_sta(

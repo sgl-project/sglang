@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
-from sgl_diffusion.runtime.distributed.device_communicators.pynccl_wrapper import (
+from sglang.multimodal_gen.runtime.distributed.device_communicators.pynccl_wrapper import (
     NCCLLibrary,
     buffer_type,
     cudaStream_t,
@@ -15,9 +15,9 @@ from sgl_diffusion.runtime.distributed.device_communicators.pynccl_wrapper impor
     ncclRedOpTypeEnum,
     ncclUniqueId,
 )
-from sgl_diffusion.runtime.distributed.utils import StatelessProcessGroup
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import current_stream
+from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import current_stream
 
 logger = init_logger(__name__)
 

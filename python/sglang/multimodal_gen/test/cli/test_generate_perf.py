@@ -3,9 +3,9 @@ import unittest
 
 from PIL import Image
 
-from sgl_diffusion.api.configs.sample.base import DataType
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.test.test_utils import TestCLIBase, check_image_size
+from sglang.multimodal_gen.api.configs.sample.base import DataType
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.test.test_utils import TestCLIBase, check_image_size
 
 logger = init_logger(__name__)
 

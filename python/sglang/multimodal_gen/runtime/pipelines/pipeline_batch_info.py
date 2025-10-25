@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, Any
 import PIL.Image
 import torch
 
-from sgl_diffusion.api.configs.sample.base import DataType
-from sgl_diffusion.runtime.utils.performance_logger import PerformanceLogger
+from sglang.multimodal_gen.api.configs.sample.base import DataType
+from sglang.multimodal_gen.runtime.utils.performance_logger import PerformanceLogger
 
 if TYPE_CHECKING:
     from torchcodec.decoders import VideoDecoder
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 import time
 from collections import OrderedDict
 
-from sgl_diffusion.api.configs.sample.teacache import (
+from sglang.multimodal_gen.api.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
 )

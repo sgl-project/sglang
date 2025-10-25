@@ -14,19 +14,19 @@ from typing import Any
 import torch
 from huggingface_hub import hf_hub_download
 
-from sgl_diffusion.runtime.distributed import get_local_torch_device
-from sgl_diffusion.runtime.loader.component_loader import (
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.component_loader import (
     PipelineComponentLoader,
 )
-from sgl_diffusion.runtime.models.encoders.bert import (
+from sglang.multimodal_gen.runtime.models.encoders.bert import (
     HunyuanClip,  # type: ignore
 )
-from sgl_diffusion.runtime.models.encoders.stepllm import STEP1TextEncoder
-from sgl_diffusion.runtime.pipelines.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.models.encoders.stepllm import STEP1TextEncoder
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sgl_diffusion.runtime.pipelines.lora_pipeline import LoRAPipeline
-from sgl_diffusion.runtime.pipelines.stages import (
+from sglang.multimodal_gen.runtime.pipelines.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines.stages import (
     DecodingStage,
     DenoisingStage,
     InputValidationStage,
@@ -34,8 +34,8 @@ from sgl_diffusion.runtime.pipelines.stages import (
     StepvideoPromptEncodingStage,
     TimestepPreparationStage,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

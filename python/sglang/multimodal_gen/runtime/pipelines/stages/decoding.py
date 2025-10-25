@@ -7,22 +7,22 @@ import weakref
 
 import torch
 
-from sgl_diffusion.api.configs.models.vaes.base import VAEArchConfig
-from sgl_diffusion.api.configs.pipelines.qwen_image import (
+from sglang.multimodal_gen.api.configs.models.vaes.base import VAEArchConfig
+from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
     QwenImagePipelineConfig,
 )
-from sgl_diffusion.runtime.distributed import get_local_torch_device
-from sgl_diffusion.runtime.loader.component_loader import VAELoader
-from sgl_diffusion.runtime.models.vaes.common import ParallelTiledVAE
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
-from sgl_diffusion.runtime.pipelines.stages.base import (
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.component_loader import VAELoader
+from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
-from sgl_diffusion.runtime.pipelines.stages.validators import VerificationResult
-from sgl_diffusion.runtime.server_args import ServerArgs, get_global_server_args
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.pipelines.stages.validators import VerificationResult
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 

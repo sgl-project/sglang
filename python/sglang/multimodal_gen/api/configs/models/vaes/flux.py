@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from sgl_diffusion.api.configs.models.vaes.base import VAEArchConfig, VAEConfig
+from sglang.multimodal_gen.api.configs.models.vaes.base import VAEArchConfig, VAEConfig
 
 
 @dataclass

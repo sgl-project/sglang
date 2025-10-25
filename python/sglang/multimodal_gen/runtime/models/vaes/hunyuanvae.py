@@ -20,9 +20,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sgl_diffusion.api.configs.models.vaes import HunyuanVAEConfig
-from sgl_diffusion.runtime.layers.activation import get_act_fn
-from sgl_diffusion.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.api.configs.models.vaes import HunyuanVAEConfig
+from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
+from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
 
 def prepare_causal_attention_mask(

@@ -8,9 +8,9 @@ from typing import Any
 import torch
 from torch.nn import Parameter
 
-from sgl_diffusion.runtime.distributed import get_tp_rank
-from sgl_diffusion.runtime.models.utils import _make_synced_weight_loader
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.distributed import get_tp_rank
+from sglang.multimodal_gen.runtime.models.utils import _make_synced_weight_loader
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -44,7 +44,7 @@ class BasevLLMParameter(Parameter):
         # tensor, which is param.data, leading to the redundant memory usage.
         # This sometimes causes OOM errors during model loading. To avoid this,
         # we sync the param tensor after its weight loader is called.
-        from sgl_diffusion.runtime.platforms import current_platform
+        from sglang.multimodal_gen.runtime.platforms import current_platform
 
         if current_platform.is_tpu():
             weight_loader = _make_synced_weight_loader(weight_loader)

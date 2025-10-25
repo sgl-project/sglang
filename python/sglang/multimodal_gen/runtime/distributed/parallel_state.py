@@ -42,10 +42,10 @@ import torch
 import torch.distributed
 from torch.distributed import ProcessGroup
 
-import sgl_diffusion.envs as envs
-from sgl_diffusion.runtime.distributed.utils import StatelessProcessGroup
-from sgl_diffusion.runtime.platforms import current_platform
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from ..utils.distributed import RankGenerator
 from .group_coordinator import (
@@ -232,7 +232,7 @@ def init_distributed_environment(
     device_id: torch.device | None = None,
 ):
     # Determine the appropriate backend based on the platform
-    from sgl_diffusion.runtime.platforms import current_platform
+    from sglang.multimodal_gen.runtime.platforms import current_platform
 
     if backend == "nccl" and not current_platform.is_cuda_alike():
         # Use gloo backend for non-CUDA platforms (MPS, CPU)

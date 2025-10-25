@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
 
-from sgl_diffusion.api.configs.sample.base import SamplingParams
+from sglang.multimodal_gen.api.configs.sample.base import SamplingParams
 
 
 @dataclass

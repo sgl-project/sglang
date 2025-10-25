@@ -6,8 +6,8 @@ import os
 import torch
 from torch.distributed import ProcessGroup
 
-from sgl_diffusion.runtime.platforms import current_platform
-from sgl_diffusion.runtime.platforms.interface import CpuArchEnum
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms.interface import CpuArchEnum
 
 from .base_device_communicator import DeviceCommunicatorBase
 

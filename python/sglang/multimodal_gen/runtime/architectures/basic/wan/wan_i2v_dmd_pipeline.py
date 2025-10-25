@@ -6,15 +6,15 @@ This module contains an implementation of the Wan video diffusion pipeline
 using the modular pipeline architecture.
 """
 
-from sgl_diffusion.runtime.pipelines.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sgl_diffusion.runtime.pipelines.lora_pipeline import LoRAPipeline
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.pipelines.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # isort: off
-from sgl_diffusion.runtime.pipelines.stages import (
+from sglang.multimodal_gen.runtime.pipelines.stages import (
     ImageEncodingStage,
     ConditioningStage,
     DecodingStage,
@@ -27,7 +27,7 @@ from sgl_diffusion.runtime.pipelines.stages import (
 )
 
 # isort: on
-from sgl_diffusion.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 

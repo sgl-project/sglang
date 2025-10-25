@@ -5,7 +5,7 @@ import platform
 
 import torch
 
-from sgl_diffusion.runtime.platforms.interface import (
+from sglang.multimodal_gen.runtime.platforms.interface import (
     CpuArchEnum,
     Platform,
     PlatformEnum,
@@ -56,4 +56,4 @@ class CpuPlatform(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        return "sgl_diffusion.runtime.distributed.device_communicators.cpu_communicator.CpuCommunicator"
+        return "sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator.CpuCommunicator"

@@ -4,7 +4,7 @@
 import torch
 import torch.distributed
 
-from sgl_diffusion.runtime.distributed.parallel_state import (
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_sp_group,
     get_tp_group,

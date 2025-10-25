@@ -3,8 +3,8 @@
 import torch
 import torch.nn as nn
 
-from sgl_diffusion.runtime.layers.activation import get_act_fn
-from sgl_diffusion.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 
 
 class MLP(nn.Module):

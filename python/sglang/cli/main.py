@@ -1,24 +1,19 @@
-# SPDX-License-Identifier: Apache-2.0
-# adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/entrypoints/cli/main.py
-
-import typer
-
-from sglang.cli.serve import serve_command
-
-app = typer.Typer()
+import argparse
 
 
-@app.command()
-def serve(
-    ctx: typer.Context,
-    model_path: str = typer.Option(
-        ...,
-        "--model-path",
-        help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
-    ),
-):
-    serve_command(model_path, ctx)
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
+    # serve subcommand
+    from sglang.cli.serve import serve
 
-if __name__ == "__main__":
-    app()
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Launch the SGLang server.",
+        add_help=False,  # Defer help to the specific parser
+    )
+    serve_parser.set_defaults(func=serve)
+
+    args, extra_argv = parser.parse_known_args()
+    args.func(args, extra_argv)

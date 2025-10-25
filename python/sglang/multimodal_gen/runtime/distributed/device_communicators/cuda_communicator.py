@@ -4,7 +4,7 @@
 import torch
 from torch.distributed import ProcessGroup
 
-from sgl_diffusion.runtime.distributed.device_communicators.base_device_communicator import (
+from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
 
@@ -20,7 +20,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
 
-        from sgl_diffusion.runtime.distributed.device_communicators.pynccl import (
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
         )
 

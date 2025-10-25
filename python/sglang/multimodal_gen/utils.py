@@ -3,23 +3,19 @@
 
 import argparse
 import ctypes
-import hashlib
 import importlib
 import importlib.util
 import inspect
-import json
 import math
 import os
 import signal
 import socket
 import sys
-import tempfile
 import threading
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, fields, is_dataclass
 from functools import lru_cache, partial, wraps
-from logging import getLogger
 from typing import Any, TypeVar, cast
 
 import cloudpickle
@@ -28,16 +24,12 @@ import numpy as np
 import torch
 import torchvision
 import yaml
-from diffusers.loaders.lora_base import (
-    _best_guess_weight_name,  # watch out for potetential removal from diffusers
-)
 from einops import rearrange
-from huggingface_hub import snapshot_download
 from remote_pdb import RemotePdb
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
-import sgl_diffusion.envs as envs
-from sgl_diffusion.runtime.utils.logging_utils import (
+import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
     SortedHelpFormatter,
     init_logger,
 )
@@ -101,7 +93,7 @@ torch.cuda.set_stream = _patched_set_stream
 
 def current_stream() -> torch.cuda.Stream | None:
     """
-    replace `torch.cuda.current_stream()` with `sgl_diffusion.utils.current_stream()`.
+    replace `torch.cuda.current_stream()` with `sglang.multimodal_gen.utils.current_stream()`.
     it turns out that `torch.cuda.current_stream()` is quite expensive,
     as it will construct a new stream object at each call.
     here we patch `torch.cuda.set_stream` to keep track of the current stream
@@ -110,7 +102,7 @@ def current_stream() -> torch.cuda.Stream | None:
     the underlying hypothesis is that we do not call `torch._C._cuda_setStream`
     from C/C++ code.
     """
-    from sgl_diffusion.runtime.platforms import current_platform
+    from sglang.multimodal_gen.runtime.platforms import current_platform
 
     # For non-CUDA platforms, return None
     if not current_platform.is_cuda_alike():
@@ -472,7 +464,7 @@ def import_pynvml():
     After all the troubles, we decide to copy the official `pynvml`
     module to our codebase, and use it directly.
     """
-    import sgl_diffusion.third_party.pynvml as pynvml
+    import sglang.multimodal_gen.third_party.pynvml as pynvml
 
     return pynvml
 
@@ -680,7 +672,7 @@ def dict_to_3d_list(
 
 
 def set_random_seed(seed: int) -> None:
-    from sgl_diffusion.runtime.platforms import current_platform
+    from sglang.multimodal_gen.runtime.platforms import current_platform
 
     current_platform.seed_everything(seed)
 

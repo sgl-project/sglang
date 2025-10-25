@@ -12,15 +12,15 @@ from typing import TypeVar
 import torch
 from typing_extensions import ParamSpec
 
-from sgl_diffusion.runtime.platforms.interface import (
+from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
     Platform,
     PlatformEnum,
 )
-from sgl_diffusion.runtime.utils.common import is_blackwell
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import import_pynvml
+from sglang.multimodal_gen.runtime.utils.common import is_blackwell
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import import_pynvml
 
 logger = init_logger(__name__)
 
@@ -123,13 +123,13 @@ class CudaPlatformBase(Platform):
             try:
                 from st_attn import sliding_tile_attention  # noqa: F401
 
-                from sgl_diffusion.runtime.layers.attention.backends.sliding_tile_attn import (  # noqa: F401
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (  # noqa: F401
                     SlidingTileAttentionBackend,
                 )
 
                 logger.info("Using Sliding Tile Attention backend.")
 
-                return "sgl_diffusion.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
             except ImportError as e:
                 logger.error(
                     "Failed to import Sliding Tile Attention backend: %s", str(e)
@@ -141,13 +141,13 @@ class CudaPlatformBase(Platform):
             try:
                 from sageattention import sageattn  # noqa: F401
 
-                from sgl_diffusion.runtime.layers.attention.backends.sage_attn import (  # noqa: F401
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (  # noqa: F401
                     SageAttentionBackend,
                 )
 
                 logger.info("Using Sage Attention backend.")
 
-                return "sgl_diffusion.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
             except ImportError as e:
                 logger.info(e)
                 logger.info(
@@ -155,16 +155,16 @@ class CudaPlatformBase(Platform):
                 )
         elif selected_backend == AttentionBackendEnum.SAGE_ATTN_THREE:
             try:
-                from sgl_diffusion.runtime.layers.attention.backends.sage_attn3 import (  # noqa: F401
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3 import (  # noqa: F401
                     SageAttention3Backend,
                 )
-                from sgl_diffusion.runtime.layers.attention.backends.sageattn.api import (  # noqa: F401
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sageattn.api import (  # noqa: F401
                     sageattn_blackwell,
                 )
 
                 logger.info("Using Sage Attention 3 backend.")
 
-                return "sgl_diffusion.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
             except ImportError as e:
                 logger.info(e)
                 logger.info(
@@ -174,13 +174,13 @@ class CudaPlatformBase(Platform):
             try:
                 from vsa import block_sparse_attn  # noqa: F401
 
-                from sgl_diffusion.runtime.layers.attention.backends.video_sparse_attn import (  # noqa: F401
+                from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (  # noqa: F401
                     VideoSparseAttentionBackend,
                 )
 
                 logger.info("Using Video Sparse Attention backend.")
 
-                return "sgl_diffusion.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
             except ImportError as e:
                 logger.error(
                     "Failed to import Video Sparse Attention backend: %s", str(e)
@@ -190,17 +190,15 @@ class CudaPlatformBase(Platform):
                 ) from e
         elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
             try:
-                from kernel.attn.vmoba_attn.vmoba import (  # noqa: F401
-                    moba_attn_varlen,
-                )
+                from kernel.attn.vmoba_attn.vmoba import moba_attn_varlen  # noqa: F401
 
-                from sgl_diffusion.runtime.layers.attention.backends.vmoba import (  # noqa: F401
+                from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (  # noqa: F401
                     VMOBAAttentionBackend,
                 )
 
                 logger.info("Using Video MOBA Attention backend.")
 
-                return "sgl_diffusion.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
             except ImportError as e:
                 logger.error(
                     "Failed to import Video MoBA Attention backend: %s", str(e)
@@ -210,10 +208,10 @@ class CudaPlatformBase(Platform):
                 ) from e
         elif selected_backend == AttentionBackendEnum.AITER:
             logger.info("Using AITer backend.")
-            return "sgl_diffusion.runtime.layers.attention.backends.aiter.AITerBackend"
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
-            return "sgl_diffusion.runtime.layers.attention.backends.sdpa.SDPABackend"
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
         elif selected_backend == AttentionBackendEnum.FLASH_ATTN:
             if is_blackwell():
                 raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
@@ -243,7 +241,7 @@ class CudaPlatformBase(Platform):
         # installed.
         if target_backend == AttentionBackendEnum.FLASH_ATTN:
             try:
-                from sgl_diffusion.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
                     FlashAttentionBackend,
                 )
 
@@ -266,15 +264,15 @@ class CudaPlatformBase(Platform):
         if target_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
 
-            return "sgl_diffusion.runtime.layers.attention.backends.sdpa.SDPABackend"
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
         logger.info("Using Flash Attention backend.")
 
-        return "sgl_diffusion.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        return "sgl_diffusion.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
+        return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
 
 
 # NVML utils

@@ -4,35 +4,35 @@ from typing import Type
 import torch
 import torch.nn as nn
 
-from sgl_diffusion.runtime.distributed.communication_op import (
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     sequence_model_parallel_all_to_all_4D,
 )
-from sgl_diffusion.runtime.distributed.parallel_state import (
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_sequence_parallel_world_size,
     get_sp_parallel_rank,
     get_sp_world_size,
     get_ulysses_parallel_world_size,
 )
-from sgl_diffusion.runtime.layers.attention.backends.attention_backend import (
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
 )
-from sgl_diffusion.runtime.layers.attention.selector import (
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
     backend_name_to_enum,
     get_attn_backend,
 )
-from sgl_diffusion.runtime.layers.usp import (
+from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
     _usp_output_all_to_all,
     ring_attn,
 )
-from sgl_diffusion.runtime.managers.forward_context import (
+from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
-from sgl_diffusion.runtime.platforms import AttentionBackendEnum
-from sgl_diffusion.utils import get_compute_dtype
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.utils import get_compute_dtype
 
 
 class UlyssesAttention(nn.Module):

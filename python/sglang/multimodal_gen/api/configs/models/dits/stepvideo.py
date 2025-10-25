@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from sgl_diffusion.api.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.api.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 
 @dataclass

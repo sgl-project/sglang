@@ -6,8 +6,8 @@ import unittest
 
 from openai import OpenAI
 
-from sgl_diffusion.runtime.utils.common import kill_process_tree
-from sgl_diffusion.test.test_utils import is_mp4, is_png, wait_for_port
+from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
+from sglang.multimodal_gen.test.test_utils import is_mp4, is_png, wait_for_port
 
 
 class TestVideoHttpServer(unittest.TestCase):

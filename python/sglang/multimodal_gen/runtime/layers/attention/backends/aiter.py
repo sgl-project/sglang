@@ -3,7 +3,7 @@
 import aiter
 import torch
 
-from sgl_diffusion.runtime.layers.attention.backends.attention_backend import (
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,

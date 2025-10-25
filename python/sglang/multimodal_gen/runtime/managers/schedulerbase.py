@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import TypeVar
 
 import zmq
 
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.utils import init_logger
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -36,7 +36,7 @@ class SchedulerBase(ABC):
         Get the scheduler class based on the server arguments.
         """
         if server_args.distributed_executor_backend == "mp":
-            from sgl_diffusion.runtime.managers.scheduler import Scheduler
+            from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
             # For now, always return the new Scheduler
             return Scheduler

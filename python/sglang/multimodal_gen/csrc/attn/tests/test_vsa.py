@@ -1,18 +1,16 @@
 import os
 import sys
 
-import numpy as np
 import torch
-from tqdm import tqdm
 
 # Add the parent directory to the path to import block_sparse_attn
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from vsa import block_sparse_attn
-
 from test.utils import (
     create_full_mask_from_block_mask,
     generate_block_sparse_mask_for_function,
 )
+
+from vsa import block_sparse_attn
 
 BLOCK_M = 64
 BLOCK_N = 64

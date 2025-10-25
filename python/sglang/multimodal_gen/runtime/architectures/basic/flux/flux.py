@@ -6,8 +6,8 @@ This module contains an implementation of the Hunyuan video diffusion pipeline
 using the modular pipeline architecture.
 """
 
-from sgl_diffusion.runtime.pipelines import ComposedPipelineBase, Req
-from sgl_diffusion.runtime.pipelines.stages import (
+from sglang.multimodal_gen.runtime.pipelines import ComposedPipelineBase, Req
+from sglang.multimodal_gen.runtime.pipelines.stages import (
     ConditioningStage,
     DecodingStage,
     DenoisingStage,
@@ -16,8 +16,8 @@ from sgl_diffusion.runtime.pipelines.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # TODO(will): move PRECISION_TO_TYPE to better place
 

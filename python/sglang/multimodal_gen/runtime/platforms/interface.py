@@ -8,11 +8,11 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from sgl_diffusion.runtime.layers.attention.backends.attention_backend import (
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import resolve_obj_by_qualname
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import resolve_obj_by_qualname
 
 logger = init_logger(__name__)
 
@@ -227,7 +227,7 @@ class Platform:
         """
         Get device specific communicator class for distributed communication.
         """
-        return "sgl_diffusion.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"  # noqa
+        return "sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"  # noqa
 
     @classmethod
     def get_cpu_architecture(cls) -> CpuArchEnum:

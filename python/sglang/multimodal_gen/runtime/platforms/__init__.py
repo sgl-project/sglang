@@ -5,13 +5,13 @@ import traceback
 from typing import TYPE_CHECKING
 
 # imported by other files, do not remove
-from sgl_diffusion.runtime.platforms.interface import (  # noqa: F401
+from sglang.multimodal_gen.runtime.platforms.interface import (  # noqa: F401
     AttentionBackendEnum,
     Platform,
     PlatformEnum,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import resolve_obj_by_qualname
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import resolve_obj_by_qualname
 
 logger = init_logger(__name__)
 
@@ -20,7 +20,7 @@ def cuda_platform_plugin() -> str | None:
     is_cuda = False
 
     try:
-        from sgl_diffusion.utils import import_pynvml
+        from sglang.multimodal_gen.utils import import_pynvml
 
         pynvml = import_pynvml()  # type: ignore[no-untyped-call]
         pynvml.nvmlInit()
@@ -51,7 +51,9 @@ def cuda_platform_plugin() -> str | None:
     if is_cuda:
         logger.info("CUDA is available")
 
-    return "sgl_diffusion.runtime.platforms.cuda.CudaPlatform" if is_cuda else None
+    return (
+        "sglang.multimodal_gen.runtime.platforms.cuda.CudaPlatform" if is_cuda else None
+    )
 
 
 def mps_platform_plugin() -> str | None:
@@ -67,13 +69,13 @@ def mps_platform_plugin() -> str | None:
     except Exception as e:
         logger.info("MPS detection failed: %s", e)
 
-    return "sgl_diffusion.runtime.platforms.mps.MpsPlatform" if is_mps else None
+    return "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform" if is_mps else None
 
 
 def cpu_platform_plugin() -> str | None:
     """Detect if CPU platform should be used."""
     # CPU is always available as a fallback
-    return "sgl_diffusion.runtime.platforms.cpu.CpuPlatform"
+    return "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform"
 
 
 def rocm_platform_plugin() -> str | None:
@@ -92,7 +94,9 @@ def rocm_platform_plugin() -> str | None:
     except Exception as e:
         logger.info("ROCm platform is unavailable: %s", e)
 
-    return "sgl_diffusion.runtime.platforms.rocm.RocmPlatform" if is_rocm else None
+    return (
+        "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform" if is_rocm else None
+    )
 
 
 builtin_platform_plugins = {
@@ -140,10 +144,10 @@ if TYPE_CHECKING:
 def __getattr__(name: str):
     if name == "current_platform":
         # lazy init current_platform.
-        # 1. out-of-tree platform plugins need `from sgl_diffusion.runtime.platforms import
+        # 1. out-of-tree platform plugins need `from sglang.multimodal_gen.runtime.platforms import
         #    Platform` so that they can inherit `Platform` class. Therefore,
         #    we cannot resolve `current_platform` during the import of
-        #    `sgl_diffusion.runtime.platforms`.
+        #    `sglang.multimodal_gen.runtime.platforms`.
         # 2. when users use out-of-tree platform plugins, they might run
         #    `import sgl_diffusion`, some sgl_diffusion internal code might access
         #    `current_platform` during the import, and we need to make sure

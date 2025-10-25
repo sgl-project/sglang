@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapt from https://github.com/KwaiVGI/VMoBA/blob/main/src/vmoba.py
 
-import os
 import random
 import time
 from typing import Tuple

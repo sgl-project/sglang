@@ -17,8 +17,8 @@ import torch.profiler
 from einops import rearrange
 from tqdm.auto import tqdm
 
-from sgl_diffusion.api.configs.pipelines.base import STA_Mode
-from sgl_diffusion.runtime.distributed import (
+from sglang.multimodal_gen.api.configs.pipelines.base import STA_Mode
+from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
     get_sp_group,
@@ -26,36 +26,36 @@ from sgl_diffusion.runtime.distributed import (
     get_sp_world_size,
     get_world_group,
 )
-from sgl_diffusion.runtime.distributed.communication_op import (
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
-from sgl_diffusion.runtime.distributed.parallel_state import (
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-from sgl_diffusion.runtime.layers.attention.selector import get_attn_backend
-from sgl_diffusion.runtime.layers.attention.STA_configuration import (
+from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
-from sgl_diffusion.runtime.loader.component_loader import TransformerLoader
-from sgl_diffusion.runtime.managers.forward_context import set_forward_context
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.pipelines.stages.base import (
+from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
-from sgl_diffusion.runtime.pipelines.stages.validators import (
+from sglang.multimodal_gen.runtime.pipelines.stages.validators import (
     StageValidators as V,
 )
-from sgl_diffusion.runtime.pipelines.stages.validators import VerificationResult
-from sgl_diffusion.runtime.platforms.interface import AttentionBackendEnum
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import dict_to_3d_list, masks_like
+from sglang.multimodal_gen.runtime.pipelines.stages.validators import VerificationResult
+from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 
 try:
-    from sgl_diffusion.runtime.layers.attention.backends.sliding_tile_attn import (
+    from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (
         SlidingTileAttentionBackend,
     )
 
@@ -64,17 +64,17 @@ except ImportError:
     st_attn_available = False
 
 try:
-    from sgl_diffusion.runtime.layers.attention.backends.vmoba import (
+    from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (
         VMOBAAttentionBackend,
     )
-    from sgl_diffusion.utils import is_vmoba_available
+    from sglang.multimodal_gen.utils import is_vmoba_available
 
     vmoba_attn_available = is_vmoba_available()
 except ImportError:
     vmoba_attn_available = False
 
 try:
-    from sgl_diffusion.runtime.layers.attention.backends.video_sparse_attn import (
+    from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (
         VideoSparseAttentionBackend,
     )
 
@@ -1033,7 +1033,7 @@ class DenoisingStage(PipelineStage):
                 timesteps=timesteps_num,
             )
         elif STA_mode == STA_Mode.STA_INFERENCE:
-            import sgl_diffusion.envs as envs
+            import sglang.multimodal_gen.envs as envs
 
             config_file = envs.SGL_DIFFUSION_ATTENTION_CONFIG
             if config_file is None:

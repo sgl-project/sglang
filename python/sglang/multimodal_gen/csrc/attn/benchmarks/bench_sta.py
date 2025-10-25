@@ -2,7 +2,6 @@ import os
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 from st_attn import sliding_tile_attention
 from triton.testing import do_bench

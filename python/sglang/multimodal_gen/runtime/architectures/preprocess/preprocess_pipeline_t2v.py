@@ -5,8 +5,8 @@ T2V Data Preprocessing pipeline implementation.
 This module contains an implementation of the T2V Data Preprocessing pipeline
 using the modular pipeline architecture.
 """
-from sgl_diffusion.dataset.dataloader.schema import pyarrow_schema_t2v
-from sgl_diffusion.runtime.pipelines.preprocess.preprocess_pipeline_base import (
+from sglang.multimodal_gen.dataset.dataloader.schema import pyarrow_schema_t2v
+from sglang.multimodal_gen.runtime.pipelines.preprocess.preprocess_pipeline_base import (
     BasePreprocessPipeline,
 )
 

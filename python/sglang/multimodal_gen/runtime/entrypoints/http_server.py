@@ -3,14 +3,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from sgl_diffusion.runtime.entrypoints.openai import image_api, video_api
-from sgl_diffusion.runtime.server_args import ServerArgs, prepare_server_args
-from sgl_diffusion.runtime.utils.logging_utils import configure_logger
+from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, prepare_server_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from sgl_diffusion.runtime.scheduler_client import (
+    from sglang.multimodal_gen.runtime.scheduler_client import (
         run_zeromq_broker,
         scheduler_client,
     )

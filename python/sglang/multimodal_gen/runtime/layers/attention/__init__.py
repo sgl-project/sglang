@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from sgl_diffusion.runtime.layers.attention.backends.attention_backend import (
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sgl_diffusion.runtime.layers.attention.layer import (
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
     LocalAttention,
     UlyssesAttention_VSA,
     USPAttention,
 )
-from sgl_diffusion.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 
 __all__ = [
     "USPAttention",

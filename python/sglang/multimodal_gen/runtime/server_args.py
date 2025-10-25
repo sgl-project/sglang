@@ -12,27 +12,27 @@ from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
-from sgl_diffusion.api.configs.configs import PreprocessConfig
-from sgl_diffusion.api.configs.pipelines import FluxPipelineConfig
-from sgl_diffusion.api.configs.pipelines.base import PipelineConfig, STA_Mode
-from sgl_diffusion.api.configs.pipelines.qwen_image import (
+from sglang.multimodal_gen.api.configs.configs import PreprocessConfig
+from sglang.multimodal_gen.api.configs.pipelines import FluxPipelineConfig
+from sglang.multimodal_gen.api.configs.pipelines.base import PipelineConfig, STA_Mode
+from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
     QwenImagePipelineConfig,
 )
-from sgl_diffusion.api.configs.utils import clean_cli_args
-from sgl_diffusion.runtime.distributed.parallel_state import HAS_LONG_CTX_ATTN
-from sgl_diffusion.runtime.platforms import (
+from sglang.multimodal_gen.api.configs.utils import clean_cli_args
+from sglang.multimodal_gen.runtime.distributed.parallel_state import HAS_LONG_CTX_ATTN
+from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sgl_diffusion.runtime.utils.common import (
+from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
     is_valid_ipv6_address,
 )
-from sgl_diffusion.runtime.utils.logging_utils import (
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
-from sgl_diffusion.utils import FlexibleArgumentParser, StoreBoolean
+from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean
 
 logger = init_logger(__name__)
 

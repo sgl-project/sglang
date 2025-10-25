@@ -6,33 +6,33 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from sgl_diffusion.api.configs.models.dits import HunyuanVideoConfig
-from sgl_diffusion.api.configs.sample.teacache import TeaCacheParams
-from sgl_diffusion.runtime.distributed.parallel_state import get_sp_world_size
-from sgl_diffusion.runtime.layers.attention import LocalAttention, USPAttention
-from sgl_diffusion.runtime.layers.layernorm import (
+from sglang.multimodal_gen.api.configs.models.dits import HunyuanVideoConfig
+from sglang.multimodal_gen.api.configs.sample.teacache import TeaCacheParams
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     ScaleResidual,
     ScaleResidualLayerNormScaleShift,
 )
-from sgl_diffusion.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 
 # TODO(will-PY-refactor): RMSNorm ....
-from sgl_diffusion.runtime.layers.mlp import MLP
-from sgl_diffusion.runtime.layers.rotary_embedding import (
+from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     get_rotary_pos_embed,
 )
-from sgl_diffusion.runtime.layers.visual_embedding import (
+from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
     PatchEmbed,
     TimestepEmbedder,
     unpatchify,
 )
-from sgl_diffusion.runtime.managers.forward_context import get_forward_context
-from sgl_diffusion.runtime.models.dits.base import CachableDiT
-from sgl_diffusion.runtime.models.utils import modulate
-from sgl_diffusion.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.utils import modulate
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class HunyuanRMSNorm(nn.Module):

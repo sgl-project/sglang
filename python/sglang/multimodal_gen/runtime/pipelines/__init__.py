@@ -1,27 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Diffusion pipelines for sgl_diffusion.
+Diffusion pipelines for sglang.multimodal_gen.
 
 This package contains diffusion pipelines for generating videos and images.
 """
 
 from typing import cast
 
-from sgl_diffusion.runtime.pipelines.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sgl_diffusion.runtime.pipelines.lora_pipeline import LoRAPipeline
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.pipelines.pipeline_registry import (
+from sglang.multimodal_gen.runtime.pipelines.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.pipeline_registry import (
     PipelineType,
     get_pipeline_registry,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.hf_diffusers_utils import (
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
     verify_model_config_and_directory,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

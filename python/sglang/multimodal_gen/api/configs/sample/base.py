@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
 
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import align_to
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import align_to
 
 logger = init_logger(__name__)
 
@@ -164,7 +164,7 @@ class SamplingParams:
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
-        from sgl_diffusion.api.configs.sample.registry import (
+        from sglang.multimodal_gen.api.configs.sample.registry import (
             get_sampling_param_cls_for_name,
         )
 

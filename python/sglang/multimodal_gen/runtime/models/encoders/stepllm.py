@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
 
-from sgl_diffusion.runtime.models.dits.stepvideo import StepVideoRMSNorm
+from sglang.multimodal_gen.runtime.models.dits.stepvideo import StepVideoRMSNorm
 
 
 class EmptyInitOnDevice(torch.overrides.TorchFunctionMode):

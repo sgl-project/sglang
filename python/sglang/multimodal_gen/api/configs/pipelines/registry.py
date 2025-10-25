@@ -4,19 +4,19 @@
 import os
 from collections.abc import Callable
 
-from sgl_diffusion.api.configs.pipelines.base import PipelineConfig
-from sgl_diffusion.api.configs.pipelines.flux import FluxPipelineConfig
-from sgl_diffusion.api.configs.pipelines.hunyuan import (
+from sglang.multimodal_gen.api.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.api.configs.pipelines.flux import FluxPipelineConfig
+from sglang.multimodal_gen.api.configs.pipelines.hunyuan import (
     FastHunyuanConfig,
     HunyuanConfig,
 )
-from sgl_diffusion.api.configs.pipelines.qwen_image import (
+from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
     QwenImagePipelineConfig,
 )
-from sgl_diffusion.api.configs.pipelines.stepvideo import StepVideoT2VConfig
+from sglang.multimodal_gen.api.configs.pipelines.stepvideo import StepVideoT2VConfig
 
 # isort: off
-from sgl_diffusion.api.configs.pipelines.wan import (
+from sglang.multimodal_gen.api.configs.pipelines.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
     Wan2_2_I2V_A14B_Config,
@@ -28,13 +28,13 @@ from sgl_diffusion.api.configs.pipelines.wan import (
     WanT2V720PConfig,
     SelfForcingWanT2V480PConfig,
 )
-from sgl_diffusion.runtime.utils.hf_diffusers_utils import (
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
     maybe_download_model_index,
 )
 
 # isort: on
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

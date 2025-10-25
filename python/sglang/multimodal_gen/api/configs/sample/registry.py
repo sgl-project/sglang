@@ -3,18 +3,18 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-from sgl_diffusion.api.configs.sample.flux import FluxSamplingParams
-from sgl_diffusion.api.configs.sample.hunyuan import (
+from sglang.multimodal_gen.api.configs.sample.flux import FluxSamplingParams
+from sglang.multimodal_gen.api.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
 )
-from sgl_diffusion.api.configs.sample.qwenimage import QwenImageSamplingParams
-from sgl_diffusion.api.configs.sample.stepvideo import (
+from sglang.multimodal_gen.api.configs.sample.qwenimage import QwenImageSamplingParams
+from sglang.multimodal_gen.api.configs.sample.stepvideo import (
     StepVideoT2VSamplingParams,
 )
 
 # isort: off
-from sgl_diffusion.api.configs.sample.wan import (
+from sglang.multimodal_gen.api.configs.sample.wan import (
     FastWanT2V480PConfig,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
     Wan2_2_I2V_A14B_SamplingParam,
@@ -26,13 +26,13 @@ from sgl_diffusion.api.configs.sample.wan import (
     WanT2V_14B_SamplingParams,
     SelfForcingWanT2V480PConfig,
 )
-from sgl_diffusion.runtime.utils.hf_diffusers_utils import (
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model_index,
     verify_model_config_and_directory,
 )
 
 # isort: on
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 # Registry maps specific model weights to their config classes

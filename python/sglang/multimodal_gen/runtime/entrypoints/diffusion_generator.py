@@ -26,14 +26,14 @@ logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
 logging.getLogger("PIL").setLevel(logging.WARNING)
 logging.getLogger("PIL.Image").setLevel(logging.WARNING)
 
-from sgl_diffusion.api.configs.sample.base import DataType, SamplingParams
-from sgl_diffusion.runtime.entrypoints.utils import prepare_request
-from sgl_diffusion.runtime.launch_server import launch_server
-from sgl_diffusion.runtime.managers.schedulerbase import SchedulerBase
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
-from sgl_diffusion.runtime.server_args import PortArgs, ServerArgs
-from sgl_diffusion.runtime.sync_scheduler_client import sync_scheduler_client
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.api.configs.sample.base import DataType, SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.launch_server import launch_server
+from sglang.multimodal_gen.runtime.managers.schedulerbase import SchedulerBase
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
+from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_client
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

@@ -13,21 +13,21 @@ from typing import Any, cast
 import torch
 from tqdm import tqdm
 
-from sgl_diffusion.api.configs.pipelines import PipelineConfig
-from sgl_diffusion.runtime.loader.component_loader import (
+from sglang.multimodal_gen.api.configs.pipelines import PipelineConfig
+from sglang.multimodal_gen.runtime.loader.component_loader import (
     PipelineComponentLoader,
 )
-from sgl_diffusion.runtime.pipelines.executors.pipeline_executor import (
+from sglang.multimodal_gen.runtime.pipelines.executors.pipeline_executor import (
     PipelineExecutor,
 )
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.pipelines.stages import PipelineStage
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.hf_diffusers_utils import (
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.stages import PipelineStage
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
     verify_model_config_and_directory,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -88,7 +88,7 @@ class ComposedPipelineBase(ABC):
 
     def build_executor(self, server_args: ServerArgs):
         # TODO
-        from sgl_diffusion.runtime.pipelines.executors.parallel_executor import (
+        from sglang.multimodal_gen.runtime.pipelines.executors.parallel_executor import (
             ParallelExecutor,
         )
 

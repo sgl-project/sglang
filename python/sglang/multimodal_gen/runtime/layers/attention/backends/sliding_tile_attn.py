@@ -6,20 +6,20 @@ from typing import Any
 import torch
 from einops import rearrange
 
-import sgl_diffusion.envs as envs
-from sgl_diffusion.runtime.distributed import get_sp_group
-from sgl_diffusion.runtime.layers.attention.backends.attention_backend import (
+import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.distributed import get_sp_group
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sgl_diffusion.runtime.managers.forward_context import (
+from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
-from sgl_diffusion.utils import dict_to_3d_list
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import dict_to_3d_list
 
 try:
     from st_attn import sliding_tile_attention

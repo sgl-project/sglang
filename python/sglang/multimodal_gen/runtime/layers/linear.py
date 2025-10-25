@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from sgl_diffusion.runtime.distributed import (
+from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_rank,
     get_tp_world_size,
@@ -15,13 +15,13 @@ from sgl_diffusion.runtime.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sgl_diffusion.runtime.layers.quantization.base_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
 
 # yapf: disable
-from sgl_diffusion.runtime.models.parameter import (
+from sglang.multimodal_gen.runtime.models.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
     PackedColumnParameter,
@@ -31,8 +31,8 @@ from sgl_diffusion.runtime.models.parameter import (
 )
 
 # yapf: enable
-from sgl_diffusion.runtime.models.utils import set_weight_attrs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

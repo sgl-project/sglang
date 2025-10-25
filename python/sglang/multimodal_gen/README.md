@@ -35,7 +35,7 @@ uv sync && uv pip install -e '.[kernels]'
 Here's a minimal example to generate a video using the default settings:
 
 ```python
-from sgl_diffusion import DiffGenerator
+from sglang.multimodal_gen import DiffGenerator
 
 def main():
     # Create a diff generator from a pre-trained model

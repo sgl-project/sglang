@@ -14,8 +14,8 @@ import torch
 from safetensors.torch import safe_open
 from tqdm.auto import tqdm
 
-from sgl_diffusion.runtime.distributed import get_local_torch_device
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

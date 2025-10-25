@@ -3,12 +3,12 @@
 import torch
 from sageattention import sageattn
 
-from sgl_diffusion.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
 )
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

@@ -15,22 +15,22 @@ from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from sgl_diffusion.dataset import gettextdataset
-from sgl_diffusion.dataset.dataloader.parquet_io import (
+from sglang.multimodal_gen.dataset import gettextdataset
+from sglang.multimodal_gen.dataset.dataloader.parquet_io import (
     ParquetDatasetWriter,
     records_to_table,
 )
-from sgl_diffusion.dataset.dataloader.record_schema import (
+from sglang.multimodal_gen.dataset.dataloader.record_schema import (
     text_only_record_creator,
 )
-from sgl_diffusion.dataset.dataloader.schema import pyarrow_schema_text_only
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.pipelines.preprocess.preprocess_pipeline_base import (
+from sglang.multimodal_gen.dataset.dataloader.schema import pyarrow_schema_text_only
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.preprocess.preprocess_pipeline_base import (
     BasePreprocessPipeline,
 )
-from sgl_diffusion.runtime.pipelines.stages import TextEncodingStage
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.pipelines.stages import TextEncodingStage
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -155,7 +155,7 @@ class PreprocessPipeline_Text(BasePreprocessPipeline):
             if written:
                 logger.info("Final flush wrote %s samples", written)
 
-    # Text-only record creation moved to sgl_diffusion.dataset.dataloader.record_schema
+    # Text-only record creation moved to sglang.multimodal_gen.dataset.dataloader.record_schema
 
     def forward(self, batch: Req, server_args: ServerArgs, args):
         if not self.post_init_called:

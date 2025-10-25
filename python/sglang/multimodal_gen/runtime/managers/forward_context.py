@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/forward_context.py
-import logging
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -9,11 +8,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
-    from sgl_diffusion.runtime.layers.attention import AttentionMetadata
-    from sgl_diffusion.runtime.pipelines import Req
+    from sglang.multimodal_gen.runtime.layers.attention import AttentionMetadata
+    from sglang.multimodal_gen.runtime.pipelines import Req
 
 logger = init_logger(__name__)
 

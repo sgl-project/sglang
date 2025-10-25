@@ -1,19 +1,19 @@
 import torch  # type: ignore
 
-from sgl_diffusion.runtime.distributed import get_local_torch_device
-from sgl_diffusion.runtime.managers.forward_context import set_forward_context
-from sgl_diffusion.runtime.models.utils import pred_noise_to_pred_video
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.pipelines.stages.denoising import DenoisingStage
-from sgl_diffusion.runtime.pipelines.stages.validators import (
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines.stages.validators import (
     StageValidators as V,
 )
-from sgl_diffusion.runtime.pipelines.stages.validators import VerificationResult
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.pipelines.stages.validators import VerificationResult
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 try:
-    from sgl_diffusion.runtime.layers.attention.backends.sliding_tile_attn import (
+    from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (
         SlidingTileAttentionBackend,
     )
 
@@ -23,7 +23,7 @@ except ImportError:
     SlidingTileAttentionBackend = None  # type: ignore
 
 try:
-    from sgl_diffusion.runtime.layers.attention.backends.video_sparse_attn import (
+    from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (
         VideoSparseAttentionBackend,
     )
 

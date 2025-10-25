@@ -7,43 +7,43 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from sgl_diffusion.api.configs.models.dits import WanVideoConfig
-from sgl_diffusion.api.configs.sample.wan import WanTeaCacheParams
-from sgl_diffusion.runtime.distributed.parallel_state import get_sp_world_size
-from sgl_diffusion.runtime.layers.attention import (
+from sglang.multimodal_gen.api.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.api.configs.sample.wan import WanTeaCacheParams
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,
     UlyssesAttention_VSA,
     USPAttention,
 )
-from sgl_diffusion.runtime.layers.layernorm import (
+from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidual,
     ScaleResidualLayerNormScaleShift,
 )
-from sgl_diffusion.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 
 # from torch.nn import RMSNorm
 # TODO: RMSNorm ....
-from sgl_diffusion.runtime.layers.mlp import MLP
-from sgl_diffusion.runtime.layers.rotary_embedding import (
+from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
 )
-from sgl_diffusion.runtime.layers.visual_embedding import (
+from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
     PatchEmbed,
     TimestepEmbedder,
 )
-from sgl_diffusion.runtime.managers.forward_context import get_forward_context
-from sgl_diffusion.runtime.models.dits.base import CachableDiT
-from sgl_diffusion.runtime.platforms import (
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sgl_diffusion.runtime.server_args import get_global_server_args
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

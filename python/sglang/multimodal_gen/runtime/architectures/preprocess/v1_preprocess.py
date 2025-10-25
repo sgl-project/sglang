@@ -2,27 +2,27 @@ import argparse
 import os
 from typing import Any
 
-from sgl_diffusion import PipelineConfig
-from sgl_diffusion.api.configs.models.vaes import WanVAEConfig
-from sgl_diffusion.runtime.architectures.preprocess.preprocess_pipeline_i2v import (
+from sglang.multimodal_gen import PipelineConfig
+from sglang.multimodal_gen.api.configs.models.vaes import WanVAEConfig
+from sglang.multimodal_gen.runtime.architectures.preprocess.preprocess_pipeline_i2v import (
     PreprocessPipeline_I2V,
 )
-from sgl_diffusion.runtime.architectures.preprocess.preprocess_pipeline_ode_trajectory import (
+from sglang.multimodal_gen.runtime.architectures.preprocess.preprocess_pipeline_ode_trajectory import (
     PreprocessPipeline_ODE_Trajectory,
 )
-from sgl_diffusion.runtime.architectures.preprocess.preprocess_pipeline_t2v import (
+from sglang.multimodal_gen.runtime.architectures.preprocess.preprocess_pipeline_t2v import (
     PreprocessPipeline_T2V,
 )
-from sgl_diffusion.runtime.architectures.preprocess.preprocess_pipeline_text import (
+from sglang.multimodal_gen.runtime.architectures.preprocess.preprocess_pipeline_text import (
     PreprocessPipeline_Text,
 )
-from sgl_diffusion.runtime.distributed import (
+from sglang.multimodal_gen.runtime.distributed import (
     get_world_size,
     maybe_init_distributed_environment_and_model_parallel,
 )
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.hf_diffusers_utils import maybe_download_model
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

@@ -9,20 +9,20 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from sgl_diffusion.dataset import getdataset
-from sgl_diffusion.dataset.dataloader.parquet_io import (
+from sglang.multimodal_gen.dataset import getdataset
+from sglang.multimodal_gen.dataset.dataloader.parquet_io import (
     ParquetDatasetWriter,
     records_to_table,
 )
-from sgl_diffusion.dataset.preprocessing_datasets import PreprocessBatch
-from sgl_diffusion.runtime.distributed import get_local_torch_device
-from sgl_diffusion.runtime.pipelines.composed_pipeline_base import (
+from sglang.multimodal_gen.dataset.preprocessing_datasets import PreprocessBatch
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sgl_diffusion.runtime.pipelines.pipeline_batch_info import Req
-from sgl_diffusion.runtime.pipelines.stages import TextEncodingStage
-from sgl_diffusion.runtime.server_args import ServerArgs
-from sgl_diffusion.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.stages import TextEncodingStage
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 

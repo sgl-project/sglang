@@ -3,11 +3,11 @@ from typing import Callable
 
 import torch
 
-from sgl_diffusion.api.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sgl_diffusion.api.configs.models.dits.qwenimage import QwenImageDitConfig
-from sgl_diffusion.api.configs.models.encoders.qwen_image import Qwen2_5VLConfig
-from sgl_diffusion.api.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sgl_diffusion.api.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.api.configs.models import DiTConfig, EncoderConfig, VAEConfig
+from sglang.multimodal_gen.api.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.api.configs.models.encoders.qwen_image import Qwen2_5VLConfig
+from sglang.multimodal_gen.api.configs.models.vaes.qwenimage import QwenImageVAEConfig
+from sglang.multimodal_gen.api.configs.pipelines.base import PipelineConfig
 
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):

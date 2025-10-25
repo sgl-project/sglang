@@ -18,8 +18,8 @@ from einops import rearrange
 from torch import nn
 from torch.nn import functional as F
 
-from sgl_diffusion.api.configs.models.vaes import StepVideoVAEConfig
-from sgl_diffusion.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.api.configs.models.vaes import StepVideoVAEConfig
+from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
 
 def base_group_norm(x, norm_layer, act_silu=False, channel_last=False) -> torch.Tensor:

@@ -22,13 +22,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sgl_diffusion.api.configs.models.vaes import WanVAEConfig
-from sgl_diffusion.runtime.layers.activation import get_act_fn
-from sgl_diffusion.runtime.models.vaes.common import (
+from sglang.multimodal_gen.api.configs.models.vaes import WanVAEConfig
+from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
+from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
     ParallelTiledVAE,
 )
-from sgl_diffusion.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 CACHE_T = 2
 

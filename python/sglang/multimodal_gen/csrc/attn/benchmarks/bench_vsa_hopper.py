@@ -3,7 +3,6 @@ import random
 
 import numpy as np
 import torch
-import triton
 from triton.testing import do_bench
 from vsa import BLOCK_M, BLOCK_N, block_sparse_bwd, block_sparse_fwd
 
