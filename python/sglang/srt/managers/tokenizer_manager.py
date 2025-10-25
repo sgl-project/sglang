@@ -46,6 +46,7 @@ from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchT
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActiveRanksOutput,
     BaseReq,
     BatchEmbeddingOutput,
     BatchMultimodalOutput,
@@ -374,6 +375,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
+                (ActiveRanksOutput, self.update_active_ranks),
             ]
         )
 
@@ -1738,6 +1740,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             }
         state.out_list.append(out)
         state.event.set()
+
+    def update_active_ranks(self, ranks: ActiveRanksOutput):
+        self.send_to_scheduler.send_pyobj(ranks)
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
