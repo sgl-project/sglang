@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 
 MODELS = [
     SimpleNamespace(
-        model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+        model="meta-llama/Llama-4-Scout-17B-16E-Instruct",
         tp_size=4,
     ),
 ]
@@ -31,6 +31,8 @@ class TestLlama4LoRA(CustomTestCase):
                     timeout=3 * DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                     other_args=[
                         "--enable-lora",
+                        "--lora-path",
+                        "Guilherme34/llama-4-scout-sam-test",
                         "--max-lora-rank",
                         "64",
                         "--lora-target-modules",
