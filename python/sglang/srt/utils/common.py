@@ -3068,12 +3068,16 @@ def apply_module_patch(target_module, target_function, wrappers):
         setattr(original_module, target_function, candidate)
 
     for key, value in sys.modules.copy().items():
-        if (
-            target_function is not None
-            and hasattr(value, target_function)
-            and id(getattr(value, target_function)) == original_function_id
-        ):
-            setattr(value, target_function, candidate)
+        try:
+            if (
+                target_function is not None
+                and hasattr(value, target_function)
+                and id(getattr(value, target_function)) == original_function_id
+            ):
+                setattr(value, target_function, candidate)
+        except ImportError as e:
+            # Ignore some modules reporting ImportError when calling hasattr
+            logger.warning(f"Ignore {value} reports ImportError with:\n{str(e)}")
 
 
 def parse_module_path(module_path, function_name, create_dummy):
