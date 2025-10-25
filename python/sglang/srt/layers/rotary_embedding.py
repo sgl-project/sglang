@@ -1361,6 +1361,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         else:
             return self._forward_native(positions, query, key)
 
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _forward_triton(
         self,
         positions: torch.Tensor,
@@ -1379,6 +1380,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         if positions.ndim == 2:
             assert self.mrope_section
 
+            torch._dynamo.graph_break()
             q, k = triton_mrope(
                 query,
                 key,
@@ -1389,6 +1391,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 self.rotary_dim,
                 self.mrope_interleaved,
             )
+            torch._dynamo.graph_break()
 
             return q.reshape(query_shape), k.reshape(key_shape)
 
