@@ -24,7 +24,7 @@ use super::{
     types::BackgroundTaskInfo,
 };
 /// This is a re-export of the shared implementation from openai::mcp
-pub(super) use crate::routers::openai::mcp::mcp_manager_from_request_tools as create_mcp_manager_from_request;
+pub(super) use crate::routers::openai::mcp::ensure_request_mcp_client as create_mcp_manager_from_request;
 use crate::{
     data_connector::{
         SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,

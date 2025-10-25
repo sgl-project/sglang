@@ -128,8 +128,16 @@ impl FunctionCallInProgress {
 // MCP Manager Integration
 // ============================================================================
 
-/// Build a request-scoped MCP client from request tools using McpManager.
-pub async fn mcp_manager_from_request_tools(
+/// Ensure a dynamic MCP client exists for request-scoped tools.
+///
+/// This function parses request tools to extract MCP server configuration,
+/// then ensures a dynamic client exists in the McpManager via `get_or_create_client()`.
+/// The McpManager itself is returned (cloned Arc) for convenience, though the main
+/// purpose is the side effect of registering the dynamic client.
+///
+/// Returns Some(manager) if a dynamic MCP tool was found and client was created/retrieved,
+/// None if no MCP tools were found or connection failed.
+pub async fn ensure_request_mcp_client(
     mcp_manager: &Arc<mcp::McpManager>,
     tools: &[ResponseTool],
 ) -> Option<Arc<mcp::McpManager>> {

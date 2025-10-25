@@ -207,60 +207,53 @@ python3 -m sglang_router.launch_router \
 - The Rust binary supports the same flags (`./target/release/sglang-router --backend openai ...`).
 
 ### MCP Integration
-The SGL Model Gateway provides native Model Context Protocol (MCP) client integration, enabling tool calling across STDIO, SSE, and Streamable transports. MCP servers are configured via a JSON configuration file and registered at startup through the workflow engine.
+The SGL Model Gateway provides native Model Context Protocol (MCP) client integration, enabling tool calling across STDIO, SSE, and Streamable transports. MCP servers are configured via a YAML configuration file and registered at startup through the workflow engine.
 
 #### Basic Usage
 ```bash
 # Rust binary
 ./target/release/sglang-router \
-  --mcp-config-path /path/to/mcp-config.json \
+  --mcp-config-path /path/to/mcp-config.yaml \
   --worker-urls http://worker1:8000
 
 # Python launcher
 python3 -m sglang_router.launch_router \
-  --mcp-config-path /path/to/mcp-config.json \
+  --mcp-config-path /path/to/mcp-config.yaml \
   --worker-urls http://worker1:8000
 ```
 
 #### MCP Configuration File
 Create an MCP configuration file to define servers, transports, and connection settings:
 
-```json
-{
-  "servers": [
-    {
-      "name": "filesystem",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
-      "required": false
-    },
-    {
-      "name": "github",
-      "url": "https://api.github.com/mcp",
-      "token": "ghp_xxxxx",
-      "transport": "sse",
-      "required": false
-    },
-    {
-      "name": "custom-tools",
-      "url": "https://tools.example.com/mcp",
-      "transport": "streamable",
-      "required": true
-    }
-  ],
-  "pool": {
-    "max_connections": 100,
-    "idle_timeout_secs": 300
-  },
-  "proxy": {
-    "http": "http://proxy.internal:8080",
-    "https": "https://proxy.internal:8443",
-    "no_proxy": "localhost,127.0.0.1,*.internal"
-  },
-  "inventory": {
-    "refresh_interval_secs": 300
-  }
-}
+```yaml
+servers:
+  - name: "filesystem"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    required: false
+
+  - name: "github"
+    url: "https://api.github.com/mcp"
+    token: "ghp_xxxxx"
+    transport: "sse"
+    required: false
+
+  - name: "custom-tools"
+    url: "https://tools.example.com/mcp"
+    transport: "streamable"
+    required: true
+
+pool:
+  max_connections: 100
+  idle_timeout_secs: 300
+
+proxy:
+  http: "http://proxy.internal:8080"
+  https: "https://proxy.internal:8443"
+  no_proxy: "localhost,127.0.0.1,*.internal"
+
+inventory:
+  refresh_interval_secs: 300
 ```
 
 #### Configuration Options
@@ -290,36 +283,29 @@ Create an MCP configuration file to define servers, transports, and connection s
 #### Transport Types
 
 **STDIO** (Local Process):
-```json
-{
-  "name": "local-tools",
-  "command": "python",
-  "args": ["-m", "my_mcp_server"],
-  "envs": {
-    "API_KEY": "secret",
-    "DEBUG": "true"
-  }
-}
+```yaml
+name: "local-tools"
+command: "python"
+args: ["-m", "my_mcp_server"]
+envs:
+  API_KEY: "secret"
+  DEBUG: "true"
 ```
 
 **SSE** (Server-Sent Events):
-```json
-{
-  "name": "remote-sse",
-  "url": "https://mcp.example.com/events",
-  "token": "bearer-token",
-  "transport": "sse"
-}
+```yaml
+name: "remote-sse"
+url: "https://mcp.example.com/events"
+token: "bearer-token"
+transport: "sse"
 ```
 
 **Streamable** (Bidirectional Streaming):
-```json
-{
-  "name": "streaming-tools",
-  "url": "https://mcp.example.com/stream",
-  "transport": "streamable",
-  "required": true
-}
+```yaml
+name: "streaming-tools"
+url: "https://mcp.example.com/stream"
+transport: "streamable"
+required: true
 ```
 
 #### Server Lifecycle

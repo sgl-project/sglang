@@ -28,7 +28,7 @@ use super::conversations::{
 };
 use super::{
     mcp::{
-        execute_tool_loop, mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
+        ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
         McpLoopConfig,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
@@ -224,7 +224,7 @@ impl OpenAIRouter {
         // Check if MCP is active for this request
         // Ensure dynamic client is created if needed
         if let Some(ref tools) = original_body.tools {
-            mcp_manager_from_request_tools(&self.mcp_manager, tools.as_slice()).await;
+            ensure_request_mcp_client(&self.mcp_manager, tools.as_slice()).await;
         }
 
         // Use the tool loop if the manager has any tools available (static or dynamic).

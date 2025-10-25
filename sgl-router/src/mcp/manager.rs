@@ -9,7 +9,7 @@
 //! - McpManager (single component handling all MCP concerns)
 //! - McpClient (actual client to one server)
 
-use std::{borrow::Cow, collections::HashSet, sync::Arc, time::Duration};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use backoff::ExponentialBackoffBuilder;
 use dashmap::DashMap;
@@ -56,7 +56,8 @@ pub struct McpManager {
     clients: Arc<DashMap<String, Arc<McpClient>>>,
 
     /// Track which servers are static (from config)
-    static_servers: HashSet<String>,
+    /// Using DashMap for thread-safe mutation during workflow registration
+    static_servers: Arc<DashMap<String, ()>>,
 
     /// Shared tool inventory with TTL and caching
     inventory: Arc<ToolInventory>,
@@ -87,14 +88,14 @@ impl McpManager {
 
         // Create manager structure
         let clients = Arc::new(DashMap::new());
-        let mut static_servers = HashSet::new();
+        let static_servers = Arc::new(DashMap::new());
 
         // Get global proxy config for all servers
         let global_proxy = config.proxy.as_ref();
 
         // Connect to all static servers from config
         for server_config in &config.servers {
-            static_servers.insert(server_config.name.clone());
+            static_servers.insert(server_config.name.clone(), ());
 
             match Self::connect_server(server_config, global_proxy).await {
                 Ok(client) => {
@@ -178,12 +179,15 @@ impl McpManager {
 
     /// List all static server names
     pub fn list_static_servers(&self) -> Vec<String> {
-        self.static_servers.iter().cloned().collect()
+        self.static_servers
+            .iter()
+            .map(|e| e.key().clone())
+            .collect()
     }
 
     /// Check if a server is static
     pub fn is_static_server(&self, server_name: &str) -> bool {
-        self.static_servers.contains(server_name)
+        self.static_servers.contains_key(server_name)
     }
 
     /// Register a static server (called by workflow system)
@@ -198,8 +202,9 @@ impl McpManager {
         // Insert into clients map
         self.clients.insert(name.clone(), client);
 
-        // Note: static_servers is immutable after construction, so we can't add to it
-        // This is okay because the workflow-registered servers are also considered static
+        // Mark as static server (for background refresh and stats)
+        self.static_servers.insert(name.clone(), ());
+
         info!("Registered static MCP server: {}", name);
     }
 

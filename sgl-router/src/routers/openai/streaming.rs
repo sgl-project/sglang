@@ -25,8 +25,8 @@ use tracing::warn;
 use super::conversations::persist_conversation_items;
 use super::{
     mcp::{
-        build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-        mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
+        build_resume_payload, ensure_request_mcp_client, execute_streaming_tool_calls,
+        inject_mcp_metadata_streaming, prepare_mcp_payload_for_streaming,
         send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
@@ -1504,7 +1504,7 @@ pub(super) async fn handle_streaming_response(
     // Check if MCP is active for this request
     // Ensure dynamic client is created if needed
     if let (Some(manager), Some(ref tools)) = (mcp_manager, &original_body.tools) {
-        mcp_manager_from_request_tools(manager, tools.as_slice()).await;
+        ensure_request_mcp_client(manager, tools.as_slice()).await;
     }
 
     // Use the tool loop if the manager has any tools available (static or dynamic).
