@@ -64,8 +64,8 @@ pub struct McpManager {
     /// Connection pool for dynamic servers (TTL-based cleanup)
     connection_pool: Arc<McpConnectionPool>,
 
-    /// Original config for static servers
-    config: McpConfig,
+    /// Original config for static servers (kept for potential future use)
+    _config: McpConfig,
 }
 
 impl McpManager {
@@ -122,7 +122,7 @@ impl McpManager {
             static_servers,
             inventory,
             connection_pool,
-            config,
+            _config: config,
         })
     }
 
