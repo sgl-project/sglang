@@ -19,6 +19,9 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative.eagle_draft_extend_npu_graph_runner import (
+    EAGLEDraftExtendNpuGraphRunner,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
@@ -208,11 +211,11 @@ class EagleDraftWorker(BaseDraftWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph or is_npu():
+        if self.server_args.disable_cuda_graph:
             return
 
         # Capture draft
-        if self.speculative_num_steps > 1:
+        if self.speculative_num_steps > 1 and not is_npu():
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -231,8 +234,10 @@ class EagleDraftWorker(BaseDraftWorker):
             logger.info(
                 f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
-                self
+            self.cuda_graph_runner_for_draft_extend = (
+                EAGLEDraftExtendCudaGraphRunner(self)
+                if not is_npu()
+                else EAGLEDraftExtendNpuGraphRunner(self)
             )
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -256,12 +261,22 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch,
             )
         else:
-            if self.speculative_num_steps > 1:
+            if (
+                not forward_batch.forward_mode.is_idle()
+                and self.speculative_num_steps > 1
+            ):
                 # Skip attention backend init for 1-step draft,
                 # `draft_forward` only does sample in this case.
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
+            )
+
+        if model_worker_batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
             )
 
         # Build tree mask
@@ -405,13 +420,14 @@ class EagleDraftWorker(BaseDraftWorker):
             next_token_ids: Next token ids generated from the target forward.
         """
         # Construct input_ids
-        pt = 0
-        for i, extend_len in enumerate(batch.extend_seq_lens):
-            input_ids = batch.input_ids[pt : pt + extend_len]
-            batch.input_ids[pt : pt + extend_len] = torch.cat(
-                (input_ids[1:], next_token_ids[i].reshape(1))
-            )
-            pt += extend_len
+        if not batch.forward_mode.is_idle():
+            pt = 0
+            for i, extend_len in enumerate(batch.extend_seq_lens):
+                input_ids = batch.input_ids[pt : pt + extend_len]
+                batch.input_ids[pt : pt + extend_len] = torch.cat(
+                    (input_ids[1:], next_token_ids[i].reshape(1))
+                )
+                pt += extend_len
 
         # Construct spec_info
         next_draft_input = EagleDraftInput(
@@ -419,6 +435,8 @@ class EagleDraftWorker(BaseDraftWorker):
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
             allocate_lens=batch.seq_lens,
+            num_tokens_per_batch=1,
+            num_tokens_for_logprob_per_batch=1,
         )
         batch.spec_info = next_draft_input
 
@@ -455,6 +473,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 batch_result.next_token_ids,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
+                self.cuda_graph_runner_for_draft_extend,
             )
 
         if self.plan_stream:
@@ -463,9 +482,18 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
         # Run draft extend batch in the main compute stream
-        draft_logits_output = self.draft_runner.model.forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch
+        can_cuda_graph = (
+            self.cuda_graph_runner_for_draft_extend
+            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
+        if can_cuda_graph:
+            draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
+                forward_batch
+            )
+        else:
+            draft_logits_output = self.draft_runner.model.forward(
+                forward_batch.input_ids, forward_batch.positions, forward_batch
+            )
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
@@ -556,16 +584,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
-        if model_worker_batch.forward_mode.is_decode():
-            draft_input: EagleDraftInput = model_worker_batch.spec_info
-            assert draft_input.is_draft_input()
-            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
-            assert verify_input.is_verify_input()
-            model_worker_batch.spec_info = verify_input
-            batch_output = self.verify(model_worker_batch, draft_input.allocate_lens)
-            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
-            return batch_output
-        else:
+        if (
+            model_worker_batch.forward_mode.is_extend()
+            or model_worker_batch.is_extend_in_batch
+        ):
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_output = self.target_worker.forward_batch_generation(
@@ -579,6 +601,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
             )
+            return batch_output
+        else:
+            if model_worker_batch.spec_info is None:
+                model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
+                    device=self.device,
+                    hidden_size=self.target_worker.model_config.hidden_size,
+                    dtype=self.target_worker.model_config.dtype,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                )
+            draft_input: EagleDraftInput = model_worker_batch.spec_info
+            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
+            assert verify_input.is_verify_input()
+            model_worker_batch.spec_info = verify_input
+            batch_output = self.verify(model_worker_batch, draft_input.allocate_lens)
+            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
             return batch_output
 
     def verify(
@@ -610,7 +648,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:
-            torch.get_device_module().current_stream().wait_stream(self.plan_stream)
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
 
             # Some values such as custom_mask and position depend on the output of draft,
             # so the previous plan step used the wrong values. Here, we need to run the related
@@ -645,14 +685,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
-        all_verified_id = predict[accept_index]
-        verified_id = torch.empty_like(accept_length, dtype=torch.int32)
-        fill_new_verified_id[(bs,)](
-            all_verified_id,
-            accept_length,
-            verified_id,
-            self.speculative_num_draft_tokens,
-        )
+        if not batch.forward_mode.is_idle():
+            all_verified_id = predict[accept_index]
+            verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+            fill_new_verified_id[(bs,)](
+                all_verified_id,
+                accept_length,
+                verified_id,
+                self.speculative_num_draft_tokens,
+            )
+        else:
+            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(

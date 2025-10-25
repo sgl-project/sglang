@@ -166,9 +166,25 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
-        metadata.actual_seq_lengths_q = torch.tensor(
-            [1 + i * 1 for i in range(bs)], dtype=torch.int32, device=seq_lens.device
-        )
+        if (
+            forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+            or forward_mode.is_draft_extend()
+        ):
+            metadata.actual_seq_lengths_q = torch.arange(
+                self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens
+                + bs * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+        else:
+            metadata.actual_seq_lengths_q = torch.tensor(
+                [1 + i * 1 for i in range(bs)],
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
 
         self.graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -198,7 +214,8 @@ class AscendAttnBackend(AttentionBackend):
         )
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
-
+        if forward_mode.is_target_verify():
+            seq_lens = seq_lens + self.speculative_num_draft_tokens
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
         self.forward_metadata = metadata
@@ -222,7 +239,11 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor = None,
     ):
 
-        is_prefill = forward_batch.forward_mode.is_extend()
+        is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_target_verify()
+        )
 
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -243,9 +264,28 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen.clip_(min=0, max=bsz)
         else:
             if self.forward_metadata.actual_seq_lengths_q is None:
-                actual_seq_qlen = torch.arange(
-                    1, q.shape[0] + 1, device=q.device, dtype=torch.int32
-                )
+                if (
+                    forward_batch.forward_mode.is_draft_extend_v2()
+                    or forward_batch.forward_mode.is_target_verify()
+                ):
+                    actual_seq_qlen = (
+                        torch.arange(
+                            2,
+                            2 + forward_batch.num_token_non_padded_cpu,
+                            2,
+                            device=q.device,
+                            dtype=torch.int32,
+                        )
+                    )
+                elif forward_batch.forward_mode.is_draft_extend():
+                    actual_seq_qlen = (
+                        forward_batch.extend_seq_lens.cumsum()
+                        .to(device=q.device, dtype=torch.int32)
+                    )
+                else:
+                    actual_seq_qlen = (
+                        torch.arange(1, q.shape[0] + 1).to(device=q.device, dtype=torch.int32)
+                    )
             else:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
         if self.forward_metadata.seq_lens_cpu_int is None:
@@ -510,7 +550,7 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv = (
                 self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
             )
-        if forward_batch.forward_mode.is_draft_extend():
+        if forward_batch.forward_mode.is_draft_extend() and not self.graph_mode:
             actual_seq_lengths = (
                 np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
             )

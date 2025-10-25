@@ -703,6 +703,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
+            allocate_lens=torch.empty((0,), device=device, dtype=torch.int32),
+            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length_cpu=[],
         )
@@ -797,12 +799,12 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
-            assert spec_info.future_indices is not None
-            self.future_indices = FutureIndices(
-                indices=torch.cat(
-                    [self.future_indices.indices, spec_info.future_indices.indices]
+            if spec_info.future_indices is not None:
+                self.future_indices = FutureIndices(
+                    indices=torch.cat(
+                        [self.future_indices.indices, spec_info.future_indices.indices]
+                    )
                 )
-            )
             self.allocate_lens = torch.cat(
                 [self.allocate_lens, spec_info.allocate_lens]
             )

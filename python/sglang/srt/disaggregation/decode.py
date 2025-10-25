@@ -1005,7 +1005,13 @@ class SchedulerDisaggregationDecodeMixin:
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt_extend()
         new_batch.process_prebuilt_extend(self.server_args, self.model_config)
-
+        if self.spec_algorithm.is_eagle() and self.enable_overlap:
+            new_batch.spec_info.future_indices = self.future_map.alloc_future_indices(
+                len(new_batch.seq_lens)
+            )
+            self.future_map.store_to_map_for_new_batch(
+                new_batch.spec_info.future_indices, new_batch.spec_info
+            )
         return new_batch
 
     def process_decode_queue(self: Scheduler):

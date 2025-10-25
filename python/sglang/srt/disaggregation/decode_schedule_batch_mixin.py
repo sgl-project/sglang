@@ -165,6 +165,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_index=topk_index,
                 hidden_states=hidden_states,
                 verified_id=self.output_ids,
+                new_seq_lens=self.seq_lens,
+                allocate_lens=self.seq_lens,
+                num_tokens_per_batch=1,
+                num_tokens_for_logprob_per_batch=1,
             )
             spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
