@@ -23,7 +23,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         initialize_model_parallel,
     )
     from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-    from sglang.srt.layers.quantization.utils import get_dynamic_override
+    from sglang.srt.layers.quantization.utils.utils import get_dynamic_override
     from sglang.srt.model_loader import get_model
     from sglang.srt.server_args import ServerArgs
 

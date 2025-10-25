@@ -17,7 +17,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_permute_scales,
     marlin_zero_points,
 )
-from sglang.srt.layers.quantization.utils import (
+from sglang.srt.layers.quantization.utils.utils import (
     get_pack_factor,
     gptq_quantize_weights,
     quantize_weights,

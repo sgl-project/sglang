@@ -33,7 +33,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_sort_g_idx,
     marlin_zero_points,
 )
-from sglang.srt.layers.quantization.utils import (
+from sglang.srt.layers.quantization.utils.utils import (
     get_scalar_types,
     replace_parameter,
     unpack_cols,

@@ -2,7 +2,7 @@ import pytest
 import torch
 from sgl_kernel import gptq_gemm
 
-from sglang.srt.layers.quantization.utils import pack_cols, pack_rows
+from sglang.srt.layers.quantization.utils.utils import pack_cols, pack_rows
 
 
 def torch_dequantize(q_weight, q_zeros, scales, g_idx, use_shuffle, bit, K, N):
