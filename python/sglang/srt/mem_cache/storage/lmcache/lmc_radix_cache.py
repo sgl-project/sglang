@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.server_args import ServerArgs
 
 try:
     from lmcache.integration.sglang.sglang_adapter import (
@@ -79,6 +80,7 @@ class LMCRadixCache(RadixCache):
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         eviction_policy: str = "lru",
+        server_args: Optional[ServerArgs] = None,
     ):
         super().__init__(
             req_to_token_pool=req_to_token_pool,
@@ -87,6 +89,7 @@ class LMCRadixCache(RadixCache):
             disable=disable,
             enable_kv_cache_events=enable_kv_cache_events,
             eviction_policy=eviction_policy,
+            server_args=server_args,
         )
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()

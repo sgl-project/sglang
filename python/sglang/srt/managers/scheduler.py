@@ -383,6 +383,10 @@ class Scheduler(
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
+        # Init metrics stats
+        self.init_metrics(tp_rank, pp_rank, dp_rank)
+        self.init_kv_events(server_args.kv_events_config)
+
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
 
@@ -481,9 +485,6 @@ class Scheduler(
             if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
             else None
         )
-
-        # Init metrics stats
-        self.init_metrics(tp_rank, pp_rank, dp_rank)
 
         if self.enable_kv_cache_events:
             self.init_kv_events(server_args.kv_events_config)
@@ -745,6 +746,7 @@ class Scheduler(
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
                     enable_kv_cache_events=self.enable_kv_cache_events,
+                    server_args=self.server_args,
                 )
             elif self.enable_hierarchical_cache:
                 self.tree_cache = HiRadixCache(
@@ -768,6 +770,7 @@ class Scheduler(
                     model_name=server_args.served_model_name,
                     storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
                     is_eagle=self.spec_algorithm.is_eagle(),
+                    server_args=self.server_args,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -787,6 +790,7 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    server_args=self.server_args,
                 )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
@@ -803,6 +807,7 @@ class Scheduler(
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
                     eviction_policy=server_args.radix_eviction_policy,
+                    server_args=self.server_args,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -813,6 +818,7 @@ class Scheduler(
                     enable_kv_cache_events=self.enable_kv_cache_events,
                     eviction_policy=server_args.radix_eviction_policy,
                     is_eagle=self.spec_algorithm.is_eagle(),
+                    server_args=self.server_args,
                 )
 
         if (
