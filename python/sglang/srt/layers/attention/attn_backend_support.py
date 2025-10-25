@@ -87,7 +87,10 @@ def _validate_single_backend(
         return
 
     if backend_name not in ATTN_BACKEND_CAPS:
-        raise KeyError(f"Unknown attention backend: {backend_name}")
+        raise KeyError(
+            f"Attention backend '{backend_name}' is not registered."
+            f"Available backends are: {list(ATTN_BACKEND_CAPS.keys())}"
+        )
 
     caps = ATTN_BACKEND_CAPS[backend_name]
 
@@ -138,7 +141,7 @@ def _validate_single_backend(
 
     # MLA usage
     if use_mla and not caps.mla:
-        raise RuntimeError(f"{backend_name} can only be used with non-MLA models.")
+        raise RuntimeError(f"{backend_name} does not support MLA models.")
 
     # DP Attention
     if server_args.enable_dp_attention and not caps.dp_attention:
