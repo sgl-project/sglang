@@ -464,7 +464,7 @@ impl McpClientManager {
             }
 
             McpTransport::Streamable { url, token } => {
-                // TODO(Phase 7): Add proxy support for Streamable transport
+                // TODO: Add proxy support for Streamable transport
                 // StreamableHttpClientTransport doesn't expose HTTP client configuration,
                 // so proxy support requires changes to rmcp library or custom transport impl
                 let _proxy_config = crate::mcp::proxy::resolve_proxy_config(config, global_proxy);
