@@ -155,7 +155,6 @@ class BaseMultimodalProcessor(ABC):
     ):
         self.hf_config = hf_config
         self._processor = _processor
-        self.arch = hf_config.architectures[0]
         self.server_args = server_args
         self.transport_mode = transport_mode
 
@@ -179,6 +178,7 @@ class BaseMultimodalProcessor(ABC):
             "image_attention_mask": Modality.IMAGE,
             "image_emb_mask": Modality.IMAGE,
             "images_spatial_crop": Modality.IMAGE,
+            "images_crop": Modality.IMAGE,
             "tgt_size": Modality.IMAGE,
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
@@ -191,6 +191,7 @@ class BaseMultimodalProcessor(ABC):
             "input_features": Modality.AUDIO,
             "input_features_mask": Modality.AUDIO,
             "audio_attention_mask": Modality.AUDIO,
+            "feature_attention_mask": Modality.AUDIO,
             # Video-related attributes
             "pixel_values_videos": Modality.VIDEO,
             "second_per_grid_ts": Modality.VIDEO,
@@ -222,6 +223,7 @@ class BaseMultimodalProcessor(ABC):
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
                 "Qwen2AudioProcessor",
+                "Qwen3OmniMoeProcessor",
             }:
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
                 kwargs["audio"] = audios
@@ -234,7 +236,14 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
-            kwargs["device"] = "cuda" if not _is_npu else "npu"
+            if not _is_npu:
+                kwargs["device"] = "cuda"
+            elif processor.__class__.__name__ not in {
+                "Qwen2_5_VLProcessor",
+                "Qwen3VLProcessor",
+            }:
+                # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
+                kwargs["device"] = "npu"
         result = processor.__call__(
             text=[input_text],
             padding=True,
@@ -305,7 +314,9 @@ class BaseMultimodalProcessor(ABC):
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data)
-                return img.convert("RGB") if discard_alpha_channel else img
+                if discard_alpha_channel and img.mode != "RGB":
+                    img = img.convert("RGB")
+                return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
