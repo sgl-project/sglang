@@ -672,43 +672,6 @@ impl McpClientManager {
             .map_err(|e| McpError::ToolExecution(format!("Failed to unsubscribe: {}", e)))
     }
 
-    /// Spawn a background task to periodically refresh server inventories
-    ///
-    /// This task will refresh all connected servers at the specified interval
-    /// to keep the inventory fresh and detect new/removed tools.
-    ///
-    /// # Arguments
-    /// * `refresh_interval` - How often to refresh (default: 5 minutes)
-    ///
-    /// # Returns
-    /// A JoinHandle that can be used to cancel the background task
-    pub fn spawn_background_refresh(
-        self: Arc<Self>,
-        refresh_interval: Duration,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(refresh_interval);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                interval.tick().await;
-
-                tracing::debug!("Background refresh: Refreshing all server inventories");
-
-                // Get list of servers to refresh
-                let server_names: Vec<String> = self.clients.keys().cloned().collect();
-
-                for server_name in server_names {
-                    if let Err(e) = self.refresh_server_inventory(&server_name).await {
-                        tracing::warn!("Background refresh failed for '{}': {}", server_name, e);
-                    }
-                }
-
-                tracing::debug!("Background refresh: Completed refresh cycle");
-            }
-        })
-    }
-
     /// Disconnect from all servers (for cleanup)
     pub async fn shutdown(&mut self) {
         for (name, client) in self.clients.drain() {

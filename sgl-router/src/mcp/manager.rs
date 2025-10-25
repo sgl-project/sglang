@@ -17,6 +17,7 @@ use crate::mcp::{
     client_manager::McpClientManager, connection_pool::McpConnectionPool, error::McpResult,
     inventory::ToolInventory,
 };
+use crate::mcp::McpTransport::{Streamable, Stdio, Sse};
 
 /// Unified MCP manager handling both static and dynamic servers
 ///
@@ -95,31 +96,21 @@ impl McpManager {
         Self::new(Duration::from_secs(300), Duration::from_secs(300), 100)
     }
 
-    /// Get MCP client for a server
+    /// Get MCP client for a static server by name
     ///
-    /// This method checks static servers first, then falls back to the connection pool.
-    /// This ensures that explicitly configured servers are preferred over dynamic servers.
-    ///
-    /// # Priority Order
-    /// 1. Static servers (from config file)
-    /// 2. Connection pool (dynamic servers from per-request tools)
+    /// This method only checks static servers (from config file).
+    /// For dynamic servers (per-request tools), use `get_or_create_dynamic_client()`.
     ///
     /// # Arguments
-    /// * `server_url` - The server URL or name to look up
+    /// * `server_name` - The server name from config
     ///
     /// # Returns
     /// Arc to the MCP client manager if found, None otherwise
-    pub async fn get_client(&self, server_url: &str) -> Option<Arc<McpClientManager>> {
-        // Priority 1: Check if this is a static server (from config)
-        if let Some(client) = self.static_servers.get(server_url) {
-            return Some(Arc::clone(client.value()));
-        }
-
-        // Priority 2: Get from connection pool (dynamic server)
-        // Note: This requires a server config, which we don't have here
-        // For Phase 6, we'll keep this simple and only support static servers
-        // Phase 7 will add dynamic server support via connection pool
-        None
+    pub async fn get_client(&self, server_name: &str) -> Option<Arc<McpClientManager>> {
+        // Check if this is a static server (from config)
+        self.static_servers
+            .get(server_name)
+            .map(|e| Arc::clone(e.value()))
     }
 
     /// Register a static server (called by workflow)
@@ -154,6 +145,33 @@ impl McpManager {
             .iter()
             .map(|e| e.key().clone())
             .collect()
+    }
+
+    /// Get or create a dynamic MCP client using the connection pool
+    ///
+    /// This method is used for per-request dynamic servers (from tools field in API requests).
+    /// It uses the connection pool to reuse connections and avoid 70-650ms overhead.
+    ///
+    /// # Arguments
+    /// * `server_config` - Configuration for the dynamic MCP server
+    ///
+    /// # Returns
+    /// Arc to the MCP client manager on success, error otherwise
+    pub async fn get_or_create_dynamic_client(
+        &self,
+        server_config: crate::mcp::McpServerConfig,
+    ) -> McpResult<Arc<McpClientManager>> {
+        // Extract server URL from transport for cache key
+        let server_url = match &server_config.transport {
+            Streamable { url, .. } => url.clone(),
+            Sse { url, .. } => url.clone(),
+            Stdio { command, .. } => command.clone(),
+        };
+
+        // Use connection pool to get or create the client
+        self.connection_pool
+            .get_or_create(&server_url, server_config)
+            .await
     }
 
     /// Get the shared tool inventory
@@ -191,15 +209,67 @@ impl McpManager {
 
     /// Refresh inventory for a static server
     ///
-    /// This is a placeholder for Phase 7 when we add inventory refresh logic.
-    /// For now, it returns an error indicating not implemented.
+    /// This method refreshes the tool inventory for a specific static server by calling
+    /// the underlying client's refresh method. The refreshed tools are stored in the
+    /// shared inventory with TTL-based caching.
+    ///
+    /// # Arguments
+    /// * `server_name` - The name of the static server to refresh
+    ///
+    /// # Returns
+    /// Ok(()) on success, error if server not found or refresh fails
     pub async fn refresh_static_server_inventory(&self, server_name: &str) -> McpResult<()> {
-        // TODO(Phase 7): Implement inventory refresh
-        tracing::warn!(
-            "Inventory refresh not implemented yet (Phase 7): {}",
-            server_name
-        );
-        Ok(())
+        let client = self
+            .get_static_server(server_name)
+            .ok_or_else(|| crate::mcp::McpError::ServerNotFound(server_name.to_string()))?;
+
+        client.refresh_server_inventory(server_name).await
+    }
+
+    /// Start background refresh for all static servers
+    ///
+    /// This method spawns a SINGLE background task that periodically refreshes the inventory
+    /// for ALL registered static MCP servers. This is more efficient than spawning one task
+    /// per server.
+    ///
+    /// # Arguments
+    /// * `refresh_interval` - How often to refresh (e.g., Duration::from_secs(300) for 5 minutes)
+    ///
+    /// # Returns
+    /// Join handle for the spawned background task
+    pub fn spawn_background_refresh_all(
+        self: Arc<Self>,
+        refresh_interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(refresh_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+
+                let server_names = self.list_static_servers();
+
+                if !server_names.is_empty() {
+                    tracing::debug!(
+                        "Background refresh: Refreshing {} static server(s)",
+                        server_names.len()
+                    );
+
+                    for server_name in server_names {
+                        if let Err(e) = self.refresh_static_server_inventory(&server_name).await {
+                            tracing::warn!(
+                                "Background refresh failed for '{}': {}",
+                                server_name,
+                                e
+                            );
+                        }
+                    }
+
+                    tracing::debug!("Background refresh: Completed refresh cycle");
+                }
+            }
+        })
     }
 }
 

@@ -23,10 +23,13 @@ use crate::{
     routers::header_utils::apply_request_headers,
 };
 
-// TODO(Phase 6/8): Remove this global static when integrating with AppContext
-// This is a temporary Phase 3 solution for connection pooling.
-// In Phase 6, connection pool will be owned by McpManager.
-// In Phase 8, McpManager will be stored in AppContext and injected via router state.
+// TODO(Phase 8): Remove this global static when fully integrated with AppContext
+// Phase 2 Status: Connection pool is now owned by McpManager
+//   - McpManager has get_or_create_dynamic_client() method
+//   - Connection pool provides 90%+ performance improvement by reusing connections
+// Phase 8 Plan: Inject McpManager via router state instead of using global static
+//   - Update function signature to accept Arc<McpManager>
+//   - Pass McpManager from AppContext to all call sites
 // Global connection pool for dynamic MCP servers (per-request)
 // This provides 90%+ performance improvement by reusing connections
 static MCP_CONNECTION_POOL: OnceCell<McpConnectionPool> = OnceCell::const_new();
