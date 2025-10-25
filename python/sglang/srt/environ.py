@@ -259,6 +259,7 @@ def _print_deprecated_env(new_name: str, old_name: str):
         warnings.warn(
             f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
         )
+        os.environ[new_name] = os.environ[old_name]
 
 
 def _convert_SGL_to_SGLANG():
