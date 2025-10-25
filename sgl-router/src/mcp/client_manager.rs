@@ -13,41 +13,12 @@ use rmcp::{
     },
     RoleClient, ServiceExt,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::mcp::{
-    config::{McpConfig, McpServerConfig, McpTransport},
+    config::{McpConfig, McpServerConfig, McpTransport, PromptInfo, ResourceInfo, ToolInfo},
     error::{McpError, McpResult},
     inventory::ToolInventory,
 };
-
-/// Information about an available tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolInfo {
-    pub name: String,
-    pub description: String,
-    pub server: String,
-    pub parameters: Option<serde_json::Value>,
-}
-
-/// Information about an available prompt
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptInfo {
-    pub name: String,
-    pub description: Option<String>,
-    pub server: String,
-    pub arguments: Option<Vec<serde_json::Value>>,
-}
-
-/// Information about an available resource
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceInfo {
-    pub uri: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub mime_type: Option<String>,
-    pub server: String,
-}
 
 /// Manages MCP client connections and tool execution
 pub struct McpClientManager {

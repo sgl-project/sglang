@@ -85,8 +85,8 @@ pub struct OpenAIRouter {
     conversation_storage: SharedConversationStorage,
     /// Conversation item storage backend
     conversation_item_storage: SharedConversationItemStorage,
-    /// Optional MCP manager (handles both static and dynamic servers)
-    mcp_manager: Option<Arc<crate::mcp::McpManager>>,
+    /// MCP manager (handles both static and dynamic servers)
+    mcp_manager: Arc<crate::mcp::McpManager>,
 }
 
 impl std::fmt::Debug for OpenAIRouter {
@@ -130,8 +130,12 @@ impl OpenAIRouter {
 
         let circuit_breaker = CircuitBreaker::with_config(core_cb_config);
 
-        // Use MCP manager from AppContext (already initialized)
-        let mcp_manager = ctx.mcp_manager.get().map(Arc::clone);
+        // Get MCP manager from AppContext (must be initialized)
+        let mcp_manager = ctx
+            .mcp_manager
+            .get()
+            .ok_or_else(|| "MCP manager not initialized in AppContext".to_string())?
+            .clone();
 
         Ok(Self {
             client,
@@ -217,12 +221,13 @@ impl OpenAIRouter {
         original_previous_response_id: Option<String>,
     ) -> Response {
         // Check if MCP is active for this request
+        // Get dynamic MCP client from request tools if manager is available
         let req_mcp_manager = if let Some(ref tools) = original_body.tools {
-            mcp_manager_from_request_tools(tools.as_slice()).await
+            mcp_manager_from_request_tools(&self.mcp_manager, tools.as_slice()).await
         } else {
             None
         };
-        let active_mcp = req_mcp_manager.as_ref().or(self.mcp_manager.as_ref());
+        let active_mcp = req_mcp_manager.as_ref();
 
         let mut response_json: Value;
 
@@ -960,7 +965,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             handle_streaming_response(
                 &self.client,
                 &self.circuit_breaker,
-                self.mcp_manager.as_ref(),
+                Some(&self.mcp_manager),
                 self.response_storage.clone(),
                 self.conversation_storage.clone(),
                 self.conversation_item_storage.clone(),

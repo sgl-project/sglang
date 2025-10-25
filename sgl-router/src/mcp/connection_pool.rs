@@ -14,18 +14,21 @@ use std::{
 };
 
 use dashmap::DashMap;
+use rmcp::{service::RunningService, RoleClient};
 
 use crate::mcp::{
-    client_manager::McpClientManager,
-    config::{McpConfig, McpProxyConfig, McpServerConfig},
+    config::{McpProxyConfig, McpServerConfig},
     error::McpResult,
 };
+
+/// Type alias for MCP client
+type McpClient = RunningService<RoleClient, ()>;
 
 /// Cached MCP connection with metadata
 #[derive(Clone)]
 pub struct CachedConnection {
-    /// The MCP client manager instance
-    pub client: Arc<McpClientManager>,
+    /// The MCP client instance
+    pub client: Arc<McpClient>,
     /// Last time this connection was accessed
     pub last_used: Instant,
     /// Server configuration used to create this connection
@@ -34,7 +37,7 @@ pub struct CachedConnection {
 
 impl CachedConnection {
     /// Create a new cached connection
-    pub fn new(client: Arc<McpClientManager>, config: McpServerConfig) -> Self {
+    pub fn new(client: Arc<McpClient>, config: McpServerConfig) -> Self {
         Self {
             client,
             last_used: Instant::now(),
@@ -122,14 +125,20 @@ impl McpConnectionPool {
     /// # Arguments
     /// * `server_url` - The MCP server URL (used as cache key)
     /// * `server_config` - Server configuration (used to create new connection if needed)
+    /// * `connect_fn` - Async function to create a new client connection
     ///
     /// # Returns
-    /// Arc to the MCP client manager, either from cache or newly created
-    pub async fn get_or_create(
+    /// Arc to the MCP client, either from cache or newly created
+    pub async fn get_or_create<F, Fut>(
         &self,
         server_url: &str,
         server_config: McpServerConfig,
-    ) -> McpResult<Arc<McpClientManager>> {
+        connect_fn: F,
+    ) -> McpResult<Arc<McpClient>>
+    where
+        F: FnOnce(McpServerConfig, Option<McpProxyConfig>) -> Fut,
+        Fut: std::future::Future<Output = McpResult<McpClient>>,
+    {
         // Fast path: Check if connection exists and is still fresh
         if let Some(mut entry) = self.connections.get_mut(server_url) {
             let cached = entry.value_mut();
@@ -159,28 +168,15 @@ impl McpConnectionPool {
             }
         }
 
-        // Create new MCP client with global proxy configuration
-        let config = McpConfig {
-            servers: vec![server_config.clone()],
-            pool: Default::default(),
-            proxy: self.global_proxy.clone(),
-            warmup: Vec::new(),
-            inventory: Default::default(),
-        };
-
-        // Create temporary inventory for per-request dynamic servers
-        let inventory = Arc::new(crate::mcp::ToolInventory::new(
-            Duration::from_secs(3600), // 1 hour TTL
-        ));
-
-        let manager = McpClientManager::new(config, inventory).await?;
-        let client = Arc::new(manager);
+        // Create new MCP client using the provided connect function
+        let client = connect_fn(server_config.clone(), self.global_proxy.clone()).await?;
+        let client_arc = Arc::new(client);
 
         // Cache the new connection
-        let cached = CachedConnection::new(Arc::clone(&client), server_config);
+        let cached = CachedConnection::new(Arc::clone(&client_arc), server_config);
         self.connections.insert(server_url.to_string(), cached);
 
-        Ok(client)
+        Ok(client_arc)
     }
 
     /// Remove all idle connections that have exceeded the TTL
@@ -279,30 +275,30 @@ mod tests {
     #[allow(invalid_value)]
     fn test_cached_connection_touch() {
         let config = create_test_config("http://localhost:3000");
-        let manager: Arc<McpClientManager> = Arc::new(unsafe {
+        let client: Arc<McpClient> = Arc::new(unsafe {
             // SAFETY: This is only for testing the CachedConnection struct
             std::mem::MaybeUninit::zeroed().assume_init()
         });
-        let mut cached = CachedConnection::new(manager.clone(), config);
+        let mut cached = CachedConnection::new(client.clone(), config);
 
         let first_time = cached.last_used;
         std::thread::sleep(Duration::from_millis(10));
         cached.touch();
         assert!(cached.last_used > first_time);
 
-        // Prevent drop of invalid Arc (would segfault due to zeroed inventory field)
-        std::mem::forget(manager);
+        // Prevent drop of invalid Arc (would segfault)
+        std::mem::forget(client);
     }
 
     #[test]
     #[allow(invalid_value)]
     fn test_cached_connection_is_idle() {
         let config = create_test_config("http://localhost:3000");
-        let manager: Arc<McpClientManager> = Arc::new(unsafe {
+        let client: Arc<McpClient> = Arc::new(unsafe {
             // SAFETY: This is only for testing the CachedConnection struct
             std::mem::MaybeUninit::zeroed().assume_init()
         });
-        let cached = CachedConnection::new(manager.clone(), config);
+        let cached = CachedConnection::new(client.clone(), config);
 
         // Fresh connection should not be idle
         assert!(!cached.is_idle(Duration::from_secs(1)));
@@ -311,8 +307,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(cached.is_idle(Duration::from_millis(50)));
 
-        // Prevent drop of invalid Arc (would segfault due to zeroed inventory field)
-        std::mem::forget(manager);
+        // Prevent drop of invalid Arc (would segfault)
+        std::mem::forget(client);
     }
 
     #[test]
@@ -335,9 +331,9 @@ mod tests {
 
         // Add a connection manually for testing
         let config = create_test_config("http://localhost:3000");
-        let manager: Arc<McpClientManager> =
+        let client: Arc<McpClient> =
             Arc::new(unsafe { std::mem::MaybeUninit::zeroed().assume_init() });
-        let cached = CachedConnection::new(manager.clone(), config);
+        let cached = CachedConnection::new(client.clone(), config);
         pool.connections
             .insert("http://localhost:3000".to_string(), cached);
 
@@ -350,8 +346,8 @@ mod tests {
         pool.cleanup_idle_connections();
         assert_eq!(pool.len(), 0);
 
-        // Prevent drop of invalid Arc (would segfault due to zeroed inventory field)
-        std::mem::forget(manager);
+        // Prevent drop of invalid Arc (would segfault)
+        std::mem::forget(client);
     }
 
     #[test]
@@ -359,18 +355,18 @@ mod tests {
     fn test_find_oldest_connection() {
         let pool = McpConnectionPool::new();
 
-        // Collect managers to forget at end
-        let mut managers = Vec::new();
+        // Collect clients to forget at end
+        let mut clients = Vec::new();
 
         // Add connections with different timestamps
         for i in 0..3 {
             let url = format!("http://localhost:{}", 3000 + i);
             let config = create_test_config(&url);
-            let manager: Arc<McpClientManager> =
+            let client: Arc<McpClient> =
                 Arc::new(unsafe { std::mem::MaybeUninit::zeroed().assume_init() });
-            let cached = CachedConnection::new(manager.clone(), config);
+            let cached = CachedConnection::new(client.clone(), config);
             pool.connections.insert(url, cached);
-            managers.push(manager);
+            clients.push(client);
             std::thread::sleep(Duration::from_millis(10));
         }
 
@@ -379,9 +375,9 @@ mod tests {
         assert!(oldest.is_some());
         assert_eq!(oldest.unwrap(), "http://localhost:3000");
 
-        // Prevent drop of invalid Arcs (would segfault due to zeroed inventory field)
-        for manager in managers {
-            std::mem::forget(manager);
+        // Prevent drop of invalid Arcs (would segfault)
+        for client in clients {
+            std::mem::forget(client);
         }
     }
 
@@ -392,9 +388,9 @@ mod tests {
 
         // Add a connection
         let config = create_test_config("http://localhost:3000");
-        let manager: Arc<McpClientManager> =
+        let client: Arc<McpClient> =
             Arc::new(unsafe { std::mem::MaybeUninit::zeroed().assume_init() });
-        let cached = CachedConnection::new(manager.clone(), config);
+        let cached = CachedConnection::new(client.clone(), config);
         pool.connections
             .insert("http://localhost:3000".to_string(), cached);
 
@@ -404,8 +400,8 @@ mod tests {
         assert_eq!(pool.len(), 0);
         assert!(pool.is_empty());
 
-        // Prevent drop of invalid Arc (would segfault due to zeroed inventory field)
-        std::mem::forget(manager);
+        // Prevent drop of invalid Arc (would segfault)
+        std::mem::forget(client);
     }
 
     #[test]

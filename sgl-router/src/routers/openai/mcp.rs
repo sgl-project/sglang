@@ -139,8 +139,9 @@ impl FunctionCallInProgress {
 // MCP Manager Integration
 // ============================================================================
 
-/// Build a request-scoped MCP manager from request tools, if present.
+/// Build a request-scoped MCP client from request tools using McpManager.
 pub async fn mcp_manager_from_request_tools(
+    mcp_manager: &Arc<crate::mcp::McpManager>,
     tools: &[ResponseTool],
 ) -> Option<Arc<McpClientManager>> {
     let tool = tools
@@ -179,13 +180,11 @@ pub async fn mcp_manager_from_request_tools(
         required: false,
     };
 
-    // Get or initialize the global connection pool
-    let pool = MCP_CONNECTION_POOL
-        .get_or_init(|| async { McpConnectionPool::new() })
-        .await;
-
-    // Use connection pool to get or create connection
-    match pool.get_or_create(&server_url, server_config).await {
+    // Use McpManager's connection pool to get or create dynamic client
+    match mcp_manager
+        .get_or_create_dynamic_client(server_config)
+        .await
+    {
         Ok(mgr) => Some(mgr),
         Err(err) => {
             warn!("Failed to get/create MCP connection: {}", err);

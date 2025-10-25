@@ -1491,7 +1491,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
 pub(super) async fn handle_streaming_response(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,
-    mcp_manager: Option<&Arc<crate::mcp::McpClientManager>>,
+    mcp_manager: Option<&Arc<crate::mcp::McpManager>>,
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
@@ -1502,12 +1502,14 @@ pub(super) async fn handle_streaming_response(
     original_previous_response_id: Option<String>,
 ) -> Response {
     // Check if MCP is active for this request
-    let req_mcp_manager = if let Some(ref tools) = original_body.tools {
-        mcp_manager_from_request_tools(tools.as_slice()).await
-    } else {
-        None
-    };
-    let active_mcp = req_mcp_manager.as_ref().or(mcp_manager);
+    // Get dynamic MCP client from request tools if manager is available
+    let req_mcp_manager =
+        if let (Some(manager), Some(ref tools)) = (mcp_manager, &original_body.tools) {
+            mcp_manager_from_request_tools(manager, tools.as_slice()).await
+        } else {
+            None
+        };
+    let active_mcp = req_mcp_manager.as_ref();
 
     // If no MCP is active, use simple pass-through streaming
     if active_mcp.is_none() {

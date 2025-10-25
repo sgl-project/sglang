@@ -13,14 +13,15 @@ pub mod connection_pool;
 pub mod error;
 pub mod inventory;
 pub mod manager;
+mod manager_v2;
 pub mod oauth;
 pub mod proxy;
 
 // Re-export the main types for convenience
-pub use client_manager::{McpClientManager, PromptInfo, ResourceInfo, ToolInfo};
+pub use client_manager::McpClientManager;
 pub use config::{
     InventoryConfig, McpConfig, McpPoolConfig, McpProxyConfig, McpServerConfig, McpTransport,
-    WarmupServer,
+    PromptInfo, ResourceInfo, ToolInfo, WarmupServer,
 };
 pub use connection_pool::{CachedConnection, McpConnectionPool, PoolStats};
 pub use error::{McpError, McpResult};

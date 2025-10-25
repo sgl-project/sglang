@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
-use crate::mcp::client_manager::{PromptInfo, ResourceInfo, ToolInfo};
+use crate::mcp::config::{PromptInfo, ResourceInfo, ToolInfo};
 
 /// Cached tool with metadata
 #[derive(Clone)]
