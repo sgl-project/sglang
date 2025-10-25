@@ -826,7 +826,7 @@ class FlashAttentionBackend(AttentionBackend):
             if (
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
+                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
@@ -1686,7 +1686,7 @@ class FlashAttentionBackend(AttentionBackend):
                     self.target_verify_metadata_topk_swa[bs] = metadata_swa
                     metadata.swa_spec_metadata = metadata_swa
 
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
@@ -1932,7 +1932,7 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata, metadata_expand, metadata_swa
                     )
 
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
