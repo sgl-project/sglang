@@ -1331,7 +1331,7 @@ def launch_server(
         3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
-    1. The HTTP server, Engine, and TokenizerManager both run in the main process.
+    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     tokenizer_manager, template_manager, scheduler_info, port_args = (
