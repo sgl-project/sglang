@@ -350,7 +350,11 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 
 def handle_attention_fa3(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "fa3")
+    # when deterministic inference is enabled, use MLA
+    if get_global_server_args().enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)
+    else:
+        return _handle_attention_backend(attn, forward_batch, "fa3")
 
 
 def handle_attention_flashmla(attn, forward_batch):
@@ -394,6 +398,10 @@ def handle_attention_nsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
+    # when deterministic inference is enabled, use MLA
+    if get_global_server_args().enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)
+
     if (
         _is_extend_without_speculative(forward_batch)
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
