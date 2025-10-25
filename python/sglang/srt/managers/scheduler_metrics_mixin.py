@@ -39,10 +39,13 @@ class SchedulerMetricsMixin:
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
-        self.spec_num_total_accepted_tokens = 0
-        self.spec_num_total_forward_ct = 0
-        self.cum_spec_accept_length = 0
-        self.cum_spec_accept_count = 0
+
+        # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
+        self.spec_num_accepted_tokens = 0
+        self.spec_num_forward_ct = 0
+        # The total number of accepted tokens and forward ct for the whole server lifetime
+        self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_forward_ct = 0
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
 
@@ -67,8 +70,8 @@ class SchedulerMetricsMixin:
             )
 
     def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
-        self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
-        self.spec_num_total_forward_ct += bs
+        self.spec_num_accepted_tokens += num_accepted_tokens + bs
+        self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
 
     def log_prefill_stats(
@@ -253,20 +256,20 @@ class SchedulerMetricsMixin:
             spec_accept_rate = 0
         else:
             spec_accept_length = (
-                self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
+                self.spec_num_accepted_tokens / self.spec_num_forward_ct
             )
             # Calculate acceptance rate: accepted tokens / total draft tokens
-            total_draft_tokens = self.spec_num_total_forward_ct * (
+            total_draft_tokens = self.spec_num_forward_ct * (
                 (self.server_args.speculative_num_steps or 0) + 1
             )
             spec_accept_rate = (
-                self.spec_num_total_accepted_tokens / total_draft_tokens
+                self.spec_num_accepted_tokens / total_draft_tokens
                 if total_draft_tokens > 0
                 else 0
             )
-            self.cum_spec_accept_length += self.spec_num_total_accepted_tokens
-            self.cum_spec_accept_count += self.spec_num_total_forward_ct
-            self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
+            self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
+            self.spec_total_num_forward_ct += self.spec_num_forward_ct
+            self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
         cache_hit_rate = 0.0
 
