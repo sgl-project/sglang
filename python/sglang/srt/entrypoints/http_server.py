@@ -20,7 +20,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 import asyncio
 import dataclasses
 import logging
-import multiprocessing as multiprocessing
+import multiprocessing
 import os
 import tempfile
 import threading
