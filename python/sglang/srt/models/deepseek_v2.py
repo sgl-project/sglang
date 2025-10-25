@@ -1582,7 +1582,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self.use_deep_gemm_bmm and not get_global_server_args().enable_deterministic_inference:
+        if (
+            self.use_deep_gemm_bmm
+            and not get_global_server_args().enable_deterministic_inference
+        ):
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             )
@@ -3005,13 +3008,14 @@ class DeepseekV2ForCausalLM(nn.Module):
             or self.config.architectures[0] != architecture
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
-            or get_global_server_args().enable_deterministic_inference
         ):
             disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
         elif self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
+        elif get_global_server_args().enable_deterministic_inference:
+            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization with deterministic inference."
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
@@ -3191,7 +3195,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )
 
-            if not use_deep_gemm_bmm or get_global_server_args().enable_deterministic_inference:
+            if (
+                not use_deep_gemm_bmm
+                or get_global_server_args().enable_deterministic_inference
+            ):
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
