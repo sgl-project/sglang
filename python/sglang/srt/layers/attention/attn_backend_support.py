@@ -86,9 +86,13 @@ def _validate_single_backend(
     if backend_name is None:
         return
 
+    # TODO(brayden): Enable validation for additional backends.
+    if backend_name != "trtllm_mha":
+        return
+
     if backend_name not in ATTN_BACKEND_CAPS:
         raise KeyError(
-            f"Attention backend '{backend_name}' is not registered."
+            f"Attention backend '{backend_name}' is not registered. "
             f"Available backends are: {list(ATTN_BACKEND_CAPS.keys())}"
         )
 
