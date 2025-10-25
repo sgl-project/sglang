@@ -845,39 +845,9 @@ fn create_harmony_system_message(
                 }
             }
 
-            // Check GPT_OSS_SYSTEM_TOOL_MCP_LABELS env var for MCP tool allowlist
-            // Allows MCP tools to enable built-in tools (browser, python, container)
-            // Example: GPT_OSS_SYSTEM_TOOL_MCP_LABELS=web_search_preview,code_interpreter
-            if let Ok(allowlist_str) = std::env::var("GPT_OSS_SYSTEM_TOOL_MCP_LABELS") {
-                let allowlist: Vec<&str> = allowlist_str.split(',').map(|s| s.trim()).collect();
-
-                // For each MCP tool, check if server_label is in allowlist
-                for tool in tools {
-                    if matches!(tool.r#type, ResponseToolType::Mcp) {
-                        if let Some(ref label) = tool.server_label {
-                            if allowlist.contains(&label.as_str()) {
-                                // Map server_label to built-in tool type
-                                let builtin_tool = match label.as_str() {
-                                    "web_search_preview" => Some("browser"),
-                                    "code_interpreter" => Some("python"),
-                                    "container" => Some("container"),
-                                    _ => None,
-                                };
-
-                                if let Some(t) = builtin_tool {
-                                    if !tool_types_to_enable.contains(&t) {
-                                        tool_types_to_enable.push(t);
-                                        debug!(
-                                            "MCP tool with label '{}' enabled built-in tool '{}'",
-                                            label, t
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // NOTE: GPT_OSS_SYSTEM_TOOL_MCP_LABELS is no longer needed!
+            // MCP tools are now added directly to the developer message with their actual schemas.
+            // This section for enabling builtin tools via MCP label mapping has been removed.
 
             // Now enable all collected tool types
             for tool_type in tool_types_to_enable {
@@ -889,9 +859,9 @@ fn create_harmony_system_message(
         }
     }
 
-    // Disable commentary channel if no custom function tools
+    // Enable commentary channel if custom function tools OR MCP tools are present
     // Built-in tools (browser, python, container) don't use commentary channel
-    // Custom function tools DO use commentary channel for function calls
+    // Custom function tools and MCP tools DO use commentary channel for function calls
     let has_custom_tools = request
         .tools
         .as_ref()
@@ -902,7 +872,17 @@ fn create_harmony_system_message(
         })
         .unwrap_or(false);
 
-    if !has_custom_tools {
+    let has_mcp_tools = request
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .any(|tool| matches!(tool.r#type, ResponseToolType::Mcp))
+        })
+        .unwrap_or(false);
+
+    if !has_custom_tools && !has_mcp_tools {
         if let Some(ref channel_config) = sys_content.channel_config {
             let valid_channels: Vec<_> = channel_config
                 .valid_channels
@@ -914,7 +894,10 @@ fn create_harmony_system_message(
             sys_content = sys_content.with_channel_config(new_config);
         }
     } else {
-        debug!("Commentary channel enabled for custom function tools");
+        debug!(
+            "Commentary channel enabled (function_tools={}, mcp_tools={})",
+            has_custom_tools, has_mcp_tools
+        );
     }
 
     Ok(HarmonyMessage::from_role_and_content(
@@ -976,8 +959,10 @@ fn get_builtin_tool_config(
 /// Create developer message for Harmony models:
 /// - Adds instructions if not already in system message
 /// - Adds function tool definitions for custom tools
+/// - Adds MCP tool definitions from MCP manager
 fn create_harmony_developer_message(
     request: &ResponsesRequest,
+    mcp_manager: Option<&McpClientManager>,
 ) -> Result<Option<HarmonyMessage>, String> {
     // Check if instructions should go to developer message
     let use_system_instructions = std::env::var("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS")
@@ -997,11 +982,17 @@ fn create_harmony_developer_message(
         })
         .unwrap_or_default();
 
+    // Check if we have MCP tools
+    let has_mcp_tools = mcp_manager.map(|m| !m.list_tools().is_empty()).unwrap_or(false);
+
     // Create developer message if:
     // 1. There are function tools, OR
-    // 2. Instructions should go to developer message (not system)
+    // 2. There are MCP tools, OR
+    // 3. Instructions should go to developer message (not system)
     let need_dev_message =
-        !function_tools.is_empty() || (!use_system_instructions && request.instructions.is_some());
+        !function_tools.is_empty()
+        || has_mcp_tools
+        || (!use_system_instructions && request.instructions.is_some());
 
     if !need_dev_message {
         return Ok(None);
@@ -1016,30 +1007,48 @@ fn create_harmony_developer_message(
         }
     }
 
-    // Convert function tools to ToolDescription
-    let tool_descriptions: Vec<ToolDescription> = function_tools
-        .iter()
-        .filter_map(|tool| {
-            tool.function.as_ref().map(|func| {
-                ToolDescription::new(
-                    &func.name,
-                    func.description.as_deref().unwrap_or(""),
-                    func.parameters.clone(),
-                )
-            })
-        })
-        .collect();
+    // Collect all tool descriptions
+    let mut tool_descriptions: Vec<ToolDescription> = Vec::new();
+
+    // 1. Add function tools from request
+    for tool in function_tools.iter() {
+        if let Some(func) = &tool.function {
+            tool_descriptions.push(ToolDescription::new(
+                &func.name,
+                func.description.as_deref().unwrap_or(""),
+                func.parameters.clone(),
+            ));
+        }
+    }
+
+    // 2. Add MCP tools from MCP manager
+    if let Some(mcp) = mcp_manager {
+        for tool_info in mcp.list_tools() {
+            debug!(
+                "Adding MCP tool to developer message: name={}, description={}",
+                tool_info.name, tool_info.description
+            );
+
+            tool_descriptions.push(ToolDescription::new(
+                &tool_info.name,
+                &tool_info.description,
+                tool_info.parameters.clone(),
+            ));
+        }
+    }
 
     if tool_descriptions.is_empty() {
         return Ok(None);
     }
 
-    // Add function tools to developer content
-    dev_content = dev_content.with_function_tools(tool_descriptions);
+    // Add all tools to developer content in "functions" namespace
+    dev_content = dev_content.with_function_tools(tool_descriptions.clone());
 
     debug!(
-        "Created developer message with {} function tools",
-        function_tools.len()
+        "Created developer message with {} total tools ({} function, {} MCP)",
+        tool_descriptions.len(),
+        function_tools.len(),
+        tool_descriptions.len() - function_tools.len()
     );
 
     Ok(Some(HarmonyMessage::from_role_and_content(
@@ -1076,8 +1085,8 @@ fn convert_input_to_harmony_messages(
         let system_message = create_harmony_system_message(request, mcp_manager)?;
         messages.push(system_message);
 
-        // 2. Add developer message if custom tools present
-        if let Some(developer_message) = create_harmony_developer_message(request)? {
+        // 2. Add developer message if custom tools or MCP tools present
+        if let Some(developer_message) = create_harmony_developer_message(request, mcp_manager)? {
             messages.push(developer_message);
         }
 
