@@ -728,6 +728,7 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_accepted_tokens = []
         output_hidden_states = None
+        load = self.get_load()
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -770,6 +771,7 @@ class SchedulerOutputProcessorMixin:
                 if req.finished_len is None:
                     req.finished_len = len(req.output_ids)
                 should_output = True
+                load.num_finished_reqs += 1
             else:
                 if req.stream:
                     stream_interval = (
@@ -950,6 +952,7 @@ class SchedulerOutputProcessorMixin:
                     http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
+                    load=load,
                 )
             )
 
