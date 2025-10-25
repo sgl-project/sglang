@@ -727,6 +727,7 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         spec_verify_ct = []
         spec_accepted_tokens = []
+        retraction_counts = []
         output_hidden_states = None
 
         if return_logprob:
@@ -827,6 +828,8 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+
+                retraction_counts.append(req.retraction_count)
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -950,6 +953,7 @@ class SchedulerOutputProcessorMixin:
                     http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
+                    retraction_counts=retraction_counts,
                 )
             )
 
@@ -961,6 +965,7 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
+        retraction_counts = []
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
@@ -969,6 +974,7 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+                retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 finished_reasons,
@@ -979,5 +985,6 @@ class SchedulerOutputProcessorMixin:
                 http_worker_ipcs=http_worker_ipcs,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
+                retraction_counts=retraction_counts,
             )
         )

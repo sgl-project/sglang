@@ -854,6 +854,9 @@ class BatchTokenIDOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -930,6 +933,9 @@ class BatchStrOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -971,6 +977,9 @@ class BatchEmbeddingOutput(BaseBatchReq):
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
 
 
 @dataclass
