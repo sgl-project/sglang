@@ -30,6 +30,7 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         launch_args = [
+            "--trust-remote-code",
             "--attention-backend",
             cls.attention_backend,
             "--speculative-algorithm",
