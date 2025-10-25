@@ -1041,6 +1041,9 @@ class ModelRunner:
         self.server_args.load_format = load_format
         self.load_config = load_config
 
+        if self.server_args.recapture_cuda_graph and self.device == "cuda":
+            self.init_device_graphs()
+
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
