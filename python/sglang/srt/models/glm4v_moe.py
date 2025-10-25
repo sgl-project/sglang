@@ -53,7 +53,6 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         )
         self.visual = Glm4vVisionModel(
             config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-5),
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
         )
