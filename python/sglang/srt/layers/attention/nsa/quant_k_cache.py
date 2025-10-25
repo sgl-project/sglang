@@ -206,6 +206,8 @@ def _quantize_k_cache_fast_kernel(
 
 
 if __name__ == "__main__":
+    import dequant_k_cache
+
     for num_blocks, block_size in [
         (1, 1),
         (10, 64),
@@ -220,8 +222,6 @@ if __name__ == "__main__":
 
         ref_quant = _quantize_k_cache_slow(input_k_cache)
         actual_quant = _quantize_k_cache_fast_wrapped(input_k_cache)
-
-        import dequant_k_cache
 
         ref_ref_dequant = dequant_k_cache._dequantize_k_cache_slow(ref_quant)
         ref_actual_dequant = dequant_k_cache._dequantize_k_cache_fast_wrapped(ref_quant)
@@ -276,9 +276,6 @@ if __name__ == "__main__":
 
         actual_quant = _quantize_k_cache_fast_wrapped(input_k_cache)
 
-        import dequant_k_cache
-
-        # test dequant_k_cache_paged
         page_table_1 = torch.arange(
             num_blocks * block_size, dtype=torch.int32, device="cuda"
         )

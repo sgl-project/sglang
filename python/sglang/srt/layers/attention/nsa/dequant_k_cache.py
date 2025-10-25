@@ -97,7 +97,6 @@ def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
     assert num_blocks_per_token == 5
 
     assert dim_nope % group_size == 0
-    NUM_NOPE_BLOCKS = dim_nope // group_size
 
     input_nope_q = quant_k_cache[:, :dim_nope]
     input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
@@ -114,7 +113,7 @@ def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
         input_nope_q.stride(0),
         input_nope_s.stride(0),
         input_rope.stride(0),
-        NUM_NOPE_BLOCKS=NUM_NOPE_BLOCKS,
+        NUM_NOPE_BLOCKS=num_tiles,
         GROUP_SIZE=group_size,
         DIM_NOPE=dim_nope,
         DIM_ROPE=dim_rope,
@@ -182,7 +181,7 @@ def dequantize_k_cache_paged(
         quant_k_cache: [total_num_tokens, 1, dim_quant] or [num_blocks, block_size, 1, dim_quant], the quantized k-cache in paged layout
         page_table_1_flattened: [num_tokens], the flattened page_table_1 with the page indices in each requests concatenated together
     Returns:
-        output: [num_tokens, dim_nope + dim_rope], the de-quantized k-cache
+        output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
     assert (
@@ -200,7 +199,7 @@ def dequantize_k_cache_paged(
     num_tiles = dim_nope // group_size  # 512 // 128 = 4
 
     output = torch.empty(
-        (num_tokens, dim_nope + dim_rope),
+        (num_tokens, 1, dim_nope + dim_rope),
         dtype=torch.bfloat16,
         device=quant_k_cache.device,
     )
@@ -210,7 +209,6 @@ def dequantize_k_cache_paged(
     assert num_blocks_per_token == 5
 
     assert dim_nope % group_size == 0
-    NUM_NOPE_BLOCKS = dim_nope // group_size  # 512 // 128 = 4
 
     input_nope_q = quant_k_cache[:, :dim_nope]
     # [:, 512:512+4*4] = [:, 512:528]
@@ -230,13 +228,13 @@ def dequantize_k_cache_paged(
         input_nope_q.stride(0),
         input_nope_s.stride(0),
         input_rope.stride(0),
-        NUM_NOPE_BLOCKS=NUM_NOPE_BLOCKS,
+        NUM_NOPE_BLOCKS=num_tiles,
         GROUP_SIZE=group_size,
         DIM_NOPE=dim_nope,
         DIM_ROPE=dim_rope,
     )
 
-    return output.unsqueeze(1)
+    return output
 
 
 @triton.jit
