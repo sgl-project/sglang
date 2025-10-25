@@ -21,7 +21,7 @@ use sglang_router_rs::{
     config::{
         ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
     },
-    data_connector::{MemoryResponseStorage, ResponseId, ResponseStorage, StoredResponse},
+    data_connector::{ResponseId, StoredResponse},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
         common::StringOrArray,
@@ -207,10 +207,12 @@ async fn test_openai_router_responses_with_mock() {
     });
 
     let base_url = format!("http://{}", addr);
-    let storage = Arc::new(MemoryResponseStorage::new());
 
     let ctx = common::test_app::create_test_app_context().await;
     let router = OpenAIRouter::new(vec![base_url], &ctx).await.unwrap();
+
+    // Get storage from context (router uses this, not a separate storage)
+    let storage = ctx.response_storage.clone();
 
     let request1 = ResponsesRequest {
         model: "gpt-4o-mini".to_string(),
@@ -469,17 +471,17 @@ async fn test_openai_router_responses_streaming_with_mock() {
     });
 
     let base_url = format!("http://{}", addr);
-    let storage = Arc::new(MemoryResponseStorage::new());
 
-    // Seed a previous response so previous_response_id logic has data to pull from.
+    let ctx = common::test_app::create_test_app_context().await;
+    let router = OpenAIRouter::new(vec![base_url], &ctx).await.unwrap();
+
+    // Get storage from context and seed a previous response
+    let storage = ctx.response_storage.clone();
     let mut previous = StoredResponse::new(None);
     previous.id = ResponseId::from("resp_prev_chain");
     previous.input = serde_json::json!("Earlier bedtime question");
     previous.output = serde_json::json!("Earlier answer");
     storage.store_response(previous).await.unwrap();
-
-    let ctx = common::test_app::create_test_app_context().await;
-    let router = OpenAIRouter::new(vec![base_url], &ctx).await.unwrap();
 
     let mut metadata = HashMap::new();
     metadata.insert("topic".to_string(), json!("unicorns"));
