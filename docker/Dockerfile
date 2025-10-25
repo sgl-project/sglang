@@ -186,7 +186,7 @@ RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
 
 # In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
 # latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
-RUN python3 -m pip install --no-cache-dir --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0" 
+RUN python3 -m pip install --no-cache-dir --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0"
 
 # For cuda 13, we need to install Triton from source to solve sm103 issue
 # Go back to official after >3.4.5 is released
