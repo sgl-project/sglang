@@ -9,10 +9,10 @@ use super::{
     RouterTrait,
 };
 use crate::{
+    app_context::AppContext,
     config::{PolicyConfig, RoutingMode},
     core::ConnectionMode,
     policies::PolicyFactory,
-    server::AppContext,
 };
 
 /// Factory for creating router instances based on configuration
