@@ -235,6 +235,10 @@ async fn execute_harmony_internal(
     if let Some(tools) = &body.tools {
         if let Some(mcp_manager) = create_mcp_manager_from_request(tools).await {
             debug!("MCP tools detected for Harmony, using tool loop");
+            debug!(
+                "Available MCP tools: {:?}",
+                mcp_manager.list_tools().iter().map(|t| &t.name).collect::<Vec<_>>()
+            );
 
             // Load conversation history to get modified request
             let modified_request = super::load_conversation_history(
@@ -937,13 +941,22 @@ fn get_builtin_tool_config(
         }
         "browser" => {
             // Check if any browser tools are available
-            let has_browser = mcp_manager.has_tool("browser.search")
-                || mcp_manager.has_tool("browser.open")
-                || mcp_manager.has_tool("browser.find");
+            let has_browser_search = mcp_manager.has_tool("browser.search");
+            let has_browser_open = mcp_manager.has_tool("browser.open");
+            let has_browser_find = mcp_manager.has_tool("browser.find");
+
+            debug!(
+                "Checking for browser tools: browser.search={}, browser.open={}, browser.find={}",
+                has_browser_search, has_browser_open, has_browser_find
+            );
+
+            let has_browser = has_browser_search || has_browser_open || has_browser_find;
 
             if has_browser {
+                debug!("Browser tools found, adding ToolNamespaceConfig::browser() to system message");
                 Some(ToolNamespaceConfig::browser())
             } else {
+                debug!("No browser tools found in MCP manager");
                 None
             }
         }
