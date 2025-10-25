@@ -13,7 +13,12 @@ from __future__ import annotations
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Mixin class and utils for multi-http-worker mode"""
+
+"""
+Mixin classes and utils for multi-http-worker mode
+This file uses multiple processes to handle requests and tokenization, reducing the overhead of python and http server.
+"""
+
 import asyncio
 import logging
 import multiprocessing as multiprocessing

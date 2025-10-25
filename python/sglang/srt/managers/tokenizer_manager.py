@@ -67,7 +67,6 @@ from sglang.srt.managers.io_struct import (
     WatchLoadUpdateReq,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
-from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -259,6 +258,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
         else:
+            from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
+
             # Use tokenizer_worker_ipc_name in multi-tokenizer mode
             send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
