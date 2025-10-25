@@ -368,6 +368,8 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
     ):
+        if storage_backend_extra_config is None:
+            storage_backend_extra_config = {}
 
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()
@@ -381,7 +383,7 @@ class HiCacheController:
         # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
 
-        return HiCacheStorageConfig(
+        config = HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             is_mla_model=is_mla_backend,
@@ -389,6 +391,20 @@ class HiCacheController:
             model_name=model_name,
             extra_config=storage_backend_extra_config,
         )
+
+        # Check if this is the decode side in PD separation mode
+        config.is_decode_side = storage_backend_extra_config.get("role") == "decode"
+        if config.is_decode_side:
+            config.prefill_tp_size = storage_backend_extra_config.get("prefill_tp_size")
+            config.decode_tp_size = self.tp_size
+            config.should_split_heads = (
+                not config.is_mla_model
+                and self.mem_pool_host.layout == "page_head"
+                and config.prefill_tp_size is not None
+                and config.decode_tp_size < config.prefill_tp_size
+            )
+
+        return config
 
     def reset(self):
         self.stop_event.set()
