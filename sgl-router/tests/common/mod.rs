@@ -15,6 +15,7 @@ use std::{
 
 use serde_json::json;
 use sglang_router_rs::{
+    app_context::AppContext,
     config::RouterConfig,
     core::{LoadMonitor, WorkerRegistry},
     data_connector::{
@@ -23,7 +24,6 @@ use sglang_router_rs::{
     middleware::TokenBucket,
     policies::PolicyRegistry,
     protocols::common::{Function, Tool},
-    server::AppContext,
 };
 
 /// Helper function to create AppContext for tests
@@ -66,22 +66,25 @@ pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engine = Arc::new(OnceLock::new());
 
-    let app_context = Arc::new(AppContext::new(
-        config,
-        client,
-        rate_limiter,
-        None, // tokenizer
-        None, // reasoning_parser_factory
-        None, // tool_parser_factory
-        worker_registry,
-        policy_registry,
-        response_storage,
-        conversation_storage,
-        conversation_item_storage,
-        load_monitor,
-        worker_job_queue,
-        workflow_engine,
-    ));
+    let app_context = Arc::new(
+        AppContext::builder()
+            .router_config(config)
+            .client(client)
+            .rate_limiter(rate_limiter)
+            .tokenizer(None) // tokenizer
+            .reasoning_parser_factory(None) // reasoning_parser_factory
+            .tool_parser_factory(None) // tool_parser_factory
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .load_monitor(load_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engine(workflow_engine)
+            .build()
+            .unwrap(),
+    );
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);

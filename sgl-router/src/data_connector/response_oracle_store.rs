@@ -72,13 +72,13 @@ impl OracleResponseStorage {
         let previous: Option<String> = row.get(1).map_err(|err| {
             map_oracle_error(err).into_storage_error("fetch previous_response_id")
         })?;
-        let input: String = row
+        let input_json: Option<String> = row
             .get(2)
             .map_err(|err| map_oracle_error(err).into_storage_error("fetch input"))?;
         let instructions: Option<String> = row
             .get(3)
             .map_err(|err| map_oracle_error(err).into_storage_error("fetch instructions"))?;
-        let output: String = row
+        let output_json: Option<String> = row
             .get(4)
             .map_err(|err| map_oracle_error(err).into_storage_error("fetch output"))?;
         let tool_calls_json: Option<String> = row
@@ -107,6 +107,8 @@ impl OracleResponseStorage {
         let tool_calls = parse_tool_calls(tool_calls_json)?;
         let metadata = parse_metadata(metadata_json)?;
         let raw_response = parse_raw_response(raw_response_json)?;
+        let input = parse_json_value(input_json)?;
+        let output = parse_json_value(output_json)?;
 
         Ok(StoredResponse {
             id: ResponseId(id),
@@ -146,6 +148,8 @@ impl ResponseStorage for OracleResponseStorage {
         let response_id = id.clone();
         let response_id_str = response_id.0.clone();
         let previous_id = previous_response_id.map(|r| r.0);
+        let json_input = serde_json::to_string(&input)?;
+        let json_output = serde_json::to_string(&output)?;
         let json_tool_calls = serde_json::to_string(&tool_calls)?;
         let json_metadata = serde_json::to_string(&metadata)?;
         let json_raw_response = serde_json::to_string(&raw_response)?;
@@ -158,9 +162,9 @@ impl ResponseStorage for OracleResponseStorage {
                 &[
                     &response_id_str,
                     &previous_id,
-                    &input,
+                    &json_input,
                     &instructions,
-                    &output,
+                    &json_output,
                     &json_tool_calls,
                     &json_metadata,
                     &created_at,
@@ -475,6 +479,15 @@ fn parse_raw_response(raw: Option<String>) -> StorageResult<Value> {
             serde_json::from_str(&s).map_err(ResponseStorageError::SerializationError)
         }
         _ => Ok(Value::Null),
+    }
+}
+
+fn parse_json_value(raw: Option<String>) -> StorageResult<Value> {
+    match raw {
+        Some(s) if !s.is_empty() => {
+            serde_json::from_str(&s).map_err(ResponseStorageError::SerializationError)
+        }
+        _ => Ok(Value::Array(vec![])),
     }
 }
 

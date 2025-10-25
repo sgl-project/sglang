@@ -206,15 +206,17 @@ mod tests {
     #[tokio::test]
     async fn test_store_with_custom_id() {
         let store = MemoryResponseStorage::new();
-        let mut response = StoredResponse::new("Input".to_string(), "Output".to_string(), None);
+        let mut response = StoredResponse::new(None);
         response.id = ResponseId::from("resp_custom");
+        response.input = serde_json::json!("Input");
+        response.output = serde_json::json!("Output");
         store.store_response(response.clone()).await.unwrap();
         let retrieved = store
             .get_response(&ResponseId::from("resp_custom"))
             .await
             .unwrap();
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().output, "Output");
+        assert_eq!(retrieved.unwrap().output, serde_json::json!("Output"));
     }
 
     #[tokio::test]
@@ -222,13 +224,15 @@ mod tests {
         let store = MemoryResponseStorage::new();
 
         // Store a response
-        let response = StoredResponse::new("Hello".to_string(), "Hi there!".to_string(), None);
+        let mut response = StoredResponse::new(None);
+        response.input = serde_json::json!("Hello");
+        response.output = serde_json::json!("Hi there!");
         let response_id = store.store_response(response).await.unwrap();
 
         // Retrieve it
         let retrieved = store.get_response(&response_id).await.unwrap();
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().input, "Hello");
+        assert_eq!(retrieved.unwrap().input, serde_json::json!("Hello"));
 
         // Delete it
         store.delete_response(&response_id).await.unwrap();
@@ -241,35 +245,35 @@ mod tests {
         let store = MemoryResponseStorage::new();
 
         // Create a chain of responses
-        let response1 =
-            StoredResponse::new("First".to_string(), "First response".to_string(), None);
+        let mut response1 = StoredResponse::new(None);
+        response1.input = serde_json::json!("First");
+        response1.output = serde_json::json!("First response");
         let id1 = store.store_response(response1).await.unwrap();
 
-        let response2 = StoredResponse::new(
-            "Second".to_string(),
-            "Second response".to_string(),
-            Some(id1.clone()),
-        );
+        let mut response2 = StoredResponse::new(Some(id1.clone()));
+        response2.input = serde_json::json!("Second");
+        response2.output = serde_json::json!("Second response");
         let id2 = store.store_response(response2).await.unwrap();
 
-        let response3 = StoredResponse::new(
-            "Third".to_string(),
-            "Third response".to_string(),
-            Some(id2.clone()),
-        );
+        let mut response3 = StoredResponse::new(Some(id2.clone()));
+        response3.input = serde_json::json!("Third");
+        response3.output = serde_json::json!("Third response");
         let id3 = store.store_response(response3).await.unwrap();
 
         // Get the chain
         let chain = store.get_response_chain(&id3, None).await.unwrap();
         assert_eq!(chain.responses.len(), 3);
-        assert_eq!(chain.responses[0].input, "First");
-        assert_eq!(chain.responses[1].input, "Second");
-        assert_eq!(chain.responses[2].input, "Third");
+        assert_eq!(chain.responses[0].input, serde_json::json!("First"));
+        assert_eq!(chain.responses[1].input, serde_json::json!("Second"));
+        assert_eq!(chain.responses[2].input, serde_json::json!("Third"));
 
         let limited_chain = store.get_response_chain(&id3, Some(2)).await.unwrap();
         assert_eq!(limited_chain.responses.len(), 2);
-        assert_eq!(limited_chain.responses[0].input, "Second");
-        assert_eq!(limited_chain.responses[1].input, "Third");
+        assert_eq!(
+            limited_chain.responses[0].input,
+            serde_json::json!("Second")
+        );
+        assert_eq!(limited_chain.responses[1].input, serde_json::json!("Third"));
     }
 
     #[tokio::test]
@@ -277,27 +281,21 @@ mod tests {
         let store = MemoryResponseStorage::new();
 
         // Store responses for different users
-        let mut response1 = StoredResponse::new(
-            "User1 message".to_string(),
-            "Response to user1".to_string(),
-            None,
-        );
+        let mut response1 = StoredResponse::new(None);
+        response1.input = serde_json::json!("User1 message");
+        response1.output = serde_json::json!("Response to user1");
         response1.user = Some("user1".to_string());
         store.store_response(response1).await.unwrap();
 
-        let mut response2 = StoredResponse::new(
-            "Another user1 message".to_string(),
-            "Another response to user1".to_string(),
-            None,
-        );
+        let mut response2 = StoredResponse::new(None);
+        response2.input = serde_json::json!("Another user1 message");
+        response2.output = serde_json::json!("Another response to user1");
         response2.user = Some("user1".to_string());
         store.store_response(response2).await.unwrap();
 
-        let mut response3 = StoredResponse::new(
-            "User2 message".to_string(),
-            "Response to user2".to_string(),
-            None,
-        );
+        let mut response3 = StoredResponse::new(None);
+        response3.input = serde_json::json!("User2 message");
+        response3.output = serde_json::json!("Response to user2");
         response3.user = Some("user2".to_string());
         store.store_response(response3).await.unwrap();
 
@@ -325,11 +323,15 @@ mod tests {
     async fn test_memory_store_stats() {
         let store = MemoryResponseStorage::new();
 
-        let mut response1 = StoredResponse::new("Test1".to_string(), "Reply1".to_string(), None);
+        let mut response1 = StoredResponse::new(None);
+        response1.input = serde_json::json!("Test1");
+        response1.output = serde_json::json!("Reply1");
         response1.user = Some("user1".to_string());
         store.store_response(response1).await.unwrap();
 
-        let mut response2 = StoredResponse::new("Test2".to_string(), "Reply2".to_string(), None);
+        let mut response2 = StoredResponse::new(None);
+        response2.input = serde_json::json!("Test2");
+        response2.output = serde_json::json!("Reply2");
         response2.user = Some("user2".to_string());
         store.store_response(response2).await.unwrap();
 
