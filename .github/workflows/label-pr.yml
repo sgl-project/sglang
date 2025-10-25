@@ -26,7 +26,7 @@ jobs:
         if: steps.checkAccess.outputs.require-result == 'true'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_PAT_FOR_TAGGING }}
+          github-token: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
           script: |
             github.rest.issues.addLabels({
               owner: context.repo.owner,
