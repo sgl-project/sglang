@@ -46,6 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.utils import SupportsPP
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
@@ -390,7 +391,7 @@ class LlamaModel(nn.Module):
         return self.embed_tokens
 
 
-class LlamaForCausalLM(nn.Module):
+class LlamaForCausalLM(nn.Module, SupportsPP):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -425,9 +426,36 @@ class LlamaForCausalLM(nn.Module):
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
-        if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+
+        # handle the lm head on different pp ranks
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
         else:
+            # ranks other than the last rank will have a placeholder layer
+            self.lm_head = PPMissingLayer()
+
+        # perform weight tying for PP
+        if self.pp_group.world_size > 1 and config.tie_word_embeddings:
+            if self.pp_group.is_first_rank:
+                self.pp_group.send(
+                    self.model.embed_tokens.weight, dst=self.pp_group.last_rank
+                )
+            else:
+                emb_token_weight = self.pp_group.recv(
+                    size=(config.vocab_size, config.hidden_size),
+                    dtype=next(self.model.parameters()).dtype,
+                    src=self.pp_group.first_rank,
+                )
+                self.lm_head.weight.copy_(emb_token_weight)
+
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
@@ -569,17 +597,8 @@ class LlamaForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
+        filtered_weights = self.filter_weights_by_layers(weights)
+        for name, loaded_weight in filtered_weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -589,7 +608,16 @@ class LlamaForCausalLM(nn.Module):
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
+                if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
+                    # Handle pp weight tying here
+                    # find the embed_tokens.weight in the weights
+                    embed_token_weights = next(
+                        filter(lambda x: x[0] == "model.embed_tokens.weight", weights)
+                    )[1]
+                    loaded_weight = embed_token_weights
+                else:
+                    continue
+
             # Handle FP8 kv-scale remapping
             if "scale" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)

@@ -65,7 +65,9 @@ def get_pp_indices(
 ) -> Tuple[int, int]:
     """Try to evenly distribute layers across partitions.
     If the number of layers is not divisible by the number of partitions,
-    the last partition will have the remaining layers.
+    the remaining layers are evenly distributed across all but the last
+    partition. The last partition is excluded because it often contains an
+    additional norm layer and we are attempting to balance compute.
     """
     # partition_list_str can be set to None in sglang
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
@@ -80,15 +82,32 @@ def get_pp_indices(
             raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
         if sum(partitions) != num_hidden_layers:
             raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
-        start_layer = sum(partitions[:pp_rank])
-        end_layer = start_layer + partitions[pp_rank]
     else:
         layers_per_partition = num_hidden_layers // pp_size
-        start_layer = pp_rank * layers_per_partition
-        end_layer = start_layer + layers_per_partition
 
-        if pp_rank == pp_size - 1:
-            end_layer = num_hidden_layers
+        # Initialize all partitions with the base layer count
+        partitions = [layers_per_partition] * pp_size
+
+        # Check if layers don't divide evenly
+        if remaining_layers := num_hidden_layers % pp_size:
+            # Distribute remaining layers starting from the second-last partition
+            # to avoid overloading the first/last partitions (which often handle I/O)
+            start_idx = pp_size - 2  # Index of second-last partition
+            end_idx = start_idx - remaining_layers  # Calculate stopping point
+
+            for i in range(start_idx, end_idx, -1):  # Walk backwards
+                partitions[i] += 1
+
+            # Log the uneven distribution for debugging
+            logger.info(
+                "Uneven layer distribution (added %d extra layers): [%s]",
+                "Using SGLANG_PP_LAYER_PARTITION environment variable to override this",
+                remaining_layers,
+                ",".join(map(str, partitions)),
+            )
+
+    start_layer = sum(partitions[:pp_rank])
+    end_layer = start_layer + partitions[pp_rank]
 
     return (start_layer, end_layer)
 
