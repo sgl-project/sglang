@@ -206,6 +206,130 @@ python3 -m sglang_router.launch_router \
 - Provide exactly one `--worker-urls` entry per router instance.
 - The Rust binary supports the same flags (`./target/release/sglang-router --backend openai ...`).
 
+### MCP Integration
+The SGL Model Gateway provides native Model Context Protocol (MCP) client integration, enabling tool calling across STDIO, SSE, and Streamable transports. MCP servers are configured via a JSON configuration file and registered at startup through the workflow engine.
+
+#### Basic Usage
+```bash
+# Rust binary
+./target/release/sglang-router \
+  --mcp-config /path/to/mcp-config.json \
+  --worker-urls http://worker1:8000
+
+# Python launcher
+python3 -m sglang_router.launch_router \
+  --mcp-config /path/to/mcp-config.json \
+  --worker-urls http://worker1:8000
+```
+
+#### MCP Configuration File
+Create an MCP configuration file to define servers, transports, and connection settings:
+
+```json
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "required": false
+    },
+    {
+      "name": "github",
+      "url": "https://api.github.com/mcp",
+      "token": "ghp_xxxxx",
+      "transport": "sse",
+      "required": false
+    },
+    {
+      "name": "custom-tools",
+      "url": "https://tools.example.com/mcp",
+      "transport": "streamable",
+      "required": true
+    }
+  ],
+  "pool": {
+    "max_connections": 100,
+    "idle_timeout_secs": 300
+  },
+  "proxy": {
+    "http": "http://proxy.internal:8080",
+    "https": "https://proxy.internal:8443",
+    "no_proxy": "localhost,127.0.0.1,*.internal"
+  },
+  "inventory": {
+    "refresh_interval_secs": 300
+  }
+}
+```
+
+#### Configuration Options
+
+**Server Configuration** (`servers` array):
+- `name`: Unique identifier for the MCP server
+- `command` + `args`: For STDIO transport (local process execution)
+- `url`: For SSE or Streamable transports (HTTP/HTTPS endpoints)
+- `token`: Optional authentication token for HTTP-based transports
+- `transport`: Protocol type (`"sse"` or `"streamable"`; STDIO is inferred from `command`)
+- `required`: If `true`, router fails to start if server is unreachable (default: `false`)
+- `envs`: Environment variables for STDIO processes (optional)
+- `proxy`: Per-server proxy override (set to `null` to bypass global proxy)
+
+**Connection Pool** (`pool`):
+- `max_connections`: Maximum pooled connections for dynamic servers (default: 100)
+- `idle_timeout_secs`: TTL for idle connections (default: 300)
+
+**Proxy Configuration** (`proxy`):
+- `http`/`https`: Proxy URLs for MCP server connections (not LLM traffic)
+- `no_proxy`: Comma-separated hosts to exclude from proxying (supports wildcards)
+
+**Inventory Settings** (`inventory`):
+- `refresh_interval_secs`: Tool/prompt/resource inventory refresh interval (default: 300)
+
+#### Transport Types
+
+**STDIO** (Local Process):
+```json
+{
+  "name": "local-tools",
+  "command": "python",
+  "args": ["-m", "my_mcp_server"],
+  "envs": {
+    "API_KEY": "secret",
+    "DEBUG": "true"
+  }
+}
+```
+
+**SSE** (Server-Sent Events):
+```json
+{
+  "name": "remote-sse",
+  "url": "https://mcp.example.com/events",
+  "token": "bearer-token",
+  "transport": "sse"
+}
+```
+
+**Streamable** (Bidirectional Streaming):
+```json
+{
+  "name": "streaming-tools",
+  "url": "https://mcp.example.com/stream",
+  "transport": "streamable",
+  "required": true
+}
+```
+
+#### Server Lifecycle
+- MCP servers are registered via the workflow engine with retry logic (100 attempts, 2-hour timeout for STDIO servers)
+- Discovery phase identifies tools, prompts, and resources
+- Tool inventory is cached with configurable TTL and periodic refresh
+- Failed optional servers log warnings; required servers halt startup
+- Static servers (from config) are permanent; dynamic servers (per-request) use connection pooling
+
+Check Prometheus metrics for MCP activity (`mcp_*` metrics) and workflow job status via the admin API.
+
 ### Python Launcher (Router + Workers)
 Launch router and SGLang worker processes together; `launch_server` spins up workers (HTTP or gRPC) and the router in one shot.
 ```bash
