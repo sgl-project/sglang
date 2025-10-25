@@ -6,6 +6,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci
     popen_launch_server,
 )
 
@@ -15,6 +16,7 @@ MODELS = [
         tp_size=8,
     ),
 ]
+
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestLlama4LoRA(CustomTestCase):
