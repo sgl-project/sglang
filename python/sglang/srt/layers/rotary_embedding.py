@@ -1,7 +1,6 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 
 """Rotary Positional Embeddings."""
-
 import itertools
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -896,6 +895,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
+
     def __init__(
         self,
         head_size: int,
@@ -942,6 +942,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 
 
 class Llama4VisionRotaryEmbedding(RotaryEmbedding):
+
     def __init__(
         self,
         head_size: int,
@@ -1071,10 +1072,23 @@ def _triton_mrope_forward(
     is_interleaved: tl.constexpr,
     is_neox_style: tl.constexpr,
 ):
+    # Adapted from
+    # https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/qwen2vl_mrope.py
+    # This version supports flatten input tensors from vllm
+    # and supports cos and sin cache with shape (3, num_tokens, head_dim // 2)
+    # instead of (3, bsz, seq_len, head_dim), also supports interleaved rotary
     pid = tl.program_id(0)
+    # locate start address
     q_ptr = q_ptr + pid * (n_qh * hd)
     k_ptr = k_ptr + pid * (n_kh * hd)
 
+    # ####################################################################
+    # get the cos(mθ_{i...d/2}) and sin(mθ_{i...d/2}) for token position
+    # m of this program instance
+    # ####################################################################
+    # Note: cos and sin now have shape (3, num_tokens, head_dim // 2)
+
+    # Updated stride calculation for half head_dim
     half_rd = rd // 2
     t_cos = cos + pid * half_rd
     h_cos = t_cos + num_tokens * half_rd
@@ -1083,6 +1097,7 @@ def _triton_mrope_forward(
     h_sin = t_sin + num_tokens * half_rd
     w_sin = h_sin + num_tokens * half_rd
 
+    # Updated offsets for half head_dim
     cos_offsets = tl.arange(0, pad_hd // 2)
     if is_interleaved:
         h_mask = ((cos_offsets % 3) == 1) & (cos_offsets <= 3 * mrope_section_h)
@@ -1110,7 +1125,6 @@ def _triton_mrope_forward(
     # program instance (i.e. for the current token) separately
     # ####################################################################
     # left half of the head
-
     if is_neox_style:
         first_half_q_offsets = (
             tl.arange(0, pad_n_qh)[:, None] * hd + tl.arange(0, pad_hd // 2)[None, :]
@@ -1124,16 +1138,20 @@ def _triton_mrope_forward(
         first_k_mask = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (
             tl.arange(0, pad_hd // 2)[None, :] < rd // 2
         )
+
         q_tile_1 = tl.load(q_ptr + first_half_q_offsets, mask=first_q_mask, other=0).to(
             sin_row.dtype
         )
         k_tile_1 = tl.load(k_ptr + first_half_k_offsets, mask=first_k_mask, other=0).to(
             sin_row.dtype
         )
+
+        # right half of the head
         second_half_q_offsets = first_half_q_offsets + (rd // 2)
         second_half_k_offsets = first_half_k_offsets + (rd // 2)
         second_q_mask = first_q_mask
         second_k_mask = first_k_mask
+
         q_tile_2 = tl.load(
             q_ptr + second_half_q_offsets, mask=second_q_mask, other=0
         ).to(sin_row.dtype)
@@ -1141,14 +1159,17 @@ def _triton_mrope_forward(
             k_ptr + second_half_k_offsets, mask=second_k_mask, other=0
         ).to(sin_row.dtype)
 
+        # y = [x1, x2] * [cos, cos] + [-x2, x1] * [sin, sin]
+        # Since cos and sin are now half-size,
+        # we use the same cos_row and sin_row for both halves
         new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
-        new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
-        new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
-        new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
-
         tl.store(q_ptr + first_half_q_offsets, new_q_tile_1, mask=first_q_mask)
+        new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
         tl.store(q_ptr + second_half_q_offsets, new_q_tile_2, mask=second_q_mask)
+
+        new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
         tl.store(k_ptr + first_half_k_offsets, new_k_tile_1, mask=first_k_mask)
+        new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
         tl.store(k_ptr + second_half_k_offsets, new_k_tile_2, mask=second_k_mask)
     else:
         base_q = tl.arange(0, pad_n_qh)[:, None] * hd
