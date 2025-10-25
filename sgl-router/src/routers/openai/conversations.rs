@@ -14,10 +14,9 @@ use tracing::{debug, info, warn};
 use super::{responses::build_stored_response, utils::generate_id};
 use crate::{
     data_connector::{
-        conversation_items::{ListParams, SortOrder},
         Conversation, ConversationId, ConversationItemId, ConversationItemStorage,
-        ConversationStorage, NewConversation, NewConversationItem, ResponseId, ResponseStorage,
-        SharedConversationItemStorage, SharedConversationStorage,
+        ConversationStorage, ListParams, NewConversation, NewConversationItem, ResponseId,
+        ResponseStorage, SharedConversationItemStorage, SharedConversationStorage, SortOrder,
     },
     protocols::responses::{ResponseInput, ResponsesRequest},
 };
@@ -889,7 +888,7 @@ fn parse_item_from_value(
 
 /// Convert ConversationItem to JSON response format
 /// Extracts fields from content for special types (mcp_call, mcp_list_tools, etc.)
-fn item_to_json(item: &crate::data_connector::conversation_items::ConversationItem) -> Value {
+fn item_to_json(item: &crate::data_connector::ConversationItem) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("id".to_string(), json!(item.id.0));
     obj.insert("type".to_string(), json!(item.item_type));
