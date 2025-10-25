@@ -62,7 +62,7 @@ if __name__ == '__main__':
 Or, more simply, with the CLI:
 
 ```bash
-sgl-diffusion generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers
     --text-encoder-cpu-offload --pin-cpu-memory
     --prompt "A curious raccoon"
     --save-output

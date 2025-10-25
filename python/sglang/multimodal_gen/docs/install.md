@@ -43,7 +43,7 @@ docker run --gpus all \
     --env "HF_TOKEN=<secret>" \
     --ipc=host \
     lmsysorg/sgl-diffusion:latest \
-    sgl-diffusion generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
           --use-fsdp-inference \
           --text-encoder-cpu-offload --pin-cpu-memory \
           --prompt "A curious raccoon" \

@@ -47,7 +47,7 @@ The sgl-diffusion CLI provides a quick way to access the sgl-diffusion inference
 Instead of specifying all parameters on the command line, you can use a configuration file:
 
 ```bash
-sgl-diffusion generate --config {CONFIG_FILE_PATH}
+sglang generate --config {CONFIG_FILE_PATH}
 ```
 
 The configuration file should be in JSON or YAML format with the same parameter names as the CLI options. Command-line arguments take precedence over settings in the configuration file, allowing you to override specific values while keeping the rest from the configuration file.
@@ -122,7 +122,7 @@ enable_torch_compile: false
 To see all the options, you can use the `--help` flag:
 
 ```bash
-sgl-diffusion generate --help
+sglang generate --help
 ```
 
 ## Serve
@@ -143,7 +143,7 @@ SERVER_ARGS=(
   --ring-degree=2
 )
 
-sgl-diffusion serve $SERVER_ARGS
+sglang serve $SERVER_ARGS
 ```
 
 - **--model-path**: Which model to load. The example uses `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
@@ -265,7 +265,7 @@ SAMPLING_ARGS=(
   --output-file-name "A curious raccoon.mp4"
 )
 
-sgl-diffusion generate $SERVER_ARGS $SAMPLING_ARGS
+sglang generate $SERVER_ARGS $SAMPLING_ARGS
 ```
 
 Once the generation task has finished, the server will shut down automatically.
