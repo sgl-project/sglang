@@ -17,7 +17,7 @@ use crate::{
     app_context::AppContext,
     core::workflow::*,
     mcp::{
-        client_manager::McpClientManager, config::McpServerConfig, PromptInfo, ResourceInfo,
+        manager::McpClientManager, config::McpServerConfig, PromptInfo, ResourceInfo,
         ToolInfo,
     },
 };
