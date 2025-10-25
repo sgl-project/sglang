@@ -496,10 +496,6 @@ def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = 
 
 
 def bmm_batch_invariant(a, b, *, out=None):
-    print("hi bmm_batch_invariant!!")
-    import traceback
-    traceback.print_stack()
-
     # Batched matrix multiply: (B, M, K) x (B, K, N) -> (B, M, N)
     # Process each batch separately with our persistent kernel
     if a.ndim == 3 and b.ndim == 3:
