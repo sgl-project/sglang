@@ -21,6 +21,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 
 import heapq
 import time
+from functools import partial
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -32,6 +33,7 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
+    _key_match_paged,
     get_child_key,
 )
 
@@ -320,11 +322,9 @@ class MambaRadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
     ):
-        assert isinstance(token_to_kv_pool_allocator, TokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
-        assert page_size == 1, "Only support page_size=1 in mamba radix cache now."
         self.page_size = page_size
         self.disable = disable
 
@@ -333,8 +333,13 @@ class MambaRadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
-        self.key_match_fn = _key_match_page_size1
-        self.get_child_key_fn = get_child_key
+        if self.page_size == 1:
+            self.key_match_fn = _key_match_page_size1
+            self.get_child_key_fn = get_child_key
+        else:
+            self.key_match_fn = partial(_key_match_paged, page_size=page_size)
+            self.get_child_key_fn = partial(get_child_key, page_size=page_size)
+        
         self.reset()
 
     ##### Public API #####
@@ -366,6 +371,20 @@ class MambaRadixCache(BasePrefixCache):
         """
         cow_mamba: bool = kwargs.get("cow_mamba", False)
         req: Req = kwargs.get("req", None)
+
+        if (
+            not self.disable
+            and req is not None
+            and req.mamba_pool_copy_ping_pong_idx is None
+        ):
+            copy_index = self.req_to_token_pool.mamba_pool.alloc(2)
+            if copy_index is None:
+                self.evict_mamba(2)
+                copy_index = self.req_to_token_pool.mamba_pool.alloc(2)
+                assert copy_index is not None, "Can not alloc mamba cache"
+            # rank0_log(f"DEBUG: match_prefix, {req.rid=}, {copy_index=}")
+            req.mamba_pool_copy_ping_pong_idx = copy_index
+            req.mamba_pool_copy_next_idx = 0
 
         if self.disable or len(key) == 0:
             return MatchResult(
@@ -415,7 +434,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def insert(self, key: RadixKey, value=None, mamba_value=None) -> Tuple[int, bool]:
         if self.disable:
-            return 0
+            return 0, False
 
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
@@ -437,14 +456,33 @@ class MambaRadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        page_aligned_len = len(kv_indices)
-        page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        cache_len = req.mamba_pool_copy_last_seqlen
+        if cache_len is None:
+            cache_len = 0
+        if cache_len != len(token_ids):
+            free_start_idx = max(cache_len, len(req.actual_prefix_indices))
+            self.token_to_kv_pool_allocator.free(kv_indices[free_start_idx:])
+            token_ids = token_ids[:cache_len]
+            kv_indices = kv_indices[:cache_len]
+
+        if self.page_size != 1:
+            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
+        else:
+            page_aligned_len = len(kv_indices)
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+
+        assert (
+            cache_len == page_aligned_len
+        ), f"It is required {cache_len=}, {page_aligned_len=}, ping @hanming if you see this"
 
         # Radix Cache takes one ref in memory pool
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
         mamba_value = (
-            self.req_to_token_pool.get_mamba_indices(req.req_pool_idx)
+            req.mamba_pool_copy_ping_pong_idx[1 - req.mamba_pool_copy_next_idx]
             .unsqueeze(-1)
             .clone()
         )
@@ -456,15 +494,30 @@ class MambaRadixCache(BasePrefixCache):
         )
 
         self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
+            kv_indices[len(req.actual_prefix_indices) : new_prefix_len]
         )
 
-        self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=mamba_exist)
+        self.req_to_token_pool.free(req.req_pool_idx)
+        if mamba_exist:
+            self.req_to_token_pool.mamba_pool.free(mamba_value)
+
+        mamba_value_other = (
+            req.mamba_pool_copy_ping_pong_idx[req.mamba_pool_copy_next_idx]
+            .unsqueeze(-1)
+            .clone()
+        )
+        self.req_to_token_pool.mamba_pool.free(mamba_value_other)
+        # TODO: these set to None seems not necessary?
+        req.mamba_pool_copy_ping_pong_idx = None
+        req.mamba_pool_copy_next_idx = None
+        req.mamba_pool_copy_last_seqlen = None
+
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
-        if self.disable:
+        # if self.disable:
+        if True: # TODO: properly handle this with a flag
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(req.fill_ids)
             ]

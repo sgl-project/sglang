@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+MAMBA_COPY_MASK_MOD = 256 # TODO: pass in properly
 
 
 class SchedulerOutputProcessorMixin:
@@ -324,6 +325,15 @@ class SchedulerOutputProcessorMixin:
                 new_accepted_len = len(next_token_id)
 
             req.check_finished(new_accepted_len)
+
+            # Update Mamba
+            seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+            if (
+                req.mamba_pool_copy_ping_pong_idx is not None
+                and seq_len % MAMBA_COPY_MASK_MOD == 0
+            ):
+                req.mamba_pool_copy_next_idx = 1 - req.mamba_pool_copy_next_idx
+                req.mamba_pool_copy_last_seqlen = seq_len
 
             if req.finished():
                 if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():

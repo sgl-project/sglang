@@ -249,15 +249,15 @@ class MambaPool:
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
+        # clear at alloc time. If clear at free time, may cause race with ping pong buffer freeing
+        self.mamba_cache.conv[:, select_index] = self.mamba_cache.temporal[:, select_index] = 0
+
         return select_index
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
         self.free_slots = torch.cat((self.free_slots, free_index))
-        self.mamba_cache.conv[:, free_index] = self.mamba_cache.temporal[
-            :, free_index
-        ] = 0
 
     def clear(self):
         self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
