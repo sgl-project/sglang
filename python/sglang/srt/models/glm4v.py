@@ -40,14 +40,14 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -779,5 +779,6 @@ class Glm4vForConditionalGeneration(nn.Module):
             self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
 
 EntryClass = [Glm4vForConditionalGeneration]

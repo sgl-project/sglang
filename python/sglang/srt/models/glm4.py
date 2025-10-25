@@ -18,7 +18,7 @@
 """Inference-only GLM-4-0414 model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
