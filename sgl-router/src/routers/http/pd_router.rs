@@ -23,7 +23,7 @@ use crate::{
     metrics::RouterMetrics,
     policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        chat::{ChatCompletionRequest, ChatMessage},
         classify::ClassifyRequest,
         common::{InputIds, StringOrArray},
         completion::CompletionRequest,
@@ -1098,11 +1098,22 @@ impl RouterTrait for PDRouter {
 
         let request_text = if self.policies_need_request_text() {
             body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) => Some(text.clone()),
-                    UserMessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.clone()),
+                ChatMessage::User { content, .. } => {
+                    let text = content.extract_text_from_content();
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(text)
+                    }
+                }
+                ChatMessage::System { content, .. } => {
+                    let text = content.extract_text_from_content();
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(text)
+                    }
+                }
                 _ => None,
             })
         } else {

@@ -84,6 +84,15 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    // more types here...
+}
+
+/// Text-only content part
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum TextContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -19,7 +19,7 @@ use crate::protocols::validated::Normalizable;
 pub enum ChatMessage {
     #[serde(rename = "system")]
     System {
-        content: String,
+        content: TextMessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -55,6 +55,48 @@ pub enum ChatMessage {
 pub enum UserMessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+impl UserMessageContent {
+    /// Extract text content from UserMessageContent
+    /// - If it's a Text variant, returns the text directly
+    /// - If it's a Parts variant, extracts all text parts and joins them with a space
+    pub fn extract_text_from_content(&self) -> String {
+        match self {
+            UserMessageContent::Text(text) => text.clone(),
+            UserMessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<String>>()
+                .join(" "),
+        }
+    }
+}
+
+/// Text-only message content (no image support)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum TextMessageContent {
+    Text(String),
+    Parts(Vec<TextContentPart>),
+}
+
+impl TextMessageContent {
+    pub fn extract_text_from_content(&self) -> String {
+        match self {
+            TextMessageContent::Text(text) => text.clone(),
+            TextMessageContent::Parts(parts) => parts
+                .iter()
+                .map(|part| match part {
+                    TextContentPart::Text { text } => text.clone(),
+                })
+                .collect::<Vec<String>>()
+                .join(" "),
+        }
+    }
 }
 
 // ============================================================================
@@ -564,20 +606,8 @@ impl GenerationRequest for ChatCompletionRequest {
         self.messages
             .iter()
             .filter_map(|msg| match msg {
-                ChatMessage::System { content, .. } => Some(content.clone()),
-                ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) => Some(text.clone()),
-                    UserMessageContent::Parts(parts) => {
-                        let texts: Vec<String> = parts
-                            .iter()
-                            .filter_map(|part| match part {
-                                ContentPart::Text { text } => Some(text.clone()),
-                                _ => None,
-                            })
-                            .collect();
-                        Some(texts.join(" "))
-                    }
-                },
+                ChatMessage::System { content, .. } => Some(content.extract_text_from_content()),
+                ChatMessage::User { content, .. } => Some(content.extract_text_from_content()),
                 ChatMessage::Assistant {
                     content,
                     reasoning_content,
