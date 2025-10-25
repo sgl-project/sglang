@@ -213,10 +213,6 @@ async def lifespan(fast_api_app: FastAPI):
         )
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
-    # Add api key authorization
-    if server_args.api_key:
-        add_api_key_middleware(fast_api_app, server_args.api_key)
-
     # Add prometheus middleware
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
@@ -1357,6 +1353,11 @@ def launch_server(
             pipe_finish_writer,
             launch_callback,
         )
+
+        # Add api key authorization
+        # This is only supported in single tokenizer mode.
+        if server_args.api_key:
+            add_api_key_middleware(app, server_args.api_key)
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
         # for other worker processes to read.
