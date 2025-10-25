@@ -1204,14 +1204,18 @@ def _triton_mrope_forward(
             sin_row.dtype
         )
 
+        # y = [x_even, x_odd] * [cos, cos] + [-x_odd, x_even] * [sin, sin]
+        # NeoX-style rotary embedding:
+        # Each (even, odd) channel pair forms one rotation arm.
+        # cos_row and sin_row each have length rd//2, shared across all (even, odd) pairs.
         new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
-        new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
-        new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
-        new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
-
         tl.store(q_ptr + even_q_offsets, new_q_tile_1, mask=even_q_mask)
+        new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
         tl.store(q_ptr + odd_q_offsets, new_q_tile_2, mask=odd_q_mask)
+
+        new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
         tl.store(k_ptr + even_k_offsets, new_k_tile_1, mask=even_k_mask)
+        new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
         tl.store(k_ptr + odd_k_offsets, new_k_tile_2, mask=odd_k_mask)
 
 
