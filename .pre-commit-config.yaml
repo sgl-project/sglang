@@ -34,16 +34,12 @@ repos:
         files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-router/py_*)
         exclude: |
           (?x)^(
-          # 排除所有 __init__.py 文件
           .*/__init__\.py$|
-          # 排除所有 Jupyter Notebook
           .*\.ipynb$|
-          # 排除自动生成的 grpc 文件
           python/sglang/srt/grpc/.*_pb2\.py$|
           python/sglang/srt/grpc/.*_pb2_grpc\.py$|
           python/sglang/srt/grpc/.*_pb2\.pyi$|
           python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|
-          # 排除整个 multimodal_gen 文件夹及其所有内容 (修正后)
           .*/multimodal_gen/.*
           )$
   - repo: https://github.com/psf/black
