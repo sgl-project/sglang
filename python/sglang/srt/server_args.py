@@ -1122,21 +1122,7 @@ class ServerArgs:
                     "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or auto."
                 )
 
-        if (
-            self.attention_backend == "trtllm_mha"
-            or self.decode_attention_backend == "trtllm_mha"
-            or self.prefill_attention_backend == "trtllm_mha"
-        ):
-            if not is_sm100_supported():
-                raise ValueError(
-                    "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
-                )
-
-            if self.page_size not in [16, 32, 64]:
-                logger.warning(
-                    f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {self.page_size} to 64."
-                )
-                self.page_size = 64
+        # Validation logic for trtllm_mha moved to attention/attn_backend_support.py
 
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
@@ -1349,15 +1335,7 @@ class ServerArgs:
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
 
-            if (
-                self.attention_backend == "trtllm_mha"
-                or self.decode_attention_backend == "trtllm_mha"
-                or self.prefill_attention_backend == "trtllm_mha"
-            ):
-                if self.speculative_eagle_topk > 1:
-                    raise ValueError(
-                        "trtllm_mha backend only supports topk = 1 for speculative decoding."
-                    )
+            # trtllm_mha speculative constraints are validated in attention/attn_backend_support.py
 
             if (
                 self.speculative_eagle_topk == 1

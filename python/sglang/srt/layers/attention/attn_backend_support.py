@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Union
+
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import (
+    get_device_sm,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
+
+
+@dataclass
+class AttentionCapabilities:
+    # Supported hardware, subset of ["cuda", "hip", "cpu", "xpu", "npu", "hpu"]
+    hardware: List[str]
+    # List of supported major versions of SM capability if using Nvidia GPU
+    sm_capability_major: Optional[List[int]] = None
+    # Whether the backend supports page size > 1
+    # If set as a list of int, it means the backend only supports the page sizes in the list
+    page_size_gt_1: Union[bool, List[int]] = False
+    # Cuda graph support
+    cuda_graph: bool = False
+    # Speculative decoding support (whether topk = 1 or topk > 1)
+    spec: bool = False
+    # Speculative decoding support for topk > 1
+    spec_topk_gt_1: bool = False
+    # Sliding window support (SWA)
+    sliding_window: bool = False
+    # MLA support
+    mla: bool = False
+    # DP attention support. This depends on the MLA support.
+    dp_attention: bool = False
+    # Chunked prefix cache support. This depends on the MLA support.
+    chunked_prefix_cache: bool = False
+    # Supported kv cache dtypes (< bf16 precision)
+    kv_cache_dtype: Optional[List[str]] = None
+    # Deterministic
+    deterministic: bool = False
+
+
+ATTN_BACKEND_CAPS: Dict[str, AttentionCapabilities] = {
+    "trtllm_mha": AttentionCapabilities(
+        hardware=["cuda"],
+        sm_capability_major=[100],
+        page_size_gt_1=[16, 32, 64],
+        cuda_graph=True,
+        spec=True,
+        spec_topk_gt_1=False,
+        sliding_window=True,
+        mla=False,
+        dp_attention=False,
+        chunked_prefix_cache=False,
+        kv_cache_dtype=None,
+        deterministic=False,
+    ),
+}
+
+
+def _current_hardware() -> str:
+    if is_cuda():
+        return "cuda"
+    if is_hip():
+        return "hip"
+    if is_xpu():
+        return "xpu"
+    if is_npu():
+        return "npu"
+    if is_cpu():
+        return "cpu"
+    raise ValueError("Unknown hardware.")
+
+
+def _validate_single_backend(
+    backend_name: str,
+    role: str,
+    server_args: ServerArgs,
+    use_mla: bool,
+    sliding_window_size: Optional[int],
+):
+    if backend_name is None:
+        return
+
+    if backend_name not in ATTN_BACKEND_CAPS:
+        raise ValueError(f"Unknown backend: {backend_name}")
+
+    caps = ATTN_BACKEND_CAPS[backend_name]
+
+    # Hardware checks
+    hw = _current_hardware()
+    if hw not in caps.hardware:
+        raise ValueError(f"{backend_name} is not supported on {hw}.")
+
+    # CUDA SM checks.
+    if hw == "cuda" and caps.sm_capability_major is not None:
+        major = get_device_sm() // 10
+        if major not in caps.sm_capability_major:
+            raise ValueError(f"{backend_name} is not supported on CUDA with SM{major}.")
+
+    if server_args.page_size and server_args.page_size > 1:
+        if isinstance(caps.page_size_gt_1, list):
+            if server_args.page_size not in caps.page_size_gt_1:
+                raise ValueError(
+                    f"Page size {server_args.page_size} is not supported for {backend_name}. "
+                    f"It should be one of {caps.page_size_gt_1}."
+                )
+        elif not caps.page_size_gt_1:
+            raise ValueError(f"Page size > 1 is not supported for {backend_name}.")
+
+    # CUDA graph checks (only when enabled)
+    if hw == "cuda" and not server_args.disable_cuda_graph:
+        if not caps.cuda_graph:
+            raise ValueError(f"{backend_name} does not support CUDA graph.")
+
+    # Speculative decoding (decode role)
+    if server_args.speculative_algorithm is not None and role == "decode":
+        if not caps.spec:
+            raise ValueError(f"{backend_name} does not support speculative decoding.")
+        if getattr(server_args, "speculative_eagle_topk", 1) > 1:
+            if not caps.spec_topk_gt_1:
+                raise ValueError(
+                    f"{backend_name} does not support speculative decoding with topk > 1."
+                )
+
+    # Sliding window
+    if sliding_window_size is not None and sliding_window_size > 0:
+        if not caps.sliding_window:
+            raise ValueError(
+                f"{backend_name} does not support sliding window attention."
+            )
+
+    # MLA usage
+    if use_mla and not caps.mla:
+        raise ValueError(f"{backend_name} can only be used with non-MLA models.")
+
+    # DP Attention
+    if server_args.enable_dp_attention and not caps.dp_attention:
+        raise ValueError(f"{backend_name} does not support DP attention.")
+
+    # Chunked prefix cache
+    if not server_args.disable_chunked_prefix_cache and not caps.chunked_prefix_cache:
+        raise ValueError(f"{backend_name} does not support chunked prefix cache.")
+
+    # KV cache dtype (< bf16)
+    if server_args.kv_cache_dtype != "auto":
+        if caps.kv_cache_dtype is None:
+            raise ValueError(f"{backend_name} does not support kv cache dtype < bf16.")
+        if server_args.kv_cache_dtype not in caps.kv_cache_dtype:
+            raise ValueError(
+                f"{backend_name} does not support kv cache dtype {server_args.kv_cache_dtype}."
+            )
+
+
+def validate_attention_backends(
+    server_args: ServerArgs,
+    use_mla: bool,
+    sliding_window_size: Optional[int],
+):
+    prefill_backend, decode_backend = ServerArgs.get_attention_backends(server_args)
+    _validate_single_backend(
+        prefill_backend,
+        role="prefill",
+        server_args=server_args,
+        use_mla=use_mla,
+        sliding_window_size=sliding_window_size,
+    )
+    _validate_single_backend(
+        decode_backend,
+        role="decode",
+        server_args=server_args,
+        use_mla=use_mla,
+        sliding_window_size=sliding_window_size,
+    )

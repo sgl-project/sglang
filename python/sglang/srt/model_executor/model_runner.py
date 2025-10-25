@@ -289,6 +289,21 @@ class ModelRunner:
         # Model-specific adjustment
         self.model_specific_adjustment()
 
+        # Validate attention backend compatibility (after adjustments)
+        try:
+            from sglang.srt.layers.attention.attn_backend_support import (
+                validate_attention_backends,
+            )
+
+            validate_attention_backends(
+                self.server_args,
+                use_mla=self.use_mla_backend,
+                sliding_window_size=getattr(self, "sliding_window_size", None),
+            )
+        except Exception as e:
+            # Defer raise with context for easier debugging
+            raise
+
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
         global_server_args = get_global_server_args()
