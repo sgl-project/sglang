@@ -1,11 +1,10 @@
 use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use backoff::ExponentialBackoffBuilder;
-use dashmap::DashMap;
 use rmcp::{
     model::{
-        CallToolRequestParam, GetPromptRequestParam, GetPromptResult, Prompt,
-        ReadResourceRequestParam, ReadResourceResult, Resource, Tool as McpTool,
+        CallToolRequestParam, GetPromptRequestParam, GetPromptResult, ReadResourceRequestParam,
+        ReadResourceResult,
     },
     service::RunningService,
     transport::{
@@ -58,15 +57,6 @@ pub struct McpClientManager {
     inventory: Arc<ToolInventory>,
     /// Map of server_name -> MCP client
     clients: HashMap<String, RunningService<RoleClient, ()>>,
-    /// Map of tool_name -> (server_name, tool_definition)
-    /// TODO: Migrate to inventory-based lookup
-    tools: DashMap<String, (String, McpTool)>,
-    /// Map of prompt_name -> (server_name, prompt_definition)
-    /// TODO: Migrate to inventory-based lookup
-    prompts: DashMap<String, (String, Prompt)>,
-    /// Map of resource_uri -> (server_name, resource_definition)
-    /// TODO: Migrate to inventory-based lookup
-    resources: DashMap<String, (String, Resource)>,
 }
 
 impl McpClientManager {
@@ -76,9 +66,6 @@ impl McpClientManager {
             config: config.clone(),
             inventory,
             clients: HashMap::new(),
-            tools: DashMap::new(),
-            prompts: DashMap::new(),
-            resources: DashMap::new(),
         };
 
         // Get global proxy config for all servers
@@ -132,17 +119,6 @@ impl McpClientManager {
                         server_name.to_string(),
                         tool_info,
                     );
-
-                    // Also store in legacy cache for backwards compatibility
-                    if self.tools.contains_key(t.name.as_ref()) {
-                        tracing::warn!(
-                            "Tool '{}' from server '{}' is overwriting an existing tool.",
-                            &t.name,
-                            server_name
-                        );
-                    }
-                    self.tools
-                        .insert(t.name.to_string(), (server_name.to_string(), t));
                 }
             }
             Err(e) => tracing::warn!("Failed to list tools from '{}': {}", server_name, e),
@@ -167,17 +143,6 @@ impl McpClientManager {
                         server_name.to_string(),
                         prompt_info,
                     );
-
-                    // Also store in legacy cache for backwards compatibility
-                    if self.prompts.contains_key(&p.name) {
-                        tracing::warn!(
-                            "Prompt '{}' from server '{}' is overwriting an existing prompt.",
-                            &p.name,
-                            server_name
-                        );
-                    }
-                    self.prompts
-                        .insert(p.name.clone(), (server_name.to_string(), p));
                 }
             }
             Err(e) => tracing::debug!("No prompts or failed to list on '{}': {}", server_name, e),
@@ -201,17 +166,6 @@ impl McpClientManager {
                         server_name.to_string(),
                         resource_info,
                     );
-
-                    // Also store in legacy cache for backwards compatibility
-                    if self.resources.contains_key(&r.uri) {
-                        tracing::warn!(
-                            "Resource '{}' from server '{}' is overwriting an existing resource.",
-                            &r.uri,
-                            server_name
-                        );
-                    }
-                    self.resources
-                        .insert(r.uri.clone(), (server_name.to_string(), r));
                 }
             }
             Err(e) => tracing::debug!("No resources or failed to list on '{}': {}", server_name, e),
@@ -235,12 +189,6 @@ impl McpClientManager {
             Ok(tools) => {
                 tracing::debug!("Refreshed {} tools from '{}'", tools.len(), server_name);
                 for tool in tools {
-                    // Update internal cache
-                    self.tools.insert(
-                        tool.name.to_string(),
-                        (server_name.to_string(), tool.clone()),
-                    );
-
                     // Update shared inventory
                     let tool_info = ToolInfo {
                         name: tool.name.to_string(),
@@ -269,12 +217,6 @@ impl McpClientManager {
             Ok(prompts) => {
                 tracing::debug!("Refreshed {} prompts from '{}'", prompts.len(), server_name);
                 for prompt in prompts {
-                    // Update internal cache
-                    self.prompts.insert(
-                        prompt.name.clone(),
-                        (server_name.to_string(), prompt.clone()),
-                    );
-
                     // Update shared inventory
                     let prompt_info = PromptInfo {
                         name: prompt.name.clone(),
@@ -309,12 +251,6 @@ impl McpClientManager {
                     server_name
                 );
                 for resource in resources {
-                    // Update internal cache
-                    self.resources.insert(
-                        resource.uri.clone(),
-                        (server_name.to_string(), resource.clone()),
-                    );
-
                     // Update shared inventory
                     let resource_info = ResourceInfo {
                         uri: resource.uri.clone(),
@@ -567,24 +503,24 @@ impl McpClientManager {
             .ok_or_else(|| McpError::ServerNotFound(server_name.to_string()))
     }
 
-    fn tool_entry(&self, name: &str) -> McpResult<(String, McpTool)> {
-        self.tools
-            .get(name)
-            .map(|e| e.value().clone())
+    fn tool_entry(&self, name: &str) -> McpResult<String> {
+        self.inventory
+            .get_tool(name)
+            .map(|(server_name, _tool_info)| server_name)
             .ok_or_else(|| McpError::ToolNotFound(name.to_string()))
     }
 
-    fn prompt_entry(&self, name: &str) -> McpResult<(String, Prompt)> {
-        self.prompts
-            .get(name)
-            .map(|e| e.value().clone())
+    fn prompt_entry(&self, name: &str) -> McpResult<String> {
+        self.inventory
+            .get_prompt(name)
+            .map(|(server_name, _prompt_info)| server_name)
             .ok_or_else(|| McpError::PromptNotFound(name.to_string()))
     }
 
-    fn resource_entry(&self, uri: &str) -> McpResult<(String, Resource)> {
-        self.resources
-            .get(uri)
-            .map(|e| e.value().clone())
+    fn resource_entry(&self, uri: &str) -> McpResult<String> {
+        self.inventory
+            .get_resource(uri)
+            .map(|(server_name, _resource_info)| server_name)
             .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))
     }
 
@@ -594,7 +530,7 @@ impl McpClientManager {
         tool_name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> McpResult<rmcp::model::CallToolResult> {
-        let (server_name, _tool) = self.tool_entry(tool_name)?;
+        let server_name = self.tool_entry(tool_name)?;
         let client = self.client_for(&server_name)?;
 
         tracing::debug!("Calling tool '{}' on '{}'", tool_name, server_name);
@@ -641,7 +577,7 @@ impl McpClientManager {
         prompt_name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> McpResult<GetPromptResult> {
-        let (server_name, _prompt) = self.prompt_entry(prompt_name)?;
+        let server_name = self.prompt_entry(prompt_name)?;
         let client = self.client_for(&server_name)?;
 
         tracing::debug!("Getting prompt '{}' from '{}'", prompt_name, server_name);
@@ -674,7 +610,7 @@ impl McpClientManager {
 
     /// Read a resource by URI
     pub async fn read_resource(&self, uri: &str) -> McpResult<ReadResourceResult> {
-        let (server_name, _resource) = self.resource_entry(uri)?;
+        let server_name = self.resource_entry(uri)?;
         let client = self.client_for(&server_name)?;
 
         tracing::debug!("Reading resource '{}' from '{}'", uri, server_name);
@@ -706,7 +642,7 @@ impl McpClientManager {
 
     /// Subscribe to resource changes
     pub async fn subscribe_resource(&self, uri: &str) -> McpResult<()> {
-        let (server_name, _resource) = self.resource_entry(uri)?;
+        let server_name = self.resource_entry(uri)?;
         let client = self.client_for(&server_name)?;
 
         tracing::debug!("Subscribing to '{}' on '{}'", uri, server_name);
@@ -722,7 +658,7 @@ impl McpClientManager {
 
     /// Unsubscribe from resource changes
     pub async fn unsubscribe_resource(&self, uri: &str) -> McpResult<()> {
-        let (server_name, _resource) = self.resource_entry(uri)?;
+        let server_name = self.resource_entry(uri)?;
         let client = self.client_for(&server_name)?;
 
         tracing::debug!("Unsubscribing from '{}' on '{}'", uri, server_name);
@@ -780,8 +716,5 @@ impl McpClientManager {
                 tracing::warn!("Error disconnecting from '{}': {}", name, e);
             }
         }
-        self.tools.clear();
-        self.prompts.clear();
-        self.resources.clear();
     }
 }
