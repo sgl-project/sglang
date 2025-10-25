@@ -54,7 +54,7 @@ ATTN_BACKEND_CAPS: dict[str, AttentionCapabilities] = {
         mla=False,
         dp_attention=False,
         chunked_prefix_cache=False,
-        kv_cache_dtype=None,
+        kv_cache_dtype=["fp8_e4m3", "bfloat16"],
         deterministic=False,
     ),
 }
@@ -71,7 +71,9 @@ def _current_hardware() -> str:
         return "npu"
     if is_cpu():
         return "cpu"
-    raise ValueError("Unknown hardware.")
+    raise RuntimeError(
+        "Unknown hardware platform. Please check if your device environment is properly configured."
+    )
 
 
 def _validate_single_backend(
@@ -85,72 +87,82 @@ def _validate_single_backend(
         return
 
     if backend_name not in ATTN_BACKEND_CAPS:
-        raise ValueError(f"Unknown backend: {backend_name}")
+        raise KeyError(f"Unknown attention backend: {backend_name}")
 
     caps = ATTN_BACKEND_CAPS[backend_name]
 
     # Hardware checks
     hw = _current_hardware()
     if hw not in caps.hardware:
-        raise ValueError(f"{backend_name} is not supported on {hw}.")
+        raise RuntimeError(f"{backend_name} is not supported on {hw}.")
 
     # CUDA SM checks.
     if hw == "cuda" and caps.sm_capability_major is not None:
         major = get_device_sm() // 10
         if major not in caps.sm_capability_major:
-            raise ValueError(f"{backend_name} is not supported on CUDA with SM{major}.")
+            raise RuntimeError(
+                f"{backend_name} is not supported on CUDA with SM{major}."
+            )
 
     if server_args.page_size and server_args.page_size > 1:
         if isinstance(caps.page_size_gt_1, list):
             if server_args.page_size not in caps.page_size_gt_1:
-                raise ValueError(
+                raise RuntimeError(
                     f"Page size {server_args.page_size} is not supported for {backend_name}. "
                     f"It should be one of {caps.page_size_gt_1}."
                 )
         elif not caps.page_size_gt_1:
-            raise ValueError(f"Page size > 1 is not supported for {backend_name}.")
+            raise RuntimeError(f"Page size > 1 is not supported for {backend_name}.")
 
     # CUDA graph checks (only when enabled)
     if hw == "cuda" and not server_args.disable_cuda_graph:
         if not caps.cuda_graph:
-            raise ValueError(f"{backend_name} does not support CUDA graph.")
+            raise RuntimeError(f"{backend_name} does not support CUDA graph.")
 
     # Speculative decoding (decode role)
     if server_args.speculative_algorithm is not None and role == "decode":
         if not caps.spec:
-            raise ValueError(f"{backend_name} does not support speculative decoding.")
+            raise RuntimeError(f"{backend_name} does not support speculative decoding.")
         if getattr(server_args, "speculative_eagle_topk", 1) > 1:
             if not caps.spec_topk_gt_1:
-                raise ValueError(
+                raise RuntimeError(
                     f"{backend_name} does not support speculative decoding with topk > 1."
                 )
 
     # Sliding window
     if sliding_window_size is not None and sliding_window_size > 0:
         if not caps.sliding_window:
-            raise ValueError(
+            raise RuntimeError(
                 f"{backend_name} does not support sliding window attention."
             )
 
     # MLA usage
     if use_mla and not caps.mla:
-        raise ValueError(f"{backend_name} can only be used with non-MLA models.")
+        raise RuntimeError(f"{backend_name} can only be used with non-MLA models.")
 
     # DP Attention
     if server_args.enable_dp_attention and not caps.dp_attention:
-        raise ValueError(f"{backend_name} does not support DP attention.")
+        raise RuntimeError(f"{backend_name} does not support DP attention.")
 
     # Chunked prefix cache
     if not server_args.disable_chunked_prefix_cache and not caps.chunked_prefix_cache:
-        raise ValueError(f"{backend_name} does not support chunked prefix cache.")
+        raise RuntimeError(f"{backend_name} does not support chunked prefix cache.")
 
-    # KV cache dtype (< bf16)
-    if server_args.kv_cache_dtype != "auto":
+    # KV cache dtype validation
+    # Policy:
+    # - Always allow 'auto' and bfloat16 as a baseline that all backends support.
+    # - For custom dtypes (e.g., fp8_*), require backend to explicitly list support.
+    req_dtype = server_args.kv_cache_dtype
+    if req_dtype == "bf16":
+        req_dtype = "bfloat16"
+    if req_dtype != "auto":
         if caps.kv_cache_dtype is None:
-            raise ValueError(f"{backend_name} does not support kv cache dtype < bf16.")
-        if server_args.kv_cache_dtype not in caps.kv_cache_dtype:
-            raise ValueError(
-                f"{backend_name} does not support kv cache dtype {server_args.kv_cache_dtype}."
+            raise RuntimeError(
+                f"{backend_name} does not support custom kv cache dtype '{server_args.kv_cache_dtype}' (only 'auto' or bfloat16)."
+            )
+        if req_dtype not in caps.kv_cache_dtype:
+            raise RuntimeError(
+                f"{backend_name} does not support kv cache dtype '{server_args.kv_cache_dtype}'. Supported: {sorted(caps.kv_cache_dtype)}."
             )
 
 
