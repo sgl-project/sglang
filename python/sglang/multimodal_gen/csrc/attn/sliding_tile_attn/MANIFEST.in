@@ -1,0 +1,2 @@
+recursive-include tk *
+include config_sta.py
