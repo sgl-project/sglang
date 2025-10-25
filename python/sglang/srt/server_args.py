@@ -3745,6 +3745,13 @@ class PortArgs:
         else:
             nccl_port = server_args.nccl_port
 
+        if server_args.tokenizer_worker_num > 1:
+            tokenizer_worker_ipc_name = (
+                f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+            )
+        else:
+            tokenizer_worker_ipc_name = None
+
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -3754,7 +3761,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                tokenizer_worker_ipc_name=None,
+                tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -3788,7 +3795,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
-                tokenizer_worker_ipc_name=None,
+                tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
 
 
