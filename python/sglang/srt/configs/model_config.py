@@ -535,7 +535,7 @@ class ModelConfig:
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
         return quant_cfg
 
-    def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> dict:
+    def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
         """Parse ModelOpt quantization config and return the appropriate quant_method."""
         json_quant_configs = quant_config_dict["quantization"]
         quant_algo = json_quant_configs.get("quant_algo", None)
@@ -547,8 +547,7 @@ class ModelConfig:
         elif quant_algo and "FP8" in quant_algo:
             return {"quant_method": "modelopt_fp8"}
         else:
-            # Default to FP8 for backward compatibility
-            return {"quant_method": "modelopt_fp8"}
+            return None
 
     def _is_already_quantized(self) -> bool:
         """Check if the model is already quantized based on config files."""
