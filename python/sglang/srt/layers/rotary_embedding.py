@@ -1361,6 +1361,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         else:
             return self._forward_native(positions, query, key)
 
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _forward_triton(
         self,
         positions: torch.Tensor,
