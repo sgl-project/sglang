@@ -35,6 +35,7 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
+    ModelImpl,
     get_nsa_index_head_dim,
     is_deepseek_nsa,
 )
@@ -309,6 +310,9 @@ class ModelRunner:
         if get_bool_env_var("SGLANG_DETECT_SLOW_RANK"):
             slow_rank_detector.execute()
 
+        # Init mindspore running environment when model impl is "mindspore"
+        self.init_mindspore_runner()
+
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
@@ -344,6 +348,20 @@ class ModelRunner:
                 self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
         else:
             self.piecewise_cuda_graph_runner = None
+
+    def init_mindspore_runner(self):
+        # Init the mindspore runner
+        # for now, there is only some communication initialization work
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE and _is_npu:
+            from sglang.srt.model_executor.mindspore_runner import init_ms_distributed
+
+            init_ms_distributed(
+                world_size=self.tp_size * self.pp_size,
+                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                local_rank=self.gpu_id,
+                server_args=self.server_args,
+                port=self.dist_port,
+            )
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -2038,6 +2056,9 @@ class ModelRunner:
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
+            return
+
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
             return
 
         if self.device != "cpu" and self.server_args.disable_cuda_graph:
