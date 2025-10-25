@@ -10,16 +10,18 @@ from openai import OpenAI
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.test.test_utils import is_mp4, is_png, wait_for_port
 
+
 def wait_for_video_completion(client, video_id, timeout=300, check_interval=3):
     start = time.time()
     video = client.videos.retrieve(video_id)
-    
+
     while video.status not in ("completed", "failed"):
         time.sleep(check_interval)
         video = client.videos.retrieve(video_id)
         assert time.time() - start < timeout, "video generate timeout"
-    
+
     return video
+
 
 class TestVideoHttpServer(unittest.TestCase):
     model_name = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
@@ -135,8 +137,8 @@ class TestFastWan2_2HttpServer(TestVideoHttpServer):
 #         video_id = video.id
 #         self.assertEqual(video.status, "queued")
 
-        # video = wait_for_video_completion(client, video_id, timeout=self.timeout)
-        # self.assertEqual(video.status, "completed", "video generate failed")
+# video = wait_for_video_completion(client, video_id, timeout=self.timeout)
+# self.assertEqual(video.status, "completed", "video generate failed")
 
 #         response = client.videos.download_content(
 #             video_id=video_id,
