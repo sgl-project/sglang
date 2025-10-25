@@ -319,6 +319,9 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For attention tp scattered
+    attn_input_tp_scattered: Optional[bool] = None
+
     @classmethod
     def init_new(
         cls,
@@ -362,6 +365,11 @@ class ForwardBatch:
             tbo_split_seq_index=batch.tbo_split_seq_index,
         )
         device = model_runner.device
+
+        attn_input_tp_scattered = hasattr(
+            model_runner.model, "attn_input_tp_scattered"
+        ) and model_runner.model.attn_input_tp_scattered(ret)
+        ret.attn_input_tp_scattered = attn_input_tp_scattered
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
