@@ -13,6 +13,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -50,7 +51,7 @@ class MoeRunnerBackend(Enum):
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
-    TRITON_KERNEL = "triton_kernel"
+    TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
@@ -66,8 +67,8 @@ class MoeRunnerBackend(Enum):
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON
 
-    def is_triton_kernel(self):
-        return self == MoeRunnerBackend.TRITON_KERNEL
+    def is_triton_kernels(self):
+        return self == MoeRunnerBackend.TRITON_KERNELS
 
     def is_flashinfer_trtllm(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM
@@ -159,8 +160,9 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
 def get_moe_runner_backend() -> MoeRunnerBackend:
     global MOE_RUNNER_BACKEND
     if MOE_RUNNER_BACKEND is None:
-        logger.warning(
-            "MOE_RUNNER_BACKEND is not initialized, the backend will be automatically selected"
+        log_info_on_rank0(
+            logger,
+            "MOE_RUNNER_BACKEND is not initialized, the backend will be automatically selected",
         )
         MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return MOE_RUNNER_BACKEND
