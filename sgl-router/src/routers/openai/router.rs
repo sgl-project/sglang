@@ -41,6 +41,7 @@ use crate::{
         ConversationId, ListParams, ResponseId, SharedConversationItemStorage,
         SharedConversationStorage, SharedResponseStorage, SortOrder,
     },
+    mcp::McpManager,
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -86,7 +87,7 @@ pub struct OpenAIRouter {
     /// Conversation item storage backend
     conversation_item_storage: SharedConversationItemStorage,
     /// MCP manager (handles both static and dynamic servers)
-    mcp_manager: Arc<crate::mcp::McpManager>,
+    mcp_manager: Arc<McpManager>,
 }
 
 impl std::fmt::Debug for OpenAIRouter {

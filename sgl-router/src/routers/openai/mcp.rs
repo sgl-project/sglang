@@ -13,26 +13,15 @@ use std::{io, sync::Arc};
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde_json::{json, to_value, Value};
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::utils::{event_types, generate_id};
 use crate::{
-    mcp::{McpClientManager, McpConnectionPool},
+    mcp,
     protocols::responses::{ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
     routers::header_utils::apply_request_headers,
 };
-
-// TODO(Phase 8): Remove this global static when fully integrated with AppContext
-// Phase 2 Status: Connection pool is now owned by McpManager
-//   - McpManager has get_or_create_dynamic_client() method
-//   - Connection pool provides 90%+ performance improvement by reusing connections
-// Phase 8 Plan: Inject McpManager via router state instead of using global static
-//   - Update function signature to accept Arc<McpManager>
-//   - Pass McpManager from AppContext to all call sites
-// Global connection pool for dynamic MCP servers (per-request)
-// This provides 90%+ performance improvement by reusing connections
-static MCP_CONNECTION_POOL: OnceCell<McpConnectionPool> = OnceCell::const_new();
 
 // ============================================================================
 // Configuration and State Types
@@ -141,9 +130,9 @@ impl FunctionCallInProgress {
 
 /// Build a request-scoped MCP client from request tools using McpManager.
 pub async fn mcp_manager_from_request_tools(
-    mcp_manager: &Arc<crate::mcp::McpManager>,
+    mcp_manager: &Arc<mcp::McpManager>,
     tools: &[ResponseTool],
-) -> Option<Arc<McpClientManager>> {
+) -> Option<Arc<mcp::McpManager>> {
     let tool = tools
         .iter()
         .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
@@ -161,31 +150,28 @@ pub async fn mcp_manager_from_request_tools(
         .unwrap_or_else(|| "request-mcp".to_string());
     let token = tool.authorization.clone();
     let transport = if server_url.contains("/sse") {
-        crate::mcp::McpTransport::Sse {
+        mcp::McpTransport::Sse {
             url: server_url.clone(),
             token,
         }
     } else {
-        crate::mcp::McpTransport::Streamable {
+        mcp::McpTransport::Streamable {
             url: server_url.clone(),
             token,
         }
     };
 
     // Create server config
-    let server_config = crate::mcp::McpServerConfig {
+    let server_config = mcp::McpServerConfig {
         name,
         transport,
         proxy: None,
         required: false,
     };
 
-    // Use McpManager's connection pool to get or create dynamic client
-    match mcp_manager
-        .get_or_create_dynamic_client(server_config)
-        .await
-    {
-        Ok(mgr) => Some(mgr),
+    // Use McpManager to get or create dynamic client
+    match mcp_manager.get_or_create_client(server_config).await {
+        Ok(_client) => Some(mcp_manager.clone()),
         Err(err) => {
             warn!("Failed to get/create MCP connection: {}", err);
             None
@@ -199,7 +185,7 @@ pub async fn mcp_manager_from_request_tools(
 
 /// Execute an MCP tool call
 pub(super) async fn execute_mcp_call(
-    mcp_mgr: &Arc<McpClientManager>,
+    mcp_mgr: &Arc<mcp::McpManager>,
     tool_name: &str,
     args_json_str: &str,
 ) -> Result<(String, String), String> {
@@ -226,7 +212,7 @@ pub(super) async fn execute_mcp_call(
 /// Returns false if client disconnected during execution
 pub(super) async fn execute_streaming_tool_calls(
     pending_calls: Vec<FunctionCallInProgress>,
-    active_mcp: &Arc<McpClientManager>,
+    active_mcp: &Arc<mcp::McpManager>,
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     state: &mut ToolLoopState,
     server_label: &str,
@@ -291,7 +277,7 @@ pub(super) async fn execute_streaming_tool_calls(
 /// Transform payload to replace MCP tools with function tools for streaming
 pub(super) fn prepare_mcp_payload_for_streaming(
     payload: &mut Value,
-    active_mcp: &Arc<McpClientManager>,
+    active_mcp: &Arc<mcp::McpManager>,
 ) {
     if let Some(obj) = payload.as_object_mut() {
         // Remove any non-function tools from outgoing payload
@@ -399,7 +385,7 @@ pub(super) fn build_resume_payload(
 /// Returns false if client disconnected
 pub(super) fn send_mcp_list_tools_events(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
-    mcp: &Arc<McpClientManager>,
+    mcp: &Arc<mcp::McpManager>,
     server_label: &str,
     output_index: usize,
     sequence_number: &mut u64,
@@ -555,7 +541,7 @@ pub(super) fn send_mcp_call_completion_events_with_error(
 pub(super) fn inject_mcp_metadata_streaming(
     response: &mut Value,
     state: &ToolLoopState,
-    mcp: &Arc<McpClientManager>,
+    mcp: &Arc<mcp::McpManager>,
     server_label: &str,
 ) {
     if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
@@ -595,7 +581,7 @@ pub(super) async fn execute_tool_loop(
     headers: Option<&HeaderMap>,
     initial_payload: Value,
     original_body: &ResponsesRequest,
-    active_mcp: &Arc<McpClientManager>,
+    active_mcp: &Arc<mcp::McpManager>,
     config: &McpLoopConfig,
 ) -> Result<Value, String> {
     let mut state = ToolLoopState::new(original_body.input.clone());
@@ -756,7 +742,7 @@ pub(super) fn build_incomplete_response(
     mut response: Value,
     state: ToolLoopState,
     reason: &str,
-    active_mcp: &Arc<McpClientManager>,
+    active_mcp: &Arc<mcp::McpManager>,
     original_body: &ResponsesRequest,
 ) -> Result<Value, String> {
     let obj = response
@@ -859,7 +845,7 @@ pub(super) fn build_incomplete_response(
 // ============================================================================
 
 /// Build an mcp_list_tools output item
-pub(super) fn build_mcp_list_tools_item(mcp: &Arc<McpClientManager>, server_label: &str) -> Value {
+pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label: &str) -> Value {
     let tools = mcp.list_tools();
     let tools_json: Vec<Value> = tools
         .iter()

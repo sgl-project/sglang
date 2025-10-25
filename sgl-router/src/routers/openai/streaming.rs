@@ -907,7 +907,7 @@ pub(super) fn send_final_response_event(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     sequence_number: &mut u64,
     state: &ToolLoopState,
-    active_mcp: Option<&Arc<crate::mcp::McpClientManager>>,
+    active_mcp: Option<&Arc<crate::mcp::McpManager>>,
     original_request: &ResponsesRequest,
     previous_response_id: Option<&str>,
     server_label: &str,
@@ -1138,7 +1138,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
     mut payload: Value,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<String>,
-    active_mcp: &Arc<crate::mcp::McpClientManager>,
+    active_mcp: &Arc<crate::mcp::McpManager>,
 ) -> Response {
     // Transform MCP tools to function tools in payload
     prepare_mcp_payload_for_streaming(&mut payload, active_mcp);
