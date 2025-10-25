@@ -29,6 +29,7 @@ pub enum PolicyType {
     RoundRobin,
     CacheAware,
     PowerOfTwo,
+    Bucket,
 }
 
 #[pyclass(eq)]
@@ -169,6 +170,8 @@ struct Router {
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
+    // Takes effect in PD mode and when policy = bucket
+    bucket_adjust_interval_secs: usize,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
@@ -242,6 +245,11 @@ impl Router {
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
+                },
+                PolicyType::Bucket => ConfigPolicyConfig::Bucket {
+                    balance_abs_threshold: self.balance_abs_threshold,
+                    balance_rel_threshold: self.balance_rel_threshold,
+                    bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
                 },
             }
         };
@@ -405,6 +413,7 @@ impl Router {
         request_timeout_secs = 1800,
         request_id_headers = None,
         pd_disaggregation = false,
+        bucket_adjust_interval_secs = 5,
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
@@ -477,6 +486,7 @@ impl Router {
         request_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
+        bucket_adjust_interval_secs: usize,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
         prefill_policy: Option<PolicyType>,
@@ -562,6 +572,7 @@ impl Router {
             request_timeout_secs,
             request_id_headers,
             pd_disaggregation,
+            bucket_adjust_interval_secs,
             prefill_urls,
             decode_urls,
             prefill_policy,
