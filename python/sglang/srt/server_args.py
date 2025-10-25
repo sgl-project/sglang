@@ -523,6 +523,9 @@ class ServerArgs:
         )
         return prefill_attention_backend_str, decode_attention_backend_str
 
+    # Multimodal settings
+    max_num_images: Optional[int] = None
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -3307,6 +3310,12 @@ class ServerArgs:
             default=ServerArgs.sm_group_num,
             help="Number of sm partition groups.",
         )
+
+        parser.add_argument(
+            "--max-num-images",
+            type=int,
+            default=None,
+            help="The maximum number of images allowed in a single multimodal request to prevent OOM errors.",
 
         # For deterministic inference
         parser.add_argument(
