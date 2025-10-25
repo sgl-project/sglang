@@ -58,7 +58,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 
-class DeepEPNormalOutput(NamedTuple):
+class DeepEPNormalDispatchOutput(NamedTuple):
     """DeepEP normal dispatch output."""
 
     hidden_states: torch.Tensor
@@ -72,7 +72,7 @@ class DeepEPNormalOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_NORMAL
 
 
-class DeepEPLLOutput(NamedTuple):
+class DeepEPLLDispatchOutput(NamedTuple):
     """DeepEP low latency dispatch output."""
 
     hidden_states: torch.Tensor
@@ -87,14 +87,17 @@ class DeepEPLLOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_LL
 
 
-assert isinstance(DeepEPNormalOutput, DispatchOutput)
-assert isinstance(DeepEPLLOutput, DispatchOutput)
+assert isinstance(DeepEPNormalDispatchOutput, DispatchOutput)
+assert isinstance(DeepEPLLDispatchOutput, DispatchOutput)
 
 
 class DeepEPNormalCombineInput(NamedTuple):
     """DeepEP normal combine input."""
 
-    pass
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    overlap_args: Optional[CombineOverlapArgs] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -104,7 +107,10 @@ class DeepEPNormalCombineInput(NamedTuple):
 class DeepEPLLCombineInput(NamedTuple):
     """DeepEP low latency combine input."""
 
-    pass
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    overlap_args: Optional[CombineOverlapArgs] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -383,7 +389,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         else:
             hidden_states_scale = None
 
-        return DeepEPNormalOutput(
+        return DeepEPNormalDispatchOutput(
             hidden_states,
             hidden_states_scale,
             topk_ids,
@@ -562,7 +568,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         else:
             hidden_states_scale = None
 
-        deepep_output = DeepEPLLOutput(
+        deepep_output = DeepEPLLDispatchOutput(
             hidden_states,
             hidden_states_scale,
             topk_ids,
@@ -756,18 +762,16 @@ class DeepEPDispatcher(BaseDispatcher):
         del self._dispatch_intermediate_state
         return self._get_impl().dispatch_b(*inner_state)
 
-    def combine(self, *args, **kwargs) -> Tuple:
-        self.combine_a(*args, **kwargs)
+    def combine(self, combine_input: CombineInput) -> Tuple:
+        self.combine_a(combine_input)
         ret = self.combine_b()
         return ret
 
     def combine_a(
         self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        overlap_args: Optional["CombineOverlapArgs"] = None,
+        combine_input: CombineInput,
     ):
+        hidden_states, topk_ids, topk_weights, overlap_args = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,
