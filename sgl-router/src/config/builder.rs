@@ -14,6 +14,7 @@ pub struct RouterConfigBuilder {
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
+    mcp_config_path: Option<String>,
 }
 
 impl RouterConfigBuilder {
@@ -29,6 +30,7 @@ impl RouterConfigBuilder {
             client_cert_path: None,
             client_key_path: None,
             ca_cert_paths: Vec::new(),
+            mcp_config_path: None,
         }
     }
 
@@ -620,6 +622,21 @@ impl RouterConfigBuilder {
         self
     }
 
+    // ==================== MCP Configuration ====================
+
+    /// Set MCP server configuration file path
+    /// The config file will be loaded during build()
+    pub fn mcp_config_path<S: Into<String>>(mut self, path: S) -> Self {
+        self.mcp_config_path = Some(path.into());
+        self
+    }
+
+    /// Set MCP server configuration file path if Some
+    pub fn maybe_mcp_config_path(mut self, path: Option<impl Into<String>>) -> Self {
+        self.mcp_config_path = path.map(|p| p.into());
+        self
+    }
+
     // ==================== Builder Methods ====================
 
     /// Build the RouterConfig, validating if requested
@@ -691,6 +708,20 @@ impl RouterConfigBuilder {
                 reason: format!("Failed to read CA certificate from {}: {}", path, e),
             })?;
             self.config.ca_certificates.push(cert);
+        }
+
+        // Read MCP config if path is provided
+        if let Some(mcp_config_path) = &self.mcp_config_path {
+            let contents = std::fs::read_to_string(mcp_config_path).map_err(|e| {
+                ConfigError::ValidationFailed {
+                    reason: format!("Failed to read MCP config from {}: {}", mcp_config_path, e),
+                }
+            })?;
+            let mcp_config: crate::mcp::McpConfig =
+                serde_json::from_str(&contents).map_err(|e| ConfigError::ValidationFailed {
+                    reason: format!("Failed to parse MCP config from {}: {}", mcp_config_path, e),
+                })?;
+            self.config.mcp_config = Some(mcp_config);
         }
 
         Ok(self)

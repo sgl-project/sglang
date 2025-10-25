@@ -11,7 +11,7 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
     app_context::AppContext,
@@ -169,8 +169,8 @@ impl StepExecutor for DiscoverMcpInventoryStep {
 
 /// Step 3: Cache MCP tools in inventory
 ///
-/// This step stores the discovered tools, prompts, and resources in the global
-/// ToolInventory for fast lookup and TTL-based expiration.
+/// This step stores the discovered tools, prompts, and resources in the shared
+/// ToolInventory from McpManager for fast lookup and TTL-based expiration.
 pub struct CacheMcpToolsStep;
 
 #[async_trait]
@@ -179,7 +179,7 @@ impl StepExecutor for CacheMcpToolsStep {
         let config_request: Arc<McpServerConfigRequest> = context
             .get("mcp_server_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
-        let _app_context: Arc<AppContext> = context
+        let app_context: Arc<AppContext> = context
             .get("app_context")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
         let tools: Arc<Vec<ToolInfo>> = context
@@ -195,9 +195,17 @@ impl StepExecutor for CacheMcpToolsStep {
 
         debug!("Caching inventory for MCP server: {}", config_request.name);
 
-        // TODO(Phase 6): Use global ToolInventory instance when it's added to AppContext
-        // For now, create a local inventory instance for testing (TTL: 5 minutes)
-        let inventory = crate::mcp::ToolInventory::new(Duration::from_secs(300));
+        // Get shared ToolInventory from McpManager
+        let mcp_manager =
+            app_context
+                .mcp_manager
+                .get()
+                .ok_or_else(|| WorkflowError::StepFailed {
+                    step_id: StepId::new("cache_mcp_tools"),
+                    message: "MCP manager not initialized".to_string(),
+                })?;
+
+        let inventory = mcp_manager.inventory();
 
         // Cache tools
         for tool in tools.iter() {
@@ -222,6 +230,9 @@ impl StepExecutor for CacheMcpToolsStep {
             );
         }
 
+        // Mark server as refreshed
+        inventory.mark_refreshed(&config_request.name);
+
         info!(
             "Cached inventory for {}: {} tools, {} prompts, {} resources",
             config_request.name,
@@ -240,8 +251,8 @@ impl StepExecutor for CacheMcpToolsStep {
 
 /// Step 4: Register MCP server in manager
 ///
-/// This step adds the MCP server to the global static server map so it can be
-/// used for dynamic tool calls.
+/// This step adds the MCP server to the McpManager's static server map so it can be
+/// used for tool calls and inventory management.
 pub struct RegisterMcpServerStep;
 
 #[async_trait]
@@ -250,33 +261,30 @@ impl StepExecutor for RegisterMcpServerStep {
         let config_request: Arc<McpServerConfigRequest> = context
             .get("mcp_server_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
-        let _app_context: Arc<AppContext> = context
+        let app_context: Arc<AppContext> = context
             .get("app_context")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let _mcp_client_manager: Arc<McpClientManager> = context
+        let mcp_client_manager: Arc<McpClientManager> = context
             .get("mcp_client_manager")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_client_manager".to_string()))?;
 
         debug!("Registering MCP server: {}", config_request.name);
 
-        // TODO(Phase 6): Register server in McpManager's static server map
-        // For now, we're using the global static in routers/openai/mcp.rs
-        // In Phase 6, this will be:
-        // app_context.mcp_manager.register_static_server(
-        //     config_request.name.clone(),
-        //     Arc::clone(mcp_client_manager.as_ref())
-        // );
+        // Get MCP manager from app context
+        let mcp_manager =
+            app_context
+                .mcp_manager
+                .get()
+                .ok_or_else(|| WorkflowError::StepFailed {
+                    step_id: StepId::new("register_mcp_server"),
+                    message: "MCP manager not initialized".to_string(),
+                })?;
 
-        // Temporary: Just log the registration
-        warn!(
-            "MCP server registration not implemented yet (Phase 6): {}",
-            config_request.name
-        );
+        // Register the server in the static server map
+        mcp_manager
+            .register_static_server(config_request.name.clone(), Arc::clone(&mcp_client_manager));
 
-        info!(
-            "Registered MCP server {} (placeholder until Phase 6)",
-            config_request.name
-        );
+        info!("Registered MCP server: {}", config_request.name);
 
         Ok(StepResult::Success)
     }

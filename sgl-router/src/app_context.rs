@@ -8,11 +8,17 @@ use tracing::info;
 
 use crate::{
     config::RouterConfig,
-    core::{workflow::WorkflowEngine, ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry},
+    core::{
+        workflow::{steps::McpServerConfigRequest, WorkflowEngine},
+        ConnectionMode,
+        Job::RegisterMcpServer,
+        JobQueue, LoadMonitor, WorkerRegistry,
+    },
     data_connector::{
         create_storage, SharedConversationItemStorage, SharedConversationStorage,
         SharedResponseStorage,
     },
+    mcp::McpManager,
     middleware::TokenBucket,
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
@@ -56,6 +62,7 @@ pub struct AppContext {
     pub configured_tool_parser: Option<String>,
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
     pub workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
+    pub mcp_manager: Arc<OnceLock<Arc<McpManager>>>,
 }
 
 pub struct AppContextBuilder {
@@ -74,6 +81,7 @@ pub struct AppContextBuilder {
     load_monitor: Option<Arc<LoadMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engine: Option<Arc<OnceLock<Arc<WorkflowEngine>>>>,
+    mcp_manager: Option<Arc<OnceLock<Arc<McpManager>>>>,
 }
 
 impl AppContext {
@@ -91,6 +99,59 @@ impl AppContext {
             .await?
             .build()
             .map_err(|e| e.to_string())
+    }
+
+    /// Register MCP servers from config
+    /// Submits MCP server registration jobs to the workflow queue
+    pub async fn register_mcp_servers(&self) -> Result<(), String> {
+        use tracing::{info, warn};
+
+        // Get the MCP config from router config
+        let Some(mcp_config) = &self.router_config.mcp_config else {
+            return Ok(());
+        };
+
+        // Get the job queue
+        let job_queue = self
+            .worker_job_queue
+            .get()
+            .ok_or("Worker job queue not initialized")?;
+
+        info!("Found {} MCP server(s) in config", mcp_config.servers.len());
+
+        // Submit registration jobs for each MCP server
+        for server_config in &mcp_config.servers {
+            let server_name = server_config.name.clone();
+            let is_required = server_config.required;
+
+            let job = RegisterMcpServer {
+                config: Box::new(McpServerConfigRequest {
+                    name: server_name.clone(),
+                    config: server_config.clone(),
+                }),
+            };
+
+            match job_queue.submit(job).await {
+                Ok(_) => {
+                    info!("Submitted MCP registration job for '{}'", server_name);
+                }
+                Err(e) => {
+                    if is_required {
+                        return Err(format!(
+                            "Failed to submit required MCP server '{}': {}",
+                            server_name, e
+                        ));
+                    } else {
+                        warn!(
+                            "Failed to submit optional MCP server '{}': {}",
+                            server_name, e
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -112,6 +173,7 @@ impl AppContextBuilder {
             load_monitor: None,
             worker_job_queue: None,
             workflow_engine: None,
+            mcp_manager: None,
         }
     }
 
@@ -196,6 +258,11 @@ impl AppContextBuilder {
         self
     }
 
+    pub fn mcp_manager(mut self, mcp_manager: Arc<OnceLock<Arc<McpManager>>>) -> Self {
+        self.mcp_manager = Some(mcp_manager);
+        self
+    }
+
     pub fn build(self) -> Result<AppContext, AppContextBuildError> {
         let router_config = self
             .router_config
@@ -235,6 +302,9 @@ impl AppContextBuilder {
             workflow_engine: self
                 .workflow_engine
                 .ok_or(AppContextBuildError("workflow_engine"))?,
+            mcp_manager: self
+                .mcp_manager
+                .ok_or(AppContextBuildError("mcp_manager"))?,
         })
     }
 
@@ -256,6 +326,7 @@ impl AppContextBuilder {
             .with_load_monitor(&router_config)
             .with_worker_job_queue()
             .with_workflow_engine()
+            .with_mcp_manager()
             .router_config(router_config))
     }
 
@@ -455,6 +526,12 @@ impl AppContextBuilder {
     /// Create workflow engine OnceLock container
     fn with_workflow_engine(mut self) -> Self {
         self.workflow_engine = Some(Arc::new(OnceLock::new()));
+        self
+    }
+
+    /// Create MCP manager OnceLock container
+    fn with_mcp_manager(mut self) -> Self {
+        self.mcp_manager = Some(Arc::new(OnceLock::new()));
         self
     }
 }
