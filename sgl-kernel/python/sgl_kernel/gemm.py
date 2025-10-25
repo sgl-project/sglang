@@ -60,7 +60,6 @@ def _bmm_fp8_internal(
         B_scale,
         workspace_buffer,
         cublas_handle,
-        get_cuda_stream(),
     )
 
 
