@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
+LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 
 
 class KvMetrics:
@@ -125,8 +127,10 @@ class SchedulerMetricsMixin:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"token usage: {token_usage:.2f}, "
 
+        iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
+
         f = (
-            f"Prefill batch. "
+            f"Prefill batch{iter_msg}, "
             f"#new-seq: {len(can_run_list)}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
@@ -249,7 +253,8 @@ class SchedulerMetricsMixin:
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        msg = f"Decode batch. #running-req: {num_running_reqs}, {token_usage_msg}"
+        iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
+        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
