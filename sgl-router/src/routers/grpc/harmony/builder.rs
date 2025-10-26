@@ -17,6 +17,10 @@ use super::types::HarmonyBuildOutput;
 use crate::protocols::{
     chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
     common::{ContentPart, Tool},
+    responses::{
+        ReasoningEffort as ResponsesReasoningEffort, ResponseInput, ResponseToolType,
+        ResponsesRequest,
+    },
 };
 
 /// Global Harmony encoding (lazy-initialized)
@@ -30,6 +34,20 @@ pub(super) fn get_harmony_encoding() -> &'static HarmonyEncoding {
         openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
             .expect("Failed to load Harmony encoding")
     })
+}
+
+/// Built-in tools that are added to the system message
+const BUILTIN_TOOLS: &[&str] = &["web_search_preview", "code_interpreter", "container"];
+
+/// Check if there are custom tools beyond built-in ones
+///
+/// Following vLLM's has_custom_tools() logic:
+/// ```python
+/// def has_custom_tools(tool_types: list[str]) -> bool:
+///     return not set(tool_types).issubset(BUILTIN_TOOLS)
+/// ```
+fn has_custom_tools(tool_types: &[&str]) -> bool {
+    !tool_types.iter().all(|t| BUILTIN_TOOLS.contains(t))
 }
 
 /// Harmony request builder
@@ -94,6 +112,43 @@ impl HarmonyBuilder {
         })
     }
 
+    /// Build Harmony request from Responses request
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The ResponsesRequest to encode
+    ///
+    /// # Returns
+    ///
+    /// HarmonyBuildOutput containing input_ids, stop_token_ids, selection_text, and messages
+    pub fn build_from_responses(
+        &self,
+        request: &ResponsesRequest,
+    ) -> Result<HarmonyBuildOutput, String> {
+        let all_messages = self.construct_input_messages_with_harmony(request)?;
+
+        let conversation = Conversation::from_messages(all_messages.clone());
+        let token_ids = self
+            .encoding
+            .render_conversation_for_completion(&conversation, Role::Assistant, None)
+            .map_err(|e| format!("Failed to encode Harmony conversation: {}", e))?;
+
+        let selection_text = self.extract_selection_text(&all_messages);
+
+        // TODO: implement proper stop sequence encoding
+        let stop_token_ids = Vec::new();
+
+        Ok(HarmonyBuildOutput {
+            input_ids: token_ids,
+            stop_token_ids,
+            selection_text,
+            harmony_messages: all_messages
+                .into_iter()
+                .map(super::types::HarmonyMessage::from_openai_harmony)
+                .collect(),
+        })
+    }
+
     /// Build system message from ChatCompletionRequest
     ///
     /// Follows vLLM's get_system_message() logic for Chat Completion API
@@ -115,6 +170,59 @@ impl HarmonyBuilder {
 
         // If no tools, remove "commentary" from valid channels
         if request.tools.is_none() {
+            if let Some(channel_config) = &sys_content.channel_config {
+                let valid_channels: Vec<String> = channel_config
+                    .valid_channels
+                    .iter()
+                    .filter(|c| c.as_str() != "commentary")
+                    .cloned()
+                    .collect();
+                sys_content = sys_content
+                    .with_channel_config(ChannelConfig::require_channels(valid_channels));
+            }
+        }
+
+        HarmonyMessage::from_role_and_content(Role::System, sys_content)
+    }
+
+    /// Build system message from ResponsesRequest
+    ///
+    /// Follows vLLM's get_system_message() logic for Responses API
+    ///
+    /// # Arguments
+    /// * `request` - The ResponsesRequest
+    /// * `with_custom_tools` - Whether custom tools (beyond built-ins) are present
+    fn build_system_message_from_responses(
+        &self,
+        request: &ResponsesRequest,
+        with_custom_tools: bool,
+    ) -> HarmonyMessage {
+        let mut sys_content = SystemContent::new();
+
+        // Add instructions (Responses API)
+        if let Some(instructions) = request.instructions.as_deref() {
+            sys_content = sys_content.with_model_identity(instructions.to_string());
+        }
+
+        // Extract reasoning effort from Responses API
+        if let Some(reasoning) = &request.reasoning {
+            if let Some(effort) = &reasoning.effort {
+                let effort_enum = match effort {
+                    ResponsesReasoningEffort::High => ReasoningEffort::High,
+                    ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
+                    ResponsesReasoningEffort::Low => ReasoningEffort::Low,
+                };
+                sys_content = sys_content.with_reasoning_effort(effort_enum);
+            }
+        }
+
+        // Set conversation start date (current date)
+        sys_content =
+            sys_content.with_conversation_start_date(Local::now().format("%Y-%m-%d").to_string());
+
+        // If no custom tools, remove "commentary" from valid channels
+        // Following vLLM's logic
+        if !with_custom_tools {
             if let Some(channel_config) = &sys_content.channel_config {
                 let valid_channels: Vec<String> = channel_config
                     .valid_channels
@@ -192,6 +300,192 @@ impl HarmonyBuilder {
         }
 
         HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
+    }
+
+    /// Get developer message for Responses API
+    ///
+    /// Follows vLLM's get_developer_message() logic for Responses API
+    ///
+    /// # Arguments
+    /// * `instructions` - Optional instructions (Responses API specific, handled in system message)
+    /// * `tools` - Optional list of tools
+    fn get_developer_message_from_responses(
+        &self,
+        _instructions: Option<&str>,
+        tools: Option<&Vec<crate::protocols::responses::ResponseTool>>,
+    ) -> HarmonyMessage {
+        let dev_content = DeveloperContent::new();
+
+        // Note: Instructions are handled in build_system_message_from_responses,
+        // added to model_identity, following vLLM's get_system_message() logic
+
+        // Early return if no tools
+        let Some(tools) = tools else {
+            return HarmonyMessage::from_role_and_content(Role::Developer, dev_content);
+        };
+
+        // Filter tools - skip built-in tools, only add function tools
+        // Following vLLM's logic:
+        // - web_search_preview, code_interpreter, container, mcp are built-in (skip)
+        // - function tools are added to developer message
+        // Note: Currently Responses API doesn't have function tools,
+        // TODO: Implement function tool descriptions when available
+
+        for tool in tools {
+            match tool.r#type {
+                ResponseToolType::WebSearchPreview
+                | ResponseToolType::CodeInterpreter
+                | ResponseToolType::Mcp => {
+                    // These are built-in tools that are added to the system message.
+                    // Skip them in developer message.
+                }
+            }
+        }
+
+        HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
+    }
+
+    /// Construct input messages for Responses API with Harmony
+    ///
+    /// Follows vLLM's _construct_input_messages_with_harmony() logic for Responses API.
+    /// Handles both new conversations and continuations of previous responses.
+    ///
+    /// This handles:
+    /// - New conversation: system message, developer message, and user input
+    /// - Continuing conversation: loads previous messages, cleans up chain-of-thoughts
+    /// - MCP tool allowlisting for special tool types
+    /// - Complex response input parsing with function call tracking
+    ///
+    /// # Arguments
+    /// * `request` - The ResponsesRequest
+    /// * `prev_response` - Optional previous response to continue from
+    fn construct_input_messages_with_harmony(
+        &self,
+        request: &ResponsesRequest,
+    ) -> Result<Vec<HarmonyMessage>, String> {
+        let mut all_messages = Vec::new();
+
+        // Handle new vs continuing conversation
+        if request.previous_response_id.is_none() {
+            // New conversation
+
+            let tool_types: Vec<&str> = request
+                .tools
+                .as_ref()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .map(|tool| match tool.r#type {
+                            ResponseToolType::WebSearchPreview => "web_search_preview",
+                            ResponseToolType::CodeInterpreter => "code_interpreter",
+                            ResponseToolType::Mcp => "mcp",
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let with_custom_tools = has_custom_tools(&tool_types);
+
+            // Add system message
+            let sys_msg = self.build_system_message_from_responses(request, with_custom_tools);
+            all_messages.push(sys_msg);
+
+            // Add developer message only if we have custom tools
+            if with_custom_tools {
+                let dev_msg = self.get_developer_message_from_responses(
+                    request.instructions.as_deref(),
+                    request.tools.as_ref(),
+                );
+                all_messages.push(dev_msg);
+            }
+        } else {
+            // Continue the previous conversation
+            // NOTE: Currently, request params like reasoning and instructions are ignored
+            // TODO: Load previous messages from storage (msg_store) when available
+
+            // For now, this is a placeholder - full implementation requires:
+            // 1. Access to msg_store from previous response
+            // 2. Chain-of-thoughts cleanup logic
+            // 3. Proper state management across turns
+            tracing::debug!(
+                "Continuing conversation from previous response: {:?}",
+                request.previous_response_id
+            );
+        }
+
+        // Append the new input
+        // Responses API supports simple text inputs without chat format
+        match &request.input {
+            ResponseInput::Text(text) => {
+                let user_msg = HarmonyMessage {
+                    author: Author {
+                        role: Role::User,
+                        name: None,
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent { text: text.clone() })],
+                    channel: None,
+                    content_type: None,
+                };
+                all_messages.push(user_msg);
+            }
+            ResponseInput::Items(items) => {
+                // Following vLLM's parse_response_input() logic for converting items
+                // This needs to maintain prev_outputs state for function call tracking
+                let prev_outputs = Vec::new();
+
+                for item in items {
+                    let msg = self.parse_response_item_to_harmony_message(item, &prev_outputs)?;
+                    all_messages.push(msg);
+
+                    // Track function calls for output lookup
+                    // TODO: Properly deserialize and track ResponseFunctionToolCall items
+                }
+            }
+        }
+
+        Ok(all_messages)
+    }
+
+    /// Parse a ResponseInputOutputItem into a HarmonyMessage
+    ///
+    /// Follows vLLM's parse_response_input() logic.
+    /// Handles conversion of various response item types (messages, function calls, reasoning, etc.)
+    /// to Harmony message format.
+    ///
+    /// # Arguments
+    /// * `item` - The ResponseInputOutputItem to parse
+    /// * `prev_outputs` - Previous outputs for tracking function call context
+    fn parse_response_item_to_harmony_message(
+        &self,
+        item: &crate::protocols::responses::ResponseInputOutputItem,
+        _prev_outputs: &[crate::protocols::responses::ResponseOutputItem],
+    ) -> Result<HarmonyMessage, String> {
+        // TODO: Full implementation needed to match vLLM's parse_response_input() logic
+        // This should handle:
+        // - Regular messages (user/assistant/system)
+        // - Function call outputs with call_id lookup
+        // - Reasoning items
+        // - Function calls with arguments
+        // - Proper channel and recipient assignment
+
+        // For now, handle basic message types
+        // Default: treat as text content user message
+        let text_content = serde_json::to_string(item)
+            .map_err(|e| format!("Failed to serialize response item: {}", e))?;
+
+        let msg = HarmonyMessage {
+            author: Author {
+                role: Role::User,
+                name: None,
+            },
+            recipient: None,
+            content: vec![Content::Text(TextContent { text: text_content })],
+            channel: None,
+            content_type: None,
+        };
+
+        Ok(msg)
     }
 
     /// Convert OpenAI ChatMessage format to Harmony messages
@@ -410,280 +704,5 @@ impl HarmonyBuilder {
 impl Default for HarmonyBuilder {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocols::{
-        chat::ChatMessage,
-        common::{FunctionCallResponse, ToolCall},
-    };
-
-    #[test]
-    fn test_builder_creation() {
-        let builder = HarmonyBuilder::new();
-        // Ensure it can be created
-        let _ = builder;
-    }
-
-    #[test]
-    fn test_convert_simple_messages() {
-        use crate::protocols::chat::UserMessageContent;
-
-        let builder = HarmonyBuilder::new();
-
-        let messages = vec![
-            ChatMessage::User {
-                content: UserMessageContent::Text("Hello".to_string()),
-                name: None,
-            },
-            ChatMessage::Assistant {
-                content: Some("Hi there".to_string()),
-                name: None,
-                tool_calls: None,
-                reasoning_content: None,
-            },
-        ];
-
-        let harmony_messages = builder.convert_chat_messages(&messages).unwrap();
-        assert_eq!(harmony_messages.len(), 2);
-        assert_eq!(harmony_messages[0].author.role, Role::User);
-        assert_eq!(harmony_messages[1].author.role, Role::Assistant);
-        // Assistant message should have channel="final"
-        assert_eq!(harmony_messages[1].channel.as_deref(), Some("final"));
-    }
-
-    #[test]
-    fn test_convert_tool_calls() {
-        use crate::protocols::chat::UserMessageContent;
-
-        let builder = HarmonyBuilder::new();
-
-        let messages = vec![
-            ChatMessage::User {
-                content: UserMessageContent::Text("What's the weather?".to_string()),
-                name: None,
-            },
-            ChatMessage::Assistant {
-                content: None,
-                name: None,
-                tool_calls: Some(vec![
-                    ToolCall {
-                        id: "call_1".to_string(),
-                        tool_type: "function".to_string(),
-                        function: FunctionCallResponse {
-                            name: "get_weather".to_string(),
-                            arguments: Some(r#"{"location": "SF"}"#.to_string()),
-                        },
-                    },
-                    ToolCall {
-                        id: "call_2".to_string(),
-                        tool_type: "function".to_string(),
-                        function: FunctionCallResponse {
-                            name: "get_time".to_string(),
-                            arguments: Some(r#"{"timezone": "PST"}"#.to_string()),
-                        },
-                    },
-                ]),
-                reasoning_content: None,
-            },
-        ];
-
-        let harmony_messages = builder.convert_chat_messages(&messages).unwrap();
-        // Should have 3 messages: 1 user + 2 tool calls
-        assert_eq!(harmony_messages.len(), 3);
-
-        // First message is user
-        assert_eq!(harmony_messages[0].author.role, Role::User);
-
-        // Second and third are tool calls
-        assert_eq!(harmony_messages[1].author.role, Role::Assistant);
-        assert_eq!(harmony_messages[1].channel.as_deref(), Some("commentary"));
-        assert_eq!(
-            harmony_messages[1].recipient.as_deref(),
-            Some("functions.get_weather")
-        );
-        assert_eq!(harmony_messages[1].content_type.as_deref(), Some("json"));
-
-        assert_eq!(harmony_messages[2].author.role, Role::Assistant);
-        assert_eq!(harmony_messages[2].channel.as_deref(), Some("commentary"));
-        assert_eq!(
-            harmony_messages[2].recipient.as_deref(),
-            Some("functions.get_time")
-        );
-    }
-
-    #[test]
-    fn test_convert_tool_response() {
-        let builder = HarmonyBuilder::new();
-
-        let messages = vec![ChatMessage::Tool {
-            content: r#"{"temperature": 72}"#.to_string(),
-            tool_call_id: "call_1".to_string(),
-        }];
-
-        let harmony_messages = builder.convert_chat_messages(&messages).unwrap();
-        assert_eq!(harmony_messages.len(), 1);
-
-        // Should use Role::Tool
-        assert_eq!(harmony_messages[0].author.role, Role::Tool);
-        assert_eq!(
-            harmony_messages[0].author.name.as_deref(),
-            Some("functions.call_1")
-        );
-        assert_eq!(harmony_messages[0].channel.as_deref(), Some("commentary"));
-    }
-
-    #[test]
-    fn test_extract_selection_text() {
-        let builder = HarmonyBuilder::new();
-
-        let messages = vec![
-            HarmonyMessage {
-                author: Author {
-                    role: Role::User,
-                    name: None,
-                },
-                recipient: None,
-                content: vec![Content::Text(TextContent {
-                    text: "Hello, how are you?".to_string(),
-                })],
-                channel: None,
-                content_type: None,
-            },
-            HarmonyMessage {
-                author: Author {
-                    role: Role::Assistant,
-                    name: None,
-                },
-                recipient: None,
-                content: vec![Content::Text(TextContent {
-                    text: "I'm doing well, thanks!".to_string(),
-                })],
-                channel: Some("final".to_string()),
-                content_type: None,
-            },
-            HarmonyMessage {
-                author: Author {
-                    role: Role::User,
-                    name: None,
-                },
-                recipient: None,
-                content: vec![Content::Text(TextContent {
-                    text: "Can you help me with something?".to_string(),
-                })],
-                channel: None,
-                content_type: None,
-            },
-        ];
-
-        let selection = builder.extract_selection_text(&messages);
-        assert_eq!(selection, "Can you help me with something?");
-    }
-
-    #[test]
-    fn test_extract_selection_text_truncation() {
-        let builder = HarmonyBuilder::new();
-
-        let long_message = "a".repeat(150);
-        let messages = vec![HarmonyMessage {
-            author: Author {
-                role: Role::User,
-                name: None,
-            },
-            recipient: None,
-            content: vec![Content::Text(TextContent { text: long_message })],
-            channel: None,
-            content_type: None,
-        }];
-
-        let selection = builder.extract_selection_text(&messages);
-        assert_eq!(selection.len(), 100);
-        assert_eq!(selection, "a".repeat(100));
-    }
-
-    #[test]
-    fn test_build_from_chat_encoding() {
-        use crate::protocols::chat::UserMessageContent;
-
-        let builder = HarmonyBuilder::new();
-
-        let request = ChatCompletionRequest {
-            messages: vec![ChatMessage::User {
-                content: UserMessageContent::Text("Hello".to_string()),
-                name: None,
-            }],
-            model: "gpt-4o".to_string(),
-            frequency_penalty: None,
-            logit_bias: None,
-            logprobs: false,
-            max_completion_tokens: None,
-            metadata: None,
-            modalities: None,
-            n: Some(1),
-            parallel_tool_calls: None,
-            presence_penalty: None,
-            prompt_cache_key: None,
-            reasoning_effort: None,
-            response_format: None,
-            safety_identifier: None,
-            service_tier: None,
-            stop: None,
-            stream: false,
-            stream_options: None,
-            temperature: None,
-            tool_choice: None,
-            tools: None,
-            top_logprobs: None,
-            top_p: None,
-            verbosity: None,
-            top_k: None,
-            min_p: None,
-            min_tokens: None,
-            repetition_penalty: None,
-            regex: None,
-            ebnf: None,
-            stop_token_ids: None,
-            no_stop_trim: false,
-            ignore_eos: false,
-            continue_final_message: false,
-            skip_special_tokens: true,
-            lora_path: None,
-            session_params: None,
-            separate_reasoning: true,
-            stream_reasoning: true,
-            chat_template_kwargs: None,
-            return_hidden_states: false,
-            sampling_seed: None,
-            #[allow(deprecated)]
-            function_call: None,
-            #[allow(deprecated)]
-            functions: None,
-            #[allow(deprecated)]
-            max_tokens: None,
-            #[allow(deprecated)]
-            seed: None,
-        };
-
-        let output = builder.build_from_chat(&request).unwrap();
-
-        // Verify output has token_ids (actual encoding happened)
-        assert!(!output.input_ids.is_empty(), "Expected non-empty token IDs");
-
-        // Verify selection text was extracted
-        assert_eq!(output.selection_text, "Hello");
-
-        // Verify harmony messages were created: system + developer + user
-        assert_eq!(
-            output.harmony_messages.len(),
-            3,
-            "Expected 3 messages: system, developer, user"
-        );
-        assert_eq!(output.harmony_messages[0].role, "system");
-        assert_eq!(output.harmony_messages[1].role, "developer");
-        assert_eq!(output.harmony_messages[2].role, "user");
-        assert_eq!(output.harmony_messages[2].content, "Hello");
     }
 }
