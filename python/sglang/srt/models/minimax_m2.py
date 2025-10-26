@@ -64,8 +64,13 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.utils import add_prefix, make_layers
-from sglang.srt.utils.common import BumpAllocator, is_non_idle_and_non_empty
+from sglang.srt.utils import (
+    BumpAllocator,
+    add_prefix,
+    get_compiler_backend,
+    is_non_idle_and_non_empty,
+    make_layers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +101,7 @@ class MiniMaxM2RMSNormTP(nn.Module):
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
         param.data.copy_(loaded_weight[shard])
 
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward(
         self,
         x: torch.Tensor,
@@ -197,7 +203,7 @@ class MiniMaxM2MoE(nn.Module):
             top_k=config.num_experts_per_tok,
             renormalize=True,
             scoring_func=config.scoring_func,
-            use_grouped_topk=True,
+            use_grouped_topk=True,  # TODO: Use "grouped top-k" flag only for hardcoded sigmoid scoring
             num_expert_group=1,
             topk_group=1,
             correction_bias=self.e_score_correction_bias,
