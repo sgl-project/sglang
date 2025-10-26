@@ -1880,14 +1880,14 @@ async def benchmark(
     async for request in request_generator:
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
-                lora_name = lora_names[random.randint(0, len(lora_names) - 1)]
+                lora_name = random.choice(lora_names)
             elif lora_request_distribution == "distinct":
                 lora_name = lora_names[lora_idx]
                 lora_idx = (lora_idx + 1) % len(lora_names)
             else:
                 assert (
                     lora_request_distribution == "skewed"
-                ), "lora_request_distribution should either be 'uniform' or 'skewed' if lora_names was specified"
+                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
 
                 lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
@@ -2272,14 +2272,14 @@ def run_benchmark(args_: argparse.Namespace):
             not args.tokenize_prompt
         ), "`--tokenize-prompt` not compatible with image dataset"
 
-    if args.lora_request_distribution in ["distinct," "skewed"]:
+    if args.lora_request_distribution in ["distinct", "skewed"]:
         assert (
             args.lora_name is not None and len(args.lora_name) > 1
         ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
 
-        assert (
-            args.lora_zipf_alpha > 1
-        ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+    assert (
+        args.lora_zipf_alpha > 1
+    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
 
     print(f"{args}\n")
 
