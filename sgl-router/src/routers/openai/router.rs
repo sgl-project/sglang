@@ -28,7 +28,7 @@ use super::conversations::{
 };
 use super::{
     mcp::{
-        execute_tool_loop, mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
+        ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
         McpLoopConfig,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
@@ -36,12 +36,12 @@ use super::{
     utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model},
 };
 use crate::{
-    config::CircuitBreakerConfig,
     core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
     data_connector::{
         ConversationId, ListParams, ResponseId, SharedConversationItemStorage,
         SharedConversationStorage, SharedResponseStorage, SortOrder,
     },
+    mcp::McpManager,
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -86,8 +86,8 @@ pub struct OpenAIRouter {
     conversation_storage: SharedConversationStorage,
     /// Conversation item storage backend
     conversation_item_storage: SharedConversationItemStorage,
-    /// Optional MCP manager (enabled via config presence)
-    mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    /// MCP manager (handles both static and dynamic servers)
+    mcp_manager: Arc<McpManager>,
 }
 
 impl std::fmt::Debug for OpenAIRouter {
@@ -109,15 +109,10 @@ impl OpenAIRouter {
     /// Create a new OpenAI router
     pub async fn new(
         worker_urls: Vec<String>,
-        circuit_breaker_config: Option<CircuitBreakerConfig>,
-        response_storage: SharedResponseStorage,
-        conversation_storage: SharedConversationStorage,
-        conversation_item_storage: SharedConversationItemStorage,
+        ctx: &Arc<crate::app_context::AppContext>,
     ) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        // Use HTTP client from AppContext
+        let client = ctx.client.clone();
 
         // Normalize URLs (remove trailing slashes)
         let worker_urls: Vec<String> = worker_urls
@@ -125,37 +120,23 @@ impl OpenAIRouter {
             .map(|url| url.trim_end_matches('/').to_string())
             .collect();
 
-        // Convert circuit breaker config
-        let core_cb_config = circuit_breaker_config
-            .map(|cb| CoreCircuitBreakerConfig {
-                failure_threshold: cb.failure_threshold,
-                success_threshold: cb.success_threshold,
-                timeout_duration: Duration::from_secs(cb.timeout_duration_secs),
-                window_duration: Duration::from_secs(cb.window_duration_secs),
-            })
-            .unwrap_or_default();
+        // Convert circuit breaker config from AppContext
+        let cb = &ctx.router_config.circuit_breaker;
+        let core_cb_config = CoreCircuitBreakerConfig {
+            failure_threshold: cb.failure_threshold,
+            success_threshold: cb.success_threshold,
+            timeout_duration: Duration::from_secs(cb.timeout_duration_secs),
+            window_duration: Duration::from_secs(cb.window_duration_secs),
+        };
 
         let circuit_breaker = CircuitBreaker::with_config(core_cb_config);
 
-        // Optional MCP manager activation via env var path (config-driven gate)
-        let mcp_manager = match std::env::var("SGLANG_MCP_CONFIG").ok() {
-            Some(path) if !path.trim().is_empty() => {
-                match crate::mcp::McpConfig::from_file(&path).await {
-                    Ok(cfg) => match crate::mcp::McpClientManager::new(cfg).await {
-                        Ok(mgr) => Some(Arc::new(mgr)),
-                        Err(err) => {
-                            warn!("Failed to initialize MCP manager: {}", err);
-                            None
-                        }
-                    },
-                    Err(err) => {
-                        warn!("Failed to load MCP config from '{}': {}", path, err);
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
+        // Get MCP manager from AppContext (must be initialized)
+        let mcp_manager = ctx
+            .mcp_manager
+            .get()
+            .ok_or_else(|| "MCP manager not initialized in AppContext".to_string())?
+            .clone();
 
         Ok(Self {
             client,
@@ -163,9 +144,9 @@ impl OpenAIRouter {
             model_cache: Arc::new(DashMap::new()),
             circuit_breaker,
             healthy: AtomicBool::new(true),
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
+            response_storage: ctx.response_storage.clone(),
+            conversation_storage: ctx.conversation_storage.clone(),
+            conversation_item_storage: ctx.conversation_item_storage.clone(),
             mcp_manager,
         })
     }
@@ -241,12 +222,17 @@ impl OpenAIRouter {
         original_previous_response_id: Option<String>,
     ) -> Response {
         // Check if MCP is active for this request
-        let req_mcp_manager = if let Some(ref tools) = original_body.tools {
-            mcp_manager_from_request_tools(tools.as_slice()).await
-        } else {
+        // Ensure dynamic client is created if needed
+        if let Some(ref tools) = original_body.tools {
+            ensure_request_mcp_client(&self.mcp_manager, tools.as_slice()).await;
+        }
+
+        // Use the tool loop if the manager has any tools available (static or dynamic).
+        let active_mcp = if self.mcp_manager.list_tools().is_empty() {
             None
+        } else {
+            Some(&self.mcp_manager)
         };
-        let active_mcp = req_mcp_manager.as_ref().or(self.mcp_manager.as_ref());
 
         let mut response_json: Value;
 
@@ -984,7 +970,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             handle_streaming_response(
                 &self.client,
                 &self.circuit_breaker,
-                self.mcp_manager.as_ref(),
+                Some(&self.mcp_manager),
                 self.response_storage.clone(),
                 self.conversation_storage.clone(),
                 self.conversation_item_storage.clone(),
