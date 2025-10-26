@@ -20,6 +20,10 @@ import torch
 import torch.nn as nn
 from packaging.version import Version
 
+from sglang.srt.batch_invariant_ops import (
+    is_batch_invariant_mode_enabled,
+    rms_norm_batch_invariant,
+)
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -90,8 +94,6 @@ class RMSNorm(CustomOp):
         )
         if _use_aiter:
             self._forward_method = self.forward_aiter
-        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
-            self._forward_method = self.forward_native
 
     def forward_cuda(
         self,
@@ -100,6 +102,14 @@ class RMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
+        if is_batch_invariant_mode_enabled():
+            if residual is not None:
+                return self.forward_native(x, residual)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
