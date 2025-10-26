@@ -57,8 +57,7 @@ use super::{
 };
 use crate::{
     data_connector::{
-        ConversationId, ResponseId, SharedConversationItemStorage, SharedConversationStorage,
-        SharedResponseStorage,
+        ConversationId, ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage,
     },
     protocols::{
         chat::ChatCompletionStreamResponse,
@@ -529,9 +528,9 @@ async fn process_and_transform_sse_stream(
     body: Body,
     original_request: ResponsesRequest,
     _chat_request: Arc<crate::protocols::chat::ChatCompletionRequest>,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     // Create accumulator for final response

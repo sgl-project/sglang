@@ -10,9 +10,7 @@ use tokio::sync::RwLock;
 use super::types::BackgroundTaskInfo;
 use crate::{
     core::WorkerRegistry,
-    data_connector::{
-        SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
-    },
+    data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     mcp::McpManager,
     routers::grpc::{context::SharedComponents, pipeline::RequestPipeline},
 };
@@ -32,13 +30,13 @@ pub struct ResponsesContext {
     pub worker_registry: Arc<WorkerRegistry>,
 
     /// Response storage backend
-    pub response_storage: SharedResponseStorage,
+    pub response_storage: Arc<dyn ResponseStorage>,
 
     /// Conversation storage backend
-    pub conversation_storage: SharedConversationStorage,
+    pub conversation_storage: Arc<dyn ConversationStorage>,
 
     /// Conversation item storage backend
-    pub conversation_item_storage: SharedConversationItemStorage,
+    pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
 
     /// MCP manager for tool support
     pub mcp_manager: Arc<McpManager>,
@@ -53,9 +51,9 @@ impl ResponsesContext {
         pipeline: Arc<RequestPipeline>,
         components: Arc<SharedComponents>,
         worker_registry: Arc<WorkerRegistry>,
-        response_storage: SharedResponseStorage,
-        conversation_storage: SharedConversationStorage,
-        conversation_item_storage: SharedConversationItemStorage,
+        response_storage: Arc<dyn ResponseStorage>,
+        conversation_storage: Arc<dyn ConversationStorage>,
+        conversation_item_storage: Arc<dyn ConversationItemStorage>,
         mcp_manager: Arc<McpManager>,
     ) -> Self {
         Self {
