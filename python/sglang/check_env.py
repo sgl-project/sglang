@@ -48,7 +48,7 @@ PACKAGE_LIST = [
     "tiktoken",
     "anthropic",
     "litellm",
-    "decord",
+    "decord2",
 ]
 
 

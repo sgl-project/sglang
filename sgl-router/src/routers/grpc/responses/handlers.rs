@@ -65,6 +65,7 @@ pub async fn route_responses(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 ) -> Response {
     // 1. Validate mutually exclusive parameters
@@ -113,6 +114,7 @@ pub async fn route_responses(
             response_storage,
             conversation_storage,
             conversation_item_storage,
+            mcp_manager,
         )
         .await
     } else if is_background {
@@ -125,6 +127,7 @@ pub async fn route_responses(
             response_storage,
             conversation_storage,
             conversation_item_storage,
+            mcp_manager,
             background_tasks,
         )
         .await
@@ -138,6 +141,7 @@ pub async fn route_responses(
             response_storage,
             conversation_storage,
             conversation_item_storage,
+            mcp_manager,
             None, // No response_id for sync
             None, // No background_tasks for sync
         )
@@ -167,6 +171,7 @@ async fn route_responses_sync(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     response_id: Option<String>,
     background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Response {
@@ -179,6 +184,7 @@ async fn route_responses_sync(
         response_storage,
         conversation_storage,
         conversation_item_storage,
+        mcp_manager,
         response_id,
         background_tasks,
     )
@@ -209,6 +215,7 @@ async fn route_responses_internal(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     response_id: Option<String>,
     background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Result<ResponsesResponse, String> {
@@ -223,7 +230,10 @@ async fn route_responses_internal(
 
     // 2. Check if request has MCP tools - if so, use tool loop
     let responses_response = if let Some(tools) = &request.tools {
-        if let Some(mcp_manager) = create_mcp_manager_from_request(tools).await {
+        // Try to create dynamic MCP client from request tools using the manager
+        if let Some(request_mcp_manager) =
+            create_mcp_manager_from_request(&mcp_manager, tools).await
+        {
             debug!("MCP tools detected, using tool loop");
 
             // Execute with MCP tool loop
@@ -234,13 +244,14 @@ async fn route_responses_internal(
                 headers,
                 model_id,
                 components,
-                mcp_manager,
+                request_mcp_manager,
                 response_id.clone(),
                 background_tasks,
             )
             .await?
         } else {
-            // No MCP manager, execute normally
+            debug!("Failed to create MCP client from request tools");
+            // Fall through to non-MCP execution
             execute_without_mcp(
                 pipeline,
                 &modified_request,
@@ -303,6 +314,7 @@ async fn route_responses_background(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 ) -> Response {
     // Generate response_id for background tracking
@@ -324,10 +336,7 @@ async fn route_responses_background(
         incomplete_details: None,
         instructions: request.instructions.clone(),
         max_output_tokens: request.max_output_tokens,
-        model: request
-            .model
-            .clone()
-            .unwrap_or_else(|| "default".to_string()),
+        model: request.model.clone(),
         output: Vec::new(),
         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
         previous_response_id: request.previous_response_id.clone(),
@@ -368,6 +377,7 @@ async fn route_responses_background(
     let response_storage_clone = response_storage.clone();
     let conversation_storage_clone = conversation_storage.clone();
     let conversation_item_storage_clone = conversation_item_storage.clone();
+    let mcp_manager_clone = mcp_manager.clone();
     let response_id_clone = response_id.clone();
     let background_tasks_clone = background_tasks.clone();
 
@@ -385,6 +395,7 @@ async fn route_responses_background(
             response_storage_clone,
             conversation_storage_clone,
             conversation_item_storage_clone,
+            mcp_manager_clone,
             Some(response_id_clone.clone()),
             Some(background_tasks_clone.clone()),
         )
@@ -437,6 +448,7 @@ async fn route_responses_streaming(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Arc<crate::mcp::McpManager>,
 ) -> Response {
     // 1. Load conversation history
     let modified_request = match load_conversation_history(
@@ -464,7 +476,10 @@ async fn route_responses_streaming(
 
     // 2. Check if request has MCP tools - if so, use streaming tool loop
     if let Some(tools) = &request.tools {
-        if let Some(mcp_manager) = create_mcp_manager_from_request(tools).await {
+        // Try to create dynamic MCP client from request tools using the manager
+        if let Some(request_mcp_manager) =
+            create_mcp_manager_from_request(&mcp_manager, tools).await
+        {
             debug!("MCP tools detected in streaming mode, using streaming tool loop");
 
             return execute_tool_loop_streaming(
@@ -474,7 +489,7 @@ async fn route_responses_streaming(
                 headers,
                 model_id,
                 components,
-                mcp_manager,
+                request_mcp_manager,
                 response_storage,
                 conversation_storage,
                 conversation_item_storage,
@@ -622,10 +637,7 @@ async fn process_and_transform_sse_stream(
 
     // Create event emitter for OpenAI-compatible streaming
     let response_id = format!("resp_{}", Uuid::new_v4());
-    let model = original_request
-        .model
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
+    let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
 
@@ -963,25 +975,36 @@ async fn load_conversation_history(
             Ok(chain) => {
                 let mut items = Vec::new();
                 for stored in chain.responses.iter() {
-                    // Convert input to conversation item
-                    items.push(ResponseInputOutputItem::Message {
-                        id: format!("msg_u_{}", stored.id.0.trim_start_matches("resp_")),
-                        role: "user".to_string(),
-                        content: vec![ResponseContentPart::InputText {
-                            text: stored.input.clone(),
-                        }],
-                        status: Some("completed".to_string()),
-                    });
+                    // Convert input items from stored input (which is now a JSON array)
+                    if let Some(input_arr) = stored.input.as_array() {
+                        for item in input_arr {
+                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
+                                Ok(input_item) => {
+                                    items.push(input_item);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to deserialize stored input item: {}. Item: {}",
+                                        e, item
+                                    );
+                                }
+                            }
+                        }
+                    }
 
-                    // Convert output to conversation items
-                    if let Some(output_arr) =
-                        stored.raw_response.get("output").and_then(|v| v.as_array())
-                    {
+                    // Convert output items from stored output (which is now a JSON array)
+                    if let Some(output_arr) = stored.output.as_array() {
                         for item in output_arr {
-                            if let Ok(output_item) =
-                                serde_json::from_value::<ResponseInputOutputItem>(item.clone())
-                            {
-                                items.push(output_item);
+                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
+                                Ok(output_item) => {
+                                    items.push(output_item);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to deserialize stored output item: {}. Item: {}",
+                                        e, item
+                                    );
+                                }
                             }
                         }
                     }
@@ -1016,7 +1039,7 @@ async fn load_conversation_history(
                     .collect::<serde_json::Map<String, serde_json::Value>>()
             });
 
-            let new_conv = crate::data_connector::conversations::NewConversation {
+            let new_conv = crate::data_connector::NewConversation {
                 id: Some(conv_id.clone()), // Use user-provided conversation ID
                 metadata,
             };
@@ -1028,9 +1051,9 @@ async fn load_conversation_history(
 
         // Load conversation history
         const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
-        let params = crate::data_connector::conversation_items::ListParams {
+        let params = crate::data_connector::ListParams {
             limit: MAX_CONVERSATION_HISTORY_ITEMS,
-            order: crate::data_connector::conversation_items::SortOrder::Asc,
+            order: crate::data_connector::SortOrder::Asc,
             after: None,
         };
 
@@ -1063,7 +1086,12 @@ async fn load_conversation_history(
                         });
                     }
                     ResponseInput::Items(current_items) => {
-                        items.extend_from_slice(current_items);
+                        // Process all item types, converting SimpleInputMessage to Message
+                        for item in current_items.iter() {
+                            let normalized =
+                                crate::protocols::responses::normalize_input_item(item);
+                            items.push(normalized);
+                        }
                     }
                 }
 
@@ -1094,7 +1122,11 @@ async fn load_conversation_history(
                 });
             }
             ResponseInput::Items(current_items) => {
-                items.extend_from_slice(current_items);
+                // Process all item types, converting SimpleInputMessage to Message
+                for item in current_items.iter() {
+                    let normalized = crate::protocols::responses::normalize_input_item(item);
+                    items.push(normalized);
+                }
             }
         }
 
