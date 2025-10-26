@@ -446,28 +446,35 @@ class ModelRunner:
             self.graph_mem_usage = 0
             self.init_attention_backend()
 
-        # auxiliary hidden capture mode. TODO: expose this to server args?
-        if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
-            # load draft config
-            draft_model_config = ModelConfig.from_server_args(
-                server_args,
-                model_path=(server_args.speculative_draft_model_path),
-                is_draft_model=True,
-            )
+        # auxiliary hidden capture mode.
+        is_eagle3_target_model_runner = (self.spec_algorithm.is_eagle3() and not self.is_draft_worker)
+        if self.model_config.capture_states_of_layers or is_eagle3_target_model_runner:
 
-            try:
-                # get the aux layer from draft model config
-                eagle_config = getattr(
-                    draft_model_config.hf_config, "eagle_config", None
+            if is_eagle3_target_model_runner:
+                # load draft config
+                draft_model_config = ModelConfig.from_server_args(
+                    server_args,
+                    model_path=(server_args.speculative_draft_model_path),
+                    is_draft_model=True,
                 )
-                eagle_aux_hidden_state_layer_ids = eagle_config[
-                    "eagle_aux_hidden_state_layer_ids"
-                ]
-            except:
-                # if there is no aux layer, set to None
-                eagle_aux_hidden_state_layer_ids = None
 
-            self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
+                try:
+                    # get the aux layer from draft model config
+                    eagle_config = getattr(
+                        draft_model_config.hf_config, "eagle_config", None
+                    )
+                    capture_states_of_layers = eagle_config[
+                        "eagle_aux_hidden_state_layer_ids"
+                    ]
+                except:
+                    # if there is no aux layer, set to None
+                    capture_states_of_layers = None
+            else:
+                capture_states_of_layers = self.model_config.capture_states_of_layers
+                # Although this case is agnostic to speculative decoding,
+                # we still use the set_eagle3_layers_to_capture API for code reuse.
+
+            self.model.set_eagle3_layers_to_capture(capture_states_of_layers)
 
     def model_specific_adjustment(self):
         server_args = self.server_args

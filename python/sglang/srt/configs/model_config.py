@@ -89,6 +89,7 @@ class ModelConfig:
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        capture_states_of_layers: Optional[list] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -96,6 +97,7 @@ class ModelConfig:
         self.quantization = quantization
         self.is_draft_model = is_draft_model
         self.model_impl = model_impl
+        self.capture_states_of_layers = capture_states_of_layers
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
@@ -199,6 +201,13 @@ class ModelConfig:
         model_revision: str = None,
         **kwargs,
     ):
+        # convert server arg in a string to layer index lists in integers
+        if server_args.capture_states_of_layers:
+            capture_states_of_layers = server_args.capture_states_of_layers.split(',')
+            capture_states_of_layers = map(lambda i: int(i), capture_states_of_layers)
+        else:
+            capture_states_of_layers = None
+
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -211,6 +220,7 @@ class ModelConfig:
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
+            capture_states_of_layers=capture_states_of_layers,
             **kwargs,
         )
 

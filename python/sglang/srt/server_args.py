@@ -167,6 +167,7 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
+    capture_states_of_layers: Optional[str] = None
 
     # HTTP server
     host: str = "127.0.0.1"
