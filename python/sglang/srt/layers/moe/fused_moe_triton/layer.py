@@ -176,6 +176,7 @@ class FusedMoE(torch.nn.Module):
 
         self.expert_mask_gpu = None
 
+        self.expert_mask_gpu = None
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
         self.reduce_results = reduce_results
