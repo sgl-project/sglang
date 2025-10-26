@@ -27,13 +27,21 @@ impl ToolArgs {
                 let mut value: serde_json::Value =
                     serde_json::from_str(&s).map_err(|e| format!("parse tool args: {}", e))?;
                 Self::coerce_types(&mut value, tool_schema)?;
-                Ok(value.as_object().cloned())
+                let result = match value {
+                    serde_json::Value::Object(m) => Some(m),
+                    _ => None,
+                };
+                Ok(result)
             }
             ToolArgs::Map(map) => {
                 if let Some(m) = map {
                     let mut value = serde_json::Value::Object(m);
                     Self::coerce_types(&mut value, tool_schema)?;
-                    Ok(value.as_object().cloned())
+                    let result = match value {
+                        serde_json::Value::Object(m) => Some(m),
+                        _ => None,
+                    };
+                    Ok(result)
                 } else {
                     Ok(None)
                 }
@@ -47,24 +55,27 @@ impl ToolArgs {
         value: &mut serde_json::Value,
         tool_schema: Option<&serde_json::Value>,
     ) -> Result<(), String> {
-        if let Some(params) = tool_schema {
-            let properties = params.get("properties").and_then(|p| p.as_object());
-            let args_obj = value.as_object_mut();
+        let Some(params) = tool_schema else {
+            return Ok(());
+        };
+        let Some(props) = params.get("properties").and_then(|p| p.as_object()) else {
+            return Ok(());
+        };
+        let Some(args) = value.as_object_mut() else {
+            return Ok(());
+        };
 
-            if let (Some(props), Some(args)) = (properties, args_obj) {
-                for (key, val) in args.iter_mut() {
-                    let should_be_number = props
-                        .get(key)
-                        .and_then(|s| s.get("type"))
-                        .and_then(|t| t.as_str())
-                        .is_some_and(|t| matches!(t, "number" | "integer"));
+        for (key, val) in args.iter_mut() {
+            let should_be_number = props
+                .get(key)
+                .and_then(|s| s.get("type"))
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| matches!(t, "number" | "integer"));
 
-                    if should_be_number {
-                        if let Some(s) = val.as_str() {
-                            if let Ok(num) = s.parse::<f64>() {
-                                *val = serde_json::json!(num);
-                            }
-                        }
+            if should_be_number {
+                if let Some(s) = val.as_str() {
+                    if let Ok(num) = s.parse::<f64>() {
+                        *val = serde_json::json!(num);
                     }
                 }
             }
