@@ -167,7 +167,6 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
-    capture_states_of_layers: Optional[str] = None
 
     # HTTP server
     host: str = "127.0.0.1"
@@ -416,6 +415,7 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
+    capture_states_of_layers: Optional[str] = None
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
