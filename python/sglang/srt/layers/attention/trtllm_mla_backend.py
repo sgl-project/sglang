@@ -6,7 +6,7 @@ Support attention backend for TRTLLM MLA kernels from flashinfer.
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import triton
@@ -24,7 +24,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_flashinfer_available
-from sglang.srt.utils.common import cached_triton_kernel
+from sglang.srt.utils.common import cached_triton_kernel, next_power_of_2
 
 if is_flashinfer_available():
     import flashinfer
@@ -284,29 +284,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
-    def _calc_padded_blocks(self, max_seq_len: int) -> int:
-        """
-        Calculate padded block count that satisfies both TRT-LLM and Triton constraints.
-
-        Args:
-            max_seq_len: Maximum sequence length in tokens
-
-        Returns:
-            Number of blocks padded to satisfy all constraints
-        """
-        blocks = triton.cdiv(max_seq_len, self.page_size)
-
-        # Apply dual constraints (take LCM to satisfy both):
-        # 1. TRT-LLM: block_num % (128 / page_size) == 0
-        # 2. Triton: number of pages per block
-        trtllm_constraint = TRTLLM_BLOCK_CONSTRAINT // self.page_size
-        triton_constraint = get_num_page_per_block_flashmla(self.page_size)
-        constraint_lcm = math.lcm(trtllm_constraint, triton_constraint)
-
-        if blocks % constraint_lcm != 0:
-            blocks = triton.cdiv(blocks, constraint_lcm) * constraint_lcm
-        return blocks
-
     def _create_block_kv_indices(
         self,
         batch_size: int,
@@ -353,11 +330,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Initialize CUDA graph state for TRTLLM MLA."""
 
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        if kv_indices_buf is not None:
+            self.decode_cuda_graph_kv_indices = kv_indices_buf
+        else:
+            max_blocks_per_seq = _calc_padded_blocks(
+                self.max_context_len, self.page_size
+            )
 
-        self.decode_cuda_graph_kv_indices = torch.full(
-            (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
-        )
+            self.decode_cuda_graph_kv_indices = torch.full(
+                (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
+            )
         num_tokens_per_bs = max_num_tokens // max_bs
 
         # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
@@ -373,8 +355,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             dtype=self.data_type,
             device=self.device,
         )
-
-        super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -409,7 +389,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Custom fast-path for decode/idle.
         # Capture with full width so future longer sequences are safe during replay
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        max_blocks_per_seq = _calc_padded_blocks(self.max_context_len, self.page_size)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
 
         create_flashmla_kv_indices_triton[(bs,)](
@@ -551,7 +531,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq = max_seq + self.num_draft_tokens
                 seq_lens = seq_lens + self.num_draft_tokens
 
-            max_seqlen_pad = self._calc_padded_blocks(max_seq)
+            max_seqlen_pad = _calc_padded_blocks(max_seq, self.page_size)
             block_kv_indices = self._create_block_kv_indices(
                 bs,
                 max_seqlen_pad,
@@ -1052,7 +1032,14 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     def __init__(
         self, model_runner: "ModelRunner", topk: int, speculative_num_steps: int
     ):
+        from sglang.srt.speculative.spec_utils import (
+            generate_draft_decode_kv_indices_paged_mla,
+        )
+
         super().__init__(model_runner, topk, speculative_num_steps)
+        self.generate_draft_decode_kv_indices_paged_mla = (
+            generate_draft_decode_kv_indices_paged_mla
+        )
 
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i] = TRTLLMMLABackend(
@@ -1062,9 +1049,94 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 q_indptr_decode_buf=self.q_indptr_decode,
             )
 
+    def common_template(
+        self,
+        forward_batch: ForwardBatch,
+        kv_indices_buffer: torch.Tensor,
+        call_fn: Optional[Callable] = None,
+    ):
+        num_seqs = forward_batch.batch_size
+        bs = self.topk * num_seqs
+        seq_lens_sum = forward_batch.seq_lens_sum
+
+        self.generate_draft_decode_kv_indices_paged_mla[
+            (self.speculative_num_steps, num_seqs, self.topk)
+        ](
+            forward_batch.req_pool_indices,
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.seq_lens,
+            kv_indices_buffer,
+            self.kv_indptr,
+            forward_batch.positions,
+            self.pool_len,
+            kv_indices_buffer.shape[1] * kv_indices_buffer.shape[2],
+            self.kv_indptr.shape[1],
+            next_power_of_2(num_seqs),
+            next_power_of_2(self.speculative_num_steps),
+            next_power_of_2(bs),
+            self.page_size,
+        )
+
+        assert forward_batch.spec_info is not None
+        assert forward_batch.spec_info.is_draft_input()
+
+        if call_fn is None:
+            return
+
+        for i in range(self.speculative_num_steps - 1):
+            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
+            forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
+                : seq_lens_sum * self.topk + bs * (i + 1)
+            ]
+            call_fn(i, forward_batch)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        max_blocks_per_seq = _calc_padded_blocks(self.max_context_len, self.page_size)
+
+        self.cuda_graph_kv_indices = torch.full(
+            (self.speculative_num_steps, max_bs, max_blocks_per_seq),
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_cuda_graph_state(
+                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
+            )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, forward_batch: ForwardBatch, bs: int
+    ):
+        self.common_template(forward_batch, self.cuda_graph_kv_indices, None)
+
 
 def _concat_mla_absorb_q_general(q_nope, q_rope):
     if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
         return concat_mla_absorb_q(q_nope, q_rope)
     else:
         return torch.cat([q_nope, q_rope], dim=-1)
+
+
+def _calc_padded_blocks(max_seq_len: int, page_size: int) -> int:
+    """
+    Calculate padded block count that satisfies both TRT-LLM and Triton constraints.
+
+    Args:
+        max_seq_len: Maximum sequence length in tokens
+
+    Returns:
+        Number of blocks padded to satisfy all constraints
+    """
+    blocks = triton.cdiv(max_seq_len, page_size)
+
+    # Apply dual constraints (take LCM to satisfy both):
+    # 1. TRT-LLM: block_num % (128 / page_size) == 0
+    # 2. Triton: number of pages per block
+    trtllm_constraint = TRTLLM_BLOCK_CONSTRAINT // page_size
+    triton_constraint = get_num_page_per_block_flashmla(page_size)
+    constraint_lcm = math.lcm(trtllm_constraint, triton_constraint)
+
+    if blocks % constraint_lcm != 0:
+        blocks = triton.cdiv(blocks, constraint_lcm) * constraint_lcm
+    return blocks

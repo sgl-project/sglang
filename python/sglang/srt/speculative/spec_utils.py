@@ -261,6 +261,90 @@ def generate_draft_decode_kv_indices(
 
 
 @triton.jit
+def generate_draft_decode_kv_indices_paged_mla(
+    req_pool_indices,
+    req_to_token,
+    paged_kernel_lens,
+    kv_indices,
+    kv_indptr,
+    positions,
+    pool_len: tl.constexpr,
+    kv_indices_stride: tl.constexpr,
+    kv_indptr_stride: tl.constexpr,
+    bs_upper: tl.constexpr,
+    iter_upper: tl.constexpr,
+    num_tokens_upper: tl.constexpr,
+    page_size: tl.constexpr,
+):
+    iters = tl.program_id(axis=0)
+    bid = tl.program_id(axis=1)
+    topk_id = tl.program_id(axis=2)
+
+    num_steps = tl.num_programs(axis=0)
+    num_seqs = tl.num_programs(axis=1)
+    topk = tl.num_programs(axis=2)
+
+    kv_indices += kv_indices_stride * iters
+    kv_indptr += kv_indptr_stride * iters
+    iters += 1
+
+    load_offset = tl.arange(0, bs_upper)
+    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid, other=0)
+    seq_len = tl.load(paged_kernel_lens + bid)
+    cum_seq_len = tl.sum(seq_lens)
+
+    req_pool_index = tl.load(req_pool_indices + bid)
+    token_pool_ptr = req_to_token + req_pool_index * pool_len
+
+    kv_start = 0
+    kv_end = seq_len + iters
+
+    prefix_len = seq_len
+    last_page_len = prefix_len % page_size
+    num_new_pages_per_topk = (last_page_len + num_steps + page_size - 1) // page_size
+    prefix_base = (prefix_len // page_size) * page_size
+    start_extend_base = (
+        prefix_base + topk_id * num_new_pages_per_topk * page_size + last_page_len
+    )
+
+    total_tokens = kv_end - kv_start
+    total_pages = tl.cdiv(total_tokens, page_size)
+    prefix_pages = tl.cdiv(prefix_len, page_size)
+    extend_pages = total_pages - prefix_pages
+
+    pages_per_seq = kv_indices_stride // bs_upper
+    out_base = kv_indices + (bid * topk + topk_id) * pages_per_seq
+
+    BLOCK_PAGES: tl.constexpr = 128
+    page_blk = tl.arange(0, BLOCK_PAGES)
+    num_loops_prefix = tl.cdiv(prefix_pages, BLOCK_PAGES)
+    for lp in range(0, num_loops_prefix):
+        pidx = page_blk + lp * BLOCK_PAGES
+        mask = pidx < prefix_pages
+        toff = kv_start + (pidx * page_size).to(tl.int64)
+        data = tl.load(token_pool_ptr + toff, mask=mask, other=0)
+        pageid = (data // page_size).to(tl.int32)
+        tl.store(out_base + pidx, pageid, mask=mask)
+
+    num_loops_ext = tl.cdiv(extend_pages, BLOCK_PAGES)
+    for lp in range(0, num_loops_ext):
+        pidx_e = page_blk + lp * BLOCK_PAGES
+        mask_e = pidx_e < extend_pages
+        toff_e = start_extend_base + (pidx_e * page_size).to(tl.int64)
+        data_e = tl.load(token_pool_ptr + toff_e, mask=mask_e, other=0)
+        pageid_e = (data_e // page_size).to(tl.int32)
+        tl.store(out_base + (prefix_pages + pidx_e), pageid_e, mask=mask_e)
+
+    bs_offset = tl.arange(0, num_tokens_upper)
+    zid = bid * topk + topk_id
+    if zid == 0:
+        zid = num_seqs * topk
+    pos = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
+    base = tl.sum(pos)
+    tl.store(kv_indptr + zid, base + zid * iters)
+
+
+@triton.jit
 def align_evict_mask_to_page_size(
     seq_lens,
     evict_mask,
