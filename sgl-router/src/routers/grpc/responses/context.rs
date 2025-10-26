@@ -19,7 +19,6 @@ use crate::{
 
 /// Context for /v1/responses endpoint
 ///
-/// Bundles all dependencies to reduce function parameter count from 10+ to 4.
 /// All fields are Arc/shared references, so cloning this context is cheap.
 #[derive(Clone)]
 pub struct ResponsesContext {
