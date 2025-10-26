@@ -10,9 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     core::Worker,
-    grpc_client::proto::{DisaggregatedParams, GenerateRequest, TokenizedInput},
+    grpc_client::proto::{DisaggregatedParams, GenerateRequest},
     routers::grpc::{
-        context::{RequestContext, RequestType, WorkerSelection},
+        context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
         stages::PipelineStage,
         utils,
     },
@@ -72,32 +72,73 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             .ok_or_else(|| utils::internal_error_static("Preparation not completed"))?;
 
         // Get clients
-        let _clients = ctx
+        let clients = ctx
             .state
             .clients
             .as_ref()
             .ok_or_else(|| utils::internal_error_static("Client acquisition not completed"))?;
+        let builder_client = match clients {
+            ClientSelection::Single { client } => client,
+            ClientSelection::Dual { prefill, .. } => prefill,
+        };
 
-        // Generate request ID based on request type
+        // Generate request_id based on request type
         let request_id = match &ctx.input.request_type {
             RequestType::Chat(_) => format!("chatcmpl-{}", Uuid::new_v4()),
-            RequestType::Generate(request) => request
-                .rid
-                .clone()
-                .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4())),
             RequestType::Responses(_) => format!("responses-{}", Uuid::new_v4()),
+            RequestType::Generate(_) => {
+                return Err(utils::bad_request_error(
+                    "Generate requests are not supported with Harmony models".to_string(),
+                ));
+            }
         };
 
-        // Build proto::GenerateRequest from Harmony-encoded input_ids
-        // The tokenized field contains the input_ids we got from Harmony encoding
-        let mut proto_request = GenerateRequest {
-            request_id,
-            tokenized: Some(TokenizedInput {
-                original_text: String::new(), // Not needed for Harmony encoded inputs
-                input_ids: prep.token_ids.clone(),
-            }),
-            ..Default::default()
+        // Build gRPC request using token_ids directly (Harmony encoding already handled message rendering)
+        // We still leverage the ChatCompletionRequest to build sampling params.
+        let (body_for_params, tool_constraint) = match &ctx.input.request_type {
+            RequestType::Chat(request) => {
+                // Prefer filtered request if present; otherwise use the original
+                let body = prep
+                    .filtered_request
+                    .as_ref()
+                    .unwrap_or(request.as_ref())
+                    .clone();
+
+                // Generate tool constraints if tools are present
+                let constraint = if let Some(tools) = body.tools.as_ref() {
+                    utils::generate_tool_constraints(tools, &body.tool_choice, &body.model)
+                        .map_err(|e| {
+                            utils::bad_request_error(format!("Invalid tool configuration: {}", e))
+                        })?
+                } else {
+                    None
+                };
+
+                (body, constraint)
+            }
+            // Responses path is handled in Phase 5; unreachable here for Harmony gRPC pipeline
+            RequestType::Responses(_) => {
+                return Err(utils::bad_request_error(
+                    "Responses requests are not supported in Harmony gRPC pipeline (Phase 3)"
+                        .to_string(),
+                ));
+            }
+            _ => unreachable!(),
         };
+
+        // Use a placeholder for original_text; Harmony uses input_ids for tokenization
+        let placeholder_processed_text = "[harmony]".to_string();
+
+        let mut proto_request = builder_client
+            .build_generate_request(
+                request_id,
+                &body_for_params,
+                placeholder_processed_text,
+                prep.token_ids.clone(),
+                None,
+                tool_constraint,
+            )
+            .map_err(|e| utils::bad_request_error(format!("Invalid request parameters: {}", e)))?;
 
         // Inject Harmony stop token IDs into sampling params
         if let Some(harmony_stops) = &prep.harmony_stop_ids {

@@ -53,7 +53,13 @@ impl PipelineStage for WorkerSelectionStage {
             .as_ref()
             .ok_or_else(|| utils::internal_error_static("Preparation stage not completed"))?;
 
-        let text = prep.original_text.as_deref();
+        // For Harmony, use selection_text produced during Harmony encoding
+        // Otherwise, use original_text from regular preparation
+        let text = if prep.harmony_mode {
+            prep.selection_text.as_deref()
+        } else {
+            prep.original_text.as_deref()
+        };
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {

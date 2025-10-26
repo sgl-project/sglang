@@ -34,7 +34,7 @@ impl PipelineStage for DispatchMetadataStage {
                     .clone()
                     .unwrap_or_else(|| "default".to_string())
             }
-            RequestType::Responses(req) => req.model.clone()
+            RequestType::Responses(req) => req.model.clone(),
         };
 
         let weight_version = ctx

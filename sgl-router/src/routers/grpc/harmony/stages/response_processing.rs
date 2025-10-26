@@ -4,10 +4,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
-use uuid::Uuid;
 
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
-use crate::routers::grpc::{context::RequestContext, stages::PipelineStage, utils};
+use crate::routers::grpc::{
+    context::{FinalResponse, RequestContext},
+    stages::PipelineStage,
+    utils,
+};
 
 /// Harmony Response Processing stage: Parse and format Harmony responses
 ///
@@ -56,16 +59,24 @@ impl PipelineStage for HarmonyResponseProcessingStage {
             ));
         }
 
-        // For non-streaming, delegate to response processor
+        // For non-streaming, delegate to Harmony response processor to build ChatCompletionResponse
         let chat_request = ctx.chat_request_arc();
 
-        // Generate or use provided request ID for response
-        let request_id = Uuid::new_v4().to_string();
+        let response = self
+            .processor
+            .process_non_streaming_chat_response(
+                execution_result,
+                chat_request,
+                ctx.state
+                    .dispatch
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?,
+            )
+            .await?;
 
-        self.processor
-            .process_harmony_response(execution_result, chat_request, request_id)
-            .await
-            .map(Some)
+        ctx.state.response.final_response = Some(FinalResponse::Chat(response));
+        Ok(None)
     }
 
     fn name(&self) -> &'static str {

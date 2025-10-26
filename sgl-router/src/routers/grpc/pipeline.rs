@@ -11,7 +11,7 @@ use tracing::{debug, error};
 
 // Import all stage types from the stages module
 use super::stages::*;
-use super::{context::*, processing, responses::BackgroundTaskInfo, streaming, utils};
+use super::{context::*, harmony, processing, responses::BackgroundTaskInfo, streaming, utils};
 use crate::{
     core::WorkerRegistry,
     policies::PolicyRegistry,
@@ -78,6 +78,64 @@ impl RequestPipeline {
             Box::new(DispatchMetadataStage),
             Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
             Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
+        ];
+
+        Self {
+            stages: Arc::new(stages),
+        }
+    }
+
+    /// Create a Harmony (single-worker) pipeline for Harmony-capable models
+    pub fn new_harmony(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+        _tokenizer: Arc<dyn Tokenizer>,
+        _tool_parser_factory: ToolParserFactory,
+        _reasoning_parser_factory: ReasoningParserFactory,
+        _configured_tool_parser: Option<String>,
+        _configured_reasoning_parser: Option<String>,
+    ) -> Self {
+        let stages: Vec<Box<dyn PipelineStage>> = vec![
+            Box::new(harmony::stages::HarmonyPreparationStage::new()),
+            Box::new(WorkerSelectionStage::new(
+                worker_registry,
+                policy_registry,
+                WorkerSelectionMode::Regular,
+            )),
+            Box::new(ClientAcquisitionStage),
+            Box::new(harmony::stages::HarmonyRequestBuildingStage::new(false)),
+            Box::new(DispatchMetadataStage),
+            Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
+            Box::new(harmony::stages::HarmonyResponseProcessingStage::new()),
+        ];
+
+        Self {
+            stages: Arc::new(stages),
+        }
+    }
+
+    /// Create a Harmony PD (prefill-decode) pipeline
+    pub fn new_harmony_pd(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+        _tokenizer: Arc<dyn Tokenizer>,
+        _tool_parser_factory: ToolParserFactory,
+        _reasoning_parser_factory: ReasoningParserFactory,
+        _configured_tool_parser: Option<String>,
+        _configured_reasoning_parser: Option<String>,
+    ) -> Self {
+        let stages: Vec<Box<dyn PipelineStage>> = vec![
+            Box::new(harmony::stages::HarmonyPreparationStage::new()),
+            Box::new(WorkerSelectionStage::new(
+                worker_registry,
+                policy_registry,
+                WorkerSelectionMode::PrefillDecode,
+            )),
+            Box::new(ClientAcquisitionStage),
+            Box::new(harmony::stages::HarmonyRequestBuildingStage::new(true)),
+            Box::new(DispatchMetadataStage),
+            Box::new(RequestExecutionStage::new(ExecutionMode::DualDispatch)),
+            Box::new(harmony::stages::HarmonyResponseProcessingStage::new()),
         ];
 
         Self {
