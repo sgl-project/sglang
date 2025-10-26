@@ -1098,10 +1098,15 @@ impl RequestPipeline {
         }
     }
 
-    /// Execute chat pipeline for responses endpoint (Result-based for easier composition)
+    /// Execute chat pipeline for responses endpoint
     ///
-    /// This is used by the responses module and returns Result instead of Response.
-    /// Returns Err(Response) to preserve HTTP status codes (503, 400, etc.).
+    /// TODO: The support for background tasks is not scalable. Consider replacing this with
+    /// a better design in the future.
+    /// Used by ALL non-streaming /v1/responses requests (both sync and background modes).
+    /// Uses the same 7 pipeline stages as execute_chat(), with three differences:
+    /// 1. Returns Result<ChatCompletionResponse, Response> for tool_loop composition
+    /// 2. Disallows streaming (responses endpoint uses different SSE format)
+    /// 3. Injects hooks for background task cancellation (only active when response_id provided)
     pub async fn execute_chat_for_responses(
         &self,
         request: Arc<ChatCompletionRequest>,

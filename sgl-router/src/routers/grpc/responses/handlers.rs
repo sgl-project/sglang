@@ -1,9 +1,35 @@
 //! Handler functions for /v1/responses endpoints
 //!
-//! This module contains all the actual implementation logic for:
-//! - POST /v1/responses (route_responses)
-//! - GET /v1/responses/{response_id} (get_response_impl)
-//! - POST /v1/responses/{response_id}/cancel (cancel_response_impl)
+//! # Public API
+//!
+//! - `route_responses()` - POST /v1/responses (main entry point)
+//! - `get_response_impl()` - GET /v1/responses/{response_id}
+//! - `cancel_response_impl()` - POST /v1/responses/{response_id}/cancel
+//!
+//! # Architecture
+//!
+//! This module orchestrates all request handling for the /v1/responses endpoint.
+//! It supports three execution modes:
+//!
+//! 1. **Synchronous** - Returns complete response immediately
+//! 2. **Background** - Returns queued response, executes in background task
+//! 3. **Streaming** - Returns SSE stream with real-time events
+//!
+//! # Request Flow
+//!
+//! ```text
+//! route_responses()
+//!   ├─► route_responses_sync()       → route_responses_internal()
+//!   ├─► route_responses_background() → spawn(route_responses_internal())
+//!   └─► route_responses_streaming()  → convert_chat_stream_to_responses_stream()
+//!
+//! route_responses_internal()
+//!   ├─► load_conversation_history()
+//!   ├─► execute_tool_loop() (if MCP tools)
+//!   │   └─► pipeline.execute_chat_for_responses() [loop]
+//!   └─► execute_without_mcp() (if no MCP tools)
+//!       └─► pipeline.execute_chat_for_responses()
+//! ```
 
 use std::{
     sync::Arc,
