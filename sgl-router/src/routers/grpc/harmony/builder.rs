@@ -17,11 +17,6 @@ use super::types::HarmonyBuildOutput;
 use crate::protocols::{
     chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
     common::{ContentPart, Tool},
-    responses::{
-        ReasoningEffort as ResponsesReasoningEffort, ResponseContentPart, ResponseInput,
-        ResponseInputOutputItem, ResponseOutputItem, ResponseReasoningContent, ResponseTool,
-        ResponseToolType, ResponsesRequest,
-    },
 };
 
 /// Global Harmony encoding (lazy-initialized)
@@ -94,7 +89,7 @@ impl HarmonyBuilder {
             selection_text,
             harmony_messages: all_messages
                 .into_iter()
-                .map(|msg| super::types::HarmonyMessage::from_openai_harmony(msg))
+                .map(super::types::HarmonyMessage::from_openai_harmony)
                 .collect(),
         })
     }
@@ -308,7 +303,7 @@ impl HarmonyBuilder {
                         let mut text = content.clone().unwrap_or_default();
                         if let Some(reasoning) = reasoning_content {
                             if !text.is_empty() {
-                                text.push_str("\n");
+                                text.push('\n');
                             }
                             text.push_str(reasoning);
                         }
