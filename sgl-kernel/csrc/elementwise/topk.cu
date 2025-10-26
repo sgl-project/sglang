@@ -388,9 +388,9 @@ auto get_params(
 
 template <auto* f, size_t max_dynamic_smem>
 void setup_kernel_smem_once() {
-  [[maybe_unused]]
-  static const auto result =
-      [] { return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem); }();
+  [[maybe_unused]] static const auto result = [] {
+    return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+  }();
   TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
 }
 
