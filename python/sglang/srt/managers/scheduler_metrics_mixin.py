@@ -123,7 +123,7 @@ class SchedulerMetricsMixin:
             token_usage_msg = f"token usage: {token_usage:.2f}, "
 
         f = (
-            f"Prefill batch [{self.forward_ct + 1}], "
+            f"Prefill batch. "
             f"#new-seq: {len(can_run_list)}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
@@ -246,7 +246,7 @@ class SchedulerMetricsMixin:
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        msg = f"Decode batch [{self.forward_ct}], #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = f"Decode batch. #running-req: {num_running_reqs}, {token_usage_msg}"
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
