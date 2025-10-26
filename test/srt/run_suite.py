@@ -191,6 +191,7 @@ suites = {
     "per-commit-8-gpu-h200-deepseek-v32": [
         TestFile("test_deepseek_v32_basic.py", 275),
         TestFile("test_deepseek_v32_mtp.py", 275),
+        TestFile("test_deepseek_v32_nsabackend.py", 600),
     ],
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),
