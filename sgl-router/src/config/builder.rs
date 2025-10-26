@@ -3,7 +3,7 @@ use super::{
     HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig, RouterConfig,
     RoutingMode, TokenizerCacheConfig,
 };
-use crate::core::ConnectionMode;
+use crate::{core::ConnectionMode, mcp::McpConfig};
 
 /// Builder for RouterConfig that wraps the config itself
 /// This eliminates field duplication and stays in sync automatically
@@ -654,6 +654,9 @@ impl RouterConfigBuilder {
         // Read mTLS certificates from paths if provided
         self = self.read_mtls_certificates()?;
 
+        // Read MCP config from path if provided
+        self = self.read_mcp_config()?;
+
         let config: RouterConfig = self.into();
         if validate {
             config.validate()?;
@@ -710,14 +713,18 @@ impl RouterConfigBuilder {
             self.config.ca_certificates.push(cert);
         }
 
-        // Read MCP config if path is provided
+        Ok(self)
+    }
+
+    /// Internal method to read MCP config from path
+    fn read_mcp_config(mut self) -> ConfigResult<Self> {
         if let Some(mcp_config_path) = &self.mcp_config_path {
             let contents = std::fs::read_to_string(mcp_config_path).map_err(|e| {
                 ConfigError::ValidationFailed {
                     reason: format!("Failed to read MCP config from {}: {}", mcp_config_path, e),
                 }
             })?;
-            let mcp_config: crate::mcp::McpConfig =
+            let mcp_config: McpConfig =
                 serde_yaml::from_str(&contents).map_err(|e| ConfigError::ValidationFailed {
                     reason: format!("Failed to parse MCP config from {}: {}", mcp_config_path, e),
                 })?;
