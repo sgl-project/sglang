@@ -6,10 +6,13 @@ from .evs_core import (
     redistribute_placeholder_tokens_by_tokens_per_frame,
 )
 from .evs_module import EVS, EVSConfig, EVSEmbeddingResult, EVSProcessor
+from .qwen_mrope import compute_mrope_for_media, recompute_mrope_positions
 
 __all__ = [
     "compute_retained_tokens_count",
     "compute_retention_mask",
+    "compute_mrope_for_media",
+    "recompute_mrope_positions",
     "EVSConfig",
     "EVSEmbeddingResult",
     "EVS",
