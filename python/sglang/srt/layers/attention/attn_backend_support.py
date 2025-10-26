@@ -15,6 +15,13 @@ from sglang.srt.utils.common import (
 
 @dataclass
 class AttentionCapabilities:
+    """
+    This class is used to store the capabilities of an attention backend to validate the runtime
+    configuration and raise errors if the configuration is invalid or not supported.
+    In the future, all backends should be registered here instead of the current server args validation.
+    This is to avoid the server args validation from becoming too complex and difficult to maintain.
+    """
+
     # Supported hardware, subset of ["cuda", "hip", "cpu", "xpu", "npu", "hpu"]
     hardware: list[str]
     # List of supported major versions of SM capability if using Nvidia GPU
