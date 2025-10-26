@@ -24,7 +24,7 @@ class RoutedExpertsCapturer(ABC):
     def is_initialized(self):
         raise NotImplementedError
 
-    def capture(self, routed_experts):
+    def capture(self, layer_id: int, topk_output: StandardTopKOutput):
         raise NotImplementedError
 
     def clear_buffer(self):
@@ -75,7 +75,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     def is_initialized(self):
         pass
 
-    def capture(self, routed_experts):
+    def capture(self, layer_id: int, topk_output: StandardTopKOutput):
         pass
 
     def clear_buffer(self):
