@@ -253,7 +253,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 else:
                     prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
-        # Common processing for both paths
+        # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=stop,
             model_generation_config=self.default_sampling_params,
