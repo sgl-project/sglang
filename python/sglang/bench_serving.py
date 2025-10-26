@@ -88,6 +88,7 @@ class RequestFuncOutput:
     latency: float = 0.0
     ttft: float = 0.0  # Time to first token
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
+    text_chunks: List[str] = field(default_factory=list)
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
@@ -258,6 +259,9 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
+                                    output.text_chunks.append(
+                                        data["choices"][0]["text"]
+                                    )
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
@@ -574,9 +578,8 @@ async def async_request_sglang_generate(
                                     num_new_tokens = output_len - last_output_len
                                     if num_new_tokens == 0:
                                         continue
-                                    adjust_itl = (
-                                        timestamp - most_recent_timestamp
-                                    ) / num_new_tokens
+                                    chunk_gap = timestamp - most_recent_timestamp
+                                    adjust_itl = chunk_gap / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
 
                                 most_recent_timestamp = timestamp
@@ -1626,6 +1629,7 @@ def calculate_metrics(
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
     backend: str,
+    accept_length: Optional[float] = None,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
@@ -1637,6 +1641,14 @@ def calculate_metrics(
     tpots: List[float] = []
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
+    retokenized_itls: List[float] = []
+
+    use_retokenized_itl = (
+        accept_length is not None
+        and accept_length > 0
+        and backend in ("sglang-oai", "sglang-oai-chat")
+    )
+
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_len
@@ -1650,7 +1662,17 @@ def calculate_metrics(
             total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
-            itls += outputs[i].itl
+            if use_retokenized_itl:
+                for k, itl in enumerate(outputs[i].itl):
+                    num_tokens = len(
+                        tokenizer.encode(
+                            outputs[i].text_chunks[k], add_special_tokens=False
+                        )
+                    )
+                    adjusted_itl = itl / num_tokens
+                    retokenized_itls.extend([adjusted_itl] * num_tokens)
+            else:
+                itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
@@ -1666,6 +1688,8 @@ def calculate_metrics(
             "on the benchmark arguments.",
             stacklevel=2,
         )
+
+    itls = retokenized_itls if use_retokenized_itl else itls
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -1929,6 +1953,7 @@ async def benchmark(
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
         backend=backend,
+        accept_length=accept_length,
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
