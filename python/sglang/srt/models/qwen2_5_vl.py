@@ -63,6 +63,11 @@ from sglang.srt.models.utils import permute_inv
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
+from sglang.srt.managers.evs import (
+    compute_retention_mask, compute_mrope_for_media, compute_retained_tokens_count,
+    recompute_mrope_positions,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -521,6 +526,51 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
+        # TODO(yuan-luo): feature flag setting
+        self.video_pruning_rate = 0.2
+        self.is_multimodal_pruning_enabled = self.video_pruning_rate > 0.0
+        self.tokens_per_second = getattr(config.vision_config, "tokens_per_second", 1.0)
+
+    def _postprocess_image_embeds_evs(self, image_embeds: torch.Tensor, image_grid_thw: torch.Tensor):
+        # For each image, attach mRoPE
+        merge = self.visual.spatial_merge_size
+        outs = []
+        sizes = (image_grid_thw.prod(-1) // (merge * merge)).tolist()
+        cursor = 0
+        for (t,h,w), sz in zip(image_grid_thw.tolist(), sizes):
+            emb = image_embeds[cursor:cursor+sz]
+            pos = compute_mrope_for_media(torch.tensor([t,h,w], device=emb.device),
+                                          spatial_merge_size=merge,
+                                          tokens_per_second=self.tokens_per_second,
+                                          video_second_per_grid=1)
+            emb = torch.cat([emb, pos.to(emb.device)], dim=1)
+            outs.append(emb); cursor += sz
+        return torch.cat(outs, dim=0)
+
+    def _postprocess_video_embeds_evs(self, video_embeds: torch.Tensor,
+                                      video_grid_thw: torch.Tensor,
+                                      second_per_grid_ts: Optional[torch.Tensor] = None):
+        merge = self.visual.spatial_merge_size
+        outs = []
+        sizes = (video_grid_thw.prod(-1) // (merge * merge)).tolist()
+        cursor = 0
+        for idx, ((t,h,w), sz) in enumerate(zip(video_grid_thw.tolist(), sizes)):
+            emb = video_embeds[cursor:cursor+sz]
+            s_pg = 1 if second_per_grid_ts is None else int(second_per_grid_ts[idx].item())
+
+            mask = compute_retention_mask(emb, (t,h,w), spatial_merge_size=merge, q=self.video_pruning_rate)
+            emb_kept = emb[mask]
+
+            pos = compute_mrope_for_media(torch.tensor([t,h,w], device=emb.device),
+                                          spatial_merge_size=merge,
+                                          tokens_per_second=self.tokens_per_second,
+                                          video_second_per_grid=s_pg).to(emb.device)
+            pos_kept = pos[mask]
+            emb_plus4 = torch.cat([emb_kept, pos_kept], dim=1)
+            outs.append(emb_plus4)
+            cursor += sz
+        return torch.cat(outs, dim=0)
+
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
@@ -534,6 +584,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if self.is_multimodal_pruning_enabled:
+            image_embeds = self._postprocess_image_embeds_evs(image_embeds, image_grid_thw)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -545,6 +597,12 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
         video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+        if self.is_multimodal_pruning_enabled:
+            second = None
+            if hasattr(items[0], "second_per_grid_ts") and items[0].second_per_grid_ts is not None:
+                second = torch.concat([it.second_per_grid_ts for it in items], dim=0)
+            video_embeds = self._postprocess_video_embeds_evs(video_embeds, video_grid_thw, second_per_grid_ts=second)
+
         return video_embeds
 
     def get_input_embeddings(self):
@@ -582,6 +640,20 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
+
+        if getattr(self, "_mm_positions_cache", None) and len(self._mm_positions_cache) > 0:
+            cfg = self.config
+            new_pos, delta = recompute_mrope_positions(
+                input_ids=input_ids,
+                multimodal_positions=self._mm_positions_cache,  # List[(4, K_i)]
+                mrope_positions=positions,                      # (3, N) or (4, N)
+                num_computed_tokens=forward_batch.num_computed_tokens if hasattr(forward_batch, "num_computed_tokens") else 0,
+                vision_start_token_id=cfg.vision_start_token_id,
+                image_token_id=cfg.image_token_id,
+                video_token_id=cfg.video_token_id,
+            )
+            positions = new_pos
+            self._mm_positions_cache = []
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,

@@ -202,49 +202,106 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         """
         This function will replace the data-tokens in between with pad_values accordingly
         """
-        pad_values = [item.pad_value for item in mm_inputs.mm_items]
-        data_token_pairs = self.data_token_id_pairs
-        mm_inputs.data_offsets = []
-        if data_token_pairs is None:
-            data_token_pairs = [mm_inputs.im_start_id, mm_inputs.im_end_id]
-        if data_token_pairs is None:
-            print_warning_once(
-                "No data_token_pairs provided, RadixAttention might be influenced."
-            )
-            return input_ids
-        start_token_ids = {s for s, _e in data_token_pairs}
-        end_tokens_ids = {e for _s, e in data_token_pairs}
-
-        padded_ids = []
-        last_idx = 0
-        data_idx = -1
-
-        start_indices = [i for i, x in enumerate(input_ids) if x in start_token_ids]
-        end_indices = [i for i, x in enumerate(input_ids) if x in end_tokens_ids]
-
-        if len(start_indices) != len(end_indices):
+        if not input_ids or not mm_inputs.mm_items:
             return input_ids
 
-        for start_idx, end_idx in zip(start_indices, end_indices):
-            padded_ids.extend(input_ids[last_idx : start_idx + 1])
+        # TODO(yuan-luo): introduce the following
+        merge = int(getattr(mm_inputs, "spatial_merge_size", 2))
+        q = float(getattr(mm_inputs, "video_pruning_rate", 0.2))
 
-            if input_ids[start_idx] in self.data_start_token_ids:
-                data_idx += 1
-                mm_inputs.data_offsets += [start_idx]
+        im_tok = getattr(mm_inputs, "im_token_id", None)
+        vd_tok = getattr(mm_inputs, "video_token_id", None)
+        au_tok = getattr(mm_inputs, "audio_token_id", None)
 
-            if data_idx >= len(pad_values):
-                data_idx = len(pad_values) - 1
+        images = [x for x in mm_inputs.mm_items if x is not None and x.is_image()]
+        videos = [x for x in mm_inputs.mm_items if x is not None and x.is_video()]
+        audios = [x for x in mm_inputs.mm_items if x is not None and x.is_audio()]
+        i_img = i_vid = i_aud = 0
 
-            num_tokens = end_idx - start_idx - 1
-            pad_value = pad_values[data_idx]
-            padded_ids.extend([pad_value] * num_tokens)
+        try:
+            from sglang.srt.managers.evs import compute_retained_tokens_count
+        except Exception:
+            compute_retained_tokens_count = None
 
-            last_idx = end_idx
+        def _get_thw(item, is_video: bool) -> Optional[tuple[int, int, int]]:
+            grid = getattr(item, "video_grid_thw" if is_video else "image_grid_thw", None)
+            if grid is None:
+                return None
+            if isinstance(grid, torch.Tensor):
+                vals = grid.view(-1).tolist()
+            else:
+                vals = list(grid)
+            if len(vals) != 3:
+                return None
+            return tuple(map(int, vals))  # (t, h, w)
 
-        padded_ids.extend(input_ids[last_idx:])
+        out: List[int] = []
+        pos = 0  # record offsets
 
-        assert len(input_ids) == len(padded_ids), "Length validation fails"
-        return padded_ids
+        for tok in input_ids:
+            # IMAGE
+            if im_tok is not None and tok == im_tok and i_img < len(images):
+                item = images[i_img]; i_img += 1
+                pad_val = int(getattr(item, "pad_value", im_tok))
+
+                thw = _get_thw(item, is_video=False)
+                if thw is None:
+                    num = 1
+                else:
+                    t, h, w = thw
+                    tpf = max(1, (h // merge) * (w // merge))
+                    num = max(1, tpf * max(1, t))
+
+                start = pos
+                out.extend([pad_val] * num)
+                end = pos + num - 1
+                pos += num
+                try:
+                    item.offsets = [(start, end)]
+                except Exception:
+                    pass
+                continue
+
+            # VIDEO
+            if vd_tok is not None and tok == vd_tok and i_vid < len(videos):
+                item = videos[i_vid]; i_vid += 1
+                pad_val = int(getattr(item, "pad_value", vd_tok))
+
+                thw = _get_thw(item, is_video=True)
+                if thw is None:
+                    num = 1
+                else:
+                    t, h, w = thw
+                    tpf = max(1, (h // merge) * (w // merge))
+                    num = compute_retained_tokens_count(tpf, max(1, t), q)
+
+                start = pos
+                out.extend([pad_val] * num)
+                end = pos + num - 1
+                pos += num
+                try:
+                    item.offsets = [(start, end)]
+                except Exception:
+                    pass
+                continue
+
+            if au_tok is not None and tok == au_tok and i_aud < len(audios):
+                item = audios[i_aud]; i_aud += 1
+                pad_val = int(getattr(item, "pad_value", au_tok))
+                start = pos
+                out.append(pad_val)
+                end = pos
+                pos += 1
+                try:
+                    item.offsets = [(start, end)]
+                except Exception:
+                    pass
+                continue
+
+            out.append(tok)
+            pos += 1
+
+        return out
 
 
 class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPattern):
