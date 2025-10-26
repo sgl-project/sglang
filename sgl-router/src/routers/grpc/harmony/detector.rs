@@ -30,7 +30,7 @@ impl HarmonyDetector {
         model_lower.contains("gpt-oss")
             || model_lower.contains("gpt-4o")
             || model_lower.contains("gpt-4.5")
-            || model_lower.starts_with("gpt-5")
+            || model_lower.contains("gpt-5")
     }
 }
 
