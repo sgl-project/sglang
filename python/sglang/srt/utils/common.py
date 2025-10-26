@@ -3573,3 +3573,11 @@ def cached_triton_kernel(key_fn=None):
         return CachedKernel(fn, key_fn)
 
     return decorator
+
+
+# Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
+def calc_diff(x, y):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
