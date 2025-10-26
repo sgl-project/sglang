@@ -248,6 +248,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
             reasoning_text=reasoning_text,
         )
 
+
 class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     """
     Append `<think>` token to the beginning of the text.
@@ -268,9 +269,10 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
             self.is_first_chunk = True
             new_text = self.think_start_token + new_text
         return StreamingParseResult(normal_text=new_text)
-    
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         return StreamingParseResult(normal_text=self.think_start_token + text)
+
 
 class ReasoningParser:
     """
