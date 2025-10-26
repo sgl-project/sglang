@@ -549,7 +549,7 @@ class ChatCompletionRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def validate_messages_or_input_ids(cls, values):
+    def validate_messages_or_input_ids(cls, values: Dict):
         """Ensure either messages or input_ids is provided, but not both."""
         messages = values.get("messages")
         input_ids = values.get("input_ids")
