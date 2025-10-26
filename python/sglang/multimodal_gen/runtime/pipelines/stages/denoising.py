@@ -621,11 +621,13 @@ class DenoisingStage(PipelineStage):
                         neg_cond_kwargs,
                         server_args,
                         guidance=guidance,
+                        latents=latents,
                     )
 
                     if batch.perf_logger:
                         batch.perf_logger.record_step_end("denoising_step_guided", i)
-
+                    print(f"{noise_pred.shape=}")
+                    print(f"{latents.shape=}")
                     # Compute the previous noisy sample
                     latents = self.scheduler.step(
                         model_output=noise_pred,
@@ -825,6 +827,7 @@ class DenoisingStage(PipelineStage):
         neg_cond_kwargs: dict[str, Any],
         server_args,
         guidance,
+        latents,
     ):
         """
         Predict the noise residual with classifier-free guidance.
@@ -848,7 +851,13 @@ class DenoisingStage(PipelineStage):
         noise_pred_cond: torch.Tensor | None = None
         noise_pred_uncond: torch.Tensor | None = None
         cfg_rank = get_classifier_free_guidance_rank()
-
+        # print(f"{latent_model_input=}")
+        # print(f"{server_args.pipeline_config.get_pos_prompt_embeds(batch)=}")
+        # print(f"{guidance=}")
+        # print(pos_cond_kwargs["freqs_cis"])
+        # print(pos_cond_kwargs["img_shapes"])
+        # print(pos_cond_kwargs["txt_seq_lens"])
+        # assert False
         # positive pass
         if not (server_args.enable_cfg_parallel and cfg_rank != 0):
             batch.is_cfg_negative = False
@@ -868,6 +877,10 @@ class DenoisingStage(PipelineStage):
                     guidance=guidance,
                     **image_kwargs,
                     **pos_cond_kwargs,
+                )
+                # TODO: can it be moved to after _predict_noise_with_cfg?
+                noise_pred_cond = server_args.pipeline_config.slice_noise_pred(
+                    noise_pred_cond, latents
                 )
         if not batch.do_classifier_free_guidance:
             # If CFG is disabled, we are done. Return the conditional prediction.
@@ -892,6 +905,9 @@ class DenoisingStage(PipelineStage):
                     guidance=guidance,
                     **image_kwargs,
                     **neg_cond_kwargs,
+                )
+                noise_pred_uncond = server_args.pipeline_config.slice_noise_pred(
+                    noise_pred_uncond, latents
                 )
 
         # Combine predictions
@@ -1102,9 +1118,9 @@ class DenoisingStage(PipelineStage):
         # result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
         result.add_check("prompt_embeds", batch.prompt_embeds, V.list_not_empty)
         result.add_check("image_embeds", batch.image_embeds, V.is_list)
-        result.add_check(
-            "image_latent", batch.image_latent, V.none_or_tensor_with_dims(5)
-        )
+        # result.add_check(
+        #     "image_latent", batch.image_latent, V.none_or_tensor_with_dims(5)
+        # )
         result.add_check(
             "num_inference_steps", batch.num_inference_steps, V.positive_int
         )

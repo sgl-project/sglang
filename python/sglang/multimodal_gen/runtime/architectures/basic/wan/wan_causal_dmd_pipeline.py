@@ -11,7 +11,7 @@ from sglang.multimodal_gen.runtime.pipelines import ComposedPipelineBase, LoRAPi
 from sglang.multimodal_gen.runtime.pipelines.stages import (
     ConditioningStage,
     DecodingStage,
-    CausalDMDDenosingStage,
+    CausalDMDDenoisingStage,
     InputValidationStage,
     LatentPreparationStage,
     TextEncodingStage,
@@ -62,7 +62,7 @@ class WanCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
 
         self.add_stage(
             stage_name="denoising_stage",
-            stage=CausalDMDDenosingStage(
+            stage=CausalDMDDenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
             ),

@@ -35,7 +35,7 @@ except ImportError:
 logger = init_logger(__name__)
 
 
-class CausalDMDDenosingStage(DenoisingStage):
+class CausalDMDDenoisingStage(DenoisingStage):
     """
     Denoising stage for causal diffusion.
     """

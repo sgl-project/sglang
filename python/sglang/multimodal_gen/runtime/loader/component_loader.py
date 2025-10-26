@@ -15,7 +15,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 from torch.distributed import init_device_mesh
-from transformers import AutoImageProcessor, AutoTokenizer
+from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.api.configs.models import EncoderConfig
@@ -90,6 +90,7 @@ class ComponentLoader(ABC):
             "tokenizer_2": (TokenizerLoader, "transformers"),
             "image_processor": (ImageProcessorLoader, "transformers"),
             "image_encoder": (ImageEncoderLoader, "transformers"),
+            "processor": (AutoProcessorLoader, "transformers"),
         }
 
         if module_type in module_loaders:
@@ -247,13 +248,13 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config.update_model_arch(model_config)
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
-            encoder_precision = server_args.pipeline_config.text_encoder_precisions[0]
+            encoder_dtype = server_args.pipeline_config.text_encoder_precisions[0]
         else:
             assert len(server_args.pipeline_config.text_encoder_configs) == 2
             encoder_config = server_args.pipeline_config.text_encoder_configs[1]
             encoder_config.update_model_arch(model_config)
-            encoder_precision = server_args.pipeline_config.text_encoder_precisions[1]
-
+            encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
+        print(f"{encoder_dtype=}")
         target_device = get_local_torch_device()
         # TODO(will): add support for other dtypes
         return self.load_model(
@@ -261,7 +262,7 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config,
             target_device,
             server_args,
-            encoder_precision,
+            encoder_dtype,
         )
 
     def load_model(
@@ -388,6 +389,20 @@ class ImageProcessorLoader(ComponentLoader):
         )
         logger.info("Loaded image processor: %s", image_processor.__class__.__name__)
         return image_processor
+
+
+class AutoProcessorLoader(ComponentLoader):
+    """Loader for auto processor."""
+
+    def load(self, model_path: str, server_args: ServerArgs, *args):
+        """Load the image processor based on the model path, and inference args."""
+        logger.info("Loading auto processor from %s", model_path)
+
+        processor = AutoProcessor.from_pretrained(
+            model_path,
+        )
+        logger.info("Loaded auto processor: %s", processor.__class__.__name__)
+        return processor
 
 
 class TokenizerLoader(ComponentLoader):

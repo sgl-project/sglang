@@ -7,7 +7,15 @@ This module contains implementations of image encoding stages for diffusion pipe
 
 import PIL
 import torch
+from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import (
+    calculate_dimensions,
+    retrieve_latents,
+)
 
+from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
+    _pack_latents,
+    qwen_image_postprocess_text,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
@@ -39,17 +47,82 @@ class ImageEncodingStage(PipelineStage):
     expected by the diffusion model.
     """
 
-    def __init__(self, image_encoder, image_processor) -> None:
+    def __init__(
+        self,
+        image_processor,
+        image_encoder=None,
+        text_encoder=None,
+        vae_image_processor=None,
+        vae=None,
+    ) -> None:
         """
         Initialize the prompt encoding stage.
 
         Args:
-            enable_logging: Whether to enable logging for this stage.
-            is_secondary: Whether this is a secondary image encoder.
+            text_encoder: An encoder to encode input_ids and pixel values
         """
         super().__init__()
         self.image_processor = image_processor
+        self.vae_image_processor = vae_image_processor
         self.image_encoder = image_encoder
+        self.text_encoder = text_encoder
+        self.vae = vae
+
+    def move_to_device(self, device):
+        fields = [
+            "image_processor",
+            "image_encoder",
+            # "text_encoder",
+        ]
+        for field in fields:
+            processor = getattr(self, field, None)
+            if processor and hasattr(processor, "to"):
+                print(f"{field=}")
+                setattr(self, field, processor.to(device))
+
+    def _encode_vae_image(
+        self,
+        image: torch.Tensor,
+        generator: torch.Generator,
+        latent_channels,
+        server_args: ServerArgs,
+        device,
+    ):
+        if isinstance(generator, list):
+            image_latents = [
+                retrieve_latents(
+                    self.vae.encode(image[i : i + 1]),
+                    generator=generator[i],
+                    sample_mode="argmax",
+                )
+                for i in range(image.shape[0])
+            ]
+            image_latents = torch.cat(image_latents, dim=0)
+        else:
+            image_latents = retrieve_latents(
+                self.vae.encode(image), generator=generator, sample_mode="argmax"
+            )
+        image_latents = image_latents.to(device)
+        latents_mean = (
+            torch.tensor(
+                server_args.pipeline_config.vae_config.arch_config.latents_mean
+            )
+            .view(1, latent_channels, 1, 1, 1)
+            .to(image_latents.device, image_latents.dtype)
+        )
+        latents_std = (
+            torch.tensor(server_args.pipeline_config.vae_config.arch_config.latents_std)
+            .view(1, latent_channels, 1, 1, 1)
+            .to(image_latents.device, image_latents.dtype)
+        )
+        image_latents = (image_latents - latents_mean) / latents_std
+
+        return image_latents
+
+    def encoding_qwen_image_edit(self, outputs, image_inputs):
+        # encoder hidden state
+        prompt_embeds = qwen_image_postprocess_text(outputs, image_inputs, 64)
+        return prompt_embeds
 
     @torch.no_grad()
     def forward(
@@ -67,21 +140,132 @@ class ImageEncodingStage(PipelineStage):
         Returns:
             The batch with encoded prompt embeddings.
         """
-        self.image_encoder = self.image_encoder.to(get_local_torch_device())
+
+        cuda_device = get_local_torch_device()
+        self.move_to_device(cuda_device)
 
         image = batch.pil_image
 
-        image_inputs = self.image_processor(images=image, return_tensors="pt").to(
-            get_local_torch_device()
+        # preprocess the imag_processor
+        prompt_image = server_args.pipeline_config.preprocess_image(
+            image, self.vae_image_processor
         )
-        with set_forward_context(current_timestep=0, attn_metadata=None):
-            outputs = self.image_encoder(**image_inputs)
-            image_embeds = outputs.last_hidden_state
 
-        batch.image_embeds.append(image_embeds)
+        if batch.prompt:
+            prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
+            txt = prompt_template_encode.format(batch.prompt)
 
-        if server_args.image_encoder_cpu_offload:
-            self.image_encoder.to("cpu")
+            image_processor_kwargs = dict(text=[txt], padding=True)
+        else:
+            image_processor_kwargs = {}
+
+        print(f"{type(self.image_processor)=}")
+        print(f"{image_processor_kwargs=}")
+        image_inputs = self.image_processor(
+            images=prompt_image, return_tensors="pt", **image_processor_kwargs
+        ).to(get_local_torch_device())
+        print(f"{image_inputs=}")
+        if self.image_encoder:
+            # if an image encoder is provided
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                outputs = self.image_encoder(**image_inputs)
+                image_embeds = outputs.last_hidden_state
+            batch.image_embeds.append(image_embeds)
+        elif self.text_encoder:
+            # if a text encoder is provided, e.g. Qwen-Image-Edit
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                outputs = self.text_encoder(
+                    input_ids=image_inputs.input_ids,
+                    attention_mask=image_inputs.attention_mask,
+                    pixel_values=image_inputs.pixel_values,
+                    image_grid_thw=image_inputs.image_grid_thw,
+                    output_hidden_states=True,
+                )
+                print(f"{self.text_encoder=}")
+                print(f"{image_inputs.image_grid_thw=}")
+                print(f"{image_inputs.input_ids.tolist()=}")
+                print(f"{image_inputs.input_ids.shape=}")
+                print(f"{image_inputs.pixel_values=}")
+            batch.prompt_embeds.append(
+                self.encoding_qwen_image_edit(outputs, image_inputs)
+            )
+
+            # 1. neg prompt embeds
+            if batch.prompt:
+                prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
+                txt = prompt_template_encode.format(batch.negative_prompt)
+                neg_image_processor_kwargs = dict(text=[txt], padding=True)
+            else:
+                neg_image_processor_kwargs = {}
+
+            neg_image_inputs = self.image_processor(
+                images=prompt_image, return_tensors="pt", **neg_image_processor_kwargs
+            ).to(get_local_torch_device())
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                neg_outputs = self.text_encoder(
+                    input_ids=neg_image_inputs.input_ids,
+                    attention_mask=neg_image_inputs.attention_mask,
+                    pixel_values=neg_image_inputs.pixel_values,
+                    image_grid_thw=neg_image_inputs.image_grid_thw,
+                    output_hidden_states=True,
+                )
+            batch.negative_prompt_embeds.append(
+                self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
+            )
+
+            # 2. image latents
+            image_size = image[0].size if isinstance(image, list) else image.size
+
+            calculated_width, calculated_height, _ = calculate_dimensions(
+                1024 * 1024, image_size[0] / image_size[1]
+            )
+            image = self.vae_image_processor.preprocess(
+                image, calculated_height, calculated_width
+            )
+            latent_channels = server_args.pipeline_config.vae_config.arch_config.z_dim
+            image = image.unsqueeze(2)
+            batch_size = batch.batch_size
+            if image.shape[1] != latent_channels:
+                image_latents = self._encode_vae_image(
+                    image=image,
+                    generator=batch.generator,
+                    latent_channels=latent_channels,
+                    server_args=server_args,
+                    device=cuda_device,
+                )
+            if (
+                batch_size > image_latents.shape[0]
+                and batch_size % image_latents.shape[0] == 0
+            ):
+                # expand init_latents for batch_size
+                additional_image_per_prompt = batch_size // image_latents.shape[0]
+                image_latents = torch.cat(
+                    [image_latents] * additional_image_per_prompt, dim=0
+                )
+            elif (
+                batch_size > image_latents.shape[0]
+                and batch_size % image_latents.shape[0] != 0
+            ):
+                raise ValueError(
+                    f"Cannot duplicate `image` of batch size {image_latents.shape[0]} to {batch_size} text prompts."
+                )
+            else:
+                image_latents = torch.cat([image_latents], dim=0)
+            image_latent_height, image_latent_width = image_latents.shape[3:]
+            num_channels_latents = (
+                self.server_args.pipeline_config.dit_config.arch_config.in_channels // 4
+            )
+            image_latents = _pack_latents(
+                image_latents,
+                batch_size,
+                num_channels_latents,
+                image_latent_height,
+                image_latent_width,
+            )
+            print(f"{image_latents.shape=}")
+            batch.image_latent = image_latents
+
+        self.move_to_device("cpu")
 
         return batch
 
@@ -95,7 +279,7 @@ class ImageEncodingStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify image encoding stage outputs."""
         result = VerificationResult()
-        result.add_check("image_embeds", batch.image_embeds, V.list_of_tensors_dims(3))
+        # result.add_check("image_embeds", batch.image_embeds, V.list_of_tensors_dims(3))
         return result
 
 

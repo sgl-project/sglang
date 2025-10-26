@@ -105,9 +105,14 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata,
     ):
         attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
-        if attn_metadata.max_seqlen_q is None:
+        if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
             attn_metadata.max_seqlen_q = query.shape[1]
             attn_metadata.max_seqlen_k = key.shape[1]
+            max_seqlen_q = attn_metadata.max_seqlen_q
+            max_seqlen_k = attn_metadata.max_seqlen_k
+        else:
+            max_seqlen_q = query.shape[1]
+            max_seqlen_k = key.shape[1]
 
         output = flash_attn_func(
             q=query,  # type: ignore[no-untyped-call]
@@ -115,8 +120,8 @@ class FlashAttentionImpl(AttentionImpl):
             v=value,
             cu_seqlens_q=None,
             cu_seqlens_k=None,
-            max_seqlen_q=attn_metadata.max_seqlen_q,
-            max_seqlen_k=attn_metadata.max_seqlen_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
         )

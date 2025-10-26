@@ -60,6 +60,7 @@ SAMPLING_PARAM_REGISTRY: dict[str, Any] = {
     # Add other specific weight variants
     "black-forest-labs/FLUX.1-dev": FluxSamplingParams,
     "Qwen/Qwen-Image": QwenImageSamplingParams,
+    "Qwen/Qwen-Image-Edit": QwenImageSamplingParams,
 }
 
 # For determining pipeline type from model ID

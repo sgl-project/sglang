@@ -445,15 +445,6 @@ class QwenImageCrossAttention(nn.Module):
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
         # Compute joint attention
-        # joint_hidden_states = dispatch_attention_fn(
-        #     joint_query,
-        #     joint_key,
-        #     joint_value,
-        #     attn_mask=attention_mask,
-        #     dropout_p=0.0,
-        #     is_causal=False,
-        #     backend=self._attention_backend,
-        # )
         joint_hidden_states = self.attn(
             joint_query,
             joint_key,
@@ -585,20 +576,6 @@ class QwenImageTransformerBlock(nn.Module):
             ),  # For scale, shift, gate for norm1 and norm2
         )
         self.img_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
-        # self.attn = Attention(
-        #     query_dim=dim,
-        #     cross_attention_dim=None,  # Enable cross attention for joint computation
-        #     added_kv_proj_dim=dim,  # Enable added KV projections for text stream
-        #     dim_head=attention_head_dim,
-        #     heads=num_attention_heads,
-        #     out_dim=dim,
-        #     context_pre_only=False,
-        #     bias=True,
-        #     processor=QwenDoubleStreamAttnProcessor2_0(dim=dim, head_dim=attention_head_dim,
-        #                                                num_heads=num_attention_heads),
-        #     qk_norm=qk_norm,
-        #     eps=eps,
-        # )
 
         self.attn = QwenImageCrossAttention(
             dim=dim,
@@ -628,6 +605,7 @@ class QwenImageTransformerBlock(nn.Module):
 
     def _modulate(self, x, mod_params):
         """Apply modulation to input tensor"""
+        # TODO: needs further profile
         return modulate_triton(x, mod_params)
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate.unsqueeze(1)
@@ -818,7 +796,6 @@ class QwenImageTransformer2DModel(CachableDiT):
         temb = self.time_text_embed(timestep, hidden_states)
 
         image_rotary_emb = freqs_cis
-
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,

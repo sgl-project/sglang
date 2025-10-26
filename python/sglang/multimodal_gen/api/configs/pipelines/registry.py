@@ -11,6 +11,7 @@ from sglang.multimodal_gen.api.configs.pipelines.hunyuan import (
     HunyuanConfig,
 )
 from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
+    QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.api.configs.pipelines.stepvideo import StepVideoT2VConfig
@@ -59,6 +60,7 @@ PIPE_NAME_TO_CONFIG: dict[str, type[PipelineConfig]] = {
     # Add other specific weight variants
     "black-forest-labs/FLUX.1-dev": FluxPipelineConfig,
     "Qwen/Qwen-Image": QwenImagePipelineConfig,
+    "Qwen/Qwen-Image-Edit": QwenImageEditPipelineConfig,
 }
 
 # For determining pipeline type from model ID
@@ -69,7 +71,8 @@ PIPELINE_DETECTOR: dict[str, Callable[[str], bool]] = {
     "wandmdpipeline": lambda id: "wandmdpipeline" in id.lower(),
     "wancausaldmdpipeline": lambda id: "wancausaldmdpipeline" in id.lower(),
     "stepvideo": lambda id: "stepvideo" in id.lower(),
-    "qwenimage": lambda id: "qwen-image" in id.lower(),
+    "qwenimage": lambda id: "qwen-image" in id.lower() and "edit" not in id.lower(),
+    "qwenimageedit": lambda id: "qwen-image-edit" in id.lower(),
     # Add other pipeline architecture detectors
 }
 
@@ -82,6 +85,7 @@ PIPELINE_FALLBACK_CONFIG: dict[str, type[PipelineConfig]] = {
     "wancausaldmdpipeline": SelfForcingWanT2V480PConfig,
     "stepvideo": StepVideoT2VConfig,
     "qwenimage": QwenImagePipelineConfig,
+    "qwenimageedit": QwenImageEditPipelineConfig,
     # Other fallbacks by architecture
 }
 
@@ -123,11 +127,12 @@ def get_pipeline_config_cls_from_name(
     if pipeline_name_or_path in PIPE_NAME_TO_CONFIG:
         pipeline_config_cls = PIPE_NAME_TO_CONFIG[pipeline_name_or_path]
 
-    # Try partial matches (for local paths that might include the weight ID)
-    for registered_id, config_class in PIPE_NAME_TO_CONFIG.items():
-        if registered_id in pipeline_name_or_path:
-            pipeline_config_cls = config_class
-            break
+    if pipeline_config_cls is None:
+        # Try partial matches (for local paths that might include the weight ID)
+        for registered_id, config_class in PIPE_NAME_TO_CONFIG.items():
+            if registered_id in pipeline_name_or_path:
+                pipeline_config_cls = config_class
+                break
 
     # If no match, try to use the fallback config
     if pipeline_config_cls is None:

@@ -393,20 +393,30 @@ class SamplingParams:
     @property
     def n_tokens(self) -> int:
         # Calculate latent sizes
-        latents_size = [
-            (self.num_frames - 1) // 4 + 1,
-            self.height // 8,
-            self.width // 8,
-        ]
-        n_tokens = latents_size[0] * latents_size[1] * latents_size[2]
+        if self.height and self.width:
+            latents_size = [
+                (self.num_frames - 1) // 4 + 1,
+                self.height // 8,
+                self.width // 8,
+            ]
+            n_tokens = latents_size[0] * latents_size[1] * latents_size[2]
+        else:
+            n_tokens = -1
         return n_tokens
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
 
     def log(self, server_args: ServerArgs):
-        target_height = align_to(self.height, 16)
-        target_width = align_to(self.width, 16)
+        # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
+        if self.height:
+            target_height = align_to(self.height, 16)
+        else:
+            target_height = -1
+        if self.width:
+            target_width = align_to(self.width, 16)
+        else:
+            target_width = -1
 
         # Log sampling parameters
         debug_str = f"""Sampling params:

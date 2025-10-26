@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any, cast
 
 import torch
+from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.api.configs.models import (
     DiTConfig,
@@ -105,10 +106,24 @@ class PipelineConfig:
 
     # Wan2.2 TI2V parameters
     ti2v_task: bool = False
+    ti2i_task: bool = False
     boundary_ratio: float | None = None
 
     # Compilation
     # enable_torch_compile: bool = False
+
+    def slice_noise_pred(self, noise, latents):
+        return noise
+
+    def set_width_and_height(self, width, height, image):
+        """
+        image: input image
+        """
+        return width, height
+
+    # called in ImageEncodingStage, preprocess the image
+    def preprocess_image(self, image, image_processor: VaeImageProcessor):
+        return image
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio

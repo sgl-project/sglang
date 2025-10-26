@@ -15,6 +15,7 @@ import PIL.Image
 import torch
 
 from sglang.multimodal_gen.api.configs.sample.base import DataType
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.performance_logger import PerformanceLogger
 
 if TYPE_CHECKING:
@@ -112,7 +113,6 @@ class Req:
     do_classifier_free_guidance: bool = False
 
     # Batch info
-    batch_size: int | None = None
     num_outputs_per_prompt: int = 1
     seed: int | None = None
     seeds: list[int] | None = None
@@ -194,6 +194,20 @@ class Req:
     # results
     output: torch.Tensor | None = None
 
+    @property
+    def batch_size(self):
+        # Determine batch size
+        if isinstance(self.prompt, list):
+            batch_size = len(self.prompt)
+        elif self.prompt is not None:
+            batch_size = 1
+        else:
+            batch_size = self.prompt_embeds[0].shape[0]
+
+        # Adjust batch size for number of videos per prompt
+        batch_size *= self.num_outputs_per_prompt
+        return batch_size
+
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
         # Set do_classifier_free_guidance based on guidance scale and negative prompt
@@ -206,6 +220,17 @@ class Req:
 
         if self.perf_logger is None:
             self.perf_logger = PerformanceLogger(self.request_id)
+
+    def set_width_and_height(self, server_args: ServerArgs):
+        if self.height is None or self.width is None:
+            width, height = server_args.pipeline_config.set_width_and_height(
+                self.width, self.height, self.pil_image
+            )
+            self.width = width
+            self.height = height
+        if self.height is None or self.width is None:
+            self.width = 1280
+            self.height = 720
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)

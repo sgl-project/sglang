@@ -12,6 +12,7 @@ import numpy as np
 
 from sglang.multimodal_gen.api.configs.pipelines import FluxPipelineConfig
 from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
+    QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -74,9 +75,11 @@ class TimestepPreparationStage(PipelineStage):
         sigmas = batch.sigmas
         n_tokens = batch.n_tokens
 
-        is_flux = isinstance(
-            server_args.pipeline_config, FluxPipelineConfig
-        ) or isinstance(server_args.pipeline_config, QwenImagePipelineConfig)
+        is_flux = (
+            isinstance(server_args.pipeline_config, FluxPipelineConfig)
+            or isinstance(server_args.pipeline_config, QwenImagePipelineConfig)
+            or isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig)
+        )
         if is_flux:
             sigmas = (
                 np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)

@@ -608,6 +608,7 @@ class WanTransformer3DModel(CachableDiT):
             if (attn_backend and attn_backend.lower() == "video_sparse_attn")
             else WanTransformerBlock
         )
+        print(f"{transformer_block=}")
         self.blocks = nn.ModuleList(
             [
                 transformer_block(
@@ -618,7 +619,8 @@ class WanTransformer3DModel(CachableDiT):
                     config.cross_attn_norm,
                     config.eps,
                     config.added_kv_proj_dim,
-                    self._supported_attention_backends,
+                    self._supported_attention_backends
+                    + (AttentionBackendEnum.VIDEO_SPARSE_ATTN,),
                     prefix=f"{config.prefix}.blocks.{i}",
                 )
                 for i in range(config.num_layers)

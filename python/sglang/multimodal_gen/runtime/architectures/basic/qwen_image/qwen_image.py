@@ -5,11 +5,14 @@ Hunyuan video diffusion pipeline implementation.
 This module contains an implementation of the Hunyuan video diffusion pipeline
 using the modular pipeline architecture.
 """
+from diffusers.image_processor import VaeImageProcessor
+
 from sglang.multimodal_gen.runtime.pipelines import ComposedPipelineBase, Req
 from sglang.multimodal_gen.runtime.pipelines.stages import (
     ConditioningStage,
     DecodingStage,
     DenoisingStage,
+    ImageEncodingStage,
     InputValidationStage,
     LatentPreparationStage,
     TextEncodingStage,
@@ -114,4 +117,67 @@ class QwenImagePipeline(ComposedPipelineBase):
         )
 
 
-EntryClass = QwenImagePipeline
+class QwenImageEditPipeline(ComposedPipelineBase):
+    pipeline_name = "QwenImageEditPipeline"
+
+    _required_config_modules = [
+        "processor",
+        "scheduler",
+        "text_encoder",
+        "tokenizer",
+        "transformer",
+        "vae",
+    ]
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        """Set up pipeline stages with proper dependency injection."""
+
+        self.add_stage(
+            stage_name="input_validation_stage", stage=InputValidationStage()
+        )
+
+        self.add_stage(
+            stage_name="prompt_encoding_stage_primary",
+            stage=ImageEncodingStage(
+                image_processor=self.get_module("processor"),
+                text_encoder=self.get_module("text_encoder"),
+                vae_image_processor=VaeImageProcessor(
+                    vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
+                    * 2
+                ),
+                vae=self.get_module("vae"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="timestep_preparation_stage",
+            stage=TimestepPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                prepare_extra_set_timesteps_kwargs=[prepare_mu],
+            ),
+        )
+
+        self.add_stage(
+            stage_name="latent_preparation_stage",
+            stage=LatentPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                transformer=self.get_module("transformer"),
+            ),
+        )
+
+        self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
+
+        self.add_stage(
+            stage_name="denoising_stage",
+            stage=DenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="decoding_stage", stage=DecodingStage(vae=self.get_module("vae"))
+        )
+
+
+EntryClass = [QwenImagePipeline, QwenImageEditPipeline]

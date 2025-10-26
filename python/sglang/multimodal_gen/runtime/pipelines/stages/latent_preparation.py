@@ -50,16 +50,8 @@ class LatentPreparationStage(PipelineStage):
         # Adjust video length based on VAE version if needed
         if hasattr(self, "adjust_video_length"):
             latent_num_frames = self.adjust_video_length(batch, server_args)
-        # Determine batch size
-        if isinstance(batch.prompt, list):
-            batch_size = len(batch.prompt)
-        elif batch.prompt is not None:
-            batch_size = 1
-        else:
-            batch_size = batch.prompt_embeds[0].shape[0]
 
-        # Adjust batch size for number of videos per prompt
-        batch_size *= batch.num_outputs_per_prompt
+        batch_size = batch.batch_size
 
         # Get required parameters
         dtype = batch.prompt_embeds[0].dtype
@@ -88,6 +80,7 @@ class LatentPreparationStage(PipelineStage):
             shape = server_args.pipeline_config.prepare_latent_shape(
                 batch, batch_size, num_frames
             )
+            print(f"{server_args.pipeline_config=}")
             latents = randn_tensor(
                 shape, generator=generator, device=device, dtype=dtype
             )
@@ -97,6 +90,7 @@ class LatentPreparationStage(PipelineStage):
         else:
             latents = latents.to(device)
 
+        print(f"{latents.shape=}")
         # Scale the initial noise if needed
         if hasattr(self.scheduler, "init_noise_sigma"):
             latents = latents * self.scheduler.init_noise_sigma

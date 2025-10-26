@@ -41,11 +41,7 @@ def prepare_sampling_params(
         sampling_params.negative_prompt = sampling_params.negative_prompt.strip()
 
     # Validate dimensions
-    if (
-        sampling_params.height <= 0
-        or sampling_params.width <= 0
-        or sampling_params.num_frames <= 0
-    ):
+    if sampling_params.num_frames <= 0:
         raise ValueError(
             f"Height, width, and num_frames must be positive integers, got "
             f"height={sampling_params.height}, width={sampling_params.width}, "
@@ -125,7 +121,17 @@ def prepare_request(
 
     sampling_params = prepare_sampling_params(prompt, server_args, sampling_params)
 
-    return Req(
+    req = Req(
         **shallow_asdict(sampling_params),
         VSA_sparsity=server_args.VSA_sparsity,
     )
+    # req.set_width_and_height(server_args)
+
+    # if (req.width <= 0
+    #     or req.height <= 0):
+    #     raise ValueError(
+    #         f"Height, width must be positive integers, got "
+    #         f"height={req.height}, width={req.width}"
+    #     )
+
+    return req

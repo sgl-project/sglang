@@ -11,12 +11,13 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import field
 from enum import Enum
-from typing import Any, Optional, cast
+from typing import Any, Optional
 
 from sglang.multimodal_gen.api.configs.configs import PreprocessConfig
 from sglang.multimodal_gen.api.configs.pipelines import FluxPipelineConfig
 from sglang.multimodal_gen.api.configs.pipelines.base import PipelineConfig, STA_Mode
 from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
+    QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import HAS_LONG_CTX_ATTN
@@ -824,8 +825,10 @@ class ServerArgs:
             self.use_fsdp_inference = False
 
         # autocast
-        is_flux = isinstance(self.pipeline_config, FluxPipelineConfig) or isinstance(
-            self.pipeline_config, QwenImagePipelineConfig
+        is_flux = (
+            isinstance(self.pipeline_config, FluxPipelineConfig)
+            or isinstance(self.pipeline_config, QwenImagePipelineConfig)
+            or isinstance(self.pipeline_config, QwenImageEditPipelineConfig)
         )
         if is_flux:
             self.disable_autocast = True

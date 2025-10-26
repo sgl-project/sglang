@@ -91,7 +91,7 @@ class _PipelineRegistry:
                 raise ValueError(f"Invalid pipeline type: {pipeline_type.value}")
         except KeyError as e:
             logger.error(
-                f"Please check if the ComposedPipeline class has been defined associated with {pipeline_type.value}"
+                f"Please check if the ComposedPipeline class has been defined associated with {pipeline_type.value}.{pipeline_name_in_config}"
             )
             raise e
         return None
@@ -172,6 +172,10 @@ def import_pipeline_classes(
                         if not ispkg:
                             pipeline_module = importlib.import_module(module_name)
                             if hasattr(pipeline_module, "EntryClass"):
+                                entry_cls_list = pipeline_module.EntryClass
+                                if not isinstance(entry_cls_list, list):
+                                    entry_cls_list = [entry_cls_list]
+
                                 if isinstance(pipeline_module.EntryClass, list):
                                     pipeline_names = [
                                         pipeline.__name__
@@ -182,12 +186,16 @@ def import_pipeline_classes(
                                         pipeline_module.EntryClass.__name__
                                     ]
 
-                                for pipeline_name in pipeline_names:
+                                for entry_cls, pipeline_name in zip(
+                                    entry_cls_list, pipeline_names
+                                ):
                                     assert (
                                         pipeline_name not in pipeline_dict
                                     ), f"Duplicated pipeline implementation for {pipeline_name} in {pipeline_type_str}.{arch_package_name}"
-                                    entry_cls = pipeline_module.EntryClass
-                                    assert hasattr(entry_cls, "pipeline_name")
+
+                                    assert hasattr(
+                                        entry_cls, "pipeline_name"
+                                    ), f"{entry_cls}"
                                     pipeline_dict[pipeline_name] = entry_cls
 
             type_to_pipeline_dict[pipeline_type_str] = pipeline_dict

@@ -8,7 +8,7 @@ complete diffusion pipelines.
 
 from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines.stages.causal_denoising import (
-    CausalDMDDenosingStage,
+    CausalDMDDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines.stages.conditioning import (
     ConditioningStage,
@@ -47,7 +47,7 @@ __all__ = [
     "ConditioningStage",
     "DenoisingStage",
     "DmdDenoisingStage",
-    "CausalDMDDenosingStage",
+    "CausalDMDDenoisingStage",
     "EncodingStage",
     "DecodingStage",
     "ImageEncodingStage",

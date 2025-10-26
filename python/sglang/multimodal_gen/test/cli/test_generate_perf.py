@@ -20,6 +20,7 @@ class TestGenerateBase(TestCLIBase):
     width: int = 720
     height: int = 720
     output_path: str = "outputs"
+    image_path: str | None = None
 
     base_command = [
         "sglang",
@@ -213,6 +214,35 @@ class TestQwenImage(TestGenerateBase):
     thresholds = {
         "test_single_gpu": 10.0 * 1.05,
     }
+
+
+class TestQwenImageEdit(TestGenerateBase):
+    model_path = "Qwen/Qwen-Image-Edit"
+    extra_args = []
+    data_type: DataType = DataType.IMAGE
+    thresholds = {
+        "test_single_gpu": 52.3 * 1.05,
+    }
+    """single gpu"""
+
+    def test_cfg_parallel(self):
+        pass
+
+    def test_mixed(self):
+        pass
+
+    def test_usp(self):
+        pass
+
+    def test_single_gpu(self):
+        self.base_command += ["image_path=test_files/rabbit.jpg"]
+
+        self._run_test(
+            name=f"{self.model_name()}, single gpu",
+            args=None,
+            model_path=self.model_path,
+            test_key="test_single_gpu",
+        )
 
 
 if __name__ == "__main__":

@@ -7,6 +7,9 @@ import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
 
+from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
+    QwenImageEditPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
 from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
@@ -107,8 +110,18 @@ class InputValidationStage(PipelineStage):
                 image = load_image(batch.image_path)
             batch.pil_image = image
 
-        # further processing for ti2v task
-        if server_args.pipeline_config.ti2v_task and batch.pil_image is not None:
+        if isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig):
+            # TODO: we need to know if no width or height is passed as sampling params
+            width, height = server_args.pipeline_config.set_width_and_height(
+                None, None, batch.pil_image
+            )
+            batch.width = width
+            batch.height = height
+        elif (
+            server_args.pipeline_config.ti2v_task
+            or server_args.pipeline_config.ti2i_task
+        ) and batch.pil_image is not None:
+            # further processing for ti2v task
             img = batch.pil_image
             ih, iw = img.height, img.width
             patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size

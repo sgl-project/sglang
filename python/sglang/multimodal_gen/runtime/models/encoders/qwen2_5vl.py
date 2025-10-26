@@ -58,6 +58,7 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VisionTransformerPretrainedModel,
     Qwen2_5_VLAttention,
     Qwen2_5_VLCausalLMOutputWithPast,
     Qwen2_5_VLModelOutputWithPast,
@@ -504,12 +505,15 @@ class Qwen2_5_VLModel(nn.Module):
     _checkpoint_conversion_mapping = {"^model": "language_model"}
     # Reference: fix gemma3 grad acc #37208
     accepts_loss_kwargs = False
-    # config: Qwen2_5VLConfig
     _no_split_modules = ["Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"]
 
     def __init__(self, config):
         super().__init__()
+        self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(
+            config.vision_config
+        )
         self.language_model = Qwen2_5_VLTextModel(config.text_config)
+        self.visual.to(torch.get_default_dtype())
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config
         # Initialize weights and apply final processing
@@ -909,6 +913,26 @@ class Qwen2_5_VLModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
+        if pixel_values is not None:
+            image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds = torch.cat(image_embeds, dim=0).to(
+                inputs_embeds.device, inputs_embeds.dtype
+            )
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if pixel_values_videos is not None:
+            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+            video_embeds = torch.cat(video_embeds, dim=0).to(
+                inputs_embeds.device, inputs_embeds.dtype
+            )
+            _, video_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
         if position_ids is None:
             # Calculate RoPE index once per generation in the pre-fill stage only.
             # When compiling, we can't check tensor values thus we check only input length
@@ -1123,14 +1147,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            # (".qkv_proj", ".q_proj", "q"),
-            # (".qkv_proj", ".k_proj", "k"),
-            # (".qkv_proj", ".v_proj", "v"),
-            # ("gate_up_proj", "up_proj", 1),
-            # ("gate_up_proj", "gate_proj", 0),
-        ]
         loaded_params: set[str] = set()
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -1139,42 +1155,21 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
                 continue
 
             name = name.replace("model.", "model.language_model.")
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if (
-                    "visual" in name
-                    and "up_proj" not in name
-                    and "gate_proj" not in name
-                ):
-                    continue
-                name = name.replace(weight_name, param_name)
-
+            if "visual." in name:
+                name = name.replace("visual.", "model.visual.")
+            try:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                if "visual" in name:
-                    continue
+            except KeyError:
+                print(params_dict.keys())
+                raise
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
-
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            loaded_weight = loaded_weight.to(param.dtype)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
         return loaded_params
 
     def get_embed_and_head(self):

@@ -9,6 +9,7 @@ import torch
 
 from sglang.multimodal_gen.api.configs.models.vaes.base import VAEArchConfig
 from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
+    QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -63,7 +64,9 @@ class DecodingStage(PipelineStage):
         self, vae_arch_config: VAEArchConfig, latents: torch.Tensor, server_args
     ):
         # 1. scale
-        is_qwen_image = isinstance(server_args.pipeline_config, QwenImagePipelineConfig)
+        is_qwen_image = isinstance(
+            server_args.pipeline_config, QwenImagePipelineConfig
+        ) or isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig)
         if is_qwen_image:
             scaling_factor = 1.0 / torch.tensor(
                 vae_arch_config.latents_std, device=latents.device

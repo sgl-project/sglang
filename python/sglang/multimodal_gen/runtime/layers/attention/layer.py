@@ -62,7 +62,10 @@ class UlyssesAttention(nn.Module):
         attn_backend = get_attn_backend(
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
+        print(f"{supported_attention_backends=}")
         impl_cls = attn_backend.get_impl_cls()
+        print(f"{impl_cls=}")
+
         self.attn_impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
@@ -206,7 +209,7 @@ class UlyssesAttention_VSA(UlyssesAttention):
 
         q, k, v, gate_compress = qkvg.chunk(4, dim=0)
         output = self.attn_impl.forward(
-            q, k, v, gate_compress, ctx_attn_metadata
+            q, k, v, gate_compress=gate_compress, attn_metadata=ctx_attn_metadata
         )  # type: ignore[call-arg]
 
         # Redistribute back if using sequence parallelism
@@ -285,7 +288,7 @@ class LocalAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
 
-        output = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
         return output
 
 

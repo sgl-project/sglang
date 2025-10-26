@@ -266,7 +266,7 @@ class CudaPlatformBase(Platform):
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        logger.info("Using Flash Attention backend.")
+        logger.info("Using fa3 backend.")
 
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 

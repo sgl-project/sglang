@@ -62,5 +62,4 @@ class QwenImageArchConfig(TextEncoderArchConfig):
 @dataclass
 class Qwen2_5VLConfig(TextEncoderConfig):
     arch_config: TextEncoderArchConfig = field(default_factory=QwenImageArchConfig)
-
-    prefix: str = "qwen_image"
+    # prefix: str = "qwen_image"
