@@ -683,4 +683,4 @@ class BertModel(CLIPTextModel):
     pass
 
 
-EntryClass = CLIPTextModel
+EntryClass = [CLIPTextModel, CLIPVisionModel]

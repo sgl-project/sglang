@@ -82,7 +82,12 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
                                 logger.warning(
                                     f"Duplicate architecture found: {model_cls_str}. It will be overwritten."
                                 )
-                            discovered_models[model_cls_str] = (
+                            model_arch = (
+                                model_cls_str
+                                if model_cls_str != "CLIPVisionModel"
+                                else "CLIPVisionModelWithProjection"
+                            )
+                            discovered_models[model_arch] = (
                                 component,
                                 mod_relname,
                                 model_cls_str,
