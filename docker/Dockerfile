@@ -148,7 +148,7 @@ RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
       if [ "$CUDA_VERSION" = "12.6.1" ]; then \
         export FLASH_MLA_DISABLE_SM100=1; \
       fi && \
-      pip install -v . ;
+      pip install --no-build-isolation -v . ;
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
