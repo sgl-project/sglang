@@ -191,6 +191,9 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -499,6 +502,9 @@ class Scheduler(
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
+        
+        # Init routed experts capturer
+        self.init_routed_experts_capturer()
 
         # Init overlap
         self.init_overlap()
@@ -709,6 +715,16 @@ class Scheduler(
                     revision=server_args.revision,
                 )
 
+    def init_routed_experts_capturer(self):
+        if self.server_args.enable_return_routed_experts:
+            self.routed_experts_capturer = RoutedExpertsCapturer.create(
+                self.server_args.enable_return_routed_experts
+            )
+            self.routed_experts_capturer.init_buffer(
+                max_running_requests=self.max_running_requests,
+                model_config=self.model_config,
+            )
+    
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
 
@@ -1195,6 +1211,7 @@ class Scheduler(
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=recv_req.custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
+                return_routed_experts=recv_req.return_routed_experts,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,

@@ -147,6 +147,13 @@ class SchedulerOutputProcessorMixin:
                             .clone()
                             .tolist()
                         )
+                    
+                    if req.return_routed_experts:
+                        req.routed_experts.append(
+                            self.routed_experts_capturer.get_captured_experts()[i]
+                            .clone()
+                            .tolist()
+                        )
 
                     if req.grammar is not None:
                         # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -372,6 +379,13 @@ class SchedulerOutputProcessorMixin:
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
+                )
+            
+            if req.return_routed_experts:
+                req.routed_experts.append(
+                    self.routed_experts_capturer.get_captured_experts()[i]
+                    .clone()
+                    .tolist()
                 )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
@@ -728,6 +742,7 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_accepted_tokens = []
         output_hidden_states = None
+        output_routed_experts = None
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -904,6 +919,10 @@ class SchedulerOutputProcessorMixin:
                     if output_hidden_states is None:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
+                if req.return_routed_experts:
+                    if output_routed_experts is None:
+                        output_routed_experts = []
+                    output_routed_experts.append(req.routed_experts)
 
             if (
                 req.finished()
@@ -946,6 +965,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
+                    output_routed_experts=output_routed_experts,
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,

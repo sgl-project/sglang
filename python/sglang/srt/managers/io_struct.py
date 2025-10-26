@@ -126,6 +126,8 @@ class GenerateReqInput(BaseReq):
     log_metrics: bool = True
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
+    # Whether to return captured routed experts
+    return_routed_experts: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -540,6 +542,7 @@ class GenerateReqInput(BaseReq):
                 if isinstance(self.return_hidden_states, list)
                 else self.return_hidden_states
             ),
+            return_routed_experts=self.return_routed_experts,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -602,6 +605,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether to return captured routed experts
+    return_routed_experts: bool = False
+    
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
@@ -848,6 +854,9 @@ class BatchTokenIDOutput(BaseBatchReq):
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The routed experts for each output token
+    output_routed_experts: List[List[int]]
+    
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -924,6 +933,9 @@ class BatchStrOutput(BaseBatchReq):
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The routed experts for each output token
+    output_routed_experts: List[List[int]]
+    
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.

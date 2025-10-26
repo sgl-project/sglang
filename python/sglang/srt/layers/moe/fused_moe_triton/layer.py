@@ -51,6 +51,10 @@ from sglang.srt.utils import (
     is_hip,
     round_up,
 )
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    RoutedExpertsCapturer
+)
 
 if is_flashinfer_available():
     from flashinfer import RoutingMethodType, fp4_quantize
@@ -227,6 +231,9 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        self.routed_experts_capturer = RoutedExpertsCapturer.create(
+            get_global_server_args().enable_return_routed_experts
+        )
 
         self.should_fuse_routed_scaling_factor_in_topk = isinstance(
             self.quant_method, ModelOptNvFp4FusedMoEMethod
@@ -834,7 +841,11 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
-
+        self.routed_experts_capturer.capture(
+            layer_id=self.layer_id,
+            topk_output=topk_output,
+        )
+        
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
             **kwargs,
