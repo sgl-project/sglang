@@ -268,8 +268,7 @@ class ReasoningParser:
         "kimi": KimiDetector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
-        "minimax-m1": Qwen3Detector,
-        "minimax-m2": Qwen3Detector,
+        "minimax": Qwen3Detector,
         "step3": DeepSeekR1Detector,
     }
 
@@ -287,7 +286,7 @@ class ReasoningParser:
             raise ValueError(f"Unsupported model type: {model_type}")
 
         # Special cases where we override force_reasoning
-        if model_type.lower() in {"qwen3-thinking", "gpt-oss"}:
+        if model_type.lower() in {"qwen3-thinking", "gpt-oss", "minimax"}:
             force_reasoning = True
 
         # Only pass force_reasoning if explicitly set, let detectors use their defaults
