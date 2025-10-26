@@ -36,7 +36,7 @@ RUN pip install --no-cache-dir -e /opt/sglang-src/python[all]
 COPY .hathora_build/app /app/
 RUN chmod +x /app/entrypoint.sh
 RUN chmod +x /app/entrypoint_sglang_native.sh
-RUN chmod +x /app/k2/preset.sh
+RUN chmod +x /app/kimi_k2/preset.sh
 
 EXPOSE 8000
 
