@@ -174,8 +174,7 @@ pub struct ResponseState {
     pub harmony_parser: Option<super::harmony::HarmonyParserAdapter>,
 
     /// Harmony parsers for streaming (one per index for n>1 support)
-    pub harmony_parser_per_index:
-        Option<HashMap<usize, super::harmony::HarmonyParserAdapter>>,
+    pub harmony_parser_per_index: Option<HashMap<usize, super::harmony::HarmonyParserAdapter>>,
 }
 
 /// Streaming state (per-choice tracking)
