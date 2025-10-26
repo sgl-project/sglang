@@ -204,9 +204,7 @@ class MMMUVLMEval(Eval):
 
             # Sample
             response_text = sampler(prompt_messages)
-            # Handle case where response_text is None or empty
-            if response_text is None:
-                response_text = ""
+            response_text = response_text or ""
 
             # Parse and score
             gold = sample["answer"]
