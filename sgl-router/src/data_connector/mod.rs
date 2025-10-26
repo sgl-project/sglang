@@ -13,12 +13,10 @@ mod memory;
 mod noop;
 mod oracle;
 
-// Re-export all core types
-pub use core::*;
-
-// Re-export factory function
+pub use core::{
+    Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,
+    ConversationStorage, ListParams, NewConversation, NewConversationItem, ResponseId,
+    ResponseStorage, SortOrder, StoredResponse,
+};
 pub use factory::create_storage;
-// Re-export all storage implementations
-pub use memory::*;
-pub use noop::*;
-pub use oracle::*;
+pub use memory::{MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage};
