@@ -691,6 +691,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def should_apply_lora(self, module_name: str) -> bool:
+        """Apply LoRA only to text stack; skip vision tower."""
+        return not module_name.startswith("visual")
+
     def forward(
         self,
         input_ids: torch.Tensor,
