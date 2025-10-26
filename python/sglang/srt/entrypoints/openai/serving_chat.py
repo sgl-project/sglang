@@ -113,12 +113,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
-        # Check that either messages or input_ids is provided
-        if not request.messages and not request.input_ids:
-            return "Either messages or input_ids must be provided."
-
-        if request.messages and request.input_ids:
-            return "Cannot provide both messages and input_ids."
 
         # When using input_ids, skip message-related validations
         if request.input_ids:
