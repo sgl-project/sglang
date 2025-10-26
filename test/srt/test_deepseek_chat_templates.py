@@ -36,7 +36,9 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
                 template_content = f.read()
             cls.templates[version] = Template(template_content)
 
-    def _render_template(self, version, messages, tools=None, add_generation_prompt=True):
+    def _render_template(
+        self, version, messages, tools=None, add_generation_prompt=True
+    ):
         """Helper method to render a template with given messages and tools."""
         template = self.templates[version]
 
@@ -68,7 +70,10 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
                                 "type": "function",
                                 "function": {
                                     "name": "get_weather",
-                                    "arguments": {"city": "New York", "unit": "celsius"},  # Dict
+                                    "arguments": {
+                                        "city": "New York",
+                                        "unit": "celsius",
+                                    },  # Dict
                                 },
                             }
                         ],
@@ -96,11 +101,17 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
 
                 # Should contain properly formatted JSON (not double-escaped)
                 self.assertIn('"city"', output, f"{version}: Should contain city key")
-                self.assertIn('"New York"', output, f"{version}: Should contain city value")
+                self.assertIn(
+                    '"New York"', output, f"{version}: Should contain city value"
+                )
 
                 # Should NOT contain double-escaped quotes
-                self.assertNotIn('\\"city\\"', output, f"{version}: Should not double-escape")
-                self.assertNotIn('\\\\"', output, f"{version}: Should not have escaped backslashes")
+                self.assertNotIn(
+                    '\\"city\\"', output, f"{version}: Should not double-escape"
+                )
+                self.assertNotIn(
+                    '\\\\"', output, f"{version}: Should not have escaped backslashes"
+                )
 
     def test_tool_arguments_as_string(self):
         """Test that tool arguments as string are used as-is (multi-round case)."""
@@ -145,15 +156,25 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
                 output = self._render_template(version, messages, tools)
 
                 # Should contain the JSON string as-is
-                self.assertIn('{"symbol": "NVDA"}', output, f"{version}: Should contain JSON as-is")
+                self.assertIn(
+                    '{"symbol": "NVDA"}',
+                    output,
+                    f"{version}: Should contain JSON as-is",
+                )
 
                 # Should NOT double-escape (the bug from issue #11700)
                 # Bad output would look like: "{\"symbol\": \"NVDA\"}" or "{\\"symbol\\": \\"NVDA\\"}"
-                self.assertNotIn('{\\"symbol\\"', output, f"{version}: Should not double-escape")
-                self.assertNotIn('"{\\"symbol', output, f"{version}: Should not wrap and escape")
+                self.assertNotIn(
+                    '{\\"symbol\\"', output, f"{version}: Should not double-escape"
+                )
+                self.assertNotIn(
+                    '"{\\"symbol', output, f"{version}: Should not wrap and escape"
+                )
 
                 # Verify it's not triple-quoted or escaped
-                self.assertNotIn('""{"', output, f"{version}: Should not have extra quotes")
+                self.assertNotIn(
+                    '""{"', output, f"{version}: Should not have extra quotes"
+                )
 
     def test_multiple_tool_calls_mixed_types(self):
         """Test multiple tool calls with mixed dict and string argument types."""
@@ -191,7 +212,10 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
                         "function": {
                             "name": "get_weather",
                             "description": "Get weather",
-                            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
                         },
                     },
                     {
@@ -199,7 +223,10 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
                         "function": {
                             "name": "get_stock_info",
                             "description": "Get stock info",
-                            "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}},
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"symbol": {"type": "string"}},
+                            },
                         },
                     },
                 ]
@@ -207,15 +234,33 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
                 output = self._render_template(version, messages, tools)
 
                 # First tool (dict) should be properly JSON-encoded
-                self.assertIn('"city"', output, f"{version}: First tool should have city key")
-                self.assertIn('"Boston"', output, f"{version}: First tool should have Boston value")
+                self.assertIn(
+                    '"city"', output, f"{version}: First tool should have city key"
+                )
+                self.assertIn(
+                    '"Boston"',
+                    output,
+                    f"{version}: First tool should have Boston value",
+                )
 
                 # Second tool (string) should be used as-is
-                self.assertIn('{"symbol": "TSLA"}', output, f"{version}: Second tool should use string as-is")
+                self.assertIn(
+                    '{"symbol": "TSLA"}',
+                    output,
+                    f"{version}: Second tool should use string as-is",
+                )
 
                 # Neither should be double-escaped
-                self.assertNotIn('\\"city\\"', output, f"{version}: First tool should not double-escape")
-                self.assertNotIn('\\"symbol\\"', output, f"{version}: Second tool should not double-escape")
+                self.assertNotIn(
+                    '\\"city\\"',
+                    output,
+                    f"{version}: First tool should not double-escape",
+                )
+                self.assertNotIn(
+                    '\\"symbol\\"',
+                    output,
+                    f"{version}: Second tool should not double-escape",
+                )
 
     def test_tool_call_with_content(self):
         """Test tool calls that also include content text."""
@@ -246,7 +291,10 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
                         "function": {
                             "name": "get_weather",
                             "description": "Get weather",
-                            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
                         },
                     }
                 ]
@@ -254,9 +302,17 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
                 output = self._render_template(version, messages, tools)
 
                 # Should contain both the content and the tool call
-                self.assertIn("Let me check the weather", output, f"{version}: Should include content")
-                self.assertIn('"city"', output, f"{version}: Should include tool arguments")
-                self.assertNotIn('\\"city\\"', output, f"{version}: Should not double-escape")
+                self.assertIn(
+                    "Let me check the weather",
+                    output,
+                    f"{version}: Should include content",
+                )
+                self.assertIn(
+                    '"city"', output, f"{version}: Should include tool arguments"
+                )
+                self.assertNotIn(
+                    '\\"city\\"', output, f"{version}: Should not double-escape"
+                )
 
 
 if __name__ == "__main__":
