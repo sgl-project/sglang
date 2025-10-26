@@ -1004,7 +1004,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        from flash_mla import flash_mla_sparse_fwd
+        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_all,
@@ -1025,7 +1025,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         metadata: NSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        from flash_mla import flash_mla_with_kvcache
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.nsa_cache_seqlens_int32
 
@@ -1127,7 +1127,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         return NSAIndexerMetadata(attn_metadata=self.forward_metadata)
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        from flash_mla import get_mla_metadata
+        from sgl_kernel.flash_mla import get_mla_metadata
 
         flashmla_metadata, num_splits = get_mla_metadata(
             cache_seqlens=cache_seqlens,
