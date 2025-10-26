@@ -690,7 +690,7 @@ pub fn build_app(
         )
         .route("/v1/responses/{response_id}", delete(v1_responses_delete))
         .route(
-            "/v1/responses/{response_id}/input",
+            "/v1/responses/{response_id}/input_items",
             get(v1_responses_list_input_items),
         )
         .route("/v1/conversations", post(v1_conversations_create))
