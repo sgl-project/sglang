@@ -174,6 +174,126 @@ class TestSageMakerServer(CustomTestCase):
             for parallel_sample_num in [1, 2]:
                 self.run_chat_completion_stream(logprobs, parallel_sample_num)
 
+    def test_chat_completion_with_input_ids(self):
+        """Test chat completion using input_ids instead of messages"""
+        # Prepare the prompt and tokenize it
+        messages = [
+            {"role": "system", "content": "You are a helpful AI assistant"},
+            {
+                "role": "user",
+                "content": "What is the capital of France? Answer in a few words.",
+            },
+        ]
+
+        # Apply chat template to get input_ids
+        input_ids = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+
+        # Test with input_ids
+        data = {
+            "model": self.model,
+            "input_ids": input_ids,
+            "temperature": 0,
+            "max_tokens": 50,
+        }
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        response = requests.post(
+            f"{self.base_url}/invocations", json=data, headers=headers
+        ).json()
+
+        # Verify response structure
+        assert len(response["choices"]) == 1
+        assert response["choices"][0]["message"]["role"] == "assistant"
+        assert isinstance(response["choices"][0]["message"]["content"], str)
+        assert len(response["choices"][0]["message"]["content"]) > 0
+        assert response["id"]
+        assert response["created"]
+        assert response["usage"]["prompt_tokens"] > 0
+        assert response["usage"]["completion_tokens"] > 0
+        assert response["usage"]["total_tokens"] > 0
+
+        print(
+            f"✅ input_ids test passed. Response: {response['choices'][0]['message']['content']}"
+        )
+
+    def test_chat_completion_with_input_ids_stream(self):
+        """Test streaming chat completion using input_ids"""
+        # Prepare the prompt and tokenize it
+        messages = [
+            {"role": "system", "content": "You are a helpful AI assistant"},
+            {
+                "role": "user",
+                "content": "What is the capital of France? Answer in a few words.",
+            },
+        ]
+
+        # Apply chat template to get input_ids
+        input_ids = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+
+        # Test streaming with input_ids
+        data = {
+            "model": self.model,
+            "input_ids": input_ids,
+            "temperature": 0,
+            "max_tokens": 50,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        response = requests.post(
+            f"{self.base_url}/invocations", json=data, stream=True, headers=headers
+        )
+
+        is_first = True
+        content_chunks = []
+
+        for line in response.iter_lines():
+            line = line.decode("utf-8").replace("data: ", "")
+            if len(line) < 1 or line == "[DONE]":
+                continue
+
+            line = json.loads(line)
+
+            # Check usage chunk
+            usage = line.get("usage")
+            if usage is not None:
+                assert usage["prompt_tokens"] > 0
+                assert usage["completion_tokens"] > 0
+                assert usage["total_tokens"] > 0
+                continue
+
+            data_chunk = line.get("choices")[0].get("delta")
+
+            if is_first:
+                assert data_chunk["role"] == "assistant"
+                is_first = False
+                continue
+
+            # Collect content
+            if "content" in data_chunk and data_chunk["content"]:
+                content_chunks.append(data_chunk["content"])
+                assert isinstance(data_chunk["content"], str)
+
+            assert line["id"]
+            assert line["created"]
+
+        # Verify we got some content
+        full_content = "".join(content_chunks)
+        assert len(full_content) > 0
+
+        print(f"✅ input_ids streaming test passed. Response: {full_content}")
+
 
 if __name__ == "__main__":
     unittest.main()
