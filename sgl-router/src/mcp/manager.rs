@@ -37,7 +37,9 @@ use crate::mcp::{
     connection_pool::McpConnectionPool,
     error::{McpError, McpResult},
     inventory::ToolInventory,
+    tool_args::ToolArgs,
 };
+
 /// Type alias for MCP client
 type McpClient = RunningService<RoleClient, ()>;
 
@@ -221,17 +223,27 @@ impl McpManager {
             .collect()
     }
 
-    /// Call a tool by name
+    /// Call a tool by name with automatic type coercion
+    ///
+    /// Accepts either JSON string or parsed Map as arguments.
+    /// Automatically converts string numbers to actual numbers based on tool schema.
     pub async fn call_tool(
         &self,
         tool_name: &str,
-        args: Option<Map<String, serde_json::Value>>,
+        args: impl Into<ToolArgs>,
     ) -> McpResult<CallToolResult> {
-        // Get server that owns this tool
-        let (server_name, _tool_info) = self
+        // Get tool info for schema and server
+        let (server_name, tool_info) = self
             .inventory
             .get_tool(tool_name)
             .ok_or_else(|| McpError::ToolNotFound(tool_name.to_string()))?;
+
+        // Convert args with type coercion based on schema
+        let tool_schema = tool_info.parameters.as_ref();
+        let args_map = args
+            .into()
+            .into_map(tool_schema)
+            .map_err(McpError::InvalidArguments)?;
 
         // Get client for that server
         let client = self
@@ -242,7 +254,7 @@ impl McpManager {
         // Call the tool
         let request = CallToolRequestParam {
             name: Cow::Owned(tool_name.to_string()),
-            arguments: args,
+            arguments: args_map,
         };
 
         client
