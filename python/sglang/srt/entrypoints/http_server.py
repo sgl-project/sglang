@@ -506,8 +506,8 @@ async def get_server_info():
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
-        # "internal_states": internal_states,
-        # "version": __version__,
+        "internal_states": internal_states,
+        "version": __version__,
     }
 
 
