@@ -218,9 +218,10 @@ mod test_pd_routing {
                     config.worker_startup_check_interval_secs,
                 )));
 
-                // Create empty OnceLock for worker job queue and workflow engine
+                // Create empty OnceLock for worker job queue, workflow engine, and mcp manager
                 let worker_job_queue = Arc::new(OnceLock::new());
                 let workflow_engine = Arc::new(OnceLock::new());
+                let mcp_manager = Arc::new(OnceLock::new());
 
                 Arc::new(
                     AppContext::builder()
@@ -238,6 +239,7 @@ mod test_pd_routing {
                         .load_monitor(load_monitor)
                         .worker_job_queue(worker_job_queue)
                         .workflow_engine(workflow_engine)
+                        .mcp_manager(mcp_manager)
                         .build()
                         .unwrap(),
                 )
