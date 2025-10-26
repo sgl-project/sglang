@@ -45,7 +45,7 @@ impl TestContext {
             worker_urls: worker_urls.clone(),
         };
 
-        let app_context = common::create_test_context(config.clone());
+        let app_context = common::create_test_context(config.clone()).await;
 
         let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
