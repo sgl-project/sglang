@@ -68,6 +68,7 @@ class MultimodalLanguageRequest:
     partial_fill_ids: List[int] = None
     partial_sent_tokens: int = None
     partial_aux_datas: torch.Tensor = None
+    partial_deepstack_embedding: torch.Tensor = None
 
 
 class MultimodalLanguagePreallocQueue:
@@ -304,11 +305,15 @@ class MultimodalLanguageTransferQueue:
                             language_req.partial_aux_datas[0].item()
                             - language_req.partial_sent_tokens
                         )
-                        embedding_data, fill_ids, mrope_positions, aux_datas = (
-                            self.metadata_buffers.get_buf(
-                                block_indices=block_indices,
-                                actual_total_length=actual_total_length,
-                            )
+                        (
+                            embedding_data,
+                            fill_ids,
+                            mrope_positions,
+                            aux_datas,
+                            deepstack_embedding,
+                        ) = self.metadata_buffers.get_buf(
+                            block_indices=block_indices,
+                            actual_total_length=actual_total_length,
                         )
                         # Merge partial data with new data
                         logger.info(
@@ -319,6 +324,13 @@ class MultimodalLanguageTransferQueue:
                         embedding_data = torch.cat(
                             [language_req.partial_input_embeds, embedding_data]
                         )
+                        if deepstack_embedding is not None:
+                            deepstack_embedding = torch.cat(
+                                [
+                                    language_req.partial_deepstack_embedding,
+                                    deepstack_embedding,
+                                ]
+                            )
 
                         # Concatenate fill_ids
                         fill_ids = torch.cat(
@@ -338,17 +350,31 @@ class MultimodalLanguageTransferQueue:
                         del language_req.partial_fill_ids
                         del language_req.partial_mrope_positions
                         del language_req.partial_sent_tokens
+                        del language_req.partial_deepstack_embedding
                     else:
-                        embedding_data, fill_ids, mrope_positions, aux_datas = (
-                            self.metadata_buffers.get_buf(block_indices=block_indices)
-                        )
+                        (
+                            embedding_data,
+                            fill_ids,
+                            mrope_positions,
+                            aux_datas,
+                            deepstack_embedding,
+                        ) = self.metadata_buffers.get_buf(block_indices=block_indices)
 
                     embedding_length = int(aux_datas[0])
                     mrope_position_delta = aux_datas[1]
-                    language_req.req.input_embeds = embedding_data
-                    language_req.req.origin_input_ids = fill_ids.tolist()
                     mm_inputs = None
                     ori_input_length = len(language_req.req.origin_input_ids)
+                    language_req.req.origin_input_ids = fill_ids.tolist()
+
+                    if deepstack_embedding is not None:
+                        # NOTE: merge input_embeds and deepstack_embedding to input_embeds to
+                        # simplify the model forward pass
+                        language_req.req.input_embeds = torch.cat(
+                            [embedding_data, deepstack_embedding],
+                            dim=-1,
+                        ).contiguous()
+                    else:
+                        language_req.req.input_embeds = embedding_data
 
                     if ori_input_length == embedding_length:
                         mm_inputs = None
@@ -390,9 +416,13 @@ class MultimodalLanguageTransferQueue:
                     and language_req.partial_input_embeds is None
                 ):
                     # Get partial data and actual total length from aux_datas
-                    embedding_data, fill_ids, mrope_positions, aux_datas = (
-                        self.metadata_buffers.get_buf(block_indices=block_indices)
-                    )
+                    (
+                        embedding_data,
+                        fill_ids,
+                        mrope_positions,
+                        aux_datas,
+                        deepstack_embedding,
+                    ) = self.metadata_buffers.get_buf(block_indices=block_indices)
                     actual_total_length = int(aux_datas[0])  # Actual total length
                     sent_tokens = len(fill_ids)  # Tokens already sent
 
@@ -433,6 +463,7 @@ class MultimodalLanguageTransferQueue:
                         language_req.partial_mrope_positions = mrope_positions
                         language_req.partial_aux_datas = aux_datas
                         language_req.partial_sent_tokens = sent_tokens
+                        language_req.partial_deepstack_embedding = deepstack_embedding
 
                         # Free old allocation
                         self.req_to_metadata_buffer_idx_allocator.free(

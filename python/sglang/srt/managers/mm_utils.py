@@ -5,7 +5,7 @@ Multi-modality utils
 import hashlib
 import pickle
 from abc import abstractmethod
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -642,7 +642,7 @@ def general_mm_embed_routine(
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     use_deepstack: bool = False,
     **kwargs,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Process multimodal inputs and forward through language model.
 
@@ -700,6 +700,11 @@ def general_mm_embed_routine(
         inputs_embeds = embed_tokens(input_ids)
 
     if get_multimodal_embedding:
+        input_deepstack_embeds = kwargs.get("input_deepstack_embeds", None)
+        if input_deepstack_embeds is not None:
+            inputs_embeds = torch.concat(
+                [inputs_embeds, input_deepstack_embeds], dim=-1
+            )
         return inputs_embeds
 
     hidden_states = language_model(

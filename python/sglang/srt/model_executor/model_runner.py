@@ -256,6 +256,15 @@ class ModelRunner:
         self.multimodal_encode_disaggregated = (
             server_args.disaggregation_mode == "encode"
         )
+        self.multimodal_language_disaggregated = (
+            server_args.disaggregation_mode == "language"
+        )
+        vision_config = getattr(self.model_config.hf_config, "vision_config", None)
+        self.enable_deepstack_input = (
+            vision_config is not None
+            and getattr(vision_config, "deepstack_visual_indexes", None)
+            and len(vision_config.deepstack_visual_indexes) > 0
+        )
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -2039,7 +2048,16 @@ class ModelRunner:
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         if forward_batch.input_embeds is not None:
-            kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
+            if self.enable_deepstack_input:
+                # Separate input_embeds into language and deepstack parts (Qwen3-VL with deepstack)
+                separate_index = self.model_config.hidden_size
+                emb = forward_batch.input_embeds
+                kwargs["input_embeds"] = emb[:, :separate_index].bfloat16().contiguous()
+                kwargs["input_deepstack_embeds"] = (
+                    emb[:, separate_index:].bfloat16().contiguous()
+                )
+            else:
+                kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
         if self.multimodal_encode_disaggregated:

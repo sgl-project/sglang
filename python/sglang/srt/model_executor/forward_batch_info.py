@@ -255,6 +255,7 @@ class ForwardBatch:
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
+    deepstack_embedding: Optional[torch.Tensor] = None
 
     # For cross-encoder model
     token_type_ids: Optional[torch.Tensor] = None

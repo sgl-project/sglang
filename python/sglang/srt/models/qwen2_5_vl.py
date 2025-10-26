@@ -525,10 +525,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             self.is_multimodal_embedding = False
 
         if config.tie_word_embeddings:
-            if self.is_multimodal_embedding:
-                self.lm_head = self.embed_tokens
-            else:
-                self.lm_head = self.model.embed_tokens
+            self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,

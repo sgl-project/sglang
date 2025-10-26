@@ -744,6 +744,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+        self.is_mrope_enabled = (
+            hasattr(config, "rope_scaling") and config.rope_scaling is not None
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -756,13 +759,26 @@ class Qwen3MoeForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_deepstack_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+        # TODO: remove here from modeling
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and forward_batch.contains_mm_inputs()
+        ):
+            # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
+            # just being defensive here
+            forward_batch.mm_inputs = None
+
         hidden_states = self.model(
             input_ids,
             positions,
             forward_batch,
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
+            input_deepstack_embeds=input_deepstack_embeds,
         )
 
         aux_hidden_states = None

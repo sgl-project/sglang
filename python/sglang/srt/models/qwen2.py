@@ -451,7 +451,9 @@ class Qwen2ForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        self.is_mrope_enabled = (
+            hasattr(config, "rope_scaling") and config.rope_scaling is not None
+        )
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
