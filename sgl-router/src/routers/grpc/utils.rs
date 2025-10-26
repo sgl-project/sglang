@@ -580,7 +580,7 @@ pub fn parse_json_schema_response(
                             let parameters = obj.get("parameters")?;
 
                             Some(ToolCall {
-                                id: format!("call_{}_{}", i, Uuid::new_v4()),
+                                id: format!("call_{}", Uuid::new_v4()),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
                                     name,
