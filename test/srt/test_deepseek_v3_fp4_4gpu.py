@@ -104,7 +104,6 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "4",
             "--kv-cache-dtype",
             "fp8_e4m3",
-            "--enable-beta-spec",
         ]
         cls.process = popen_launch_server(
             cls.model,
