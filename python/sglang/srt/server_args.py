@@ -3476,7 +3476,6 @@ class ServerArgs:
         else:
             return f"http://{self.host}:{self.port}"
 
-    @lru_cache(maxsize=1)
     def get_hf_config(self):
         kwargs = {}
         hf_config = get_config(
@@ -3488,14 +3487,15 @@ class ServerArgs:
         )
         return hf_config
 
-    @lru_cache(maxsize=1)
     def get_model_config(self):
         # Lazy init to avoid circular import
         from sglang.srt.configs.model_config import ModelConfig
 
-        return ModelConfig.from_server_args(self)
+        if hasattr(self, "model_config"):
+            return self.model_config
+        self.model_config = ModelConfig.from_server_args(self)
+        return self.model_config
 
-    @lru_cache(maxsize=1)
     def get_attention_backends(self):
         prefill_attention_backend_str = (
             self.prefill_attention_backend
@@ -3509,7 +3509,6 @@ class ServerArgs:
         )
         return prefill_attention_backend_str, decode_attention_backend_str
 
-    @lru_cache(maxsize=1)
     def use_mla_backend(self):
         from sglang.srt.configs.model_config import AttentionArch
 
