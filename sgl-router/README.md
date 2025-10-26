@@ -245,7 +245,7 @@ servers:
 
 pool:
   max_connections: 100
-  idle_timeout_secs: 300
+  idle_timeout: 300  # seconds
 
 proxy:
   http: "http://proxy.internal:8080"
@@ -253,7 +253,9 @@ proxy:
   no_proxy: "localhost,127.0.0.1,*.internal"
 
 inventory:
-  refresh_interval_secs: 300
+  enable_refresh: true
+  tool_ttl: 300  # seconds - how long tools are considered fresh
+  refresh_interval: 300  # seconds - background refresh interval
 ```
 
 #### Configuration Options
@@ -270,7 +272,7 @@ inventory:
 
 **Connection Pool** (`pool`):
 - `max_connections`: Maximum pooled connections for dynamic servers (default: 100)
-- `idle_timeout_secs`: TTL for idle connections (default: 300)
+- `idle_timeout`: Idle connection timeout in seconds before cleanup (default: 300)
 
 **Proxy Configuration** (`proxy`):
 - `http`/`https`: Proxy URLs for MCP server connections (not LLM traffic)
@@ -278,7 +280,9 @@ inventory:
 - **Note**: Proxy settings are currently ignored for `streamable` transport. Use STDIO or SSE transports if proxy support is required.
 
 **Inventory Settings** (`inventory`):
-- `refresh_interval_secs`: Tool/prompt/resource inventory refresh interval (default: 300)
+- `enable_refresh`: Enable automatic background refresh of tool inventory (default: true)
+- `tool_ttl`: Tool cache TTL in seconds - how long tools are considered fresh (default: 300)
+- `refresh_interval`: Background refresh interval in seconds - proactive inventory refresh (default: 300)
 
 #### Transport Types
 
