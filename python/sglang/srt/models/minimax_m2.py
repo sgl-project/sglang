@@ -546,7 +546,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
         self.block_sparse_moe = MiniMaxM2MoE(
             config=config,
-            layer_id=layer_id,  # 传递layer_id参数
+            layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
