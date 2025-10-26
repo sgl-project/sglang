@@ -32,7 +32,6 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
@@ -281,10 +280,7 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
-            self.stream = graph_capture_context.stream
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if self.model_runner.tp_group.ca_comm is not None:
                 old_ca_disable = self.model_runner.tp_group.ca_comm.disabled
                 self.model_runner.tp_group.ca_comm.disabled = True
@@ -319,7 +315,6 @@ class PiecewiseCudaGraphRunner:
                 self.model_runner.tp_group.ca_comm.disabled = old_ca_disable
 
     def capture_one_batch_size(self, num_tokens: int):
-        stream = self.stream
         bs = 1
 
         # Graph inputs
@@ -484,6 +479,9 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if self.model_runner.tp_group.ca_comm is not None:
+            old_ca_disable = self.model_runner.tp_group.ca_comm.disabled
+            self.model_runner.tp_group.ca_comm.disabled = True
         static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
         # Replay
         with set_forward_context(static_forward_batch, self.attention_layers):
@@ -509,6 +507,8 @@ class PiecewiseCudaGraphRunner:
                 raise NotImplementedError(
                     "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
                 )
+        if self.model_runner.tp_group.ca_comm is not None:
+            self.model_runner.tp_group.ca_comm.disabled = old_ca_disable
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
