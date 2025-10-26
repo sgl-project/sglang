@@ -12,10 +12,13 @@ from .evs_module import (
     EVSProcessorMixin,
     NonEVSConfig,
 )
+from .qwen_mrope import compute_mrope_for_media, recompute_mrope_positions
 
 __all__ = [
     "compute_retained_tokens_count",
     "compute_retention_mask",
+    "compute_mrope_for_media",
+    "recompute_mrope_positions",
     "EVSConfig",
     "EVSEmbeddingResult",
     "EVSModule",
