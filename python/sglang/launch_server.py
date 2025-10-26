@@ -12,10 +12,12 @@ if __name__ == "__main__":
 
     try:
         if server_args.grpc_mode:
+            # Handle gRPC server
             from sglang.srt.entrypoints.grpc_server import serve_grpc
 
             asyncio.run(serve_grpc(server_args))
         else:
+            # Handle HTTP server
             from sglang.srt.entrypoints.http_server import launch_server
 
             launch_server(server_args)

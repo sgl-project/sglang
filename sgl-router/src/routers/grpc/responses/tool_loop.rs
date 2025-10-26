@@ -24,12 +24,11 @@ use super::{
     types::BackgroundTaskInfo,
 };
 /// This is a re-export of the shared implementation from openai::mcp
-pub(super) use crate::routers::openai::mcp::mcp_manager_from_request_tools as create_mcp_manager_from_request;
+pub(super) use crate::routers::openai::mcp::ensure_request_mcp_client as create_mcp_manager_from_request;
 use crate::{
     data_connector::{
         SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
     },
-    mcp::McpClientManager,
     protocols::{
         chat::ChatCompletionResponse,
         common::{Tool, ToolChoice, ToolChoiceValue},
@@ -102,7 +101,7 @@ fn extract_all_tool_calls_from_chat(
 
 /// Execute an MCP tool call
 async fn execute_mcp_call(
-    mcp_mgr: &Arc<McpClientManager>,
+    mcp_mgr: &Arc<crate::mcp::McpManager>,
     tool_name: &str,
     args_json_str: &str,
 ) -> Result<String, String> {
@@ -222,7 +221,7 @@ fn generate_mcp_id(prefix: &str) -> String {
 
 /// Build mcp_list_tools output item
 fn build_mcp_list_tools_item(
-    mcp: &Arc<McpClientManager>,
+    mcp: &Arc<crate::mcp::McpManager>,
     server_label: &str,
 ) -> ResponseOutputItem {
     let tools = mcp.list_tools();
@@ -287,7 +286,7 @@ pub(super) async fn execute_tool_loop(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
     components: Arc<SharedComponents>,
-    mcp_manager: Arc<McpClientManager>,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     response_id: Option<String>,
     background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Result<ResponsesResponse, String> {
@@ -414,7 +413,10 @@ pub(super) async fn execute_tool_loop(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
-                ResponseInput::Items(items) => items.clone(),
+                ResponseInput::Items(items) => items
+                    .iter()
+                    .map(crate::protocols::responses::normalize_input_item)
+                    .collect(),
             };
 
             // Append all conversation history (function calls and outputs)
@@ -504,7 +506,7 @@ pub(super) async fn execute_tool_loop_streaming(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
     components: Arc<SharedComponents>,
-    mcp_manager: Arc<McpClientManager>,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
@@ -595,7 +597,7 @@ async fn execute_tool_loop_streaming_internal(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
     components: Arc<SharedComponents>,
-    mcp_manager: Arc<McpClientManager>,
+    mcp_manager: Arc<crate::mcp::McpManager>,
     server_label: String,
     _response_storage: SharedResponseStorage,
     _conversation_storage: SharedConversationStorage,
@@ -608,11 +610,7 @@ async fn execute_tool_loop_streaming_internal(
 
     // Create response event emitter
     let response_id = format!("resp_{}", Uuid::new_v4());
-    let model = if current_request.model.is_empty() {
-        "default".to_string()
-    } else {
-        current_request.model.clone()
-    };
+    let model = current_request.model.clone();
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -871,13 +869,14 @@ async fn execute_tool_loop_streaming_internal(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
-                ResponseInput::Items(items) => items.clone(),
+                ResponseInput::Items(items) => items
+                    .iter()
+                    .map(crate::protocols::responses::normalize_input_item)
+                    .collect(),
             };
 
-            // Append all conversation history
             input_items.extend_from_slice(&state.conversation_history);
 
-            // Build new request for next iteration
             current_request = ResponsesRequest {
                 input: ResponseInput::Items(input_items),
                 model: current_request.model.clone(),
@@ -886,8 +885,8 @@ async fn execute_tool_loop_streaming_internal(
                 max_output_tokens: current_request.max_output_tokens,
                 temperature: current_request.temperature,
                 top_p: current_request.top_p,
-                stream: Some(true), // Keep streaming enabled
-                store: Some(false), // Don't store intermediate responses
+                stream: Some(true),
+                store: Some(false),
                 background: Some(false),
                 max_tool_calls: current_request.max_tool_calls,
                 tool_choice: current_request.tool_choice.clone(),
