@@ -30,8 +30,6 @@ use crate::protocols::{
         ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest, ResponsesResponse,
     },
 };
-/// This is a re-export of the shared implementation from openai::mcp
-pub(super) use crate::routers::openai::mcp::ensure_request_mcp_client as create_mcp_manager_from_request;
 
 /// Extract function call from a chat completion response
 /// Returns (call_id, tool_name, arguments_json_str) if found
@@ -219,7 +217,6 @@ pub(super) async fn execute_tool_loop(
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    mcp_manager: Arc<crate::mcp::McpManager>,
     response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
     // Get server label from original request tools
@@ -246,7 +243,7 @@ pub(super) async fn execute_tool_loop(
     );
 
     // Get MCP tools and convert to chat format (do this once before loop)
-    let mcp_tools = mcp_manager.list_tools();
+    let mcp_tools = ctx.mcp_manager.list_tools();
     let chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
     debug!("Converted {} MCP tools to chat format", chat_tools.len());
 
@@ -327,7 +324,7 @@ pub(super) async fn execute_tool_loop(
                 "Calling MCP tool '{}' with args: {}",
                 tool_name, args_json_str
             );
-            let (output_str, success, error) = match mcp_manager
+            let (output_str, success, error) = match ctx.mcp_manager
                 .call_tool(tool_name.as_str(), args_json_str.as_str())
                 .await
             {
@@ -436,7 +433,7 @@ pub(super) async fn execute_tool_loop(
             // Inject MCP metadata into output
             if state.total_calls > 0 {
                 // Prepend mcp_list_tools item
-                let mcp_list_tools = build_mcp_list_tools_item(&mcp_manager, &server_label);
+                let mcp_list_tools = build_mcp_list_tools_item(&ctx.mcp_manager, &server_label);
                 responses_response.output.insert(0, mcp_list_tools);
 
                 // Append all mcp_call items at the end
@@ -464,7 +461,6 @@ pub(super) async fn execute_tool_loop_streaming(
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    mcp_manager: Arc<crate::mcp::McpManager>,
 ) -> Response {
     // Create SSE channel for client
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
@@ -481,7 +477,6 @@ pub(super) async fn execute_tool_loop_streaming(
             &original_request_clone,
             headers,
             model_id,
-            mcp_manager,
             tx.clone(),
         )
         .await;
@@ -533,7 +528,6 @@ async fn execute_tool_loop_streaming_internal(
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    mcp_manager: Arc<crate::mcp::McpManager>,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     // Extract server label from original request tools
@@ -568,7 +562,7 @@ async fn execute_tool_loop_streaming_internal(
     emitter.send_event(&event, &tx)?;
 
     // Get MCP tools and convert to chat format (do this once before loop)
-    let mcp_tools = mcp_manager.list_tools();
+    let mcp_tools = ctx.mcp_manager.list_tools();
     let chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
     debug!(
         "Streaming: Converted {} MCP tools to chat format",
@@ -746,7 +740,7 @@ async fn execute_tool_loop_streaming_internal(
                     "Calling MCP tool '{}' with args: {}",
                     tool_name, args_json_str
                 );
-                let (output_str, success, error) = match mcp_manager
+                let (output_str, success, error) = match ctx.mcp_manager
                     .call_tool(tool_name.as_str(), args_json_str.as_str())
                     .await
                 {

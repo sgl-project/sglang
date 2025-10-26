@@ -52,7 +52,7 @@ use uuid::Uuid;
 use super::{
     conversions,
     streaming::ResponseStreamEventEmitter,
-    tool_loop::{create_mcp_manager_from_request, execute_tool_loop, execute_tool_loop_streaming},
+    tool_loop::{execute_tool_loop, execute_tool_loop_streaming},
     types::BackgroundTaskInfo,
 };
 use crate::{
@@ -67,7 +67,10 @@ use crate::{
             ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
-    routers::openai::conversations::persist_conversation_items,
+    routers::openai::{
+        conversations::persist_conversation_items,
+        mcp::ensure_request_mcp_client,
+    },
 };
 
 // ============================================================================
@@ -193,9 +196,10 @@ async fn route_responses_internal(
 
     // 2. Check if request has MCP tools - if so, use tool loop
     let responses_response = if let Some(tools) = &request.tools {
-        // Try to create dynamic MCP client from request tools using the manager
-        if let Some(request_mcp_manager) =
-            create_mcp_manager_from_request(&ctx.mcp_manager, tools).await
+        // Ensure dynamic MCP client is registered for request-scoped tools
+        if ensure_request_mcp_client(&ctx.mcp_manager, tools)
+            .await
+            .is_some()
         {
             debug!("MCP tools detected, using tool loop");
 
@@ -206,7 +210,6 @@ async fn route_responses_internal(
                 &request,
                 headers,
                 model_id,
-                request_mcp_manager,
                 response_id.clone(),
             )
             .await?
@@ -397,9 +400,10 @@ async fn route_responses_streaming(
 
     // 2. Check if request has MCP tools - if so, use streaming tool loop
     if let Some(tools) = &request.tools {
-        // Try to create dynamic MCP client from request tools using the manager
-        if let Some(request_mcp_manager) =
-            create_mcp_manager_from_request(&ctx.mcp_manager, tools).await
+        // Ensure dynamic MCP client is registered for request-scoped tools
+        if ensure_request_mcp_client(&ctx.mcp_manager, tools)
+            .await
+            .is_some()
         {
             debug!("MCP tools detected in streaming mode, using streaming tool loop");
 
@@ -409,7 +413,6 @@ async fn route_responses_streaming(
                 &request,
                 headers,
                 model_id,
-                request_mcp_manager,
             )
             .await;
         }
