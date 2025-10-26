@@ -73,6 +73,7 @@ COPY . /src
 
 FROM base AS build-image
 # Install SGLang
+# Until torch 2.9 and cu13 are stable we manually update torch if you are on CUDA 13
 WORKDIR /sgl-workspace
 ARG BRANCH_TYPE
 COPY --from=local_src /src /tmp/local_src

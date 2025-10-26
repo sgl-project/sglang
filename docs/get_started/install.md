@@ -12,7 +12,7 @@ It is recommended to use uv for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install "sglang[all]" --prerelease=allow
+uv pip install sglang --prerelease=allow
 ```
 
 **Quick fixes to common problems**
@@ -30,7 +30,7 @@ cd sglang
 
 # Install the python packages
 pip install --upgrade pip
-pip install -e "python[all]"
+pip install -e "python" --prerelease=allow
 ```
 
 **Quick fixes to common problems**
