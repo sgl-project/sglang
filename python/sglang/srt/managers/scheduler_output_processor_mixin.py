@@ -194,7 +194,7 @@ class SchedulerOutputProcessorMixin:
                                     last_prefill_chunk=False,
                                 )
                             logprob_pt += num_input_logprobs
-            if req.return_routed_experts:
+            if batch.return_routed_experts:
                 self.routed_experts_capturer.clear_buffer()
         else:  # embedding or reward model
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
@@ -401,7 +401,7 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
-        if req.return_routed_experts:
+        if batch.return_routed_experts:
             self.routed_experts_capturer.clear_buffer()
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
