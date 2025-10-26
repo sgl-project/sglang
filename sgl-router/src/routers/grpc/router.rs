@@ -1,6 +1,6 @@
 // gRPC Router Implementation
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use axum::{
@@ -9,12 +9,22 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use tokio::sync::RwLock;
 use tracing::debug;
 
-use super::{context::SharedComponents, pipeline::RequestPipeline};
+use super::{
+    context::SharedComponents,
+    pipeline::RequestPipeline,
+    responses::{self, BackgroundTaskInfo},
+};
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
     core::WorkerRegistry,
+    data_connector::{
+        SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
+    },
+    mcp::McpManager,
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
@@ -27,7 +37,6 @@ use crate::{
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::RouterTrait,
-    server::AppContext,
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
 };
@@ -48,6 +57,13 @@ pub struct GrpcRouter {
     configured_tool_parser: Option<String>,
     pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
+    // Storage backends for /v1/responses support
+    response_storage: SharedResponseStorage,
+    conversation_storage: SharedConversationStorage,
+    conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Arc<McpManager>,
+    // Background task handles for cancellation support (includes gRPC client for Python abort)
+    background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 }
 
 impl GrpcRouter {
@@ -72,6 +88,18 @@ impl GrpcRouter {
 
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
+
+        // Extract storage backends from context
+        let response_storage = ctx.response_storage.clone();
+        let conversation_storage = ctx.conversation_storage.clone();
+        let conversation_item_storage = ctx.conversation_item_storage.clone();
+
+        // Get MCP manager from app context
+        let mcp_manager = ctx
+            .mcp_manager
+            .get()
+            .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
+            .clone();
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
@@ -104,6 +132,11 @@ impl GrpcRouter {
             configured_tool_parser: ctx.configured_tool_parser.clone(),
             pipeline,
             shared_components,
+            response_storage,
+            conversation_storage,
+            conversation_item_storage,
+            mcp_manager,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -217,24 +250,46 @@ impl RouterTrait for GrpcRouter {
 
     async fn route_responses(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ResponsesRequest,
-        _model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        // Use responses module for ALL requests (streaming and non-streaming)
+        // Responses module handles:
+        // - Request validation (previous_response_id XOR conversation)
+        // - Loading response chain / conversation history from storage
+        // - Conversion: ResponsesRequest → ChatCompletionRequest
+        // - Execution through chat pipeline stages
+        // - Conversion: ChatCompletionResponse → ResponsesResponse
+        // - Response persistence
+        // - MCP tool loop wrapper (future)
+        responses::route_responses(
+            &self.pipeline,
+            Arc::new(body.clone()),
+            headers.cloned(),
+            model_id.map(|s| s.to_string()),
+            self.shared_components.clone(),
+            self.response_storage.clone(),
+            self.conversation_storage.clone(),
+            self.conversation_item_storage.clone(),
+            self.mcp_manager.clone(),
+            self.background_tasks.clone(),
+        )
+        .await
     }
 
     async fn get_response(
         &self,
         _headers: Option<&HeaderMap>,
-        _response_id: &str,
+        response_id: &str,
         _params: &ResponsesGetParams,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        responses::get_response_impl(&self.response_storage, response_id).await
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        responses::cancel_response_impl(&self.response_storage, &self.background_tasks, response_id)
+            .await
     }
 
     async fn route_classify(
