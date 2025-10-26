@@ -4,12 +4,14 @@ from dataclasses import dataclass, field
 from sglang.multimodal_gen.api.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 
+def is_transformer_blocks(n, m):
+    return "transformer_blocks" in n and n.split(".")[-1].isdigit()
+
+
 @dataclass
 class StepVideoArchConfig(DiTArchConfig):
     _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [
-            lambda n, m: "transformer_blocks" in n and n.split(".")[-1].isdigit()
-        ]
+        default_factory=lambda: [is_transformer_blocks]
     )
 
     param_names_mapping: dict = field(
