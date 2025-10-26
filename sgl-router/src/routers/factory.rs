@@ -9,9 +9,10 @@ use super::{
     RouterTrait,
 };
 use crate::{
-    config::{ConnectionMode, PolicyConfig, RoutingMode},
+    app_context::AppContext,
+    config::{PolicyConfig, RoutingMode},
+    core::ConnectionMode,
     policies::PolicyFactory,
-    server::AppContext,
 };
 
 /// Factory for creating router instances based on configuration
@@ -21,7 +22,7 @@ impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
         match ctx.router_config.connection_mode {
-            ConnectionMode::Grpc => match &ctx.router_config.mode {
+            ConnectionMode::Grpc { .. } => match &ctx.router_config.mode {
                 RoutingMode::Regular { .. } => Self::create_grpc_router(ctx).await,
                 RoutingMode::PrefillDecode {
                     prefill_policy,
@@ -126,14 +127,7 @@ impl RouterFactory {
             return Err("OpenAI mode requires at least one worker URL".to_string());
         }
 
-        let router = OpenAIRouter::new(
-            worker_urls,
-            Some(ctx.router_config.circuit_breaker.clone()),
-            ctx.response_storage.clone(),
-            ctx.conversation_storage.clone(),
-            ctx.conversation_item_storage.clone(),
-        )
-        .await?;
+        let router = OpenAIRouter::new(worker_urls, ctx).await?;
 
         Ok(Box::new(router))
     }
