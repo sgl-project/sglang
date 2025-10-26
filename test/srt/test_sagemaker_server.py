@@ -217,10 +217,6 @@ class TestSageMakerServer(CustomTestCase):
         assert response["usage"]["completion_tokens"] > 0
         assert response["usage"]["total_tokens"] > 0
 
-        print(
-            f"✅ input_ids test passed. Response: {response['choices'][0]['message']['content']}"
-        )
-
     def test_chat_completion_with_input_ids_stream(self):
         """Test streaming chat completion using input_ids"""
         # Prepare the prompt and tokenize it
@@ -291,8 +287,6 @@ class TestSageMakerServer(CustomTestCase):
         # Verify we got some content
         full_content = "".join(content_chunks)
         assert len(full_content) > 0
-
-        print(f"✅ input_ids streaming test passed. Response: {full_content}")
 
 
 if __name__ == "__main__":
