@@ -2620,17 +2620,12 @@ def get_local_ip_auto(fallback: str = None) -> str:
     raise ValueError("Can not get local ip")
 
 
-def is_page_size_one(server_args):
-    return server_args.page_size == 1
-
-
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk == 1
-        and is_page_size_one(server_args)
+        server_args.speculative_eagle_topk == 1
+        and (server_args.page_size == 1 or server_args.page_size is None)
     )
 
 
