@@ -69,6 +69,8 @@ class RMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
         x = x.view(-1, shape[-1])
+        if residual is not None:
+            residual = residual.view(-1, shape[-1])
 
         if x.dtype == torch.float:
             # fp32

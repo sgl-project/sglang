@@ -845,3 +845,6 @@ class AutoencoderKLHunyuanVideo(nn.Module, ParallelTiledVAE):
             z = posterior.mode()
         dec = self.decode(z)
         return dec
+
+
+EntryClass = AutoencoderKLHunyuanVideo
