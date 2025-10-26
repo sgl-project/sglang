@@ -1067,11 +1067,11 @@ class ServerArgs:
                 2.3 Otherwise, we will use triton backend.
             """
 
-            if not self.use_mla_backend:
+            if not use_mla_backend:
                 # MHA architecture
                 if (
                     is_hopper_with_cuda_12_3()
-                    and is_no_spec_infer_or_topk_one(server_args)
+                    and is_no_spec_infer_or_topk_one(self)
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     self.attention_backend = "fa3"
