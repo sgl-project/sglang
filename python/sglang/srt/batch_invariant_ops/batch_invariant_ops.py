@@ -15,9 +15,15 @@ from sglang.srt.utils.common import calc_diff, get_bool_env_var
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
 
+_ENABLE_MM_DEEPGEMM = get_bool_env_var(
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
+)
 _ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"
 )
+
+if not _ENABLE_MM_DEEPGEMM:
+    print("Disable DeepGEMM in batch invariant ops. Performance may be suboptimal.")
 
 __all__ = [
     "set_batch_invariant_mode",
@@ -235,7 +241,7 @@ def _matmul_persistent_deepgemm(
     dtype = a.dtype
     out = torch.empty((M, N), device=a.device, dtype=dtype)
 
-    deep_gemm.bf16_gemm_nt(a, b.transpose(0, 1), out)
+    deep_gemm.bf16_gemm_nn(a, b, out)
 
     # TODO can this be put in DeepGEMM's `c`?
     if bias is not None:
@@ -248,7 +254,8 @@ def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
     if (
-        ENABLE_JIT_DEEPGEMM
+        _ENABLE_MM_DEEPGEMM
+        and ENABLE_JIT_DEEPGEMM
         and (a.dtype == torch.bfloat16)
         and (b.dtype == torch.bfloat16)
         and a.is_contiguous()
