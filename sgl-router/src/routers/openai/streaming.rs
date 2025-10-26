@@ -25,8 +25,8 @@ use tracing::warn;
 use super::conversations::persist_conversation_items;
 use super::{
     mcp::{
-        build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-        mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
+        build_resume_payload, ensure_request_mcp_client, execute_streaming_tool_calls,
+        inject_mcp_metadata_streaming, prepare_mcp_payload_for_streaming,
         send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
@@ -907,7 +907,7 @@ pub(super) fn send_final_response_event(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     sequence_number: &mut u64,
     state: &ToolLoopState,
-    active_mcp: Option<&Arc<crate::mcp::McpClientManager>>,
+    active_mcp: Option<&Arc<crate::mcp::McpManager>>,
     original_request: &ResponsesRequest,
     previous_response_id: Option<&str>,
     server_label: &str,
@@ -1138,7 +1138,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
     mut payload: Value,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<String>,
-    active_mcp: &Arc<crate::mcp::McpClientManager>,
+    active_mcp: &Arc<crate::mcp::McpManager>,
 ) -> Response {
     // Transform MCP tools to function tools in payload
     prepare_mcp_payload_for_streaming(&mut payload, active_mcp);
@@ -1491,7 +1491,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
 pub(super) async fn handle_streaming_response(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,
-    mcp_manager: Option<&Arc<crate::mcp::McpClientManager>>,
+    mcp_manager: Option<&Arc<crate::mcp::McpManager>>,
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
@@ -1502,12 +1502,19 @@ pub(super) async fn handle_streaming_response(
     original_previous_response_id: Option<String>,
 ) -> Response {
     // Check if MCP is active for this request
-    let req_mcp_manager = if let Some(ref tools) = original_body.tools {
-        mcp_manager_from_request_tools(tools.as_slice()).await
-    } else {
-        None
-    };
-    let active_mcp = req_mcp_manager.as_ref().or(mcp_manager);
+    // Ensure dynamic client is created if needed
+    if let (Some(manager), Some(ref tools)) = (mcp_manager, &original_body.tools) {
+        ensure_request_mcp_client(manager, tools.as_slice()).await;
+    }
+
+    // Use the tool loop if the manager has any tools available (static or dynamic).
+    let active_mcp = mcp_manager.and_then(|mgr| {
+        if mgr.list_tools().is_empty() {
+            None
+        } else {
+            Some(mgr)
+        }
+    });
 
     // If no MCP is active, use simple pass-through streaming
     if active_mcp.is_none() {
