@@ -72,12 +72,10 @@ class ImageEncodingStage(PipelineStage):
         fields = [
             "image_processor",
             "image_encoder",
-            # "text_encoder",
         ]
         for field in fields:
             processor = getattr(self, field, None)
             if processor and hasattr(processor, "to"):
-                print(f"{field=}")
                 setattr(self, field, processor.to(device))
 
     def _encode_vae_image(
@@ -159,12 +157,9 @@ class ImageEncodingStage(PipelineStage):
         else:
             image_processor_kwargs = {}
 
-        print(f"{type(self.image_processor)=}")
-        print(f"{image_processor_kwargs=}")
         image_inputs = self.image_processor(
             images=prompt_image, return_tensors="pt", **image_processor_kwargs
         ).to(get_local_torch_device())
-        print(f"{image_inputs=}")
         if self.image_encoder:
             # if an image encoder is provided
             with set_forward_context(current_timestep=0, attn_metadata=None):
@@ -181,11 +176,6 @@ class ImageEncodingStage(PipelineStage):
                     image_grid_thw=image_inputs.image_grid_thw,
                     output_hidden_states=True,
                 )
-                print(f"{self.text_encoder=}")
-                print(f"{image_inputs.image_grid_thw=}")
-                print(f"{image_inputs.input_ids.tolist()=}")
-                print(f"{image_inputs.input_ids.shape=}")
-                print(f"{image_inputs.pixel_values=}")
             batch.prompt_embeds.append(
                 self.encoding_qwen_image_edit(outputs, image_inputs)
             )
@@ -262,7 +252,6 @@ class ImageEncodingStage(PipelineStage):
                 image_latent_height,
                 image_latent_width,
             )
-            print(f"{image_latents.shape=}")
             batch.image_latent = image_latents
 
         self.move_to_device("cpu")

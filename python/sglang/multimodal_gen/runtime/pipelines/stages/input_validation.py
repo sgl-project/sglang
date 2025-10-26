@@ -110,10 +110,12 @@ class InputValidationStage(PipelineStage):
                 image = load_image(batch.image_path)
             batch.pil_image = image
 
+        # NOTE: resizing needs to be bring in advance
         if isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig):
-            # TODO: we need to know if no width or height is passed as sampling params
+            height = None if batch.height_not_provided else batch.height
+            width = None if batch.width_not_provided else batch.width
             width, height = server_args.pipeline_config.set_width_and_height(
-                None, None, batch.pil_image
+                height, width, batch.pil_image
             )
             batch.width = width
             batch.height = height

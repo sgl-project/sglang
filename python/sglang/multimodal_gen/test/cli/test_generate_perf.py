@@ -1,5 +1,6 @@
 import os.path
 import unittest
+from pathlib import Path
 
 from PIL import Image
 
@@ -21,13 +22,14 @@ class TestGenerateBase(TestCLIBase):
     height: int = 720
     output_path: str = "outputs"
     image_path: str | None = None
+    prompt: str | None = "A curious raccoon"
 
     base_command = [
         "sglang",
         "generate",
         "--text-encoder-cpu-offload",
         "--pin-cpu-memory",
-        "--prompt='A curious raccoon'",
+        f"--prompt='{prompt}'",
         "--save-output",
         "--log-level=debug",
         f"--width={width}",
@@ -221,9 +223,12 @@ class TestQwenImageEdit(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.IMAGE
     thresholds = {
-        "test_single_gpu": 52.3 * 1.05,
+        "test_single_gpu": 40.5 * 1.05,
     }
-    """single gpu"""
+
+    prompt: str | None = (
+        "Change the rabbit's color to purple, with a flash light background."
+    )
 
     def test_cfg_parallel(self):
         pass
@@ -235,7 +240,20 @@ class TestQwenImageEdit(TestGenerateBase):
         pass
 
     def test_single_gpu(self):
-        self.base_command += ["image_path=test_files/rabbit.jpg"]
+        test_dir = Path(__file__).parent
+        img_path = (test_dir / ".." / "test_files" / "rabbit.jpg").resolve().as_posix()
+        self.base_command = [
+            "sglang",
+            "generate",
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+            f"--prompt='{self.prompt}'",
+            "--save-output",
+            "--log-level=debug",
+            f"--width={self.width}",
+            f"--height={self.height}",
+            f"--output-path={self.output_path}",
+        ] + [f"--image-path={img_path}"]
 
         self._run_test(
             name=f"{self.model_name()}, single gpu",

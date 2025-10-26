@@ -32,22 +32,17 @@ def qwen_image_preprocess_text(prompt):
 def qwen_image_postprocess_text(outputs, _text_inputs, drop_idx=34):
     # squeeze the batch dim
     hidden_states = outputs.hidden_states[-1]
-    print(f"{hidden_states=}")
-    print(f"{drop_idx=}")
     split_hidden_states = _extract_masked_hidden(
         hidden_states, _text_inputs.attention_mask
     )
     split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
     max_seq_len = max([e.size(0) for e in split_hidden_states])
-    print(f"{max_seq_len=}")
     prompt_embeds = torch.stack(
         [
             torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))])
             for u in split_hidden_states
         ]
     )
-    print(f"{prompt_embeds=}")
-
     return prompt_embeds
 
 

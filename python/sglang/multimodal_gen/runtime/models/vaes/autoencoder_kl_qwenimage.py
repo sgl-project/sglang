@@ -949,7 +949,6 @@ class AutoencoderKLQwenImage(nn.Module):
         return AutoencoderKLOutput(latent_dist=posterior)
 
     def _decode(self, z: torch.Tensor, return_dict: bool = True):
-        print(f"{z.shape=}")
         _, _, num_frame, height, width = z.shape
         tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio

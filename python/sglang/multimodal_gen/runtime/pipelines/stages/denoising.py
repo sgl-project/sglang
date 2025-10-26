@@ -626,8 +626,6 @@ class DenoisingStage(PipelineStage):
 
                     if batch.perf_logger:
                         batch.perf_logger.record_step_end("denoising_step_guided", i)
-                    print(f"{noise_pred.shape=}")
-                    print(f"{latents.shape=}")
                     # Compute the previous noisy sample
                     latents = self.scheduler.step(
                         model_output=noise_pred,
@@ -851,13 +849,6 @@ class DenoisingStage(PipelineStage):
         noise_pred_cond: torch.Tensor | None = None
         noise_pred_uncond: torch.Tensor | None = None
         cfg_rank = get_classifier_free_guidance_rank()
-        # print(f"{latent_model_input=}")
-        # print(f"{server_args.pipeline_config.get_pos_prompt_embeds(batch)=}")
-        # print(f"{guidance=}")
-        # print(pos_cond_kwargs["freqs_cis"])
-        # print(pos_cond_kwargs["img_shapes"])
-        # print(pos_cond_kwargs["txt_seq_lens"])
-        # assert False
         # positive pass
         if not (server_args.enable_cfg_parallel and cfg_rank != 0):
             batch.is_cfg_negative = False

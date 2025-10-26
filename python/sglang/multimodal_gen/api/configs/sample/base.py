@@ -82,8 +82,11 @@ class SamplingParams:
     num_frames_round_down: bool = (
         False  # Whether to round down num_frames if it's not divisible by num_gpus
     )
-    height: int = 720
-    width: int = 1280
+    height: int | None = None
+    width: int | None = None
+    # NOTE: this is temporary, we need a way to know if width or height is not provided, or do the image resize earlier
+    height_not_provided: bool = False
+    width_not_provided: bool = False
     fps: int = 24
 
     # Denoising parameters
@@ -148,6 +151,13 @@ class SamplingParams:
         assert self.num_frames >= 1
         self.data_type = DataType.VIDEO if self.num_frames > 1 else DataType.IMAGE
         self.set_output_file_name()
+
+        if self.width is None:
+            self.width_not_provided = True
+            self.width = 1280
+        if self.height is None:
+            self.height_not_provided = True
+            self.height = 720
 
     def check_sampling_param(self):
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
@@ -347,6 +357,8 @@ class SamplingParams:
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         attrs = [attr.name for attr in dataclasses.fields(cls)]
+        args.height_not_provided = False
+        args.width_not_provided = False
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def output_file_path(self):

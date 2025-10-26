@@ -138,6 +138,8 @@ class Req:
     height: list[int] | int | None = None
     width: list[int] | int | None = None
     fps: list[int] | int | None = None
+    height_not_provided: bool = False
+    width_not_provided: bool = False
 
     # Timesteps
     timesteps: torch.Tensor | None = None

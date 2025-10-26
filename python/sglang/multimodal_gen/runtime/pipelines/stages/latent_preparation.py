@@ -80,7 +80,6 @@ class LatentPreparationStage(PipelineStage):
             shape = server_args.pipeline_config.prepare_latent_shape(
                 batch, batch_size, num_frames
             )
-            print(f"{server_args.pipeline_config=}")
             latents = randn_tensor(
                 shape, generator=generator, device=device, dtype=dtype
             )
@@ -90,7 +89,6 @@ class LatentPreparationStage(PipelineStage):
         else:
             latents = latents.to(device)
 
-        print(f"{latents.shape=}")
         # Scale the initial noise if needed
         if hasattr(self.scheduler, "init_noise_sigma"):
             latents = latents * self.scheduler.init_noise_sigma
