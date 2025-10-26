@@ -515,6 +515,26 @@ def bmm_batch_invariant(a, b, *, out=None):
         )
 
 
+def rms_norm_batch_invariant(
+    input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Batch-invariant wrapper for RMS normalization.
+
+    This function provides a deterministic, batch-invariant implementation
+    of RMS normalization for use with the batch_invariant mode.
+
+    Args:
+        input: Input tensor of shape (..., hidden_size)
+        weight: Weight tensor of shape (hidden_size,)
+        eps: Small constant for numerical stability
+
+    Returns:
+        RMS normalized tensor
+    """
+    return rms_norm(input, weight, eps=eps)
+
+
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
 _original_torch_bmm = None
