@@ -148,7 +148,9 @@ class ChatCompletionSampler(SamplerBase):
                     reasoning_effort=self.reasoning_effort,
                     extra_body=self.extra_body,
                 )
-                return response.choices[0].message.content
+                content = response.choices[0].message.content
+                # Handle case where content is None (e.g., max tokens reached)
+                return content if content is not None else ""
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)
@@ -161,7 +163,9 @@ class ChatCompletionSampler(SamplerBase):
                 )
                 time.sleep(exception_backoff)
                 trial += 1
-            # unknown error shall throw exception
+        # If all retries are exhausted, return empty string instead of None
+        print(f"All retry attempts exhausted for request. Returning empty response.")
+        return ""
 
 
 QUERY_TEMPLATE_MULTICHOICE = """
@@ -261,6 +265,9 @@ def format_multichoice_question(row):
 def check_equality(sampler: SamplerBase, expr1: str, expr2: str):
     prompt = EQUALITY_TEMPLATE % {"expression1": expr1, "expression2": expr2}
     response = sampler([dict(content=prompt, role="user")])
+    # Handle case where response is None
+    if response is None:
+        return False
     return response.lower().strip() == "yes"
 
 

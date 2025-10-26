@@ -101,6 +101,9 @@ class MMLUEval(Eval):
                 )
             ]
             response_text = sampler(prompt_messages)
+            # Handle case where response_text is None or empty
+            if response_text is None:
+                response_text = ""
             match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
             extracted_answer = match.group(1) if match else None
             score = 1.0 if extracted_answer == row["Answer"] else 0.0
