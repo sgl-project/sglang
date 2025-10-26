@@ -32,6 +32,8 @@ class TestDeepseekV3FP4(CustomTestCase):
             "flashinfer_trtllm",
             "--quantization",
             "modelopt_fp4",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -100,6 +102,9 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "1",
             "--speculative-num-draft-tokens",
             "4",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--enable-beta-spec",
         ]
         cls.process = popen_launch_server(
             cls.model,
