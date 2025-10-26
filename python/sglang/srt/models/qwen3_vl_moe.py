@@ -14,6 +14,7 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
+import re
 from functools import lru_cache
 from typing import Iterable, Optional, Tuple, Union
 
@@ -166,6 +167,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         language_model_cls=Qwen3MoeLLMModel,
     ):
         super().__init__(config, quant_config, prefix, language_model_cls)
+
+    # Only allow LoRA on attention projections within text layers for MoE.
+    _lora_pattern_moe = re.compile(
+        r"^model\.layers\.(\d+)\.self_attn\.(?:qkv_proj|o_proj)$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern_moe.match(module_name))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
