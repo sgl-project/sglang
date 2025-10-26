@@ -1,6 +1,6 @@
 // gRPC Router Implementation
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{
@@ -9,22 +9,13 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use tokio::sync::RwLock;
 use tracing::debug;
 
-use super::{
-    context::SharedComponents,
-    pipeline::RequestPipeline,
-    responses::{self, BackgroundTaskInfo},
-};
+use super::{context::SharedComponents, pipeline::RequestPipeline, responses};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::WorkerRegistry,
-    data_connector::{
-        SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
-    },
-    mcp::McpManager,
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
@@ -57,14 +48,7 @@ pub struct GrpcRouter {
     configured_tool_parser: Option<String>,
     pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
-    // Storage backends for /v1/responses support
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
-    mcp_manager: Arc<McpManager>,
-    // Background task handles for cancellation support (includes gRPC client for Python abort)
-    background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
-    // Responses context (bundles responses-specific dependencies)
+    // Responses context (bundles all /v1/responses dependencies: storage, MCP, background_tasks)
     responses_context: responses::ResponsesContext,
 }
 
@@ -91,18 +75,6 @@ impl GrpcRouter {
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        // Extract storage backends from context
-        let response_storage = ctx.response_storage.clone();
-        let conversation_storage = ctx.conversation_storage.clone();
-        let conversation_item_storage = ctx.conversation_item_storage.clone();
-
-        // Get MCP manager from app context
-        let mcp_manager = ctx
-            .mcp_manager
-            .get()
-            .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
-            .clone();
-
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
             tokenizer: tokenizer.clone(),
@@ -126,10 +98,13 @@ impl GrpcRouter {
             Arc::new(pipeline.clone()),
             shared_components.clone(),
             worker_registry.clone(),
-            response_storage.clone(),
-            conversation_storage.clone(),
-            conversation_item_storage.clone(),
-            mcp_manager.clone(),
+            ctx.response_storage.clone(),
+            ctx.conversation_storage.clone(),
+            ctx.conversation_item_storage.clone(),
+            ctx.mcp_manager
+                .get()
+                .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
+                .clone(),
         );
 
         Ok(GrpcRouter {
@@ -145,11 +120,6 @@ impl GrpcRouter {
             configured_tool_parser: ctx.configured_tool_parser.clone(),
             pipeline,
             shared_components,
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
-            mcp_manager,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
             responses_context,
         })
     }
