@@ -622,6 +622,8 @@ def rms_norm_batch_invariant(
     This function provides a deterministic, batch-invariant implementation
     of RMS normalization for use with the batch_invariant mode.
 
+    Adapted from @https://github.com/vllm-project/vllm/blob/66a168a197ba214a5b70a74fa2e713c9eeb3251a/vllm/model_executor/layers/batch_invariant.py#L649
+
     Args:
         input: Input tensor of shape (..., hidden_size)
         weight: Weight tensor of shape (hidden_size,)
