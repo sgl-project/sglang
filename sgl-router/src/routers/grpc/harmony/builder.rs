@@ -39,13 +39,6 @@ pub(super) fn get_harmony_encoding() -> &'static HarmonyEncoding {
 /// Built-in tools that are added to the system message
 const BUILTIN_TOOLS: &[&str] = &["web_search_preview", "code_interpreter", "container"];
 
-/// Check if there are custom tools beyond built-in ones
-///
-/// Following vLLM's has_custom_tools() logic:
-/// ```python
-/// def has_custom_tools(tool_types: list[str]) -> bool:
-///     return not set(tool_types).issubset(BUILTIN_TOOLS)
-/// ```
 fn has_custom_tools(tool_types: &[&str]) -> bool {
     !tool_types.iter().all(|t| BUILTIN_TOOLS.contains(t))
 }
@@ -150,8 +143,6 @@ impl HarmonyBuilder {
     }
 
     /// Build system message from ChatCompletionRequest
-    ///
-    /// Follows vLLM's get_system_message() logic for Chat Completion API
     fn build_system_message_from_chat(&self, request: &ChatCompletionRequest) -> HarmonyMessage {
         let mut sys_content = SystemContent::new();
 
@@ -187,7 +178,6 @@ impl HarmonyBuilder {
 
     /// Build system message from ResponsesRequest
     ///
-    /// Follows vLLM's get_system_message() logic for Responses API
     ///
     /// # Arguments
     /// * `request` - The ResponsesRequest
@@ -221,7 +211,6 @@ impl HarmonyBuilder {
             sys_content.with_conversation_start_date(Local::now().format("%Y-%m-%d").to_string());
 
         // If no custom tools, remove "commentary" from valid channels
-        // Following vLLM's logic
         if !with_custom_tools {
             if let Some(channel_config) = &sys_content.channel_config {
                 let valid_channels: Vec<String> = channel_config
@@ -269,7 +258,7 @@ impl HarmonyBuilder {
                     continue;
                 }
                 "mcp" => {
-                    // We support MCP tools (unlike vLLM which skips them for now).
+                    // We support MCP tools.
                     // Add them as function tools.
                     function_tools.push(tool);
                 }
@@ -304,8 +293,6 @@ impl HarmonyBuilder {
 
     /// Get developer message for Responses API
     ///
-    /// Follows vLLM's get_developer_message() logic for Responses API
-    ///
     /// # Arguments
     /// * `instructions` - Optional instructions (Responses API specific, handled in system message)
     /// * `tools` - Optional list of tools
@@ -316,16 +303,12 @@ impl HarmonyBuilder {
     ) -> HarmonyMessage {
         let dev_content = DeveloperContent::new();
 
-        // Note: Instructions are handled in build_system_message_from_responses,
-        // added to model_identity, following vLLM's get_system_message() logic
-
         // Early return if no tools
         let Some(tools) = tools else {
             return HarmonyMessage::from_role_and_content(Role::Developer, dev_content);
         };
 
         // Filter tools - skip built-in tools, only add function tools
-        // Following vLLM's logic:
         // - web_search_preview, code_interpreter, container, mcp are built-in (skip)
         // - function tools are added to developer message
         // Note: Currently Responses API doesn't have function tools,
@@ -347,7 +330,6 @@ impl HarmonyBuilder {
 
     /// Construct input messages for Responses API with Harmony
     ///
-    /// Follows vLLM's _construct_input_messages_with_harmony() logic for Responses API.
     /// Handles both new conversations and continuations of previous responses.
     ///
     /// This handles:
@@ -430,7 +412,6 @@ impl HarmonyBuilder {
                 all_messages.push(user_msg);
             }
             ResponseInput::Items(items) => {
-                // Following vLLM's parse_response_input() logic for converting items
                 // This needs to maintain prev_outputs state for function call tracking
                 let prev_outputs = Vec::new();
 
@@ -449,7 +430,6 @@ impl HarmonyBuilder {
 
     /// Parse a ResponseInputOutputItem into a HarmonyMessage
     ///
-    /// Follows vLLM's parse_response_input() logic.
     /// Handles conversion of various response item types (messages, function calls, reasoning, etc.)
     /// to Harmony message format.
     ///
@@ -461,7 +441,6 @@ impl HarmonyBuilder {
         item: &crate::protocols::responses::ResponseInputOutputItem,
         _prev_outputs: &[crate::protocols::responses::ResponseOutputItem],
     ) -> Result<HarmonyMessage, String> {
-        // TODO: Full implementation needed to match vLLM's parse_response_input() logic
         // This should handle:
         // - Regular messages (user/assistant/system)
         // - Function call outputs with call_id lookup
@@ -490,7 +469,6 @@ impl HarmonyBuilder {
 
     /// Convert OpenAI ChatMessage format to Harmony messages
     ///
-    /// Following vLLM's parse_chat_input logic:
     /// - Assistant messages with tool_calls create multiple messages (one per tool call)
     /// - Tool role messages use Role::Tool with proper author
     /// - Tool-related messages use channel="commentary"
@@ -620,7 +598,6 @@ impl HarmonyBuilder {
                     content,
                     tool_call_id,
                 } => {
-                    // Following vLLM: Use Role::Tool with Author name "functions.{function_name}"
                     // Look up the function name from the tool_call_id
                     let function_name = tool_call_map
                         .get(tool_call_id)
