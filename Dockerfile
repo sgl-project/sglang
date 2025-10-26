@@ -4,7 +4,8 @@ WORKDIR /app
 
 # System deps needed by runtime and healthcheck + NVIDIA CUDA Toolkit 12.8
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl gnupg ca-certificates dnsutils libnuma1 numactl wget ibutils && \
+    curl gnupg ca-certificates dnsutils libnuma1 numactl wget ibutils \
+    build-essential gcc g++ python3-dev && \
     wget -qO /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
     dpkg -i /tmp/cuda-keyring.deb && rm -f /tmp/cuda-keyring.deb && \
     apt-get update && apt-get install -y --no-install-recommends cuda-toolkit-12-8 && \

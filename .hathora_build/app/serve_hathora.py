@@ -4,9 +4,6 @@ import os
 import sys
 from typing import Optional
 
-from sglang.srt.server_args import prepare_server_args
-from sglang.srt.entrypoints.http_server import launch_server
-
 
 def _env_truthy(val: Optional[str], default: bool = False) -> bool:
     if val is None:
@@ -15,9 +12,9 @@ def _env_truthy(val: Optional[str], default: bool = False) -> bool:
 
 
 def _get_env_or_cfg(key: str, cfg: Optional[dict], cfg_keys: list[str], default=None):
-    if key in os.environ and os.environ[key] != "":
+    if key in os.environ and os.environ[key]:
         return os.environ[key]
-    if cfg is not None:
+    if cfg:
         for ck in cfg_keys:
             v = cfg.get(ck)
             if v not in (None, ""):
@@ -25,195 +22,124 @@ def _get_env_or_cfg(key: str, cfg: Optional[dict], cfg_keys: list[str], default=
     return default
 
 
+def _add_arg_if_set(argv: list[str], flag: str, value) -> None:
+    if value:
+        argv.extend([flag, str(value)])
+
+
 def _build_sglang_argv_from_env() -> list[str]:
     cfg_json = os.environ.get("DEPLOYMENT_CONFIG_JSON")
-    cfg: Optional[dict] = None
-    if cfg_json:
-        try:
-            cfg = json.loads(cfg_json)
-        except Exception:
-            cfg = None
+    cfg = json.loads(cfg_json) if cfg_json else None
 
-    argv: list[str] = []
-
-
-    model_path = _get_env_or_cfg("MODEL_PATH", cfg, ["model_id", "model_path"]) or ""
+    model_path = _get_env_or_cfg("MODEL_PATH", cfg, ["model_id", "model_path"])
     if not model_path:
-        raise RuntimeError("MODEL_PATH is required (or provide model_id in DEPLOYMENT_CONFIG_JSON)")
+        raise RuntimeError("MODEL_PATH is required")
 
-    tp_size = _get_env_or_cfg("TP_SIZE", cfg, ["tp_size"], "1")
-    dp_size = _get_env_or_cfg("DP_SIZE", cfg, ["dp_size"], "1")
-    dtype = _get_env_or_cfg("DTYPE", cfg, ["dtype"], "auto")
-    kv_cache_dtype = _get_env_or_cfg("KV_CACHE_DTYPE", cfg, ["kv_cache_dtype"], "auto")
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = os.environ.get("PORT", os.environ.get("HATHORA_DEFAULT_PORT", "8000"))
-    log_level = os.environ.get("LOG_LEVEL", "info").lower()
-    schedule_conservativeness = os.environ.get("SCHEDULE_CONSERVATIVENESS", "1.0")
-
-    argv += [
+    argv = [
         "--model-path", str(model_path),
-        "--tp-size", str(tp_size),
-        "--dp-size", str(dp_size),
-        "--dtype", str(dtype),
-        "--kv-cache-dtype", str(kv_cache_dtype),
-        "--host", str(host),
-        "--port", str(port),
-        "--log-level", str(log_level),
-        "--schedule-conservativeness", str(schedule_conservativeness),
+        "--tp-size", _get_env_or_cfg("TP_SIZE", cfg, ["tp_size"], "1"),
+        "--dp-size", _get_env_or_cfg("DP_SIZE", cfg, ["dp_size"], "1"),
+        "--dtype", _get_env_or_cfg("DTYPE", cfg, ["dtype"], "auto"),
+        "--kv-cache-dtype", _get_env_or_cfg("KV_CACHE_DTYPE", cfg, ["kv_cache_dtype"], "auto"),
+        "--host", os.environ.get("HOST", "0.0.0.0"),
+        "--port", os.environ.get("PORT", os.environ.get("HATHORA_DEFAULT_PORT", "8000")),
+        "--log-level", os.environ.get("LOG_LEVEL", "info").lower(),
+        "--schedule-conservativeness", os.environ.get("SCHEDULE_CONSERVATIVENESS", "1.0"),
         "--skip-server-warmup",
         "--scheduler-recv-interval", "0",
+        "--disable-custom-all-reduce",
     ]
 
-    # Optional arguments (kept minimal, parity with native entrypoint)
-    quantization = _get_env_or_cfg("QUANTIZATION", cfg, ["quantization"], None)
-    if quantization:
-        argv += ["--quantization", str(quantization)]
-
-    # Context length (K2 and long-context models)
-    context_length = _get_env_or_cfg("CONTEXT_LENGTH", cfg, ["context_length", "max_context_length"], None)
-    if context_length:
-        argv += ["--context-length", str(context_length)]
-
-    # Context length (K2 and long-context models)
-    context_length = _get_env_or_cfg(
-        "CONTEXT_LENGTH", cfg, ["context_length", "max_context_length"], None
-    )
-    if context_length:
-        argv += ["--context-length", str(context_length)]
-
-    max_total_tokens = _get_env_or_cfg("MAX_TOTAL_TOKENS", cfg, ["max_total_tokens"], None)
-    if max_total_tokens:
-        argv += ["--max-total-tokens", str(max_total_tokens)]
-
-    mem_fraction_static = _get_env_or_cfg("MEM_FRACTION_STATIC", cfg, ["mem_fraction_static"], None)
-    if mem_fraction_static:
-        argv += ["--mem-fraction-static", str(mem_fraction_static)]
-
-    max_running_requests = os.environ.get("MAX_RUNNING_REQUESTS")
-    if max_running_requests:
-        argv += ["--max-running-requests", str(max_running_requests)]
-
-    cuda_graph_max_bs = os.environ.get("CUDA_GRAPH_MAX_BS")
-    if cuda_graph_max_bs:
-        argv += ["--cuda-graph-max-bs", str(cuda_graph_max_bs)]
-
-    chunked_prefill_size = os.environ.get("CHUNKED_PREFILL_SIZE")
-    if chunked_prefill_size:
-        argv += ["--chunked-prefill-size", str(chunked_prefill_size)]
-
-    max_prefill_tokens = os.environ.get("MAX_PREFILL_TOKENS")
-    if max_prefill_tokens:
-        argv += ["--max-prefill-tokens", str(max_prefill_tokens)]
-
-    chat_template = os.environ.get("CHAT_TEMPLATE")
-    if chat_template:
-        argv += ["--chat-template", str(chat_template)]
-
-    tool_call_parser = os.environ.get("TOOL_CALL_PARSER")
-    if tool_call_parser:
-        argv += ["--tool-call-parser", str(tool_call_parser)]
-
-    api_key = os.environ.get("API_KEY") or os.environ.get("HATHORA_APP_SECRET")
-    if api_key:
-        argv += ["--api-key", str(api_key)]
+    # Optional server arguments
+    _add_arg_if_set(argv, "--quantization", _get_env_or_cfg("QUANTIZATION", cfg, ["quantization"]))
+    _add_arg_if_set(argv, "--context-length", _get_env_or_cfg("CONTEXT_LENGTH", cfg, ["context_length", "max_context_length"]))
+    _add_arg_if_set(argv, "--max-total-tokens", _get_env_or_cfg("MAX_TOTAL_TOKENS", cfg, ["max_total_tokens"]))
+    _add_arg_if_set(argv, "--mem-fraction-static", _get_env_or_cfg("MEM_FRACTION_STATIC", cfg, ["mem_fraction_static"]))
+    _add_arg_if_set(argv, "--max-running-requests", os.environ.get("MAX_RUNNING_REQUESTS"))
+    _add_arg_if_set(argv, "--cuda-graph-max-bs", os.environ.get("CUDA_GRAPH_MAX_BS"))
+    _add_arg_if_set(argv, "--chunked-prefill-size", os.environ.get("CHUNKED_PREFILL_SIZE"))
+    _add_arg_if_set(argv, "--max-prefill-tokens", os.environ.get("MAX_PREFILL_TOKENS"))
+    _add_arg_if_set(argv, "--chat-template", os.environ.get("CHAT_TEMPLATE"))
+    _add_arg_if_set(argv, "--tool-call-parser", os.environ.get("TOOL_CALL_PARSER"))
+    _add_arg_if_set(argv, "--api-key", os.environ.get("API_KEY") or os.environ.get("HATHORA_APP_SECRET"))
 
     # Embedding mode
-    is_embedding = _env_truthy(os.environ.get("IS_EMBEDDING"), False)
-    try:
-        mp_lower = (model_path or "").lower()
-        if "embedding" in mp_lower:
-            is_embedding = True
-    except Exception:
-        pass
+    is_embedding = _env_truthy(os.environ.get("IS_EMBEDDING")) or "embedding" in model_path.lower()
     if is_embedding:
-        argv += ["--is-embedding", "--disable-radix-cache"]
+        argv.extend(["--is-embedding", "--disable-radix-cache"])
 
-    # Metrics and trust-remote-code
+    # Boolean flags
     if _env_truthy(os.environ.get("ENABLE_METRICS"), True):
-        argv += ["--enable-metrics"]
-    if _env_truthy(os.environ.get("TRUST_REMOTE_CODE"), False):
-        argv += ["--trust-remote-code"]
-
-    # DP Attention
-    if _env_truthy(os.environ.get("ENABLE_DP_ATTENTION"), False):
-        argv += ["--enable-dp-attention"]
-    if _env_truthy(os.environ.get("ENABLE_DP_LM_HEAD"), False):
-        argv += ["--enable-dp-lm-head"]
+        argv.append("--enable-metrics")
+    if _env_truthy(os.environ.get("TRUST_REMOTE_CODE")):
+        argv.append("--trust-remote-code")
+    if _env_truthy(os.environ.get("ENABLE_DP_ATTENTION")):
+        argv.append("--enable-dp-attention")
+    if _env_truthy(os.environ.get("ENABLE_DP_LM_HEAD")):
+        argv.append("--enable-dp-lm-head")
+    if _env_truthy(os.environ.get("ENABLE_MEMORY_SAVER")):
+        argv.append("--enable-memory-saver")
 
     # MoE optimizations
-    moe_runner_backend = os.environ.get("MOE_RUNNER_BACKEND")
-    if moe_runner_backend and moe_runner_backend != "auto":
-        argv += ["--moe-runner-backend", str(moe_runner_backend)]
+    _add_arg_if_set(argv, "--moe-runner-backend", os.environ.get("MOE_RUNNER_BACKEND"))
+    if _env_truthy(os.environ.get("ENABLE_EPLB")):
+        argv.append("--enable-eplb")
+        _add_arg_if_set(argv, "--eplb-algorithm", os.environ.get("EPLB_ALGORITHM"))
+        _add_arg_if_set(argv, "--eplb-rebalance-num-iterations", os.environ.get("EPLB_REBALANCE_NUM_ITERATIONS"))
+
+    # Speculative decoding
+    if _env_truthy(os.environ.get("SPEC_DECODE")):
+        _add_arg_if_set(argv, "--speculative-algorithm", os.environ.get("SPECULATIVE_ALGORITHM"))
+        _add_arg_if_set(argv, "--speculative-draft-model-path", os.environ.get("SPECULATIVE_DRAFT_MODEL_PATH"))
+        _add_arg_if_set(argv, "--speculative-num-steps", os.environ.get("SPECULATIVE_NUM_STEPS"))
+
+    # Disaggregation
+    _add_arg_if_set(argv, "--disaggregation-decode-tp", os.environ.get("DISAGGREGATION_DECODE_TP") or os.environ.get("DISAGG_DECODE_TP"))
+    _add_arg_if_set(argv, "--disaggregation-prefill-pp", os.environ.get("DISAGGREGATION_PREFILL_PP"))
+
+    # Multi-node distributed serving
+    _add_arg_if_set(argv, "--dist-init-addr", os.environ.get("DIST_INIT_ADDR"))
+    _add_arg_if_set(argv, "--nnodes", os.environ.get("NNODES"))
+    _add_arg_if_set(argv, "--node-rank", os.environ.get("NODE_RANK"))
+
+    # Router configuration
+    _add_arg_if_set(argv, "--router-policy", os.environ.get("ROUTER_POLICY", "cache_aware"))
+    _add_arg_if_set(argv, "--router-api-key", os.environ.get("API_KEY") or os.environ.get("HATHORA_APP_SECRET"))
+    _add_arg_if_set(argv, "--router-request-timeout-secs", os.environ.get("ROUTER_REQUEST_TIMEOUT_SECS"))
+    _add_arg_if_set(argv, "--router-max-concurrent-requests", os.environ.get("ROUTER_MAX_CONCURRENT_REQUESTS"))
+    _add_arg_if_set(argv, "--router-queue-size", os.environ.get("ROUTER_QUEUE_SIZE"))
+    _add_arg_if_set(argv, "--router-queue-timeout-secs", os.environ.get("ROUTER_QUEUE_TIMEOUT_SECS"))
+    _add_arg_if_set(argv, "--max-queued-requests", os.environ.get("MAX_QUEUED_REQUESTS"))
     
-    # Expert Load Balancing (EPLB)
-    if _env_truthy(os.environ.get("ENABLE_EPLB"), False):
-        argv += ["--enable-eplb"]
-        eplb_algorithm = os.environ.get("EPLB_ALGORITHM")
-        if eplb_algorithm and eplb_algorithm != "auto":
-            argv += ["--eplb-algorithm", str(eplb_algorithm)]
-        eplb_rebalance_iterations = os.environ.get("EPLB_REBALANCE_NUM_ITERATIONS")
-        if eplb_rebalance_iterations:
-            argv += ["--eplb-rebalance-num-iterations", str(eplb_rebalance_iterations)]
-
-    # Memory saver (only if explicitly requested)
-    if _env_truthy(os.environ.get("ENABLE_MEMORY_SAVER"), False):
-        argv += ["--enable-memory-saver"]
-
-    # Speculative decoding (minimal passthrough)
-    if _env_truthy(os.environ.get("SPEC_DECODE"), False):
-        spec_algo = os.environ.get("SPECULATIVE_ALGORITHM")
-        if spec_algo:
-            argv += ["--speculative-algorithm", spec_algo]
-            draft_path = os.environ.get("SPECULATIVE_DRAFT_MODEL_PATH")
-            if draft_path:
-                argv += ["--speculative-draft-model-path", draft_path]
-            num_steps = os.environ.get("SPECULATIVE_NUM_STEPS")
-            if num_steps:
-                argv += ["--speculative-num-steps", str(num_steps)]
-
-    # Disaggregation passthrough
-    disagg_decode_tp = os.environ.get("DISAGGREGATION_DECODE_TP") or os.environ.get("DISAGG_DECODE_TP")
-    if disagg_decode_tp:
-        argv += ["--disaggregation-decode-tp", str(disagg_decode_tp)]
-    disagg_prefill_pp = os.environ.get("DISAGGREGATION_PREFILL_PP")
-    if disagg_prefill_pp:
-        argv += ["--disaggregation-prefill-pp", str(disagg_prefill_pp)]
-
-    # Multi-node distributed serving (K2 capability)
-    dist_init_addr = os.environ.get("DIST_INIT_ADDR")
-    nnodes = os.environ.get("NNODES")
-    node_rank = os.environ.get("NODE_RANK")
-    if dist_init_addr:
-        argv += ["--dist-init-addr", str(dist_init_addr)]
-    if nnodes:
-        argv += ["--nnodes", str(nnodes)]
-    if node_rank:
-        argv += ["--node-rank", str(node_rank)]
-
-    # Custom all-reduce disabled (parity with native entrypoint)
-    argv += ["--disable-custom-all-reduce"]
+    if _env_truthy(os.environ.get("ROUTER_DISABLE_RETRIES")):
+        argv.append("--router-disable-retries")
+    
+    if "kimi" in model_path.lower():
+        argv.extend(["--router-reasoning-parser", "kimi"])
 
     return argv
 
 
 def main():
-    # Setup minimal logging
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(level=getattr(logging, log_level), stream=sys.stdout)
 
-    # HF token passthrough if provided via config json
-    try:
-        cfg_json = os.environ.get("DEPLOYMENT_CONFIG_JSON")
-        if cfg_json and not os.environ.get("HF_TOKEN"):
-            _cfg = json.loads(cfg_json)
-            if isinstance(_cfg, dict) and _cfg.get("hf_token"):
-                os.environ["HF_TOKEN"] = str(_cfg["hf_token"])  # export for SGLang
-    except Exception:
-        pass
+    # Pass HF token from deployment config if available
+    cfg_json = os.environ.get("DEPLOYMENT_CONFIG_JSON")
+    if cfg_json and not os.environ.get("HF_TOKEN"):
+        try:
+            cfg = json.loads(cfg_json)
+            if cfg.get("hf_token"):
+                os.environ["HF_TOKEN"] = str(cfg["hf_token"])
+        except Exception:
+            pass
 
+    # Launch with router
     argv = _build_sglang_argv_from_env()
-    server_args = prepare_server_args(argv)
-    launch_server(server_args)
+    sys.argv = ["sglang_router.launch_server"] + argv
+
+    from sglang_router.launch_server import main as router_main
+    router_main()
 
 
 if __name__ == "__main__":
