@@ -38,8 +38,8 @@ use super::{
 use crate::{
     core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
     data_connector::{
-        ConversationId, ListParams, ResponseId, SharedConversationItemStorage,
-        SharedConversationStorage, SharedResponseStorage, SortOrder,
+        ConversationId, ConversationItemStorage, ConversationStorage, ListParams, ResponseId,
+        ResponseStorage, SortOrder,
     },
     mcp::McpManager,
     protocols::{
@@ -81,11 +81,11 @@ pub struct OpenAIRouter {
     /// Health status
     healthy: AtomicBool,
     /// Response storage for managing conversation history
-    response_storage: SharedResponseStorage,
+    response_storage: Arc<dyn ResponseStorage>,
     /// Conversation storage backend
-    conversation_storage: SharedConversationStorage,
+    conversation_storage: Arc<dyn ConversationStorage>,
     /// Conversation item storage backend
-    conversation_item_storage: SharedConversationItemStorage,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     /// MCP manager (handles both static and dynamic servers)
     mcp_manager: Arc<McpManager>,
 }
