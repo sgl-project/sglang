@@ -271,7 +271,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         page_table_1_flattened = None
         topk_indices_offset = None
         self.set_nsa_prefill_impl(forward_batch)
-        self.topk_transform_method = self.get_topk_transform_method()
+        topk_transform_method = self.get_topk_transform_method()
 
         if forward_batch.forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
@@ -350,7 +350,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 ]
             )
 
-            if self.topk_transform_method == TopkTransformMethod.RAGGED:
+            if topk_transform_method == TopkTransformMethod.RAGGED:
                 page_table_1_flattened = torch.cat(
                     [
                         page_table[i, :kv_len]
@@ -844,11 +844,11 @@ class NativeSparseAttnBackend(AttentionBackend):
             q_rope = q_all[:, :, layer.v_head_dim :]
 
         # NOTE(dark): here, we use page size = 1
-
+        topk_transform_method = self.get_topk_transform_method()
         if NSA_FUSE_TOPK:
             page_table_1 = topk_indices
         else:
-            if self.topk_transform_method == TopkTransformMethod.RAGGED:
+            if topk_transform_method == TopkTransformMethod.RAGGED:
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
                 mask = topk_indices != -1
@@ -860,7 +860,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 topk_indices = torch.where(
                     mask, topk_indices + topk_indices_offset, topk_indices
                 )
-            elif self.topk_transform_method == TopkTransformMethod.PAGED:
+            elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.nsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
                     page_table=metadata.page_table_1,
@@ -885,7 +885,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
             # NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 has no effect here,
             # because the flashmla_sparse kernel doesn't support fp8 compute
-            if self.topk_transform_method == TopkTransformMethod.RAGGED:
+            if topk_transform_method == TopkTransformMethod.RAGGED:
                 if any(forward_batch.extend_prefix_lens_cpu):
                     page_table_1_flattened = (
                         self.forward_metadata.page_table_1_flattened
