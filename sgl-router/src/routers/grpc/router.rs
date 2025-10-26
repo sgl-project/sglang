@@ -64,6 +64,8 @@ pub struct GrpcRouter {
     mcp_manager: Arc<McpManager>,
     // Background task handles for cancellation support (includes gRPC client for Python abort)
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
+    // Responses context (bundles responses-specific dependencies)
+    responses_context: responses::ResponsesContext,
 }
 
 impl GrpcRouter {
@@ -119,6 +121,17 @@ impl GrpcRouter {
             ctx.configured_reasoning_parser.clone(),
         );
 
+        // Create responses context with all dependencies
+        let responses_context = responses::ResponsesContext::new(
+            Arc::new(pipeline.clone()),
+            shared_components.clone(),
+            worker_registry.clone(),
+            response_storage.clone(),
+            conversation_storage.clone(),
+            conversation_item_storage.clone(),
+            mcp_manager.clone(),
+        );
+
         Ok(GrpcRouter {
             worker_registry,
             policy_registry,
@@ -137,6 +150,7 @@ impl GrpcRouter {
             conversation_item_storage,
             mcp_manager,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            responses_context,
         })
     }
 
@@ -254,26 +268,11 @@ impl RouterTrait for GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Use responses module for ALL requests (streaming and non-streaming)
-        // Responses module handles:
-        // - Request validation (previous_response_id XOR conversation)
-        // - Loading response chain / conversation history from storage
-        // - Conversion: ResponsesRequest → ChatCompletionRequest
-        // - Execution through chat pipeline stages
-        // - Conversion: ChatCompletionResponse → ResponsesResponse
-        // - Response persistence
-        // - MCP tool loop wrapper (future)
         responses::route_responses(
-            &self.pipeline,
+            &self.responses_context,
             Arc::new(body.clone()),
             headers.cloned(),
             model_id.map(|s| s.to_string()),
-            self.shared_components.clone(),
-            self.response_storage.clone(),
-            self.conversation_storage.clone(),
-            self.conversation_item_storage.clone(),
-            self.mcp_manager.clone(),
-            self.background_tasks.clone(),
         )
         .await
     }
@@ -284,12 +283,11 @@ impl RouterTrait for GrpcRouter {
         response_id: &str,
         _params: &ResponsesGetParams,
     ) -> Response {
-        responses::get_response_impl(&self.response_storage, response_id).await
+        responses::get_response_impl(&self.responses_context, response_id).await
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        responses::cancel_response_impl(&self.response_storage, &self.background_tasks, response_id)
-            .await
+        responses::cancel_response_impl(&self.responses_context, response_id).await
     }
 
     async fn route_classify(
