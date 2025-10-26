@@ -67,10 +67,7 @@ use crate::{
             ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
-    routers::openai::{
-        conversations::persist_conversation_items,
-        mcp::ensure_request_mcp_client,
-    },
+    routers::openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
 };
 
 // ============================================================================
@@ -407,14 +404,8 @@ async fn route_responses_streaming(
         {
             debug!("MCP tools detected in streaming mode, using streaming tool loop");
 
-            return execute_tool_loop_streaming(
-                ctx,
-                modified_request,
-                &request,
-                headers,
-                model_id,
-            )
-            .await;
+            return execute_tool_loop_streaming(ctx, modified_request, &request, headers, model_id)
+                .await;
         }
     }
 

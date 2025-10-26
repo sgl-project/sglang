@@ -324,7 +324,8 @@ pub(super) async fn execute_tool_loop(
                 "Calling MCP tool '{}' with args: {}",
                 tool_name, args_json_str
             );
-            let (output_str, success, error) = match ctx.mcp_manager
+            let (output_str, success, error) = match ctx
+                .mcp_manager
                 .call_tool(tool_name.as_str(), args_json_str.as_str())
                 .await
             {
@@ -740,7 +741,8 @@ async fn execute_tool_loop_streaming_internal(
                     "Calling MCP tool '{}' with args: {}",
                     tool_name, args_json_str
                 );
-                let (output_str, success, error) = match ctx.mcp_manager
+                let (output_str, success, error) = match ctx
+                    .mcp_manager
                     .call_tool(tool_name.as_str(), args_json_str.as_str())
                     .await
                 {
