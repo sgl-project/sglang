@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 class SchedulerMultiplexMixin:
 
-    def init_pdmux():
+    def init_pdmux(self):
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(self.server_args.pdmux_config_path)
         initialize_stream_groups(self.gpu_id, self.pdmux_config)
