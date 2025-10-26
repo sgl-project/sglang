@@ -519,7 +519,7 @@ class CudaGraphRunner:
         graph_fn = (
             partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
             if memory_saver_adapter.enabled
-            else torch.cuda.graph
+            else torch.device_module.graph
         )
         with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
             out = run_once_fn()
