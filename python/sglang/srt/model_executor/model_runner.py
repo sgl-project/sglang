@@ -447,7 +447,9 @@ class ModelRunner:
             self.init_attention_backend()
 
         # auxiliary hidden capture mode.
-        is_eagle3_target_model_runner = (self.spec_algorithm.is_eagle3() and not self.is_draft_worker)
+        is_eagle3_target_model_runner = (
+            self.spec_algorithm.is_eagle3() and not self.is_draft_worker
+        )
         if self.model_config.capture_states_of_layers or is_eagle3_target_model_runner:
 
             if is_eagle3_target_model_runner:
