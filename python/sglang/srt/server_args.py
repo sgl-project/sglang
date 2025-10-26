@@ -34,12 +34,16 @@ from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
+    cpu_has_amx_support,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
     is_cuda,
+    is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
+    is_hopper_with_cuda_12_3,
+    is_no_spec_infer_or_topk_one,
     is_npu,
     is_port_available,
     is_remote_url,
@@ -51,6 +55,7 @@ from sglang.srt.utils.common import (
     json_list_type,
     nullable_str,
     parse_connector_type,
+    xpu_has_xmx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
@@ -545,6 +550,9 @@ class ServerArgs:
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
+        # Handle Hicache settings.
+        self._handle_hicache()
+
         # Set kernel backends.
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
@@ -566,9 +574,6 @@ class ServerArgs:
 
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
-
-        # Handle Hicache settings.
-        self._handle_hicache()
 
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
@@ -779,11 +784,9 @@ class ServerArgs:
                 else 0.88
             )
 
-            # Lazy init to avoid circular import
-            # Multimodal models need more memory for the image processor
-            from sglang.srt.configs.model_config import ModelConfig
-
-            model_config = ModelConfig.from_server_args(self)
+            # Multimodal models need more memory for the image processing,
+            # so we adjust the mem_fraction_static accordingly.
+            model_config = self.get_model_config()
             if model_config.is_multimodal:
                 self.adjust_mem_fraction_for_vlm(model_config)
 
@@ -1042,6 +1045,67 @@ class ServerArgs:
             )
 
     def _handle_attention_backend_compatibility(self):
+        model_config = self.get_model_config()
+        use_mla_backend = self.use_mla_backend()
+
+        if self.prefill_attention_backend is not None and (
+            self.prefill_attention_backend == self.decode_attention_backend
+        ):  # override the default attention backend
+            self.attention_backend = self.prefill_attention_backend
+
+        # Pick the default attention backend if not specified
+        if self.attention_backend is None:
+            """
+            Auto select the fastest attention backend.
+
+            1. Models with MHA Architecture (e.g: Llama, QWen)
+                1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
+                1.2 In other cases, we will use flashinfer if available, otherwise use triton.
+            2. Models with MLA Architecture and using FA3
+                2.1 We will use FA3 backend on hopper.
+                2.2 We will use Flashinfer backend on blackwell.
+                2.3 Otherwise, we will use triton backend.
+            """
+
+            if not self.use_mla_backend:
+                # MHA architecture
+                if (
+                    is_hopper_with_cuda_12_3()
+                    and is_no_spec_infer_or_topk_one(server_args)
+                    and is_fa3_default_architecture(self.model_config.hf_config)
+                ):
+                    self.attention_backend = "fa3"
+                elif is_hip():
+                    self.attention_backend = "aiter"
+                elif is_npu():
+                    self.attention_backend = "ascend"
+                else:
+                    self.attention_backend = (
+                        "flashinfer" if is_flashinfer_available() else "triton"
+                    )
+            else:
+                # MLA architecture
+                if is_hopper_with_cuda_12_3():
+                    self.attention_backend = "fa3"
+                elif is_sm100_supported():
+                    self.attention_backend = "flashinfer"
+                elif is_hip():
+                    head_num = model_config.get_num_kv_heads(self.tp_size)
+                    # TODO current aiter only support head number 16 or 128 head number
+                    if head_num == 128 or head_num == 16:
+                        self.attention_backend = "aiter"
+                    else:
+                        self.attention_backend = "triton"
+                elif is_npu():
+                    self.attention_backend = "ascend"
+                else:
+                    self.attention_backend = "triton"
+
+            logger.warning(
+                f"Attention backend not explicitly specified. Use {self.attention_backend} backend by default."
+            )
+
+        # Torch native and flex attention backends
         if self.attention_backend == "torch_native":
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
@@ -1057,12 +1121,7 @@ class ServerArgs:
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
 
-        if is_npu() and self.attention_backend in ["ascend"]:
-            logger.warning(
-                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
-            )
-            self.page_size = 128
-
+        # Major NVIDIA platforms backends
         if (
             self.attention_backend == "flashmla"
             or self.decode_attention_backend == "flashmla"
@@ -1117,19 +1176,13 @@ class ServerArgs:
                 )
                 self.page_size = 64
 
-        if self.attention_backend == "dual_chunk_flash_attn":
+        if self.attention_backend == "fa3" and self.kv_cache_dtype == "fp8_e5m2":
             logger.warning(
-                "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
+                "FlashAttention3 only supports fp8_e4m3 if using FP8; "
+                "Setting attention backend to triton."
             )
-            self.enable_mixed_chunk = False
-            self.disable_radix_cache = True
+            self.attention_backend = "triton"
 
-        if self.attention_backend == "intel_xpu":
-            if self.page_size not in [32, 64, 128]:
-                logger.warning(
-                    f"Intel XPU attention backend only supports page_size of 32, 64 or 128, changing page_size from {self.page_size} to 128."
-                )
-                self.page_size = 128
         if self.attention_backend == "fa4" or self.decode_attention_backend == "fa4":
             raise ValueError(
                 "FA4 backend is only supported for prefill. Please use `--prefill-attention-backend fa4` instead."
@@ -1139,6 +1192,66 @@ class ServerArgs:
                 f"FA4 backend only supports page size 128, changing page_size from {self.page_size} to 128."
             )
             self.page_size = 128
+
+        # AMD platforms backends
+        if self.attention_backend == "aiter":
+            if model_config.context_len > 8192:
+                self.mem_fraction_static *= 0.90
+
+        # NPU platforms backends
+        if is_npu() and self.attention_backend in ["ascend"]:
+            logger.warning(
+                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
+
+        # Other platforms backends
+        if (
+            self.attention_backend == "intel_amx"
+            and self.device == "cpu"
+            and not cpu_has_amx_support()
+        ):
+            logger.warning(
+                "The current platform does not support Intel AMX, will fallback to torch_native backend."
+            )
+            self.attention_backend = "torch_native"
+
+        if (
+            self.attention_backend == "intel_xpu"
+            and self.device == "xpu"
+            and not xpu_has_xmx_support()
+        ):
+            logger.warning(
+                "The current platform does not support Intel XMX, will fallback to triton backend."
+            )
+            self.attention_backend = "triton"
+
+        if self.attention_backend == "intel_xpu":
+            if self.page_size not in [32, 64, 128]:
+                logger.warning(
+                    f"Intel XPU attention backend only supports page_size of 32, 64 or 128, changing page_size from {self.page_size} to 128."
+                )
+                self.page_size = 128
+
+        # Dual chunk flash attention backend
+        if (
+            getattr(model_config.hf_config, "dual_chunk_attention_config", None)
+            is not None
+        ):
+            if self.attention_backend is None:
+                self.attention_backend = "dual_chunk_flash_attn"
+                logger.info("Dual chunk attention is turned on by default.")
+            elif self.attention_backend != "dual_chunk_flash_attn":
+                raise ValueError(
+                    "Dual chunk attention is enabled, but attention backend is set to "
+                    f"{self.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
+                )
+        if self.attention_backend == "dual_chunk_flash_attn":
+            logger.warning(
+                "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
+            )
+            self.enable_mixed_chunk = False
+            self.disable_radix_cache = True
 
     def _handle_page_size(self):
         if self.page_size is None:
@@ -1281,6 +1394,24 @@ class ServerArgs:
                 self.hicache_io_backend = "direct"
                 logger.warning(
                     "Page first direct layout only support direct io backend"
+                )
+
+        if self.enable_hierarchical_cache and self.hicache_io_backend == "kernel":
+            # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
+            if self.decode_attention_backend is None:
+                if not self.use_mla_backend():
+                    self.decode_attention_backend = (
+                        "flashinfer" if is_flashinfer_available() else "triton"
+                    )
+                else:
+                    self.decode_attention_backend = (
+                        "flashinfer" if is_sm100_supported() else "triton"
+                    )
+            elif self.decode_attention_backend == "fa3":
+                self.hicache_io_backend = "direct"
+                logger.warning(
+                    "FlashAttention3 decode backend is not compatible with hierarchical cache. "
+                    "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
 
     def _handle_speculative_decoding(self):
@@ -3355,6 +3486,15 @@ class ServerArgs:
         )
         return hf_config
 
+    def get_model_config(self):
+        # Lazy init to avoid circular import
+        from sglang.srt.configs.model_config import ModelConfig
+
+        if hasattr(self, "model_config"):
+            return self.model_config
+        self.model_config = ModelConfig.from_server_args(self)
+        return self.model_config
+
     def get_attention_backends(server_args):
         prefill_attention_backend_str = (
             server_args.prefill_attention_backend
@@ -3367,6 +3507,12 @@ class ServerArgs:
             else server_args.attention_backend
         )
         return prefill_attention_backend_str, decode_attention_backend_str
+
+    def use_mla_backend(self):
+        from sglang.srt.configs.model_config import AttentionArch
+
+        model_config = self.get_model_config()
+        return model_config.attention_arch == AttentionArch.MLA
 
     def check_server_args(self):
         # Check parallel size constraints
