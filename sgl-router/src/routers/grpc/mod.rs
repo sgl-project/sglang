@@ -8,6 +8,7 @@ pub mod pipeline;
 pub mod processing;
 pub mod responses;
 pub mod router;
+pub mod stages;
 pub mod streaming;
 pub mod utils;
 
