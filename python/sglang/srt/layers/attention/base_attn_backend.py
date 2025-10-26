@@ -72,8 +72,7 @@ class AttentionBackend(ABC):
         Here, we need to redo the computation of all metadata of the attention backend
         that depends on tree mask and position buffers.
         """
-        pass
-        # raise NotImplementedError()
+        raise NotImplementedError()
 
     def forward(
         self,
