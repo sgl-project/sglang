@@ -1642,7 +1642,6 @@ def calculate_metrics(
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
     retokenized_itls: List[float] = []
-    retokenized_itl_tokens = 0
 
     use_retokenized_itl = (
         accept_length is not None
@@ -1672,7 +1671,6 @@ def calculate_metrics(
                     )
                     adjusted_itl = itl / num_tokens
                     retokenized_itls.extend([adjusted_itl] * num_tokens)
-                    retokenized_itl_tokens += num_tokens
             else:
                 itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
