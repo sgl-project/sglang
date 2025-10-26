@@ -28,7 +28,7 @@ class AttentionCapabilities:
     sm_capability_major: list[int] | None = None
     # Whether the backend supports page size > 1
     # If set as a list of int, it means the backend only supports the page sizes in the list
-    page_size_gt_1: bool | list[int] = False
+    allowed_page_sizes_gt_1: bool | list[int] = False
     # Cuda graph support
     cuda_graph: bool = False
     # Speculative decoding support (whether topk = 1 or topk > 1)
@@ -52,8 +52,8 @@ class AttentionCapabilities:
 ATTN_BACKEND_CAPS: dict[str, AttentionCapabilities] = {
     "trtllm_mha": AttentionCapabilities(
         hardware=["cuda"],
-        sm_capability_major=[100],
-        page_size_gt_1=[16, 32, 64],
+        sm_capability_major=[10],
+        allowed_page_sizes_gt_1=[16, 32, 64],
         cuda_graph=True,
         spec=True,
         spec_topk_gt_1=False,
@@ -119,13 +119,13 @@ def _validate_single_backend(
             )
 
     if server_args.page_size and server_args.page_size > 1:
-        if isinstance(caps.page_size_gt_1, list):
-            if server_args.page_size not in caps.page_size_gt_1:
+        if isinstance(caps.allowed_page_sizes_gt_1, list):
+            if server_args.page_size not in caps.allowed_page_sizes_gt_1:
                 raise RuntimeError(
                     f"Page size {server_args.page_size} is not supported for {backend_name}. "
-                    f"It should be one of {caps.page_size_gt_1}."
+                    f"It should be one of {caps.allowed_page_sizes_gt_1}."
                 )
-        elif not caps.page_size_gt_1:
+        elif not caps.allowed_page_sizes_gt_1:
             raise RuntimeError(f"Page size > 1 is not supported for {backend_name}.")
 
     # CUDA graph checks (only when enabled)
