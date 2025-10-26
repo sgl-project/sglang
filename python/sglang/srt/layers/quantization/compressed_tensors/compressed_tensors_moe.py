@@ -15,6 +15,7 @@ except ImportError:
     FUSED_MARLIN_MOE_AVAILABLE = False
 
 import torch
+import torch.nn.functional as F
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
@@ -33,7 +34,13 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_cuda,
+    is_hip,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -292,16 +299,77 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 max_w13_scales, requires_grad=False
             )
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if _use_aiter:
+            padding_size = get_int_env_var("AITER_MOE_PADDING_SIZE")
+
+            N = layer.w2_weight.shape[-1]
+            if padding_size:
+                pad_size = (padding_size - (N % padding_size)) % padding_size
+            else:
+                pad_size = 0
+
+            if self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
+                # pad w13_weight_scale
+                with torch.no_grad():
+                    part1 = layer.w13_weight_scale.data[:, :N, :]
+                    part2 = layer.w13_weight_scale.data[:, N:, :]
+                    # 1. pad part1
+                    part1_padded = torch.nn.functional.pad(
+                        part1,
+                        (0, 0, 0, pad_size, 0, 0),  # pad on right on dim 1
+                        mode="constant",
+                        value=0,
+                    )
+                    # 2. pad part2
+                    part2_padded = torch.nn.functional.pad(
+                        part2,
+                        (0, 0, 0, pad_size, 0, 0),  # pad on right on dim 1
+                        mode="constant",
+                        value=0,
+                    )
+
+                    # 3. concatenate part1 and part2
+                    padded_w13_weight_scale = torch.cat(
+                        [part1_padded, part2_padded], dim=1
+                    )
+                    layer.w13_weight_scale = torch.nn.Parameter(
+                        padded_w13_weight_scale,
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+
             with torch.no_grad():
                 # Pre-shuffle weights
+                part1 = layer.w13_weight.data[
+                    :, :N, :
+                ]  # part1: [1..192]，shape: [128, 192, 512]
+                part2 = layer.w13_weight.data[
+                    :, N:, :
+                ]  # part2: [193..384]，shape: [128, 192, 512]
+
+                # 1. pad part1
+                part1_padded = torch.nn.functional.pad(
+                    part1, (0, 0, 0, pad_size, 0, 0), mode="constant", value=0
+                )
+
+                # 2. pad part2
+                part2_padded = torch.nn.functional.pad(
+                    part2, (0, 0, 0, pad_size, 0, 0), mode="constant", value=0
+                )
+
+                # 3. concat
+                padded_w13_weight = torch.cat([part1_padded, part2_padded], dim=1)
+
                 layer.w13_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w13_weight.data, (16, 16)),
+                    shuffle_weight(padded_w13_weight, (16, 16)),
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
+                padded_w2_weight = F.pad(
+                    layer.w2_weight.data, (0, pad_size, 0, 0, 0, 0), "constant", 0
+                )
                 layer.w2_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w2_weight.data, (16, 16)),
+                    shuffle_weight(padded_w2_weight, (16, 16)),
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
