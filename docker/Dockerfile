@@ -110,7 +110,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
       python3 -m pip install --no-cache-dir nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-      python3 -m pip install --no-cache-dir torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUDA_VERSION} ;
+      python3 -m pip install --no-cache-dir torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUDA_VERSION} ; \
     else \
       echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
     fi \
