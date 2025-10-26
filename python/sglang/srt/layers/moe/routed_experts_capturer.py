@@ -62,7 +62,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
     def clear_buffer(self):
         global _experts_capturer_host_buffer
-        _experts_capturer_host_buffer.zeros_()
+        _experts_capturer_host_buffer.zero_()
     
     def get_captured_experts(self):
         global _experts_capturer_host_buffer
