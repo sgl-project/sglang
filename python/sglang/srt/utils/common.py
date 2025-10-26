@@ -56,7 +56,6 @@ from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -93,9 +92,6 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +134,7 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
@@ -1105,9 +1102,9 @@ def add_api_key_middleware(app, api_key: str):
     async def authentication(request, call_next):
         if request.method == "OPTIONS":
             return await call_next(request)
-        if request.url.path.startswith("/health"):
-            return await call_next(request)
-        if request.url.path.startswith("/metrics"):
+        if request.url.path.startswith("/health") or request.url.path.startswith(
+            "/metrics"
+        ):
             return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)

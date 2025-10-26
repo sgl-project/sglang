@@ -806,7 +806,7 @@ def _get_and_verify_dtype(
 ) -> torch.dtype:
     # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
-    config_dtype = getattr(config, "torch_dtype", None)
+    config_dtype = getattr(config, "dtype", None)
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_TORCH_DTYPE.get(config_dtype, None)
     if config_dtype is None:
