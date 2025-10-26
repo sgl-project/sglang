@@ -33,7 +33,6 @@ pub enum Job {
     InitializeWorkersFromConfig { router_config: Box<RouterConfig> },
     InitializeMcpServers { mcp_config: Box<McpConfig> },
     RegisterMcpServer { config: Box<McpServerConfigRequest> },
-    RefreshMcpInventory { server_name: String },
 }
 
 impl Job {
@@ -45,7 +44,6 @@ impl Job {
             Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
             Job::InitializeMcpServers { .. } => "InitializeMcpServers",
             Job::RegisterMcpServer { .. } => "RegisterMcpServer",
-            Job::RefreshMcpInventory { .. } => "RefreshMcpInventory",
         }
     }
 
@@ -57,7 +55,6 @@ impl Job {
             Job::InitializeWorkersFromConfig { .. } => "startup",
             Job::InitializeMcpServers { .. } => "startup",
             Job::RegisterMcpServer { config } => &config.name,
-            Job::RefreshMcpInventory { server_name } => server_name,
         }
     }
 }
@@ -489,22 +486,6 @@ impl JobQueue {
                 )
                 .await
             }
-            Job::RefreshMcpInventory { server_name } => {
-                // TODO(Phase 7): Implement inventory refresh logic
-                // This will:
-                // 1. Look up the server in McpManager's static server map
-                // 2. Call list_tools(), list_prompts(), list_resources()
-                // 3. Update the ToolInventory cache
-                // 4. Clean up expired entries
-                warn!(
-                    "MCP inventory refresh not implemented yet (Phase 7): {}",
-                    server_name
-                );
-                Ok(format!(
-                    "MCP inventory refresh placeholder for {}",
-                    server_name
-                ))
-            }
         }
     }
 
@@ -555,8 +536,15 @@ impl JobQueue {
         workflow_context.set("mcp_server_config", config.clone());
         workflow_context.set_arc("app_context", Arc::clone(context));
 
+        // Choose workflow based on server's required field
+        let workflow_id = if config.config.required {
+            "mcp_registration_required"
+        } else {
+            "mcp_registration_optional"
+        };
+
         engine
-            .start_workflow(WorkflowId::new("mcp_registration"), workflow_context)
+            .start_workflow(WorkflowId::new(workflow_id), workflow_context)
             .await
             .map_err(|e| format!("Failed to start MCP registration workflow: {:?}", e))
     }

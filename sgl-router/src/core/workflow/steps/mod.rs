@@ -11,8 +11,8 @@ pub mod worker_registration;
 pub mod worker_removal;
 
 pub use mcp_registration::{
-    create_mcp_registration_workflow, ConnectMcpServerStep, DiscoverMcpInventoryStep,
-    McpServerConfigRequest, RegisterMcpServerStep,
+    create_mcp_registration_workflow_optional, create_mcp_registration_workflow_required,
+    ConnectMcpServerStep, DiscoverMcpInventoryStep, McpServerConfigRequest, RegisterMcpServerStep,
 };
 pub use worker_registration::{
     create_worker_registration_workflow, ActivateWorkerStep, CreateWorkerStep,

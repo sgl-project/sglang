@@ -180,14 +180,43 @@ impl StepExecutor for RegisterMcpServerStep {
     }
 }
 
-/// Create MCP server registration workflow definition
+/// Create MCP server registration workflow for required servers
 ///
 /// Workflow configuration:
 /// - ConnectMcpServer: 100 retries, 2hr timeout (aggressive retry for slow servers)
 /// - DiscoverMcpInventory: 3 retries, 10s timeout (discovery + caching)
 /// - RegisterMcpServer: No retry, 5s timeout (fast registration)
-pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
-    WorkflowDefinition::new("mcp_registration", "MCP Server Registration")
+///
+/// # Failure Behavior
+/// All steps use FailWorkflow - router startup will fail if this server cannot be reached
+pub fn create_mcp_registration_workflow_required() -> WorkflowDefinition {
+    create_mcp_registration_workflow_internal(
+        "mcp_registration_required",
+        FailureAction::FailWorkflow,
+    )
+}
+
+/// Create MCP server registration workflow for optional servers (default)
+///
+/// Workflow configuration:
+/// - ConnectMcpServer: 100 retries, 2hr timeout (aggressive retry for slow servers)
+/// - DiscoverMcpInventory: 3 retries, 10s timeout (discovery + caching)
+/// - RegisterMcpServer: No retry, 5s timeout (fast registration)
+///
+/// # Failure Behavior
+/// All steps use ContinueNextStep - router will log warning but continue if this server fails
+pub fn create_mcp_registration_workflow_optional() -> WorkflowDefinition {
+    create_mcp_registration_workflow_internal(
+        "mcp_registration_optional",
+        FailureAction::ContinueNextStep,
+    )
+}
+
+fn create_mcp_registration_workflow_internal(
+    workflow_id: &str,
+    failure_action: FailureAction,
+) -> WorkflowDefinition {
+    WorkflowDefinition::new(workflow_id, "MCP Server Registration")
         .add_step(
             StepDefinition::new(
                 "connect_mcp_server",
@@ -202,7 +231,7 @@ pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
                 },
             })
             .with_timeout(Duration::from_secs(7200)) // 2 hours
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(failure_action),
         )
         .add_step(
             StepDefinition::new(
@@ -215,7 +244,7 @@ pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(failure_action),
         )
         .add_step(
             StepDefinition::new(
@@ -224,6 +253,6 @@ pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
                 Arc::new(RegisterMcpServerStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow), // Fail workflow if registration fails (server connected but not usable)
+            .with_failure_action(failure_action),
         )
 }
