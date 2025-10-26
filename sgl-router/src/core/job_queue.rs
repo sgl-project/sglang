@@ -536,15 +536,8 @@ impl JobQueue {
         workflow_context.set("mcp_server_config", config.clone());
         workflow_context.set_arc("app_context", Arc::clone(context));
 
-        // Choose workflow based on server's required field
-        let workflow_id = if config.config.required {
-            "mcp_registration_required"
-        } else {
-            "mcp_registration_optional"
-        };
-
         engine
-            .start_workflow(WorkflowId::new(workflow_id), workflow_context)
+            .start_workflow(WorkflowId::new("mcp_registration"), workflow_context)
             .await
             .map_err(|e| format!("Failed to start MCP registration workflow: {:?}", e))
     }

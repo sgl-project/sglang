@@ -11,7 +11,8 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use tracing::{debug, info};
+use rmcp::{service::RunningService, RoleClient};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     app_context::AppContext,
@@ -26,6 +27,13 @@ pub struct McpServerConfigRequest {
     pub name: String,
     /// Server configuration (transport, proxy, etc.)
     pub config: McpServerConfig,
+}
+
+impl McpServerConfigRequest {
+    /// Check if this server is required for router startup
+    pub fn is_required(&self) -> bool {
+        self.config.required
+    }
 }
 
 /// Step 1: Connect to MCP server
@@ -180,43 +188,72 @@ impl StepExecutor for RegisterMcpServerStep {
     }
 }
 
-/// Create MCP server registration workflow for required servers
+/// Step 4: Validate registration based on required flag
+///
+/// This step checks if the server is marked as required. If the server is required
+/// but wasn't successfully registered (client not in context), this step fails the workflow.
+/// For optional servers, this step always succeeds, allowing the workflow to complete
+/// even if earlier steps failed.
+pub struct ValidateRegistrationStep;
+
+#[async_trait]
+impl StepExecutor for ValidateRegistrationStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let config_request: Arc<McpServerConfigRequest> = context
+            .get("mcp_server_config")
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
+
+        let client_registered = context
+            .get::<Arc<RunningService<RoleClient, ()>>>("mcp_client")
+            .is_some();
+
+        if client_registered {
+            info!(
+                "MCP server '{}' registered successfully",
+                config_request.name
+            );
+            return Ok(StepResult::Success);
+        }
+
+        if config_request.is_required() {
+            error!(
+                "Required MCP server '{}' failed to register",
+                config_request.name
+            );
+            Err(WorkflowError::StepFailed {
+                step_id: StepId::new("validate_registration"),
+                message: format!(
+                    "Required MCP server '{}' failed to register",
+                    config_request.name
+                ),
+            })
+        } else {
+            warn!(
+                "Optional MCP server '{}' failed to register, continuing workflow",
+                config_request.name
+            );
+            Ok(StepResult::Success)
+        }
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+}
+
+/// Create MCP server registration workflow
+///
+/// This workflow adapts its failure behavior based on the `required` field in the server config:
+/// - If `required == true`: Uses FailWorkflow - router startup fails if server cannot be reached
+/// - If `required == false` (default): Uses ContinueNextStep - logs warning but continues
 ///
 /// Workflow configuration:
 /// - ConnectMcpServer: 100 retries, 2hr timeout (aggressive retry for slow servers)
 /// - DiscoverMcpInventory: 3 retries, 10s timeout (discovery + caching)
 /// - RegisterMcpServer: No retry, 5s timeout (fast registration)
-///
-/// # Failure Behavior
-/// All steps use FailWorkflow - router startup will fail if this server cannot be reached
-pub fn create_mcp_registration_workflow_required() -> WorkflowDefinition {
-    create_mcp_registration_workflow_internal(
-        "mcp_registration_required",
-        FailureAction::FailWorkflow,
-    )
-}
-
-/// Create MCP server registration workflow for optional servers (default)
-///
-/// Workflow configuration:
-/// - ConnectMcpServer: 100 retries, 2hr timeout (aggressive retry for slow servers)
-/// - DiscoverMcpInventory: 3 retries, 10s timeout (discovery + caching)
-/// - RegisterMcpServer: No retry, 5s timeout (fast registration)
-///
-/// # Failure Behavior
-/// All steps use ContinueNextStep - router will log warning but continue if this server fails
-pub fn create_mcp_registration_workflow_optional() -> WorkflowDefinition {
-    create_mcp_registration_workflow_internal(
-        "mcp_registration_optional",
-        FailureAction::ContinueNextStep,
-    )
-}
-
-fn create_mcp_registration_workflow_internal(
-    workflow_id: &str,
-    failure_action: FailureAction,
-) -> WorkflowDefinition {
-    WorkflowDefinition::new(workflow_id, "MCP Server Registration")
+/// - ValidateRegistration: Final validation step
+pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
+    WorkflowDefinition::new("mcp_registration", "MCP Server Registration")
         .add_step(
             StepDefinition::new(
                 "connect_mcp_server",
@@ -231,7 +268,7 @@ fn create_mcp_registration_workflow_internal(
                 },
             })
             .with_timeout(Duration::from_secs(7200)) // 2 hours
-            .with_failure_action(failure_action),
+            .with_failure_action(FailureAction::ContinueNextStep),
         )
         .add_step(
             StepDefinition::new(
@@ -244,7 +281,7 @@ fn create_mcp_registration_workflow_internal(
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(failure_action),
+            .with_failure_action(FailureAction::ContinueNextStep),
         )
         .add_step(
             StepDefinition::new(
@@ -253,6 +290,15 @@ fn create_mcp_registration_workflow_internal(
                 Arc::new(RegisterMcpServerStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(failure_action),
+            .with_failure_action(FailureAction::ContinueNextStep),
+        )
+        .add_step(
+            StepDefinition::new(
+                "validate_registration",
+                "Validate MCP Registration",
+                Arc::new(ValidateRegistrationStep),
+            )
+            .with_timeout(Duration::from_secs(1))
+            .with_failure_action(FailureAction::FailWorkflow),
         )
 }
