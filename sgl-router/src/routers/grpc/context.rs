@@ -53,6 +53,7 @@ pub struct RequestInput {
 pub enum RequestType {
     Chat(Arc<ChatCompletionRequest>),
     Generate(Arc<GenerateRequest>),
+    Responses(Arc<ResponsesRequest>),
 }
 
 /// Shared components (injected once at creation)
@@ -279,6 +280,7 @@ impl RequestContext {
         match &self.input.request_type {
             RequestType::Chat(req) => req.stream,
             RequestType::Generate(req) => req.stream,
+            RequestType::Responses(req) => req.stream.unwrap_or(false),
         }
     }
 }
@@ -392,7 +394,9 @@ impl ClientSelection {
 // Execution and Response Types
 // ============================================================================
 
-use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
+use crate::{
+    grpc_client::sglang_scheduler::AbortOnDropStream, protocols::responses::ResponsesRequest,
+};
 
 /// Result of request execution (streams from workers)
 /// Uses AbortOnDropStream to automatically abort on cancellation

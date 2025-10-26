@@ -32,12 +32,20 @@
 pub mod builder;
 pub mod detector;
 pub mod parser;
+pub mod processor;
+pub mod stages;
+pub mod streaming;
 pub mod types;
 
 // Re-export main types for convenience
 pub use builder::HarmonyBuilder;
 pub use detector::HarmonyDetector;
 pub use parser::HarmonyParserAdapter;
+pub use processor::HarmonyResponseProcessor;
+pub use stages::{
+    HarmonyPreparationStage, HarmonyRequestBuildingStage, HarmonyResponseProcessingStage,
+};
+pub use streaming::HarmonyStreamingProcessor;
 pub use types::{
     FunctionDelta, HarmonyBuildOutput, HarmonyChannelDelta, HarmonyChannelOutput, HarmonyMessage,
     ToolCallDelta,

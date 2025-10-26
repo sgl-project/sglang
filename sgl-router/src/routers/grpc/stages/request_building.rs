@@ -88,6 +88,16 @@ impl PipelineStage for RequestBuildingStage {
                     )
                     .map_err(utils::bad_request_error)?
             }
+            RequestType::Responses(_request) => {
+                // Responses API builds request during the MCP loop
+                // For now, create minimal request - responses handler will populate it
+                let request_id = format!("resp-{}", Uuid::new_v4());
+
+                proto::GenerateRequest {
+                    request_id,
+                    ..Default::default()
+                }
+            }
         };
 
         // Inject PD metadata if needed

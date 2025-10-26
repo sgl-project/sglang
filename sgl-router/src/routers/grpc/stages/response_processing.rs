@@ -40,8 +40,13 @@ impl PipelineStage for ResponseProcessingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         // Delegate to request-type specific processing
         match &ctx.input.request_type {
-            RequestType::Chat(_) => return self.process_chat_response(ctx).await,
-            RequestType::Generate(_) => return self.process_generate_response(ctx).await,
+            RequestType::Chat(_) =>  self.process_chat_response(ctx).await,
+            RequestType::Generate(_) => self.process_generate_response(ctx).await,
+            RequestType::Responses(_) => {
+                Err(utils::bad_request_error(
+                    "Responses API processing must be handled by responses handler".to_string(),
+                ))
+            }
         }
     }
 
