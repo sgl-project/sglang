@@ -33,6 +33,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    FlashAttentionBackend,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
@@ -754,36 +757,39 @@ class DenoisingStage(PipelineStage):
             The attention metadata, or None if not applicable.
         """
         attn_metadata = None
+        self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
+        if self.attn_metadata_builder_cls:
+            self.attn_metadata_builder = self.attn_metadata_builder_cls()
         if (st_attn_available and self.attn_backend == SlidingTileAttentionBackend) or (
             vsa_available and self.attn_backend == VideoSparseAttentionBackend
         ):
-            self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
-            if self.attn_metadata_builder_cls is not None:
-                self.attn_metadata_builder = self.attn_metadata_builder_cls()
-                attn_metadata = self.attn_metadata_builder.build(
-                    current_timestep=i,
-                    raw_latent_shape=batch.raw_latent_shape[2:5],
-                    patch_size=server_args.pipeline_config.dit_config.patch_size,
-                    STA_param=batch.STA_param,
-                    VSA_sparsity=server_args.VSA_sparsity,
-                    device=get_local_torch_device(),
-                )
-                assert attn_metadata is not None, "attn_metadata cannot be None"
+            attn_metadata = self.attn_metadata_builder.build(
+                current_timestep=i,
+                raw_latent_shape=batch.raw_latent_shape[2:5],
+                patch_size=server_args.pipeline_config.dit_config.patch_size,
+                STA_param=batch.STA_param,
+                VSA_sparsity=server_args.VSA_sparsity,
+                device=get_local_torch_device(),
+            )
         elif vmoba_attn_available and self.attn_backend == VMOBAAttentionBackend:
-            self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
-            if self.attn_metadata_builder_cls is not None:
-                self.attn_metadata_builder = self.attn_metadata_builder_cls()
-                moba_params = server_args.moba_config.copy()
-                moba_params.update(
-                    {
-                        "current_timestep": i,
-                        "raw_latent_shape": batch.raw_latent_shape[2:5],
-                        "patch_size": server_args.pipeline_config.dit_config.patch_size,
-                        "device": get_local_torch_device(),
-                    }
-                )
-                attn_metadata = self.attn_metadata_builder.build(**moba_params)
-                assert attn_metadata is not None, "attn_metadata cannot be None"
+            moba_params = server_args.moba_config.copy()
+            moba_params.update(
+                {
+                    "current_timestep": i,
+                    "raw_latent_shape": batch.raw_latent_shape[2:5],
+                    "patch_size": server_args.pipeline_config.dit_config.patch_size,
+                    "device": get_local_torch_device(),
+                }
+            )
+        elif self.attn_backend == FlashAttentionBackend:
+            attn_metadata = self.attn_metadata_builder.build(
+                raw_latent_shape=batch.raw_latent_shape
+            )
+        else:
+            return None
+
+        assert attn_metadata is not None, "attn_metadata cannot be None"
+
         return attn_metadata
 
     def _predict_noise(

@@ -4,7 +4,7 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
@@ -35,6 +35,16 @@ class ForwardContext:
     # TODO: extend to support per-layer dynamic forward context
     attn_metadata: "AttentionMetadata"  # set dynamically for each forward pass
     forward_batch: Optional["Req"] = None
+    attention_backend_cls: Optional[Type] = None
+
+    def set_attn_backend_cls(self, attention_backend_cls: Type):
+        if self.attention_backend_cls:
+            if self.attention_backend_cls != attention_backend_cls:
+                raise RuntimeError(
+                    f"Different types of attention backend in a same context detected, previous: {self.attention_backend_cls}, new: {attention_backend_cls}"
+                )
+        else:
+            self.attention_backend_cls = attention_backend_cls
 
 
 _forward_context: Optional["ForwardContext"] = None

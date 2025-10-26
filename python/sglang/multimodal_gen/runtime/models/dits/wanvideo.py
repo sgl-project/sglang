@@ -378,7 +378,6 @@ class WanTransformerBlock(nn.Module):
         query, key = _apply_rotary_emb(
             query, cos, sin, is_neox_style=False
         ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-
         attn_output, _ = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)

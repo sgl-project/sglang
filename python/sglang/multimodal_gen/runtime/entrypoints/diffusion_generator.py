@@ -283,6 +283,7 @@ class DiffGenerator:
                 if output_batch.error:
                     raise Exception(f"{output_batch.error}")
 
+                # FIXME: in generate mode, an internal assertion error won't raise an error
                 logger.info(
                     "Pixel data generated successfully in %.2f seconds",
                     gen_time,

@@ -247,6 +247,7 @@ class LocalAttention(nn.Module):
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
         impl_cls = attn_backend.get_impl_cls()
+        # get_forward_context().set_attn_backend_cls(impl_cls)
         self.attn_impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,

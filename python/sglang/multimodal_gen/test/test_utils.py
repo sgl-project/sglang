@@ -22,7 +22,7 @@ def run_command(command):
     ) as process:
         for line in process.stdout:
             sys.stdout.write(line)
-            if "Pixel data generated successfully in " in line:
+            if "Pixel data generated" in line:
                 words = line.split(" ")
                 duration = float(words[-2])
 
