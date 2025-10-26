@@ -27,6 +27,7 @@ from typing import Dict, List, Literal, Optional, Union
 import orjson
 
 from sglang.srt.connector import ConnectorType
+from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -342,7 +343,6 @@ class ServerArgs:
     nsa_decode_backend: str = "fa3"
 
     # Speculative decoding
-    enable_beta_spec: bool = False
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
@@ -1431,13 +1431,16 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            if self.speculative_algorithm == "EAGLE" and self.enable_beta_spec:
+            if (
+                self.speculative_algorithm == "EAGLE"
+                and envs.SGLANG_ENABLE_SPEC_V2.get()
+            ):
                 self.disable_overlap_schedule = False
                 logger.warning(
                     "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
                 )
 
-            if not self.enable_beta_spec:
+            if not envs.SGLANG_ENABLE_SPEC_V2.get():
                 self.disable_overlap_schedule = True
                 logger.warning(
                     "Overlap scheduler is disabled because of using eagle3 or standalone speculative decoding."
@@ -2573,7 +2576,6 @@ class ServerArgs:
         )
 
         # Speculative decoding
-        parser.add_argument("--enable-beta-spec", action="store_true")
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
