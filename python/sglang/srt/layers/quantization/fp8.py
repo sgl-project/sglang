@@ -55,7 +55,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
+    dispatch_w8a8_block_fp8_gemm,
     dispatch_w8a8_block_fp8_linear,
+    dispatch_w8a8_block_fp8_quant,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
@@ -228,6 +230,8 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = self.quant_config.weight_block_size is not None
 
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+        self.w8a8_block_fp8_quant = dispatch_w8a8_block_fp8_quant()
+        self.w8a8_block_fp8_gemm = dispatch_w8a8_block_fp8_gemm()
 
     def create_weights(
         self,
@@ -496,6 +500,57 @@ class Fp8LinearMethod(LinearMethodBase):
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
+        )
+
+    def apply_quant(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+    ):
+        if self.use_marlin:
+            raise RuntimeError("Marlin does not support quant-only mode")
+
+        if self.block_quant:
+            if use_intel_amx_backend(layer):
+                raise RuntimeError("Intel AMX does not support quant-only mode")
+
+            return self.w8a8_block_fp8_quant(
+                input=x,
+                weight=layer.weight,
+                block_size=self.quant_config.weight_block_size,
+            )
+
+        raise RuntimeError(
+            "Quant-only mode is only supported for block-wise quantization"
+        )
+
+    def apply_gemm(
+        self,
+        layer: torch.nn.Module,
+        q_input: torch.Tensor,
+        x_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+    ):
+        if self.use_marlin:
+            raise RuntimeError("Marlin does not support quant-only mode")
+
+        if self.block_quant:
+            if use_intel_amx_backend(layer):
+                raise RuntimeError("Intel AMX does not support quant-only mode")
+
+            return self.w8a8_block_fp8_gemm(
+                q_input=q_input,
+                x_scale=x_scale,
+                weight=layer.weight,
+                block_size=self.quant_config.weight_block_size,
+                weight_scale=layer.weight_scale_inv,
+                dtype=output_dtype,
+                bias=bias,
+            )
+
+        raise RuntimeError(
+            "Quant-only mode is only supported for block-wise quantization"
         )
 
 
