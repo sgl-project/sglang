@@ -170,7 +170,7 @@ python3 -m sglang.launch_server \
 - The best configuration for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
 - FlashAttention3, FlashMLA, and Triton backend fully supports MTP usage. For FlashInfer backend (`--attention-backend flashinfer`) with speculative decoding,`--speculative-eagle-topk` parameter should be set to `1`. MTP support for the CutlassMLA and TRTLLM MLA backends are still under development.
 - To enable DeepSeek MTP for large batch sizes (>32), there are some parameters should be changed (Reference [this discussion](https://github.com/sgl-project/sglang/issues/4543#issuecomment-2737413756)):
-  - Adjust `--max-running-requests` to a larger number. The default value is `32` for MTP. For larger batch sizes, you should increase this value beyond the default value.
+  - Adjust `--max-running-requests` to a larger number. The default value is `48` for MTP. For larger batch sizes, you should increase this value beyond the default value.
   - Set `--cuda-graph-bs`. It's a list of batch sizes for cuda graph capture. The default captured batch sizes for speculative decoding is set [here](https://github.com/sgl-project/sglang/blob/49420741746c8f3e80e0eb17e7d012bfaf25793a/python/sglang/srt/model_executor/cuda_graph_runner.py#L126). You can include more batch sizes into it.
 
 
@@ -234,6 +234,44 @@ Important Notes:
 1. Use a lower `"temperature"` value for better results.
 2. To receive more consistent tool call results, it is recommended to use `--chat-template examples/chat_template/tool_chat_template_deepseekv3.jinja`. It provides an improved unified prompt.
 
+
+### Thinking Budget for DeepSeek R1
+
+In SGLang, we can implement thinking budget with `CustomLogitProcessor`.
+
+Launch a server with `--enable-custom-logit-processor` flag on.
+
+```
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-R1 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --disable-cuda-graph --reasoning-parser deepseek-r1 --enable-custom-logit-processor
+```
+
+Sample Request:
+
+```python
+import openai
+from rich.pretty import pprint
+from sglang.srt.sampling.custom_logit_processor import DeepSeekR1ThinkingBudgetLogitProcessor
+
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-R1",
+    messages=[
+        {
+            "role": "user",
+            "content": "Question: Is Paris the Capital of France?",
+        }
+    ],
+    max_tokens=1024,
+    extra_body={
+        "custom_logit_processor": DeepSeekR1ThinkingBudgetLogitProcessor().to_str(),
+        "custom_params": {
+            "thinking_budget": 512,
+        },
+    },
+)
+pprint(response)
+```
 
 ## FAQ
 

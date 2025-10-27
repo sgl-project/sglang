@@ -26,6 +26,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **AITER (ROCm)**                | ✅                          | ❌               | ✅              | ✅              | ❌                 | ❌             |
 | **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
 | **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ✅                 | ❌             |
 
 ### MLA Backends
 
@@ -188,6 +189,13 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --attention-backend ascend
+```
+
+- Intel XPU
+```bash
+python3 -m sglang.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --attention-backend intel_xpu
 ```
 
 - Wave

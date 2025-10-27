@@ -169,6 +169,17 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         custom_labels = {**custom_labels, **metric_labels}
 
+        # Resolve LoRA adapter from model parameter or explicit lora_path
+        lora_path = self._resolve_lora_path(request.model, request.lora_path)
+        if lora_path:
+            first_adapter = (
+                lora_path
+                if isinstance(lora_path, str)
+                else next((a for a in lora_path if a), None)
+            )
+            if first_adapter:
+                self._validate_lora_enabled(first_adapter)
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -181,7 +192,7 @@ class OpenAIServingChat(OpenAIServingBase):
             stream=request.stream,
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
-            lora_path=request.lora_path,
+            lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
@@ -190,6 +201,7 @@ class OpenAIServingChat(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             custom_labels=custom_labels,
+            custom_logit_processor=request.custom_logit_processor,
         )
 
         return adapted_request, request
