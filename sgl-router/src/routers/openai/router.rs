@@ -2,6 +2,7 @@
 
 use std::{
     any::Any,
+    collections::HashSet,
     sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
@@ -15,6 +16,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::StreamExt;
+use once_cell::sync::Lazy;
 use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -60,6 +62,32 @@ use crate::{
 // ============================================================================
 // OpenAIRouter Struct
 // ============================================================================
+
+/// Fields specific to SGLang that should be stripped when forwarding to OpenAI-compatible endpoints
+static SGLANG_FIELDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    HashSet::from([
+        "request_id",
+        "priority",
+        "top_k",
+        "min_p",
+        "min_tokens",
+        "regex",
+        "ebnf",
+        "stop_token_ids",
+        "no_stop_trim",
+        "ignore_eos",
+        "continue_final_message",
+        "skip_special_tokens",
+        "lora_path",
+        "session_params",
+        "separate_reasoning",
+        "stream_reasoning",
+        "chat_template_kwargs",
+        "return_hidden_states",
+        "repetition_penalty",
+        "sampling_seed",
+    ])
+});
 
 /// Cached endpoint information
 #[derive(Clone, Debug)]
@@ -547,29 +575,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         };
         if let Some(obj) = payload.as_object_mut() {
             // Always remove SGLang-specific fields (unsupported by OpenAI)
-            for key in [
-                "top_k",
-                "min_p",
-                "min_tokens",
-                "regex",
-                "ebnf",
-                "stop_token_ids",
-                "no_stop_trim",
-                "ignore_eos",
-                "continue_final_message",
-                "skip_special_tokens",
-                "lora_path",
-                "session_params",
-                "separate_reasoning",
-                "stream_reasoning",
-                "chat_template_kwargs",
-                "return_hidden_states",
-                "repetition_penalty",
-                "sampling_seed",
-            ] {
-                obj.remove(key);
-            }
-
+            obj.retain(|k, _| !SGLANG_FIELDS.contains(&k.as_str()));
             // Remove logprobs if false (Gemini don't accept it)
             if obj.get("logprobs").and_then(|v| v.as_bool()) == Some(false) {
                 obj.remove("logprobs");
@@ -899,30 +905,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         // Remove SGLang-specific fields only
         if let Some(obj) = payload.as_object_mut() {
             // Remove SGLang-specific fields (not part of OpenAI API)
-            for key in [
-                "request_id",
-                "priority",
-                "top_k",
-                "min_p",
-                "min_tokens",
-                "regex",
-                "ebnf",
-                "stop_token_ids",
-                "no_stop_trim",
-                "ignore_eos",
-                "continue_final_message",
-                "skip_special_tokens",
-                "lora_path",
-                "session_params",
-                "separate_reasoning",
-                "stream_reasoning",
-                "chat_template_kwargs",
-                "return_hidden_states",
-                "repetition_penalty",
-                "sampling_seed",
-            ] {
-                obj.remove(key);
-            }
+            obj.retain(|k, _| !SGLANG_FIELDS.contains(&k.as_str()));
             // XAI (Grok models) requires special handling of input items
             // Check if model is a Grok model
             let is_grok_model = obj
