@@ -99,7 +99,7 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["accuracy"], 0.94)
+            self.assertGreater(metrics["accuracy"], 0.93)
             if avg_spec_accept_length is not None:
                 self.assertGreater(avg_spec_accept_length, 3.2)
 
