@@ -1,64 +1,72 @@
-from typing import Any, Dict, List, Optional, Type
+from typing import Any
 
 import torch.nn as nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from sglang.srt.managers.io_struct import (
-    EmbeddingReqInput,
-    GenerateReqInput,
-    ImageDataInputItem,
-)
-from sglang.srt.models.vila import VILAForConditionalGeneration
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.models.nvila import NVILAForConditionalGeneration
+from sglang.srt.models.nvila_lite import NVILALiteForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
 from sglang.srt.server_args import ServerArgs
 
-
-class VILAProcessor(ProcessorMixin):
-    """A stub class for the VILA processor."""
-
-    tokenizer: PreTrainedTokenizerBase
+NUM_VIDEO_FRAMES = 8
 
 
-class VILAMultimodalProcessor(BaseMultimodalProcessor):
-    models: List[Type[nn.Module]] = [VILAForConditionalGeneration]
-
-    _processor: VILAProcessor
+class NVILAMultimodalProcessor(BaseMultimodalProcessor):
+    models: list[type[nn.Module]] = [
+        NVILAForConditionalGeneration,
+        NVILALiteForConditionalGeneration,
+    ]
 
     def __init__(
         self,
         hf_config: PretrainedConfig,
         server_args: ServerArgs,
-        _processor: VILAProcessor,
+        _processor: ProcessorMixin,
         *args,
         **kwargs,
     ) -> None:
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+
+        self._processor: ProcessorMixin
+
+        tokenizer: PreTrainedTokenizerBase = getattr(self._processor, "tokenizer")
+
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token=self._processor.tokenizer.image_token,
+            image_token=tokenizer.image_token,
             image_token_id=hf_config.image_token_id,
+            video_token=tokenizer.video_token,
             video_token_id=hf_config.video_token_id,
         ).build(_processor)
 
     async def process_mm_data_async(
         self,
-        image_data: Optional[ImageDataInputItem | List[ImageDataInputItem]],
-        input_text: str | List[int],
-        request_obj: GenerateReqInput | EmbeddingReqInput,
+        image_data,
+        audio_data,
+        input_text,
+        request_obj: GenerateReqInput,
         **kwargs,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         base_output = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
-            image_data=image_data,
+            image_data=request_obj.image_data,  # type: ignore
+            video_data=request_obj.video_data,  # type: ignore
         )
 
+        for i, video in enumerate(base_output.videos):  # type: ignore
+            base_output.videos[i] = [x.asnumpy() for x in video]  # type: ignore
+
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
+            base_output,
+            self.mm_tokens,
+            do_sample_frames=True,
+            num_frames=NUM_VIDEO_FRAMES,
         )
 
         return {

@@ -151,6 +151,7 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -212,6 +213,7 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
+    SchedulerMultiplexMixin,
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
 ):
@@ -251,6 +253,7 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.enable_metrics_for_all_schedulers = (
@@ -283,6 +286,10 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
+
+        # Init pdmux context
+        if self.enable_pdmux:
+            self.init_pdmux()
 
         # Init tokenizer
         self.init_tokenizer()
@@ -392,6 +399,8 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
+        # The current split prefill batch
+        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
@@ -494,7 +503,7 @@ class Scheduler(
         )
         self.init_disaggregation()
 
-        if get_bool_env_var("SGLANG_GC_LOG"):
+        if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
@@ -1895,7 +1904,6 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-
             batch_or_worker_batch = batch
 
             if self.enable_overlap or self.spec_algorithm.is_none():
@@ -1952,6 +1960,9 @@ class Scheduler(
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
@@ -2074,15 +2085,18 @@ class Scheduler(
             num_tokens_for_logprob = num_tokens
         else:
             num_tokens = local_batch.extend_num_tokens
-            num_tokens_for_logprob = sum(
-                [
+            if local_batch.return_logprob:
+                num_tokens_for_logprob = sum(
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
                     for logprob_start_len, extend_len in zip(
-                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                        local_batch.extend_logprob_start_lens,
+                        local_batch.extend_lens,
                     )
-                ]
-            )
+                )
+            else:
+                # When return_logprob = False, only need last token per request
+                num_tokens_for_logprob = local_batch.batch_size()
 
         if local_batch is None or local_batch.forward_mode.is_decode_or_idle():
             can_cuda_graph = 1
@@ -2303,13 +2317,30 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
-    def flush_cache(self):
-        """Flush the memory pool and cache."""
-        if (
+    def _is_no_request(self):
+        no_request = (
             len(self.waiting_queue) == 0
             and self.running_batch.is_empty()
+            and (self.last_batch is None or self.last_batch.is_empty())
+            and (self.cur_batch is None or self.cur_batch.is_empty())
+            and (not self.enable_overlap or len(self.result_queue) == 0)
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
-        ):
+        )
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            no_request &= (
+                len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                and len(self.disagg_prefill_inflight_queue) == 0
+            )
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            no_request &= (
+                len(self.disagg_decode_prealloc_queue.queue) == 0
+                and len(self.disagg_decode_transfer_queue.queue) == 0
+            )
+        return no_request
+
+    def flush_cache(self):
+        """Flush the memory pool and cache."""
+        if self._is_no_request():
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -2323,10 +2354,10 @@ class Scheduler(
 
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0
-            self.spec_num_total_accepted_tokens = 0
-            self.spec_num_total_forward_ct = 0
-            self.cum_spec_accept_length = 0
-            self.cum_spec_accept_count = 0
+            self.spec_num_accepted_tokens = 0
+            self.spec_num_forward_ct = 0
+            self.spec_total_num_accepted_tokens = 0
+            self.spec_total_num_forward_ct = 0
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
             if_success = True
@@ -2399,12 +2430,15 @@ class Scheduler(
             self.tp_worker.model_runner.graph_mem_usage, 2
         )
 
-        if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
+        if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
-                self.cum_spec_accept_length / self.cum_spec_accept_count
+                self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
             )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
+
+        # This field is not serializable.
+        ret.pop("model_config", None)
 
         return GetInternalStateReqOutput(internal_state=ret)
 
@@ -2432,12 +2466,12 @@ class Scheduler(
                 if_success = False
                 break
         if if_success:
-            if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
+            if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
                 avg_spec_accept_length = (
-                    self.cum_spec_accept_length / self.cum_spec_accept_count
+                    self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
                 )
                 logger.info(f"{avg_spec_accept_length=}")
-            self.cum_spec_accept_length = self.cum_spec_accept_count = 0
+            self.spec_total_num_accepted_tokens = self.spec_total_num_forward_ct = 0
             for k, v in server_args_dict.items():
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")
@@ -2764,7 +2798,9 @@ def run_scheduler_process(
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
-            if server_args.pp_size > 1:
+            if scheduler.enable_pdmux:
+                scheduler.event_loop_pdmux()
+            elif server_args.pp_size > 1:
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap()
