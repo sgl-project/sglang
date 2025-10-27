@@ -2,6 +2,8 @@ SGLang performs inference on models for you.
 
 It takes < 5 min to set up an SGLang inference-ready deployment with your model.
 
+Some common use cases are: TODO
+
 To use SGLang you need two ingredients:
 
 1). Model (locally or on huggingface)
