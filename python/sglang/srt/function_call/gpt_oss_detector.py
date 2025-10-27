@@ -31,7 +31,7 @@ class GptOssDetector(BaseFormatDetector):
 
         # Pattern to extract function name and JSON from tool_call event content
         self.tool_extract_pattern = re.compile(
-            r"to=([a-zA-Z_][a-zA-Z0-9_.]*)\s*<\|constrain\|>json<\|message\|>(.*?)(?:<\|call\|>|$)",
+            r"to=([a-zA-Z_][a-zA-Z0-9_.-]*)\s*<\|constrain\|>json<\|message\|>(.*?)(?:<\|call\|>|$)",
             re.DOTALL,
         )
 
@@ -80,6 +80,29 @@ class GptOssDetector(BaseFormatDetector):
 
         # Always use HarmonyParser for parsing to ensure proper filtering
         events = self.harmony_parser.parse(new_text)
+
+        # If there are no parsed events and the chunk contains no Harmony structural
+        # markers, treat it as plain text and pass it through. This fixes a bug where
+        # normal content was held in the buffer when tools were provided but not used.
+        if not events:
+            has_harmony_markers = any(
+                marker in self._buffer
+                for marker in (
+                    "<|start|>",
+                    "<|channel|>",
+                    "<|message|>",
+                    "<|constrain|>",
+                    "<|end|>",
+                    "<|call|>",
+                    "<|return|>",
+                    "assistantfinal",
+                )
+            )
+            if not has_harmony_markers:
+                # Plain text with no tool markers — emit as normal content
+                out = self._buffer
+                self._buffer = ""
+                return StreamingParseResult(normal_text=out, calls=[])
 
         # Quick check if we might have tool calls
         if (

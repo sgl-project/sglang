@@ -1,0 +1,150 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang"
+version = "0.5.4.post1"
+description = "SGLang is a fast serving framework for large language models and vision language models."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+]
+dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle"]
+
+[project.optional-dependencies]
+runtime_common = [
+  "IPython",
+  "aiohttp",
+  "anthropic>=0.20.0",
+  "blobfile==3.0.0",
+  "build",
+  "compressed-tensors",
+  "decord2",
+  "datasets",
+  "einops",
+  "fastapi",
+  "hf_transfer",
+  "huggingface_hub",
+  "interegular",
+  "llguidance>=0.7.11,<0.8.0",
+  "modelscope",
+  "msgspec",
+  "ninja",
+  "numpy",
+  "openai-harmony==0.0.4",
+  "openai==1.99.1",
+  "orjson",
+  "outlines==0.1.11",
+  "packaging",
+  "partial_json_parser",
+  "pillow",
+  "prometheus-client>=0.20.0",
+  "psutil",
+  "py-spy",
+  "pybase64",
+  "pydantic",
+  "python-multipart",
+  "pyzmq>=25.1.2",
+  "requests",
+  "scipy",
+  "sentencepiece",
+  "setproctitle",
+  "soundfile==0.13.1",
+  "tiktoken",
+  "timm==1.0.16",
+  "torchao==0.9.0",
+  "tqdm",
+  "transformers==4.57.1",
+  "uvicorn",
+  "uvloop",
+  "xgrammar==0.1.25",
+  "grpcio==1.75.1", # keep it align with compile_proto.py
+  "grpcio-tools==1.75.1", # keep it align with compile_proto.py
+  "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
+]
+
+tracing = [
+  "opentelemetry-sdk",
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+]
+
+# HIP (Heterogeneous-computing Interface for Portability) for AMD
+# => base docker rocm/vllm-dev:20250114, not from public vllm whl
+srt_hip = [
+  "sglang[runtime_common]",
+  "torch",
+  "petit_kernel==0.0.2",
+  "wave-lang==3.8.0",
+]
+
+# https://docs.sglang.ai/platforms/ascend_npu.html
+srt_npu = ["sglang[runtime_common]"]
+
+# For Intel Gaudi(device : hpu) follow the installation guide
+# https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
+srt_hpu = ["sglang[runtime_common]"]
+
+test = [
+  "accelerate",
+  "expecttest",
+  "gguf",
+  "jsonlines",
+  "matplotlib",
+  "pandas",
+  "peft",
+  "pytest",
+  "sentence_transformers",
+  "tabulate",
+]
+all_hip = ["sglang[srt_hip]"]
+all_npu = ["sglang[srt_npu]"]
+all_hpu = ["sglang[srt_hpu]"]
+
+dev_hip = ["sglang[all_hip]", "sglang[test]"]
+dev_npu = ["sglang[all_npu]", "sglang[test]"]
+dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+
+[project.urls]
+"Homepage" = "https://github.com/sgl-project/sglang"
+"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[tool.setuptools.package-data]
+"sglang" = [
+  "srt/layers/moe/fused_moe_triton/configs/*/*.json",
+  "srt/layers/quantization/configs/*.json",
+  "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
+  "srt/speculative/cpp_ngram/*.cpp",
+  "srt/speculative/cpp_ngram/*.h",
+]
+
+[tool.setuptools.packages.find]
+exclude = [
+  "assets*",
+  "benchmark*",
+  "docs*",
+  "dist*",
+  "playground*",
+  "scripts*",
+  "tests*",
+]
+
+[tool.wheel]
+exclude = [
+  "assets*",
+  "benchmark*",
+  "docs*",
+  "dist*",
+  "playground*",
+  "scripts*",
+  "tests*",
+]
+
+[tool.codespell]
+ignore-words-list = "ans, als, hel, boostrap, childs, te, vas, hsa, ment"
+skip = "*.json,*.jsonl,*.patch,*.txt"
