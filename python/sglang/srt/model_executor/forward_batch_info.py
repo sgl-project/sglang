@@ -96,6 +96,7 @@ class ForwardMode(IntEnum):
                 else False
             )
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.SPLIT_PREFILL
         )
 
     def is_decode(self):
