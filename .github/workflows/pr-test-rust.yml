@@ -232,6 +232,12 @@ jobs:
           cd sgl-router
           SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
 
+      - name: Cleanup Oracle Database
+        if: always()
+        run: |
+          docker stop oracle-db || true
+          docker rm oracle-db || true
+
 
   finish:
     needs: [unit-test-rust, pytest-rust, pytest-rust-2]
