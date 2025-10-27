@@ -178,7 +178,7 @@ RUN cd /sgl-workspace/DeepEP && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
 
 # Install flashmla
-RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
+RUN if [ "$CUDA_VERSION" != "13.0.1" ]; then \
     git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
       cd flash-mla && \
       git checkout ${FLASHMLA_COMMIT} && \
