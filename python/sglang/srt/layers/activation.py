@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -59,6 +60,11 @@ logger = logging.getLogger(__name__)
 
 
 class SiluAndMul(CustomOp):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if get_global_server_args().rl_on_policy_target == "fsdp":
+            self._forward_method = self.forward_native
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
