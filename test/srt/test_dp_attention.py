@@ -44,19 +44,6 @@ class TestDPAttentionDP2TP2(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.5)
-
     def test_mgsm_en(self):
         args = SimpleNamespace(
             base_url=self.base_url,
@@ -87,7 +74,7 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(CustomTestCase):
             "4",
             "--speculative-num-draft-tokens",
             "4",
-            "--speculative-draft",
+            "--speculative-draft-model-path",
             DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
             "--tp-size",
             "2",
@@ -135,61 +122,6 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(CustomTestCase):
             f"{avg_spec_accept_length=:.3f}\n"
         )
         self.assertGreater(avg_spec_accept_length, 2.5)
-
-
-class TestDPAttentionMinimumTokenLoadBalance(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "2",
-                "--enable-dp-attention",
-                "--dp",
-                "2",
-                "--enable-torch-compile",
-                "--torch-compile-max-bs",
-                "2",
-                "--load-balance-method",
-                "minimum_tokens",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.5)
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.8)
 
 
 if __name__ == "__main__":

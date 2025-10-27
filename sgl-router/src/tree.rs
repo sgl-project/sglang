@@ -1,16 +1,12 @@
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, VecDeque},
+    sync::{Arc, RwLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use dashmap::{mapref::entry::Entry, DashMap};
 use tracing::info;
-
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::RwLock;
-
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 type NodeRef = Arc<Node>;
 
@@ -38,6 +34,7 @@ struct EvictionEntry {
 
 impl Eq for EvictionEntry {}
 
+#[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd for EvictionEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.timestamp.cmp(&other.timestamp))
@@ -74,11 +71,17 @@ fn shared_prefix_count(a: &str, b: &str) -> usize {
         }
     }
 
-    return i;
+    i
 }
 
 fn slice_by_chars(s: &str, start: usize, end: usize) -> String {
     s.chars().skip(start).take(end - start).collect()
+}
+
+impl Default for Tree {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Tree {
@@ -86,7 +89,7 @@ impl Tree {
     Thread-safe multi tenant radix tree
 
     1. Storing data for multiple tenants (the overlap of multiple radix tree)
-    2. Node-level lock to enable concurrent acesss on nodes
+    2. Node-level lock to enable concurrent access on nodes
     3. Leaf LRU eviction based on tenant access time
     */
 
@@ -152,12 +155,11 @@ impl Tree {
                         parent: RwLock::new(Some(Arc::clone(&curr))),
                     });
 
-                    // Increment char count when creating new node with tenant
+                    // Attach tenant to the new node (map is empty here) and increment count once
                     self.tenant_char_count
                         .entry(tenant.to_string())
                         .and_modify(|count| *count += curr_text_count)
                         .or_insert(curr_text_count);
-
                     new_node
                         .tenant_last_access_time
                         .insert(tenant.to_string(), timestamp_ms);
@@ -213,32 +215,38 @@ impl Tree {
 
                         prev = Arc::clone(&new_node);
 
-                        // Increment char count for the tenant in the new split node
-                        if !prev.tenant_last_access_time.contains_key(tenant) {
-                            self.tenant_char_count
-                                .entry(tenant.to_string())
-                                .and_modify(|count| *count += matched_text_count)
-                                .or_insert(matched_text_count);
+                        // Atomically attach tenant to the new split node and increment count once
+                        match prev.tenant_last_access_time.entry(tenant.to_string()) {
+                            Entry::Vacant(v) => {
+                                self.tenant_char_count
+                                    .entry(tenant.to_string())
+                                    .and_modify(|count| *count += matched_text_count)
+                                    .or_insert(matched_text_count);
+                                v.insert(timestamp_ms);
+                            }
+                            Entry::Occupied(mut o) => {
+                                o.insert(timestamp_ms);
+                            }
                         }
-
-                        prev.tenant_last_access_time
-                            .insert(tenant.to_string(), timestamp_ms);
 
                         curr_idx += shared_count;
                     } else {
                         // move to next node
                         prev = Arc::clone(&matched_node);
 
-                        // Increment char count when adding tenant to existing node
-                        if !prev.tenant_last_access_time.contains_key(tenant) {
-                            self.tenant_char_count
-                                .entry(tenant.to_string())
-                                .and_modify(|count| *count += matched_node_text_count)
-                                .or_insert(matched_node_text_count);
+                        // Atomically attach tenant to existing node and increment count once
+                        match prev.tenant_last_access_time.entry(tenant.to_string()) {
+                            Entry::Vacant(v) => {
+                                self.tenant_char_count
+                                    .entry(tenant.to_string())
+                                    .and_modify(|count| *count += matched_node_text_count)
+                                    .or_insert(matched_node_text_count);
+                                v.insert(timestamp_ms);
+                            }
+                            Entry::Occupied(mut o) => {
+                                o.insert(timestamp_ms);
+                            }
                         }
-
-                        prev.tenant_last_access_time
-                            .insert(tenant.to_string(), timestamp_ms);
                         curr_idx += shared_count;
                     }
                 }
@@ -260,29 +268,26 @@ impl Tree {
 
             curr = prev.clone();
 
-            match curr.children.entry(first_char) {
-                Entry::Occupied(entry) => {
-                    let matched_node = entry.get().clone();
-                    let shared_count =
-                        shared_prefix_count(&matched_node.text.read().unwrap(), &curr_text);
+            if let Some(entry) = curr.children.get(&first_char) {
+                let matched_node = entry.value().clone();
+                let matched_text_guard = matched_node.text.read().unwrap();
+                let shared_count = shared_prefix_count(&matched_text_guard, &curr_text);
+                let matched_node_text_count = matched_text_guard.chars().count();
+                drop(matched_text_guard);
 
-                    let matched_node_text_count = matched_node.text.read().unwrap().chars().count();
-
-                    if shared_count == matched_node_text_count {
-                        // Full match with current node's text, continue to next node
-                        curr_idx += shared_count;
-                        prev = Arc::clone(&matched_node);
-                    } else {
-                        // Partial match, stop here
-                        curr_idx += shared_count;
-                        prev = Arc::clone(&matched_node);
-                        break;
-                    }
-                }
-                Entry::Vacant(_) => {
-                    // No match found, stop here
+                if shared_count == matched_node_text_count {
+                    // Full match with current node's text, continue to next node
+                    curr_idx += shared_count;
+                    prev = Arc::clone(&matched_node);
+                } else {
+                    // Partial match, stop here
+                    curr_idx += shared_count;
+                    prev = Arc::clone(&matched_node);
                     break;
                 }
+            } else {
+                // No match found, stop here
+                break;
             }
         }
 
@@ -330,35 +335,32 @@ impl Tree {
 
             curr = prev.clone();
 
-            match curr.children.entry(first_char) {
-                Entry::Occupied(entry) => {
-                    let matched_node = entry.get().clone();
+            if let Some(entry) = curr.children.get(&first_char) {
+                let matched_node = entry.value().clone();
 
-                    // Only continue matching if this node belongs to the specified tenant
-                    if !matched_node.tenant_last_access_time.contains_key(tenant) {
-                        break;
-                    }
-
-                    let shared_count =
-                        shared_prefix_count(&matched_node.text.read().unwrap(), &curr_text);
-
-                    let matched_node_text_count = matched_node.text.read().unwrap().chars().count();
-
-                    if shared_count == matched_node_text_count {
-                        // Full match with current node's text, continue to next node
-                        curr_idx += shared_count;
-                        prev = Arc::clone(&matched_node);
-                    } else {
-                        // Partial match, stop here
-                        curr_idx += shared_count;
-                        prev = Arc::clone(&matched_node);
-                        break;
-                    }
-                }
-                Entry::Vacant(_) => {
-                    // No match found, stop here
+                // Only continue matching if this node belongs to the specified tenant
+                if !matched_node.tenant_last_access_time.contains_key(tenant) {
                     break;
                 }
+
+                let matched_text_guard = matched_node.text.read().unwrap();
+                let shared_count = shared_prefix_count(&matched_text_guard, &curr_text);
+                let matched_node_text_count = matched_text_guard.chars().count();
+                drop(matched_text_guard);
+
+                if shared_count == matched_node_text_count {
+                    // Full match with current node's text, continue to next node
+                    curr_idx += shared_count;
+                    prev = Arc::clone(&matched_node);
+                } else {
+                    // Partial match, stop here
+                    curr_idx += shared_count;
+                    prev = Arc::clone(&matched_node);
+                    break;
+                }
+            } else {
+                // No match found, stop here
+                break;
             }
         }
 
@@ -444,12 +446,11 @@ impl Tree {
 
             // Decrement when removing tenant from node
             if node.tenant_last_access_time.contains_key(&tenant) {
+                let node_len = node.text.read().unwrap().chars().count();
                 self.tenant_char_count
                     .entry(tenant.clone())
                     .and_modify(|count| {
-                        if *count > 0 {
-                            *count -= node.text.read().unwrap().chars().count();
-                        }
+                        *count = count.saturating_sub(node_len);
                     });
             }
 
@@ -458,9 +459,11 @@ impl Tree {
 
             // Remove empty nodes
             if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
-                if let Some(parent) = node.parent.write().unwrap().as_ref() {
-                    let first_char = node.text.read().unwrap().chars().next().unwrap();
-                    parent.children.remove(&first_char);
+                if let Some(parent) = node.parent.read().unwrap().as_ref() {
+                    let text_guard = node.text.read().unwrap();
+                    if let Some(first_char) = text_guard.chars().next() {
+                        parent.children.remove(&first_char);
+                    }
                 }
             }
 
@@ -507,15 +510,17 @@ impl Tree {
             // remove empty nodes
             if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
                 if let Some(parent) = curr.parent.read().unwrap().as_ref() {
-                    let first_char = curr.text.read().unwrap().chars().next().unwrap();
-                    parent.children.remove(&first_char);
+                    let text_guard = curr.text.read().unwrap();
+                    if let Some(first_char) = text_guard.chars().next() {
+                        parent.children.remove(&first_char);
+                    }
                 }
             }
 
             // add parent to queue if it becomes a leaf
             if let Some(parent) = curr.parent.read().unwrap().as_ref() {
                 if Tree::leaf_of(parent).contains(&tenant.to_string()) {
-                    queue.push_back(Arc::clone(&parent));
+                    queue.push_back(Arc::clone(parent));
                 }
             }
         }
@@ -651,20 +656,18 @@ impl Tree {
         }
 
         println!("{result}");
-
-        return;
     }
 }
 
 //  Unit tests
 #[cfg(test)]
 mod tests {
-    use rand::distributions::Alphanumeric;
-    use rand::distributions::DistString;
-    use rand::thread_rng;
-    use rand::Rng;
-    use std::thread;
-    use std::time::Instant;
+    use std::{thread, time::Instant};
+
+    use rand::{
+        distr::{Alphanumeric, SampleString},
+        rng as thread_rng, Rng,
+    };
 
     use super::*;
 
@@ -672,7 +675,6 @@ mod tests {
     fn test_get_smallest_tenant() {
         let tree = Tree::new();
 
-        // Test empty tree
         assert_eq!(tree.get_smallest_tenant(), "empty");
 
         // Insert data for tenant1 - "ap" + "icot" = 6 chars
@@ -682,7 +684,6 @@ mod tests {
         // Insert data for tenant2 - "cat" = 3 chars
         tree.insert("cat", "tenant2");
 
-        // Test - tenant2 should be smallest with 3 chars vs 6 chars
         assert_eq!(
             tree.get_smallest_tenant(),
             "tenant2",
@@ -695,7 +696,6 @@ mod tests {
         tree.insert("do", "tenant3");
         tree.insert("hi", "tenant4");
 
-        // Test - should return either tenant3 or tenant4 (both have 2 chars)
         let smallest = tree.get_smallest_tenant();
         assert!(
             smallest == "tenant3" || smallest == "tenant4",
@@ -713,7 +713,6 @@ mod tests {
             "Expected tenant3 to be smallest with 2 characters"
         );
 
-        // Test eviction
         tree.evict_tenant_by_size(3); // This should evict tenants with more than 3 chars
 
         let post_eviction_smallest = tree.get_smallest_tenant();
@@ -724,7 +723,6 @@ mod tests {
     fn test_tenant_char_count() {
         let tree = Tree::new();
 
-        // Phase 1: Initial insertions
         tree.insert("apple", "tenant1");
         tree.insert("apricot", "tenant1");
         tree.insert("banana", "tenant1");
@@ -748,7 +746,6 @@ mod tests {
             "Phase 1: Initial insertions"
         );
 
-        // Phase 2: Additional insertions
         tree.insert("apartment", "tenant1");
         tree.insert("appetite", "tenant2");
         tree.insert("ball", "tenant1");
@@ -771,7 +768,6 @@ mod tests {
             "Phase 2: Additional insertions"
         );
 
-        // Phase 3: Overlapping insertions
         tree.insert("zebra", "tenant1");
         tree.insert("zebra", "tenant2");
         tree.insert("zero", "tenant1");
@@ -794,7 +790,6 @@ mod tests {
             "Phase 3: Overlapping insertions"
         );
 
-        // Phase 4: Eviction test
         tree.evict_tenant_by_size(10);
 
         let computed_sizes = tree.get_used_size_per_tenant();
@@ -856,8 +851,8 @@ mod tests {
         // spawn 3 threads for insert
         let tree_clone = Arc::clone(&tree);
 
-        let texts = vec!["hello", "apple", "banana"];
-        let tenants = vec!["tenant1", "tenant2", "tenant3"];
+        let texts = ["hello", "apple", "banana"];
+        let tenants = ["tenant1", "tenant2", "tenant3"];
 
         let mut handles = vec![];
 
@@ -910,13 +905,12 @@ mod tests {
         // spawn 3 threads for insert
         let tree_clone = Arc::clone(&tree);
 
-        let texts = vec!["apple", "apabc", "acbdeds"];
+        static TEXTS: [&str; 3] = ["apple", "apabc", "acbdeds"];
 
         let mut handles = vec![];
 
-        for i in 0..3 {
+        for text in TEXTS.iter() {
             let tree_clone = Arc::clone(&tree_clone);
-            let text = texts[i];
             let tenant = "tenant0";
 
             let handle = thread::spawn(move || {
@@ -936,14 +930,13 @@ mod tests {
 
         let tree_clone = Arc::clone(&tree);
 
-        for i in 0..3 {
+        for text in TEXTS.iter() {
             let tree_clone = Arc::clone(&tree_clone);
-            let text = texts[i];
             let tenant = "tenant0";
 
             let handle = thread::spawn(move || {
                 let (matched_text, matched_tenant) = tree_clone.prefix_match(text);
-                assert_eq!(matched_text, text);
+                assert_eq!(matched_text, *text);
                 assert_eq!(matched_tenant, tenant);
             });
 
@@ -958,13 +951,13 @@ mod tests {
 
     #[test]
     fn test_group_prefix_insert_match_concurrent() {
-        let prefix = vec![
+        static PREFIXES: [&str; 4] = [
             "Clock strikes midnight, I'm still wide awake",
             "Got dreams bigger than these city lights",
             "Time waits for no one, gotta make my move",
             "Started from the bottom, that's no metaphor",
         ];
-        let suffix = vec![
+        let suffixes = [
             "Got too much to prove, ain't got time to lose",
             "History in the making, yeah, you can't erase this",
         ];
@@ -972,10 +965,10 @@ mod tests {
 
         let mut handles = vec![];
 
-        for i in 0..prefix.len() {
-            for j in 0..suffix.len() {
+        for (i, prefix) in PREFIXES.iter().enumerate() {
+            for suffix in suffixes.iter() {
                 let tree_clone = Arc::clone(&tree);
-                let text = format!("{} {}", prefix[i], suffix[j]);
+                let text = format!("{} {}", prefix, suffix);
                 let tenant = format!("tenant{}", i);
 
                 let handle = thread::spawn(move || {
@@ -994,17 +987,15 @@ mod tests {
         tree.pretty_print();
 
         // check matching using multi threads
-
         let mut handles = vec![];
 
-        for i in 0..prefix.len() {
+        for (i, prefix) in PREFIXES.iter().enumerate() {
             let tree_clone = Arc::clone(&tree);
-            let text = prefix[i];
 
             let handle = thread::spawn(move || {
-                let (matched_text, matched_tenant) = tree_clone.prefix_match(text);
+                let (matched_text, matched_tenant) = tree_clone.prefix_match(prefix);
                 let tenant = format!("tenant{}", i);
-                assert_eq!(matched_text, text);
+                assert_eq!(matched_text, *prefix);
                 assert_eq!(matched_tenant, tenant);
             });
 
@@ -1021,13 +1012,13 @@ mod tests {
     fn test_mixed_concurrent_insert_match() {
         // ensure it does not deadlock instead of doing correctness check
 
-        let prefix = vec![
+        static PREFIXES: [&str; 4] = [
             "Clock strikes midnight, I'm still wide awake",
             "Got dreams bigger than these city lights",
             "Time waits for no one, gotta make my move",
             "Started from the bottom, that's no metaphor",
         ];
-        let suffix = vec![
+        let suffixes = [
             "Got too much to prove, ain't got time to lose",
             "History in the making, yeah, you can't erase this",
         ];
@@ -1035,10 +1026,10 @@ mod tests {
 
         let mut handles = vec![];
 
-        for i in 0..prefix.len() {
-            for j in 0..suffix.len() {
+        for (i, prefix) in PREFIXES.iter().enumerate() {
+            for suffix in suffixes.iter() {
                 let tree_clone = Arc::clone(&tree);
-                let text = format!("{} {}", prefix[i], suffix[j]);
+                let text = format!("{} {}", prefix, suffix);
                 let tenant = format!("tenant{}", i);
 
                 let handle = thread::spawn(move || {
@@ -1050,13 +1041,11 @@ mod tests {
         }
 
         // check matching using multi threads
-
-        for i in 0..prefix.len() {
+        for prefix in PREFIXES.iter() {
             let tree_clone = Arc::clone(&tree);
-            let text = prefix[i];
 
             let handle = thread::spawn(move || {
-                let (_matched_text, _matched_tenant) = tree_clone.prefix_match(text);
+                let (_matched_text, _matched_tenant) = tree_clone.prefix_match(prefix);
             });
 
             handles.push(handle);
@@ -1074,27 +1063,23 @@ mod tests {
         // use .chars() to get the iterator of the utf-8 value
         let tree = Arc::new(Tree::new());
 
-        let test_pairs = vec![
+        static TEST_PAIRS: [(&str, &str); 3] = [
             ("你好嗎", "tenant1"),
             ("你好喔", "tenant2"),
             ("你心情好嗎", "tenant3"),
         ];
 
         // Insert sequentially
-        for i in 0..test_pairs.len() {
-            let text = test_pairs[i].0;
-            let tenant = test_pairs[i].1;
+        for (text, tenant) in TEST_PAIRS.iter() {
             tree.insert(text, tenant);
         }
 
         tree.pretty_print();
 
-        // Test sequentially
-
-        for i in 0..test_pairs.len() {
-            let (matched_text, matched_tenant) = tree.prefix_match(test_pairs[i].0);
-            assert_eq!(matched_text, test_pairs[i].0);
-            assert_eq!(matched_tenant, test_pairs[i].1);
+        for (text, tenant) in TEST_PAIRS.iter() {
+            let (matched_text, matched_tenant) = tree.prefix_match(text);
+            assert_eq!(matched_text, *text);
+            assert_eq!(matched_tenant, *tenant);
         }
     }
 
@@ -1102,7 +1087,7 @@ mod tests {
     fn test_utf8_split_concurrent() {
         let tree = Arc::new(Tree::new());
 
-        let test_pairs = vec![
+        static TEST_PAIRS: [(&str, &str); 3] = [
             ("你好嗎", "tenant1"),
             ("你好喔", "tenant2"),
             ("你心情好嗎", "tenant3"),
@@ -1111,13 +1096,11 @@ mod tests {
         // Create multiple threads for insertion
         let mut handles = vec![];
 
-        for i in 0..test_pairs.len() {
+        for (text, tenant) in TEST_PAIRS.iter() {
             let tree_clone = Arc::clone(&tree);
-            let text = test_pairs[i].0.to_string();
-            let tenant = test_pairs[i].1.to_string();
 
             let handle = thread::spawn(move || {
-                tree_clone.insert(&text, &tenant);
+                tree_clone.insert(text, tenant);
             });
 
             handles.push(handle);
@@ -1133,15 +1116,13 @@ mod tests {
         // Create multiple threads for matching
         let mut handles = vec![];
 
-        for i in 0..test_pairs.len() {
+        for (text, tenant) in TEST_PAIRS.iter() {
             let tree_clone = Arc::clone(&tree);
-            let text = test_pairs[i].0.to_string();
-            let tenant = test_pairs[i].1.to_string();
 
             let handle = thread::spawn(move || {
-                let (matched_text, matched_tenant) = tree_clone.prefix_match(&text);
-                assert_eq!(matched_text, text);
-                assert_eq!(matched_tenant, tenant);
+                let (matched_text, matched_tenant) = tree_clone.prefix_match(text);
+                assert_eq!(matched_text, *text);
+                assert_eq!(matched_tenant, *tenant);
             });
 
             handles.push(handle);
@@ -1167,7 +1148,6 @@ mod tests {
 
         tree.pretty_print();
 
-        // Verify initial sizes
         let sizes_before = tree.get_used_size_per_tenant();
         assert_eq!(sizes_before.get("tenant1").unwrap(), &5); // "hello" = 5
         assert_eq!(sizes_before.get("tenant2").unwrap(), &10); // "hello" + "world" = 10
@@ -1177,12 +1157,10 @@ mod tests {
 
         tree.pretty_print();
 
-        // Verify sizes after eviction
         let sizes_after = tree.get_used_size_per_tenant();
         assert_eq!(sizes_after.get("tenant1").unwrap(), &5); // Should be unchanged
         assert_eq!(sizes_after.get("tenant2").unwrap(), &5); // Only "world" remains
 
-        // Verify "world" remains for tenant2
         let (matched, tenant) = tree.prefix_match("world");
         assert_eq!(matched, "world");
         assert_eq!(tenant, "tenant2");
@@ -1196,7 +1174,7 @@ mod tests {
         let max_size: usize = 100;
 
         // Define prefixes
-        let prefixes = vec!["aqwefcisdf", "iajsdfkmade", "kjnzxcvewqe", "iejksduqasd"];
+        let prefixes = ["aqwefcisdf", "iajsdfkmade", "kjnzxcvewqe", "iejksduqasd"];
 
         // Insert strings with shared prefixes
         for _i in 0..100 {
@@ -1213,7 +1191,6 @@ mod tests {
 
         // Check sizes after eviction
         let sizes_after = tree.get_used_size_per_tenant();
-        // Verify all tenants are under their size limits
         for (tenant, &size) in sizes_after.iter() {
             assert!(
                 size <= max_size,
@@ -1254,27 +1231,27 @@ mod tests {
         for thread_id in 0..4 {
             let tree = Arc::clone(&tree);
             let handle = thread::spawn(move || {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let tenant = format!("tenant{}", thread_id + 1);
                 let prefix = format!("prefix{}", thread_id);
 
                 while start_time.elapsed() < test_duration {
                     // Random decision: match or insert (70% match, 30% insert)
-                    if rng.gen_bool(0.7) {
+                    if rng.random_bool(0.7) {
                         // Perform match operation
-                        let random_len = rng.gen_range(3..10);
+                        let random_len = rng.random_range(3..10);
                         let search_str = format!("{}{}", prefix, random_string(random_len));
                         let (_matched, _) = tree.prefix_match(&search_str);
                     } else {
                         // Perform insert operation
-                        let random_len = rng.gen_range(5..15);
+                        let random_len = rng.random_range(5..15);
                         let insert_str = format!("{}{}", prefix, random_string(random_len));
                         tree.insert(&insert_str, &tenant);
                         // println!("Thread {} inserted: {}", thread_id, insert_str);
                     }
 
                     // Small random sleep to vary timing
-                    thread::sleep(Duration::from_millis(rng.gen_range(10..100)));
+                    thread::sleep(Duration::from_millis(rng.random_range(10..100)));
                 }
             });
             handles.push(handle);
@@ -1292,7 +1269,6 @@ mod tests {
         let final_sizes = tree.get_used_size_per_tenant();
         println!("Final sizes after test completion: {:?}", final_sizes);
 
-        // Verify all tenants are under limit
         for (_, &size) in final_sizes.iter() {
             assert!(
                 size <= max_size,
@@ -1369,14 +1345,12 @@ mod tests {
         tree.insert("help", "tenant1"); // tenant1: hel -> p
         tree.insert("helicopter", "tenant2"); // tenant2: hel -> icopter
 
-        // Test tenant1's data
         assert_eq!(tree.prefix_match_tenant("hello", "tenant1"), "hello"); // Full match for tenant1
         assert_eq!(tree.prefix_match_tenant("help", "tenant1"), "help"); // Exclusive to tenant1
         assert_eq!(tree.prefix_match_tenant("hel", "tenant1"), "hel"); // Shared prefix
         assert_eq!(tree.prefix_match_tenant("hello world", "tenant1"), "hello"); // Should stop at tenant1's boundary
         assert_eq!(tree.prefix_match_tenant("helicopter", "tenant1"), "hel"); // Should stop at tenant1's boundary
 
-        // Test tenant2's data
         assert_eq!(tree.prefix_match_tenant("hello", "tenant2"), "hello"); // Full match for tenant2
         assert_eq!(
             tree.prefix_match_tenant("hello world", "tenant2"),
@@ -1389,7 +1363,6 @@ mod tests {
         assert_eq!(tree.prefix_match_tenant("hel", "tenant2"), "hel"); // Shared prefix
         assert_eq!(tree.prefix_match_tenant("help", "tenant2"), "hel"); // Should stop at tenant2's boundary
 
-        // Test non-existent tenant
         assert_eq!(tree.prefix_match_tenant("hello", "tenant3"), ""); // Non-existent tenant
         assert_eq!(tree.prefix_match_tenant("help", "tenant3"), ""); // Non-existent tenant
     }
@@ -1404,7 +1377,6 @@ mod tests {
         tree.insert("hello", "tenant2");
         tree.insert("help", "tenant2");
 
-        // Verify initial state
         let initial_sizes = tree.get_used_size_per_tenant();
         assert_eq!(initial_sizes.get("tenant1").unwrap(), &10); // "hello" + "world"
         assert_eq!(initial_sizes.get("tenant2").unwrap(), &6); // "hello" + "p"
@@ -1412,7 +1384,6 @@ mod tests {
         // Evict tenant1
         tree.remove_tenant("tenant1");
 
-        // Verify after eviction
         let final_sizes = tree.get_used_size_per_tenant();
         assert!(
             !final_sizes.contains_key("tenant1"),
@@ -1424,11 +1395,9 @@ mod tests {
             "tenant2 should be unaffected"
         );
 
-        // Verify tenant1's data is inaccessible
         assert_eq!(tree.prefix_match_tenant("hello", "tenant1"), "");
         assert_eq!(tree.prefix_match_tenant("world", "tenant1"), "");
 
-        // Verify tenant2's data is still accessible
         assert_eq!(tree.prefix_match_tenant("hello", "tenant2"), "hello");
         assert_eq!(tree.prefix_match_tenant("help", "tenant2"), "help");
     }
@@ -1446,7 +1415,6 @@ mod tests {
         tree.insert("banana", "tenant2");
         tree.insert("ball", "tenant2");
 
-        // Verify initial state
         let initial_sizes = tree.get_used_size_per_tenant();
         println!("Initial sizes: {:?}", initial_sizes);
         tree.pretty_print();
@@ -1454,29 +1422,24 @@ mod tests {
         // Evict tenant1
         tree.remove_tenant("tenant1");
 
-        // Verify final state
         let final_sizes = tree.get_used_size_per_tenant();
         println!("Final sizes: {:?}", final_sizes);
         tree.pretty_print();
 
-        // Verify tenant1 is completely removed
         assert!(
             !final_sizes.contains_key("tenant1"),
             "tenant1 should be completely removed"
         );
 
-        // Verify all tenant1's data is inaccessible
         assert_eq!(tree.prefix_match_tenant("apple", "tenant1"), "");
         assert_eq!(tree.prefix_match_tenant("application", "tenant1"), "");
         assert_eq!(tree.prefix_match_tenant("banana", "tenant1"), "");
 
-        // Verify tenant2's data is intact
         assert_eq!(tree.prefix_match_tenant("apple", "tenant2"), "apple");
         assert_eq!(tree.prefix_match_tenant("appetite", "tenant2"), "appetite");
         assert_eq!(tree.prefix_match_tenant("banana", "tenant2"), "banana");
         assert_eq!(tree.prefix_match_tenant("ball", "tenant2"), "ball");
 
-        // Verify the tree structure is still valid for tenant2
         let tenant2_size = final_sizes.get("tenant2").unwrap();
         assert_eq!(tenant2_size, &(5 + 5 + 6 + 2)); // "apple" + "etite" + "banana" + "ll"
     }

@@ -483,7 +483,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         ).squeeze(1)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
         Args:
@@ -1537,7 +1537,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     query_inter,
                     key_cache,
                     value_cache,
-                    block_table[:, : decode_meta.max_seq_len_inter],
+                    block_table,
                     decode_meta.seq_lens_inter,
                     softmax_scale,
                     causal=False,

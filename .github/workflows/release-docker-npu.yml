@@ -1,0 +1,74 @@
+name: Release Docker Images (Ascend NPU)
+on:
+  push:
+    tags:
+      - "*" # Trigger on all tags and filterred by pep440 later
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release-docker-npu.yml"
+      - "docker/npu.Dockerfile"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    strategy:
+      matrix:
+        cann_version: ["8.2.rc1"]
+        device_type: ["910b", "a3"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          docker-images: false
+
+        # push with tag
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            lmsysorg/sglang
+          tags: |
+            type=ref,event=pr
+            type=ref,event=tag,suffix=-cann${{ matrix.cann_version }}-${{ matrix.device_type }}
+          flavor: |
+            latest=false
+
+      # Login against a Docker registry except on PR
+      # https://github.com/docker/login-action
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        if: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Get version
+        id: get_version
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          echo "TAG=lmsysorg/sglang:v$version-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/npu.Dockerfile
+          # TODO: need add x86 platforms support when memfabric is ready
+          platforms: linux/arm64
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags || steps.get_version.outputs.TAG }}
+          push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
+          provenance: false
+          build-args: |
+            SGLANG_KERNEL_NPU_TAG=20250926
+            CANN_VERSION=${{ matrix.cann_version }}
+            DEVICE_TYPE=${{ matrix.device_type }}

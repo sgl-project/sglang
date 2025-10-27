@@ -2,6 +2,7 @@ import functools
 from typing import Optional
 
 import torch
+from sgl_kernel import silu_and_mul
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
@@ -79,6 +80,12 @@ def fused_marlin_moe(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
+    assert (
+        hidden_states.dtype == w1_scale.dtype
+    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
+    assert (
+        hidden_states.dtype == w2_scale.dtype
+    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
     assert num_bits in [4, 8]
 
     M, K = hidden_states.shape
@@ -159,13 +166,13 @@ def fused_marlin_moe(
         size_m=M,
         size_n=2 * N,
         size_k=K,
-        is_full_k=is_k_full,
+        is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
     )
 
-    torch.ops._C.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, 2 * N))
+    silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
     if expert_map is not None:
         intermediate_cache3.zero_()
@@ -191,7 +198,7 @@ def fused_marlin_moe(
         size_m=M * topk,
         size_n=K,
         size_k=N,
-        is_full_k=is_k_full,
+        is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,

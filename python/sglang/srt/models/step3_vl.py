@@ -1,8 +1,7 @@
 import logging
 import math
-from collections.abc import Iterable
 from math import sqrt
-from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -25,7 +24,11 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -34,6 +37,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -52,7 +56,6 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
-    global_server_args_dict,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -128,7 +131,7 @@ class Step3TextMoEMLP(nn.Module):
             use_grouped_topk=False,
         )
 
-        self.experts = get_moe_impl_class()(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.moe_num_experts,
             top_k=config.moe_top_k,
             hidden_size=config.hidden_size,
@@ -146,7 +149,7 @@ class Step3TextMoEMLP(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if global_server_args_dict["moe_a2a_backend"].is_deepep():
+        if get_moe_a2a_backend().is_deepep():
             raise NotImplementedError("DeepEP MoE is not supported yet in Step3 model.")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -295,7 +298,7 @@ class Step3TextDecoderLayer(nn.Module):
         # self.n_shared_experts = 1
         # self.num_fused_shared_experts = (
         #     0
-        #     if global_server_args_dict["disable_shared_experts_fusion"]
+        #     if global_server_args.disable_shared_experts_fusion
         #     else self.n_shared_experts
         # )
         self.num_fused_shared_experts = 0
@@ -437,7 +440,7 @@ class Step3TextModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=not is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -769,7 +772,7 @@ class Step3VLForConditionalGeneration(nn.Module):
         # self.n_shared_experts = 1
         # self.num_fused_shared_experts = (
         #     0
-        #     if global_server_args_dict["disable_shared_experts_fusion"]
+        #     if global_server_args.disable_shared_experts_fusion
         #     else self.n_shared_experts
         # )
         self.num_fused_shared_experts = 0

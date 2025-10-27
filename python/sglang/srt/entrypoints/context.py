@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copied from vLLM
-import json
 import logging
 from abc import ABC, abstractmethod
 from typing import Union
+
+import orjson
 
 logger = logging.getLogger(__name__)
 
 try:
     from mcp import ClientSession
-except ImportError:
-    logger.warning("Ignoring mcp import error")
+except ImportError as e:
+    mcp = e
 
 from openai_harmony import Author, Message, Role, StreamState, TextContent
 
@@ -115,6 +116,8 @@ class HarmonyContext(ConversationContext):
         return self._messages
 
     def need_builtin_tool_call(self) -> bool:
+        if not self.messages:
+            return False
         last_msg = self.messages[-1]
         recipient = last_msg.recipient
         return recipient is not None and (
@@ -146,7 +149,7 @@ class HarmonyContext(ConversationContext):
         if isinstance(tool_session, Tool):
             return await tool_session.get_result(self)
         tool_name = last_msg.recipient.split(".")[1]
-        args = json.loads(last_msg.content[0].text)
+        args = orjson.loads(last_msg.content[0].text)
         result = await tool_session.call_tool(tool_name, args)
         result_str = result.content[0].text
         content = TextContent(text=result_str)
