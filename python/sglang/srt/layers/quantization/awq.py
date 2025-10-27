@@ -61,7 +61,6 @@ elif _is_hip:
     warnings.warn(f"HIP does not support fused_marlin_moe currently.")
 elif _is_cpu and _is_cpu_amx_available:
     from sglang.srt.layers.amx_utils import (
-        SGLANG_USE_CPU_INT4_W4A8,
         CPUMoECompMethod,
         _amx_process_weight_after_loading,
     )
@@ -435,7 +434,6 @@ class AWQLinearMethod(LinearMethodBase):
                 layer.qzeros,
                 layer.scales,
                 bias,
-                SGLANG_USE_CPU_INT4_W4A8,
             )
 
         qweight = layer.qweight
@@ -802,11 +800,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
                 topk_weights,
                 topk_ids,
                 False,  # inplace See [Note] inplace should be False in fused_experts.
-                (
-                    CPUMoECompMethod.INT4_W4A16_GEMM
-                    if not SGLANG_USE_CPU_INT4_W4A8
-                    else CPUMoECompMethod.INT4_W4A8_GEMM
-                ),
+                CPUMoECompMethod.INT4_W4A8_GEMM,
                 layer.w13_scales,  # w1_scale
                 layer.w2_scales,  # w2_scale
                 layer.w13_qzeros,

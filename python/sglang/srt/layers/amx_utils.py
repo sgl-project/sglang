@@ -8,15 +8,12 @@ logger = logging.getLogger(__name__)
 
 from enum import IntEnum
 
-SGLANG_USE_CPU_INT4_W4A8 = get_bool_env_var("SGLANG_USE_CPU_INT4_W4A8")
-
 
 class CPUMoECompMethod(IntEnum):
     BF16_GEMM = 0
     INT8_W8A8_GEMM = 1
     FP8_W8A16_GEMM = 2
-    INT4_W4A16_GEMM = 3
-    INT4_W4A8_GEMM = 4
+    INT4_W4A8_GEMM = 3
 
 
 def amx_process_weight_after_loading(weight):
@@ -85,7 +82,7 @@ def _amx_process_weight_after_loading(
         qzeros_tensor = getattr(module, weight_names[1])
         scales_tensor = getattr(module, weight_names[2])
         qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-            qweight_tensor, qzeros_tensor, scales_tensor, SGLANG_USE_CPU_INT4_W4A8
+            qweight_tensor, qzeros_tensor, scales_tensor
         )
         packed_qweight = torch.nn.Parameter(
             qweight.detach(),
