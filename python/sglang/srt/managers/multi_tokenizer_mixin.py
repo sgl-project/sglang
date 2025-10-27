@@ -535,19 +535,32 @@ class MultiDetokenizerRouter:
             # Use consistent routing based on http_worker_ipc
             if isinstance(recv_obj, BaseReq):
                 # Single request: use http_worker_ipc for consistent routing
-                assert recv_obj.http_worker_ipc is not None, f"Single req {recv_obj.rid=} has no http_worker_ipc!"
-                worker_index = hash(recv_obj.http_worker_ipc) % self.detokenizer_worker_num
+                assert (
+                    recv_obj.http_worker_ipc is not None
+                ), f"Single req {recv_obj.rid=} has no http_worker_ipc!"
+                worker_index = (
+                    hash(recv_obj.http_worker_ipc) % self.detokenizer_worker_num
+                )
                 detokenizer_worker_ipc = self.ipc_name_list[worker_index]
             elif isinstance(recv_obj, BaseBatchReq):
                 # Batch request: use first http_worker_ipc for consistent routing
-                assert recv_obj.http_worker_ipcs is not None and recv_obj.http_worker_ipcs[0] is not None, f"Batch req {recv_obj.rids=} has no http_worker_ipcs!"
-                worker_index = hash(recv_obj.http_worker_ipcs[0]) % self.detokenizer_worker_num
+                assert (
+                    recv_obj.http_worker_ipcs is not None
+                    and recv_obj.http_worker_ipcs[0] is not None
+                ), f"Batch req {recv_obj.rids=} has no http_worker_ipcs!"
+                worker_index = (
+                    hash(recv_obj.http_worker_ipcs[0]) % self.detokenizer_worker_num
+                )
                 detokenizer_worker_ipc = self.ipc_name_list[worker_index]
             else:
                 # Unknown request type: use round-robin
-                logger.warning(f"[WARNING] Unknown request type {type(recv_obj)}, using round-robin")
+                logger.warning(
+                    f"[WARNING] Unknown request type {type(recv_obj)}, using round-robin"
+                )
                 detokenizer_worker_ipc = self.ipc_name_list[self.ipc_name_index]
-                self.ipc_name_index = (self.ipc_name_index + 1) % self.detokenizer_worker_num
+                self.ipc_name_index = (
+                    self.ipc_name_index + 1
+                ) % self.detokenizer_worker_num
 
             # Send to selected detokenizer worker
             self.socket_mapping.send_output(
