@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Usage:
 1) Launch the server with wait-for-initial-weights option in one terminal:
