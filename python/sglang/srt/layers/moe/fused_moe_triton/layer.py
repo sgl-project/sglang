@@ -33,6 +33,11 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    CompressedTensorsWNA16AMXEPMoEMethod,
+    CompressedTensorsWNA16AMXMoEMethod,
+    CompressedTensorsWNA16MoEMethod,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -44,7 +49,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_flashinfer_available,
     is_hip,
-    next_power_of_2,
     round_up,
 )
 
@@ -67,21 +71,11 @@ if should_use_flashinfer_trtllm_moe():
 logger = logging.getLogger(__name__)
 
 
-def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
-    # Guess tokens per expert assuming perfect expert distribution first.
-    num_tokens_per_expert = (num_tokens * top_k) // num_experts
-    # And pad the number to the next power of 2.
-    tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
-    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
-    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-    return tile_tokens_dim
-
-
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none():
         return StandardDispatcher(moe_runner_config)
-    elif a2a_backend.is_deepep():
+    elif a2a_backend.is_deepep() or a2a_backend.is_mooncake():
         return MaybeTboDeepEPDispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
@@ -150,7 +144,6 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
     ):
         super().__init__()
-
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -179,7 +172,7 @@ class FusedMoE(torch.nn.Module):
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
 
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -227,6 +220,8 @@ class FusedMoE(torch.nn.Module):
                 if not use_weight_loader_fused
                 else self.weight_loader_fused
             ),
+            intermediate_size_full=intermediate_size,
+            top_k=top_k,
             with_bias=with_bias,
         )
 
@@ -237,7 +232,7 @@ class FusedMoE(torch.nn.Module):
             self.quant_method, ModelOptNvFp4FusedMoEMethod
         ) or (
             isinstance(self.quant_method, Fp8MoEMethod)
-            and self.quant_method.use_cutlass_fused_experts_fp8
+            and self.quant_method._should_use_cutlass_fused_experts()
         )
 
     def _load_per_tensor_weight_scale(
@@ -542,6 +537,18 @@ class FusedMoE(torch.nn.Module):
             if expert_id == -1:
                 return
 
+        if isinstance(
+            self.quant_method,
+            (
+                CompressedTensorsWNA16MoEMethod,
+                CompressedTensorsWNA16AMXMoEMethod,
+                CompressedTensorsWNA16AMXEPMoEMethod,
+            ),
+        ):
+            if self.quant_method.num_gpu_experts != -1:
+                if expert_id >= self.quant_method.num_gpu_experts:
+                    return
+
         self._weight_loader_impl(
             param=param,
             loaded_weight=loaded_weight,
@@ -568,7 +575,12 @@ class FusedMoE(torch.nn.Module):
             loaded_weight.t().contiguous()
             if (
                 self.quant_method.__class__.__name__
-                == "CompressedTensorsWNA16MoEMethod"
+                in [
+                    "CompressedTensorsWNA16MarlinMoEMethod",
+                    "CompressedTensorsWNA16MoEMethod",
+                    "CompressedTensorsWNA16AMXMoEMethod",
+                    "CompressedTensorsWNA16AMXEPMoEMethod",
+                ]
             )
             else loaded_weight
         )
@@ -827,8 +839,7 @@ class FusedMoE(torch.nn.Module):
             dispatch_output=dispatch_output,
             **kwargs,
         )
-
-        final_hidden_states = self.dispatcher.combine(combine_input)
+        final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
         # TODO: should we add some conditions here?
         final_hidden_states = final_hidden_states[
@@ -1058,9 +1069,7 @@ class FlashInferFP4MoE(FusedMoE):
             local_expert_offset=self.moe_ep_rank * self.num_local_experts,
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
-            tile_tokens_dim=_get_tile_tokens_dim(
-                hidden_states.shape[0], topk_config.top_k, self.num_local_experts
-            ),
+            tile_tokens_dim=None,
             routing_method_type=RoutingMethodType.DeepSeekV3,
             do_finalize=True,
         )[0]
