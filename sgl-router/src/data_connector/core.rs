@@ -340,8 +340,8 @@ pub struct StoredResponse {
     /// When this response was created
     pub created_at: DateTime<Utc>,
 
-    /// User identifier (optional)
-    pub user: Option<String>,
+    /// Safety identifier for content moderation
+    pub safety_identifier: Option<String>,
 
     /// Model used for generation
     pub model: Option<String>,
@@ -366,7 +366,7 @@ impl StoredResponse {
             tool_calls: Vec::new(),
             metadata: HashMap::new(),
             created_at: Utc::now(),
-            user: None,
+            safety_identifier: None,
             model: None,
             conversation_id: None,
             raw_response: Value::Null,

@@ -270,8 +270,8 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
 struct InnerStore {
     /// All stored responses indexed by ID
     responses: HashMap<ResponseId, StoredResponse>,
-    /// Index of response IDs by user
-    user_index: HashMap<String, Vec<ResponseId>>,
+    /// Index of response IDs by safety identifier
+    identifier_index: HashMap<String, Vec<ResponseId>>,
 }
 
 /// In-memory implementation of response storage
@@ -292,7 +292,7 @@ impl MemoryResponseStorage {
         let store = self.store.read();
         MemoryStoreStats {
             response_count: store.responses.len(),
-            user_count: store.user_index.len(),
+            user_count: store.identifier_index.len(),
         }
     }
 
@@ -300,7 +300,7 @@ impl MemoryResponseStorage {
     pub fn clear(&self) {
         let mut store = self.store.write();
         store.responses.clear();
-        store.user_index.clear();
+        store.identifier_index.clear();
     }
 }
 
@@ -323,11 +323,11 @@ impl ResponseStorage for MemoryResponseStorage {
         // Single lock acquisition for atomic update
         let mut store = self.store.write();
 
-        // Update user index if user is specified
-        if let Some(ref user) = response.user {
+        // Update safety identifier index if specified
+        if let Some(ref safety_identifier) = response.safety_identifier {
             store
-                .user_index
-                .entry(user.clone())
+                .identifier_index
+                .entry(safety_identifier.clone())
                 .or_default()
                 .push(response_id.clone());
         }
@@ -354,8 +354,8 @@ impl ResponseStorage for MemoryResponseStorage {
 
         // Remove the response and update user index if needed
         if let Some(response) = store.responses.remove(response_id) {
-            if let Some(ref user) = response.user {
-                if let Some(user_responses) = store.user_index.get_mut(user) {
+            if let Some(ref safety_identifier) = response.safety_identifier {
+                if let Some(user_responses) = store.identifier_index.get_mut(safety_identifier) {
                     user_responses.retain(|id| id != response_id);
                 }
             }
@@ -416,7 +416,7 @@ impl ResponseStorage for MemoryResponseStorage {
     ) -> ResponseResult<Vec<StoredResponse>> {
         let store = self.store.read();
 
-        if let Some(user_response_ids) = store.user_index.get(user) {
+        if let Some(user_response_ids) = store.identifier_index.get(user) {
             // Collect responses with their timestamps for sorting
             let mut responses_with_time: Vec<_> = user_response_ids
                 .iter()
@@ -443,7 +443,7 @@ impl ResponseStorage for MemoryResponseStorage {
     async fn delete_user_responses(&self, user: &str) -> ResponseResult<usize> {
         let mut store = self.store.write();
 
-        if let Some(user_response_ids) = store.user_index.remove(user) {
+        if let Some(user_response_ids) = store.identifier_index.remove(user) {
             let count = user_response_ids.len();
             for id in user_response_ids {
                 store.responses.remove(&id);
@@ -660,19 +660,19 @@ mod tests {
         let mut response1 = StoredResponse::new(None);
         response1.input = json!("User1 message");
         response1.output = json!("Response to user1");
-        response1.user = Some("user1".to_string());
+        response1.safety_identifier = Some("user1".to_string());
         store.store_response(response1).await.unwrap();
 
         let mut response2 = StoredResponse::new(None);
         response2.input = json!("Another user1 message");
         response2.output = json!("Another response to user1");
-        response2.user = Some("user1".to_string());
+        response2.safety_identifier = Some("user1".to_string());
         store.store_response(response2).await.unwrap();
 
         let mut response3 = StoredResponse::new(None);
         response3.input = json!("User2 message");
         response3.output = json!("Response to user2");
-        response3.user = Some("user2".to_string());
+        response3.safety_identifier = Some("user2".to_string());
         store.store_response(response3).await.unwrap();
 
         // List user1's responses
@@ -702,13 +702,13 @@ mod tests {
         let mut response1 = StoredResponse::new(None);
         response1.input = json!("Test1");
         response1.output = json!("Reply1");
-        response1.user = Some("user1".to_string());
+        response1.safety_identifier = Some("user1".to_string());
         store.store_response(response1).await.unwrap();
 
         let mut response2 = StoredResponse::new(None);
         response2.input = json!("Test2");
         response2.output = json!("Reply2");
-        response2.user = Some("user2".to_string());
+        response2.safety_identifier = Some("user2".to_string());
         store.store_response(response2).await.unwrap();
 
         let stats = store.stats();

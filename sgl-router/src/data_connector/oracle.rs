@@ -768,7 +768,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
 // ============================================================================
 
 const SELECT_BASE: &str = "SELECT id, previous_response_id, input, instructions, output, \
-    tool_calls, metadata, created_at, user_id, model, conversation_id, raw_response FROM responses";
+    tool_calls, metadata, created_at, safety_identifier, model, conversation_id, raw_response FROM responses";
 
 #[derive(Clone)]
 pub struct OracleResponseStorage {
@@ -798,7 +798,7 @@ impl OracleResponseStorage {
                         tool_calls CLOB,
                         metadata CLOB,
                         created_at TIMESTAMP WITH TIME ZONE,
-                        user_id VARCHAR2(128),
+                        safety_identifier VARCHAR2(128),
                         model VARCHAR2(128),
                         raw_response CLOB
                     )",
@@ -816,7 +816,7 @@ impl OracleResponseStorage {
             create_index_if_missing(
                 conn,
                 "RESPONSES_USER_IDX",
-                "CREATE INDEX responses_user_idx ON responses(user_id)",
+                "CREATE INDEX responses_user_idx ON responses(safety_identifier)",
             )?;
 
             Ok(())
@@ -835,7 +835,7 @@ impl OracleResponseStorage {
         let tool_calls_json: Option<String> = row.get(5).map_err(map_oracle_error)?;
         let metadata_json: Option<String> = row.get(6).map_err(map_oracle_error)?;
         let created_at: DateTime<Utc> = row.get(7).map_err(map_oracle_error)?;
-        let user_id: Option<String> = row.get(8).map_err(map_oracle_error)?;
+        let safety_identifier: Option<String> = row.get(8).map_err(map_oracle_error)?;
         let model: Option<String> = row.get(9).map_err(map_oracle_error)?;
         let conversation_id: Option<String> = row.get(10).map_err(map_oracle_error)?;
         let raw_response_json: Option<String> = row.get(11).map_err(map_oracle_error)?;
@@ -856,7 +856,7 @@ impl OracleResponseStorage {
             tool_calls,
             metadata,
             created_at,
-            user: user_id,
+            safety_identifier,
             model,
             conversation_id,
             raw_response,
@@ -880,7 +880,7 @@ impl ResponseStorage for OracleResponseStorage {
         let json_raw_response = serde_json::to_string(&response.raw_response)?;
         let instructions = response.instructions.clone();
         let created_at = response.created_at;
-        let user = response.user.clone();
+        let safety_identifier = response.safety_identifier.clone();
         let model = response.model.clone();
         let conversation_id = response.conversation_id.clone();
 
@@ -888,7 +888,7 @@ impl ResponseStorage for OracleResponseStorage {
             .execute(move |conn| {
                 conn.execute(
                     "INSERT INTO responses (id, previous_response_id, input, instructions, output, \
-                        tool_calls, metadata, created_at, user_id, model, conversation_id, raw_response) \
+                        tool_calls, metadata, created_at, safety_identifier, model, conversation_id, raw_response) \
                      VALUES (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)",
                     &[
                         &response_id_str,
@@ -899,7 +899,7 @@ impl ResponseStorage for OracleResponseStorage {
                         &json_tool_calls,
                         &json_metadata,
                         &created_at,
-                        &user,
+                        &safety_identifier,
                         &model,
                         &conversation_id,
                         &json_raw_response,
@@ -992,11 +992,11 @@ impl ResponseStorage for OracleResponseStorage {
             .execute(move |conn| {
                 let sql = if let Some(limit) = limit {
                     format!(
-                        "SELECT * FROM ({} WHERE user_id = :1 ORDER BY created_at DESC) WHERE ROWNUM <= {}",
+                        "SELECT * FROM ({} WHERE safety_identifier = :1 ORDER BY created_at DESC) WHERE ROWNUM <= {}",
                         SELECT_BASE, limit
                     )
                 } else {
-                    format!("{} WHERE user_id = :1 ORDER BY created_at DESC", SELECT_BASE)
+                    format!("{} WHERE safety_identifier = :1 ORDER BY created_at DESC", SELECT_BASE)
                 };
 
                 let mut stmt = conn.statement(&sql).build().map_err(map_oracle_error)?;
@@ -1019,8 +1019,11 @@ impl ResponseStorage for OracleResponseStorage {
         let affected = self
             .store
             .execute(move |conn| {
-                conn.execute("DELETE FROM responses WHERE user_id = :1", &[&user])
-                    .map_err(map_oracle_error)
+                conn.execute(
+                    "DELETE FROM responses WHERE safety_identifier = :1",
+                    &[&user],
+                )
+                .map_err(map_oracle_error)
             })
             .await
             .map_err(ResponseStorageError::StorageError)?;

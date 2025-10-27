@@ -389,7 +389,7 @@ pub(super) async fn execute_tool_loop(
                 parallel_tool_calls: current_request.parallel_tool_calls,
                 previous_response_id: None,
                 conversation: None,
-                user: current_request.user.clone(),
+                safety_identifier: current_request.safety_identifier.clone(),
                 metadata: current_request.metadata.clone(),
                 // Additional fields from ResponsesRequest
                 include: current_request.include.clone(),
@@ -862,7 +862,7 @@ async fn execute_tool_loop_streaming_internal(
                 parallel_tool_calls: current_request.parallel_tool_calls,
                 previous_response_id: None,
                 conversation: None,
-                user: current_request.user.clone(),
+                safety_identifier: current_request.safety_identifier.clone(),
                 metadata: current_request.metadata.clone(),
                 include: current_request.include.clone(),
                 reasoning: current_request.reasoning.clone(),

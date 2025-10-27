@@ -325,7 +325,7 @@ async fn route_responses_background(
         top_p: request.top_p,
         truncation: None,
         usage: None,
-        user: request.user.clone(),
+        safety_identifier:request.safety_identifier.clone(),
         metadata: request.metadata.clone().unwrap_or_default(),
     };
 
@@ -841,7 +841,7 @@ impl StreamingResponseAccumulator {
             top_p: self.original_request.top_p,
             truncation: None,
             usage,
-            user: None,
+            safety_identifier: self.original_request.safety_identifier.clone(),
             metadata: self.original_request.metadata.clone().unwrap_or_default(),
         }
     }

@@ -502,6 +502,10 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponseReasoningParam>,
 
+    /// Safety identifier for content moderation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+
     /// Service tier
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
@@ -540,10 +544,6 @@ pub struct ResponsesRequest {
     /// Truncation behavior
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation: Option<Truncation>,
-
-    /// User identifier
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
 
     /// Request ID
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -600,6 +600,7 @@ impl Default for ResponsesRequest {
             parallel_tool_calls: None,
             previous_response_id: None,
             reasoning: None,
+            safety_identifier: None,
             service_tier: None,
             store: None,
             stream: None,
@@ -609,7 +610,6 @@ impl Default for ResponsesRequest {
             top_logprobs: None,
             top_p: None,
             truncation: None,
-            user: None,
             request_id: None,
             priority: 0,
             frequency_penalty: None,
@@ -853,9 +853,9 @@ pub struct ResponsesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<ResponsesUsage>,
 
-    /// User identifier
+    /// Safety identifier for content moderation
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
+    pub safety_identifier: Option<String>,
 
     /// Additional metadata
     #[serde(default)]
