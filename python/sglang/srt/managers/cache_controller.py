@@ -394,8 +394,6 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
-            self.session_loading_process = {}
-
     def prefetch_from_session_cache(
         self,
         session_id: str,
@@ -403,7 +401,6 @@ class HiCacheController:
         starting_offset: int,
         prefetch_length: int,
     ):
-        self.session_loading_process[session_id] = False
         operation = SessionOperation(
             session_id, host_indices, starting_offset, prefetch_length
         )
