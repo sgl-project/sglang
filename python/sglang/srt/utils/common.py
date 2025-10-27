@@ -56,7 +56,6 @@ from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -93,9 +92,6 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +134,7 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
@@ -510,6 +507,8 @@ def get_available_gpu_memory(
                 f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
                 "which may cause useless memory allocation for torch NPU context.",
             )
+        if empty_cache:
+            torch.npu.empty_cache()
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
 
     if distributed:
@@ -1067,32 +1066,6 @@ def monkey_patch_p2p_access_check():
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
 
-def monkey_patch_vllm_gguf_config():
-    try:
-        from vllm.model_executor.layers.quantization.gguf import (
-            GGUFConfig,
-            GGUFEmbeddingMethod,
-            GGUFLinearMethod,
-        )
-    except ImportError:
-        return
-
-    from sglang.srt.layers.linear import LinearBase
-    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-
-    def get_quant_method_with_embedding_replaced(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[QuantizeMethodBase]:
-        if isinstance(layer, LinearBase):
-            return GGUFLinearMethod(self)
-        elif isinstance(layer, VocabParallelEmbedding):
-            # patch to own VocabParallelEmbedding
-            return GGUFEmbeddingMethod(self)
-        return None
-
-    setattr(GGUFConfig, "get_quant_method", get_quant_method_with_embedding_replaced)
-
-
 def set_ulimit(target_soft_limit=65535):
     # number of open files
     resource_type = resource.RLIMIT_NOFILE
@@ -1129,9 +1102,9 @@ def add_api_key_middleware(app, api_key: str):
     async def authentication(request, call_next):
         if request.method == "OPTIONS":
             return await call_next(request)
-        if request.url.path.startswith("/health"):
-            return await call_next(request)
-        if request.url.path.startswith("/metrics"):
+        if request.url.path.startswith("/health") or request.url.path.startswith(
+            "/metrics"
+        ):
             return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
@@ -1635,13 +1608,18 @@ def get_cpu_memory_capacity():
         for numa_id in range(n_numa_node):
             file_meminfo = f"node{numa_id}/meminfo"
             with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # 1st line contains 'MemTotal'
-                line = f.read().split("\n")[0]
-                numa_mem_list.append(int(line.split()[3]))
+                # MemTotal info is at the 1st line
+                line = f.readline()
+                # Expected format: "Node 0 MemTotal:       100000000 kB"
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] == "MemTotal:":
+                    numa_mem_list.append(int(parts[3]))
+                else:
+                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
         # Retrieved value in KB, need MB
         numa_mem = float(min(numa_mem_list) // 1024)
         return numa_mem
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError, IndexError):
         numa_mem = psutil.virtual_memory().total / n_numa_node
         # Retrieved value in Byte, need MB
         return float(numa_mem // (1 << 20))
@@ -2111,7 +2089,7 @@ class MultiprocessingSerializer:
 
         if output_str:
             # Convert bytes to base64-encoded string
-            pybase64.b64encode(output).decode("utf-8")
+            output = pybase64.b64encode(output).decode("utf-8")
 
         return output
 
@@ -2130,7 +2108,78 @@ class MultiprocessingSerializer:
             # Decode base64 string to bytes
             data = pybase64.b64decode(data, validate=True)
 
-        return ForkingPickler.loads(data)
+        return SafeUnpickler(io.BytesIO(data)).load()
+
+
+class SafeUnpickler(pickle.Unpickler):
+    ALLOWED_MODULE_PREFIXES = {
+        # --- Python types ---
+        "builtins.",
+        "collections.",
+        "copyreg.",
+        "functools.",
+        "itertools.",
+        "operator.",
+        "types.",
+        "weakref.",
+        # --- PyTorch types ---
+        "torch.",
+        "torch._tensor.",
+        "torch.storage.",
+        "torch.nn.parameter.",
+        "torch.autograd.function.",
+        # --- torch distributed ---
+        "torch.distributed.",
+        "torch.distributed._shard.",
+        "torch.distributed._composable.",
+        "torch._C._distributed_c10d.",
+        "torch._C._distributed_fsdp.",
+        "torch.distributed.optim.",
+        # --- multiprocessing ---
+        "multiprocessing.resource_sharer.",
+        "multiprocessing.reduction.",
+        "pickletools.",
+        # --- PEFT / LoRA ---
+        "peft.",
+        "transformers.",
+        "huggingface_hub.",
+        # --- SGLang & Unitest ---
+        "sglang.srt.weight_sync.tensor_bucket.",
+        "sglang.srt.model_executor.model_runner.",
+        "sglang.srt.layers.",
+        "sglang.srt.utils.",
+    }
+
+    DENY_CLASSES = {
+        ("builtins", "eval"),
+        ("builtins", "exec"),
+        ("builtins", "compile"),
+        ("os", "system"),
+        ("subprocess", "Popen"),
+        ("subprocess", "run"),
+        ("codecs", "decode"),
+        ("types", "CodeType"),
+        ("types", "FunctionType"),
+    }
+
+    def find_class(self, module, name):
+        # Block deterministic attacks
+        if (module, name) in self.DENY_CLASSES:
+            raise RuntimeError(
+                f"Blocked unsafe class loading ({module}.{name}), "
+                f"to prevent exploitation of CVE-2025-10164"
+            )
+        # Allowlist of safe-to-load modules.
+        if any(
+            (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
+        ):
+            return super().find_class(module, name)
+
+        # Block everything else. (Potential attack surface)
+        raise RuntimeError(
+            f"Blocked unsafe class loading ({module}.{name}), "
+            f"to prevent exploitation of CVE-2025-10164"
+        )
 
 
 def debug_timing(func):
@@ -2282,6 +2331,11 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
 
     app = FastAPI()
 
+    @app.get("/ping")
+    async def ping():
+        """Could be used by the checkpoint-engine update script to confirm the server is up."""
+        return Response(status_code=200)
+
     @app.get("/health")
     async def health():
         """Check the health of the http server."""
@@ -2432,18 +2486,15 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
-    if is_remote_url(model_path):
-        try:
-            from huggingface_hub import HfApi
+    if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
+        return True
+    try:
+        from huggingface_hub import HfApi
 
-            hf_api = HfApi()
-            return hf_api.file_exists(model_path, "hf_quant_config.json")
-        except Exception:
-            return False
-    else:
-        import os
-
-        return os.path.exists(os.path.join(model_path, "hf_quant_config.json"))
+        hf_api = HfApi()
+        return hf_api.file_exists(model_path, "hf_quant_config.json")
+    except Exception:
+        return False
 
 
 def flatten_nested_list(nested_list):
@@ -2581,17 +2632,12 @@ def get_local_ip_auto(fallback: str = None) -> str:
     raise ValueError("Can not get local ip")
 
 
-def is_page_size_one(server_args):
-    return server_args.page_size == 1
-
-
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk == 1
-        and is_page_size_one(server_args)
+        server_args.speculative_eagle_topk == 1
+        and (server_args.page_size == 1 or server_args.page_size is None)
     )
 
 
@@ -3531,3 +3577,11 @@ def cached_triton_kernel(key_fn=None):
         return CachedKernel(fn, key_fn)
 
     return decorator
+
+
+# Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
+def calc_diff(x, y):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
