@@ -1,7 +1,7 @@
-//! Harmony Responses API serving layer with multi-turn MCP tool support
+//! Harmony Responses API implementation with multi-turn MCP tool support
 //!
-//! This module implements the Harmony Responses API serving logic, orchestrating
-//! full pipeline execution with MCP tool support for multi-turn conversations.
+//! This module implements the Harmony Responses API orchestration logic,
+//! coordinating full pipeline execution with MCP tool support for multi-turn conversations.
 //!
 //! ## Architecture
 //!
@@ -106,7 +106,7 @@ impl HarmonyResponsesContext {
     }
 }
 
-/// Serve Harmony Responses API request with multi-turn MCP tool support
+/// Execute Harmony Responses API request with multi-turn MCP tool support
 ///
 /// This function orchestrates the multi-turn conversation flow:
 /// 1. Execute request through full pipeline
@@ -337,7 +337,7 @@ async fn execute_mcp_tools(
 /// * `request` - Current request (contains original input)
 /// * `tool_calls` - Tool calls from commentary channel
 /// * `tool_results` - Results from MCP tool execution
-/// * `analysis` - Analysis channel content (becomes reasoning_content)
+/// * `analysis` - Analysis channel content (becomes reasoning content)
 /// * `partial_text` - Final channel content (becomes message content)
 ///
 /// # Returns
@@ -345,35 +345,99 @@ async fn execute_mcp_tools(
 /// New ResponsesRequest with appended history
 fn build_next_request_with_tools(
     mut request: ResponsesRequest,
-    _tool_calls: Vec<ToolCall>,
-    _tool_results: Vec<ToolResult>,
-    _analysis: Option<String>,
-    _partial_text: String,
+    tool_calls: Vec<ToolCall>,
+    tool_results: Vec<ToolResult>,
+    analysis: Option<String>,
+    partial_text: String,
 ) -> Result<ResponsesRequest, Box<Response>> {
+    use uuid::Uuid;
+
+    use crate::protocols::responses::{
+        ResponseContentPart, ResponseInputOutputItem, ResponseReasoningContent,
+    };
+
     // Get current input items (or empty vec if Text variant)
-    let items = match request.input {
+    let mut items = match request.input {
         ResponseInput::Items(items) => items,
-        ResponseInput::Text(_) => {
+        ResponseInput::Text(text) => {
             // Convert text to items format
-            // TODO: Handle text variant properly
-            vec![]
+            vec![ResponseInputOutputItem::SimpleInputMessage {
+                content: crate::protocols::responses::StringOrContentParts::String(text),
+                role: "user".to_string(),
+                r#type: None,
+            }]
         }
     };
 
-    // Append assistant message with tool calls
-    // TODO: Build proper ResponseInputOutputItem::Message with:
-    // - role: "assistant"
-    // - reasoning_content (from analysis)
-    // - content (from partial_text)
-    // - tool_calls
+    // Build assistant response item with reasoning + content + tool calls
+    // This represents what the model generated in this iteration
+    let assistant_id = format!("msg_{}", Uuid::new_v4());
 
-    // Append tool results
-    // TODO: Build ResponseInputOutputItem::FunctionCallOutput for each result
-    // - call_id
-    // - output (serialized result)
+    // Add reasoning if present (from analysis channel)
+    if let Some(analysis_text) = analysis {
+        items.push(ResponseInputOutputItem::Reasoning {
+            id: format!("reasoning_{}", assistant_id),
+            summary: vec![],
+            content: vec![ResponseReasoningContent::ReasoningText {
+                text: analysis_text,
+            }],
+            status: Some("completed".to_string()),
+        });
+    }
 
-    // For now, placeholder implementation
-    // This will be completed when we have proper ResponseInputOutputItem builders
+    // Add message content if present (from final channel)
+    if !partial_text.is_empty() {
+        items.push(ResponseInputOutputItem::Message {
+            id: assistant_id.clone(),
+            role: "assistant".to_string(),
+            content: vec![ResponseContentPart::OutputText {
+                text: partial_text,
+                annotations: vec![],
+                logprobs: None,
+            }],
+            status: Some("completed".to_string()),
+        });
+    }
+
+    // Add function tool calls (from commentary channel)
+    for tool_call in tool_calls {
+        items.push(ResponseInputOutputItem::FunctionToolCall {
+            id: tool_call.id.clone(),
+            name: tool_call.function.name.clone(),
+            arguments: tool_call
+                .function
+                .arguments
+                .unwrap_or_else(|| "{}".to_string()),
+            output: None, // Output will be added next
+            status: Some("in_progress".to_string()),
+        });
+    }
+
+    // Add tool results
+    for tool_result in tool_results {
+        // Serialize tool output to string
+        let output_str = serde_json::to_string(&tool_result.output).unwrap_or_else(|e| {
+            format!("{{\"error\": \"Failed to serialize tool output: {}\"}}", e)
+        });
+
+        // Update the corresponding tool call with output and completed status
+        // Find and update the matching FunctionToolCall
+        if let Some(ResponseInputOutputItem::FunctionToolCall {
+            output,
+            status,
+            ..
+        }) = items
+            .iter_mut()
+            .find(|item| matches!(item, ResponseInputOutputItem::FunctionToolCall { id, .. } if id == &tool_result.call_id))
+        {
+            *output = Some(output_str);
+            *status = if tool_result.is_error {
+                Some("failed".to_string())
+            } else {
+                Some("completed".to_string())
+            };
+        }
+    }
 
     // Update request with new items
     request.input = ResponseInput::Items(items);
@@ -384,12 +448,12 @@ fn build_next_request_with_tools(
 /// Tool execution result
 ///
 /// Contains the result of executing a single MCP tool.
-#[allow(dead_code)] // TODO: Remove when build_next_request_with_tools is implemented
 struct ToolResult {
     /// Tool call ID (for matching with request)
     call_id: String,
 
     /// Tool name
+    #[allow(dead_code)] // Kept for documentation and future use
     tool_name: String,
 
     /// Tool output (JSON value)

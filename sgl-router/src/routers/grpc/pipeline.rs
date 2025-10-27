@@ -392,7 +392,7 @@ impl RequestPipeline {
     /// This method runs a single iteration of the Responses API request,
     /// returning either ToolCallsFound (continue serving) or Completed (final response).
     ///
-    /// Called by harmony::serving::serve_harmony_responses() for each iteration.
+    /// Called by harmony::responses::serve_harmony_responses() for each iteration.
     ///
     /// # Arguments
     ///
@@ -404,14 +404,54 @@ impl RequestPipeline {
     /// ResponsesIterationResult indicating whether to continue iteration or return
     pub async fn execute_harmony_responses(
         &self,
-        _request: &crate::protocols::responses::ResponsesRequest,
-        _ctx: &harmony::serving::HarmonyResponsesContext,
+        request: &crate::protocols::responses::ResponsesRequest,
+        harmony_ctx: &harmony::responses::HarmonyResponsesContext,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
-        // TODO: Implement full pipeline execution for Harmony Responses
-        // This will be implemented in a follow-up step
-        // For now, return error to indicate not yet implemented
-        Err(utils::internal_error_static(
-            "Harmony Responses pipeline execution not yet implemented",
-        ))
+        // Create RequestContext for this Responses request
+        let mut ctx = RequestContext::for_responses(
+            Arc::new(request.clone()),
+            None, // No headers needed for internal pipeline execution
+            None, // Model ID already set in request
+            harmony_ctx.components.clone(),
+        );
+
+        // Execute each pipeline stage in sequence
+        for (idx, stage) in self.stages.iter().enumerate() {
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => {
+                    // Stage returned early response (e.g., streaming) - not expected for Responses iteration
+                    error!(
+                        "Stage {} ({}) returned unexpected response during Responses iteration",
+                        idx + 1,
+                        stage.name()
+                    );
+                    return Err(response);
+                }
+                Ok(None) => {
+                    // Stage completed successfully, continue to next stage
+                    continue;
+                }
+                Err(response) => {
+                    // Stage failed
+                    error!(
+                        "Stage {} ({}) failed with status {}",
+                        idx + 1,
+                        stage.name(),
+                        response.status()
+                    );
+                    return Err(response);
+                }
+            }
+        }
+
+        // Extract ResponsesIterationResult from context
+        // This should have been set by HarmonyResponseProcessingStage
+        ctx.state
+            .response
+            .responses_iteration_result
+            .take()
+            .ok_or_else(|| {
+                utils::internal_error_static("No ResponsesIterationResult produced by pipeline")
+            })
     }
 }

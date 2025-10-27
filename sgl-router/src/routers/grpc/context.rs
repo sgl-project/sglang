@@ -15,6 +15,7 @@ use crate::{
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         generate::{GenerateRequest, GenerateResponse},
+        responses::ResponsesRequest,
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer},
@@ -170,6 +171,9 @@ pub struct ResponseState {
     /// Final processed response
     pub final_response: Option<FinalResponse>,
 
+    /// Responses API iteration result (Harmony only, for tool loop orchestration)
+    pub responses_iteration_result: Option<super::harmony::ResponsesIterationResult>,
+
     // Harmony-specific parser state
     /// Harmony parser for non-streaming (single parser for all indices)
     pub harmony_parser: Option<super::harmony::HarmonyParserAdapter>,
@@ -238,6 +242,24 @@ impl RequestContext {
         }
     }
 
+    /// Create context for Responses API request
+    pub fn for_responses(
+        request: Arc<ResponsesRequest>,
+        headers: Option<HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self {
+            input: RequestInput {
+                request_type: RequestType::Responses(request),
+                headers,
+                model_id,
+            },
+            components,
+            state: ProcessingState::default(),
+        }
+    }
+
     /// Get reference to original request (type-safe)
     pub fn request(&self) -> &RequestType {
         &self.input.request_type
@@ -272,6 +294,22 @@ impl RequestContext {
         match &self.input.request_type {
             RequestType::Generate(req) => Arc::clone(req),
             _ => panic!("Expected generate request"),
+        }
+    }
+
+    /// Get responses request (panics if not responses)
+    pub fn responses_request(&self) -> &ResponsesRequest {
+        match &self.input.request_type {
+            RequestType::Responses(req) => req.as_ref(),
+            _ => panic!("Expected responses request"),
+        }
+    }
+
+    /// Get Arc clone of responses request (panics if not responses)
+    pub fn responses_request_arc(&self) -> Arc<ResponsesRequest> {
+        match &self.input.request_type {
+            RequestType::Responses(req) => Arc::clone(req),
+            _ => panic!("Expected responses request"),
         }
     }
 
@@ -394,9 +432,7 @@ impl ClientSelection {
 // Execution and Response Types
 // ============================================================================
 
-use crate::{
-    grpc_client::sglang_scheduler::AbortOnDropStream, protocols::responses::ResponsesRequest,
-};
+use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
 
 /// Result of request execution (streams from workers)
 /// Uses AbortOnDropStream to automatically abort on cancellation
