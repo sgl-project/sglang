@@ -464,6 +464,7 @@ class Req:
         # For req-level memory management
         self.kv_committed_len = 0
         self.kv_allocated_len = 0
+        self.kv_freed_len = 0  # for debug / corner cases
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids

@@ -303,7 +303,9 @@ class SchedulerOutputProcessorMixin:
                 else:
                     if self.page_size == 1:
                         # Free the one extra delayed token
-                        indices_to_free = batch.out_cache_loc[i : i + 1]
+                        assert (
+                            req.kv_allocated_len == req.kv_freed_len
+                        ), f"{req.kv_allocated_len=}, {req.kv_freed_len=}"
                     else:
                         if (
                             len(req.origin_input_ids) + len(req.output_ids) - 1
