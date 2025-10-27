@@ -152,7 +152,6 @@ def initialize_moe_config(server_args: ServerArgs):
 def get_moe_a2a_backend() -> MoeA2ABackend:
     global MOE_A2A_BACKEND
     if MOE_A2A_BACKEND is None:
-        logger.warning("MOE_A2A_BACKEND is not initialized, using default backend")
         MOE_A2A_BACKEND = MoeA2ABackend.NONE
     return MOE_A2A_BACKEND
 

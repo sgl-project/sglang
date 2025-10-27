@@ -21,13 +21,13 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::{
+    app_context::AppContext,
     core::{
         workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
         DPAwareWorkerBuilder, HealthConfig, Worker, WorkerType,
     },
     grpc_client::SglangSchedulerClient,
     protocols::worker_spec::WorkerConfigRequest,
-    server::AppContext,
 };
 
 // HTTP client for metadata fetching
