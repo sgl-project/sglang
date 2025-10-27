@@ -267,6 +267,7 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_session_cache = server_args.enable_session_cache
         self.page_size = server_args.page_size
 
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -1167,11 +1168,7 @@ class Scheduler(
         recv_req: TokenizedGenerateReqInput,
     ):
         # Create a new request
-        if (
-            recv_req.session_params is None
-            or recv_req.session_params.id is None
-            or recv_req.session_params.id not in self.sessions
-        ):
+        if recv_req.session_params is None or recv_req.session_params.id is None:
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
@@ -1233,8 +1230,13 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
         else:
-            # Create a new request from a previous session
-            session = self.sessions[recv_req.session_params.id]
+            session_id = recv_req.session_params.id
+            if recv_req.session_params.id not in self.sessions:
+                # resume a previous session
+                self.sessions[session_id] = Session(
+                    recv_req.capacity_of_str_len, session_id
+                )
+            session = self.sessions[session_id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
@@ -1346,6 +1348,17 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
+        if self.enable_session_cache and req.session_id is not None:
+            req.init_next_round_input(self.tree_cache)
+            matched_len = len(req.prefix_indices) + req.host_hit_length
+            new_input_tokens = req.fill_ids[matched_len:]
+            self.tree_cache.prefetch_from_session_cache(
+                req.session_id,
+                req.last_host_node,
+                matched_len,
+                req.session_cache_offset,
+            )
+
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
             if req.last_node.backuped:
@@ -1727,6 +1740,13 @@ class Scheduler(
                     break
                 if not adder.preempt_to_schedule(req, self.server_args):
                     break
+
+            if self.enable_session_cache:
+                session_id = req.session_id
+                if session_id is not None:
+                    done = self.tree_cache.check_session_prefetch_progress(session_id)
+                    if not done:
+                        continue
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)

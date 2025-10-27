@@ -209,6 +209,21 @@ class StorageOperation:
         return self.id < other.id
 
 
+class SessionOperation:
+    def __init__(
+        self,
+        session_id: str,
+        host_indices: torch.Tensor,
+        starting_offset: int,
+        prefetch_length: int,
+    ):
+        self.session_id = session_id
+        self.host_indices = host_indices
+        self.starting_offset = starting_offset
+        self.prefetch_length = prefetch_length
+        self.done = False
+
+
 class PrefetchOperation(StorageOperation):
     def __init__(
         self,
@@ -253,6 +268,7 @@ class HiCacheController:
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
+        enable_session_cache: bool = False,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
@@ -264,6 +280,7 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
+        self.enable_session_cache = enable_session_cache
 
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
@@ -363,6 +380,93 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
+        elif self.enable_session_cache:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_session_cache_func, daemon=True
+            )
+            self.backup_thread = threading.Thread(
+                target=self.backup_session_cache_func, daemon=True
+            )
+
+            self.prefetch_queue = Queue()
+            self.backup_queue = Queue()
+
+            self.prefetch_thread.start()
+            self.backup_thread.start()
+
+            self.session_loading_process = {}
+
+    def prefetch_from_session_cache(
+        self,
+        session_id: str,
+        host_indices: torch.Tensor,
+        starting_offset: int,
+        prefetch_length: int,
+    ):
+        self.session_loading_process[session_id] = False
+        operation = SessionOperation(
+            session_id, host_indices, starting_offset, prefetch_length
+        )
+        self.prefetch_queue.put(operation)
+        return operation
+
+    def append_session_cache(
+        self, session_id: str, starting_offset: int, data: torch.Tensor, event
+    ):
+        self.backup_queue.put((session_id, starting_offset, data, event))
+
+    def naive_slicing(
+        self, session_id: str, starting_offset: int, prefetch_length: int
+    ):
+        file_path = f"/tmp/{session_id}"
+        tensor = torch.load(file_path, map_location="cpu")
+        end_offset = starting_offset + prefetch_length
+        if end_offset > tensor.numel():
+            raise ValueError(
+                f"Requested range [{starting_offset}, {end_offset}) "
+                f"exceeds tensor size {tensor.numel()}"
+            )
+        data_slice = tensor[starting_offset:end_offset]
+        return data_slice
+
+    def naive_appending(
+        self, session_id: str, starting_offset: int, data: torch.Tensor
+    ):
+        file_path = f"/tmp/{session_id}"
+        try:
+            existing_tensor = torch.load(file_path, map_location="cpu")
+            if starting_offset < existing_tensor.numel():
+                data = data[existing_tensor.numel() - starting_offset :]
+            new_tensor = torch.cat((existing_tensor, data), dim=0)
+        except FileNotFoundError:
+            new_tensor = data
+        torch.save(new_tensor, file_path)
+
+    def prefetch_session_cache_func(self):
+        while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
+            try:
+                op = self.prefetch_queue.get(block=True, timeout=1)
+                # todo: demo purpose only. to be replaced with performant access
+                flat_data = self.naive_slicing(
+                    op.session_id, op.starting_offset, op.prefetch_length
+                )
+                self.mem_pool_host.set_from_flat_data(op.host_indices, flat_data)
+                op.done = True
+            except Empty:
+                continue
+
+    def backup_session_cache_func(self):
+        while not self.stop_event.is_set():
+            try:
+                session_id, starting_offset, flat_data, event = self.backup_queue.get(
+                    block=True, timeout=1
+                )
+                torch.cuda.current_stream().wait_event(event)
+                # todo: demo purpose only. to be replaced with performant access
+                self.naive_appending(session_id, starting_offset, flat_data)
+            except Empty:
+                continue
+
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
@@ -406,6 +510,11 @@ class HiCacheController:
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+        elif self.enable_session_cache:
+            self.prefetch_thread.join()
+            self.backup_thread.join()
+            self.prefetch_queue.queue.clear()
+            self.backup_queue.queue.clear()
 
         self.stop_event.clear()
 
@@ -416,6 +525,17 @@ class HiCacheController:
             self.backup_thread = threading.Thread(
                 target=self.backup_thread_func, daemon=True
             )
+            self.prefetch_thread.start()
+            self.backup_thread.start()
+
+        elif self.enable_session_cache:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_session_cache_func, daemon=True
+            )
+            self.backup_thread = threading.Thread(
+                target=self.backup_session_cache_func, daemon=True
+            )
+
             self.prefetch_thread.start()
             self.backup_thread.start()
 

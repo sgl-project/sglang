@@ -139,6 +139,7 @@ class Session:
             sampling_params=req.sampling_params,
             lora_path=req.lora_path,
             session_id=self.session_id,
+            session_cache_offset=session_params.cache_offset,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
             return_logprob=req.return_logprob,

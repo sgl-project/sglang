@@ -42,6 +42,7 @@ class HiRadixCache(RadixCache):
         eviction_policy: str = "lru",
         hicache_storage_backend: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
+        enable_session_cache: bool = False,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
         is_eagle: bool = False,
@@ -77,6 +78,7 @@ class HiRadixCache(RadixCache):
         self.tp_group = tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.enable_storage = hicache_storage_backend is not None
+        self.enable_session_cache = enable_session_cache
         self.enable_storage_metrics = self.enable_storage and enable_metrics
 
         (
@@ -106,6 +108,7 @@ class HiRadixCache(RadixCache):
             write_policy=hicache_write_policy,
             io_backend=hicache_io_backend,
             storage_backend=hicache_storage_backend,
+            enable_session_cache=enable_session_cache,
             prefetch_threshold=self.prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=extra_config,
@@ -126,6 +129,8 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        self.ongoing_session_append = {}
+        self.ongoing_session_prefetch = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 2
@@ -504,12 +509,88 @@ class HiRadixCache(RadixCache):
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()
+        if self.enable_session_cache:
+            self.check_session_cache_events()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
             self.metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+
+    def check_session_cache_events(self):
+        # todo: handle TP synchronization if needed
+        to_finalize = []
+        for session_id, (node, copy_event) in list(self.ongoing_session_append.items()):
+            if not copy_event.query():
+                continue
+            to_finalize.append(session_id)
+            self.dec_lock_ref(node)
+        for session_id in to_finalize:
+            del self.ongoing_session_append[session_id]
+
+    def prefetch_from_session_cache(
+        self,
+        session_id: str,
+        last_host_node: TreeNode,
+        starting_offset: int,
+        end_offset: int,
+    ):
+        last_host_node.protect_host()
+        prefetch_length = end_offset - starting_offset
+        if prefetch_length <= self.prefetch_threshold:
+            return
+        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None:
+            self.evict_host(prefetch_length)
+            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None:
+            last_host_node.release_host()
+            # no sufficient host memory for prefetch
+            return
+
+        operation = self.cache_controller.prefetch_from_session_cache(
+            session_id,
+            host_indices,
+            starting_offset,
+            prefetch_length,
+        )
+        self.ongoing_session_prefetch[session_id] = (last_host_node, operation)
+
+    def check_session_prefetch_progress(self, session_id: str) -> bool:
+        if session_id not in self.ongoing_session_prefetch:
+            return True
+        node, operation = self.ongoing_session_prefetch[session_id]
+        if operation.done == True:
+            node.release_host()
+            del self.ongoing_session_prefetch[session_id]
+            return True
+        return False
+
+    def write_backup_session(
+        self,
+        device_indices: torch.Tensor,
+        node: TreeNode,
+        session_id: str,
+        starting_offset: int,
+    ):
+        if not self.enable_session_cache:
+            return
+
+        # todo: replace with a GPU direct copy
+        copy_event = torch.cuda.Event()
+        flat_data = self.cache_controller.mem_pool_device.get_flat_data(
+            device_indices[starting_offset:]
+        )
+        copy_event.record()
+        self.cache_controller.append_session_cache(
+            session_id,
+            starting_offset,
+            flat_data,
+            copy_event,
+        )
+        self.inc_lock_ref(node)
+        self.ongoing_session_append[session_id] = (node, copy_event)
 
     def drain_storage_control_queues(self):
         """

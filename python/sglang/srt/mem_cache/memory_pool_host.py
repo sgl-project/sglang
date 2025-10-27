@@ -145,6 +145,12 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    @abc.abstractmethod
+    def set_from_flat_data(
+        self, indices: torch.Tensor, flat_data: torch.Tensor
+    ) -> None:
+        raise NotImplementedError()
+
     @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
@@ -414,6 +420,17 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def set_from_flat_data(
+        self, indices: torch.Tensor, flat_data: torch.Tensor
+    ) -> None:
+        self.kv_buffer[:, :, indices, :, :] = flat_data.reshape(
+            2,
+            self.layer_num,
+            self.len(indices),
+            self.head_num,
+            self.head_dim,
+        )
 
     def get_page_buffer_meta(self, indices):
         """ "
@@ -704,6 +721,16 @@ class MLATokenToKVPoolHost(HostKVCache):
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def set_from_flat_data(
+        self, indices: torch.Tensor, flat_data: torch.Tensor
+    ) -> None:
+        self.kv_buffer[:, indices, :, :] = flat_data.reshape(
+            self.layer_num,
+            len(indices),
+            1,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
 
     def get_page_buffer_meta(self, indices):
         """ "

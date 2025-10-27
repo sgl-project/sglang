@@ -401,6 +401,8 @@ class ServerArgs:
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
+    enable_session_cache: bool = False
+
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
     # LMCache
@@ -2853,6 +2855,11 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--enable-session-cache",
+            action="store_true",
+            help="Enable hierarchical session cache",
         )
         parser.add_argument(
             "--hicache-ratio",

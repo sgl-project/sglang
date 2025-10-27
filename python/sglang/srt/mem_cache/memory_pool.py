@@ -473,6 +473,13 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
+    def get_flat_data(self, indices) -> torch.Tensor:
+        """
+        Get a flat data page from the host memory pool.
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -683,6 +690,15 @@ class MHATokenToKVPool(KVCache):
                 kv_cache_cpu[-1].append([k_cpu, v_cpu])
         torch.cuda.synchronize()
         return kv_cache_cpu
+
+    def get_flat_data(self, indices: torch.Tensor) -> torch.Tensor:
+        k_caches = []
+        v_caches = []
+        for layer_id in range(self.layer_num):
+            k_caches.append(self.k_buffer[layer_id][indices])
+            v_caches.append(self.v_buffer[layer_id][indices])
+        kv_caches = [torch.cat(k_caches, dim=0), torch.cat(v_caches, dim=0)]
+        return torch.cat(kv_caches, dim=0).to(device="cpu", non_blocking=True)
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         torch.cuda.synchronize()
@@ -1459,6 +1475,12 @@ class MLATokenToKVPool(KVCache):
                 kv_cache_cpu[-1].append(kv_cpu)
         torch.cuda.synchronize()
         return kv_cache_cpu
+
+    def get_flat_data(self, indices: torch.Tensor) -> torch.Tensor:
+        kv_caches = []
+        for layer_id in range(self.layer_num):
+            kv_caches.append(self.kv_buffer[layer_id][indices])
+        return torch.cat(kv_caches, dim=0).to(device="cpu", non_blocking=True)
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         torch.cuda.synchronize()
