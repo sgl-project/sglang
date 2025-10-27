@@ -23,6 +23,7 @@ jobs:
       matrix:
         python-version: ["3.10"]
         cuda-version: ["12.9"]
+        arch: [x86_64, aarch64]
         include:
           - arch: x86_64
             runner: x64-kernel-build-node
@@ -113,6 +114,7 @@ jobs:
       matrix:
         python-version: ["3.10"]
         cuda-version: ["13.0"]
+        arch: [x86_64, aarch64]
         include:
           - arch: x86_64
             runner: x64-kernel-build-node
