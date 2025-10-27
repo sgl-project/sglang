@@ -129,7 +129,9 @@ class RotaryEmbedding(CustomOp):
 
         if get_global_server_args().rl_on_policy_target == "fsdp":
             self._forward_method = self.forward_native
-            self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(self._apply_rotary_emb_wrapped)
+            self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
+                self._apply_rotary_emb_wrapped
+            )
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -188,7 +190,9 @@ class RotaryEmbedding(CustomOp):
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
-        query_rot = self._apply_rotary_emb_wrapped(query_rot, cos, sin, self.is_neox_style)
+        query_rot = self._apply_rotary_emb_wrapped(
+            query_rot, cos, sin, self.is_neox_style
+        )
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
