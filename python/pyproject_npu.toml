@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.4.post1"
+version = "0.5.3.post3"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,6 +16,7 @@ classifiers = [
 dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle"]
 
 [project.optional-dependencies]
+
 runtime_common = [
   "IPython",
   "aiohttp",
@@ -58,7 +59,7 @@ runtime_common = [
   "timm==1.0.16",
   "torchao==0.9.0",
   "tqdm",
-  "transformers==4.57.1",
+  "transformers>=4.57.0,<4.58",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.25",
@@ -67,25 +68,8 @@ runtime_common = [
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
 ]
 
-tracing = [
-  "opentelemetry-sdk",
-  "opentelemetry-api",
-  "opentelemetry-exporter-otlp",
-  "opentelemetry-exporter-otlp-proto-grpc",
-]
-
-# HIP (Heterogeneous-computing Interface for Portability) for AMD
-# => base docker rocm/vllm-dev:20250114, not from public vllm whl
-srt_hip = [
-  "sglang[runtime_common]",
-  "torch",
-  "petit_kernel==0.0.2",
-  "wave-lang==3.8.0",
-]
-
-# For Intel Gaudi(device : hpu) follow the installation guide
-# https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
-srt_hpu = ["sglang[runtime_common]"]
+# https://docs.sglang.ai/platforms/ascend_npu.html
+srt_npu = ["sglang[runtime_common]"]
 
 test = [
   "accelerate",
@@ -99,11 +83,9 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
-all_hip = ["sglang[srt_hip]"]
-all_hpu = ["sglang[srt_hpu]"]
 
-dev_hip = ["sglang[all_hip]", "sglang[test]"]
-dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+all_npu = ["sglang[srt_npu]"]
+dev_npu = ["sglang[all_npu]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

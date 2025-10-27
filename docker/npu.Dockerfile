@@ -4,6 +4,7 @@ ARG OS=ubuntu22.04
 ARG PYTHON_VERSION=py3.11
 
 FROM quay.io/ascend/cann:$CANN_VERSION-$DEVICE_TYPE-$OS-$PYTHON_VERSION
+SHELL ["/bin/bash", "-c"]
 
 # Update pip & apt sources
 ARG DEVICE_TYPE
@@ -19,6 +20,8 @@ ARG BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/As
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=main
+ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
+ARG VER_SGLANG=main
 
 WORKDIR /workspace
 
@@ -77,9 +80,15 @@ RUN pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --inde
     && pip install ${TRITON_ASCEND_URL} --no-cache-dir
 
 # Install SGLang
-RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
-    (cd sglang/python && rm -rf pyproject.toml && mv pyproject_other.toml pyproject.toml && pip install -v .[srt_npu] --no-cache-dir) && \
-    (cd sglang/sgl-router && python -m build && pip install --force-reinstall dist/*.whl) && \
+RUN git clone ${SGLANG_REPO} --branch ${VER_SGLANG} sglang && \
+    cd sglang/python && \
+    rm -f pyproject.toml && \
+    mv pyproject_npu.toml pyproject.toml && \
+    pip install -v ".[srt_npu]" --no-cache-dir && \
+    cd ../sgl-router && \
+    python -m build && \
+    pip install --force-reinstall dist/*.whl && \
+    cd ../.. && \
     rm -rf sglang
 
 # Install Deep-ep
