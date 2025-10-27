@@ -15,7 +15,6 @@ from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import (
     MM_FEATURE_CACHE_SIZE,
-    MM_ITEM_VERIFY_BYTES,
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
     Modality,
@@ -697,31 +696,39 @@ class BaseMultimodalProcessor(ABC):
             # post-process
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                    available_slice = self.cudaipc_mmfeature_pool.return_a_slice_tensor(
-                        item.feature
+                    sync_flag, available_slice = (
+                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
+                            item.feature
+                        )
                     )
                     if isinstance(available_slice, torch.Tensor):
-                        available_slice[:-MM_ITEM_VERIFY_BYTES].copy_(
+                        available_slice.copy_(
                             item.feature.view(torch.int8).view(-1), non_blocking=True
                         )
                         item.feature = CudaIpcTensorTransportProxy(
-                            data=available_slice, info_data=item.feature
+                            data=available_slice,
+                            info_data=item.feature,
+                            sync_buffer_meta=sync_flag,
                         )
                 elif (
                     isinstance(item.precomputed_embeddings, torch.Tensor)
                     and item.precomputed_embeddings.is_cuda
                 ):
 
-                    available_slice = self.cudaipc_mmfeature_pool.return_a_slice_tensor(
-                        item.precomputed_embeddings
+                    sync_flag, available_slice = (
+                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
+                            item.precomputed_embeddings
+                        )
                     )
                     if isinstance(available_slice, torch.Tensor):
-                        available_slice[:-MM_ITEM_VERIFY_BYTES].copy_(
+                        available_slice.copy_(
                             item.precomputed_embeddings.view(torch.int8),
                             non_blocking=True,
                         )
                         item.precomputed_embeddings = CudaIpcTensorTransportProxy(
-                            data=available_slice, info_data=item.precomputed_embeddings
+                            data=available_slice,
+                            info_data=item.precomputed_embeddings,
+                            sync_buffer_meta=sync_flag,
                         )
 
         return all_collected_items, input_ids, ret
