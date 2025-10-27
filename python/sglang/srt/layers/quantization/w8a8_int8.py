@@ -6,9 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Uni
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.amx_utils import (
     CPUMoECompMethod,
     _amx_process_weight_after_loading,
