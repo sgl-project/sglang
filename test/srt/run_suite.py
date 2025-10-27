@@ -67,6 +67,7 @@ suites = {
         TestFile("quant/test_int8_kernel.py", 8),
         TestFile("quant/test_triton_scaled_mm.py", 8),
         TestFile("quant/test_w8a8_quantization.py", 46),
+        TestFile("quant/test_autoround.py", 60),
         TestFile("rl/test_fp32_lm_head.py", 30),
         TestFile("rl/test_update_weights_from_disk.py", 114),
         TestFile("rl/test_update_weights_from_tensor.py", 48),
@@ -191,6 +192,7 @@ suites = {
     "per-commit-8-gpu-h200-deepseek-v32": [
         TestFile("test_deepseek_v32_basic.py", 275),
         TestFile("test_deepseek_v32_mtp.py", 275),
+        TestFile("test_deepseek_v32_nsabackend.py", 600),
     ],
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),

@@ -46,7 +46,6 @@ from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchT
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BaseReq,
     BatchEmbeddingOutput,
     BatchMultimodalOutput,
     BatchStrOutput,
@@ -171,7 +170,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
-
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -180,9 +178,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if speculative_algorithm.is_none()
             else server_args.speculative_num_draft_tokens
         )
-        # Initialize delimiter text for multi-item scoring (will be set after tokenizer is loaded)
-        self.multi_item_delimiter_text = None
 
+        # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
             try:
@@ -237,6 +234,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     revision=server_args.revision,
                 )
                 self._initialize_multi_item_delimiter_text()
+
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
             server_args.enable_dynamic_batch_tokenizer
@@ -255,24 +253,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        if self.server_args.tokenizer_worker_num > 1:
+        if self.server_args.tokenizer_worker_num == 1:
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            )
+        else:
+            from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
+
             # Use tokenizer_worker_ipc_name in multi-tokenizer mode
             send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
 
-            class SenderWrapper:
-                def send_pyobj(self, obj):
-                    if isinstance(obj, BaseReq):
-                        obj.http_worker_ipc = port_args.tokenizer_ipc_name
-                    send_to_scheduler.send_pyobj(obj)
-
             # Make sure that each request carries the tokenizer_ipc_name for response routing
-            self.send_to_scheduler = SenderWrapper()
-        else:
-            self.send_to_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-            )
+            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
 
         # Request states
         self._chosen_loop = None
@@ -320,6 +314,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # LoRA updates and inference to overlap.
         self.lora_update_lock = asyncio.Lock()
 
+        # Disaggregation
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -389,9 +384,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         obj.normalize_batch_and_arguments()
 
         if self.server_args.tokenizer_worker_num > 1:
-            from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
-
-            assert isinstance(self, TokenizerWorker)
             self._attach_multi_http_worker_info(obj)
 
         if self.enable_trace:
