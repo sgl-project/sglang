@@ -1,6 +1,5 @@
 import uvicorn
 import zmq
-import time
 import zmq.asyncio
 import torch
 
@@ -46,6 +45,7 @@ class EmbeddingData:
 
 class ImageEncoder:
     def __init__(self, server_args:ServerArgs):
+        self.server_args = server_args
         set_global_server_args_for_scheduler(server_args)
         
         self.image_processor = AutoImageProcessor.from_pretrained(
@@ -81,8 +81,8 @@ class ImageEncoder:
                 device_config=DeviceConfig(),
             )
         
-        context = zmq.asyncio.Context(2)
-        self.send_to_prefill = get_zmq_socket(context, zmq.PUSH, f"tcp://{server_args.prefill_server_ip}:{server_args.embedding_port}", False)
+        self.context = zmq.asyncio.Context(2)
+        self.send_to_prefill_sockets = dict()
         
         self.wait_queue = deque()
         
@@ -100,6 +100,18 @@ class ImageEncoder:
         mm_embedding = self.model.get_image_feature([mm_item])
         return mm_embedding
     
+    def send(self, send_data, prefill_ip):
+        if prefill_ip in self.send_to_prefill_sockets:
+            socket = self.send_to_prefill_sockets[prefill_ip]
+        else:
+            socket = get_zmq_socket(
+                self.context, 
+                zmq.PUSH, 
+                f"tcp://{prefill_ip}:{self.server_args.embedding_port}", 
+                False)
+            self.send_to_prefill_sockets[prefill_ip] = socket
+        socket.send_pyobj(send_data)
+    
     def add(self,request_data):
         self.wait_queue.append(request_data)
         
@@ -110,7 +122,7 @@ class ImageEncoder:
                                   request_data['num_parts'],
                                   request_data['part_idx'],
                                   mm_embeddings)
-        self.send_to_prefill.send_pyobj(send_data)
+        self.send(send_data, request_data['bootstrap_host'])
         del send_data
 
 app = FastAPI()

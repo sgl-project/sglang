@@ -143,7 +143,8 @@ class MiniLoadBalancer:
                 'mm_items':img_list[cum_num_items:cum_num_items+assigned_num],
                 'num_parts': num_parts,
                 'part_idx': cum_idx,
-                'req_id': request_data.get('bootstrap_room')
+                'req_id': request_data.get('bootstrap_room'),
+                'bootstrap_host': request_data.get('bootstrap_host'),
                 })
             cum_idx += 1
             cum_num_items += assigned_num
@@ -463,23 +464,21 @@ async def handle_generate_request(request_data: dict):
 
 
 async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    bootstrap_room = _generate_bootstrap_room()
-    encode_request = request_data.copy()
-    encode_request.update({"bootstrap_room": bootstrap_room})
-    asyncio.create_task(lb.encode(encode_request, lb.encode_urls, 'encode'))
-    
     prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
+    bootstrap_room = _generate_bootstrap_room()
+    
+    # Send requests to encode server
+    encode_request = request_data.copy()
+    encode_request.update({"bootstrap_room": bootstrap_room,
+                           "bootstrap_host": hostname,})
+    asyncio.create_task(lb.encode(encode_request, lb.encode_urls, 'encode'))
+    
     modified_request = encode_request.copy()
-    modified_request.update(
-        {
-            "bootstrap_host": hostname,
-            "bootstrap_port": bootstrap_port,
-        }
-    )
+    modified_request.update({"bootstrap_port": bootstrap_port})
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
