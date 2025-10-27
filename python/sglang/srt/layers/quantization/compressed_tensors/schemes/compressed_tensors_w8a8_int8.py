@@ -17,8 +17,13 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
+from sglang.srt.layers.quantization.w8a8_int8 import (
+    NPU_W8A8DynamicLinearMethod,
+)
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_npu
 
+_is_npu = is_npu()
 _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
@@ -39,73 +44,76 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
         return 89
 
     def process_weights_after_loading(self, layer) -> None:
-        # If per tensor, when we have a fused module (e.g. QKV) with per
-        # tensor scales (thus N scales being passed to the kernel),
-        # requantize so we can always run per channel
-        if self.strategy == QuantizationStrategy.TENSOR:
-            max_w_scale, weight = requantize_with_max_scale(
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                logical_widths=layer.logical_widths,
-            )
-
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
-
-        # If channelwise, scales are already lined up, so just transpose.
-        elif self.strategy == QuantizationStrategy.CHANNEL:
-            weight = layer.weight
-            weight_scale = layer.weight_scale.data
-
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-
+        if _is_npu:
+            self.kernel.process_weights_after_loading(layer)
         else:
-            raise ValueError(f"Unknown quantization strategy {self.strategy}")
-
-        # INPUT SCALE
-        if self.is_static_input_scheme and hasattr(layer, "input_scale"):
-            if self.input_symmetric:
-                layer.input_scale = Parameter(
-                    layer.input_scale.max(), requires_grad=False
+            # If per tensor, when we have a fused module (e.g. QKV) with per
+            # tensor scales (thus N scales being passed to the kernel),
+            # requantize so we can always run per channel
+            if self.strategy == QuantizationStrategy.TENSOR:
+                max_w_scale, weight = requantize_with_max_scale(
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    logical_widths=layer.logical_widths,
                 )
+
+                layer.weight = Parameter(weight.t(), requires_grad=False)
+                layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+
+            # If channelwise, scales are already lined up, so just transpose.
+            elif self.strategy == QuantizationStrategy.CHANNEL:
+                weight = layer.weight
+                weight_scale = layer.weight_scale.data
+
+                layer.weight = Parameter(weight.t(), requires_grad=False)
+                # required by torch.compile to be torch.nn.Parameter
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+
             else:
-                input_scale = layer.input_scale
-                input_zero_point = layer.input_zero_point
+                raise ValueError(f"Unknown quantization strategy {self.strategy}")
 
-                # reconstruct the ranges
-                int8_traits = torch.iinfo(torch.int8)
-                azps = input_zero_point.to(dtype=torch.int32)
-                range_max = (input_scale * (int8_traits.max - azps)).max()
-                range_min = (input_scale * (int8_traits.min - azps)).min()
+            # INPUT SCALE
+            if self.is_static_input_scheme and hasattr(layer, "input_scale"):
+                if self.input_symmetric:
+                    layer.input_scale = Parameter(
+                        layer.input_scale.max(), requires_grad=False
+                    )
+                else:
+                    input_scale = layer.input_scale
+                    input_zero_point = layer.input_zero_point
 
-                scale = (range_max - range_min) / (int8_traits.max - int8_traits.min)
+                    # reconstruct the ranges
+                    int8_traits = torch.iinfo(torch.int8)
+                    azps = input_zero_point.to(dtype=torch.int32)
+                    range_max = (input_scale * (int8_traits.max - azps)).max()
+                    range_min = (input_scale * (int8_traits.min - azps)).min()
 
-                # AZP loaded as int8 but used as int32
-                azp = (int8_traits.min - range_min / scale).to(dtype=torch.int32)
+                    scale = (range_max - range_min) / (int8_traits.max - int8_traits.min)
 
-                layer.input_scale = Parameter(scale, requires_grad=False)
-                layer.input_zero_point = Parameter(azp, requires_grad=False)
-        else:
-            layer.input_scale = None
-            layer.input_zero_point = None
+                    # AZP loaded as int8 but used as int32
+                    azp = (int8_traits.min - range_min / scale).to(dtype=torch.int32)
 
-        # azp_adj is the AZP adjustment term, used to account for weights.
-        # It does not depend on scales or azp, so it is the same for
-        # static and dynamic quantization.
-        # For more details, see csrc/quantization/cutlass_w8a8/Epilogues.md
-        # https://github.com/vllm-project/vllm/blob/8d59dbb00044a588cab96bcdc028006ed922eb06/csrc/quantization/cutlass_w8a8/Epilogues.md
-        if not self.input_symmetric:
-            weight = layer.weight
-            azp_adj = weight.sum(dim=0, keepdim=True, dtype=torch.int32)
-            if self.is_static_input_scheme:
-                # cutlass_w8a8 requires azp to be folded into azp_adj
-                # in the per-tensor case
-                azp_adj = layer.input_zero_point * azp_adj
-            layer.azp_adj = Parameter(azp_adj, requires_grad=False)
-        else:
-            layer.azp_adj = None
+                    layer.input_scale = Parameter(scale, requires_grad=False)
+                    layer.input_zero_point = Parameter(azp, requires_grad=False)
+            else:
+                layer.input_scale = None
+                layer.input_zero_point = None
+
+            # azp_adj is the AZP adjustment term, used to account for weights.
+            # It does not depend on scales or azp, so it is the same for
+            # static and dynamic quantization.
+            # For more details, see csrc/quantization/cutlass_w8a8/Epilogues.md
+            # https://github.com/vllm-project/vllm/blob/8d59dbb00044a588cab96bcdc028006ed922eb06/csrc/quantization/cutlass_w8a8/Epilogues.md
+            if not self.input_symmetric:
+                weight = layer.weight
+                azp_adj = weight.sum(dim=0, keepdim=True, dtype=torch.int32)
+                if self.is_static_input_scheme:
+                    # cutlass_w8a8 requires azp to be folded into azp_adj
+                    # in the per-tensor case
+                    azp_adj = layer.input_zero_point * azp_adj
+                layer.azp_adj = Parameter(azp_adj, requires_grad=False)
+            else:
+                layer.azp_adj = None
 
     def create_weights(
         self,
@@ -148,6 +156,11 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
 
         # INPUT SCALE
         if self.is_static_input_scheme:
+            # TODO make NPU kernel work with compressed-tensors static input data
+            if _is_npu:
+                raise NotImplementedError(
+                "Static scheme for activations is not implemented on NPU."
+                )
             input_scale = PerTensorScaleParameter(
                 data=torch.empty(1, dtype=torch.float32), weight_loader=weight_loader
             )
@@ -161,13 +174,18 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
                     data=torch.empty(1, dtype=torch.int8), weight_loader=weight_loader
                 )
                 layer.register_parameter("input_zero_point", input_zero_point)
+        if _is_npu:
+            self.kernel = NPU_W8A8DynamicLinearMethod(None)
 
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        # TODO: add cutlass_scaled_mm_azp support
-        x_q, x_scale = per_token_quant_int8(x)
+        if _is_npu:
+            return self.kernel.apply(layer, x, bias)
+        else:
+            # TODO: add cutlass_scaled_mm_azp support
+            x_q, x_scale = per_token_quant_int8(x)
 
-        return int8_scaled_mm(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
-        )
+            return int8_scaled_mm(
+                x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
+            )
