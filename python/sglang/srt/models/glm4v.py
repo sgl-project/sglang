@@ -9,6 +9,7 @@ from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisi
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -434,7 +435,7 @@ class Glm4vVisionModel(nn.Module):
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         x = self.embeddings(

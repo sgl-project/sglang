@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -12,17 +12,20 @@ from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import add_prefix, align, is_cuda, is_hip, is_npu
 
 if is_cuda():
-    import deep_gemm
+    try:
+        import deep_gemm
+    except ImportError as e:
+        deep_gemm = e
 
-from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM, NSA_USE_REAL_INDEXER
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -71,7 +74,7 @@ class BaseIndexerMetadata(ABC):
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
-    from fast_hadamard_transform import hadamard_transform
+    from sgl_kernel import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -159,49 +162,13 @@ class Indexer(CustomOp):
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
             is_neox_style=False,
-            device=global_server_args_dict["device"],
+            device=get_global_server_args().device,
         )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-    def _forward_fake(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-    ):
-        bs = x.shape[0]
-        assert self.index_topk == 2048
-        ans = torch.arange(0, self.index_topk, dtype=torch.int32, device=x.device)[
-            None, ...
-        ].repeat(bs, 1)
-        if forward_batch.forward_mode.is_extend():
-            assert (
-                forward_batch.extend_seq_lens_cpu is not None
-                and forward_batch.seq_lens_cpu is not None
-            )
-            which = 0
-            for i, (kv_len, qo_len) in enumerate(
-                zip(
-                    forward_batch.seq_lens_cpu.tolist(),
-                    forward_batch.extend_seq_lens_cpu,
-                    strict=True,
-                )
-            ):
-                for j in range(kv_len - qo_len, kv_len):
-                    ans[which, j + 1 :] = -1
-                    which += 1
-            assert which == ans.shape[0]
-        else:
-            assert forward_batch.seq_lens_cpu is not None
-            for i, seq_len in enumerate(forward_batch.seq_lens_cpu.tolist()):
-                ans[i, seq_len:] = -1
-
-        return ans
-
+    @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x)
         weights = weights * self.n_heads**-0.5
@@ -299,7 +266,10 @@ class Indexer(CustomOp):
         )
 
         blocksize = page_size
-        seqlens_32 = metadata.get_seqlens_int32()
+        if forward_batch.forward_mode.is_target_verify():
+            seqlens_32 = metadata.get_seqlens_expanded()
+        else:
+            seqlens_32 = metadata.get_seqlens_int32()
         # NOTE(dark): 132 is SM count on H200/B200, not magic number
         schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32, blocksize, self.sm_count
@@ -350,8 +320,9 @@ class Indexer(CustomOp):
         k_fp8_list = []
         k_scale_list = []
         ks_list = []
+        ke_list = []
         offset = 0
-
+        seq_lens_expanded = metadata.get_seqlens_expanded()
         block_tables = metadata.get_page_table_64()
 
         assert (
@@ -374,33 +345,37 @@ class Indexer(CustomOp):
             )
             extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
             ks = torch.full((extend_seq_len,), offset, dtype=torch.int32, device="cuda")
+            ke = ks + seq_lens_expanded[offset : offset + extend_seq_len]
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
             ks_list.append(ks)
+            ke_list.append(ke)
             offset += extend_seq_len
 
         k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
         ks = torch.cat(ks_list, dim=0)
-        seq_lens_expanded = metadata.get_seqlens_expanded()
-        ke = ks + seq_lens_expanded
+        ke = torch.cat(ke_list, dim=0)
 
         logits = deep_gemm.fp8_mqa_logits(
-            q_fp8,
+            q_fp8[:offset],
             kv_fp8,
-            weights,
+            weights[:offset],
             ks,
             ke,
             clean_logits=False,
         )
-
+        token_nums, _, _ = q_fp8.shape
         assert logits.shape[0] == len(seq_lens_expanded)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
-
+        raw_topk_result = metadata.topk_transform(logits, self.index_topk)
+        topk_result = torch.full(
+            (token_nums, self.index_topk), -1, device=q_fp8.device, dtype=torch.int32
+        )
+        topk_result[:offset] = raw_topk_result
         return topk_result
 
-    def forward_indexer_bs_1(
+    def forward_indexer(
         self,
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
@@ -481,20 +456,9 @@ class Indexer(CustomOp):
             q_len_start = q_len_end
 
         topk_indices = torch.cat(topk_indices_list, dim=0)
-
         return topk_indices
 
-    def forward_indexer(
-        self,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        forward_batch: ForwardBatch,
-        topk: int,
-        layer_id: int,
-    ) -> Optional[torch.Tensor]:
-        return self.forward_indexer_bs_1(q_fp8, weights, forward_batch, topk, layer_id)
-
-    def _forward(
+    def forward_cuda(
         self,
         x: torch.Tensor,
         q_lora: torch.Tensor,
@@ -502,8 +466,10 @@ class Indexer(CustomOp):
         forward_batch: ForwardBatch,
         layer_id: int,
     ) -> Optional[torch.Tensor]:
-        if not is_npu():
+        if is_hip():
             from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
+        elif not is_npu():
+            from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
@@ -524,9 +490,6 @@ class Indexer(CustomOp):
         if metadata is None:
             return None
 
-        if not NSA_USE_REAL_INDEXER:  # temporary
-            return self._forward_fake(x, q_lora, positions, forward_batch, layer_id)
-
         query, key = self._get_q_k_bf16(q_lora, x, positions, enable_dual_stream)
 
         if enable_dual_stream:
@@ -545,6 +508,8 @@ class Indexer(CustomOp):
         # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
         # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
+        if not forward_batch.out_cache_loc.is_contiguous():
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
         forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
@@ -566,7 +531,10 @@ class Indexer(CustomOp):
                     (x.shape[0], self.index_topk), -1, dtype=torch.int, device="cuda"
                 )
 
-            if forward_batch.forward_mode.is_decode_or_idle():
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            ):
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
@@ -582,18 +550,7 @@ class Indexer(CustomOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
-
         return topk_result
-
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-    ) -> Optional[torch.Tensor]:
-        return self._forward(x, q_lora, positions, forward_batch, layer_id)
 
     def forward_npu(
         self,
@@ -603,7 +560,7 @@ class Indexer(CustomOp):
         forward_batch: ForwardBatch,
         layer_id: int,
     ) -> torch.Tensor:
-        import custom_ops
+        import custom_ops  # noqa: F401
         import torch_npu
 
         from sglang.srt.layers.dp_attention import (

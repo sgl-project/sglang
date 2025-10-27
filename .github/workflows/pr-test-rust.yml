@@ -1,4 +1,4 @@
-name: PR Test (Rust)
+name: PR Test (SMG)
 
 on:
   push:
@@ -54,7 +54,9 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          cargo fmt -- --check
+          rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly fmt -- --check
 
       - name: Run Rust tests
         timeout-minutes: 20
@@ -84,7 +86,7 @@ jobs:
   pytest-rust:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: 4-gpu-a10
-    timeout-minutes: 25
+    timeout-minutes: 32
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -107,7 +109,7 @@ jobs:
 
       - name: Install SGLang dependencies
         run: |
-          sudo bash scripts/ci/ci_install_dependency.sh
+          sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
 
       - name: Build python binding
         run: |
@@ -149,8 +151,58 @@ jobs:
           name: genai-bench-results-all-policies
           path: sgl-router/benchmark_**/
 
+  pytest-rust-2:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: 4-gpu-a10
+    timeout-minutes: 16
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install rust dependencies
+        run: |
+          bash scripts/ci/ci_install_rust.sh
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-router
+          cache-all-crates: true
+          cache-on-failure: true
+
+      - name: Install SGLang dependencies
+        run: |
+          sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
+
+      - name: Build python binding
+        run: |
+          source "$HOME/.cargo/env"
+          export RUSTC_WRAPPER=sccache
+          cd sgl-router
+          pip install setuptools-rust wheel build
+          python3 -m build
+          pip install --force-reinstall dist/*.whl
+
+      - name: Run Python E2E response API tests
+        run: |
+          bash scripts/killall_sglang.sh "nuk_gpus"
+          cd sgl-router
+          SHOW_ROUTER_LOGS=1 pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
+
+      - name: Run Python E2E gRPC tests
+        run: |
+          bash scripts/killall_sglang.sh "nuk_gpus"
+          cd sgl-router
+          SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
+
+
   finish:
-    needs: [unit-test-rust, pytest-rust]
+    needs: [unit-test-rust, pytest-rust, pytest-rust-2]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
