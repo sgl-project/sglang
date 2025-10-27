@@ -92,7 +92,7 @@ class WaveAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
-        if model_runner.is_hybrid_gdn:
+        if model_runner.is_hybrid:
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
         else:
