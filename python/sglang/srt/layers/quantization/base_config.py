@@ -10,7 +10,7 @@ from torch import nn
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
 
 class QuantizeMethodBase(ABC):
@@ -89,9 +89,15 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         layer: torch.nn.Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
+    ):
+        raise NotImplementedError
+
+    @abstractmethod
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         raise NotImplementedError
 
@@ -99,10 +105,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
+        dispatch_output: DispatchOutput,
+    ) -> CombineInput:
         raise NotImplementedError
 
 
@@ -155,6 +159,33 @@ class QuantizationConfig(ABC):
         this method should only be overwritten by subclasses in exceptional
         circumstances
         """
+        return None
+
+    @classmethod
+    def _modelopt_override_quantization_method(
+        cls, hf_quant_config, user_quant
+    ) -> Optional[str]:
+        """Shared ModelOpt quantization method override logic."""
+        if hf_quant_config is None:
+            return None
+
+        # Check if this is a ModelOpt config
+        quant_algo = hf_quant_config.get("quant_algo", "").upper()
+
+        # If user specified generic "modelopt", auto-detect the specific method
+        if user_quant == "modelopt":
+            if "FP8" in quant_algo:
+                return "modelopt_fp8"
+            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
+                return "modelopt_fp4"
+
+        # The hf_quant_config may be a parsed quant config, so we need to check the
+        # quant_method.
+        if hf_quant_config.get("quant_method", "") == "modelopt_fp8":
+            return "modelopt_fp8"
+        elif hf_quant_config.get("quant_method", "") == "modelopt_fp4":
+            return "modelopt_fp4"
+
         return None
 
     @staticmethod

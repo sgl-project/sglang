@@ -32,17 +32,14 @@
 
 import concurrent.futures
 import logging
-import os
-from enum import IntEnum, auto
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-from tqdm import tqdm
 
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -52,7 +49,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -75,7 +71,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM, LongcatFlashMLP
 from sglang.srt.utils import (
     BumpAllocator,
-    LazyValue,
     add_prefix,
     bind_or_assign,
     cpu_has_amx_support,
@@ -97,13 +92,7 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
 if _is_cuda:
-    from sgl_kernel import (
-        awq_dequantize,
-        bmm_fp8,
-        dsv3_fused_a_gemm,
-        dsv3_router_gemm,
-        merge_state_v2,
-    )
+    from sgl_kernel import awq_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -111,7 +100,7 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 else:
-    from vllm._custom_ops import awq_dequantize
+    pass
 
 
 logger = logging.getLogger(__name__)
@@ -344,9 +333,6 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                 ).T
         else:
             w = self_attn.kv_b_proj.weight
-        # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
-        # This may affect the accuracy of fp8 model.
-        # Fix deepseek v3 blockwise bmm by using deep_gemm
         use_deep_gemm_bmm = False
         if w.dtype in (
             torch.float8_e4m3fn,
@@ -480,24 +466,35 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
     def _weight_requant_ue8m0(self):
         weight_block_size = self.quant_config.weight_block_size
         layer = self.model.decoder
-        for module in [
-            layer.self_attn.fused_qkv_a_proj_with_mqa,
-            layer.self_attn.q_b_proj,
-            layer.self_attn.kv_b_proj,
-            layer.self_attn.o_proj,
-        ]:
-            requant_weight_ue8m0_inplace(
-                module.weight, module.weight_scale_inv, weight_block_size
-            )
+        self_attn = layer.self_attn
+        module_list = [
+            self_attn.kv_b_proj,
+            self_attn.o_proj,
+        ]
+
+        if self.config.q_lora_rank is not None:
+            module_list.append(self_attn.fused_qkv_a_proj_with_mqa)
+            module_list.append(self_attn.q_b_proj)
+        else:
+            module_list.append(self_attn.kv_a_proj_with_mqa)
+            module_list.append(self_attn.q_proj)
+
+        for module in module_list:
+            if hasattr(module, "weight_scale_inv"):
+                requant_weight_ue8m0_inplace(
+                    module.weight, module.weight_scale_inv, weight_block_size
+                )
+
         mlp = layer.mlps
         assert isinstance(mlp, LongcatFlashMLP)
         for module in [
             mlp.gate_up_proj,
             mlp.down_proj,
         ]:
-            requant_weight_ue8m0_inplace(
-                module.weight, module.weight_scale_inv, weight_block_size
-            )
+            if hasattr(module, "weight_scale_inv"):
+                requant_weight_ue8m0_inplace(
+                    module.weight, module.weight_scale_inv, weight_block_size
+                )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

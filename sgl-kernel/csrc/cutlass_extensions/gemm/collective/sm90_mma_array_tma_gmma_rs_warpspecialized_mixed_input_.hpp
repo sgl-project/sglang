@@ -1025,8 +1025,6 @@ struct CollectiveMmaArrayMixedInput<
       // src: tCrA_load, dst: tCrA_mma
       Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
 
-      tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
-
       // Unroll the K mode manually to set scale D to 1
       CUTLASS_PRAGMA_UNROLL
       for (int chunk_id = 0; chunk_id < NumChunksPerTileK; ++chunk_id) {
@@ -1059,6 +1057,8 @@ struct CollectiveMmaArrayMixedInput<
           }
         }
       }
+
+      warpgroup_wait<0>();
 
       CUTLASS_PRAGMA_UNROLL
       for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
@@ -1114,7 +1114,6 @@ struct CollectiveMmaArrayMixedInput<
             1,
             smem_pipe_read.index());
 
-        warpgroup_wait<K_WAIT_MAX>();
         Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
       }
     }
@@ -1148,8 +1147,6 @@ struct CollectiveMmaArrayMixedInput<
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
           warpgroup_commit_batch();
 
-          warpgroup_wait<K_WAIT_MAX>();  // We have K_BLOCK_MAX - 1 GMMA instructions pending for this stage, so we can
-                                         // release prior barrier
           if (k_block == K_BLOCK_MAX - 1) {
             pipeline.consumer_release(smem_pipe_release);  // UNLOCK smem_pipe_release, done _computing_ on it
             ++smem_pipe_release;
@@ -1161,6 +1158,8 @@ struct CollectiveMmaArrayMixedInput<
 
           if (k_block == K_BLOCK_MAX - 1) {
             // The last k_block
+
+            warpgroup_wait<0>();
 
             CUTLASS_PRAGMA_UNROLL
             for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
@@ -1241,7 +1240,6 @@ struct CollectiveMmaArrayMixedInput<
         tiled_mma.accumulate_ = GMMA::ScaleOut::One;
         warpgroup_commit_batch();
 
-        warpgroup_wait<K_WAIT_MAX>();
         if (k_block == K_BLOCK_MAX - 1) {
           // release prior barrier
           pipeline.consumer_release(smem_pipe_release);  // UNLOCK smem_pipe_release, done _computing_ on it
@@ -1264,6 +1262,8 @@ struct CollectiveMmaArrayMixedInput<
 
         if ((k_block + 1) % NumMMAsPerChunk == 0) {
           tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+
+          warpgroup_wait<0>();
           warpgroup_fence_operand(intermediate);
 
           // Apply the group-wise scaling
@@ -1296,7 +1296,7 @@ struct CollectiveMmaArrayMixedInput<
     smem_pipe_release.advance(k_tile_count);
 
     // Wait on all GMMAs to complete
-    warpgroup_wait<0>();
+    // warpgroup_wait<0>();
 
     for (int count = 0; count < prologue_mma_count; ++count) {
       pipeline.consumer_release(smem_pipe_release);  // UNLOCK smem_pipe_release, done _computing_ on it

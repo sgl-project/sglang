@@ -541,6 +541,11 @@ void quant_impl(
   }
 }
 
+// Avoid redefinition warnings
+#undef CHECK_CONTIGUOUS
+#undef CHECK_TH_CUDA
+#undef CHECK_INPUT
+
 /*Quantization entry for fp4 experts quantization*/
 #define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, "must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x, m) TORCH_CHECK(x.is_contiguous(), m, "must be contiguous")
@@ -563,7 +568,7 @@ void scaled_fp4_experts_quant_sm100a(
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts) {
   auto sm_version = getSMVersion();
-  TORCH_CHECK(sm_version == 100 || sm_version == 103, "fp4_quant is only supported on sm100a/sm103a");
+  TORCH_CHECK(sm_version >= 100, "fp4_quant is only supported on sm100+");
 
   CHECK_INPUT(output, "output must be a CUDA tensor");
   CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");
@@ -647,7 +652,7 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     torch::Tensor const& mask,
     bool use_silu_and_mul) {
   auto sm_version = getSMVersion();
-  TORCH_CHECK(sm_version == 100 || sm_version == 103, "fp4_quant is only supported on sm100a/sm103a");
+  TORCH_CHECK(sm_version >= 100, "fp4_quant is only supported on sm100+");
 
   CHECK_INPUT(output, "output must be a CUDA tensor");
   CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");
