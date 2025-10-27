@@ -88,7 +88,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                             }
                             "system" => {
                                 messages.push(ChatMessage::System {
-                                    content: text,
+                                    content: TextMessageContent::Text(text),
                                     name: None,
                                 });
                             }
