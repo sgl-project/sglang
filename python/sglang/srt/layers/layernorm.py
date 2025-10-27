@@ -18,8 +18,9 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from packaging.version import Version
 import torch.nn.functional as F
+from packaging.version import Version
+
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -382,6 +383,7 @@ class Qwen3NextRMSNormGated(nn.Module):
         hidden_states = hidden_states * F.silu(gate.to(torch.float32))
 
         return hidden_states.to(input_dtype)
+
 
 if not (
     _is_cuda or _is_hip or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_xpu

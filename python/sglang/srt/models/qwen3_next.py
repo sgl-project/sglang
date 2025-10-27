@@ -3,8 +3,8 @@ import logging
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import divide, get_pp_group
@@ -44,8 +44,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
-    is_cuda,
     is_cpu,
+    is_cuda,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -237,8 +237,10 @@ def fused_gdn_gating(
     )
     return g
 
+
 def gdn_gating(A_log, a, dt_bias):
     return -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+
 
 class Qwen3GatedDeltaNet(nn.Module):
     def __init__(
@@ -332,7 +334,9 @@ class Qwen3GatedDeltaNet(nn.Module):
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
         if _is_cpu:
-            self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+            self.norm = Qwen3NextRMSNormGated(
+                self.head_v_dim, eps=self.layer_norm_epsilon
+            )
         else:
             self.norm = RMSNormGated(
                 self.head_v_dim,
@@ -427,7 +431,11 @@ class Qwen3GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and is_cuda_graph and not _is_cpu:
+        if (
+            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            and is_cuda_graph
+            and not _is_cpu
+        ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,

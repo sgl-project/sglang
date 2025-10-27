@@ -594,7 +594,8 @@ def torch_chunk_gated_delta_rule(
         query = F.normalize(query, p=2, dim=-1)
         key = F.normalize(key, p=2, dim=-1)
     query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
     ]
 
     batch_size, sequence_length, num_heads, k_head_dim = key.shape
@@ -613,10 +614,14 @@ def torch_chunk_gated_delta_rule(
     k_beta = key * beta.unsqueeze(-1)
     # reshape to chunks
     query, key, value, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, k_beta, v_beta)
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, value, k_beta, v_beta)
     ]
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=0,
+    )
 
     # chunk decay
     g = g.cumsum(dim=-1)
@@ -635,7 +640,10 @@ def torch_chunk_gated_delta_rule(
         else initial_state.to(value)
     )
     core_attn_out = torch.zeros_like(value)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=1,
+    )
 
     # for each chunk
     for i in range(0, tot_heads // chunk_size):
@@ -647,26 +655,82 @@ def torch_chunk_gated_delta_rule(
         core_attn_out[:, :, i] = attn_inter + attn @ v_new
         last_recurrent_state = (
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(
+                -1, -2
+            )
+            @ v_new
         )
 
     if not output_final_state:
         last_recurrent_state = None
-    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
+    core_attn_out = core_attn_out.reshape(
+        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
+    )
     core_attn_out = core_attn_out[:, :, :num_heads]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
 
 
+def chunk_gated_delta_rule_cpu(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    initial_state=None,
+    output_final_state=False,
+    cu_seqlens=None,
+    head_first=False,
+    use_qk_l2norm_in_kernel=False,
+):
+    num_value_heads = v.size(2)
+    num_heads = q.size(2)
+    if num_value_heads // num_heads > 1:
+        q = q.repeat_interleave(num_value_heads // num_heads, dim=2)
+        k = k.repeat_interleave(num_value_heads // num_heads, dim=2)
+    core_attn_out = torch.empty_like(v)
+    batch_size = cu_seqlens.size(0) - 1
+    last_recurrent_state = []
+    start_q = 0
+    for i in range(batch_size):
+        end_q = cu_seqlens[i + 1]
+        core_attn_outi, last_recurrent_statei = torch_chunk_gated_delta_rule(
+            query=q[:, start_q:end_q, :, :],
+            key=k[:, start_q:end_q, :, :],
+            value=v[:, start_q:end_q, :, :],
+            g=g[:, start_q:end_q, :],
+            beta=beta[:, start_q:end_q, :],
+            initial_state=initial_state[i],
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        core_attn_out[:, start_q:end_q, :, :] = core_attn_outi
+        last_recurrent_statei = last_recurrent_statei.to(
+            initial_state.dtype, copy=False
+        )
+        last_recurrent_state.append(last_recurrent_statei)
+        start_q = end_q
+    last_recurrent_state = torch.cat(last_recurrent_state, dim=0)
+    return core_attn_out, last_recurrent_state
+
+
 def torch_recurrent_gated_delta_rule(
-    query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    use_qk_l2norm_in_kernel=False,
 ):
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
         query = F.normalize(query, p=2, dim=-1)
         key = F.normalize(key, p=2, dim=-1)
     query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
     ]
 
     batch_size, sequence_length, num_heads, k_head_dim = key.shape
@@ -674,7 +738,9 @@ def torch_recurrent_gated_delta_rule(
     scale = 1 / (query.shape[-1] ** 0.5)
     query = query * scale
 
-    core_attn_out = torch.zeros(batch_size, sequence_length, num_heads, v_head_dim).to(value)
+    core_attn_out = torch.zeros(batch_size, sequence_length, num_heads, v_head_dim).to(
+        value
+    )
     last_recurrent_state = (
         torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(value)
         if initial_state is None
@@ -691,7 +757,9 @@ def torch_recurrent_gated_delta_rule(
         last_recurrent_state = last_recurrent_state * g_t
         kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
         delta = (v_t - kv_mem) * beta_t
-        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(
+            -1
+        ) * delta.unsqueeze(-2)
         core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
 
     if not output_final_state:
@@ -699,3 +767,48 @@ def torch_recurrent_gated_delta_rule(
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
 
+
+def fused_sigmoid_gating_delta_rule_update_cpu(
+    A_log,
+    dt_bias,
+    q,
+    k,
+    v,
+    a,
+    b,
+    initial_state_source,
+    initial_state_indices,
+    cu_seqlens,
+    use_qk_l2norm_in_kernel=False,
+    softplus_beta=1.0,
+    softplus_threshold=20.0,
+):
+    beta = b.sigmoid()
+    g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+    num_value_heads = v.shape[2]
+    num_heads = q.shape[2]
+    if num_value_heads // num_heads > 1:
+        q = q.repeat_interleave(num_value_heads // num_heads, dim=2)
+        k = k.repeat_interleave(num_value_heads // num_heads, dim=2)
+    batch_size = cu_seqlens.shape[0] - 1
+    core_attn_out = []
+    start_q = 0
+    for i in range(batch_size):
+        end_q = cu_seqlens[i + 1]
+        core_attn_outi, last_recurrent_statei = torch_recurrent_gated_delta_rule(
+            query=q[:, start_q:end_q, :, :].transpose(0, 1),
+            key=k[:, start_q:end_q, :, :].transpose(0, 1),
+            value=v[:, start_q:end_q, :, :].transpose(0, 1),
+            g=g.unsqueeze(0),
+            beta=beta.unsqueeze(0),
+            initial_state=initial_state_source[initial_state_indices[i]],
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        initial_state_source[initial_state_indices[i]] = last_recurrent_statei.to(
+            initial_state_source.dtype, copy=False
+        )
+        core_attn_out.append(core_attn_outi)
+        start_q = end_q
+    core_attn_out = torch.cat(core_attn_out, dim=1)
+    return core_attn_out
