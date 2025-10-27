@@ -99,9 +99,35 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Check if the worker is available (healthy + circuit closed/half-open + acceptable load)
     fn is_available(&self) -> bool {
-        self.engine_load().is_acceptable()
-            && self.is_healthy()
-            && self.circuit_breaker().can_execute()
+        if !self.engine_load().is_acceptable() {
+            tracing::debug!("Worker {} is not acceptable by load, reqs: {}, waiting_reqs: {}, token: {}, max_req: {}, max_waiting_req: {}, max_token: {},",
+                self.url(),
+                self.engine_load().num_reqs(),
+                self.engine_load().num_waiting_reqs(),
+                self.engine_load().num_tokens(),
+                self.engine_load().max_req_limit,
+                self.engine_load().max_waiting_req_limit,
+                self.engine_load().max_token_limit,
+            );
+            return false;
+        }
+        if !self.is_healthy() {
+            tracing::debug!(
+                "Worker {} is not available by health check, healthy: {}",
+                self.url(),
+                self.is_healthy()
+            );
+            return false;
+        }
+        if !self.circuit_breaker().can_execute() {
+            tracing::debug!(
+                "Worker {} is not available by circuit breaker, circuit_breaker: {}",
+                self.url(),
+                self.circuit_breaker().state()
+            );
+            return false;
+        }
+        true
     }
 
     /// Record the outcome of a request to this worker
