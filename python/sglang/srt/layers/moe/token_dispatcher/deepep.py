@@ -761,7 +761,9 @@ class DeepEPDispatcher(BaseDispatcher):
         return self._get_impl().dispatch_b(*inner_state)
 
     def combine(
-        self, combine_input: CombineInput, overlap_args: Optional[CombineOverlapArgs] = None
+        self,
+        combine_input: CombineInput,
+        overlap_args: Optional[CombineOverlapArgs] = None,
     ) -> Tuple:
         self.combine_a(combine_input, overlap_args)
         ret = self.combine_b()
