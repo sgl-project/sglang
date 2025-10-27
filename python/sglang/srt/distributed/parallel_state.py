@@ -655,7 +655,9 @@ class GroupCoordinator:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
-        with pynccl_comm.change_state(enable=True, stream=torch.get_device_module().current_stream()):
+        with pynccl_comm.change_state(
+            enable=True, stream=torch.get_device_module().current_stream()
+        ):
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
             ), "pynccl is required for reduce_scatterv"
@@ -779,7 +781,9 @@ class GroupCoordinator:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
-        with pynccl_comm.change_state(enable=True, stream=torch.get_device_module().current_stream()):
+        with pynccl_comm.change_state(
+            enable=True, stream=torch.get_device_module().current_stream()
+        ):
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
             ), "pynccl is required for all_gatherv"
