@@ -521,7 +521,6 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
-            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.decode_transfer_queue_entry_time = (
