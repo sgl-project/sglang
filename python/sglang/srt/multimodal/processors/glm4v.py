@@ -1,8 +1,6 @@
-import re
 from typing import List, Union
 
 from decord import VideoReader
-from transformers.video_utils import VideoMetadata
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
@@ -10,10 +8,7 @@ from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import (
-    BaseMultiModalProcessorOutput,
-    MultimodalSpecialTokens,
-)
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
@@ -22,7 +17,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
-        # GLM-4.1V and GLM-4.5V specific tokens
+        # GLM-V specific tokens
         self.IMAGE_TOKEN = "<|image|>"
         self.VIDEO_TOKEN = "<|video|>"
         self.IMAGE_START_TOKEN = "<|begin_of_image|>"
@@ -66,17 +61,18 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         total_num_frames = len(vr)
         duration = total_num_frames / video_fps if video_fps else 0
 
-        metadata = VideoMetadata(
-            total_num_frames=int(total_num_frames),
-            fps=float(video_fps),
-            duration=float(duration),
-            video_backend="decord",
-        )
-
         # Extract all frames
         indices = list(range(total_num_frames))
         frames = vr.get_batch(indices).asnumpy()
-        metadata.frames_indices = indices
+
+        # Return metadata as dict so transformers can properly create VideoMetadata objects
+        metadata = {
+            "total_num_frames": int(total_num_frames),
+            "fps": float(video_fps),
+            "duration": float(duration),
+            "video_backend": "decord",
+            "frames_indices": indices,
+        }
 
         return frames, metadata
 

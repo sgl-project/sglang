@@ -48,9 +48,12 @@ class FakeKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List[int]] = None,
     ):
         self.has_sent = True
-        logger.debug(f"FakeKVSender send with kv_indices: {kv_indices}")
+        logger.debug(
+            f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
+        )
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
@@ -62,7 +65,7 @@ class FakeKVReceiver(BaseKVReceiver):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        data_parallel_rank: Optional[int] = None,
+        prefill_dp_rank: Optional[int] = None,
     ):
         self.has_init = False
 
@@ -75,10 +78,15 @@ class FakeKVReceiver(BaseKVReceiver):
             logger.debug("FakeKVReceiver poll success")
             return KVPoll.Success
 
-    def init(self, kv_indices: list[int], aux_index: Optional[int] = None):
+    def init(
+        self,
+        kv_indices: list[int],
+        aux_index: Optional[int] = None,
+        state_indices: Optional[List[int]] = None,
+    ):
         self.has_init = True
         logger.debug(
-            f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}"
+            f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}"
         )
 
     def failure_exception(self):

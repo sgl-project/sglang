@@ -121,16 +121,21 @@ class TiktokenTokenizer:
         return self.tokenizer.decode_batch(batch)
 
     def apply_chat_template(
-        self, messages, tokenize, add_generation_prompt, tools=None
+        self,
+        messages,
+        tokenize,
+        add_generation_prompt,
+        tools=None,
+        reasoning_effort=None,
     ):
         ret = self.chat_template_jinja.render(
             messages=messages, add_generation_prompt=add_generation_prompt
         )
         return self.encode(ret) if tokenize else ret
 
-    def __call__(self, text, **kwargs):
+    def __call__(self, text: List[str], **kwargs):
         return {
-            "input_ids": self.encode(text),
+            "input_ids": [self.encode(x) for x in text],
         }
 
     def init_xgrammar(self):

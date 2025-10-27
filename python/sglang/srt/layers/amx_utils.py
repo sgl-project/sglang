@@ -2,7 +2,7 @@ import logging
 
 import torch
 
-from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var
+from sglang.srt.utils import cpu_has_amx_support
 
 logger = logging.getLogger(__name__)
 

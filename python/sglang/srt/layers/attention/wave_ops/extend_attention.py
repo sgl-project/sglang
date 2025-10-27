@@ -67,11 +67,9 @@ def get_wave_kernel(
         schedule=SchedulingType.NONE,
         use_scheduling_barriers=False,
         dynamic_symbols=dynamic_symbols,
-        use_buffer_load_ops=True,
-        use_buffer_store_ops=True,
+        use_buffer_ops=True,
         waves_per_eu=2,
         denorm_fp_math_f32="preserve-sign",
-        gpu_native_math_precision=True,
         wave_runtime=True,
     )
     options = set_default_run_config(options)
