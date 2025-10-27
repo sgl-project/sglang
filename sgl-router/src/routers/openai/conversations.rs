@@ -16,7 +16,7 @@ use crate::{
     data_connector::{
         Conversation, ConversationId, ConversationItemId, ConversationItemStorage,
         ConversationStorage, ListParams, NewConversation, NewConversationItem, ResponseId,
-        ResponseStorage, SharedConversationItemStorage, SharedConversationStorage, SortOrder,
+        ResponseStorage, SortOrder,
     },
     protocols::responses::{ResponseInput, ResponsesRequest},
 };
@@ -30,7 +30,7 @@ pub(crate) const MAX_METADATA_PROPERTIES: usize = 16;
 
 /// Create a new conversation
 pub(super) async fn create_conversation(
-    conversation_storage: &SharedConversationStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
     body: Value,
 ) -> Response {
     // TODO: The validation should be done in the right place
@@ -83,7 +83,7 @@ pub(super) async fn create_conversation(
 
 /// Get a conversation by ID
 pub(super) async fn get_conversation(
-    conversation_storage: &SharedConversationStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
     conv_id: &str,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
@@ -112,7 +112,7 @@ pub(super) async fn get_conversation(
 
 /// Update a conversation's metadata
 pub(super) async fn update_conversation(
-    conversation_storage: &SharedConversationStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
     conv_id: &str,
     body: Value,
 ) -> Response {
@@ -224,7 +224,7 @@ pub(super) async fn update_conversation(
 
 /// Delete a conversation
 pub(super) async fn delete_conversation(
-    conversation_storage: &SharedConversationStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
     conv_id: &str,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
@@ -280,8 +280,8 @@ pub(super) async fn delete_conversation(
 
 /// List items in a conversation with pagination
 pub(super) async fn list_conversation_items(
-    conversation_storage: &SharedConversationStorage,
-    item_storage: &SharedConversationItemStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
+    item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &str,
     query_params: HashMap<String, String>,
 ) -> Response {
@@ -412,8 +412,8 @@ const IMPLEMENTED_ITEM_TYPES: &[&str] = &[
 
 /// Create items in a conversation (bulk operation)
 pub(super) async fn create_conversation_items(
-    conversation_storage: &SharedConversationStorage,
-    item_storage: &SharedConversationItemStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
+    item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &str,
     body: Value,
 ) -> Response {
@@ -681,8 +681,8 @@ pub(super) async fn create_conversation_items(
 /// Get a single conversation item
 /// Note: `include` query parameter is accepted but not yet implemented
 pub(super) async fn get_conversation_item(
-    conversation_storage: &SharedConversationStorage,
-    item_storage: &SharedConversationItemStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
+    item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &str,
     item_id: &str,
     _include: Option<Vec<String>>, // Reserved for future use
@@ -761,8 +761,8 @@ pub(super) async fn get_conversation_item(
 
 /// Delete a conversation item
 pub(super) async fn delete_conversation_item(
-    conversation_storage: &SharedConversationStorage,
-    item_storage: &SharedConversationItemStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
+    item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &str,
     item_id: &str,
 ) -> Response {

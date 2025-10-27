@@ -10,8 +10,7 @@ use crate::{
     config::RouterConfig,
     core::{workflow::WorkflowEngine, ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry},
     data_connector::{
-        create_storage, SharedConversationItemStorage, SharedConversationStorage,
-        SharedResponseStorage,
+        create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     },
     mcp::McpManager,
     middleware::TokenBucket,
@@ -49,9 +48,9 @@ pub struct AppContext {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
-    pub response_storage: SharedResponseStorage,
-    pub conversation_storage: SharedConversationStorage,
-    pub conversation_item_storage: SharedConversationItemStorage,
+    pub response_storage: Arc<dyn ResponseStorage>,
+    pub conversation_storage: Arc<dyn ConversationStorage>,
+    pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
     pub load_monitor: Option<Arc<LoadMonitor>>,
     pub configured_reasoning_parser: Option<String>,
     pub configured_tool_parser: Option<String>,
@@ -70,9 +69,9 @@ pub struct AppContextBuilder {
     worker_registry: Option<Arc<WorkerRegistry>>,
     policy_registry: Option<Arc<PolicyRegistry>>,
     router_manager: Option<Arc<RouterManager>>,
-    response_storage: Option<SharedResponseStorage>,
-    conversation_storage: Option<SharedConversationStorage>,
-    conversation_item_storage: Option<SharedConversationItemStorage>,
+    response_storage: Option<Arc<dyn ResponseStorage>>,
+    conversation_storage: Option<Arc<dyn ConversationStorage>>,
+    conversation_item_storage: Option<Arc<dyn ConversationItemStorage>>,
     load_monitor: Option<Arc<LoadMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engine: Option<Arc<OnceLock<Arc<WorkflowEngine>>>>,
@@ -167,19 +166,22 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn response_storage(mut self, response_storage: SharedResponseStorage) -> Self {
+    pub fn response_storage(mut self, response_storage: Arc<dyn ResponseStorage>) -> Self {
         self.response_storage = Some(response_storage);
         self
     }
 
-    pub fn conversation_storage(mut self, conversation_storage: SharedConversationStorage) -> Self {
+    pub fn conversation_storage(
+        mut self,
+        conversation_storage: Arc<dyn ConversationStorage>,
+    ) -> Self {
         self.conversation_storage = Some(conversation_storage);
         self
     }
 
     pub fn conversation_item_storage(
         mut self,
-        conversation_item_storage: SharedConversationItemStorage,
+        conversation_item_storage: Arc<dyn ConversationItemStorage>,
     ) -> Self {
         self.conversation_item_storage = Some(conversation_item_storage);
         self
