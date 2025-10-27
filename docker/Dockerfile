@@ -99,7 +99,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} \
    ; \
    elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu13-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
    ; \
    else \
       echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
