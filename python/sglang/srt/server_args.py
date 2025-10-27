@@ -247,7 +247,6 @@ class ServerArgs:
     mm_only: bool = False
     language_only: bool = False
     embedding_port: Optional[int] = None
-    prefill_server_ip: str = 'localhost'
 
     # Quantization and data type
     dtype: str = "auto"
@@ -2030,12 +2029,6 @@ class ServerArgs:
             type=int,
             default=54213,
             help="The port for multimodal embedding transmission."
-        )
-        parser.add_argument(
-            "--prefill-server-ip",
-            type=str,
-            default=ServerArgs.prefill_server_ip,
-            help="The IP for prefill instance when launching encode server."
         )
 
         # Quantization and data type
