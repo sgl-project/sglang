@@ -111,18 +111,21 @@ class Envs:
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
 
+    # Logging Options
+    SGLANG_LOG_GC = EnvBool(False)
+    SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
+    SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
+
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
-    SGLANG_GC_LOG = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
-    SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
@@ -228,6 +231,7 @@ class Envs:
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
     # Overlap Spec V2
+    SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # VLM
@@ -251,7 +255,17 @@ class Envs:
 envs = Envs()
 
 
+def _print_deprecated_env(new_name: str, old_name: str):
+    if old_name in os.environ:
+        warnings.warn(
+            f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
+        )
+        os.environ[new_name] = os.environ[old_name]
+
+
 def _convert_SGL_to_SGLANG():
+    _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
+
     for key, value in os.environ.items():
         if key.startswith("SGL_"):
             new_key = key.replace("SGL_", "SGLANG_", 1)

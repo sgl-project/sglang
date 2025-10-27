@@ -203,7 +203,10 @@ class SchedulerOutputProcessorMixin:
                         i
                     ].item()
             else:
-                embeddings = embeddings.tolist()
+                if isinstance(embeddings, torch.Tensor):
+                    embeddings = embeddings.tolist()
+                else:
+                    embeddings = [tensor.tolist() for tensor in embeddings]
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
