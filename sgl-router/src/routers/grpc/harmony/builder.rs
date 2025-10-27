@@ -308,12 +308,6 @@ impl HarmonyBuilder {
             return HarmonyMessage::from_role_and_content(Role::Developer, dev_content);
         };
 
-        // Filter tools - skip built-in tools, only add function tools
-        // - web_search_preview, code_interpreter, container, mcp are built-in (skip)
-        // - function tools are added to developer message
-        // Note: Currently Responses API doesn't have function tools,
-        // TODO: Implement function tool descriptions when available
-
         for tool in tools {
             match tool.r#type {
                 ResponseToolType::WebSearchPreview

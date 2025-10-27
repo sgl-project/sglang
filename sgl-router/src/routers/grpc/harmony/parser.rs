@@ -3,8 +3,10 @@
 //! Adapter for openai_harmony::StreamableParser that handles channel-based parsing.
 
 use openai_harmony::{chat::Role, HarmonyEncoding, StreamableParser};
+use uuid::Uuid;
 
 use super::types::{HarmonyChannelDelta, HarmonyChannelOutput};
+use crate::protocols::common::{FunctionCallResponse, ToolCall};
 
 /// Get the global Harmony encoding
 ///
@@ -57,7 +59,7 @@ impl HarmonyParserAdapter {
 
         // Parse messages into channel outputs
         let mut analysis = None;
-        let mut commentary = None;
+        let mut commentary: Option<Vec<ToolCall>> = None;
         let mut final_text = String::new();
 
         for msg in messages {
@@ -79,9 +81,30 @@ impl HarmonyParserAdapter {
                     analysis = Some(text);
                 }
                 "commentary" => {
-                    // TODO: Parse tool calls from commentary channel
-                    // For now, just store as text
-                    commentary = None; // Placeholder
+                    // Parse tool calls from commentary channel
+                    // Check if recipient indicates a function call (recipient = "functions.{name}")
+                    if let Some(recipient) = msg.recipient.as_deref() {
+                        if recipient.starts_with("functions.") {
+                            let function_name = recipient.strip_prefix("functions.").unwrap();
+
+                            // Create ToolCall with unique call_id
+                            let call_id = format!("call_{}", Uuid::new_v4());
+                            let tool_call = ToolCall {
+                                id: call_id,
+                                tool_type: "function".to_string(),
+                                function: FunctionCallResponse {
+                                    name: function_name.to_string(),
+                                    arguments: Some(text),
+                                },
+                            };
+
+                            // Initialize or append to commentary
+                            match commentary.as_mut() {
+                                Some(calls) => calls.push(tool_call),
+                                None => commentary = Some(vec![tool_call]),
+                            }
+                        }
+                    }
                 }
                 "final" => {
                     final_text.push_str(&text);
@@ -198,7 +221,7 @@ impl HarmonyParserAdapter {
         let messages = self.parser.messages();
 
         let mut analysis = None;
-        let mut commentary = None;
+        let mut commentary: Option<Vec<ToolCall>> = None;
         let mut final_text = String::new();
 
         for msg in messages {
@@ -219,8 +242,30 @@ impl HarmonyParserAdapter {
                     analysis = Some(text);
                 }
                 "commentary" => {
-                    // TODO: Parse tool calls
-                    commentary = None;
+                    // Parse tool calls from commentary channel
+                    // Check if recipient indicates a function call (recipient = "functions.{name}")
+                    if let Some(recipient) = msg.recipient.as_deref() {
+                        if recipient.starts_with("functions.") {
+                            let function_name = recipient.strip_prefix("functions.").unwrap();
+
+                            // Create ToolCall with unique call_id
+                            let call_id = format!("call_{}", Uuid::new_v4());
+                            let tool_call = ToolCall {
+                                id: call_id,
+                                tool_type: "function".to_string(),
+                                function: FunctionCallResponse {
+                                    name: function_name.to_string(),
+                                    arguments: Some(text),
+                                },
+                            };
+
+                            // Initialize or append to commentary
+                            match commentary.as_mut() {
+                                Some(calls) => calls.push(tool_call),
+                                None => commentary = Some(vec![tool_call]),
+                            }
+                        }
+                    }
                 }
                 "final" => {
                     final_text.push_str(&text);

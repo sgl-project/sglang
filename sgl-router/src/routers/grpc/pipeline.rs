@@ -366,4 +366,24 @@ impl RequestPipeline {
             None => Err(utils::internal_error_static("No response produced")),
         }
     }
+
+    /// Execute Responses API pipeline
+    ///
+    /// TODO: Implement Responses API native execution
+    /// This is a stub to allow compilation. The actual implementation should:
+    /// 1. Support multi-turn MCP loop orchestration
+    /// 2. Handle tool call execution and result injection
+    /// 3. Emit proper SSE events for streaming mode
+    /// 4. Store responses in data connector
+    ///
+    /// For now, this returns an error indicating the feature is not implemented.
+    pub async fn execute_responses(
+        &self,
+        _request: Arc<crate::protocols::responses::ResponsesRequest>,
+        _headers: Option<http::HeaderMap>,
+        _model_id: Option<String>,
+        _components: Arc<SharedComponents>,
+    ) -> Response {
+        utils::internal_error_static("Responses API execution not yet implemented")
+    }
 }

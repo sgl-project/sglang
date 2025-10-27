@@ -31,6 +31,7 @@ use crate::{
 
 /// gRPC router implementation for SGLang
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
     pipeline: RequestPipeline,
@@ -191,16 +192,15 @@ impl GrpcRouter {
             model_id
         );
 
-        // Use Harmony pipeline for execution
-        // TODO: Implement execute_responses for Harmony pipeline (Phase 4-5)
-        // For now, use harmony_responses_context with existing responses module
-        responses::route_responses(
-            &self.harmony_responses_context,
-            Arc::new(body.clone()),
-            headers.cloned(),
-            model_id.map(|s| s.to_string()),
-        )
-        .await
+        // Use Harmony pipeline for execution (similar to route_chat_impl)
+        self.harmony_pipeline
+            .execute_responses(
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                self.shared_components.clone(),
+            )
+            .await
     }
 }
 
