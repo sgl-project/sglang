@@ -292,6 +292,9 @@ impl HarmonyResponseProcessor {
             metadata: responses_request.metadata.clone().unwrap_or_default(),
         };
 
-        Ok(ResponsesIterationResult::Completed { response: Box::new(response), usage })
+        Ok(ResponsesIterationResult::Completed {
+            response: Box::new(response),
+            usage,
+        })
     }
 }

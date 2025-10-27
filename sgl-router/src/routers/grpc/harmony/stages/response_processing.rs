@@ -52,10 +52,21 @@ impl PipelineStage for HarmonyResponseProcessingStage {
 
         // For streaming, delegate to streaming processor and return SSE response
         if is_streaming {
+            let dispatch = ctx
+                .state
+                .dispatch
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
+
             return Ok(Some(
                 self.streaming_processor
                     .clone()
-                    .process_streaming_response(execution_result, ctx.chat_request_arc()),
+                    .process_streaming_chat_response(
+                        execution_result,
+                        ctx.chat_request_arc(),
+                        dispatch,
+                    ),
             ));
         }
 
