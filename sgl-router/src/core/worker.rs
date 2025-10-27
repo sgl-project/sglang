@@ -746,7 +746,7 @@ impl Worker for BasicWorker {
         let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
         let url = self.normalised_url()?;
-        let load_url = format!("{}/load", url);
+        let load_url = format!("{}/get_load", url);
 
         let mut req = WORKER_CLIENT.get(&load_url).timeout(timeout);
         if let Some(api_key) = &self.metadata.api_key {
@@ -766,16 +766,16 @@ impl Worker for BasicWorker {
                                 );
                                 tracing::debug!(
                                     "Updated engine load for {}: num_reqs={}, num_waiting_reqs={}, num_tokens={}",
-                                    self.metadata.url,
+                                    load_url,
                                     first_load.num_reqs,
                                     first_load.num_waiting_reqs,
                                     first_load.num_tokens
                                 );
                                 Ok(())
                             } else {
-                                tracing::warn!("Empty load response from {}", self.metadata.url);
-                                Err(WorkerError::HealthCheckFailed {
-                                    url: self.metadata.url.clone(),
+                                tracing::warn!("Empty load response from {}", load_url);
+                                Err(WorkerError::GetLoadFailed {
+                                    url: load_url,
                                     reason: "Empty load response".to_string(),
                                 })
                             }
@@ -783,10 +783,10 @@ impl Worker for BasicWorker {
                         Err(err) => {
                             tracing::warn!(
                                 "Failed to parse load response from {}: {err:?}",
-                                self.metadata.url
+                                load_url
                             );
-                            Err(WorkerError::HealthCheckFailed {
-                                url: self.metadata.url.clone(),
+                            Err(WorkerError::GetLoadFailed {
+                                url: load_url,
                                 reason: format!("Failed to parse load response: {}", err),
                             })
                         }
@@ -794,19 +794,19 @@ impl Worker for BasicWorker {
                 } else {
                     tracing::warn!(
                         "Load check failed for {} with status: {}",
-                        self.metadata.url,
+                        load_url,
                         resp.status()
                     );
-                    Err(WorkerError::HealthCheckFailed {
-                        url: self.metadata.url.clone(),
+                    Err(WorkerError::GetLoadFailed {
+                        url: load_url,
                         reason: format!("Load check failed with status: {}", resp.status()),
                     })
                 }
             }
             Err(err) => {
-                tracing::warn!("HTTP load check failed for {}: {err:?}", self.metadata.url);
-                Err(WorkerError::HealthCheckFailed {
-                    url: self.metadata.url.clone(),
+                tracing::warn!("HTTP load check failed for {}: {err:?}", load_url);
+                Err(WorkerError::GetLoadFailed {
+                    url: load_url,
                     reason: format!("HTTP request failed: {}", err),
                 })
             }
@@ -975,7 +975,7 @@ impl Worker for DPAwareWorker {
         let timeout = Duration::from_secs(self.base_worker.metadata.health_config.timeout_secs);
 
         let url = self.base_worker.normalised_url()?;
-        let load_url = format!("{}/load", url);
+        let load_url = format!("{}/get_load", url);
 
         let mut req = WORKER_CLIENT.get(&load_url).timeout(timeout);
         if let Some(api_key) = &self.base_worker.metadata.api_key {
@@ -1013,7 +1013,7 @@ impl Worker for DPAwareWorker {
                                     self.dp_rank
                                 );
                                 Err(WorkerError::HealthCheckFailed {
-                                    url: self.base_worker.metadata.url.clone(),
+                                    url: load_url,
                                     reason: format!("No load info for dp_rank {}", self.dp_rank),
                                 })
                             }
@@ -1024,7 +1024,7 @@ impl Worker for DPAwareWorker {
                                 self.base_worker.metadata.url
                             );
                             Err(WorkerError::HealthCheckFailed {
-                                url: self.base_worker.metadata.url.clone(),
+                                url: load_url,
                                 reason: format!("Failed to parse load response: {}", err),
                             })
                         }
@@ -1036,7 +1036,7 @@ impl Worker for DPAwareWorker {
                         resp.status()
                     );
                     Err(WorkerError::HealthCheckFailed {
-                        url: self.base_worker.metadata.url.clone(),
+                        url: load_url,
                         reason: format!("Load check failed with status: {}", resp.status()),
                     })
                 }
@@ -1047,7 +1047,7 @@ impl Worker for DPAwareWorker {
                     self.base_worker.metadata.url
                 );
                 Err(WorkerError::HealthCheckFailed {
-                    url: self.base_worker.metadata.url.clone(),
+                    url: load_url,
                     reason: format!("HTTP request failed: {}", err),
                 })
             }
@@ -1852,6 +1852,10 @@ mod tests {
         let dp_worker = DPAwareWorkerBuilder::new("http://worker1:8080", 0, 2)
             .worker_type(WorkerType::Regular)
             .build();
+
+        assert_eq!(dp_worker.engine_load().num_reqs(), 0);
+        assert_eq!(dp_worker.engine_load().num_waiting_reqs(), 0);
+        assert_eq!(dp_worker.engine_load().num_tokens(), 0);
 
         assert!(dp_worker.is_healthy());
         dp_worker.set_healthy(false);

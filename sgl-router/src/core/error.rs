@@ -9,6 +9,8 @@ use std::fmt;
 pub enum WorkerError {
     /// Health check failed
     HealthCheckFailed { url: String, reason: String },
+    /// Get load failed
+    GetLoadFailed { url: String, reason: String },
     /// Worker not found
     WorkerNotFound { url: String },
     /// Invalid worker configuration
@@ -46,6 +48,9 @@ impl fmt::Display for WorkerError {
             }
             WorkerError::ConnectionFailed { url, reason } => {
                 write!(f, "Connection failed for worker {}: {}", url, reason)
+            }
+            WorkerError::GetLoadFailed { url, reason } => {
+                write!(f, "Get load failed for worker {}: {}", url, reason)
             }
         }
     }
