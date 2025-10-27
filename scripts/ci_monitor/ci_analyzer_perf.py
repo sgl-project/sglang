@@ -1289,8 +1289,8 @@ class SGLangPerfAnalyzer:
                     summary_lines.append("---")
                     summary_lines.append("")
 
-            # Write summary to GitHub Actions
-            with open(github_step_summary, "w", encoding="utf-8") as f:
+            # Write summary to GitHub Actions (append mode to preserve CI Analysis report)
+            with open(github_step_summary, "a", encoding="utf-8") as f:
                 f.write("\n".join(summary_lines))
 
             print("✅ GitHub Actions summary generated successfully")

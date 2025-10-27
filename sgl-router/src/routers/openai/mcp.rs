@@ -8,17 +8,20 @@
 //! - Payload transformation for MCP tool interception
 //! - Metadata injection for MCP operations
 
-use crate::mcp::McpClientManager;
-use crate::protocols::spec::{ResponseInput, ResponseToolType, ResponsesRequest};
-use crate::routers::header_utils::apply_request_headers;
+use std::{io, sync::Arc};
+
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde_json::{json, to_value, Value};
-use std::{io, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use super::utils::event_types;
+use super::utils::{event_types, generate_id};
+use crate::{
+    mcp::McpClientManager,
+    protocols::responses::{ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
+    routers::header_utils::apply_request_headers,
+};
 
 // ============================================================================
 // Configuration and State Types
@@ -126,8 +129,8 @@ impl FunctionCallInProgress {
 // ============================================================================
 
 /// Build a request-scoped MCP manager from request tools, if present.
-pub(super) async fn mcp_manager_from_request_tools(
-    tools: &[crate::protocols::spec::ResponseTool],
+pub async fn mcp_manager_from_request_tools(
+    tools: &[ResponseTool],
 ) -> Option<Arc<McpClientManager>> {
     let tool = tools
         .iter()
@@ -335,7 +338,7 @@ pub(super) fn build_resume_payload(
             input_array.push(user_item);
         }
         ResponseInput::Items(items) => {
-            // Items are already structured ResponseInputOutputItem, convert to JSON
+            // Items are ResponseInputOutputItem (including SimpleInputMessage), convert to JSON
             if let Ok(items_value) = to_value(items) {
                 if let Some(items_arr) = items_value.as_array() {
                     input_array.extend_from_slice(items_arr);
@@ -689,9 +692,13 @@ pub(super) async fn execute_tool_loop(
             if state.total_calls > 0 {
                 let server_label = original_body
                     .tools
-                    .iter()
-                    .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-                    .and_then(|t| t.server_label.as_deref())
+                    .as_ref()
+                    .and_then(|tools| {
+                        tools
+                            .iter()
+                            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                            .and_then(|t| t.server_label.as_deref())
+                    })
                     .unwrap_or("mcp");
 
                 // Build mcp_list_tools item
@@ -747,9 +754,13 @@ pub(super) fn build_incomplete_response(
     if let Some(output_array) = obj.get_mut("output").and_then(|v| v.as_array_mut()) {
         let server_label = original_body
             .tools
-            .iter()
-            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-            .and_then(|t| t.server_label.as_deref())
+            .as_ref()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                    .and_then(|t| t.server_label.as_deref())
+            })
             .unwrap_or("mcp");
 
         // Find any function_call items and convert them to mcp_call (incomplete)
@@ -825,17 +836,6 @@ pub(super) fn build_incomplete_response(
 // Output Item Builders
 // ============================================================================
 
-/// Generate a unique ID for MCP output items (similar to OpenAI format)
-pub(super) fn generate_mcp_id(prefix: &str) -> String {
-    use rand::RngCore;
-    let mut rng = rand::rng();
-    // Generate exactly 50 hex characters (25 bytes) for the part after the underscore
-    let mut bytes = [0u8; 25];
-    rng.fill_bytes(&mut bytes);
-    let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("{}_{}", prefix, hex_string)
-}
-
 /// Build an mcp_list_tools output item
 pub(super) fn build_mcp_list_tools_item(mcp: &Arc<McpClientManager>, server_label: &str) -> Value {
     let tools = mcp.list_tools();
@@ -858,7 +858,7 @@ pub(super) fn build_mcp_list_tools_item(mcp: &Arc<McpClientManager>, server_labe
         .collect();
 
     json!({
-        "id": generate_mcp_id("mcpl"),
+        "id": generate_id("mcpl"),
         "type": event_types::ITEM_TYPE_MCP_LIST_TOOLS,
         "server_label": server_label,
         "tools": tools_json
@@ -875,7 +875,7 @@ pub(super) fn build_mcp_call_item(
     error: Option<&str>,
 ) -> Value {
     json!({
-        "id": generate_mcp_id("mcp"),
+        "id": generate_id("mcp"),
         "type": event_types::ITEM_TYPE_MCP_CALL,
         "status": if success { "completed" } else { "failed" },
         "approval_request_id": Value::Null,
