@@ -5,7 +5,7 @@ WORKDIR /app
 # System deps needed by runtime and healthcheck + NVIDIA CUDA Toolkit 12.8
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl gnupg ca-certificates dnsutils libnuma1 numactl wget ibutils \
-    build-essential gcc g++ python3-dev && \
+    build-essential gcc g++ python3-dev pkg-config libssl-dev protobuf-compiler libprotobuf-dev && \
     wget -qO /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
     dpkg -i /tmp/cuda-keyring.deb && rm -f /tmp/cuda-keyring.deb && \
     apt-get update && apt-get install -y --no-install-recommends cuda-toolkit-12-8 && \
@@ -32,6 +32,12 @@ RUN pip install --no-cache-dir -r ./requirements.txt
 
 COPY python /opt/sglang-src/python
 RUN pip install --no-cache-dir -e /opt/sglang-src/python[all]
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+COPY sgl-router /opt/sglang-router
+RUN cd /opt/sglang-router && pip install --no-cache-dir -e .
 
 COPY .hathora_build/app /app/
 RUN chmod +x /app/entrypoint.sh

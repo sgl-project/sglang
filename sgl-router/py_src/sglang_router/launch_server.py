@@ -196,8 +196,9 @@ def main():
     # Update router args with worker URLs
     # Use grpc:// protocol if server is in gRPC mode, otherwise http://
     protocol = "grpc" if server_args.grpc_mode else "http"
+    worker_host = "127.0.0.1" if server_args.host in ("0.0.0.0", "::") else server_args.host
     router_args.worker_urls = [
-        f"{protocol}://{server_args.host}:{port}" for port in worker_ports
+        f"{protocol}://{worker_host}:{port}" for port in worker_ports
     ]
 
     # Start the router
