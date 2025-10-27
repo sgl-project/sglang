@@ -12,6 +12,7 @@ import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
+    get_context_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -20,7 +21,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -41,6 +42,7 @@ _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
 
@@ -61,7 +63,7 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        if is_extend_in_batch:
+        if not _is_npu and is_extend_in_batch:
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
@@ -263,7 +265,7 @@ def initialize_dp_attention(
 
     enable_dp_attention = server_args.enable_dp_attention
     tp_size = server_args.tp_size
-    dp_size = server_args.dp_size
+    dp_size = max(server_args.dp_size, server_args.cp_size)
     moe_dense_tp_size = server_args.moe_dense_tp_size
     pp_size = server_args.pp_size
 
@@ -530,6 +532,11 @@ def dp_scatter(
 ):
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
+    if get_context_model_parallel_world_size() > 1:
+        local_tokens[...] = global_tokens.tensor_split(get_attention_dp_size())[
+            get_attention_dp_rank()
+        ]
+        return
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
     local_tokens.fill_(0)

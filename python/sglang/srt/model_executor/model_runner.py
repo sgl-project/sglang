@@ -248,6 +248,8 @@ class ModelRunner:
         moe_ep_size: int,
         pp_rank: int,
         pp_size: int,
+        cp_rank: int,
+        cp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
@@ -266,6 +268,8 @@ class ModelRunner:
         self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.cp_rank = cp_rank
+        self.cp_size = cp_size
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -641,6 +645,7 @@ class ModelRunner:
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
+                context_model_parallel_size=self.cp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 torch_compile=self.server_args.enable_piecewise_cuda_graph,
@@ -792,7 +797,9 @@ class ModelRunner:
             )
 
         self.dtype = self.model_config.dtype
-
+        gc.collect()
+        if _is_npu:
+            torch_npu.npu.empty_cache()
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         logger.info(

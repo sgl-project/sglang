@@ -8,17 +8,35 @@ from einops import rearrange
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.utils import add_prefix, align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    align,
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_npu,
+)
 
 if is_cuda():
     try:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
+elif is_npu():
+    import torch_npu
 
+from sglang.srt.distributed import (
+    context_model_parallel_all_gather,
+    get_context_model_parallel_rank,
+    get_context_model_parallel_world_size,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM
-from sglang.srt.layers.dp_attention import get_attention_tp_group
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -158,6 +176,10 @@ class Indexer(CustomOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        self.cp_size = get_context_model_parallel_world_size()
+        self.cp_rank = get_context_model_parallel_rank()
+        self.attention_tp_rank = get_attention_tp_rank()
+        self.attention_tp_size = get_attention_tp_size()
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, weights: torch.Tensor, q_scale: torch.Tensor):
@@ -648,15 +670,6 @@ class Indexer(CustomOp):
         forward_batch: ForwardBatch,
         layer_id: int,
     ) -> torch.Tensor:
-        import custom_ops  # noqa: F401
-        import torch_npu
-
-        from sglang.srt.layers.dp_attention import (
-            get_attention_tp_rank,
-            get_attention_tp_size,
-        )
-        from sglang.srt.utils import get_bool_env_var
-
         if forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = forward_batch.attn_backend.forward_metadata.seq_lens
         else:
@@ -667,29 +680,29 @@ class Indexer(CustomOp):
             get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA") and layer_id >= 4
         )
         is_prefill = forward_batch.forward_mode.is_extend()
-
-        attention_tp_rank = get_attention_tp_rank()
-        attention_tp_size = get_attention_tp_size()
-
         cos_sin = self.rotary_emb.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
         sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
-        if is_prefill and enable_index_cp:
-            slice_length = cos.shape[0] // attention_tp_size
-            cos = cos[
-                slice_length
-                * attention_tp_rank : slice_length
-                * (attention_tp_rank + 1)
-            ]
-            sin = sin[
-                slice_length
-                * attention_tp_rank : slice_length
-                * (attention_tp_rank + 1)
-            ]
-
-        slot_mapping = forward_batch.out_cache_loc
-        block_table = forward_batch.attn_backend.forward_metadata.block_tables
+        if is_prefill:
+            assert not (enable_index_cp and self.cp_size > 1)
+            if (
+                self.cp_size > 1
+            ):  # todo(zyj),  can split position at first layer only once
+                cos = cos.tensor_split(self.cp_size)[self.cp_rank]
+                sin = sin.tensor_split(self.cp_size)[self.cp_rank]
+            if enable_index_cp:
+                slice_length = cos.shape[0] // self.attention_tp_size
+                cos = cos[
+                    slice_length
+                    * self.attention_tp_rank : slice_length
+                    * (self.attention_tp_rank + 1)
+                ]
+                sin = sin[
+                    slice_length
+                    * self.attention_tp_rank : slice_length
+                    * (self.attention_tp_rank + 1)
+                ]
 
         bs = x.shape[0]
 
@@ -721,40 +734,47 @@ class Indexer(CustomOp):
         )  # [bs, 1, d]
         k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)  # [bs, 1, 128]
 
-        if is_prefill and enable_index_cp:
-            k, local_k = (
-                torch.empty(
-                    (k.shape[0] * attention_tp_size, k.shape[1], k.shape[2]),
-                    dtype=k.dtype,
-                    device=k.device,
-                ),
-                k,
-            )
-            get_attention_tp_group().all_gather_into_tensor(k, local_k)
+        if is_prefill:
+            if enable_index_cp:
+                k, local_k = (
+                    torch.empty(
+                        (k.shape[0] * self.attention_tp_size, k.shape[1], k.shape[2]),
+                        dtype=k.dtype,
+                        device=k.device,
+                    ),
+                    k,
+                )
+                get_attention_tp_group().all_gather_into_tensor(k, local_k)
+            if self.cp_size > 1:
+                k = context_model_parallel_all_gather(k, 0)
 
-        forward_batch.token_to_kv_pool.set_index_k_buffer(layer_id, slot_mapping, k)
+        forward_batch.token_to_kv_pool.set_index_k_buffer(
+            layer_id, forward_batch.out_cache_loc, k
+        )
 
-        indexer_input = {}
         if is_prefill:
             actual_seq_lengths_kv = forward_batch.seq_lens.to(device=q.device)
             actual_seq_lengths_q = forward_batch.seq_lens.cumsum(dim=0).to(
                 device=q.device
             )
             if enable_index_cp:
-                actual_seq_lengths_q -= bs * attention_tp_rank
-                actual_seq_lengths_q = torch.max(
-                    actual_seq_lengths_q,
-                    torch.zeros_like(actual_seq_lengths_q).to(
-                        device=actual_seq_lengths_q.device
-                    ),
+                rank_offset = (
+                    self.attention_tp_rank + self.attention_tp_size * self.cp_rank
                 )
-                actual_seq_lengths_q = torch.min(
-                    actual_seq_lengths_q,
-                    torch.full(actual_seq_lengths_q.shape, bs).to(
-                        device=actual_seq_lengths_q.device
-                    ),
-                )
-
+            elif self.cp_size > 1:
+                rank_offset = self.cp_rank
+            else:
+                rank_offset = None
+            if rank_offset is not None:
+                actual_seq_lengths_q -= bs * rank_offset
+                actual_seq_lengths_q.clip_(min=0, max=bs)
+                total_num = bs * (rank_offset + 1)
+                for i in range(len(actual_seq_lengths_kv)):
+                    if total_num <= actual_seq_lengths_kv[i]:
+                        actual_seq_lengths_kv[i] = total_num
+                        total_num = 0
+                    else:
+                        total_num -= actual_seq_lengths_kv[i]
         else:
             if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
                 actual_seq_lengths_q = torch.tensor(
@@ -766,9 +786,8 @@ class Indexer(CustomOp):
                 )
 
         past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
-
-        x = x.view(-1, self.hidden_size)
-        weights = self.weights_proj(x)[0]
+        weights = self.weights_proj(x.view(-1, self.hidden_size))[0]
+        block_table = forward_batch.attn_backend.forward_metadata.block_tables
         block_table = (
             block_table[: actual_seq_lengths_q.size()[0]] if is_prefill else block_table
         )
@@ -790,7 +809,7 @@ class Indexer(CustomOp):
             topk_indices, local_topk_indices = (
                 torch.empty(
                     (
-                        topk_indices.shape[0] * attention_tp_size,
+                        topk_indices.shape[0] * self.attention_tp_size,
                         topk_indices.shape[1],
                         topk_indices.shape[2],
                     ),
