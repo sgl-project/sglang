@@ -253,7 +253,7 @@ class LogitsProcessor(nn.Module):
         hidden_states,
         lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
-        aux_hidden_states: Optional[torch.Tensor] = None,
+        aux_hidden_states: Optional[List[torch.Tensor]] = None,
     ) -> LogitsProcessorOutput:
 
         # Similar to HuggingFace's convention, it is not always the case to expect
