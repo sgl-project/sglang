@@ -232,6 +232,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    device=server_args.device,
                 )
                 self._initialize_multi_item_delimiter_text()
 
