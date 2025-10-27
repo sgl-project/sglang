@@ -178,14 +178,16 @@ RUN cd /sgl-workspace/DeepEP && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
 
 # Install flashmla
-RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
+RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
+    git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
       cd flash-mla && \
       git checkout ${FLASHMLA_COMMIT} && \
       git submodule update --init --recursive && \
       if [ "$CUDA_VERSION" = "12.6.1" ]; then \
         export FLASH_MLA_DISABLE_SM100=1; \
       fi && \
-      pip install --no-build-isolation -v . ;
+      pip install --no-build-isolation -v . ; \
+    fi
 
 # In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
 # latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
