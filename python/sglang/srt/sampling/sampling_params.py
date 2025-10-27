@@ -66,6 +66,7 @@ class SamplingParams:
     stop_strs: Optional[Union[str, List[str]]] = field(init=False, default=None)
     stop_regex_strs: Optional[Union[str, List[str]]] = field(init=False, default=None)
     stop_str_max_len: int = field(init=False, default=0)
+    stop_regex_max_len: int = field(init=False, default=0)
 
     def __post_init__(self, stop, stop_regex):
         self.stop_strs = stop
