@@ -14,16 +14,15 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    core::{
-        workflow::{
-            WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus,
-        },
-        WorkerManager,
+    core::workflow::{
+        steps::{McpServerConfigRequest, WorkerRemovalRequest},
+        WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus,
     },
+    mcp::McpConfig,
     metrics::RouterMetrics,
     protocols::worker_spec::{JobStatus, WorkerConfigRequest},
-    server::AppContext,
 };
 
 /// Job types for control plane operations
@@ -32,6 +31,8 @@ pub enum Job {
     AddWorker { config: Box<WorkerConfigRequest> },
     RemoveWorker { url: String },
     InitializeWorkersFromConfig { router_config: Box<RouterConfig> },
+    InitializeMcpServers { mcp_config: Box<McpConfig> },
+    RegisterMcpServer { config: Box<McpServerConfigRequest> },
 }
 
 impl Job {
@@ -41,15 +42,19 @@ impl Job {
             Job::AddWorker { .. } => "AddWorker",
             Job::RemoveWorker { .. } => "RemoveWorker",
             Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
+            Job::InitializeMcpServers { .. } => "InitializeMcpServers",
+            Job::RegisterMcpServer { .. } => "RegisterMcpServer",
         }
     }
 
-    /// Get worker URL for logging
+    /// Get worker URL or MCP server name for logging
     pub fn worker_url(&self) -> &str {
         match self {
             Job::AddWorker { config } => &config.url,
             Job::RemoveWorker { url } => url,
             Job::InitializeWorkersFromConfig { .. } => "startup",
+            Job::InitializeMcpServers { .. } => "startup",
+            Job::RegisterMcpServer { config } => &config.name,
         }
     }
 }
@@ -139,7 +144,7 @@ impl JobQueue {
     pub fn new(config: JobQueueConfig, context: Weak<AppContext>) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(config.queue_capacity);
 
-        info!(
+        debug!(
             "Initializing worker job queue: capacity={}, workers={}",
             config.queue_capacity, config.worker_count
         );
@@ -194,7 +199,7 @@ impl JobQueue {
             Ok(_) => {
                 let queue_depth = self.tx.max_capacity() - self.tx.capacity();
                 RouterMetrics::set_job_queue_depth(queue_depth);
-                info!(
+                debug!(
                     "Job submitted: type={}, worker={}, queue_depth={}",
                     job_type, worker_url, queue_depth
                 );
@@ -225,7 +230,7 @@ impl JobQueue {
         context: Weak<AppContext>,
         status_map: Arc<DashMap<String, JobStatus>>,
     ) {
-        info!("Worker job queue worker {} started", worker_id);
+        debug!("Worker job queue worker {} started", worker_id);
 
         loop {
             // Lock the receiver and try to receive a job
@@ -246,7 +251,7 @@ impl JobQueue {
                         JobStatus::processing(&job_type, &worker_url),
                     );
 
-                    info!(
+                    debug!(
                         "Worker {} processing job: type={}, worker={}",
                         worker_id, job_type, worker_url
                     );
@@ -289,7 +294,7 @@ impl JobQueue {
             }
         }
 
-        warn!("Worker job queue worker {} stopped", worker_id);
+        debug!("Worker job queue worker {} stopped", worker_id);
     }
 
     /// Execute a specific job
@@ -303,7 +308,7 @@ impl JobQueue {
 
                 let instance_id = Self::start_worker_workflow(engine, config, context).await?;
 
-                info!(
+                debug!(
                     "Started worker registration workflow for {} (instance: {})",
                     config.url, instance_id
                 );
@@ -320,11 +325,29 @@ impl JobQueue {
                 .await
             }
             Job::RemoveWorker { url } => {
-                let result = WorkerManager::remove_worker(url, context);
+                let engine = context
+                    .workflow_engine
+                    .get()
+                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+
+                let instance_id = Self::start_worker_removal_workflow(engine, url, context).await?;
+
+                debug!(
+                    "Started worker removal workflow for {} (instance: {})",
+                    url, instance_id
+                );
+
+                let timeout_duration = Duration::from_secs(30);
+
+                let result =
+                    Self::wait_for_workflow_completion(engine, instance_id, url, timeout_duration)
+                        .await;
+
                 // Clean up job status when removing worker
                 if let Some(queue) = context.worker_job_queue.get() {
                     queue.remove_status(url);
                 }
+
                 result
             }
             Job::InitializeWorkersFromConfig { router_config } => {
@@ -357,7 +380,7 @@ impl JobQueue {
                     }
                 };
 
-                info!(
+                debug!(
                     "Creating AddWorker jobs for {} workers from config",
                     workers.len()
                 );
@@ -405,6 +428,64 @@ impl JobQueue {
 
                 Ok(format!("Submitted {} AddWorker jobs", worker_count))
             }
+            Job::InitializeMcpServers { mcp_config } => {
+                let mut server_count = 0;
+
+                debug!(
+                    "Creating RegisterMcpServer jobs for {} MCP servers from config",
+                    mcp_config.servers.len()
+                );
+
+                // Submit RegisterMcpServer jobs for each server in the config
+                for server_config in &mcp_config.servers {
+                    let mcp_server_request = McpServerConfigRequest {
+                        name: server_config.name.clone(),
+                        config: server_config.clone(),
+                    };
+
+                    let job = Job::RegisterMcpServer {
+                        config: Box::new(mcp_server_request),
+                    };
+
+                    if let Some(queue) = context.worker_job_queue.get() {
+                        queue.submit(job).await.map_err(|e| {
+                            format!(
+                                "Failed to submit RegisterMcpServer job for '{}': {}",
+                                server_config.name, e
+                            )
+                        })?;
+                        server_count += 1;
+                    } else {
+                        return Err("JobQueue not available".to_string());
+                    }
+                }
+
+                Ok(format!("Submitted {} RegisterMcpServer jobs", server_count))
+            }
+            Job::RegisterMcpServer { config } => {
+                let engine = context
+                    .workflow_engine
+                    .get()
+                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+
+                let instance_id =
+                    Self::start_mcp_registration_workflow(engine, config, context).await?;
+
+                debug!(
+                    "Started MCP registration workflow for {} (instance: {})",
+                    config.name, instance_id
+                );
+
+                let timeout_duration = Duration::from_secs(7200 + 30); // 2hr + margin
+
+                Self::wait_for_workflow_completion(
+                    engine,
+                    instance_id,
+                    &config.name,
+                    timeout_duration,
+                )
+                .await
+            }
         }
     }
 
@@ -422,6 +503,43 @@ impl JobQueue {
             .start_workflow(WorkflowId::new("worker_registration"), workflow_context)
             .await
             .map_err(|e| format!("Failed to start worker registration workflow: {:?}", e))
+    }
+
+    /// Start worker removal workflow
+    async fn start_worker_removal_workflow(
+        engine: &Arc<WorkflowEngine>,
+        url: &str,
+        context: &Arc<AppContext>,
+    ) -> Result<WorkflowInstanceId, String> {
+        let removal_request = WorkerRemovalRequest {
+            url: url.to_string(),
+            dp_aware: context.router_config.dp_aware,
+        };
+
+        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
+        workflow_context.set("removal_request", removal_request);
+        workflow_context.set_arc("app_context", Arc::clone(context));
+
+        engine
+            .start_workflow(WorkflowId::new("worker_removal"), workflow_context)
+            .await
+            .map_err(|e| format!("Failed to start worker removal workflow: {:?}", e))
+    }
+
+    /// Start MCP server registration workflow
+    async fn start_mcp_registration_workflow(
+        engine: &Arc<WorkflowEngine>,
+        config: &McpServerConfigRequest,
+        context: &Arc<AppContext>,
+    ) -> Result<WorkflowInstanceId, String> {
+        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
+        workflow_context.set("mcp_server_config", config.clone());
+        workflow_context.set_arc("app_context", Arc::clone(context));
+
+        engine
+            .start_workflow(WorkflowId::new("mcp_registration"), workflow_context)
+            .await
+            .map_err(|e| format!("Failed to start MCP registration workflow: {:?}", e))
     }
 
     /// Wait for workflow completion with adaptive polling
@@ -501,7 +619,7 @@ impl JobQueue {
             Ok(message) => {
                 RouterMetrics::record_job_success(job_type);
                 status_map.remove(worker_url);
-                info!(
+                debug!(
                     "Worker {} completed job: type={}, worker={}, duration={:.3}s, result={}",
                     worker_id,
                     job_type,

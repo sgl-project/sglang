@@ -94,6 +94,8 @@ class RouterArgs:
     tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    # MCP server configuration
+    mcp_config_path: Optional[str] = None
     # Backend selection
     backend: str = "sglang"
     # History backend configuration
@@ -106,6 +108,10 @@ class RouterArgs:
     oracle_pool_min: int = 1
     oracle_pool_max: int = 16
     oracle_pool_timeout_secs: int = 30
+    # mTLS configuration for worker communication
+    client_cert_path: Optional[str] = None
+    client_key_path: Optional[str] = None
+    ca_cert_paths: List[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(
@@ -508,6 +514,13 @@ class RouterArgs:
             default=None,
             help="Specify the parser for handling tool-call interactions",
         )
+        # MCP server configuration
+        parser.add_argument(
+            f"--{prefix}mcp-config-path",
+            type=str,
+            default=None,
+            help="Path to MCP (Model Context Protocol) server configuration file",
+        )
         # Backend selection
         parser.add_argument(
             f"--{prefix}backend",
@@ -574,6 +587,26 @@ class RouterArgs:
                 os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)
             ),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
+        )
+        # mTLS configuration
+        parser.add_argument(
+            f"--{prefix}client-cert-path",
+            type=str,
+            default=None,
+            help="Path to client certificate for mTLS authentication with workers",
+        )
+        parser.add_argument(
+            f"--{prefix}client-key-path",
+            type=str,
+            default=None,
+            help="Path to client private key for mTLS authentication with workers",
+        )
+        parser.add_argument(
+            f"--{prefix}ca-cert-paths",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Path(s) to CA certificate(s) for verifying worker TLS certificates. Can specify multiple CAs.",
         )
 
     @classmethod
