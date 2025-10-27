@@ -52,6 +52,8 @@ def history_backend_from_str(backend_str: Optional[str]) -> HistoryBackendType:
         return getattr(HistoryBackendType, "None")
     elif backend_lower == "oracle":
         return HistoryBackendType.Oracle
+    elif backend_lower == "postgres":
+        return HistoryBackendType.Postgres
     else:
         raise ValueError(f"Unknown history backend: {backend_str}")
 
@@ -185,7 +187,14 @@ class Router:
             )
         args_dict["oracle_config"] = oracle_config
         args_dict["history_backend"] = history_backend
-
+        
+        # Convert Postgres config if needed
+        if history_backend == HistoryBackendType.Postgres:
+            postgres_dsn = args_dict.get("postgres_dsn")
+            if not postgres_dsn:
+                raise ValueError("Postgres DSN must be provided for Postgres history backend.")
+            args_dict["postgres_dsn"] = postgres_dsn
+            
         # Remove fields that shouldn't be passed to Rust Router constructor
         fields_to_remove = [
             "mini_lb",
