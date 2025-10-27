@@ -1,6 +1,6 @@
 import uvicorn
 import zmq
-import asyncio
+import time
 import zmq.asyncio
 import torch
 
@@ -87,21 +87,18 @@ class ImageEncoder:
         self.wait_queue = deque()
         
         self.encode_task = None
-        
+    
+    @torch.inference_mode()
     def encode(self,mm_items):
-        mm_embeddings = []
-        # To avoid OOM, we process image one by one
-        for mm_item in mm_items:
-            image = load_images(mm_item)
-            image_input = self.image_processor(images=image)
-            mm_item = MultimodalDataItem.from_dict({
-                'modality':Modality.IMAGE,
-                'feature':image_input['pixel_values'],
-            })
-            mm_item.set('image_grid_thw', image_input['image_grid_thw'])
-            mm_embedding = self.model.get_image_feature([mm_item])
-            mm_embeddings.append(mm_embedding)
-        return torch.concatenate(mm_embeddings)
+        images = load_images(mm_items)
+        images_input = self.image_processor(images=images)
+        mm_item = MultimodalDataItem.from_dict({
+            'modality':Modality.IMAGE,
+            'feature':images_input['pixel_values'],
+        })
+        mm_item.set('image_grid_thw', images_input['image_grid_thw'])
+        mm_embedding = self.model.get_image_feature([mm_item])
+        return mm_embedding
     
     def add(self,request_data):
         self.wait_queue.append(request_data)
