@@ -181,6 +181,7 @@ jobs:
 
       - name: Setup Oracle Instant Client
         run: |
+          sudo apt-get install -y unzip
           INSTANT_CLIENT_DIR="/home/ubuntu/instant-client"
           INSTANT_CLIENT_ZIP="instantclient-basic-linux.x64-23.9.0.25.07.zip"
 
