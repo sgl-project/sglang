@@ -325,7 +325,7 @@ async fn route_responses_background(
         top_p: request.top_p,
         truncation: None,
         usage: None,
-        safety_identifier:request.safety_identifier.clone(),
+        safety_identifier: request.safety_identifier.clone(),
         metadata: request.metadata.clone().unwrap_or_default(),
     };
 

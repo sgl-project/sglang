@@ -100,7 +100,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
-        safety_identifier: None
+        safety_identifier: None,
     };
 
     let resp = router
