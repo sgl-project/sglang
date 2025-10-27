@@ -137,11 +137,7 @@ class MooncakeStoreConfig:
 
 class MooncakeStore(HiCacheStorage):
 
-    def __init__(
-        self,
-        storage_config: HiCacheStorageConfig,
-        bytes_per_page: int,
-    ):
+    def __init__(self, storage_config: HiCacheStorageConfig):
         try:
             from mooncake.store import MooncakeDistributedStore
         except ImportError as e:
@@ -218,7 +214,7 @@ class MooncakeStore(HiCacheStorage):
                 self.is_mla_backend = False
                 self.local_rank = 0
 
-            self.gb_per_page = bytes_per_page / (1 << 30)
+            self.gb_per_page = None
             self.prefetch_pgs = []
             self.backup_pgs = []
             self.prefetch_bandwidth = []
@@ -287,6 +283,9 @@ class MooncakeStore(HiCacheStorage):
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
+
+        bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
+        self.gb_per_page = bytes_per_page / (1 << 30)
 
     def _get_mha_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
