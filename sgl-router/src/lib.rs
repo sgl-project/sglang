@@ -44,6 +44,7 @@ pub enum HistoryBackendType {
     Memory,
     None,
     Oracle,
+    Postgres,
 }
 
 #[pyclass]
@@ -140,6 +141,30 @@ impl PyOracleConfig {
 
 #[pyclass]
 #[derive(Debug, Clone, PartialEq)]
+pub struct PyPostgresConfig {
+    #[pyo3(get, set)]
+    pub db_url: Option<String>,
+}
+
+#[pymethods]
+impl PyPostgresConfig {
+    #[new]
+    #[pyo3(signature = (db_url = None))]
+    fn new(db_url: Option<String>) -> PyResult<Self> {
+        Ok(PyPostgresConfig { db_url })
+    }
+}
+
+impl PyPostgresConfig {
+    fn to_config_postgres(&self) -> config::PostgresConfig {
+        config::PostgresConfig {
+            db_url: self.db_url.clone().unwrap_or_default(),
+        }
+    }
+}
+
+#[pyclass]
+#[derive(Debug, Clone, PartialEq)]
 struct Router {
     host: String,
     port: u16,
@@ -209,6 +234,7 @@ struct Router {
     backend: BackendType,
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
+    postgres_config: Option<PyPostgresConfig>,
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
@@ -297,12 +323,21 @@ impl Router {
             HistoryBackendType::Memory => config::HistoryBackend::Memory,
             HistoryBackendType::None => config::HistoryBackend::None,
             HistoryBackendType::Oracle => config::HistoryBackend::Oracle,
+            HistoryBackendType::Postgres => config::HistoryBackend::Postgres,
         };
 
         let oracle = if matches!(self.history_backend, HistoryBackendType::Oracle) {
             self.oracle_config
                 .as_ref()
                 .map(|cfg| cfg.to_config_oracle())
+        } else {
+            None
+        };
+
+        let postgres_config = if matches!(self.history_backend, HistoryBackendType::Postgres) {
+            self.postgres_config
+                .as_ref()
+                .map(|cfg| cfg.to_config_postgres())
         } else {
             None
         };
@@ -359,6 +394,7 @@ impl Router {
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
             .maybe_oracle(oracle)
+            .maybe_postgres(postgres_config)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
@@ -446,6 +482,7 @@ impl Router {
         backend = BackendType::Sglang,
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
+        postgres_config = None,
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
@@ -519,6 +556,7 @@ impl Router {
         backend: BackendType,
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
+        postgres_config: Option<PyPostgresConfig>,
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
@@ -606,6 +644,7 @@ impl Router {
             backend,
             history_backend,
             oracle_config,
+            postgres_config,
             client_cert_path,
             client_key_path,
             ca_cert_paths,

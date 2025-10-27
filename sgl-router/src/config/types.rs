@@ -53,6 +53,9 @@ pub struct RouterConfig {
     /// Required when history_backend = "oracle"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle: Option<OracleConfig>,
+    /// Required when history_backend = "postgres"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<PostgresConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)
     pub reasoning_parser: Option<String>,
     /// For tool-call interactions
@@ -123,6 +126,7 @@ pub enum HistoryBackend {
     Memory,
     None,
     Oracle,
+    Postgres,
 }
 
 /// Oracle history backend configuration
@@ -180,6 +184,13 @@ impl std::fmt::Debug for OracleConfig {
             .field("pool_timeout_secs", &self.pool_timeout_secs)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PostgresConfig {
+    // Database connection URL,
+    // postgres://[user[:password]@][netloc][:port][/dbname][?param1=value1&...]
+    pub db_url: String,
 }
 
 /// Routing mode configuration
@@ -431,6 +442,7 @@ impl Default for RouterConfig {
             chat_template: None,
             history_backend: default_history_backend(),
             oracle: None,
+            postgres: None,
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),

@@ -14,7 +14,12 @@ use super::{
     noop::{NoOpConversationItemStorage, NoOpConversationStorage, NoOpResponseStorage},
     oracle::{OracleConversationItemStorage, OracleConversationStorage, OracleResponseStorage},
 };
-use crate::config::{HistoryBackend, OracleConfig, RouterConfig};
+use crate::{
+    config::{HistoryBackend, OracleConfig, RouterConfig},
+    data_connector::postgres::{
+        PostgresConversationItemStorage, PostgresConversationStorage, PostgresResponseStorage,
+    },
+};
 
 /// Type alias for the storage tuple returned by factory functions.
 /// This avoids clippy::type_complexity warnings while keeping Arc explicit.
@@ -67,6 +72,32 @@ pub fn create_storage(config: &RouterConfig) -> Result<StorageTuple, String> {
 
             info!("Data connector initialized successfully: Oracle ATP");
             Ok(storages)
+        }
+        HistoryBackend::Postgres => {
+            let postgres_cfg = config
+                .postgres
+                .clone()
+                .ok_or("Postgres configuration is required when history_backend=postgres")?;
+            info!(
+                "Initializing data connector: Postgres (db_url: {})",
+                postgres_cfg.db_url
+            );
+            let postgres_resp = PostgresResponseStorage::new(postgres_cfg.clone())
+                .map_err(|err| format!("failed to initialize Postgres response storage: {err}"))?;
+            let postgres_conv =
+                PostgresConversationStorage::new(postgres_cfg.clone()).map_err(|err| {
+                    format!("failed to initialize Postgres conversation storage: {err}")
+                })?;
+            let postgres_item = PostgresConversationItemStorage::new(postgres_cfg.clone())
+                .map_err(|err| {
+                    format!("failed to initialize Postgres conversation item storage: {err}")
+                })?;
+            info!("Data connector initialized successfully: Postgres");
+            Ok((
+                Arc::new(postgres_resp),
+                Arc::new(postgres_conv),
+                Arc::new(postgres_item),
+            ))
         }
     }
 }
