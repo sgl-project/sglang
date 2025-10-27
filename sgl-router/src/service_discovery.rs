@@ -593,6 +593,7 @@ mod tests {
             configured_tool_parser: None,
             worker_job_queue: Arc::new(std::sync::OnceLock::new()),
             workflow_engine: Arc::new(std::sync::OnceLock::new()),
+            mcp_manager: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
