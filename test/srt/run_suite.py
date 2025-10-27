@@ -177,10 +177,10 @@ suites = {
         TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
-        TestFile("test_llama31_fp4.py", 120),
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_llama31_fp4.py", 300),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
