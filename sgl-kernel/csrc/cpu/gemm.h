@@ -66,16 +66,7 @@ at::Tensor convert_weight_packed(at::Tensor& weight);
 
 // pack weight to vnni format for int4
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
-convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales, bool is_w4a8);
-
-// int4 gemm with act quant
-at::Tensor int4_scaled_mm_cpu_with_quant(
-    const at::Tensor& input,
-    const at::Tensor& weight,
-    const at::Tensor& weight_scales,
-    const at::Tensor& weight_qzeros,
-    const std::optional<at::Tensor>& bias,
-    at::ScalarType output_dtype);
+convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales);
 
 // moe implementations for int8 w8a8
 template <typename scalar_t>
@@ -150,35 +141,6 @@ void shared_expert_int8_kernel_impl(
     int64_t N,
     int64_t K);
 
-// moe implementations for int4 w4a16
-template <typename scalar_t>
-void fused_experts_int4_w4a16_kernel_impl(
-    scalar_t* __restrict__ output,
-    scalar_t* __restrict__ ic0,
-    scalar_t* __restrict__ ic1,
-    scalar_t* __restrict__ ic2,
-    scalar_t* __restrict__ A_tmp,
-    scalar_t* __restrict__ B_tmp,
-    float* __restrict__ C_tmp,
-    const scalar_t* __restrict__ input,
-    const at::quint4x2* __restrict__ packed_w1,
-    const at::quint4x2* __restrict__ packed_w2,
-    const uint8_t* __restrict__ w1z,
-    const uint8_t* __restrict__ w2z,
-    const scalar_t* __restrict__ w1s,
-    const scalar_t* __restrict__ w2s,
-    int group_size,
-    const float* __restrict__ topk_weights,
-    const int32_t* __restrict__ sorted_ids,
-    const int32_t* __restrict__ expert_ids,
-    const int32_t* __restrict__ offsets,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t E,
-    int64_t topk,
-    int64_t num_tokens_post_pad);
-
 template <typename scalar_t>
 void fused_experts_int4_w4a8_kernel_impl(
     scalar_t* __restrict__ output,
@@ -228,26 +190,6 @@ void shared_expert_fp8_kernel_impl(
     int64_t M,
     int64_t N,
     int64_t K);
-
-template <typename scalar_t>
-void tinygemm_kernel(
-    const scalar_t* __restrict__ A,
-    const at::quint4x2* __restrict__ B,
-    scalar_t* __restrict__ C,
-    const uint8_t* __restrict__ Bz,
-    const scalar_t* __restrict__ Bs,
-    scalar_t* __restrict__ Btmp,
-    float* __restrict__ Ctmp,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int group_size,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    int64_t strideBz,
-    int64_t strideBs,
-    bool brg);
 
 // tinygemm interface
 template <typename scalar_t>

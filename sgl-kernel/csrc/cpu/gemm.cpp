@@ -588,73 +588,41 @@ std::tuple<at::Tensor, at::Tensor> autoawq_to_int4pack(
 std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
     at::Tensor qweight,  // (*, K, N / 8), int32
     at::Tensor qzeros,   // (*, K / group_size, N / 8), int32
-    at::Tensor scales,   // (*, K / group_size, N), bfloat16
-    bool is_w4a8) {
+    at::Tensor scales    // (*, K / group_size, N), bfloat16
+) {
   auto res = autoawq_to_int4pack(qweight, qzeros);
   auto _qweight = std::get<0>(res);
   auto _qzeros = std::get<1>(res);
   auto _scales = scales;
-  if (is_w4a8) {
-    _qzeros = _qzeros.transpose(-2, -1).contiguous();  // .T
-    _scales = _scales.transpose(-2, -1).contiguous();
-    if (_qweight.dim() == 3) {  // Dim=3 for MOE packing, TODO: refine a unified loop
-      int E = _qweight.size(0);
-      int K = _qweight.size(2);
-      int G = _scales.size(2);
-      int group_size = K / G;
-      int block_k = group_size > 128 ? 128 : group_size;
-      int block_n = block_size_n();
-      int Nc = _qweight.size(1) / block_n;
-      int Kc = K / block_k;
-      int64_t buffer_size_nbytes = block_k * block_n / 2 + block_n * sizeof(int32_t);
-      auto blocked_weight = at::empty({E, Nc, Kc, buffer_size_nbytes}, _qweight.options());
-      auto blocked_scales = at::empty({E, Nc, G, block_n}, _scales.options()).to(at::kFloat);
-      auto blocked_qzeros = at::empty({E, Nc, G, block_n}, _qzeros.options()).to(at::kChar);
-      for (int i = 0; i < _qweight.size(0); i++) {
-        auto res_ = convert_int4_weight_packed_with_compensation(_qweight[i], _scales[i], _qzeros[i]);
-        blocked_weight[i] = std::get<0>(res_);
-        blocked_scales[i] = std::get<1>(res_);
-        blocked_qzeros[i] = std::get<2>(res_);
-      }
-      _qweight = blocked_weight;
-      _scales = blocked_scales;
-      _qzeros = blocked_qzeros;
-    } else {
-      auto res_ = convert_int4_weight_packed_with_compensation(_qweight, _scales, _qzeros);
-      _qweight = std::get<0>(res_);
-      _scales = std::get<1>(res_);
-      _qzeros = std::get<2>(res_);
+  _qzeros = _qzeros.transpose(-2, -1).contiguous();  // .T
+  _scales = _scales.transpose(-2, -1).contiguous();
+  if (_qweight.dim() == 3) {  // Dim=3 for MOE packing, TODO: refine a unified loop
+    int E = _qweight.size(0);
+    int K = _qweight.size(2);
+    int G = _scales.size(2);
+    int group_size = K / G;
+    int block_k = group_size > 128 ? 128 : group_size;
+    int block_n = block_size_n();
+    int Nc = _qweight.size(1) / block_n;
+    int Kc = K / block_k;
+    int64_t buffer_size_nbytes = block_k * block_n / 2 + block_n * sizeof(int32_t);
+    auto blocked_weight = at::empty({E, Nc, Kc, buffer_size_nbytes}, _qweight.options());
+    auto blocked_scales = at::empty({E, Nc, G, block_n}, _scales.options()).to(at::kFloat);
+    auto blocked_qzeros = at::empty({E, Nc, G, block_n}, _qzeros.options()).to(at::kChar);
+    for (int i = 0; i < _qweight.size(0); i++) {
+      auto res_ = convert_int4_weight_packed_with_compensation(_qweight[i], _scales[i], _qzeros[i]);
+      blocked_weight[i] = std::get<0>(res_);
+      blocked_scales[i] = std::get<1>(res_);
+      blocked_qzeros[i] = std::get<2>(res_);
     }
-
+    _qweight = blocked_weight;
+    _scales = blocked_scales;
+    _qzeros = blocked_qzeros;
   } else {
-    constexpr int BLOCK_N = 32;
-    constexpr int BIT_COUNT = 32;
-    auto sizes = _qweight.sizes().vec();
-    int64_t N = sizes[sizes.size() - 2];
-    int64_t K = sizes[sizes.size() - 1];
-
-    std::vector<int64_t> new_shape;
-    std::vector<int64_t> out_shape;
-    if (sizes.size() > 2) {
-      for (int i = 0; i < sizes.size() - 2; i++) {
-        new_shape.push_back(sizes[i]);
-        out_shape.push_back(sizes[i]);
-      }
-    }
-    new_shape.push_back(N / BLOCK_N);
-    new_shape.push_back(BLOCK_N);
-    new_shape.push_back(K / 2);
-    new_shape.push_back(2);
-    out_shape.push_back(N);
-    out_shape.push_back(K / 2);
-
-    _qweight = _qweight.reshape(new_shape);
-    _qweight = _qweight.transpose(-3, -2);  // swap BLOCK_N and K/2
-    _qweight = _qweight.reshape({-1, BIT_COUNT * 2});
-    auto high = _qweight.slice(1, BIT_COUNT, BIT_COUNT * 2);
-    auto low = _qweight.slice(1, 0, BIT_COUNT);
-    auto packed = at::bitwise_or(at::bitwise_left_shift(high, 4), low);
-    _qweight = packed.reshape(out_shape);
+    auto res_ = convert_int4_weight_packed_with_compensation(_qweight, _scales, _qzeros);
+    _qweight = std::get<0>(res_);
+    _scales = std::get<1>(res_);
+    _qzeros = std::get<2>(res_);
   }
 
   return std::make_tuple(_qweight, _qzeros, _scales);

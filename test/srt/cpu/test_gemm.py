@@ -189,7 +189,7 @@ class TestGemm(CustomTestCase):
             ):
                 self._fp8_gemm(*params)
 
-    def _int4_awq_gemm(self, M, N, K, group_size, has_bias, w4a8):
+    def _int4_awq_gemm(self, M, N, K, group_size, has_bias):
         awq_weight = torch.randint(-128, 128, (K, N // 8)).to(torch.int)
         awq_zero = torch.randint(0, 10, (K // group_size, N // 8)).to(torch.int)
         awq_scales = torch.rand(int(K // group_size), N).to(torch.bfloat16)
@@ -204,35 +204,26 @@ class TestGemm(CustomTestCase):
         ref_res = torch.nn.functional.linear(
             x, bf16_weight, bias=bias.to(torch.bfloat16) if has_bias else None
         )
-        if w4a8:
-            packed_weight, packed_zero, packed_scales = (
-                torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                    awq_weight, awq_zero, awq_scales, True
-                )
+
+        packed_weight, packed_zero, packed_scales = (
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                awq_weight, awq_zero, awq_scales
             )
-            target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
-                x,
-                packed_weight,
-                packed_zero,
-                packed_scales,
-                bias,
-                w4a8,
-            )
-        else:
-            packed_weight, packed_zero, packed_scales = (
-                torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                    awq_weight, awq_zero, awq_scales, False
-                )
-            )
-            target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
-                x, packed_weight, packed_zero, packed_scales, bias, w4a8
-            )
+        )
+        target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x,
+            packed_weight,
+            packed_zero,
+            packed_scales,
+            bias,
+        )
+
         atol = rtol = precision[ref_res.dtype]
         torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
 
     def test_int4_awq_gemm(self):
         for params in itertools.product(
-            self.M_awq, self.N_awq, self.K_awq, [128], self.has_bias, [False, True]
+            self.M_awq, self.N_awq, self.K_awq, [128], self.has_bias
         ):
             with self.subTest(
                 M=params[0],
@@ -240,7 +231,6 @@ class TestGemm(CustomTestCase):
                 K=params[2],
                 group_size=params[3],
                 has_bias=params[4],
-                w4a8=params[5],
             ):
                 self._int4_awq_gemm(*params)
 

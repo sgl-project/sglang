@@ -134,16 +134,11 @@ at::Tensor int8_scaled_mm_with_quant(
 
 // int4 gemm
 at::Tensor int4_scaled_mm_cpu(
-    at::Tensor& x,
-    at::Tensor& w,
-    at::Tensor& w_zeros,
-    at::Tensor& w_scales,
-    std::optional<at::Tensor> bias,
-    bool is_w4a8);
+    at::Tensor& x, at::Tensor& w, at::Tensor& w_zeros, at::Tensor& w_scales, std::optional<at::Tensor> bias);
 
 // weight prepack for int4 weights
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
-convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales, bool is_w4a8);
+convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales);
 
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
@@ -319,13 +314,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
 
   // int4 gemm
-  m.def(
-      "int4_scaled_mm_cpu(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias, bool is_w4a8) -> Tensor");
+  m.def("int4_scaled_mm_cpu(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias) -> Tensor");
   m.impl("int4_scaled_mm_cpu", torch::kCPU, &int4_scaled_mm_cpu);
 
   // weight prepack for int4 weights
   m.def(
-      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales, bool is_w4a8) -> (Tensor, Tensor, "
+      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales) -> (Tensor, Tensor, "
       "Tensor)");
   m.impl("convert_weight_packed_scale_zp", torch::kCPU, &convert_weight_packed_scale_zp);
 

@@ -974,7 +974,7 @@ at::Tensor fused_experts_cpu(
   CHECK_INPUT(w2);
   CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());
   CHECK_DIM(2, hidden_states);
-  if (moe_comp_method == 4 && is_vnni) {
+  if (moe_comp_method == 3 && is_vnni) {
     CHECK_DIM(4, w1);
     CHECK_DIM(4, w2);
   } else {
@@ -994,7 +994,7 @@ at::Tensor fused_experts_cpu(
 
   int64_t M = hidden_states.size(0);
   int64_t K = hidden_states.size(1);
-  int64_t N = moe_comp_method == 4 ? w1_scale.value().size(1) * w1_scale.value().size(3) / 2 : w1.size(1) / 2;
+  int64_t N = moe_comp_method == 3 ? w1_scale.value().size(1) * w1_scale.value().size(3) / 2 : w1.size(1) / 2;
   int64_t E = w1.size(0);
   int64_t topk = topk_weights_.size(1);
 
@@ -1004,7 +1004,7 @@ at::Tensor fused_experts_cpu(
 
   // check weight shapes
   CHECK_EQ(w2.size(0), E);
-  if (moe_comp_method != 4) {
+  if (moe_comp_method != 3) {
     CHECK_EQ(w2.size(1), K);
     CHECK_EQ(packed_w1.size(2), packed_K / (moe_comp_method == 3 ? 2 : 1));
     CHECK_EQ(packed_w2.size(2), packed_N / (moe_comp_method == 3 ? 2 : 1));
@@ -1067,15 +1067,14 @@ at::Tensor fused_experts_cpu(
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
   //
   int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
-                               num_threads * BLOCK_M * K * (moe_comp_method == 1 | moe_comp_method == 4 ? 1 : 2) +
+                               num_threads * BLOCK_M * K * (moe_comp_method == 1 | moe_comp_method == 3 ? 1 : 2) +
                                num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
 
   // moe_comp_method :
   //    BF16_GEMM = 0
   //    INT8_W8A8_GEMM = 1
   //    FP8_W8A16_GEMM = 2
-  //    INT4_W4A16_GEMM = 3
-  //    INT4_W4A8_GEMM = 4
+  //    INT4_W4A8_GEMM = 3
 
   if (moe_comp_method == 1) {
     buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
@@ -1084,9 +1083,6 @@ at::Tensor fused_experts_cpu(
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N) * 2;
   }
   if (moe_comp_method == 3) {
-    buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * BLOCK_N * std::max(K, N) * 2;
-  }
-  if (moe_comp_method == 4) {
     buffer_size_nbytes += M * topk * 2 * N * 2 + std::max(M * K, M * topk * N) + M * topk * sizeof(float);
   }
   auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
@@ -1163,41 +1159,6 @@ at::Tensor fused_experts_cpu(
           topk,
           num_tokens_post_pad);
     } else if (moe_comp_method == 3) {
-      scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
-      float* __restrict__ C_tmp =
-          (float*)((void*)(A_tmp + num_threads * BLOCK_M * std::max(K, N)));  // Ctmp is ignored?
-      scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
-      scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
-      const int group_size = K / w1_zero.value().size(1);
-
-      // TODO: check scales and zeros
-      fused_experts_int4_w4a16_kernel_impl<scalar_t>(
-          out_hidden_states.data_ptr<scalar_t>(),
-          intermediate_cache0,
-          intermediate_cache1,
-          intermediate_cache2,
-          A_tmp,
-          B_tmp,
-          C_tmp,
-          hidden_states.data_ptr<scalar_t>(),
-          reinterpret_cast<const at::quint4x2*>(packed_w1.data_ptr<uint8_t>()),
-          reinterpret_cast<const at::quint4x2*>(packed_w2.data_ptr<uint8_t>()),
-          w1_zero.value().data_ptr<uint8_t>(),
-          w2_zero.value().data_ptr<uint8_t>(),
-          w1_scale.value().data_ptr<scalar_t>(),
-          w2_scale.value().data_ptr<scalar_t>(),
-          group_size,
-          topk_weights.data_ptr<float>(),
-          sorted_ids,
-          expert_ids,
-          offsets,
-          M,
-          N,
-          K,
-          E,
-          topk,
-          num_tokens_post_pad);
-    } else if (moe_comp_method == 4) {
       uint8_t* __restrict__ A_tmp = (uint8_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));

@@ -8,7 +8,7 @@ import torch
 
 kernel = torch.ops.sgl_kernel
 
-torch.manual_seed(1234)
+torch.manual_seed(128)
 
 from enum import IntEnum
 
@@ -33,8 +33,7 @@ class CPUMoECompMethod(IntEnum):
     BF16_GEMM = 0
     INT8_W8A8_GEMM = 1
     FP8_W8A16_GEMM = 2
-    INT4_W4A16_GEMM = 3
-    INT4_W4A8_GEMM = 4
+    INT4_W4A8_GEMM = 3
 
 
 def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
@@ -280,7 +279,7 @@ class TestFusedExperts(CustomTestCase):
             ):
                 self._fp8_moe(*params)
 
-    def _int4_moe(self, M, N, K, E, topk, use_a8w4, group_size=128):
+    def _int4_moe(self, M, N, K, E, topk, group_size=128):
         dtype = torch.bfloat16
 
         a = torch.rand(M, K, dtype=dtype) / math.sqrt(K)
@@ -324,7 +323,7 @@ class TestFusedExperts(CustomTestCase):
         for i in range(E):
             packed_weight_13_i, packed_zero_13_i, packed_scales_13_i = (
                 torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                    awq_w13_weight[i], awq_w13_zero[i], awq_w13_scales[i], use_a8w4
+                    awq_w13_weight[i], awq_w13_zero[i], awq_w13_scales[i]
                 )
             )
             awq_w13_weight_pack.append(packed_weight_13_i)
@@ -332,7 +331,7 @@ class TestFusedExperts(CustomTestCase):
             awq_w13_scales_pack.append(packed_scales_13_i)
             packed_weight_2_i, packed_zero_2_i, packed_scales_2_i = (
                 torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                    awq_w2_weight[i], awq_w2_zero[i], awq_w2_scales[i], use_a8w4
+                    awq_w2_weight[i], awq_w2_zero[i], awq_w2_scales[i]
                 )
             )
             awq_w2_weight_pack.append(packed_weight_2_i)
@@ -352,11 +351,7 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             False,
-            (
-                CPUMoECompMethod.INT4_W4A16_GEMM
-                if not use_a8w4
-                else CPUMoECompMethod.INT4_W4A8_GEMM
-            ),
+            CPUMoECompMethod.INT4_W4A8_GEMM,
             awq_w13_scales_pack,
             awq_w2_scales_pack,
             awq_w13_zero_pack,
@@ -377,7 +372,6 @@ class TestFusedExperts(CustomTestCase):
             self.K_int4,
             self.E_int4,
             self.topk_int4,
-            [False, True],
         ):
             with self.subTest(
                 M=params[0],
@@ -385,7 +379,6 @@ class TestFusedExperts(CustomTestCase):
                 K=params[2],
                 E=params[3],
                 topk=params[4],
-                use_a8w4=params[5],
             ):
                 self._int4_moe(*params)
 
