@@ -193,9 +193,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else server_args.speculative_num_draft_tokens
         )
 
-        # Initialize delimiter text for multi-item scoring (will be set after tokenizer is loaded)
-        self.multi_item_delimiter_text = None
-
         # Initialize tokenizer and processor
         set_global_server_args_for_tokenizer(server_args)
 
