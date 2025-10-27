@@ -331,7 +331,7 @@ class _DeepEPDispatcherImplBase:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional["CombineOverlapArgs"],
+        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         raise NotImplementedError
 
@@ -461,7 +461,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs],
+        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
 
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
@@ -617,7 +617,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs],
+        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
@@ -643,7 +643,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional["CombineOverlapArgs"],
+        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         buffer = self._get_buffer()
 
@@ -770,7 +770,7 @@ class DeepEPDispatcher(BaseDispatcher):
     def combine_a(
         self,
         combine_input: CombineInput,
-        overlap_args: Optional[CombineOverlapArgs],
+        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
