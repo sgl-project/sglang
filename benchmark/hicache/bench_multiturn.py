@@ -116,6 +116,12 @@ def parse_args():
         help="If set, only send i-th turn requests after all (i-1)-th turn requests finished.",
     )
     parser.add_argument(
+        "--round-wait-time",
+        type=float,
+        default=0.0,
+        help="Wait time (in seconds) before starting each new round when round-barrier is enabled.",
+    )
+    parser.add_argument(
         "--sub-question-input-length",
         type=int,
         default=0,
@@ -340,6 +346,7 @@ class WorkloadGenerator:
             "generated_len": [],
         }
         self.enable_round_barrier = args.enable_round_barrier
+        self.round_wait_time = args.round_wait_time
         if self.enable_round_barrier:
             # Add round-specific metrics while preserving the original structure
             for i in range(args.num_rounds):
@@ -450,6 +457,9 @@ class WorkloadGenerator:
                     if self.enable_round_barrier:
                         next_round_reqs.append(new_req)
                         if len(next_round_reqs) == self.num_clients:
+                            # Wait before starting next round
+                            if self.round_wait_time > 0:
+                                time.sleep(self.round_wait_time)
                             for req in next_round_reqs:
                                 self.ready_queue.append(req)
                             next_round_reqs = []
@@ -572,7 +582,7 @@ class WorkloadGenerator:
         print(f"  Cache Hit Rate: {performance_data['summary']['cache_hit_rate']:.6f}")
 
         if self.enable_round_barrier:
-            # Print round-basedsummary
+            # Print round-based summary
             print("Per-round metrics:")
             if "round" in performance_data:
                 for round_num in range(self.num_rounds):
