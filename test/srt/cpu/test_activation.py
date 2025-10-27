@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from utils import GeluAndMul, SiluAndMul, precision
 
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 torch.manual_seed(1234)
@@ -17,6 +18,8 @@ class TestActivation(CustomTestCase):
     dtype = [torch.float16, torch.bfloat16]
 
     def _silu_and_mul_test(self, m, n, dtype):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
         x = torch.randn([m, n], dtype=dtype)
 
         out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
