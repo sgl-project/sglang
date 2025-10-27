@@ -1397,52 +1397,14 @@ class RowParallelLinear(LinearBase):
         if input_.shape[0] >= 128 and get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
             if self.gemm_ar_attn_op:
                 output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
-                print(f"gemm_ar_attn_op: input_.shape: {input_.shape}; self.weight.shape: {self.weight.shape}; output.shape: {output.shape}")
-
-                # m = input_.shape[0]
-                # k = input_.shape[1] 
-                # n = self.weight.shape[0]
-                # if self.tp_rank == 0:
-                #     start_event = torch.cuda.Event(enable_timing=True)
-                #     end_event = torch.cuda.Event(enable_timing=True)
-                #     start_event.record()
-                #     output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
-                #     end_event.record()
-                #     end_event.synchronize()
-                #     execution_time = start_event.elapsed_time(end_event)
-                #     print(f"gemm_ar_attn_op: m={m}, n={n}, k={k}, forward execution time: {execution_time:.3f} ms")
-                # else:
-                #     output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
-                
-                # output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
-                #print(f"gemm_ar_attn_op: input_.shape: {input_.shape}, input_.stride(): {input_.stride()}, input_.dtype: {input_.dtype}; self.weight.shape: {self.weight.shape}, self.weight.stride(): {self.weight.stride()}, self.weight.dtype: {self.weight.dtype}; self.bias: {self.bias}")
+                # print(f"gemm_ar_attn_op: input_.shape: {input_.shape}; self.weight.shape: {self.weight.shape}; output.shape: {output.shape}")
                 # input_.shape: torch.Size([256, 2048]), input_.stride(): (2048, 1)
                 # self.weight.shape: torch.Size([8192, 2048]), self.weight.stride(): (2048, 1)
                 # self.bias: None
             else:
                 output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
-                print(f"gemm_ar_mlp_op: input_.shape: {input_.shape}; self.weight.shape: {self.weight.shape}; output.shape: {output.shape}")
+                # print(f"gemm_ar_mlp_op: input_.shape: {input_.shape}; self.weight.shape: {self.weight.shape}; output.shape: {output.shape}")
 
-                # m = input_.shape[0]
-                # k = input_.shape[1]
-                # n = self.weight.shape[0]
-                # if self.tp_rank == 0:
-                #     start_event = torch.cuda.Event(enable_timing=True)
-                #     end_event = torch.cuda.Event(enable_timing=True)
-                #     start_event.record()
-                #     output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
-                #     end_event.record()
-                #     end_event.synchronize()
-                #     execution_time = start_event.elapsed_time(end_event)
-                #     print(f"gemm_ar_mlp_op: m={m}, n={n}, k={k}, forward execution time: {execution_time:.3f} ms")
-                # else:
-                #     output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
-                
-                # print(f"gemm_ar_mlp_op forward: input_.shape: {input_.shape}, input_.stride(): {input_.stride()}, input_.dtype: {input_.dtype}; self.weight.shape: {self.weight.shape}, self.weight.stride(): {self.weight.stride()}, self.weight.dtype: {self.weight.dtype}; self.bias: {self.bias}")
-                # output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
-                # 没打
-                # print(f"forward else, original output.shape: {output.shape}, original output.stride(): {output.stride()}")
-                
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
                     
