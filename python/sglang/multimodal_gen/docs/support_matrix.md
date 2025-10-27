@@ -34,10 +34,11 @@ default parameters when initializing and generating videos.
 
 ### Image Generation Models
 
-| Model Name | HuggingFace Model ID           | Resolutions    | TeaCache | Sage Attn |
-|:-----------|:-------------------------------|:---------------|:--------:|:---------:|
-| FLUX.1-dev | `black-forest-labs/FLUX.1-dev` | Any resolution |    ❌     |     ❌     |
-| Qwen Image | `Qwen/Qwen-Image`              | Any resolution |    ❌     |     ❌     |
+| Model Name      | HuggingFace Model ID           | Resolutions    | TeaCache | Sage Attn |
+|:----------------|:-------------------------------|:---------------|:--------:|:---------:|
+| FLUX.1-dev      | `black-forest-labs/FLUX.1-dev` | Any resolution |    ❌     |     ❌     |
+| Qwen Image      | `Qwen/Qwen-Image`              | Any resolution |    ❌     |     ❌     |
+| Qwen Image Edit | `Qwen/Qwen-Image-Edit`         | Any resolution |    ❌     |     ❌     |
 
 ## Special requirements
 
