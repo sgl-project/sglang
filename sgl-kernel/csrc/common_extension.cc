@@ -113,6 +113,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
       "cu_seqlens_q) -> ()");
   m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
+  m.def(
+      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
+      "topk_indices_offset) -> ()");
+  m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
   /*
    * From gguf quantiztion
@@ -367,6 +371,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "dst_indices, int layer_id, int item_size, int src_layout_dim, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_per_layer_pf_lf", torch::kCUDA, &transfer_kv_per_layer_pf_lf);
   m.def(
+      "transfer_kv_per_layer_ph_lf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
+      "dst_indices, int layer_id, int item_size, int src_layout_dim, int page_size, int head_num, int block_quota, int "
+      "num_warps_per_block) -> ()");
+  m.impl("transfer_kv_per_layer_ph_lf", torch::kCUDA, &transfer_kv_per_layer_ph_lf);
+  m.def(
       "transfer_kv_all_layer(Tensor src_k_layers, Tensor dst_k_layers, Tensor src_v_layers, Tensor dst_v_layers, "
       "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, int block_quota, int "
       "num_warps_per_block) -> ()");
@@ -376,6 +385,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers, int block_quota, int "
       "num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer_lf_pf", torch::kCUDA, &transfer_kv_all_layer_lf_pf);
+  m.def(
+      "transfer_kv_all_layer_lf_ph(Tensor src_k_layers, Tensor dst_k, Tensor src_v_layers, Tensor dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers, int page_size, int "
+      "head_num, int block_quota, int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_all_layer_lf_ph", torch::kCUDA, &transfer_kv_all_layer_lf_ph);
   m.def(
       "transfer_kv_per_layer_mla(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int item_size, int "
       "block_quota, int num_warps_per_block) -> ()");
@@ -537,8 +551,27 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def(
       "es_fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
-      "stride_a, Tensor stride_b, Tensor stride_d, Tensor problem_sizes, Tensor expert_offsets) -> ()");
+      "stride_a, Tensor stride_b, Tensor stride_d, Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> "
+      "()");
   m.impl("es_fp8_blockwise_scaled_grouped_mm", &es_fp8_blockwise_scaled_grouped_mm);
+
+  /*
+   * From hadamard-transform
+   */
+  m.def("fast_hadamard_transform(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform", torch::kCUDA, &fast_hadamard_transform);
+
+  m.def("fast_hadamard_transform_12N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_12N", torch::kCUDA, &fast_hadamard_transform_12N);
+
+  m.def("fast_hadamard_transform_20N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_20N", torch::kCUDA, &fast_hadamard_transform_20N);
+
+  m.def("fast_hadamard_transform_28N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_28N", torch::kCUDA, &fast_hadamard_transform_28N);
+
+  m.def("fast_hadamard_transform_40N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_40N", torch::kCUDA, &fast_hadamard_transform_40N);
 }
 
 REGISTER_EXTENSION(common_ops)

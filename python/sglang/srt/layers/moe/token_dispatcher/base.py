@@ -9,8 +9,9 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLCombineInput,
-        DeepEPLLOutput,
+        DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
+        DeepEPNormalDispatchOutput,
         DeepEPNormalOutput,
         MoRILLCombineInput,
         MoRILLOutput,
@@ -33,21 +34,27 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
+    def format_is_triton_kernels(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[StandardDispatchOutput]:
+        return dispatch_output.format.is_standard()
+
+    @staticmethod
     def format_is_deepep_normal(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[DeepEPNormalOutput]:
+    ) -> TypeGuard[DeepEPNormalDispatchOutput]:
         return dispatch_output.format.is_deepep_normal()
 
     @staticmethod
     def format_is_deepep_ll(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[DeepEPLLOutput]:
+    ) -> TypeGuard[DeepEPLLDispatchOutput]:
         return dispatch_output.format.is_deepep_ll()
 
     @staticmethod
     def format_is_deepep(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[Union[DeepEPNormalOutput, DeepEPLLOutput]]:
+    ) -> TypeGuard[Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput]]:
         return dispatch_output.format.is_deepep()
 
     @staticmethod
@@ -109,7 +116,7 @@ class DispatchOutputFormat(Enum):
 class DispatchOutput(Protocol):
     """Protocol for dispatch outputs in different formats."""
 
-    # TODO: add hidden_states to the protocol
+    hidden_states: torch.Tensor
 
     @property
     def format(self) -> DispatchOutputFormat: ...

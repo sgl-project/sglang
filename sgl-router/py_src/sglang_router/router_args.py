@@ -87,8 +87,15 @@ class RouterArgs:
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
     chat_template: Optional[str] = None
+    # Tokenizer cache configuration
+    tokenizer_cache_enable_l0: bool = False
+    tokenizer_cache_l0_max_entries: int = 10000
+    tokenizer_cache_enable_l1: bool = False
+    tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    # MCP server configuration
+    mcp_config_path: Optional[str] = None
     # Backend selection
     backend: str = "sglang"
     # History backend configuration
@@ -101,6 +108,10 @@ class RouterArgs:
     oracle_pool_min: int = 1
     oracle_pool_max: int = 16
     oracle_pool_timeout_secs: int = 30
+    # mTLS configuration for worker communication
+    client_cert_path: Optional[str] = None
+    client_key_path: Optional[str] = None
+    ca_cert_paths: List[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(
@@ -468,6 +479,30 @@ class RouterArgs:
             help="Chat template path (optional)",
         )
         parser.add_argument(
+            f"--{prefix}tokenizer-cache-enable-l0",
+            action="store_true",
+            default=RouterArgs.tokenizer_cache_enable_l0,
+            help="Enable L0 (whole-string exact match) tokenizer cache (default: False)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-cache-l0-max-entries",
+            type=int,
+            default=RouterArgs.tokenizer_cache_l0_max_entries,
+            help="Maximum number of entries in L0 tokenizer cache (default: 10000)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-cache-enable-l1",
+            action="store_true",
+            default=RouterArgs.tokenizer_cache_enable_l1,
+            help="Enable L1 (prefix matching) tokenizer cache (default: False)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-cache-l1-max-memory",
+            type=int,
+            default=RouterArgs.tokenizer_cache_l1_max_memory,
+            help="Maximum memory for L1 tokenizer cache in bytes (default: 50MB)",
+        )
+        parser.add_argument(
             f"--{prefix}reasoning-parser",
             type=str,
             default=None,
@@ -478,6 +513,13 @@ class RouterArgs:
             type=str,
             default=None,
             help="Specify the parser for handling tool-call interactions",
+        )
+        # MCP server configuration
+        parser.add_argument(
+            f"--{prefix}mcp-config-path",
+            type=str,
+            default=None,
+            help="Path to MCP (Model Context Protocol) server configuration file",
         )
         # Backend selection
         parser.add_argument(
@@ -545,6 +587,26 @@ class RouterArgs:
                 os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)
             ),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
+        )
+        # mTLS configuration
+        parser.add_argument(
+            f"--{prefix}client-cert-path",
+            type=str,
+            default=None,
+            help="Path to client certificate for mTLS authentication with workers",
+        )
+        parser.add_argument(
+            f"--{prefix}client-key-path",
+            type=str,
+            default=None,
+            help="Path to client private key for mTLS authentication with workers",
+        )
+        parser.add_argument(
+            f"--{prefix}ca-cert-paths",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Path(s) to CA certificate(s) for verifying worker TLS certificates. Can specify multiple CAs.",
         )
 
     @classmethod
