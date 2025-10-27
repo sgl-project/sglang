@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Usage:
 1) Launch the server with wait-for-initial-weights option in one terminal:
@@ -5,16 +6,22 @@ Usage:
 
 2) Torchrun this script in another terminal:
     torchrun --nproc-per-node 2 update.py --update-method broadcast --checkpoint-path /workspace/Qwen/Qwen3-4B/  --inference-parallel-size 2
+
+Or use the integrated entry point:
+    python -m sglang.srt.checkpoint_engine.update --update-method broadcast --checkpoint-path /workspace/Qwen/Qwen3-4B/  --inference-parallel-size 2
 """
 
 import argparse
 import json
 import os
 import pickle
+import subprocess
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Literal
 
 import httpx
@@ -190,7 +197,56 @@ def join(
         ps.update(checkpoint_name, req_func, ranks=list(range(inference_parallel_size)))
 
 
+def run_with_torchrun():
+    """Run the update script with torchrun automatically."""
+    # Parse inference_parallel_size from command line arguments to determine nproc-per-node
+    inference_parallel_size = 8  # default
+    args = sys.argv[1:]  # Skip the script name
+    
+    # Look for --inference-parallel-size in arguments
+    for i, arg in enumerate(args):
+        if arg == "--inference-parallel-size" and i + 1 < len(args):
+            try:
+                inference_parallel_size = int(args[i + 1])
+            except ValueError:
+                pass
+            break
+        elif arg.startswith("--inference-parallel-size="):
+            try:
+                inference_parallel_size = int(arg.split("=", 1)[1])
+            except ValueError:
+                pass
+            break
+    
+    # Build torchrun command
+    cmd = [
+        "torchrun",
+        f"--nproc-per-node={inference_parallel_size}",
+        __file__
+    ] + args
+    
+    print(f"Running: {' '.join(cmd)}", file=sys.stderr)
+    
+    # Execute torchrun with the original script
+    try:
+        result = subprocess.run(cmd, check=False)
+        sys.exit(result.returncode)
+    except FileNotFoundError:
+        print("Error: torchrun command not found. Please ensure PyTorch is installed.", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user", file=sys.stderr)
+        sys.exit(130)
+
+
 def main():
+    # Check if we're running under torchrun or need to invoke it
+    if os.getenv("RANK") is None:
+        # Not running under torchrun, so invoke it
+        run_with_torchrun()
+        return
+    
+    # Running under torchrun, proceed with normal execution
     parser = argparse.ArgumentParser(description="Update weights example")
     parser.add_argument("--checkpoint-path", type=str, default=None)
     parser.add_argument("--save-metas-file", type=str, default=None)
@@ -203,14 +259,22 @@ def main():
     parser.add_argument("--uds", type=str, default=None)
     parser.add_argument("--weight-version", type=str, default=None)
     args = parser.parse_args()
-    rank = int(os.getenv("RANK"))
-    world_size = int(os.getenv("WORLD_SIZE"))
+    
+    # Get rank and world_size from environment (set by torchrun)
+    rank = int(os.getenv("RANK", 0))
+    world_size = int(os.getenv("WORLD_SIZE", 1))
+    
     req_func = req_inference(
         args.endpoint,
         args.inference_parallel_size,
         uds=args.uds,
         weight_version=args.weight_version,
     )
+    
+    if ParameterServer is None:
+        print("Error: checkpoint_engine package not available", file=sys.stderr)
+        sys.exit(1)
+        
     ps = ParameterServer(auto_pg=True)
     ps._p2p_store = None
     if args.load_metas_file:
@@ -224,7 +288,7 @@ def main():
             args.uds,
         )
     else:
-        if os.path.exists(
+        if args.checkpoint_path and os.path.exists(
             os.path.join(args.checkpoint_path, "model.safetensors.index.json")
         ):
             named_tensors = split_tensors(args.checkpoint_path, rank, world_size)
@@ -232,7 +296,7 @@ def main():
         else:
             checkpoint_files = split_checkpoint_files(
                 args.checkpoint_path, rank, world_size
-            )
+            ) if args.checkpoint_path else []
             named_tensors = {}
         update_weights(
             ps,
