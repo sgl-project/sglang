@@ -765,8 +765,12 @@ class DecodeTransferQueue:
                 indices_to_remove.add(i)
                 decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
 
-                # special handling for sampling_params.max_new_tokens == 1
-                if decode_req.req.sampling_params.max_new_tokens == 1:
+                # special handling for corner cases
+                should_finish = (
+                    decode_req.req.sampling_params.max_new_tokens == 1
+                    or output_id in decode_req.req.eos_token_ids
+                )
+                if should_finish:
                     # finish immediately
                     decode_req.req.time_stats.forward_entry_time = (
                         decode_req.req.time_stats.completion_time
