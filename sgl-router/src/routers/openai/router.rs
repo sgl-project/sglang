@@ -28,7 +28,7 @@ use super::conversations::{
 };
 use super::{
     mcp::{
-        execute_tool_loop, mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
+        ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
         McpLoopConfig,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
@@ -36,13 +36,12 @@ use super::{
     utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model},
 };
 use crate::{
-    config::CircuitBreakerConfig,
     core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
     data_connector::{
-        conversation_items::{ListParams, SortOrder},
-        ConversationId, ResponseId, SharedConversationItemStorage, SharedConversationStorage,
-        SharedResponseStorage,
+        ConversationId, ConversationItemStorage, ConversationStorage, ListParams, ResponseId,
+        ResponseStorage, SortOrder,
     },
+    mcp::McpManager,
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -82,13 +81,13 @@ pub struct OpenAIRouter {
     /// Health status
     healthy: AtomicBool,
     /// Response storage for managing conversation history
-    response_storage: SharedResponseStorage,
+    response_storage: Arc<dyn ResponseStorage>,
     /// Conversation storage backend
-    conversation_storage: SharedConversationStorage,
+    conversation_storage: Arc<dyn ConversationStorage>,
     /// Conversation item storage backend
-    conversation_item_storage: SharedConversationItemStorage,
-    /// Optional MCP manager (enabled via config presence)
-    mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
+    /// MCP manager (handles both static and dynamic servers)
+    mcp_manager: Arc<McpManager>,
 }
 
 impl std::fmt::Debug for OpenAIRouter {
@@ -110,15 +109,10 @@ impl OpenAIRouter {
     /// Create a new OpenAI router
     pub async fn new(
         worker_urls: Vec<String>,
-        circuit_breaker_config: Option<CircuitBreakerConfig>,
-        response_storage: SharedResponseStorage,
-        conversation_storage: SharedConversationStorage,
-        conversation_item_storage: SharedConversationItemStorage,
+        ctx: &Arc<crate::app_context::AppContext>,
     ) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        // Use HTTP client from AppContext
+        let client = ctx.client.clone();
 
         // Normalize URLs (remove trailing slashes)
         let worker_urls: Vec<String> = worker_urls
@@ -126,37 +120,23 @@ impl OpenAIRouter {
             .map(|url| url.trim_end_matches('/').to_string())
             .collect();
 
-        // Convert circuit breaker config
-        let core_cb_config = circuit_breaker_config
-            .map(|cb| CoreCircuitBreakerConfig {
-                failure_threshold: cb.failure_threshold,
-                success_threshold: cb.success_threshold,
-                timeout_duration: Duration::from_secs(cb.timeout_duration_secs),
-                window_duration: Duration::from_secs(cb.window_duration_secs),
-            })
-            .unwrap_or_default();
+        // Convert circuit breaker config from AppContext
+        let cb = &ctx.router_config.circuit_breaker;
+        let core_cb_config = CoreCircuitBreakerConfig {
+            failure_threshold: cb.failure_threshold,
+            success_threshold: cb.success_threshold,
+            timeout_duration: Duration::from_secs(cb.timeout_duration_secs),
+            window_duration: Duration::from_secs(cb.window_duration_secs),
+        };
 
         let circuit_breaker = CircuitBreaker::with_config(core_cb_config);
 
-        // Optional MCP manager activation via env var path (config-driven gate)
-        let mcp_manager = match std::env::var("SGLANG_MCP_CONFIG").ok() {
-            Some(path) if !path.trim().is_empty() => {
-                match crate::mcp::McpConfig::from_file(&path).await {
-                    Ok(cfg) => match crate::mcp::McpClientManager::new(cfg).await {
-                        Ok(mgr) => Some(Arc::new(mgr)),
-                        Err(err) => {
-                            warn!("Failed to initialize MCP manager: {}", err);
-                            None
-                        }
-                    },
-                    Err(err) => {
-                        warn!("Failed to load MCP config from '{}': {}", path, err);
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
+        // Get MCP manager from AppContext (must be initialized)
+        let mcp_manager = ctx
+            .mcp_manager
+            .get()
+            .ok_or_else(|| "MCP manager not initialized in AppContext".to_string())?
+            .clone();
 
         Ok(Self {
             client,
@@ -164,9 +144,9 @@ impl OpenAIRouter {
             model_cache: Arc::new(DashMap::new()),
             circuit_breaker,
             healthy: AtomicBool::new(true),
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
+            response_storage: ctx.response_storage.clone(),
+            conversation_storage: ctx.conversation_storage.clone(),
+            conversation_item_storage: ctx.conversation_item_storage.clone(),
             mcp_manager,
         })
     }
@@ -242,12 +222,17 @@ impl OpenAIRouter {
         original_previous_response_id: Option<String>,
     ) -> Response {
         // Check if MCP is active for this request
-        let req_mcp_manager = if let Some(ref tools) = original_body.tools {
-            mcp_manager_from_request_tools(tools.as_slice()).await
-        } else {
+        // Ensure dynamic client is created if needed
+        if let Some(ref tools) = original_body.tools {
+            ensure_request_mcp_client(&self.mcp_manager, tools.as_slice()).await;
+        }
+
+        // Use the tool loop if the manager has any tools available (static or dynamic).
+        let active_mcp = if self.mcp_manager.list_tools().is_empty() {
             None
+        } else {
+            Some(&self.mcp_manager)
         };
-        let active_mcp = req_mcp_manager.as_ref().or(self.mcp_manager.as_ref());
 
         let mut response_json: Value;
 
@@ -744,25 +729,37 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 Ok(chain) => {
                     let mut items = Vec::new();
                     for stored in chain.responses.iter() {
-                        // Convert input to conversation item
-                        items.push(ResponseInputOutputItem::Message {
-                            id: format!("msg_u_{}", stored.id.0.trim_start_matches("resp_")),
-                            role: "user".to_string(),
-                            content: vec![ResponseContentPart::InputText {
-                                text: stored.input.clone(),
-                            }],
-                            status: Some("completed".to_string()),
-                        });
+                        // Convert input items from stored input (which is now a JSON array)
+                        if let Some(input_arr) = stored.input.as_array() {
+                            for item in input_arr {
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.clone(),
+                                ) {
+                                    Ok(input_item) => {
+                                        items.push(input_item);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to deserialize stored input item: {}. Item: {}",
+                                            e, item
+                                        );
+                                    }
+                                }
+                            }
+                        }
 
-                        // Convert output to conversation items directly from stored response
-                        if let Some(output_arr) =
-                            stored.raw_response.get("output").and_then(|v| v.as_array())
-                        {
+                        // Convert output items from stored output (which is now a JSON array)
+                        if let Some(output_arr) = stored.output.as_array() {
                             for item in output_arr {
-                                if let Ok(output_item) =
-                                    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
-                                {
-                                    items.push(output_item);
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.clone(),
+                                ) {
+                                    Ok(output_item) => {
+                                        items.push(output_item);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to deserialize stored output item: {}. Item: {}", e, item);
+                                    }
                                 }
                             }
                         }
@@ -838,7 +835,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             });
                         }
                         ResponseInput::Items(current_items) => {
-                            items.extend_from_slice(current_items);
+                            // Process all item types, converting SimpleInputMessage to Message
+                            for item in current_items.iter() {
+                                let normalized =
+                                    crate::protocols::responses::normalize_input_item(item);
+                                items.push(normalized);
+                            }
                         }
                     }
 
@@ -868,7 +870,11 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     });
                 }
                 ResponseInput::Items(current_items) => {
-                    items.extend_from_slice(current_items);
+                    // Process all item types, converting SimpleInputMessage to Message
+                    for item in current_items.iter() {
+                        let normalized = crate::protocols::responses::normalize_input_item(item);
+                        items.push(normalized);
+                    }
                 }
             }
 
@@ -964,7 +970,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             handle_streaming_response(
                 &self.client,
                 &self.circuit_breaker,
-                self.mcp_manager.as_ref(),
+                Some(&self.mcp_manager),
                 self.response_storage.clone(),
                 self.conversation_storage.clone(),
                 self.conversation_item_storage.clone(),
@@ -1021,6 +1027,78 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             "Cancel response not implemented for OpenAI router",
         )
             .into_response()
+    }
+
+    async fn list_response_input_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        response_id: &str,
+    ) -> Response {
+        let resp_id = ResponseId::from(response_id);
+
+        match self.response_storage.get_response(&resp_id).await {
+            Ok(Some(stored)) => {
+                // Extract items from input field (which is a JSON array)
+                let items = match &stored.input {
+                    Value::Array(arr) => arr.clone(),
+                    _ => vec![],
+                };
+
+                // Generate IDs for items if they don't have them
+                let items_with_ids: Vec<Value> = items
+                    .into_iter()
+                    .map(|mut item| {
+                        if item.get("id").is_none() {
+                            // Generate ID if not present using centralized utility
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert(
+                                    "id".to_string(),
+                                    json!(super::utils::generate_id("msg")),
+                                );
+                            }
+                        }
+                        item
+                    })
+                    .collect();
+
+                let response_body = json!({
+                    "object": "list",
+                    "data": items_with_ids,
+                    "first_id": items_with_ids.first().and_then(|v| v.get("id").and_then(|i| i.as_str())),
+                    "last_id": items_with_ids.last().and_then(|v| v.get("id").and_then(|i| i.as_str())),
+                    "has_more": false
+                });
+
+                (StatusCode::OK, Json(response_body)).into_response()
+            }
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "message": format!("No response found with id '{}'", response_id),
+                        "type": "invalid_request_error",
+                        "param": Value::Null,
+                        "code": "not_found"
+                    }
+                })),
+            )
+                .into_response(),
+            Err(e) => {
+                warn!("Failed to retrieve input items for {}: {}", response_id, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": {
+                            "message": format!("Failed to retrieve input items: {}", e),
+                            "type": "internal_error",
+                            "param": Value::Null,
+                            "code": "storage_error"
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+        }
     }
 
     async fn route_embeddings(
