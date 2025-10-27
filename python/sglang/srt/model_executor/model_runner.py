@@ -200,7 +200,7 @@ SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 # the ratio of mamba cache pool size to max_running_requests, it will be safe when it is larger than 2 (yizhang2077)
-MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 5
 
 logger = logging.getLogger(__name__)
 
@@ -393,10 +393,10 @@ class ModelRunner:
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
 
-        if config := self.mamba2_config:
-            class_name = config.__class__.__name__
-            logger.warning(f"{class_name} model detected, disable radix cache")
-            self.server_args.disable_radix_cache = True
+        # if config := self.mamba2_config:
+        #     class_name = config.__class__.__name__
+        #     logger.warning(f"{class_name} model detected, disable radix cache")
+        #     self.server_args.disable_radix_cache = True
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -1294,6 +1294,7 @@ class ModelRunner:
         )
         if (
             server_args.disable_radix_cache
+            or server_args.max_mamba_cache_size is not None
             or config.mamba2_cache_params.mamba_cache_per_req == 0
         ):
             # with disable radix cache, sets the max_mamba_cache_size based on the max_running_requests

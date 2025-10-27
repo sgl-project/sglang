@@ -191,6 +191,11 @@ class ForwardBatch:
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
+    # The indices of mamba copy
+    mamba_pool_copy_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    # The mask of mamba copy
+    mamba_copy_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 
@@ -334,6 +339,8 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            mamba_pool_copy_indices=batch.mamba_pool_copy_indices,
+            mamba_copy_mask=batch.mamba_copy_mask,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
