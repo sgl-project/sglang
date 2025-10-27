@@ -178,6 +178,30 @@ impl GrpcRouter {
             )
             .await
     }
+
+    /// Main route_responses implementation (pipeline-based for Harmony)
+    async fn route_responses_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        debug!(
+            "Processing Harmony responses request for model: {:?}",
+            model_id
+        );
+
+        // Use Harmony pipeline for execution
+        // TODO: Implement execute_responses for Harmony pipeline (Phase 4-5)
+        // For now, use harmony_responses_context with existing responses module
+        responses::route_responses(
+            &self.harmony_responses_context,
+            Arc::new(body.clone()),
+            headers.cloned(),
+            model_id.map(|s| s.to_string()),
+        )
+        .await
+    }
 }
 
 impl std::fmt::Debug for GrpcRouter {
@@ -249,21 +273,22 @@ impl RouterTrait for GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Choose context based on Harmony model detection
+        // Choose implementation based on Harmony model detection
         let is_harmony = HarmonyDetector::is_harmony_model(&body.model);
-        let context = if is_harmony {
-            &self.harmony_responses_context
-        } else {
-            &self.responses_context
-        };
 
-        responses::route_responses(
-            context,
-            Arc::new(body.clone()),
-            headers.cloned(),
-            model_id.map(|s| s.to_string()),
-        )
-        .await
+        if is_harmony {
+            // Use pipeline-based implementation for Harmony models
+            self.route_responses_impl(headers, body, model_id).await
+        } else {
+            // Use legacy responses module for non-Harmony models
+            responses::route_responses(
+                &self.responses_context,
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+            )
+            .await
+        }
     }
 
     async fn get_response(
