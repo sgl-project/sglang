@@ -172,14 +172,14 @@ suites = {
         TestFile("test_disaggregation_hybrid_attention.py", 200),
     ],
     "per-commit-8-gpu-h20": [
-        TestFile("quant/test_w4a8_deepseek_v3.py", 371),
+        TestFile("quant/test_w4a8_deepseek_v3.py", 520),
         TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
-        # TestFile("test_flash_attention_4.py"),
-        # TestFile("test_gpt_oss_4gpu.py", 600),
-        # TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_flash_attention_4.py", 300),
+        TestFile("test_gpt_oss_4gpu.py", 600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -191,13 +191,14 @@ suites = {
     "per-commit-8-gpu-h200-deepseek-v32": [
         TestFile("test_deepseek_v32_basic.py", 275),
         TestFile("test_deepseek_v32_mtp.py", 275),
+        TestFile("test_deepseek_v32_nsabackend.py", 600),
     ],
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),
         TestFile("test_bnb.py", 5),
         TestFile("test_gptqmodel_dynamic.py", 102),
         TestFile("test_vllm_dependency.py", 185),
-        # TestFile("test_gguf.py", 96),
+        TestFile("test_gguf.py", 96),
     ],
     # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
     "nightly-1-gpu": [],
