@@ -54,6 +54,7 @@ from sglang.srt.configs import (
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
+from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
@@ -169,6 +170,16 @@ def _load_deepseek_v32_model(
 
     return AutoConfig.from_pretrained(
         unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
+
+
+def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
+    # TODO: Remove this workaround related when AutoConfig correctly identifies deepseek-ocr.
+    # Hugging Face's AutoConfig currently misidentifies it as deepseekvl2.
+    return (
+        getattr(config, "auto_map", None) is not None
+        and config.auto_map.get("AutoModel")
+        == "modeling_deepseekocr.DeepseekOCRForCausalLM"
     )
 
 
@@ -445,6 +456,10 @@ def get_processor(
         **kwargs,
     )
 
+    if _is_deepseek_ocr_model(config):
+        # Temporary hack for load deepseek-ocr
+        config.model_type = "deepseek-ocr"
+
     # fix: for Qwen2-VL and Sarashina2Vision models, inject default 'size' if not provided.
     if config.model_type in {"qwen2_vl", "sarashina2_vision"}:
         if "size" not in kwargs:
@@ -462,13 +477,22 @@ def get_processor(
                 **kwargs,
             )
         else:
-            processor = AutoProcessor.from_pretrained(
-                tokenizer_name,
-                *args,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
+            if config.model_type in _CUSTOMIZED_MM_PROCESSOR:
+                processor = _CUSTOMIZED_MM_PROCESSOR[config.model_type].from_pretrained(
+                    tokenizer_name,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            else:
+                processor = AutoProcessor.from_pretrained(
+                    tokenizer_name,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
 
     except ValueError as e:
         error_message = str(e)
