@@ -91,8 +91,13 @@ impl HarmonyBuilder {
 
         let selection_text = self.extract_selection_text(&all_messages);
 
-        // TODO: implement proper stop sequence encoding
-        let stop_token_ids = Vec::new();
+        // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
+        let stop_token_ids: Vec<u32> = self
+            .encoding
+            .stop_tokens_for_assistant_actions()
+            .into_iter()
+            .flat_map(|set| set.into_iter())
+            .collect();
 
         Ok(HarmonyBuildOutput {
             input_ids: token_ids,
@@ -128,8 +133,13 @@ impl HarmonyBuilder {
 
         let selection_text = self.extract_selection_text(&all_messages);
 
-        // TODO: implement proper stop sequence encoding
-        let stop_token_ids = Vec::new();
+        // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
+        let stop_token_ids: Vec<u32> = self
+            .encoding
+            .stop_tokens_for_assistant_actions()
+            .into_iter()
+            .flat_map(|set| set.into_iter())
+            .collect();
 
         Ok(HarmonyBuildOutput {
             input_ids: token_ids,
