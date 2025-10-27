@@ -433,12 +433,14 @@ class ColumnParallelLinear(LinearBase):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
-    def forward_quant(self, input_):
+    def forward_quant(self, input_: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         assert self.quant_method is not None
         q_input, x_scale = self.quant_method.apply_quant(self, input_)
         return q_input, x_scale
 
-    def forward_gemm(self, q_input_, x_scale_, dtype_):
+    def forward_gemm(
+        self, q_input_: torch.Tensor, x_scale_: torch.Tensor, dtype_: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
