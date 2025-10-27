@@ -61,7 +61,7 @@ jobs:
             exit 1
           fi
 
-          docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix} --no-cache
+          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix} --no-cache
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix}
 
   cache:
