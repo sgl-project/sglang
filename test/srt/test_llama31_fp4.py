@@ -22,7 +22,8 @@ class TestLlama31FP4B200(unittest.TestCase):
             "--trust-remote-code",
             "--mem-fraction-static",
             "0.8",
-            "--quantization modelopt_fp4",
+            "--quantization",
+            "modelopt_fp4",
         ]
         cls.process = popen_launch_server(
             cls.model,
