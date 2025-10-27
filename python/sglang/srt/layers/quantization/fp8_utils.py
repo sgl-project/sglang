@@ -236,7 +236,7 @@ def deepgemm_w8a8_block_fp8_quant_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
     block_size: List[int],
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     dtype_supported = input.dtype == torch.bfloat16
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
@@ -244,8 +244,8 @@ def deepgemm_w8a8_block_fp8_quant_with_fallback(
 
     if not (shape_supported and dtype_supported):
         raise RuntimeError(
-            f"fp8 block quant is not supported yet. \
-                             please check the weight shape and dtype."
+            "fp8 block quant is not supported yet. "
+            "Please check the weight shape and dtype."
         )
 
     input_2d = input.view(-1, input.shape[-1])
@@ -274,8 +274,8 @@ def deepgemm_w8a8_block_fp8_gemm_with_fallback(
 
     if not (shape_supported and dtype_supported):
         raise RuntimeError(
-            f"fp8 block quant is not supported yet. \
-                             please check the weight shape and dtype."
+            "fp8 block quant is not supported yet. "
+            "Please check the weight shape and dtype."
         )
 
     output_shape = [*q_input.shape[:-1], weight.shape[0]]

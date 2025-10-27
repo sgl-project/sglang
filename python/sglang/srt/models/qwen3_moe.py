@@ -506,20 +506,19 @@ class Qwen3MoeAttention(nn.Module):
             and self.enable_fp8_quant
         ):
             # 1. quant
-            q_input, x_scale = self.qkv_proj.forward_quant(hidden_states)
-            x_scale = x_scale.contiguous()
+            local_q_input, local_x_scale = self.qkv_proj.forward_quant(hidden_states)
+            local_x_scale = local_x_scale.contiguous()
 
             # 2. allgather
-            q_input, local_q = (self.get_local_quant_buffer(), q_input)
-            x_scale, local_x_scale = (
-                self.get_local_scale_buffer(self.block_size),
-                x_scale,
-            )
-            attn_tp_all_gather_into_tensor(q_input, local_q)
-            attn_tp_all_gather_into_tensor(x_scale, local_x_scale)
+            gathered_q_input = self.get_local_quant_buffer()
+            attn_tp_all_gather_into_tensor(gathered_q_input, local_q_input)
+            gathered_x_scale = self.get_local_scale_buffer(self.block_size)
+            attn_tp_all_gather_into_tensor(gathered_x_scale, local_x_scale)
 
             # 3. qkv linear
-            qkv, _ = self.qkv_proj.forward_gemm(q_input, x_scale, hidden_states.dtype)
+            qkv, _ = self.qkv_proj.forward_gemm(
+                gathered_q_input, gathered_x_scale, hidden_states.dtype
+            )
         else:
             qkv, _ = self.qkv_proj(hidden_states)
 

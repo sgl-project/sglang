@@ -112,10 +112,7 @@ def cutlass_fused_experts_fp8(
     assert w1_q.shape[0] == w2_q.shape[0], "Weights expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
     assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
-    assert a.dtype in [
-        torch.half,
-        torch.bfloat16,
-    ], f"Invalid output dtype a.dtype: {a.dtype}"
+    assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
 
     if is_cuda:
         from sglang.srt.layers.quantization.fp8_kernel import (
