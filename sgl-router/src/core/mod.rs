@@ -25,8 +25,8 @@ pub use error::{WorkerError, WorkerResult};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use retry::{is_retryable_status, BackoffCalculator, RetryError, RetryExecutor};
 pub use worker::{
-    worker_to_info, BasicWorker, ConnectionMode, DPAwareWorker, HealthChecker, HealthConfig,
-    Worker, WorkerFactory, WorkerLoadGuard, WorkerType,
+    worker_to_info, BackgroundChecker, BasicWorker, ConnectionMode, DPAwareWorker, EngineLoad,
+    HealthConfig, Worker, WorkerFactory, WorkerLoadGuard, WorkerType,
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_manager::{LoadMonitor, WorkerManager};

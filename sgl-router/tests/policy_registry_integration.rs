@@ -42,6 +42,9 @@ async fn test_policy_registry_with_router_manager() {
         health_failure_threshold: 3,
         max_connection_attempts: 20,
         dp_aware: false,
+        max_req_limit: 1024 * 1024 * 1024,
+        max_waiting_req_limit: 1024 * 1024 * 1024,
+        max_token_limit: 1024 * 1024 * 1024,
     };
 
     // This would normally connect to a real worker, but for testing we'll just verify the structure
@@ -73,6 +76,9 @@ async fn test_policy_registry_with_router_manager() {
         health_failure_threshold: 3,
         max_connection_attempts: 20,
         dp_aware: false,
+        max_req_limit: 1024 * 1024 * 1024,
+        max_waiting_req_limit: 1024 * 1024 * 1024,
+        max_token_limit: 1024 * 1024 * 1024,
     };
 
     // The second worker should use the same policy as the first (cache_aware)
@@ -100,6 +106,9 @@ async fn test_policy_registry_with_router_manager() {
         health_failure_threshold: 3,
         max_connection_attempts: 20,
         dp_aware: false,
+        max_req_limit: 1024 * 1024 * 1024,
+        max_waiting_req_limit: 1024 * 1024 * 1024,
+        max_token_limit: 1024 * 1024 * 1024,
     };
 
     let _gpt_policy = policy_registry.get_policy("gpt-4");

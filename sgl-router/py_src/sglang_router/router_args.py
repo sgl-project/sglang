@@ -78,6 +78,10 @@ class RouterArgs:
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
+    # Worker load limit configuration
+    worker_load_limit_max_req: int = 1024 * 1024 * 1024
+    worker_load_limit_max_waiting_reqs: int = 1024 * 1024 * 1024
+    worker_load_limit_max_token: int = 1024 * 1024 * 1024
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -427,6 +431,25 @@ class RouterArgs:
             type=str,
             default=RouterArgs.health_check_endpoint,
             help="Health check endpoint path",
+        )
+        # Worker load limit configuration
+        parser.add_argument(
+            f"--{prefix}worker-load-limit-max-req",
+            type=int,
+            default=RouterArgs.worker_load_limit_max_req,
+            help="Maximum number of requests a worker can handle",
+        )
+        parser.add_argument(
+            f"--{prefix}worker-load-limit-max-waiting-reqs",
+            type=int,
+            default=RouterArgs.worker_load_limit_max_waiting_reqs,
+            help="Maximum number of waiting requests a worker can handle",
+        )
+        parser.add_argument(
+            f"--{prefix}worker-load-limit-max-token",
+            type=int,
+            default=RouterArgs.worker_load_limit_max_token,
+            help="Maximum number of tokens a worker can handle",
         )
         parser.add_argument(
             f"--{prefix}max-concurrent-requests",

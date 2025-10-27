@@ -41,6 +41,8 @@ pub struct RouterConfig {
     #[serde(default)]
     pub disable_circuit_breaker: bool,
     pub health_check: HealthCheckConfig,
+    /// Worker load limit configuration
+    pub worker_load_limit: WorkerLoadLimitConfig,
     #[serde(default)]
     pub enable_igw: bool,
     /// Can be a HuggingFace model ID or local path
@@ -358,6 +360,24 @@ impl Default for HealthCheckConfig {
     }
 }
 
+/// Worker load limit configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLoadLimitConfig {
+    pub max_req: u32,
+    pub max_waiting_reqs: u32,
+    pub max_token: u32,
+}
+
+impl Default for WorkerLoadLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_req: 1024 * 1024 * 1024,
+            max_waiting_reqs: 1024 * 1024 * 1024,
+            max_token: 1024 * 1024 * 1024,
+        }
+    }
+}
+
 /// Circuit breaker configuration for worker reliability
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitBreakerConfig {
@@ -424,6 +444,7 @@ impl Default for RouterConfig {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            worker_load_limit: WorkerLoadLimitConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
             model_path: None,

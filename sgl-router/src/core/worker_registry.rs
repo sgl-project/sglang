@@ -364,7 +364,7 @@ impl WorkerRegistry {
 
     /// Start a health checker for all workers in the registry
     /// This should be called once after the registry is populated with workers
-    pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
+    pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::BackgroundChecker {
         use std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -413,7 +413,58 @@ impl WorkerRegistry {
             }
         });
 
-        crate::core::HealthChecker::new(handle, shutdown)
+        crate::core::BackgroundChecker::new("health_checker".to_string(), handle, shutdown)
+    }
+
+    /// Start an engine load checker for all workers in the registry
+    /// This should be called once after the registry is populated with workers
+    pub fn start_engine_load_checker(
+        &self,
+        check_interval_secs: u64,
+    ) -> crate::core::BackgroundChecker {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let workers_ref = self.workers.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
+
+            loop {
+                interval.tick().await;
+
+                // Check for shutdown signal
+                if shutdown_clone.load(Ordering::Acquire) {
+                    tracing::debug!("Registry engine load checker shutting down");
+                    break;
+                }
+
+                // Get all workers from registry
+                let workers: Vec<Arc<dyn Worker>> = workers_ref
+                    .iter()
+                    .map(|entry| entry.value().clone())
+                    .collect();
+
+                // Perform engine load checks
+                for worker in &workers {
+                    let result = worker.check_engine_load_async().await;
+                    if let Err(e) = result {
+                        tracing::debug!(
+                            "Engine load check failed for worker {}: {:?}",
+                            worker.url(),
+                            e
+                        );
+                    }
+                }
+            }
+        });
+
+        crate::core::BackgroundChecker::new("engine_load_checker".to_string(), handle, shutdown)
     }
 }
 

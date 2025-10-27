@@ -1,7 +1,7 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         Arc, LazyLock,
     },
     time::{Duration, Instant},
@@ -97,9 +97,11 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the circuit breaker for this worker
     fn circuit_breaker(&self) -> &CircuitBreaker;
 
-    /// Check if the worker is available (healthy + circuit closed/half-open)
+    /// Check if the worker is available (healthy + circuit closed/half-open + acceptable load)
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker().can_execute()
+        self.engine_load().is_acceptable()
+            && self.is_healthy()
+            && self.circuit_breaker().can_execute()
     }
 
     /// Record the outcome of a request to this worker
@@ -238,6 +240,17 @@ pub trait Worker: Send + Sync + fmt::Debug {
     }
     async fn grpc_health_check(&self) -> WorkerResult<bool>;
     async fn http_health_check(&self) -> WorkerResult<bool>;
+
+    fn engine_load(&self) -> &EngineLoad;
+
+    /// Perform an async health check on the worker
+    async fn check_engine_load_async(&self) -> WorkerResult<()>;
+
+    /// HTTP engine load check
+    async fn http_get_load(&self) -> WorkerResult<()>;
+
+    /// gRPC engine load check
+    async fn grpc_get_load(&self) -> WorkerResult<()>;
 }
 
 /// Connection mode for worker communication
@@ -357,6 +370,101 @@ pub struct WorkerMetadata {
     pub bootstrap_port: Option<u16>,
 }
 
+pub struct EngineLoad {
+    pub num_reqs: AtomicU32,
+    pub num_waiting_reqs: AtomicU32,
+    pub num_tokens: AtomicU32,
+    pub max_req_limit: u32,
+    pub max_waiting_req_limit: u32,
+    pub max_token_limit: u32,
+}
+impl Default for EngineLoad {
+    fn default() -> Self {
+        Self {
+            num_reqs: AtomicU32::new(0),
+            num_waiting_reqs: AtomicU32::new(0),
+            num_tokens: AtomicU32::new(0),
+            max_req_limit: 1024 * 1024 * 1024,
+            max_waiting_req_limit: 1024 * 1024 * 1024,
+            max_token_limit: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl EngineLoad {
+    pub fn new() -> Self {
+        Self {
+            num_reqs: AtomicU32::new(0),
+            num_waiting_reqs: AtomicU32::new(0),
+            num_tokens: AtomicU32::new(0),
+            max_req_limit: 1024 * 1024 * 1024,
+            max_waiting_req_limit: 1024 * 1024 * 1024,
+            max_token_limit: 1024 * 1024 * 1024,
+        }
+    }
+
+    pub fn new_with_limits(max_req: u32, max_waiting_reqs: u32, max_token: u32) -> Self {
+        Self {
+            num_reqs: AtomicU32::new(0),
+            num_waiting_reqs: AtomicU32::new(0),
+            num_tokens: AtomicU32::new(0),
+            max_req_limit: max_req,
+            max_waiting_req_limit: max_waiting_reqs,
+            max_token_limit: max_token,
+        }
+    }
+
+    pub fn update(&self, num_reqs: u32, num_waiting_reqs: u32, num_tokens: u32) {
+        self.num_reqs.store(num_reqs, Ordering::Relaxed);
+        self.num_waiting_reqs
+            .store(num_waiting_reqs, Ordering::Relaxed);
+        self.num_tokens.store(num_tokens, Ordering::Relaxed);
+    }
+
+    pub fn num_reqs(&self) -> u32 {
+        self.num_reqs.load(Ordering::Relaxed)
+    }
+
+    pub fn num_waiting_reqs(&self) -> u32 {
+        self.num_waiting_reqs.load(Ordering::Relaxed)
+    }
+
+    pub fn num_tokens(&self) -> u32 {
+        self.num_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Check if the load is acceptable based on configured thresholds
+    pub fn is_acceptable(&self) -> bool {
+        self.num_reqs() < self.max_req_limit
+            && self.num_waiting_reqs() < self.max_waiting_req_limit
+            && self.num_tokens() < self.max_token_limit
+    }
+}
+
+impl Clone for EngineLoad {
+    fn clone(&self) -> Self {
+        Self {
+            num_reqs: AtomicU32::new(self.num_reqs.load(Ordering::Relaxed)),
+            num_waiting_reqs: AtomicU32::new(self.num_waiting_reqs.load(Ordering::Relaxed)),
+            num_tokens: AtomicU32::new(self.num_tokens.load(Ordering::Relaxed)),
+            max_req_limit: self.max_req_limit,
+            max_waiting_req_limit: self.max_waiting_req_limit,
+            max_token_limit: self.max_token_limit,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EngineLoadResponse {
+    #[allow(dead_code)]
+    rid: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    dp_rank: Option<usize>,
+    num_reqs: u32,
+    num_waiting_reqs: u32,
+    num_tokens: u32,
+}
+
 /// Basic worker implementation
 #[derive(Clone)]
 pub struct BasicWorker {
@@ -369,6 +477,8 @@ pub struct BasicWorker {
     pub circuit_breaker: CircuitBreaker,
     /// Lazily initialized gRPC client for gRPC workers
     pub grpc_client: Arc<RwLock<Option<Arc<SglangSchedulerClient>>>>,
+    /// worker engine load
+    pub engine_load: EngineLoad,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -467,6 +577,17 @@ impl Worker for BasicWorker {
                 url: self.metadata.url.clone(),
                 reason: format!("Health check failed (consecutive failures: {})", failures),
             })
+        }
+    }
+
+    fn engine_load(&self) -> &EngineLoad {
+        &self.engine_load
+    }
+
+    async fn check_engine_load_async(&self) -> WorkerResult<()> {
+        match &self.metadata.connection_mode {
+            ConnectionMode::Http => self.http_get_load().await,
+            ConnectionMode::Grpc { .. } => self.grpc_get_load().await,
         }
     }
 
@@ -620,6 +741,83 @@ impl Worker for BasicWorker {
             }
         }
     }
+
+    async fn http_get_load(&self) -> WorkerResult<()> {
+        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+
+        let url = self.normalised_url()?;
+        let load_url = format!("{}/load", url);
+
+        let mut req = WORKER_CLIENT.get(&load_url).timeout(timeout);
+        if let Some(api_key) = &self.metadata.api_key {
+            req = req.bearer_auth(api_key);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.json::<Vec<EngineLoadResponse>>().await {
+                        Ok(loads) => {
+                            if let Some(first_load) = loads.first() {
+                                self.engine_load.update(
+                                    first_load.num_reqs,
+                                    first_load.num_waiting_reqs,
+                                    first_load.num_tokens,
+                                );
+                                tracing::debug!(
+                                    "Updated engine load for {}: num_reqs={}, num_waiting_reqs={}, num_tokens={}",
+                                    self.metadata.url,
+                                    first_load.num_reqs,
+                                    first_load.num_waiting_reqs,
+                                    first_load.num_tokens
+                                );
+                                Ok(())
+                            } else {
+                                tracing::warn!("Empty load response from {}", self.metadata.url);
+                                Err(WorkerError::HealthCheckFailed {
+                                    url: self.metadata.url.clone(),
+                                    reason: "Empty load response".to_string(),
+                                })
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "Failed to parse load response from {}: {err:?}",
+                                self.metadata.url
+                            );
+                            Err(WorkerError::HealthCheckFailed {
+                                url: self.metadata.url.clone(),
+                                reason: format!("Failed to parse load response: {}", err),
+                            })
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "Load check failed for {} with status: {}",
+                        self.metadata.url,
+                        resp.status()
+                    );
+                    Err(WorkerError::HealthCheckFailed {
+                        url: self.metadata.url.clone(),
+                        reason: format!("Load check failed with status: {}", resp.status()),
+                    })
+                }
+            }
+            Err(err) => {
+                tracing::warn!("HTTP load check failed for {}: {err:?}", self.metadata.url);
+                Err(WorkerError::HealthCheckFailed {
+                    url: self.metadata.url.clone(),
+                    reason: format!("HTTP request failed: {}", err),
+                })
+            }
+        }
+    }
+
+    async fn grpc_get_load(&self) -> WorkerResult<()> {
+        // TODO: implement gRPC load check
+        // For now, just return Ok without doing anything
+        Ok(())
+    }
 }
 
 /// A DP-aware worker that handles data-parallel routing
@@ -681,6 +879,14 @@ impl Worker for DPAwareWorker {
 
     async fn check_health_async(&self) -> WorkerResult<()> {
         self.base_worker.check_health_async().await
+    }
+
+    fn engine_load(&self) -> &EngineLoad {
+        self.base_worker.engine_load()
+    }
+
+    async fn check_engine_load_async(&self) -> WorkerResult<()> {
+        self.base_worker.check_engine_load_async().await
     }
 
     fn load(&self) -> usize {
@@ -763,6 +969,93 @@ impl Worker for DPAwareWorker {
 
     async fn http_health_check(&self) -> WorkerResult<bool> {
         self.base_worker.http_health_check().await
+    }
+
+    async fn http_get_load(&self) -> WorkerResult<()> {
+        let timeout = Duration::from_secs(self.base_worker.metadata.health_config.timeout_secs);
+
+        let url = self.base_worker.normalised_url()?;
+        let load_url = format!("{}/load", url);
+
+        let mut req = WORKER_CLIENT.get(&load_url).timeout(timeout);
+        if let Some(api_key) = &self.base_worker.metadata.api_key {
+            req = req.bearer_auth(api_key);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.json::<Vec<EngineLoadResponse>>().await {
+                        Ok(loads) => {
+                            // For DP-aware worker, find the load info matching this worker's dp_rank
+                            let matching_load =
+                                loads.iter().find(|load| load.dp_rank == Some(self.dp_rank));
+
+                            if let Some(load_info) = matching_load {
+                                self.base_worker.engine_load.update(
+                                    load_info.num_reqs,
+                                    load_info.num_waiting_reqs,
+                                    load_info.num_tokens,
+                                );
+                                tracing::debug!(
+                                    "Updated engine load for DP worker {} (rank={}): num_reqs={}, num_waiting_reqs={}, num_tokens={}",
+                                    self.base_worker.metadata.url,
+                                    self.dp_rank,
+                                    load_info.num_reqs,
+                                    load_info.num_waiting_reqs,
+                                    load_info.num_tokens
+                                );
+                                Ok(())
+                            } else {
+                                tracing::warn!(
+                                    "No matching load info found for DP worker {} with rank {}",
+                                    self.base_worker.metadata.url,
+                                    self.dp_rank
+                                );
+                                Err(WorkerError::HealthCheckFailed {
+                                    url: self.base_worker.metadata.url.clone(),
+                                    reason: format!("No load info for dp_rank {}", self.dp_rank),
+                                })
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "Failed to parse load response from {}: {err:?}",
+                                self.base_worker.metadata.url
+                            );
+                            Err(WorkerError::HealthCheckFailed {
+                                url: self.base_worker.metadata.url.clone(),
+                                reason: format!("Failed to parse load response: {}", err),
+                            })
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "Load check failed for {} with status: {}",
+                        self.base_worker.metadata.url,
+                        resp.status()
+                    );
+                    Err(WorkerError::HealthCheckFailed {
+                        url: self.base_worker.metadata.url.clone(),
+                        reason: format!("Load check failed with status: {}", resp.status()),
+                    })
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "HTTP load check failed for {}: {err:?}",
+                    self.base_worker.metadata.url
+                );
+                Err(WorkerError::HealthCheckFailed {
+                    url: self.base_worker.metadata.url.clone(),
+                    reason: format!("HTTP request failed: {}", err),
+                })
+            }
+        }
+    }
+
+    async fn grpc_get_load(&self) -> WorkerResult<()> {
+        self.base_worker.grpc_get_load().await
     }
 }
 
@@ -887,27 +1180,37 @@ impl<'a> Drop for WorkerLoadGuard<'a> {
     }
 }
 
-/// Health checker handle with graceful shutdown
-pub struct HealthChecker {
+/// Background checker handle with graceful shutdown
+pub struct BackgroundChecker {
+    name: String,
     handle: tokio::task::JoinHandle<()>,
     shutdown: Arc<AtomicBool>,
 }
 
-impl fmt::Debug for HealthChecker {
+impl fmt::Debug for BackgroundChecker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HealthChecker")
+        f.debug_struct("BackgroundChecker")
+            .field("name", &self.name)
             .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
             .finish()
     }
 }
 
-impl HealthChecker {
-    /// Create a new HealthChecker
-    pub fn new(handle: tokio::task::JoinHandle<()>, shutdown: Arc<AtomicBool>) -> Self {
-        Self { handle, shutdown }
+impl BackgroundChecker {
+    /// Create a new BackgroundChecker
+    pub fn new(
+        name: String,
+        handle: tokio::task::JoinHandle<()>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            name,
+            handle,
+            shutdown,
+        }
     }
 
-    /// Shutdown the health checker gracefully
+    /// Shutdown the background checker gracefully
     pub async fn shutdown(self) {
         self.shutdown.store(true, Ordering::Release);
         let _ = self.handle.await;

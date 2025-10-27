@@ -66,6 +66,9 @@ pub struct PodInfo {
     pub is_ready: bool,
     pub pod_type: Option<PodType>,
     pub bootstrap_port: Option<u16>,
+    pub max_req_limit: Option<u32>,
+    pub max_waiting_req_limit: Option<u32>,
+    pub max_token_limit: Option<u32>,
 }
 
 impl PodInfo {
@@ -142,6 +145,18 @@ impl PodInfo {
             None
         };
 
+        // Read worker load limit annotations
+        let annotations = pod.metadata.annotations.as_ref();
+        let max_req_limit = annotations
+            .and_then(|a| a.get("sglang.ai/worker_load_limit/max_req"))
+            .and_then(|s| s.parse::<u32>().ok());
+        let max_waiting_req_limit = annotations
+            .and_then(|a| a.get("sglang.ai/worker_load_limit/max_waiting_reqs"))
+            .and_then(|s| s.parse::<u32>().ok());
+        let max_token_limit = annotations
+            .and_then(|a| a.get("sglang.ai/worker_load_limit/max_token"))
+            .and_then(|s| s.parse::<u32>().ok());
+
         Some(PodInfo {
             name,
             ip: pod_ip,
@@ -149,6 +164,9 @@ impl PodInfo {
             is_ready,
             pod_type,
             bootstrap_port,
+            max_req_limit,
+            max_waiting_req_limit,
+            max_token_limit,
         })
     }
 
@@ -393,6 +411,16 @@ async fn handle_pod_event(
                 max_connection_attempts: app_context.router_config.health_check.success_threshold
                     * 20,
                 dp_aware: false,
+                // Use annotation values if present, otherwise use router config defaults
+                max_req_limit: pod_info
+                    .max_req_limit
+                    .unwrap_or(app_context.router_config.worker_load_limit.max_req),
+                max_waiting_req_limit: pod_info
+                    .max_waiting_req_limit
+                    .unwrap_or(app_context.router_config.worker_load_limit.max_waiting_reqs),
+                max_token_limit: pod_info
+                    .max_token_limit
+                    .unwrap_or(app_context.router_config.worker_load_limit.max_token),
             };
 
             let job = Job::AddWorker {
@@ -757,6 +785,42 @@ mod tests {
     }
 
     #[test]
+    fn test_pod_info_from_pod_with_worker_load_limit_annotations() {
+        let mut pod = create_pd_k8s_pod("worker-pod", "10.0.0.1", "worker", None);
+        pod.metadata.annotations.as_mut().unwrap().insert(
+            "sglang.ai/worker_load_limit/max_req".to_string(),
+            "100".to_string(),
+        );
+        pod.metadata.annotations.as_mut().unwrap().insert(
+            "sglang.ai/worker_load_limit/max_waiting_reqs".to_string(),
+            "50".to_string(),
+        );
+        pod.metadata.annotations.as_mut().unwrap().insert(
+            "sglang.ai/worker_load_limit/max_token".to_string(),
+            "8192".to_string(),
+        );
+        let config = create_pd_config();
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.max_req_limit, Some(100));
+        assert_eq!(pod_info.max_waiting_req_limit, Some(50));
+        assert_eq!(pod_info.max_token_limit, Some(8192));
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_with_invalid_worker_load_limit_annotations() {
+        let mut pod = create_pd_k8s_pod("worker-pod", "10.0.0.1", "worker", None);
+        pod.metadata.annotations.as_mut().unwrap().insert(
+            "sglang.ai/worker_load_limit/max_req".to_string(),
+            "invalid".to_string(),
+        );
+        let config = create_pd_config();
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert!(pod_info.max_req_limit.is_none());
+    }
+
+    #[test]
     fn test_pod_info_from_pod_not_ready() {
         let k8s_pod = create_k8s_pod(
             Some("test-pod"),
@@ -817,6 +881,9 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
         assert!(healthy_pod.is_healthy());
 
@@ -827,6 +894,9 @@ mod tests {
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
         assert!(!not_ready_pod.is_healthy());
 
@@ -837,6 +907,9 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
         assert!(!not_running_pod.is_healthy());
     }
@@ -850,6 +923,9 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
 
         let pod2 = PodInfo {
@@ -859,6 +935,9 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
 
         let pod3 = PodInfo {
@@ -868,6 +947,9 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
 
         assert_eq!(pod1, pod2);
@@ -885,6 +967,9 @@ mod tests {
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
         let port = 8080u16;
 
@@ -911,6 +996,9 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
         let port = 8080u16;
 
@@ -936,6 +1024,9 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
         let port = 8080u16;
 
@@ -967,6 +1058,9 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
         let port = 8080u16;
 
@@ -998,6 +1092,9 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
 
         // Add pod to tracked set first
@@ -1031,6 +1128,9 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
         let port = 8080u16;
 
@@ -1059,6 +1159,9 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Regular),
             bootstrap_port: None,
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
         let port = 8080u16;
 
@@ -1091,6 +1194,9 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
         let port = 8080u16;
 
@@ -1122,6 +1228,9 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            max_req_limit: None,
+            max_waiting_req_limit: None,
+            max_token_limit: None,
         };
 
         // Add pod to tracked set first

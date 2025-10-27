@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     worker::{
-        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
+        BasicWorker, ConnectionMode, DPAwareWorker, EngineLoad, HealthConfig, WorkerMetadata,
+        WorkerType,
     },
 };
 use crate::grpc_client::SglangSchedulerClient;
@@ -18,6 +19,7 @@ pub struct BasicWorkerBuilder {
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     grpc_client: Option<SglangSchedulerClient>,
+    engine_load: EngineLoad,
 }
 
 impl BasicWorkerBuilder {
@@ -32,6 +34,7 @@ impl BasicWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            engine_load: EngineLoad::default(),
         }
     }
 
@@ -46,6 +49,7 @@ impl BasicWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            engine_load: EngineLoad::default(),
         }
     }
 
@@ -94,6 +98,12 @@ impl BasicWorkerBuilder {
     /// Set gRPC client for gRPC workers
     pub fn grpc_client(mut self, client: SglangSchedulerClient) -> Self {
         self.grpc_client = Some(client);
+        self
+    }
+
+    /// Set worker load limit configuration
+    pub fn engine_load(mut self, config: EngineLoad) -> Self {
+        self.engine_load = config;
         self
     }
 
@@ -156,6 +166,7 @@ impl BasicWorkerBuilder {
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
             grpc_client,
+            engine_load: self.engine_load.clone(),
         }
     }
 }
@@ -172,6 +183,7 @@ pub struct DPAwareWorkerBuilder {
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     grpc_client: Option<SglangSchedulerClient>,
+    engine_load: EngineLoad,
 }
 
 impl DPAwareWorkerBuilder {
@@ -188,6 +200,7 @@ impl DPAwareWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            engine_load: EngineLoad::default(),
         }
     }
 
@@ -209,6 +222,7 @@ impl DPAwareWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            engine_load: EngineLoad::default(),
         }
     }
 
@@ -260,6 +274,12 @@ impl DPAwareWorkerBuilder {
         self
     }
 
+    /// Set worker load limit configuration
+    pub fn engine_load(mut self, config: EngineLoad) -> Self {
+        self.engine_load = config;
+        self
+    }
+
     /// Build the DPAwareWorker instance
     pub fn build(self) -> DPAwareWorker {
         let worker_url = format!("{}@{}", self.base_url, self.dp_rank);
@@ -268,7 +288,8 @@ impl DPAwareWorkerBuilder {
             .connection_mode(self.connection_mode)
             .labels(self.labels)
             .health_config(self.health_config)
-            .circuit_breaker_config(self.circuit_breaker_config);
+            .circuit_breaker_config(self.circuit_breaker_config)
+            .engine_load(self.engine_load);
 
         if let Some(client) = self.grpc_client {
             builder = builder.grpc_client(client);
