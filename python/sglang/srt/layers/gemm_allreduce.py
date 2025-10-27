@@ -1,16 +1,13 @@
-import argparse
-import ctypes
-import os
-import time
-from functools import partial
-from math import prod
-from typing import Optional, Tuple, Type, Union
 
 import torch
+import numpy as np
+import nvshmem.core
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-
+import torch.distributed as dist
 import cuda.bindings.driver as cuda
+from cuda.core.experimental import Device
+from typing import Optional, Tuple, Type, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -20,12 +17,10 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.distributed_helpers as distributed_helpers
-import cutlass._mlir.ir as ir
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Pointer, Int32, Float16, BFloat16, Float32
-from cutlass.cutlass_dsl import dsl_user_op
-from cutlass._mlir.dialects import llvm
+from cutlass.cute.typing import Int32, Float16, BFloat16, Float32
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 class PersistentDenseGemmKernel:
     """This class implements batched matrix multiplication (C = A x B) with support for various data types
@@ -41,7 +36,7 @@ class PersistentDenseGemmKernel:
     :type cluster_shape_mn: Tuple[int, int]
     :param use_tma_store: Whether to use Tensor Memory Access (TMA) for storing results
     :type use_tma_store: bool
-    :param all_reduce: All-reduce mode, can be "none", "two_shot"
+    :param all_reduce: All-reduce mode, can only be "two_shot" right now
     :type all_reduce: str
 
     :note: In current version, A and B tensor must have the same data type
@@ -88,7 +83,7 @@ class PersistentDenseGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         use_tma_store: bool,
-        all_reduce="none",
+        all_reduce="two_shot",
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -116,7 +111,7 @@ class PersistentDenseGemmKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param use_tma_store: Use Tensor Memory Access (TMA) or normal store for output C tensor.
         :type use_tma_store: bool
-        :param all_reduce: All-reduce mode, can be "none", "two_shot"
+        :param all_reduce: All-reduce mode, can only be "two_shot" right now
         :type all_reduce: str
         """
 
@@ -144,11 +139,7 @@ class PersistentDenseGemmKernel:
         )
         self.mma_warp_id = 4
         self.tma_warp_id = 5
-        self.all_reduce_warp_id = ()
-        self.all_reduce = "none"
-        if all_reduce != "none":
-            self.all_reduce = all_reduce
-            self.all_reduce_warp_id = (6, 7, 8, 9)
+        self.all_reduce_warp_id = (6, 7, 8, 9)
         self.threads_per_cta = 32 * len(
             (
                 self.mma_warp_id,
@@ -158,20 +149,29 @@ class PersistentDenseGemmKernel:
             )
         )
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
-        self.cta_sync_bar_id = 0
-        self.epilog_sync_bar_id = 1
-        self.tmem_alloc_sync_bar_id = 2
-        self.all_reduce_sync_bar_id = 3
+        self.cta_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=1,
+            num_threads=self.threads_per_cta,
+        )
+        self.epilog_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=2,
+            num_threads=32 * len(self.epilog_warp_id),
+        )
+        self.tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=3,
+            num_threads=32 * len((self.mma_warp_id, *self.epilog_warp_id)),
+        )
+        self.all_reduce_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=4,
+            num_threads=32 * len(self.all_reduce_warp_id),
+        )
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
 
-        self.num_ranks = 1
-        self.rank_id = 0
-        if all_reduce != "none":
-            self.num_ranks = torch.distributed.get_world_size()
-            self.rank_id = torch.distributed.get_rank()
+        self.num_ranks = torch.distributed.get_world_size()
+        self.rank_id = torch.distributed.get_rank()
 
     def is_valid(self):
-        mma_m, mma_n = self.mma_tiler_mn
+        mma_m, mma_n = self.mma_tile_shape_mn
         if (mma_m // (2 if self.use_2cta_instrs else 1)) not in [64, 128]:
             return False
         if self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0:
@@ -179,6 +179,8 @@ class PersistentDenseGemmKernel:
         if self.cluster_shape_mn[0] == 4 and self.cluster_shape_mn[1] == 4:
             return False
         return True
+
+        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -290,12 +292,12 @@ class PersistentDenseGemmKernel:
         a: cute.Tensor,
         b: cute.Tensor,
         c: cute.Tensor,
+        c_mc: cute.Tensor,
+        barrier_flag: cute.Tensor,
+        barrier_flag_mc: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
-        c_mc: cute.Tensor = None,
-        barrier_flag: cute.Tensor = None,
-        barrier_flag_mc: cute.Tensor = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -312,6 +314,10 @@ class PersistentDenseGemmKernel:
         :type c: cute.Tensor
         :param c_mc: Output symmetric tensor C_mc, any write or read to a multicast tensor will be broadcasted to all GPUs
         :type c_mc: cute.Tensor
+        :param barrier_flag: flag tensor acting as a barrier for GPUs to synchronize
+        :type barrier_flag: cute.Tensor
+        :param barrier_flag_mc: the multicast tensor of barrier_flag
+        :type barrier_flag_mc: cute.Tensor
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
         :param stream: CUDA stream for asynchronous execution
@@ -450,6 +456,9 @@ class PersistentDenseGemmKernel:
             tma_tensor_b,
             tma_atom_c,
             tma_tensor_c if self.use_tma_store else c,
+            c_mc,
+            barrier_flag,
+            barrier_flag_mc,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -457,9 +466,6 @@ class PersistentDenseGemmKernel:
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
-            c_mc,
-            barrier_flag,
-            barrier_flag_mc,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -479,6 +485,9 @@ class PersistentDenseGemmKernel:
         mB_nkl: cute.Tensor,
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: cute.Tensor,
+        c_mc: cute.Tensor,
+        barrier_flag: cute.Tensor,
+        barrier_flag_mc: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -486,9 +495,6 @@ class PersistentDenseGemmKernel:
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
-        c_mc: cute.Tensor,
-        barrier_flag: cute.Tensor,
-        barrier_flag_mc: cute.Tensor,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -542,6 +548,7 @@ class PersistentDenseGemmKernel:
             consumer_group=ab_pipeline_consumer_group,
             tx_count=self.num_tma_load_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         )
 
         # Initialize acc_pipeline (barrier) and states
@@ -558,24 +565,20 @@ class PersistentDenseGemmKernel:
             producer_group=acc_pipeline_producer_group,
             consumer_group=acc_pipeline_consumer_group,
             cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         )
 
-        tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=self.tmem_alloc_sync_bar_id,
-            num_threads=32 * len((self.mma_warp_id, *self.epilog_warp_id)),
-        )
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
-            barrier_for_retrieve=tmem_alloc_barrier,
+            barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
         )
 
         # Cluster arrive after barrier init
-        if cute.size(self.cluster_shape_mn) > 1:
-            cute.arch.cluster_arrive_relaxed()
+        pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
         #
         # Setup smem tensor A/B/C
@@ -685,12 +688,7 @@ class PersistentDenseGemmKernel:
         #
         # Cluster wait before tensor memory alloc
         #
-        if cute.size(self.cluster_shape_mn) > 1:
-            cute.arch.cluster_wait()
-        else:
-            cute.arch.barrier(
-                barrier_id=self.cta_sync_bar_id, number_of_threads=self.threads_per_cta
-            )
+        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         #
         # Specialized TMA load warp
@@ -945,7 +943,7 @@ class PersistentDenseGemmKernel:
             bSG_gC_partitioned = None
             tTR_gC_partitioned = None
             if cutlass.const_expr(self.use_tma_store):
-                tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype)
+                tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
                 tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                     tiled_copy_t2r, tTR_rC, epi_tidx, sC
                 )
@@ -982,7 +980,6 @@ class PersistentDenseGemmKernel:
                 # Threads/warps participating in tma store pipeline
                 c_producer_group = pipeline.CooperativeGroup(
                     pipeline.Agent.Thread,
-                    32 * len(self.epilog_warp_id),
                     32 * len(self.epilog_warp_id),
                 )
                 c_pipeline = pipeline.PipelineTmaStore.create(
@@ -1078,11 +1075,7 @@ class PersistentDenseGemmKernel:
                             cute.arch.ProxyKind.async_shared,
                             space=cute.arch.SharedSpace.shared_cta,
                         )
-                        epilog_threads = 32 * len(self.epilog_warp_id)
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=epilog_threads,
-                        )
+                        self.epilog_sync_barrier.arrive_and_wait()
 
                         #
                         # TMA store C to global memory
@@ -1096,10 +1089,7 @@ class PersistentDenseGemmKernel:
                             # Fence and barrier to make sure shared memory store is visible to TMA store
                             c_pipeline.producer_commit()
                             c_pipeline.producer_acquire()
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=epilog_threads,
-                        )
+                        self.epilog_sync_barrier.arrive_and_wait()
                     else:
                         #
                         # Convert to C type
@@ -1148,10 +1138,7 @@ class PersistentDenseGemmKernel:
             # Dealloc the tensor memory buffer
             #
             tmem.relinquish_alloc_permit()
-            epilog_threads = 32 * len(self.epilog_warp_id)
-            cute.arch.barrier(
-                barrier_id=self.epilog_sync_bar_id, number_of_threads=epilog_threads
-            )
+            self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
 
             #
@@ -1216,13 +1203,10 @@ class PersistentDenseGemmKernel:
                     if warp_idx == self.all_reduce_warp_id[0]:
                         with cute.arch.elect_one():
                             flag = barrier_flag.iterator + tile_id
-                            # TODO: we may use LDG+STG for spin lock instead of ATOMIC_CAS for better performance.
+                            # TODO: we may use Load + Store for spin lock instead of ATOMIC_CAS for better performance.
                             distributed_helpers.spin_lock_wait(flag, num_ranks)
 
-                    cute.arch.barrier(
-                        barrier_id=self.all_reduce_sync_bar_id,
-                        number_of_threads=32 * len(self.all_reduce_warp_id),
-                    )
+                    self.all_reduce_sync_barrier.arrive_and_wait()
                     # partition and slice at tile level
                     gC_mc = cute.local_tile(
                         c_mc,
@@ -1252,24 +1236,37 @@ class PersistentDenseGemmKernel:
                             mc_ptr = frgC_mc[None, i, j].iterator
                             x, y, z, w = 0, 0, 0, 0
                             if cutlass.const_expr(self.c_dtype == Float16):
-                                x, y, z, w = distributed_helpers.multimem_ld_reduce_8xf16(mc_ptr)
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_8xf16(mc_ptr)
+                                )
                             elif cutlass.const_expr(self.c_dtype == Float32):
-                                x, y, z, w = distributed_helpers.multimem_ld_reduce_4xf32(mc_ptr)
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_4xf32(mc_ptr)
+                                )
                             elif cutlass.const_expr(self.c_dtype == BFloat16):
-                                x, y, z, w = distributed_helpers.multimem_ld_reduce_8xbf16(mc_ptr)
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_8xbf16(
+                                        mc_ptr
+                                    )
+                                )
                             elif cutlass.const_expr(self.c_dtype == Float8E4M3FN):
-                                x, y, z, w = distributed_helpers.multimem_ld_reduce_16xe4m3(mc_ptr)
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_16xe4m3(
+                                        mc_ptr
+                                    )
+                                )
                             elif cutlass.const_expr(self.c_dtype == Float8E5M2):
-                                x, y, z, w = distributed_helpers.multimem_ld_reduce_16xe5m2(mc_ptr)
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_16xe5m2(
+                                        mc_ptr
+                                    )
+                                )
                             distributed_helpers.multimem_st_4xb32(mc_ptr, x, y, z, w)
                     # Advance to next tile
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
 
-                cute.arch.barrier(
-                    barrier_id=self.all_reduce_sync_bar_id,
-                    number_of_threads=32 * len(self.all_reduce_warp_id),
-                )
+                self.all_reduce_sync_barrier.arrive_and_wait()
                 # System barrier to make sure all the peer memory transfers are completed.
                 last_flag_idx = cute.size(
                     tile_sched.params.problem_layout_ncluster_mnl
@@ -1340,7 +1337,7 @@ class PersistentDenseGemmKernel:
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
         # (T2R, T2R_M, T2R_N)
-        tTR_rAcc = cute.make_fragment(
+        tTR_rAcc = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
@@ -1440,7 +1437,7 @@ class PersistentDenseGemmKernel:
             thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
             tTR_gC = thr_copy_t2r.partition_D(gC_epi)
             # (T2R, T2R_M, T2R_N)
-            tTR_rC = cute.make_fragment(
+            tTR_rC = cute.make_rmem_tensor(
                 tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.c_dtype
             )
             simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.c_dtype)
@@ -1617,8 +1614,6 @@ class PersistentDenseGemmKernel:
 
         :param ab_dtype: The data type of the A and B operands
         :type ab_dtype: Type[cutlass.Numeric]
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
         :param c_dtype: The data type of the output tensor
         :type c_dtype: Type[cutlass.Numeric]
 
@@ -1690,7 +1685,9 @@ class PersistentDenseGemmKernel:
             return False
 
         # check if c_dtype is supported by multimem all-reduce
-        if cutlass.const_expr(self.all_reduce != "none" and c_dtype not in {cutlass.Float16, cutlass.Float32, cutlass.BFloat16, cutlass.Float8E4M3FN, cutlass.Float8E5M2}):
+        if cutlass.const_expr(
+            c_dtype not in {cutlass.Float16, cutlass.Float32, cutlass.BFloat16, cutlass.Float8E4M3FN, cutlass.Float8E5M2}
+        ):
             return False
 
         return True
@@ -1702,43 +1699,27 @@ class PersistentDenseGemmKernel:
         :rtype: bool
         """
         is_valid = True
-        
         # Skip invalid mma tile shape
-        mma_m_valid = (
+        if not (
             (not self.use_2cta_instrs and self.mma_tiler_mn[0] in [64, 128])
             or (self.use_2cta_instrs and self.mma_tiler_mn[0] in [128, 256])
-        )
-        if not mma_m_valid:
+        ):
             is_valid = False
-            
-        mma_n_valid = self.mma_tiler_mn[1] in range(32, 257, 32)
-        if not mma_n_valid:
+        if self.mma_tiler_mn[1] not in range(32, 257, 32):
             is_valid = False
-            
         # Skip illegal cluster shape
-        cluster_m_alignment = self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) == 0
-        if not cluster_m_alignment:
+        if self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0:
             is_valid = False
-            
         # Skip invalid cluster shape
         is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
-        cluster_size_valid = self.cluster_shape_mn[0] * self.cluster_shape_mn[1] <= 16
-        cluster_m_positive = self.cluster_shape_mn[0] > 0
-        cluster_n_positive = self.cluster_shape_mn[1] > 0
-        cluster_m_power_of_2 = is_power_of_2(self.cluster_shape_mn[0])
-        cluster_n_power_of_2 = is_power_of_2(self.cluster_shape_mn[1])
-        
-        if not cluster_size_valid:
+        if (
+            self.cluster_shape_mn[0] * self.cluster_shape_mn[1] > 16
+            or self.cluster_shape_mn[0] <= 0
+            or self.cluster_shape_mn[1] <= 0
+            or not is_power_of_2(self.cluster_shape_mn[0])
+            or not is_power_of_2(self.cluster_shape_mn[1])
+        ):
             is_valid = False
-        if not cluster_m_positive:
-            is_valid = False
-        if not cluster_n_positive:
-            is_valid = False
-        if not cluster_m_power_of_2:
-            is_valid = False
-        if not cluster_n_power_of_2:
-            is_valid = False
-            
         return is_valid
 
     def is_valid_tensor_alignment(
@@ -1786,19 +1767,16 @@ class PersistentDenseGemmKernel:
             num_contiguous_elements = 16 * 8 // dtype.width
             return num_major_elements % num_contiguous_elements == 0
 
-        a_aligned = check_contigous_16B_alignment(ab_dtype, a_major == "m", (m, k, l))
-        b_aligned = check_contigous_16B_alignment(ab_dtype, b_major == "n", (n, k, l))
-        c_aligned = check_contigous_16B_alignment(c_dtype, c_major == "m", (m, n, l))
-        
-        if not (a_aligned and b_aligned and c_aligned):
+        if (
+            not check_contigous_16B_alignment(ab_dtype, a_major == "m", (m, k, l))
+            or not check_contigous_16B_alignment(ab_dtype, b_major == "n", (n, k, l))
+            or not check_contigous_16B_alignment(c_dtype, c_major == "m", (m, n, l))
+        ):
             is_valid = False
-        
-        # Check all-reduce alignment
-        all_reduce_aligned = True
-        if self.all_reduce != "none":
-            all_reduce_aligned = m % 128 == 0 or n % 128 == 0
-            if not all_reduce_aligned:
-                is_valid = False
+
+        # currently only support output tensor that can be divided by 128
+        if m % 128 != 0 and n % 128 != 0:
+            is_valid = False
 
         return is_valid
 
@@ -1818,19 +1796,16 @@ class PersistentDenseGemmKernel:
         :return: True if the epilogue store option is valid, False otherwise
         :rtype: bool
         """
+
         is_valid = True
         # None TMA store version does not have predication, can not support OOB tiles
         cta_tile_shape_mn = (
             self.mma_tiler_mn[0] // (2 if self.use_2cta_instrs else 1),
             self.mma_tiler_mn[1],
         )
-        
         if not self.use_tma_store:
-            m_aligned = m % cta_tile_shape_mn[0] == 0
-            n_aligned = n % cta_tile_shape_mn[1] == 0
-            if not (m_aligned and n_aligned):
+            if not (m % cta_tile_shape_mn[0] == 0 and n % cta_tile_shape_mn[1] == 0):
                 is_valid = False
-        
         return is_valid
 
     def can_implement(self, a: cute.Tensor, b: cute.Tensor, c: cute.Tensor) -> bool:
@@ -1846,10 +1821,7 @@ class PersistentDenseGemmKernel:
         :return: True if the gemm supports the given config, False otherwise
         :rtype: bool
         """
-        # Get tensor dimensions following distributed version pattern
-        # a.shape should be (M, K, L), b.shape should be (N, K, L), c.shape should be (M, N, L)
-        m, k, l = a.shape[0], a.shape[1], a.shape[2]
-        n = b.shape[0]
+        m, n, k, l = a.shape[0], b.shape[0], a.shape[1], a.shape[2]
 
         # infer a_major, b_major, c_major
         is_m_major_a = utils.LayoutEnum.from_tensor(a).is_m_major_a()
@@ -1860,35 +1832,23 @@ class PersistentDenseGemmKernel:
         c_major = "m" if is_m_major_c else "n"
 
         can_implement = True
-        
         # Skip unsupported types
-        dtypes_valid = self.is_valid_dtypes(a.element_type, c.element_type)
-        if not dtypes_valid:
+        if not self.is_valid_dtypes(a.element_type, c.element_type):
             can_implement = False
-            
         # Skip invalid mma tile shape and cluster shape
-        mma_tiler_valid = self.is_valid_mma_tiler_and_cluster_shape()
-        if not mma_tiler_valid:
+        if not self.is_valid_mma_tiler_and_cluster_shape():
             can_implement = False
-            
         # Skip illegal problem shape for load/store alignment
-        alignment_valid = self.is_valid_tensor_alignment(
+        if not self.is_valid_tensor_alignment(
             m, n, k, l, a.element_type, c.element_type, a_major, b_major, c_major
-        )
-        if not alignment_valid:
+        ):
             can_implement = False
-            
         # Skip invalid epilogue store option
-        epilog_valid = self.is_valid_epilog_store_option(m, n)
-        if not epilog_valid:
+        if not self.is_valid_epilog_store_option(m, n):
             can_implement = False
-            
-        # Check world size for all-reduce
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        world_size_valid = world_size in [2, 4, 8] or self.all_reduce == "none"
-        if not world_size_valid:
+        # currently only support world_size = 2, 4, 8
+        if dist.get_world_size() not in [2, 4, 8]:
             can_implement = False
-            
         return can_implement
 
 class GemmARLayer:
@@ -2055,10 +2015,10 @@ class GemmARLayer:
             self.compiled_gemm = cute.compile(
                 self.gemm_kernel,
                 a_tensor, b_tensor, c_tensor,
+                self.c_tensor_mc,
+                self.barrier_flag_memref,
+                self.barrier_flag_mc_memref,
                 self.max_active_clusters, current_stream,
-                c_mc=self.c_tensor_mc,
-                barrier_flag=self.barrier_flag_memref,
-                barrier_flag_mc=self.barrier_flag_mc_memref,
             )
             # compile_end_time = time.time()
             # compile_duration = compile_end_time - compile_start_time
@@ -2133,21 +2093,22 @@ class GemmARLayer:
         c_tensor.element_type = self.output_dtype
         c_tensor = c_tensor.mark_layout_dynamic(leading_dim=1)
         
-        print(f"a_tensor: {a_tensor.shape, a_tensor._dtype}")
-        print(f"b_tensor: {b_tensor.shape, b_tensor._dtype}")
-        print(f"c_tensor: {c_tensor.shape, c_tensor._dtype}, actual_m: {actual_m}")
+        # print(f"a_tensor: {a_tensor.shape, a_tensor._dtype}")
+        # print(f"b_tensor: {b_tensor.shape, b_tensor._dtype}")
+        # print(f"c_tensor: {c_tensor.shape, c_tensor._dtype}, actual_m: {actual_m}")
         # dist.barrier(group=self.tp_group)
         if self.all_reduce == "none":
             self.compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
         else:
             self.compiled_gemm(
-                a_tensor, b_tensor, c_tensor, current_stream,
-                c_mc=self.c_tensor_mc,
-                barrier_flag=self.barrier_flag_memref,
-                barrier_flag_mc=self.barrier_flag_mc_memref,
+                a_tensor, b_tensor, c_tensor,
+                self.c_tensor_mc,
+                self.barrier_flag_memref,
+                self.barrier_flag_mc_memref,
+                current_stream,
             )
         
         result = self.c_torch_gpu.squeeze(-1)
-        print(f"result: {result.shape}")
+        # print(f"result: {result.shape}")
         return result[:actual_m, :]
     
