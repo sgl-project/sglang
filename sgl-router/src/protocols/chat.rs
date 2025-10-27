@@ -654,7 +654,6 @@ pub struct ChatCompletionStreamResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
     pub choices: Vec<ChatStreamChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
 }
 
@@ -674,9 +673,7 @@ pub struct ChatMessageDelta {
 pub struct ChatStreamChoice {
     pub index: u32,
     pub delta: ChatMessageDelta,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_stop: Option<Value>,
 }
