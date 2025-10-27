@@ -9,7 +9,7 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
 ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
-ARG SGL_KERNEL_VERSION=0.3.16.post3
+ARG SGL_KERNEL_VERSION=0.3.16.post4
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
@@ -35,7 +35,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     software-properties-common netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
     build-essential cmake \
-    libopenmpi-dev libnuma1 libnuma-dev \
+    libopenmpi-dev libnuma1 libnuma-dev numactl \
     libibverbs-dev libibverbs1 libibumad3 \
     librdmacm1 libnl-3-200 libnl-route-3-200 libnl-route-3-dev libnl-3-dev \
     ibverbs-providers infiniband-diags perftest \
@@ -138,7 +138,7 @@ RUN cd /sgl-workspace/DeepEP && \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
         ;; \
     esac && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
+    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
 
 # Install flashmla
 RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
@@ -148,7 +148,7 @@ RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
       if [ "$CUDA_VERSION" = "12.6.1" ]; then \
         export FLASH_MLA_DISABLE_SM100=1; \
       fi && \
-      pip install -v . ;
+      pip install --no-build-isolation -v . ;
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
