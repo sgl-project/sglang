@@ -433,6 +433,7 @@ class DataParallelController:
                             moe_ep_rank,
                             pp_rank,
                             dp_rank,
+                            None,
                             writer,
                         ),
                     )
