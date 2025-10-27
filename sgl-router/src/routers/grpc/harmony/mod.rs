@@ -33,6 +33,7 @@ pub mod builder;
 pub mod detector;
 pub mod parser;
 pub mod processor;
+pub mod serving;
 pub mod stages;
 pub mod streaming;
 pub mod types;
@@ -41,7 +42,8 @@ pub mod types;
 pub use builder::HarmonyBuilder;
 pub use detector::HarmonyDetector;
 pub use parser::HarmonyParserAdapter;
-pub use processor::HarmonyResponseProcessor;
+pub use processor::{HarmonyResponseProcessor, ResponsesIterationResult};
+pub use serving::{serve_harmony_responses, HarmonyResponsesContext};
 pub use stages::{
     HarmonyPreparationStage, HarmonyRequestBuildingStage, HarmonyResponseProcessingStage,
 };

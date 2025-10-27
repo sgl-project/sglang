@@ -386,4 +386,32 @@ impl RequestPipeline {
     ) -> Response {
         utils::internal_error_static("Responses API execution not yet implemented")
     }
+
+    /// Execute Harmony Responses API request through all pipeline stages
+    ///
+    /// This method runs a single iteration of the Responses API request,
+    /// returning either ToolCallsFound (continue serving) or Completed (final response).
+    ///
+    /// Called by harmony::serving::serve_harmony_responses() for each iteration.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Responses API request
+    /// * `ctx` - Harmony Responses context with MCP manager and components
+    ///
+    /// # Returns
+    ///
+    /// ResponsesIterationResult indicating whether to continue iteration or return
+    pub async fn execute_harmony_responses(
+        &self,
+        _request: &crate::protocols::responses::ResponsesRequest,
+        _ctx: &harmony::serving::HarmonyResponsesContext,
+    ) -> Result<harmony::ResponsesIterationResult, Response> {
+        // TODO: Implement full pipeline execution for Harmony Responses
+        // This will be implemented in a follow-up step
+        // For now, return error to indicate not yet implemented
+        Err(utils::internal_error_static(
+            "Harmony Responses pipeline execution not yet implemented",
+        ))
+    }
 }
