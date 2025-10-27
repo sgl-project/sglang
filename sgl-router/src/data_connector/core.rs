@@ -11,7 +11,6 @@
 use std::{
     collections::HashMap,
     fmt::{Display, Formatter},
-    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -141,9 +140,6 @@ pub trait ConversationStorage: Send + Sync + 'static {
     async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool>;
 }
 
-/// Shared pointer alias for conversation storage
-pub type SharedConversationStorage = Arc<dyn ConversationStorage>;
-
 // ============================================================================
 // PART 2: ConversationItem Storage
 // ============================================================================
@@ -258,8 +254,6 @@ pub trait ConversationItemStorage: Send + Sync + 'static {
         item_id: &ConversationItemId,
     ) -> ConversationItemResult<()>;
 }
-
-pub type SharedConversationItemStorage = Arc<dyn ConversationItemStorage>;
 
 /// Helper to build id prefix based on item_type
 pub fn make_item_id(item_type: &str) -> ConversationItemId {
@@ -481,9 +475,6 @@ pub trait ResponseStorage: Send + Sync {
     /// Delete all responses for a user
     async fn delete_user_responses(&self, user: &str) -> ResponseResult<usize>;
 }
-
-/// Type alias for shared storage
-pub type SharedResponseStorage = Arc<dyn ResponseStorage>;
 
 impl Default for StoredResponse {
     fn default() -> Self {
