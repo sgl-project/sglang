@@ -804,6 +804,10 @@ def _launch_subprocesses(
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
                 with maybe_reindex_device_id(gpu_id) as gpu_id:
+                    attn_tp_size = server_args.tp_size // server_args.cp_size
+                    attn_cp_rank = (
+                        tp_rank // attn_tp_size if server_args.cp_size > 1 else None
+                    )
                     proc = mp.Process(
                         target=run_scheduler_process,
                         args=(
@@ -814,9 +818,11 @@ def _launch_subprocesses(
                             moe_ep_rank,
                             pp_rank,
                             None,
+                            attn_cp_rank,
                             writer,
                         ),
                     )
+
                     with memory_saver_adapter.configure_subprocess():
                         proc.start()
 

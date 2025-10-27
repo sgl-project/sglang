@@ -36,6 +36,9 @@ from sglang.srt.configs.model_config import (
     is_deepseek_nsa,
 )
 from sglang.srt.distributed import (
+    context_model_parallel_all_gather,
+    get_context_model_parallel_rank,
+    get_context_model_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -64,6 +67,7 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -1076,6 +1080,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.kv_lora_rank = kv_lora_rank
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = attn_tp_rank
+        self.attn_tp_size = attn_tp_size
+        self.cp_size = get_context_model_parallel_world_size()
+        self.cp_rank = get_context_model_parallel_rank()
 
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
@@ -1150,7 +1158,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=quant_config,
+            quant_config=None if _is_npu else quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -1411,7 +1419,10 @@ class DeepseekV2AttentionMLA(nn.Module):
                 inner_state = (*inner_state, None)  # add a position for topk_indices
         elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
             inner_state = self.forward_npu_sparse_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
@@ -1449,6 +1460,25 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             raise NotImplementedError
 
+    def scattered_to_tp_attn_full(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        hidden_states, local_hidden_states = (
+            torch.empty(
+                (
+                    forward_batch.input_ids.shape[0] // self.cp_size,
+                    hidden_states.shape[1],
+                ),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            ),
+            hidden_states,
+        )
+        attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
+        return hidden_states
+
     def forward_normal_prepare(
         self,
         positions: torch.Tensor,
@@ -1461,6 +1491,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
+            if self.cp_size > 1:
+                latent_cache = context_model_parallel_all_gather(
+                    latent_cache.contiguous(), dim=0
+                )
+
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
@@ -1486,8 +1521,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
+        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
         k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
@@ -1839,8 +1873,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             q_lora = self.q_a_layernorm(q)
         else:
-            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
             if (
                 (not isinstance(hidden_states, tuple))
                 and hidden_states.shape[0] <= 16
@@ -1854,96 +1886,25 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            k_nope = latent_cache[..., : self.kv_lora_rank]
-
-            # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                q = self.q_a_layernorm(q)
-                with torch.cuda.stream(self.alt_stream):
-                    k_nope = self.kv_a_layernorm(k_nope)
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                    q, k_nope = fused_rms_mxfp4_quant(
-                        q,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.variance_epsilon,
-                        k_nope,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.variance_epsilon,
-                    )
-                else:
-                    q = self.q_a_layernorm(q)
-                    k_nope = self.kv_a_layernorm(k_nope)
-
+            q = self.q_a_layernorm(q)
             q_lora = q.clone()  # required for topk_indices
-            k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
 
+            if self.cp_size > 1:
+                latent_cache = context_model_parallel_all_gather(
+                    latent_cache.contiguous(), dim=0
+                )
+
+            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             q_nope, q_pe = q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
-            k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
-
-            if self.use_deep_gemm_bmm:
-                q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
-                    per_token_group_quant_mla_deep_gemm_masked_fp8(
-                        q_nope.transpose(0, 1)
-                    )
-                )
-                q_nope_out = q_nope.new_empty(
-                    (self.num_local_heads, aligned_m, self.kv_lora_rank)
-                )
-                deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-                    (q_nope_val, q_nope_scale),
-                    (self.w_kc, self.w_scale_k),
-                    q_nope_out,
-                    masked_m,
-                    expected_m,
-                )
-                q_nope_out = q_nope_out[:, :expected_m, :]
-            elif _is_hip:
-                # TODO(haishaw): add bmm_fp8 to ROCm
-                if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
-                    x = q_nope.transpose(0, 1)
-                    q_nope_out = torch.empty(
-                        x.shape[0],
-                        x.shape[1],
-                        self.w_kc.shape[2],
-                        device=x.device,
-                        dtype=torch.bfloat16,
-                    )
-                    batched_gemm_afp4wfp4_pre_quant(
-                        x,
-                        self.w_kc.transpose(-2, -1),
-                        self.w_scale_k.transpose(-2, -1),
-                        torch.bfloat16,
-                        q_nope_out,
-                    )
-                else:
-                    q_nope_out = torch.bmm(
-                        q_nope.to(torch.bfloat16).transpose(0, 1),
-                        self.w_kc.to(torch.bfloat16) * self.w_scale,
-                    )
-            elif self.w_kc.dtype == torch.float8_e4m3fn:
-                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                    q_nope.transpose(0, 1),
-                    zero_allocator.allocate(1),
-                )
-                q_nope_out = bmm_fp8(
-                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-                )
-            else:
-                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
-
+            k_nope, k_pe = latent_cache.unsqueeze(1).split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            k_nope = self.kv_a_layernorm(k_nope)
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
             q_nope_out = q_nope_out.transpose(0, 1)
-
-            if not self._fuse_rope_for_trtllm_mla(forward_batch) and (
-                not _use_aiter or not _is_gfx95_supported
-            ):
-                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         # TODO: multi-stream indexer
         topk_indices = self.indexer(
@@ -1972,10 +1933,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         zero_allocator,
         positions,
     ):
+        k_nope = k_nope.contiguous()
         attn_output = self.attn_mqa(
             q_nope_out.contiguous(),
-            k_nope.contiguous(),
-            k_nope.contiguous(),
+            k_nope,
+            k_nope,
             forward_batch,
             save_kv_cache=True,  # False if forward_batch.forward_mode.is_extend() else True,
             q_rope=q_pe.contiguous(),
@@ -2474,6 +2436,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
             concat_and_cast_mha_k_triton(k, k_nope, k_pe)
         else:
+            if self.cp_size > 1:
+                k_shape = list(k_shape)
+                k_shape[0] = k_shape[0] * self.cp_size
             k = k_nope.new_empty(*k_shape)
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_pe
@@ -2583,6 +2548,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
         )
+        self.attn_tp_rank = get_attention_tp_rank()
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
@@ -2652,12 +2618,10 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
-
         if not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
-
         return hidden_states, residual
 
     def op_comm_prepare_attn(
@@ -2938,7 +2902,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-
+        # config.num_hidden_layers = 6
         # for quark model load
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         self.fuse_qkv_a_proj = (
@@ -3028,6 +2992,14 @@ class DeepseekV2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        def cp_split(x, seq_lens, cp_size):
+            cp_rank = get_context_model_parallel_rank()
+            return x.tensor_split(cp_size)[cp_rank]
+
+        cp_size = get_context_model_parallel_world_size()
+        if cp_size > 1:
+            input_ids = cp_split(input_ids, forward_batch.seq_lens, cp_size)
+
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
         )
@@ -3187,9 +3159,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
-                self_attn.w_vc = bind_or_assign(
-                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-                )
+                w_vc = w_vc.contiguous().transpose(1, 2)
+                if _is_npu:
+                    w_vc = w_vc.contiguous()
+                self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None

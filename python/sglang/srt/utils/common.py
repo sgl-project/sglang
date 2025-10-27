@@ -2707,7 +2707,9 @@ def require_mlp_tp_gather(server_args):
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     if server_args.enable_dp_attention:
-        assert server_args.dp_size > 1, "dp_size must be greater than 1"
+        assert (
+            server_args.dp_size > 1 or server_args.cp_size > 1
+        ), "dp_size or cp_size must be greater than 1"
         if (
             server_args.moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers

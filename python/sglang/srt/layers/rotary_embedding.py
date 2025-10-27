@@ -11,6 +11,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.distributed import (
+    get_context_model_parallel_rank,
+    get_context_model_parallel_world_size,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -856,19 +860,26 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         if self.rotary_dim < self.head_size:
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
-
+        if positions.numel() != num_tokens:
+            cp_size = get_context_model_parallel_world_size()
+            cp_rank = get_context_model_parallel_rank()
+            cos_split = cos.tensor_split(cp_size)[cp_rank]
+            sin_split = sin.tensor_split(cp_size)[cp_rank]
+        else:
+            cos_split, sin_split = cos, sin
         query_rot = torch_npu.npu_interleave_rope(
             query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim),
-            cos,
-            sin,
+            cos_split,
+            sin_split,
         )
         key_rot = torch_npu.npu_interleave_rope(
-            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim),
+            key_rot.reshape(-1, num_k_heads, 1, self.rotary_dim),
             cos,
             sin,
         )
-        query_rot = query_rot.reshape(num_tokens, -1, self.rotary_dim)
-        key_rot = key_rot.reshape(num_tokens, -1, self.rotary_dim)
+
+        query_rot = query_rot.reshape(num_tokens, num_q_heads, self.rotary_dim)
+        key_rot = key_rot.reshape(-1, num_k_heads, self.rotary_dim)
 
         if self.rotary_dim < self.head_size:
             query = torch.cat((query_rot, query_pass), dim=-1)

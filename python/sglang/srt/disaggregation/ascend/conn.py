@@ -47,7 +47,7 @@ class AscendKVManager(MooncakeKVManager):
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
         )
-
+        # logger.info(f"send_kvcache {prefill_kv_blocks=} {dst_kv_blocks=}")
         num_layers = len(self.kv_args.kv_data_ptrs)
         layers_params = [
             (

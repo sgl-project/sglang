@@ -201,7 +201,10 @@ class W8A8Int8Config(QuantizationConfig):
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         self.quant_description = quant_config
-        self.is_dynamic = quant_config.get("is_dynamic", False)
+        self.is_dynamic = (
+            quant_config.get("is_dynamic", False)
+            or quant_config.get("model_quant_type", "STATIC") == "W8A8_DYNAMIC"
+        )
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
@@ -210,6 +213,8 @@ class W8A8Int8Config(QuantizationConfig):
         )
 
         if _is_npu:
+            if self.is_dynamic:
+                return
             # Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models
             for name in self.quant_description.keys():
                 if "norm.bias" in name:
@@ -279,8 +284,10 @@ class W8A8Int8Config(QuantizationConfig):
                         proj_name, packed_modules_mapping_subset[proj_name][0]
                     )
                 self.is_dynamic = (
-                    self.quant_description[prefix_in_quant_config + ".weight"]
+                    self.quant_description.get(prefix_in_quant_config + ".weight", "")
                     == "W8A8_DYNAMIC"
+                    or self.quant_description.get("quant_method", "")
+                    == "compressed-tensors"
                 )
                 if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                     return UnquantizedLinearMethod()
@@ -317,7 +324,7 @@ class W8A8Int8Config(QuantizationConfig):
             is_skipped = None
             for shard_prefix in shard_prefixes:
                 is_shard_skipped = (
-                    self.quant_description[shard_prefix + ".weight"] == "FLOAT"
+                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
                 )
 
                 if is_skipped is None:
@@ -329,7 +336,7 @@ class W8A8Int8Config(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
-            is_skipped = self.quant_description[prefix + ".weight"] == "FLOAT"
+            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
 
         assert is_skipped is not None
         return is_skipped
@@ -341,7 +348,10 @@ class W8A8Int8Config(QuantizationConfig):
 class W8A8Int8LinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: W8A8Int8Config):
-        self.quantization_config = quantization_config
+        if quantization_config is None:
+            self.quantization_config = W8A8Int8Config()
+        else:
+            self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:

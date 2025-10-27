@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
+import numpy as np
 import torch
 import torch_npu
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed import (
+    get_context_model_parallel_rank,
+    get_context_model_parallel_world_size,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -20,8 +26,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-
-import numpy as np
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -201,10 +206,16 @@ class AscendAttnBackend(AttentionBackend):
         block_table = self.forward_metadata.block_tables
         if is_prefill:
             actual_seq_qlen = torch.cumsum(forward_batch.seq_lens, dim=0)
+            cp_size = get_context_model_parallel_world_size()
+            cp_rank = get_context_model_parallel_rank()
+            if cp_size > 1:
+                bsz = q_nope.shape[0]
+                actual_seq_qlen -= bsz * cp_rank
+                actual_seq_qlen.clip_(min=0, max=bsz)
         else:
             if self.forward_metadata.actual_seq_lengths_q is None:
-                actual_seq_qlen = (
-                    torch.arange(1, q.shape[0] + 1).to(q.device).to(torch.int32)
+                actual_seq_qlen = torch.arange(
+                    1, q.shape[0] + 1, device=q.device, dtype=torch.int32
                 )
             else:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
@@ -363,6 +374,21 @@ class AscendAttnBackend(AttentionBackend):
             q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
 
+            actual_seq_qlen = self.forward_metadata.seq_lens_list_cumsum.copy()
+            cp_size = get_context_model_parallel_world_size()
+            if cp_size > 1:
+                cp_rank = get_context_model_parallel_rank()
+                bsz = q_nope.shape[0]
+                actual_seq_qlen -= bsz * cp_rank
+                np.clip(actual_seq_qlen, 0, bsz, out=actual_seq_qlen)
+                if actual_seq_qlen[-1] == 0:
+                    return q_nope.new_zeros(
+                        (q_nope.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+                    )
+                elif actual_seq_qlen[-1] < bsz:
+                    q_nope = q_nope[: actual_seq_qlen[-1]]
+                    q_rope = q_rope[: actual_seq_qlen[-1]]
+
             attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                 q_nope,
                 k_nope,
@@ -373,7 +399,7 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="TND",
                 atten_mask=self.fia_mask,
                 sparse_mode=3,
-                actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
+                actual_seq_lengths=actual_seq_qlen,
                 actual_seq_lengths_kv=self.forward_metadata.seq_lens_list_cumsum,
                 scale=layer.scaling,
                 next_tokens=0,
