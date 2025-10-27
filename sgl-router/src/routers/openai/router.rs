@@ -2,6 +2,7 @@
 
 use std::{
     any::Any,
+    collections::HashSet,
     sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
@@ -15,6 +16,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::StreamExt;
+use once_cell::sync::Lazy;
 use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -56,8 +58,6 @@ use crate::{
     },
     routers::header_utils::apply_request_headers,
 };
-use once_cell::sync::Lazy;
-use std::collections::HashSet;
 
 // ============================================================================
 // OpenAIRouter Struct
@@ -88,7 +88,6 @@ static SGLANG_FIELDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
         "sampling_seed",
     ])
 });
-
 
 /// Cached endpoint information
 #[derive(Clone, Debug)]
