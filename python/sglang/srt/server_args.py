@@ -875,7 +875,7 @@ class ServerArgs:
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
                     )
-                if self.moe_runner_backend == "auto":
+                if self.moe_a2a_backend == "none" and self.moe_runner_backend == "auto":
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
