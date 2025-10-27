@@ -167,6 +167,7 @@ class MooncakeKVManager(CommonKVManager):
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
+            self._register_to_bootstrap()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
@@ -851,7 +852,7 @@ class MooncakeKVManager(CommonKVManager):
                 )
 
     def start_prefill_thread(self):
-        self._bind_server_socket()
+        self.rank_port = self._bind_server_socket()
 
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
@@ -889,7 +890,7 @@ class MooncakeKVManager(CommonKVManager):
         threading.Thread(target=bootstrap_thread).start()
 
     def start_decode_thread(self):
-        self._bind_server_socket()
+        self.rank_port = self._bind_server_socket()
 
         def decode_thread():
             while True:

@@ -68,7 +68,7 @@ class CommonKVManager(BaseKVManager):
         )
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
-        self.rank_port = get_free_port()
+        self.rank_port = -1 # lazy assign when bound to random port
         self.local_ip = get_local_ip_auto()
         self.server_socket = zmq.Context().socket(zmq.PULL)
         if is_valid_ipv6_address(self.local_ip):
@@ -76,7 +76,6 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._register_to_bootstrap()
             self.transfer_infos = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -92,8 +91,11 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
-    def _bind_server_socket(self):
-        self.server_socket.bind(format_tcp_address(self.local_ip, self.rank_port))
+    def _bind_server_socket(self) -> int:
+        """auto choose random available port, then bind it and return it"""
+        addr = f"tcp://{maybe_wrap_ipv6_address(self.local_ip)}"
+        port = self.server_socket.bind_to_random_port(addr)
+        return port
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
@@ -113,6 +115,7 @@ class CommonKVManager(BaseKVManager):
 
         bootstrap_server_url = f"{host}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
+        assert self.rank_port != -1, "self.server_socket should be bound"
         payload = {
             "role": "Prefill",
             "attn_tp_size": self.attn_tp_size,

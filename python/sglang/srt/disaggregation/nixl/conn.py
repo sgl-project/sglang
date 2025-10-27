@@ -137,6 +137,7 @@ class NixlKVManager(CommonKVManager):
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._start_bootstrap_thread()
+            self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
@@ -647,7 +648,7 @@ class NixlKVManager(CommonKVManager):
         return self.transfer_statuses[room].is_done()
 
     def _start_bootstrap_thread(self):
-        self._bind_server_socket()
+        self.rank_port = self._bind_server_socket()
 
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
