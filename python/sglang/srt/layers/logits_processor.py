@@ -255,6 +255,18 @@ class LogitsProcessor(nn.Module):
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
         aux_hidden_states: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+
+        # Similar to HuggingFace's convention, it is not always the case to expect
+        # hidden_states[-1] to match last_hidden_state exactly.
+        # (https://huggingface.co/docs/transformers/main_classes/output#model-outputs)
+        # And the returning `hidden_states_to_store` here is either `hidden_states` or
+        # `aux_hidden_states`. We'd rather carry everything on if it is not the case.
+        # Downstream usecases also prefer having all states assessible:
+        # https://github.com/sgl-project/SpecForge/blob/6bde887cc78d3e5e173d1265215efbf44f81248f/scripts/prepare_hidden_states.py#L58
+        if aux_hidden_states and aux_hidden_states[-1].shape == hidden_states.shape:
+            if not torch.all(hidden_states == aux_hidden_states[-1]):
+                aux_hidden_states.append(hidden_states)
+
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
         # Get the last hidden states and last logits for the next token prediction
