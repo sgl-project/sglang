@@ -2241,6 +2241,7 @@ class ServerArgs:
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
             "before serving inference requests.",
+        )
         
         # Encode prefill disaggregation
         parser.add_argument(
