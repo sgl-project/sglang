@@ -18,8 +18,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
-
-from sglang.srt.utils import is_hip, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -64,7 +63,9 @@ class StandardDispatcher(BaseDispatcher):
         )
         self.num_experts = moe_runner_config.num_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
-        self.num_local_routed_experts = moe_runner_config.num_local_experts - self.num_local_shared_experts
+        self.num_local_routed_experts = (
+            moe_runner_config.num_local_experts - self.num_local_shared_experts
+        )
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.local_expert_mapping = None
 
@@ -90,11 +91,14 @@ class StandardDispatcher(BaseDispatcher):
                 )
 
                 if self.num_local_shared_experts > 0:
-                    self.local_expert_mapping[-self.num_local_shared_experts:] = torch.arange(
-                        self.num_local_routed_experts,
-                        self.num_local_routed_experts + self.num_local_shared_experts,
-                        dtype=torch.int32,
-                        device="cpu",
+                    self.local_expert_mapping[-self.num_local_shared_experts :] = (
+                        torch.arange(
+                            self.num_local_routed_experts,
+                            self.num_local_routed_experts
+                            + self.num_local_shared_experts,
+                            dtype=torch.int32,
+                            device="cpu",
+                        )
                     )
 
         if self.local_expert_mapping is not None and not _use_aiter:

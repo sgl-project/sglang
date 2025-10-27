@@ -166,7 +166,9 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
         assert (num_experts - num_fused_shared_experts) % self.moe_ep_size == 0
-        self.num_local_experts = (num_experts - num_fused_shared_experts) // self.moe_ep_size + num_fused_shared_experts
+        self.num_local_experts = (
+            num_experts - num_fused_shared_experts
+        ) // self.moe_ep_size + num_fused_shared_experts
 
         self.expert_mask_gpu = None
 
@@ -464,12 +466,16 @@ class FusedMoE(torch.nn.Module):
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         num_global_routed_experts = self.num_experts - self.num_fused_shared_experts
-        num_local_routed_experts = self.num_local_experts - self.num_fused_shared_experts
+        num_local_routed_experts = (
+            self.num_local_experts - self.num_fused_shared_experts
+        )
         start_idx = self.moe_ep_rank * num_local_routed_experts
         end_idx = (self.moe_ep_rank + 1) * num_local_routed_experts
         if start_idx <= expert_id < end_idx:
             return expert_id - start_idx
-        elif self.num_fused_shared_experts > 0 and expert_id >= num_global_routed_experts:
+        elif (
+            self.num_fused_shared_experts > 0 and expert_id >= num_global_routed_experts
+        ):
             return expert_id - num_global_routed_experts + num_local_routed_experts
         else:
             return -1
@@ -843,8 +849,13 @@ class FusedMoE(torch.nn.Module):
         )
         if _use_aiter and self.dispatcher.local_expert_mapping is not None:
             self.expert_mask_gpu = (
-                (self.dispatcher.local_expert_mapping >= 0) & (self.dispatcher.local_expert_mapping < self.num_experts)
-            ).to(torch.int32).to(device="cuda")
+                (
+                    (self.dispatcher.local_expert_mapping >= 0)
+                    & (self.dispatcher.local_expert_mapping < self.num_experts)
+                )
+                .to(torch.int32)
+                .to(device="cuda")
+            )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
