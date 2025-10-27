@@ -50,8 +50,9 @@ constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
-  // PTX instructions used here requires sm100a/sm103a.
-#if CUTLASS_ARCH_MMA_SM100A_ENABLED || CUTLASS_ARCH_MMA_SM103A_ENABLED
+  // PTX instructions used here requires >= sm100f.
+#if CUTLASS_ARCH_MMA_SM100A_ENABLED || CUTLASS_ARCH_MMA_SM103A_ENABLED || \
+    (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && (__CUDA_ARCH_FAMILY_SPECIFIC__ > 1000))
   uint32_t val;
   asm volatile(
       "{\n"
@@ -76,14 +77,17 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
         "f"(array[7]));
   return val;
 #else
+  printf("fp32_vec_to_e2m1 is not supported on this architecture\n");
+  __trap();
   return 0;
 #endif
 }
 
 // Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
-  // PTX instructions used here requires sm100a/sm103a.
-#if CUTLASS_ARCH_MMA_SM100A_ENABLED || CUTLASS_ARCH_MMA_SM103A_ENABLED
+  // PTX instructions used here requires >= sm100f.
+#if CUTLASS_ARCH_MMA_SM100A_ENABLED || CUTLASS_ARCH_MMA_SM103A_ENABLED || \
+    (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && (__CUDA_ARCH_FAMILY_SPECIFIC__ > 1000))
   uint32_t val;
   asm volatile(
       "{\n"
@@ -108,6 +112,8 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
         "f"(array[3].y));
   return val;
 #else
+  printf("fp32_vec_to_e2m1 is not supported on this architecture\n");
+  __trap();
   return 0;
 #endif
 }
