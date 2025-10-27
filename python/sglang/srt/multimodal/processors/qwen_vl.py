@@ -2,6 +2,7 @@ import asyncio
 import math
 import os
 import re
+import time
 from typing import List, Union
 
 import torch
@@ -175,6 +176,7 @@ async def preprocess_video(
     image_factor: int = IMAGE_FACTOR,
     # vr: VideoReader, image_factor: int = IMAGE_FACTOR
 ) -> torch.Tensor:
+    entry_time = time.perf_counter()
     ele = {}
     total_frames, video_fps = len(vr), vr.get_avg_fps()
     nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
@@ -188,6 +190,9 @@ async def preprocess_video(
         min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
         int(min_pixels * 1.05),
     )
+
+    process1_time = time.perf_counter()
+
     max_pixels_supposed = ele.get("max_pixels", max_pixels)
     if max_pixels_supposed > max_pixels:
         logger.warning(
@@ -208,6 +213,8 @@ async def preprocess_video(
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
+
+    process2_time = time.perf_counter()
     video = torchvision.transforms.functional.resize(
         video,
         [resized_height, resized_width],
@@ -221,6 +228,14 @@ async def preprocess_video(
         "frames_indices": idx,
         "video_backend": "torchvision",
     }
+    process3_time = time.perf_counter()
+    logger.info(
+        f"[preprocess_video Perf], "
+        f"get_batch_time: {(process1_time - entry_time) * 1000:.2f} ms, "
+        f"smart_resize_time: {(process2_time - process1_time) * 1000:.2f} ms, "
+        f"torchvision_resize_time: {(process3_time - process2_time) * 1000:.2f} ms, "
+        f"total_time: {(process3_time - entry_time) * 1000:.2f} ms"
+    )
     return video, video_metadata
 
 
@@ -273,6 +288,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        entry_time = time.perf_counter()
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -280,6 +296,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
         )
+        load_time = time.perf_counter()
+        rid = getattr(request_obj, "rid", "anonymous_rid")
 
         # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
@@ -292,6 +310,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 *[preprocess_video(video) for video in base_output.videos]
             )
             base_output.videos, video_metadata = map(list, zip(*video_results))
+
+        preprocess_time = time.perf_counter()
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
         if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
@@ -317,6 +337,15 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         second_per_grid_ts = getattr(ret, "second_per_grid_ts", None) or getattr(
             ret, "video_second_per_grid", None
+        )
+
+        process_time = time.perf_counter()
+        logger.info(
+            f"[QwenVLProcessor Perf] {rid=}, "
+            f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
+            f"preprocess_time: {(preprocess_time - load_time) * 1000:.2f} ms, "
+            f"process_time: {(process_time - preprocess_time) * 1000:.2f} ms, "
+            f"total_time: {(process_time - entry_time) * 1000:.2f} ms"
         )
 
         input_ids = input_ids.flatten()
