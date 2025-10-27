@@ -137,12 +137,8 @@ class MmItemMemoryChunk:
             )
             tp_num = -1
         if self.sync_flag.buffer_wrapper.item() == tp_num:
-            # print("can recycle , sync_flag is {}".format(self.sync_flag.buffer_wrapper))
             self.sync_flag.buffer_wrapper *= 0
             return True
-
-        # print("can not recycle , sync_flag is {}".format(self.sync_flag.buffer_wrapper))
-        # print("tp_num is {}".format(tp_num))
 
         return False
 
@@ -213,10 +209,8 @@ class MmItemMemoryPool:
     def return_a_slice_tensor_with_flag(self, src_tensor: torch.Tensor):
         self.recycle_chunks()
         self.merge_chunks()
-        # self.print_available_chunk("after merge")
-        # self.print_occupied_chunk("after merge")
+
         available_chunk = self.get_available_chunk(src_tensor)
-        # logger.info("src tensor shape {}. src tensor dtype {}  available_chunk {}".format(src_tensor.shape, src_tensor.dtype, available_chunk))
         if available_chunk is not None:
             return (
                 available_chunk.sync_flag.meta_data,
