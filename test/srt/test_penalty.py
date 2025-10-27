@@ -127,7 +127,6 @@ class TestPenalty(CustomTestCase):
                 f"Negative penalty should increase '{target_word}' repetition",
             )
 
-    # Basic decode tests (from test_penalty_a.py)
     def test_default_values(self):
         self.run_decode({})
 
@@ -161,7 +160,6 @@ class TestPenalty(CustomTestCase):
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(self.run_decode, args))
 
-    # Advanced penalty effect tests (from test_penalty_b.py)
     def test_frequency_penalty_reduces_word_repetition(self):
         """Test frequency penalty using word repetition."""
         prompt = "Write exactly 10 very small sentences, each containing the word 'data'. Use the word 'data' as much as possible."
