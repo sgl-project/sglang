@@ -117,13 +117,13 @@ struct RadixTree::Impl {
     std::vector<TreeNode*> stack = {};
 
     auto process_node = [&](TreeNode* node) {
-        if (node->is_leaf()) {
-          if (node->ref_count == 0) {
-            leaves.push_back(node);
-          }
-        } else {
-            stack.push_back(node);
+      if (node->is_leaf()) {
+        if (node->ref_count == 0) {
+          leaves.push_back(node);
         }
+      } else {
+        stack.push_back(node);
+      }
     };
     for (const auto& [_, child] : m_root) {
       process_node(child.get());
@@ -145,15 +145,15 @@ struct RadixTree::Impl {
     std::vector<TreeNode*> stack = {};
 
     auto process_node = [&](TreeNode* node) {
-        if (!node->on_gpu()) return;  // skip nodes that are not on GPU
+      if (!node->on_gpu()) return;  // skip nodes that are not on GPU
 
-        if (node->is_leaf_device()) {
-          if (node->ref_count == 0) {
-            leaves.push_back(node);
-          }
-        } else {
-            stack.push_back(node);
+      if (node->is_leaf_device()) {
+        if (node->ref_count == 0) {
+          leaves.push_back(node);
         }
+      } else {
+        stack.push_back(node);
+      }
     };
     for (const auto& [_, child] : m_root) {
       process_node(child.get())
