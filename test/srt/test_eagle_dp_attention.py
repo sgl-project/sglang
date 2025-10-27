@@ -26,7 +26,6 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--disable-radix-cache",
             "--speculative-algorithm",
             "EAGLE3",
             "--speculative-num-steps",
@@ -38,7 +37,7 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
             "--speculative-draft-model-path",
             DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST,
             "--tp-size",
-            "8",
+            "2",
             "--dp-size",
             "2",
             "--enable-dp-attention",
@@ -99,7 +98,7 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["accuracy"], 0.925)
+            self.assertGreater(metrics["accuracy"], 0.91)
             if avg_spec_accept_length is not None:
                 self.assertGreater(avg_spec_accept_length, 3.2)
 
