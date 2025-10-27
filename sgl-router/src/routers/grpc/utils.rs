@@ -542,6 +542,8 @@ pub fn create_stop_decoder(
 pub fn parse_json_schema_response(
     processed_text: &str,
     tool_choice: &Option<ToolChoice>,
+    model: &str,
+    history_tool_calls_count: usize,
 ) -> (Option<Vec<ToolCall>>, String) {
     match tool_choice {
         Some(ToolChoice::Function { function, .. }) => {
@@ -549,7 +551,12 @@ pub fn parse_json_schema_response(
             match serde_json::from_str::<Value>(processed_text) {
                 Ok(params) => {
                     let tool_call = ToolCall {
-                        id: format!("call_{}", Uuid::new_v4()),
+                        id: generate_tool_call_id(
+                            model,
+                            &function.name,
+                            0,
+                            history_tool_calls_count,
+                        ),
                         tool_type: "function".to_string(),
                         function: FunctionCallResponse {
                             name: function.name.clone(),
@@ -580,7 +587,12 @@ pub fn parse_json_schema_response(
                             let parameters = obj.get("parameters")?;
 
                             Some(ToolCall {
-                                id: format!("call_{}_{}", i, Uuid::new_v4()),
+                                id: generate_tool_call_id(
+                                    model,
+                                    &name,
+                                    i,
+                                    history_tool_calls_count,
+                                ),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
                                     name,
