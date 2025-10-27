@@ -200,19 +200,6 @@ RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
         MAX_JOBS=20 pip install --break-system-packages -e .; \
     fi
 
-# In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
-# latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
-RUN python3 -m pip install --no-cache-dir --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0"
-
-# For cuda 13, we need to install Triton from source to solve sm103 issue
-# Go back to official after >3.4.5 is released
-RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
-    git clone --depth=1 https://github.com/triton-lang/triton.git && \
-    cd triton && \
-        pip install --break-system-packages -r python/requirements.txt && \
-        MAX_JOBS=20 pip install --break-system-packages -e .; \
-    fi
-
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
