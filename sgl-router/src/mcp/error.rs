@@ -31,6 +31,9 @@ pub enum McpError {
     #[error("Prompt not found: {0}")]
     PromptNotFound(String),
 
+    #[error("Invalid arguments: {0}")]
+    InvalidArguments(String),
+
     #[error(transparent)]
     Sdk(#[from] Box<rmcp::RmcpError>),
 
