@@ -840,6 +840,19 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="deepseek-ocr",
+        system_message="",
+        system_template="",
+        roles=("", ""),
+        sep="",
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        stop_str=["<｜end▁of▁sentence｜>"],
+        image_token="<image>",
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="deepseek-vl2",
         system_template="{system_message}",
         # system_message="You are a helpful assistant. Please answer truthfully and write out your "
@@ -960,6 +973,19 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="points-v15-chat",
+        system_message="",
+        system_template="",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|vision_start|><|image_pad|><|vision_end|>",
+        video_token="<|vision_start|><|video_pad|><|vision_end|>",
+    )
+)
 
 MODEL_TYPE_TO_TEMPLATE = {
     "internvl_chat": "internvl-2-5",
@@ -968,7 +994,14 @@ MODEL_TYPE_TO_TEMPLATE = {
     "phi4mm": "phi-4-mm",
     "minicpmv": "minicpmv",
     "minicpmo": "minicpmo",
+    "deepseek-ocr": "deepseek-ocr",
 }
+
+
+@register_conv_template_matching_function
+def match_points_v15_chat(model_path: str):
+    if re.search(r"points", model_path, re.IGNORECASE):
+        return "points-v15-chat"
 
 
 def get_model_type(model_path: str) -> Optional[str]:
@@ -1036,5 +1069,13 @@ def match_minicpm(model_path: str):
 def match_phi_4_mm(model_path: str):
     if "phi-4-multimodal" in model_path.lower():
         return "phi-4-mm"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
+@register_conv_template_matching_function
+def match_deepseek_ocr(model_path: str):
+    if "deepseek-ocr" in model_path.lower():
+        return "deepseek-ocr"
     model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)

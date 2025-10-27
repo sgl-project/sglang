@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -112,10 +113,10 @@ class RotaryEmbedding(CustomOp):
         if not _is_cuda:
             cache = cache.to(dtype)
 
-        if (
+        if dtype == torch.float32 or (
             (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
             and not (_is_cpu and _is_cpu_amx_available)
-            and not _is_xpu
+            and not (_is_xpu)
         ):
             from vllm._custom_ops import rotary_embedding
 
@@ -124,18 +125,29 @@ class RotaryEmbedding(CustomOp):
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
+        if get_global_server_args().rl_on_policy_target == "fsdp":
+            self._forward_method = self.forward_native
+
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
         # use CPU to compute the cache and then move it to GPU. However, we
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
+        init_device = (
+            "cpu" if get_global_server_args().rl_on_policy_target == "fsdp" else None
+        )
         inv_freq = 1.0 / (
             base
             ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+                torch.arange(
+                    0, self.rotary_dim, 2, dtype=torch.float, device=init_device
+                )
+                / self.rotary_dim
             )
         )
+        if get_global_server_args().rl_on_policy_target == "fsdp":
+            inv_freq = inv_freq.cuda()
         return inv_freq
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
@@ -254,7 +266,11 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cuda and (self.head_size in [64, 128, 256, 512]):
+        if (
+            _is_cuda
+            and (self.head_size in [64, 128, 256, 512])
+            and self.dtype != torch.float32
+        ):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -298,6 +314,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # TODO: make a wrapper, and XPU will implement this kernel later.
+        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
         return self.forward_native(positions, query, key, offsets)
 
 
@@ -1280,7 +1297,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
-    def forward_native(
+    def _forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1340,6 +1357,27 @@ class MRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with optional Triton kernel acceleration.
+        Args:
+            positions:
+                [num_tokens,] (text only) or
+                [3, num_tokens] (T/H/W positions with multimodal inputs)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        assert positions.ndim == 1 or positions.ndim == 2
+
+        if positions.ndim == 2 and self.mrope_section and _is_cuda:
+            return self._forward_triton(positions, query, key)
+        else:
+            return self._forward_native(positions, query, key)
+
+    def _forward_triton(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
         assert key is not None
