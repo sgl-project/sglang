@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from urllib.parse import urlparse
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -37,19 +38,21 @@ class TestLlama31FP4B200(unittest.TestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        parsed_url = urlparse(self.base_url)
         args = SimpleNamespace(
             num_shots=4,
             data_path=None,
             num_questions=100,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            host=f"{parsed_url.scheme}://{parsed_url.hostname}",
+            port=parsed_url.port,
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
         self.assertGreater(metrics["accuracy"], 0.61)
+        self.assertGreater(metrics["output_throughput"], 3000)
 
 
 if __name__ == "__main__":
