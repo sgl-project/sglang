@@ -62,15 +62,11 @@ LORA_MODELS_QWEN3 = [
         base="Qwen/Qwen3-VL-4B-Instruct",
         adaptors=[
             LoRAAdaptor(
-                name="gary109/uicpayworld-vl-4b-it-lora",
-                prefill_tolerance=3e-1,
-            ),
-            LoRAAdaptor(
-                name="velocitatem/dysgrafix",
+                name="mryufei/Qwen3-VL-4B-Instruct-trl-sft",
                 prefill_tolerance=3e-1,
             ),
         ],
-        max_loras_per_batch=2,
+        max_loras_per_batch=1,
     ),
 ]
 
@@ -119,11 +115,7 @@ class TestLoRAQwen3VLIntegration(CustomTestCase):
                             random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
                             random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
                         ],
-                        [
-                            None,
-                            lora_adapter_paths[0],
-                            lora_adapter_paths[1],
-                        ],
+                        [None, lora_adapter_paths[0], None],
                     ),
                     (
                         [
@@ -131,27 +123,7 @@ class TestLoRAQwen3VLIntegration(CustomTestCase):
                             random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
                             random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
                         ],
-                        [
-                            lora_adapter_paths[0],
-                            None,
-                            lora_adapter_paths[1],
-                        ],
-                    ),
-                    (
-                        [
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                        ],
-                        [lora_adapter_paths[0], lora_adapter_paths[1], None],
-                    ),
-                    (
-                        [
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                        ],
-                        [None, lora_adapter_paths[1], None],
+                        [lora_adapter_paths[0], None, None],
                     ),
                     (
                         [

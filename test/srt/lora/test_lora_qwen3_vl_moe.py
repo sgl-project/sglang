@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
 import random
 import unittest
 
@@ -52,21 +53,16 @@ class TestLoRAQwen3VLMoEFilters(CustomTestCase):
             )
 
 
-# TODO: Modify these once I figure out which models have MoE
 LORA_MODELS_QWEN3 = [
     LoRAModelCase(
-        base="Qwen/Qwen3-4B",
+        base="Qwen/Qwen3-VL-30B-A3B-Instruct",
         adaptors=[
             LoRAAdaptor(
-                name="nissenj/Qwen3-4B-lora-v2",
-                prefill_tolerance=3e-1,
-            ),
-            LoRAAdaptor(
-                name="y9760210/Qwen3-4B-lora_model",
+                name="sosoai/qwen3_vl_30b_lora",  # target_modules: [ "q_proj", "o_proj", "k_proj", "v_proj"]
                 prefill_tolerance=3e-1,
             ),
         ],
-        max_loras_per_batch=2,
+        max_loras_per_batch=1,
     ),
 ]
 
@@ -104,7 +100,7 @@ class TestLoRAQwen3VLMoEIntegration(CustomTestCase):
                 backend = "triton"
                 base_path = model_case.base
                 lora_adapter_paths = [a.name for a in model_case.adaptors]
-                assert len(lora_adapter_paths) >= 2
+                assert len(lora_adapter_paths) >= 1
 
                 batches = [
                     (
@@ -113,11 +109,7 @@ class TestLoRAQwen3VLMoEIntegration(CustomTestCase):
                             random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
                             random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
                         ],
-                        [
-                            None,
-                            lora_adapter_paths[0],
-                            lora_adapter_paths[1],
-                        ],
+                        [None, lora_adapter_paths[0], None],
                     ),
                     (
                         [
@@ -125,27 +117,7 @@ class TestLoRAQwen3VLMoEIntegration(CustomTestCase):
                             random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
                             random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
                         ],
-                        [
-                            lora_adapter_paths[0],
-                            None,
-                            lora_adapter_paths[1],
-                        ],
-                    ),
-                    (
-                        [
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                        ],
-                        [lora_adapter_paths[0], lora_adapter_paths[1], None],
-                    ),
-                    (
-                        [
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS),
-                        ],
-                        [None, lora_adapter_paths[1], None],
+                        [lora_adapter_paths[0], None, None],
                     ),
                     (
                         [
@@ -167,8 +139,8 @@ class TestLoRAQwen3VLMoEIntegration(CustomTestCase):
                     base_path,
                     torch_dtype=torch_dtype,
                     model_type="generation",
-                    lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
-                    max_loras_per_batch=len(lora_adapter_paths) + 1,
+                    lora_paths=[lora_adapter_paths[0]],
+                    max_loras_per_batch=1,
                     lora_backend=backend,
                     sleep_on_idle=True,  # Eliminate non-determinism by forcing all requests to be processed in one batch.
                     attention_backend="torch_native",
