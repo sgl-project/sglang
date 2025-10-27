@@ -175,7 +175,7 @@ RUN cd /sgl-workspace/DeepEP && \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
       sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
     fi && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
+    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
 
 # Install flashmla
 RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
@@ -185,7 +185,20 @@ RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
       if [ "$CUDA_VERSION" = "12.6.1" ]; then \
         export FLASH_MLA_DISABLE_SM100=1; \
       fi && \
-      pip install -v . ;
+      pip install --no-build-isolation -v . ;
+
+# In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
+# latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
+RUN python3 -m pip install --no-cache-dir --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0"
+
+# For cuda 13, we need to install Triton from source to solve sm103 issue
+# Go back to official after >3.4.5 is released
+RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
+    git clone --depth=1 https://github.com/triton-lang/triton.git && \
+    cd triton && \
+        pip install --break-system-packages -r python/requirements.txt && \
+        MAX_JOBS=20 pip install --break-system-packages -e .; \
+    fi
 
 # In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
 # latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
