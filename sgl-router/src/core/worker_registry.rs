@@ -2,10 +2,12 @@
 //!
 //! Provides centralized registry for workers with model-based indexing
 
-use crate::core::{ConnectionMode, Worker, WorkerType};
-use dashmap::DashMap;
 use std::sync::{Arc, RwLock};
+
+use dashmap::DashMap;
 use uuid::Uuid;
+
+use crate::core::{ConnectionMode, Worker, WorkerType};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -34,7 +36,6 @@ impl Default for WorkerId {
     }
 }
 
-/// Type alias for the model index to reduce complexity
 type ModelIndex = Arc<DashMap<String, Arc<RwLock<Vec<Arc<dyn Worker>>>>>>;
 
 /// Worker registry with model-based indexing
@@ -54,8 +55,7 @@ pub struct WorkerRegistry {
 
     /// Workers indexed by connection mode
     connection_workers: Arc<DashMap<ConnectionMode, Vec<WorkerId>>>,
-
-    /// URL to worker ID mapping (for backward compatibility)
+    /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
 }
 
@@ -256,6 +256,18 @@ impl WorkerRegistry {
             .collect()
     }
 
+    pub fn get_all_urls_with_api_key(&self) -> Vec<(String, Option<String>)> {
+        self.workers
+            .iter()
+            .map(|entry| {
+                (
+                    entry.value().url().to_string(),
+                    entry.value().api_key().clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Get all model IDs with workers
     pub fn get_models(&self) -> Vec<String> {
         self.model_workers
@@ -298,9 +310,9 @@ impl WorkerRegistry {
                     }
                 }
 
-                // Check connection_mode if specified
+                // Check connection_mode if specified (using matches for flexible gRPC matching)
                 if let Some(ref conn) = connection_mode {
-                    if w.connection_mode() != *conn {
+                    if !w.connection_mode().matches(conn) {
                         return false;
                     }
                 }
@@ -353,8 +365,10 @@ impl WorkerRegistry {
     /// Start a health checker for all workers in the registry
     /// This should be called once after the registry is populated with workers
     pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -378,7 +392,7 @@ impl WorkerRegistry {
                 }
 
                 // Get all workers from registry
-                let workers: Vec<Arc<dyn crate::core::Worker>> = workers_ref
+                let workers: Vec<Arc<dyn Worker>> = workers_ref
                     .iter()
                     .map(|entry| entry.value().clone())
                     .collect();
@@ -390,7 +404,7 @@ impl WorkerRegistry {
 
                 // Reset loads periodically
                 check_count += 1;
-                if check_count % LOAD_RESET_INTERVAL == 0 {
+                if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
                     tracing::debug!("Resetting worker loads (cycle {})", check_count);
                     for worker in &workers {
                         worker.reset_load();
@@ -423,9 +437,10 @@ pub struct WorkerRegistryStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::core::{CircuitBreakerConfig, WorkerFactory};
     use std::collections::HashMap;
+
+    use super::*;
+    use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig};
 
     #[test]
     fn test_worker_registry() {
@@ -437,23 +452,24 @@ mod tests {
         labels.insert("priority".to_string(), "50".to_string());
         labels.insert("cost".to_string(), "0.8".to_string());
 
-        let worker = WorkerFactory::create_regular_with_labels(
-            "http://worker1:8080".to_string(),
-            labels,
-            CircuitBreakerConfig::default(),
+        let worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://worker1:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
+                .build(),
         );
 
         // Register worker (WorkerFactory returns Box<dyn Worker>, convert to Arc)
         let worker_id = registry.register(Arc::from(worker));
 
-        // Verify registration
         assert!(registry.get(&worker_id).is_some());
         assert!(registry.get_by_url("http://worker1:8080").is_some());
         assert_eq!(registry.get_by_model("llama-3-8b").len(), 1);
         assert_eq!(registry.get_by_type(&WorkerType::Regular).len(), 1);
         assert_eq!(registry.get_by_connection(&ConnectionMode::Http).len(), 1);
 
-        // Test stats
         let stats = registry.stats();
         assert_eq!(stats.total_workers, 1);
         assert_eq!(stats.total_models, 1);
@@ -470,26 +486,35 @@ mod tests {
         // Create workers for different models
         let mut labels1 = HashMap::new();
         labels1.insert("model_id".to_string(), "llama-3".to_string());
-        let worker1 = WorkerFactory::create_regular_with_labels(
-            "http://worker1:8080".to_string(),
-            labels1,
-            CircuitBreakerConfig::default(),
+        let worker1: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://worker1:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels1)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
+                .build(),
         );
 
         let mut labels2 = HashMap::new();
         labels2.insert("model_id".to_string(), "llama-3".to_string());
-        let worker2 = WorkerFactory::create_regular_with_labels(
-            "http://worker2:8080".to_string(),
-            labels2,
-            CircuitBreakerConfig::default(),
+        let worker2: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://worker2:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels2)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
+                .build(),
         );
 
         let mut labels3 = HashMap::new();
         labels3.insert("model_id".to_string(), "gpt-4".to_string());
-        let worker3 = WorkerFactory::create_regular_with_labels(
-            "http://worker3:8080".to_string(),
-            labels3,
-            CircuitBreakerConfig::default(),
+        let worker3: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://worker3:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels3)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
+                .build(),
         );
 
         // Register workers
@@ -497,27 +522,22 @@ mod tests {
         registry.register(Arc::from(worker2));
         registry.register(Arc::from(worker3));
 
-        // Test get_by_model_fast for llama-3
         let llama_workers = registry.get_by_model_fast("llama-3");
         assert_eq!(llama_workers.len(), 2);
         let urls: Vec<String> = llama_workers.iter().map(|w| w.url().to_string()).collect();
         assert!(urls.contains(&"http://worker1:8080".to_string()));
         assert!(urls.contains(&"http://worker2:8080".to_string()));
 
-        // Test get_by_model_fast for gpt-4
         let gpt_workers = registry.get_by_model_fast("gpt-4");
         assert_eq!(gpt_workers.len(), 1);
         assert_eq!(gpt_workers[0].url(), "http://worker3:8080");
 
-        // Test get_by_model_fast for non-existent model
         let unknown_workers = registry.get_by_model_fast("unknown-model");
         assert_eq!(unknown_workers.len(), 0);
 
-        // Test that both get_by_model and get_by_model_fast return same results
         let llama_workers_slow = registry.get_by_model("llama-3");
         assert_eq!(llama_workers.len(), llama_workers_slow.len());
 
-        // Test removal updates the model index
         registry.remove_by_url("http://worker1:8080");
         let llama_workers_after = registry.get_by_model_fast("llama-3");
         assert_eq!(llama_workers_after.len(), 1);

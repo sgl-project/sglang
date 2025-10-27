@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -32,6 +33,8 @@ class TestDeepseekV3FP4(CustomTestCase):
             "flashinfer_trtllm",
             "--quantization",
             "modelopt_fp4",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -81,6 +84,7 @@ class TestDeepseekV3FP4(CustomTestCase):
 class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
@@ -100,6 +104,8 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "1",
             "--speculative-num-draft-tokens",
             "4",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -111,6 +117,8 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        if "SGLANG_ENABLE_SPEC_V2" in os.environ:
+            del os.environ["SGLANG_ENABLE_SPEC_V2"]
 
     def test_a_gsm8k(
         self,
@@ -141,8 +149,8 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["accuracy"], 0.935)
-            self.assertGreater(avg_spec_accept_length, 2.9)
+            self.assertGreater(metrics["accuracy"], 0.94)
+            self.assertGreater(avg_spec_accept_length, 2.04)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -156,8 +164,8 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(acc_length, 2.9)
-            self.assertGreater(speed, 130)
+            self.assertGreater(acc_length, 2.04)
+            self.assertGreater(speed, 150)
 
 
 class TestDeepseekV3FP4CutlassMoE(CustomTestCase):

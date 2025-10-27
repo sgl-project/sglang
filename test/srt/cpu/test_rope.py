@@ -8,6 +8,7 @@ from sglang.srt.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
     RotaryEmbedding,
 )
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 torch.manual_seed(1234)
@@ -24,6 +25,7 @@ class TestROPE(CustomTestCase):
         k_dim = 576
         rotary_dim = 64
         is_neox_style = False
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
         # Create cos_sin_cache
         freqs = torch.rand(max_pos, qk_rope_head_dim // 2)
@@ -95,6 +97,7 @@ class TestROPE(CustomTestCase):
             num_q_heads: int,
             num_kv_heads: int,
         ):
+            set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
             torch.manual_seed(100)
             rope_ref = RotaryEmbedding(
                 head_size,

@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     TreeNodeCpp,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -93,9 +94,9 @@ class RadixCacheCpp(BasePrefixCache):
             raise NotImplementedError("Host cache is not supported yet")
         self.tree.reset()
 
-    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
+    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
-            self.tree.match_prefix(key)
+            self.tree.match_prefix(key.token_ids)
         )
         return MatchResult(
             device_indices=self._merge_tensor(device_indices_vec),
@@ -104,16 +105,16 @@ class RadixCacheCpp(BasePrefixCache):
             host_hit_length=host_indices_length,
         )
 
-    def _insert(self, key: List[int], value: torch.Tensor) -> int:
+    def _insert(self, key: RadixKey, value: torch.Tensor) -> int:
         """
         Insert a key-value pair into the radix tree.
         Args:
-            key (List[int]): The key to insert, represented as a list of integers.
+            key (RadixKey): The key to insert, represented as a RadixKey.
             value (torch.Tensor): The value to associate with the key.
         Returns:
             int: Number of device indices that were already present in the tree before the insertion.
         """
-        ongoing_write, length = self.tree.writing_through(key, value)
+        ongoing_write, length = self.tree.writing_through(key.token_ids, value)
         if self.cache_controller is None:
             assert len(ongoing_write) == 0, "Implementation error"
             return length
@@ -150,32 +151,37 @@ class RadixCacheCpp(BasePrefixCache):
     def total_size(self):
         return self.tree.total_size()
 
-    def cache_finished_req(self, req: Req):
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
         overall_len = len(token_ids)  # prefill + decode
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :overall_len]
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        new_prefix_len = self._insert(token_ids, kv_indices)
+        page_aligned_overall_len = overall_len // self.page_size * self.page_size
 
-        # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
-        assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
-
-        # KVCache between old & new is newly generated, but already exists in the pool
-        # we need to free this newly generated kv indices
-        if old_prefix_len < new_prefix_len:
-            self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
+        if is_insert:
+            new_prefix_len = self._insert(
+                RadixKey(token_ids, req.extra_key), kv_indices
+            )
+            # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
+            assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
+            # Free duplicates that were already in the pool
+            if old_prefix_len < new_prefix_len:
+                self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
+        else:
+            self.token_to_kv_pool.free(
+                kv_indices[old_prefix_len:page_aligned_overall_len]
+            )
 
         # need to free the unaligned part, since it cannot be inserted into the radix tree
-        if self.page_size != 1 and (  # unaligned tail only exists when page_size > 1
-            (unaligned_len := overall_len % self.page_size) > 0
-        ):
+        if page_aligned_overall_len < overall_len:
             # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
-            self.token_to_kv_pool.free(kv_indices[overall_len - unaligned_len :])
+            self.token_to_kv_pool.free(kv_indices[page_aligned_overall_len:])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -191,14 +197,16 @@ class RadixCacheCpp(BasePrefixCache):
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        new_prefix_len = self._insert(token_ids, kv_indices)
+        new_prefix_len = self._insert(RadixKey(token_ids, req.extra_key), kv_indices)
 
         # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
         assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
 
         # TODO(dark): optimize the `insert` and `match` (e.g. merge into 1 function)
         # The prefix indices need to updated to reuse the kv indices in the pool
-        new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(token_ids)
+        new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(
+            RadixKey(token_ids, req.extra_key).token_ids
+        )
         new_indices = self._merge_tensor(new_indices_vec)
         assert new_prefix_len <= len(new_indices)
 
