@@ -339,7 +339,10 @@ class DenoisingStage(PipelineStage):
                 "encoder_attention_mask": batch.prompt_attention_mask,
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
-                batch, self.device, getattr(self.transformer, "rotary_emb", None)
+                batch,
+                self.device,
+                getattr(self.transformer, "rotary_emb", None),
+                dtype=target_dtype,
             ),
         )
 
@@ -351,7 +354,10 @@ class DenoisingStage(PipelineStage):
                     "encoder_attention_mask": batch.negative_attention_mask,
                 }
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
-                    batch, self.device, getattr(self.transformer, "rotary_emb", None)
+                    batch,
+                    self.device,
+                    getattr(self.transformer, "rotary_emb", None),
+                    dtype=target_dtype,
                 ),
             )
         else:

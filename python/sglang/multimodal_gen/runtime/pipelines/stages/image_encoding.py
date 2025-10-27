@@ -168,18 +168,6 @@ class ImageEncodingStage(PipelineStage):
             batch.image_embeds.append(image_embeds)
         elif self.text_encoder:
             # if a text encoder is provided, e.g. Qwen-Image-Edit
-            with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs = self.text_encoder(
-                    input_ids=image_inputs.input_ids,
-                    attention_mask=image_inputs.attention_mask,
-                    pixel_values=image_inputs.pixel_values,
-                    image_grid_thw=image_inputs.image_grid_thw,
-                    output_hidden_states=True,
-                )
-            batch.prompt_embeds.append(
-                self.encoding_qwen_image_edit(outputs, image_inputs)
-            )
-
             # 1. neg prompt embeds
             if batch.prompt:
                 prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
@@ -191,7 +179,15 @@ class ImageEncodingStage(PipelineStage):
             neg_image_inputs = self.image_processor(
                 images=prompt_image, return_tensors="pt", **neg_image_processor_kwargs
             ).to(get_local_torch_device())
+
             with set_forward_context(current_timestep=0, attn_metadata=None):
+                outputs = self.text_encoder(
+                    input_ids=image_inputs.input_ids,
+                    attention_mask=image_inputs.attention_mask,
+                    pixel_values=image_inputs.pixel_values,
+                    image_grid_thw=image_inputs.image_grid_thw,
+                    output_hidden_states=True,
+                )
                 neg_outputs = self.text_encoder(
                     input_ids=neg_image_inputs.input_ids,
                     attention_mask=neg_image_inputs.attention_mask,
@@ -199,10 +195,13 @@ class ImageEncodingStage(PipelineStage):
                     image_grid_thw=neg_image_inputs.image_grid_thw,
                     output_hidden_states=True,
                 )
+            batch.prompt_embeds.append(
+                self.encoding_qwen_image_edit(outputs, image_inputs)
+            )
+
             batch.negative_prompt_embeds.append(
                 self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
             )
-
             # 2. image latents
             image_size = image[0].size if isinstance(image, list) else image.size
 

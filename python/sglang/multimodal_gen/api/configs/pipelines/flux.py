@@ -131,7 +131,7 @@ class FluxPipelineConfig(PipelineConfig):
             device=device,
         )
         ids = torch.cat([txt_ids, img_ids], dim=0).to(device=device)
-        # NOTE(mick): prepare it here, to avoid unnecessary tensor-hashing
+        # NOTE(mick): prepare it here, to avoid unnecessary computations
         freqs_cis = rotary_emb.forward(ids)
         return freqs_cis
 

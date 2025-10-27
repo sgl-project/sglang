@@ -127,11 +127,20 @@ class QwenImagePipelineConfig(PipelineConfig):
         return latents
 
     @staticmethod
-    def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device):
-        freqs_cis = rotary_emb(img_shapes, txt_seq_lens, device=device)
-        return freqs_cis
+    def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
+        img_freqs, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
 
-    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb):
+        img_cos, img_sin = (
+            img_freqs.real.to(dtype=dtype),
+            img_freqs.imag.to(dtype=dtype),
+        )
+        txt_cos, txt_sin = (
+            txt_freqs.real.to(dtype=dtype),
+            txt_freqs.imag.to(dtype=dtype),
+        )
+        return (img_cos, img_sin), (txt_cos, txt_sin)
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         batch_size = batch.latents.shape[0]
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
 
@@ -149,11 +158,11 @@ class QwenImagePipelineConfig(PipelineConfig):
             "img_shapes": img_shapes,
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": QwenImagePipelineConfig.get_freqs_cis(
-                img_shapes, txt_seq_lens, rotary_emb, device
+                img_shapes, txt_seq_lens, rotary_emb, device, dtype
             ),
         }
 
-    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb):
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         batch_size = batch.latents.shape[0]
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
 
@@ -172,7 +181,7 @@ class QwenImagePipelineConfig(PipelineConfig):
             "img_shapes": img_shapes,
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": QwenImagePipelineConfig.get_freqs_cis(
-                img_shapes, txt_seq_lens, rotary_emb, device
+                img_shapes, txt_seq_lens, rotary_emb, device, dtype
             ),
         }
 
@@ -194,7 +203,7 @@ class QwenImagePipelineConfig(PipelineConfig):
 class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
     ti2i_task = True
 
-    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb):
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         # TODO: lots of duplications here
         batch_size = batch.latents.shape[0]
         height = batch.height
@@ -220,11 +229,11 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             "img_shapes": img_shapes,
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": QwenImagePipelineConfig.get_freqs_cis(
-                img_shapes, txt_seq_lens, rotary_emb, device
+                img_shapes, txt_seq_lens, rotary_emb, device, dtype
             ),
         }
 
-    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb):
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         batch_size = batch.latents.shape[0]
         height = batch.height
         width = batch.width
@@ -250,7 +259,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             "img_shapes": img_shapes,
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": QwenImagePipelineConfig.get_freqs_cis(
-                img_shapes, txt_seq_lens, rotary_emb, device
+                img_shapes, txt_seq_lens, rotary_emb, device, dtype
             ),
         }
 

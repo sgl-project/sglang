@@ -26,106 +26,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
-def get_timestep_embedding(
-    timesteps: torch.Tensor,
-    embedding_dim: int,
-    flip_sin_to_cos: bool = False,
-    downscale_freq_shift: float = 1,
-    scale: float = 1,
-    max_period: int = 10000,
-) -> torch.Tensor:
-    """
-    This matches the implementation in Denoising Diffusion Probabilistic Models: Create sinusoidal timestep embeddings.
-
-    Args
-        timesteps (torch.Tensor):
-            a 1-D Tensor of N indices, one per batch element. These may be fractional.
-        embedding_dim (int):
-            the dimension of the output.
-        flip_sin_to_cos (bool):
-            Whether the embedding order should be `cos, sin` (if True) or `sin, cos` (if False)
-        downscale_freq_shift (float):
-            Controls the delta between frequencies between dimensions
-        scale (float):
-            Scaling factor applied to the embeddings.
-        max_period (int):
-            Controls the maximum frequency of the embeddings
-    Returns
-        torch.Tensor: an [N x dim] Tensor of positional embeddings.
-    """
-    assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
-
-    half_dim = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(
-        start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
-    )
-    exponent = exponent / (half_dim - downscale_freq_shift)
-
-    emb = torch.exp(exponent).to(timesteps.dtype)
-    emb = timesteps[:, None].float() * emb[None, :]
-
-    # scale embeddings
-    emb = scale * emb
-
-    # concat sine and cosine embeddings
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-
-    # flip sine and cosine embeddings
-    if flip_sin_to_cos:
-        emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim=-1)
-
-    # zero pad
-    if embedding_dim % 2 == 1:
-        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
-    return emb
-
-
-def apply_rotary_emb_qwen(
-    x: torch.Tensor,
-    freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor]],
-    use_real: bool = True,
-    use_real_unbind_dim: int = -1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply rotary embeddings to input tensors using the given frequency tensor. This function applies rotary embeddings
-    to the given query or key 'x' tensors using the provided frequency tensor 'freqs_cis'. The input tensors are
-    reshaped as complex numbers, and the frequency tensor is reshaped for broadcasting compatibility. The resulting
-    tensors contain rotary embeddings and are returned as real tensors.
-
-    Args:
-        x (`torch.Tensor`):
-            Query or key tensor to apply rotary embeddings. [B, S, H, D] xk (torch.Tensor): Key tensor to apply
-        freqs_cis (`Tuple[torch.Tensor]`): Precomputed frequency tensor for complex exponentials. ([S, D], [S, D],)
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-    """
-    if use_real:
-        cos, sin = freqs_cis  # [S, D]
-
-        if use_real_unbind_dim == -1:
-            # Contiguous halves, neox-style
-            interleaved = False
-        elif use_real_unbind_dim == -2:
-            # Interleaved, gpt-j style
-            interleaved = True
-        else:
-            raise ValueError(
-                f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2."
-            )
-
-        cos, sin = cos.to(x.device), sin.to(x.device)
-        out = apply_rotary_embedding(x, cos, sin, interleaved=interleaved)
-
-        return out
-    else:
-        x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        freqs_cis = freqs_cis.unsqueeze(1)
-        x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
-
-        return x_out.type_as(x)
-
-
 class QwenTimestepProjEmbeddings(nn.Module):
     def __init__(self, embedding_dim):
         super().__init__()
@@ -432,11 +332,19 @@ class QwenImageCrossAttention(nn.Module):
 
         # Apply RoPE
         if image_rotary_emb is not None:
-            img_freqs, txt_freqs = image_rotary_emb
-            img_query = apply_rotary_emb_qwen(img_query, img_freqs, use_real=False)
-            img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
-            txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
-            txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
+            (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
+            img_query = apply_rotary_embedding(
+                img_query, img_cos, img_sin, interleaved=True
+            )
+            img_key = apply_rotary_embedding(
+                img_key, img_cos, img_sin, interleaved=True
+            )
+            txt_query = apply_rotary_embedding(
+                txt_query, txt_cos, txt_sin, interleaved=True
+            )
+            txt_key = apply_rotary_embedding(
+                txt_key, txt_cos, txt_sin, interleaved=True
+            )
 
         # Concatenate for joint attention
         # Order: [text, image]
