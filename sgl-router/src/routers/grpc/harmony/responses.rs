@@ -45,7 +45,7 @@ use crate::{
     mcp::McpManager,
     protocols::{
         common::ToolCall,
-        responses::{ResponseInput, ResponsesRequest, ResponsesResponse},
+        responses::{ResponseInput, ResponsesRequest, ResponsesResponse, StringOrContentParts},
     },
     routers::grpc::{
         context::SharedComponents, harmony::processor::ResponsesIterationResult,
@@ -362,7 +362,7 @@ fn build_next_request_with_tools(
         ResponseInput::Text(text) => {
             // Convert text to items format
             vec![ResponseInputOutputItem::SimpleInputMessage {
-                content: crate::protocols::responses::StringOrContentParts::String(text),
+                content: StringOrContentParts::String(text),
                 role: "user".to_string(),
                 r#type: None,
             }]

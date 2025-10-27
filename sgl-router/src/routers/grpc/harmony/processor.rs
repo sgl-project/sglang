@@ -2,6 +2,9 @@
 
 use std::sync::Arc;
 
+use axum::response::Response;
+use proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId};
+
 use super::HarmonyParserAdapter;
 use crate::{
     grpc_client::proto,
@@ -34,7 +37,7 @@ impl HarmonyResponseProcessor {
     /// Collect responses from ExecutionResult (similar to regular processor)
     async fn collect_responses(
         execution_result: ExecutionResult,
-    ) -> Result<Vec<proto::GenerateComplete>, axum::response::Response> {
+    ) -> Result<Vec<proto::GenerateComplete>, Response> {
         match execution_result {
             ExecutionResult::Single { mut stream } => {
                 let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
@@ -59,7 +62,7 @@ impl HarmonyResponseProcessor {
         execution_result: ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: DispatchMetadata,
-    ) -> Result<ChatCompletionResponse, axum::response::Response> {
+    ) -> Result<ChatCompletionResponse, Response> {
         // Collect all completed responses (one per choice)
         let all_responses = Self::collect_responses(execution_result).await?;
         if all_responses.is_empty() {
@@ -75,10 +78,10 @@ impl HarmonyResponseProcessor {
 
             // Convert matched_stop from proto to JSON
             let matched_stop = complete.matched_stop.as_ref().map(|m| match m {
-                proto::generate_complete::MatchedStop::MatchedTokenId(id) => {
+                MatchedTokenId(id) => {
                     serde_json::json!(id)
                 }
-                proto::generate_complete::MatchedStop::MatchedStopStr(s) => {
+                MatchedStopStr(s) => {
                     serde_json::json!(s)
                 }
             });
@@ -185,7 +188,7 @@ impl HarmonyResponseProcessor {
         execution_result: ExecutionResult,
         responses_request: Arc<ResponsesRequest>,
         dispatch: DispatchMetadata,
-    ) -> Result<ResponsesIterationResult, axum::response::Response> {
+    ) -> Result<ResponsesIterationResult, Response> {
         // Collect all completed responses
         let all_responses = Self::collect_responses(execution_result).await?;
         if all_responses.is_empty() {
@@ -204,10 +207,10 @@ impl HarmonyResponseProcessor {
 
         // Convert matched_stop from proto to JSON
         let matched_stop = complete.matched_stop.as_ref().map(|m| match m {
-            proto::generate_complete::MatchedStop::MatchedTokenId(id) => {
+            MatchedTokenId(id) => {
                 serde_json::json!(id)
             }
-            proto::generate_complete::MatchedStop::MatchedStopStr(s) => {
+            MatchedStopStr(s) => {
                 serde_json::json!(s)
             }
         });

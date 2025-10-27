@@ -1,10 +1,18 @@
 //! Harmony streaming response processor
 
-use std::{collections::HashMap, io, sync::Arc};
+use std::{
+    collections::{hash_map::Entry::Vacant, HashMap},
+    io,
+    sync::Arc,
+};
 
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
+use proto::{
+    generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
+    generate_response::Response::{Chunk, Complete},
+};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
@@ -12,7 +20,7 @@ use tracing::error;
 
 use super::{types::HarmonyChannelDelta, HarmonyParserAdapter};
 use crate::{
-    grpc_client::proto,
+    grpc_client::{proto, sglang_scheduler::AbortOnDropStream},
     protocols::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
@@ -101,7 +109,7 @@ impl HarmonyStreamingProcessor {
 
     /// Process streaming chunks from a single stream
     async fn process_single_stream(
-        mut grpc_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+        mut grpc_stream: AbortOnDropStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -121,11 +129,11 @@ impl HarmonyStreamingProcessor {
             let response = result.map_err(|e| format!("Stream error: {}", e))?;
 
             match response.response {
-                Some(proto::generate_response::Response::Chunk(chunk)) => {
+                Some(Chunk(chunk)) => {
                     let index = chunk.index;
 
                     // Initialize parser for this index if needed
-                    if let std::collections::hash_map::Entry::Vacant(e) = parsers.entry(index) {
+                    if let Vacant(e) = parsers.entry(index) {
                         e.insert(
                             HarmonyParserAdapter::new()
                                 .map_err(|e| format!("Failed to create parser: {}", e))?,
@@ -162,7 +170,7 @@ impl HarmonyStreamingProcessor {
                         }
                     }
                 }
-                Some(proto::generate_response::Response::Complete(complete)) => {
+                Some(Complete(complete)) => {
                     let index = complete.index;
 
                     // Store final metadata
@@ -170,10 +178,10 @@ impl HarmonyStreamingProcessor {
                     matched_stops.insert(
                         index,
                         complete.matched_stop.as_ref().map(|m| match m {
-                            proto::generate_complete::MatchedStop::MatchedTokenId(id) => {
+                            MatchedTokenId(id) => {
                                 serde_json::json!(id)
                             }
-                            proto::generate_complete::MatchedStop::MatchedStopStr(s) => {
+                            MatchedStopStr(s) => {
                                 serde_json::json!(s)
                             }
                         }),
@@ -228,8 +236,8 @@ impl HarmonyStreamingProcessor {
 
     /// Process streaming chunks from dual streams (prefill + decode)
     async fn process_dual_stream(
-        mut prefill_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
-        mut decode_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+        mut prefill_stream: AbortOnDropStream,
+        mut decode_stream: AbortOnDropStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -240,8 +248,7 @@ impl HarmonyStreamingProcessor {
         while let Some(result) = prefill_stream.next().await {
             let response = result.map_err(|e| format!("Prefill stream error: {}", e))?;
 
-            if let Some(proto::generate_response::Response::Complete(complete)) = response.response
-            {
+            if let Some(Complete(complete)) = response.response {
                 prompt_tokens.insert(complete.index, complete.prompt_tokens as u32);
             }
         }
@@ -259,11 +266,11 @@ impl HarmonyStreamingProcessor {
             let response = result.map_err(|e| format!("Decode stream error: {}", e))?;
 
             match response.response {
-                Some(proto::generate_response::Response::Chunk(chunk)) => {
+                Some(Chunk(chunk)) => {
                     let index = chunk.index;
 
                     // Initialize parser for this index if needed
-                    if let std::collections::hash_map::Entry::Vacant(e) = parsers.entry(index) {
+                    if let Vacant(e) = parsers.entry(index) {
                         e.insert(
                             HarmonyParserAdapter::new()
                                 .map_err(|e| format!("Failed to create parser: {}", e))?,
@@ -297,18 +304,18 @@ impl HarmonyStreamingProcessor {
                         }
                     }
                 }
-                Some(proto::generate_response::Response::Complete(complete)) => {
+                Some(Complete(complete)) => {
                     let index = complete.index;
 
                     finish_reasons.insert(index, Some(complete.finish_reason.clone()));
                     matched_stops.insert(
                         index,
                         complete.matched_stop.as_ref().map(|m| match m {
-                            proto::generate_complete::MatchedStop::MatchedTokenId(id) => {
-                                serde_json::json!(id)
+                            MatchedTokenId(id) => {
+                                json!(id)
                             }
-                            proto::generate_complete::MatchedStop::MatchedStopStr(s) => {
-                                serde_json::json!(s)
+                            MatchedStopStr(s) => {
+                                json!(s)
                             }
                         }),
                     );

@@ -12,7 +12,10 @@ use axum::{
 use tracing::debug;
 
 use super::{
-    context::SharedComponents, harmony::HarmonyDetector, pipeline::RequestPipeline, responses,
+    context::SharedComponents,
+    harmony::{serve_harmony_responses, HarmonyDetector, HarmonyResponsesContext},
+    pipeline::RequestPipeline,
+    responses,
 };
 use crate::{
     app_context::AppContext,
@@ -184,7 +187,7 @@ impl GrpcRouter {
     /// Main route_responses implementation (pipeline-based for Harmony)
     async fn route_responses_impl(
         &self,
-        headers: Option<&HeaderMap>,
+        _headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
@@ -193,15 +196,18 @@ impl GrpcRouter {
             model_id
         );
 
-        // Use Harmony pipeline for execution (similar to route_chat_impl)
-        self.harmony_pipeline
-            .execute_responses(
-                Arc::new(body.clone()),
-                headers.cloned(),
-                model_id.map(|s| s.to_string()),
-                self.shared_components.clone(),
-            )
-            .await
+        // Create HarmonyResponsesContext from existing responses context
+        let harmony_ctx = HarmonyResponsesContext::new(
+            Arc::new(self.harmony_pipeline.clone()),
+            self.shared_components.clone(),
+            self.harmony_responses_context.mcp_manager.clone(),
+        );
+
+        // Use serve_harmony_responses for multi-turn MCP tool orchestration
+        match serve_harmony_responses(&harmony_ctx, body.clone()).await {
+            Ok(response) => axum::Json(response).into_response(),
+            Err(error_response) => error_response,
+        }
     }
 }
 

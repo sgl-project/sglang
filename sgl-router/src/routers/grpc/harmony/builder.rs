@@ -18,8 +18,9 @@ use crate::protocols::{
     chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
     common::{ContentPart, Tool},
     responses::{
-        ReasoningEffort as ResponsesReasoningEffort, ResponseInput, ResponseToolType,
-        ResponsesRequest,
+        ReasoningEffort as ResponsesReasoningEffort, ResponseContentPart, ResponseInput,
+        ResponseInputOutputItem, ResponseReasoningContent, ResponseToolType, ResponsesRequest,
+        StringOrContentParts,
     },
 };
 
@@ -416,15 +417,19 @@ impl HarmonyBuilder {
                 all_messages.push(user_msg);
             }
             ResponseInput::Items(items) => {
-                // This needs to maintain prev_outputs state for function call tracking
-                let prev_outputs = Vec::new();
+                // Track function calls for looking up call_id → name mapping
+                // This matches vLLM's approach in serving_responses.py:976-991
+                let mut prev_outputs: Vec<&ResponseInputOutputItem> = Vec::new();
 
                 for item in items {
                     let msg = self.parse_response_item_to_harmony_message(item, &prev_outputs)?;
                     all_messages.push(msg);
 
-                    // Track function calls for output lookup
-                    // TODO: Properly deserialize and track ResponseFunctionToolCall items
+                    // Track function tool calls so that function_call_output can find the name
+                    // vLLM does: if type == "function_call": prev_outputs.append(response_msg)
+                    if matches!(item, ResponseInputOutputItem::FunctionToolCall { .. }) {
+                        prev_outputs.push(item);
+                    }
                 }
             }
         }
@@ -439,36 +444,182 @@ impl HarmonyBuilder {
     ///
     /// # Arguments
     /// * `item` - The ResponseInputOutputItem to parse
-    /// * `prev_outputs` - Previous outputs for tracking function call context
+    /// * `prev_outputs` - Previous items for looking up function call names (for function_call_output)
     fn parse_response_item_to_harmony_message(
         &self,
-        item: &crate::protocols::responses::ResponseInputOutputItem,
-        _prev_outputs: &[crate::protocols::responses::ResponseOutputItem],
+        item: &ResponseInputOutputItem,
+        prev_outputs: &[&ResponseInputOutputItem],
     ) -> Result<HarmonyMessage, String> {
-        // This should handle:
-        // - Regular messages (user/assistant/system)
-        // - Function call outputs with call_id lookup
-        // - Reasoning items
-        // - Function calls with arguments
-        // - Proper channel and recipient assignment
+        match item {
+            // Regular message (user or assistant)
+            ResponseInputOutputItem::Message { role, content, .. } => {
+                let harmony_role = match role.as_str() {
+                    "user" => Role::User,
+                    "assistant" => Role::Assistant,
+                    "system" => Role::System,
+                    _ => Role::User, // Default to user for unknown roles
+                };
 
-        // For now, handle basic message types
-        // Default: treat as text content user message
-        let text_content = serde_json::to_string(item)
-            .map_err(|e| format!("Failed to serialize response item: {}", e))?;
+                // Extract text from content parts
+                let text_parts: Vec<String> = content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
+                        ResponseContentPart::InputText { text } => Some(text.clone()),
+                        ResponseContentPart::Unknown => None,
+                    })
+                    .collect();
 
-        let msg = HarmonyMessage {
-            author: Author {
-                role: Role::User,
-                name: None,
-            },
-            recipient: None,
-            content: vec![Content::Text(TextContent { text: text_content })],
-            channel: None,
-            content_type: None,
-        };
+                let text = text_parts.join("\n");
 
-        Ok(msg)
+                Ok(HarmonyMessage {
+                    author: Author {
+                        role: harmony_role,
+                        name: None,
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent { text })],
+                    channel: None,
+                    content_type: None,
+                })
+            }
+
+            // Reasoning content (chain-of-thought)
+            ResponseInputOutputItem::Reasoning { content, .. } => {
+                // Extract reasoning text
+                let reasoning_texts: Vec<String> = content
+                    .iter()
+                    .map(|rc| match rc {
+                        ResponseReasoningContent::ReasoningText { text } => text.clone(),
+                    })
+                    .collect();
+
+                let text = reasoning_texts.join("\n");
+
+                // Reasoning goes in the "analysis" channel for Harmony
+                Ok(HarmonyMessage {
+                    author: Author {
+                        role: Role::Assistant,
+                        name: None,
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent { text })],
+                    channel: Some("analysis".to_string()),
+                    content_type: None,
+                })
+            }
+
+            // Function tool call (with optional output)
+            ResponseInputOutputItem::FunctionToolCall {
+                name,
+                arguments,
+                output,
+                ..
+            } => {
+                // If there's an output, this represents the tool result
+                // Otherwise, it's the tool call itself
+                if let Some(output_str) = output {
+                    // Tool result - use Tool role
+                    Ok(HarmonyMessage {
+                        author: Author {
+                            role: Role::Tool,
+                            name: Some(name.clone()),
+                        },
+                        recipient: None,
+                        content: vec![Content::Text(TextContent {
+                            text: output_str.clone(),
+                        })],
+                        channel: None,
+                        content_type: None,
+                    })
+                } else {
+                    // Tool call - assistant message in commentary channel
+                    let call_text = format!("{}({})", name, arguments);
+                    Ok(HarmonyMessage {
+                        author: Author {
+                            role: Role::Assistant,
+                            name: None,
+                        },
+                        recipient: None,
+                        content: vec![Content::Text(TextContent { text: call_text })],
+                        channel: Some("commentary".to_string()),
+                        content_type: None,
+                    })
+                }
+            }
+
+            // Function call output (separate from call) - requires looking up the original call
+            // This matches vLLM's parse_response_input for type="function_call_output"
+            ResponseInputOutputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
+                // Search prev_outputs in reverse order to find the matching function call
+                // vLLM does: for prev_response in reversed(prev_responses)
+                let call = prev_outputs
+                    .iter()
+                    .rev()
+                    .find_map(|item| match item {
+                        ResponseInputOutputItem::FunctionToolCall { id, name, .. }
+                            if id == call_id =>
+                        {
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| format!("No function call found for call_id: {}", call_id))?;
+
+                // Create Tool message with the function name from the original call
+                Ok(HarmonyMessage {
+                    author: Author {
+                        role: Role::Tool,
+                        name: Some(call),
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent {
+                        text: output.clone(),
+                    })],
+                    channel: None,
+                    content_type: None,
+                })
+            }
+
+            // Simple input message (usually user message)
+            ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
+                let harmony_role = match role.as_str() {
+                    "user" => Role::User,
+                    "assistant" => Role::Assistant,
+                    "system" => Role::System,
+                    _ => Role::User,
+                };
+
+                let text = match content {
+                    StringOrContentParts::String(s) => s.clone(),
+                    StringOrContentParts::Array(parts) => {
+                        // Extract text from content parts
+                        parts
+                            .iter()
+                            .filter_map(|part| match part {
+                                ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
+                                ResponseContentPart::InputText { text } => Some(text.clone()),
+                                ResponseContentPart::Unknown => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                };
+
+                Ok(HarmonyMessage {
+                    author: Author {
+                        role: harmony_role,
+                        name: None,
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent { text })],
+                    channel: None,
+                    content_type: None,
+                })
+            }
+        }
     }
 
     /// Convert OpenAI ChatMessage format to Harmony messages
