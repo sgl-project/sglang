@@ -74,7 +74,11 @@ from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_regi
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    set_global_server_args_for_tokenizer,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     trace_get_proc_propagate_context,
@@ -112,6 +116,7 @@ def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransport
         return "default"
     else:
         return "cuda_ipc"
+
 
 @dataclasses.dataclass
 class ReqState:
@@ -191,6 +196,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         )
         # Initialize delimiter text for multi-item scoring (will be set after tokenizer is loaded)
         self.multi_item_delimiter_text = None
+
+        set_global_server_args_for_tokenizer(server_args)
 
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
@@ -409,7 +416,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
-        
+
         async with self.model_update_lock.reader_lock:
             if self.server_args.enable_lora and obj.lora_path:
                 # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
@@ -417,7 +424,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
-                state = self._send_one_request(obj, tokenized_obj, created_time)                
+                state = self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
@@ -2118,7 +2125,6 @@ class ServerStatus(Enum):
     Up = "Up"
     Starting = "Starting"
     UnHealthy = "UnHealthy"
-
 
 
 async def print_exception_wrapper(func):
