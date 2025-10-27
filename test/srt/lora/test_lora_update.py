@@ -1349,7 +1349,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
         ) as session:
             # Test with no adapters loaded
             response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
-            self.assertTrue(response.ok, f"Failed to query /v1/models: {response.text}")
+            self.assertTrue(response.ok, response.text)
             models_data = response.json()
             self.assertEqual(models_data["object"], "list")
             self.assertEqual(len(models_data["data"]), 1)  # Only base model
@@ -1362,7 +1362,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
             
             # Test with one adapter loaded
             response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
-            self.assertTrue(response.ok)
+            self.assertTrue(response.ok, response.text)
             models_data = response.json()
             self.assertEqual(len(models_data["data"]), 2)  # Base model + 1 adapter
             
@@ -1378,7 +1378,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
             
             # Test with two adapters loaded
             response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
-            self.assertTrue(response.ok)
+            self.assertTrue(response.ok, response.text)
             models_data = response.json()
             self.assertEqual(len(models_data["data"]), 3)  # Base model + 2 adapters
             
@@ -1393,7 +1393,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
             
             # Test after unloading
             response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
-            self.assertTrue(response.ok)
+            self.assertTrue(response.ok, response.text)
             models_data = response.json()
             self.assertEqual(len(models_data["data"]), 2)  # Base model + 1 adapter
             adapter_models = [m for m in models_data["data"] if m.get("parent")]

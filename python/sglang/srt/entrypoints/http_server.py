@@ -1182,7 +1182,7 @@ async def available_models():
     # Add loaded LoRA adapters
     if _global_state.tokenizer_manager.server_args.enable_lora:
         lora_registry = _global_state.tokenizer_manager.lora_registry
-        for lora_name, lora_ref in lora_registry._registry.items():
+        for _, lora_ref in lora_registry.get_all_adapters().items():
             model_cards.append(
                 ModelCard(
                     id=lora_ref.lora_name,
