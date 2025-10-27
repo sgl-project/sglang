@@ -21,7 +21,6 @@ import time
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Literal
 
 import httpx
@@ -36,6 +35,7 @@ except ImportError:
     # Fallback for when checkpoint_engine is not available
     ParameterServer = None
     import logging
+
     logger = logging.getLogger(__name__)
 
 
@@ -202,7 +202,7 @@ def run_with_torchrun():
     # Parse inference_parallel_size from command line arguments to determine nproc-per-node
     inference_parallel_size = 8  # default
     args = sys.argv[1:]  # Skip the script name
-    
+
     # Look for --inference-parallel-size in arguments
     for i, arg in enumerate(args):
         if arg == "--inference-parallel-size" and i + 1 < len(args):
@@ -217,22 +217,21 @@ def run_with_torchrun():
             except ValueError:
                 pass
             break
-    
+
     # Build torchrun command
-    cmd = [
-        "torchrun",
-        f"--nproc-per-node={inference_parallel_size}",
-        __file__
-    ] + args
-    
+    cmd = ["torchrun", f"--nproc-per-node={inference_parallel_size}", __file__] + args
+
     print(f"Running: {' '.join(cmd)}", file=sys.stderr)
-    
+
     # Execute torchrun with the original script
     try:
         result = subprocess.run(cmd, check=False)
         sys.exit(result.returncode)
     except FileNotFoundError:
-        print("Error: torchrun command not found. Please ensure PyTorch is installed.", file=sys.stderr)
+        print(
+            "Error: torchrun command not found. Please ensure PyTorch is installed.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nInterrupted by user", file=sys.stderr)
@@ -245,7 +244,7 @@ def main():
         # Not running under torchrun, so invoke it
         run_with_torchrun()
         return
-    
+
     # Running under torchrun, proceed with normal execution
     parser = argparse.ArgumentParser(description="Update weights example")
     parser.add_argument("--checkpoint-path", type=str, default=None)
@@ -259,22 +258,22 @@ def main():
     parser.add_argument("--uds", type=str, default=None)
     parser.add_argument("--weight-version", type=str, default=None)
     args = parser.parse_args()
-    
+
     # Get rank and world_size from environment (set by torchrun)
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
-    
+
     req_func = req_inference(
         args.endpoint,
         args.inference_parallel_size,
         uds=args.uds,
         weight_version=args.weight_version,
     )
-    
+
     if ParameterServer is None:
         print("Error: checkpoint_engine package not available", file=sys.stderr)
         sys.exit(1)
-        
+
     ps = ParameterServer(auto_pg=True)
     ps._p2p_store = None
     if args.load_metas_file:
@@ -294,9 +293,11 @@ def main():
             named_tensors = split_tensors(args.checkpoint_path, rank, world_size)
             checkpoint_files = []
         else:
-            checkpoint_files = split_checkpoint_files(
-                args.checkpoint_path, rank, world_size
-            ) if args.checkpoint_path else []
+            checkpoint_files = (
+                split_checkpoint_files(args.checkpoint_path, rank, world_size)
+                if args.checkpoint_path
+                else []
+            )
             named_tensors = {}
         update_weights(
             ps,
