@@ -7,12 +7,12 @@ from PIL import Image
 
 from sglang.srt.models.points_v15_chat import POINTSV15ChatModel
 from sglang.srt.multimodal.processors.qwen_vl import (
-    Qwen2_5VLImageProcessor,
+    QwenVLImageProcessor,
     resize_image_async,
 )
 
 
-class POINTSV15ChatProcessor(Qwen2_5VLImageProcessor):
+class POINTSV15ChatProcessor(QwenVLImageProcessor):
     models = [POINTSV15ChatModel]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):

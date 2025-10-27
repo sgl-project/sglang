@@ -9,7 +9,7 @@ on:
       - main
     paths:
       - ".github/workflows/release-docker-npu.yml"
-      - "docker/Dockerfile.npu"
+      - "docker/npu.Dockerfile"
 
 jobs:
   build:
@@ -61,7 +61,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: docker
-          file: docker/Dockerfile.npu
+          file: docker/npu.Dockerfile
           # TODO: need add x86 platforms support when memfabric is ready
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}

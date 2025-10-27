@@ -32,7 +32,6 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
@@ -250,6 +249,9 @@ class PiecewiseCudaGraphRunner:
                 lora_ids=None,
             )
 
+        # Attention backend
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
         with set_forward_context(forward_batch, self.attention_layers):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -262,9 +264,14 @@ class PiecewiseCudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         num_tokens = len(forward_batch.input_ids)
-        # TODO(yuwei): support return logprob
+        # TODO(yuwei): support return input_ids' logprob
         if forward_batch.return_logprob:
-            return False
+            for start_len, seq_len in zip(
+                forward_batch.extend_logprob_start_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            ):
+                if start_len is not None and start_len < seq_len:
+                    return False
         if num_tokens <= self.max_num_tokens:
             return True
         return False
@@ -273,10 +280,10 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
-            self.stream = graph_capture_context.stream
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+            if self.model_runner.tp_group.ca_comm is not None:
+                old_ca_disable = self.model_runner.tp_group.ca_comm.disabled
+                self.model_runner.tp_group.ca_comm.disabled = True
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
@@ -304,9 +311,10 @@ class PiecewiseCudaGraphRunner:
 
                 # Save gemlite cache after each capture
                 save_gemlite_cache()
+            if self.model_runner.tp_group.ca_comm is not None:
+                self.model_runner.tp_group.ca_comm.disabled = old_ca_disable
 
     def capture_one_batch_size(self, num_tokens: int):
-        stream = self.stream
         bs = 1
 
         # Graph inputs
@@ -369,9 +377,6 @@ class PiecewiseCudaGraphRunner:
 
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
-
-        # # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         # Run and capture
         def run_once():
@@ -438,7 +443,7 @@ class PiecewiseCudaGraphRunner:
             out_cache_loc=out_cache_loc,
             seq_lens_sum=forward_batch.seq_lens_sum,
             encoder_lens=forward_batch.encoder_lens,
-            return_logprob=forward_batch.return_logprob,
+            return_logprob=False,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             extend_start_loc=forward_batch.extend_start_loc,
@@ -474,6 +479,9 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if self.model_runner.tp_group.ca_comm is not None:
+            old_ca_disable = self.model_runner.tp_group.ca_comm.disabled
+            self.model_runner.tp_group.ca_comm.disabled = True
         static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
         # Replay
         with set_forward_context(static_forward_batch, self.attention_layers):
@@ -499,6 +507,8 @@ class PiecewiseCudaGraphRunner:
                 raise NotImplementedError(
                     "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
                 )
+        if self.model_runner.tp_group.ca_comm is not None:
+            self.model_runner.tp_group.ca_comm.disabled = old_ca_disable
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

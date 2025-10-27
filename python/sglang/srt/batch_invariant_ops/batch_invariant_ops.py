@@ -9,6 +9,22 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+from sglang.srt.utils.common import calc_diff, get_bool_env_var
+
+if ENABLE_JIT_DEEPGEMM:
+    import deep_gemm
+
+_ENABLE_MM_DEEPGEMM = get_bool_env_var(
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
+)
+_ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"
+)
+
+if not _ENABLE_MM_DEEPGEMM:
+    print("Disable DeepGEMM in batch invariant ops. Performance may be suboptimal.")
+
 __all__ = [
     "set_batch_invariant_mode",
     "is_batch_invariant_mode_enabled",
@@ -140,7 +156,7 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-def matmul_persistent(
+def _matmul_persistent_triton(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
     # Check constraints.
@@ -215,6 +231,54 @@ def matmul_persistent(
         **configs[dtype],
     )
     return c
+
+
+def _matmul_persistent_deepgemm(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+):
+    M, K = a.shape
+    K, N = b.shape
+    dtype = a.dtype
+    out = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    deep_gemm.bf16_gemm_nn(a, b, out)
+
+    # TODO can this be put in DeepGEMM's `c`?
+    if bias is not None:
+        out += bias
+
+    return out
+
+
+def matmul_persistent(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+):
+    if (
+        _ENABLE_MM_DEEPGEMM
+        and ENABLE_JIT_DEEPGEMM
+        and (a.dtype == torch.bfloat16)
+        and (b.dtype == torch.bfloat16)
+        and a.is_contiguous()
+        and b.transpose(0, 1).is_contiguous()
+    ):
+        if _ENABLE_MM_COMPARISON_TEST:
+            out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
+            out_deepgemm = _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+            diff = calc_diff(out_triton, out_deepgemm)
+            assert diff < 0.0001, f"{diff=} {out_triton=} {out_deepgemm=}"
+            # can be enabled for debugging
+            # print(
+            #     f"{diff=} "
+            #     f"{(out_triton - out_deepgemm).abs().mean()=} "
+            #     f"{(out_triton - out_deepgemm).abs().sum()=} "
+            #     f"{torch.sum(out_triton != out_deepgemm)=} "
+            # )
+            # print(f"{a=} {b=} {bias=} {out_triton=} {out_deepgemm=}")
+            return out_deepgemm
+
+        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+
+    return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
 
 @triton.jit
@@ -495,16 +559,39 @@ def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = 
         return torch.sum(input, dim=dim, keepdim=keepdim, dtype=torch.float32) / n_elems
 
 
+def bmm_batch_invariant(a, b, *, out=None):
+    # Batched matrix multiply: (B, M, K) x (B, K, N) -> (B, M, N)
+    # Process each batch separately with our persistent kernel
+    if a.ndim == 3 and b.ndim == 3:
+        results = []
+        for i in range(a.shape[0]):
+            results.append(matmul_persistent(a[i], b[i]))
+        result = torch.stack(results, dim=0)
+
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+    else:
+        raise ValueError(
+            f"bmm_batch_invariant expects 3D tensors, "
+            f"got shapes {a.shape} and {b.shape}"
+        )
+
+
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
+_original_torch_bmm = None
 
 
 def is_batch_invariant_mode_enabled():
     return _batch_invariant_MODE
 
 
-def enable_batch_invariant_mode():
-    global _batch_invariant_MODE, _batch_invariant_LIB
+def enable_batch_invariant_mode(
+    enable_bmm: bool = True,
+):
+    global _batch_invariant_MODE, _batch_invariant_LIB, _original_torch_bmm
     if _batch_invariant_MODE:
         return
 
@@ -517,11 +604,21 @@ def enable_batch_invariant_mode():
     )
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, "CUDA")
 
+    if enable_bmm:
+        _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, "CUDA")
+
+        # Also monkeypatch torch.bmm directly as a fallback
+        _original_torch_bmm = torch.bmm
+        torch.bmm = bmm_batch_invariant
+
 
 def disable_batch_invariant_mode():
-    global _batch_invariant_MODE, _batch_invariant_LIB
+    global _batch_invariant_MODE, _batch_invariant_LIB, _original_torch_bmm
     if _batch_invariant_LIB is not None:
         _batch_invariant_LIB._destroy()
+    if _original_torch_bmm is not None:
+        torch.bmm = _original_torch_bmm
+        _original_torch_bmm = None
     _batch_invariant_MODE = False
     _batch_invariant_LIB = None
 

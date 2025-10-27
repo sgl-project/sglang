@@ -193,6 +193,8 @@ impl ResponseProcessor {
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,
                     &original_request.tool_choice,
+                    &original_request.model,
+                    history_tool_calls_count,
                 );
             } else if tool_parser_available {
                 (tool_calls, processed_text) = self

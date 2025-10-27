@@ -15,6 +15,7 @@ use std::{
 
 use serde_json::json;
 use sglang_router_rs::{
+    app_context::AppContext,
     config::RouterConfig,
     core::{LoadMonitor, WorkerRegistry},
     data_connector::{
@@ -23,11 +24,10 @@ use sglang_router_rs::{
     middleware::TokenBucket,
     policies::PolicyRegistry,
     protocols::common::{Function, Tool},
-    server::AppContext,
 };
 
 /// Helper function to create AppContext for tests
-pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
+pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     let client = reqwest::Client::new();
 
     // Initialize rate limiter
@@ -62,26 +62,31 @@ pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         config.worker_startup_check_interval_secs,
     )));
 
-    // Create empty OnceLock for worker job queue and workflow engine
+    // Create empty OnceLock for worker job queue, workflow engine, and mcp manager
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engine = Arc::new(OnceLock::new());
+    let mcp_manager_lock = Arc::new(OnceLock::new());
 
-    let app_context = Arc::new(AppContext::new(
-        config,
-        client,
-        rate_limiter,
-        None, // tokenizer
-        None, // reasoning_parser_factory
-        None, // tool_parser_factory
-        worker_registry,
-        policy_registry,
-        response_storage,
-        conversation_storage,
-        conversation_item_storage,
-        load_monitor,
-        worker_job_queue,
-        workflow_engine,
-    ));
+    let app_context = Arc::new(
+        AppContext::builder()
+            .router_config(config)
+            .client(client)
+            .rate_limiter(rate_limiter)
+            .tokenizer(None) // tokenizer
+            .reasoning_parser_factory(None) // reasoning_parser_factory
+            .tool_parser_factory(None) // tool_parser_factory
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .load_monitor(load_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engine(workflow_engine)
+            .mcp_manager(mcp_manager_lock)
+            .build()
+            .unwrap(),
+    );
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
@@ -105,6 +110,130 @@ pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
+
+    // Initialize MCP manager with empty config
+    use sglang_router_rs::mcp::{McpConfig, McpManager};
+    let empty_config = McpConfig {
+        servers: vec![],
+        pool: Default::default(),
+        proxy: None,
+        warmup: vec![],
+        inventory: Default::default(),
+    };
+    let mcp_manager = McpManager::with_defaults(empty_config)
+        .await
+        .expect("Failed to create MCP manager");
+    app_context
+        .mcp_manager
+        .set(Arc::new(mcp_manager))
+        .ok()
+        .expect("McpManager should only be initialized once");
+
+    app_context
+}
+
+/// Helper function to create AppContext for tests with MCP config from file
+pub async fn create_test_context_with_mcp_config(
+    config: RouterConfig,
+    mcp_config_path: &str,
+) -> Arc<AppContext> {
+    use sglang_router_rs::mcp::{McpConfig, McpManager};
+
+    let client = reqwest::Client::new();
+
+    // Initialize rate limiter
+    let rate_limiter = match config.max_concurrent_requests {
+        n if n <= 0 => None,
+        n => {
+            let rate_limit_tokens = config
+                .rate_limit_tokens_per_second
+                .filter(|&t| t > 0)
+                .unwrap_or(n);
+            Some(Arc::new(TokenBucket::new(
+                n as usize,
+                rate_limit_tokens as usize,
+            )))
+        }
+    };
+
+    // Initialize registries
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+
+    // Initialize storage backends (Memory for tests)
+    let response_storage = Arc::new(MemoryResponseStorage::new());
+    let conversation_storage = Arc::new(MemoryConversationStorage::new());
+    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+
+    // Initialize load monitor
+    let load_monitor = Some(Arc::new(LoadMonitor::new(
+        worker_registry.clone(),
+        policy_registry.clone(),
+        client.clone(),
+        config.worker_startup_check_interval_secs,
+    )));
+
+    // Create empty OnceLock for worker job queue, workflow engine, and mcp manager
+    let worker_job_queue = Arc::new(OnceLock::new());
+    let workflow_engine = Arc::new(OnceLock::new());
+    let mcp_manager_lock = Arc::new(OnceLock::new());
+
+    let app_context = Arc::new(
+        AppContext::builder()
+            .router_config(config)
+            .client(client)
+            .rate_limiter(rate_limiter)
+            .tokenizer(None) // tokenizer
+            .reasoning_parser_factory(None) // reasoning_parser_factory
+            .tool_parser_factory(None) // tool_parser_factory
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .load_monitor(load_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engine(workflow_engine)
+            .mcp_manager(mcp_manager_lock)
+            .build()
+            .unwrap(),
+    );
+
+    // Initialize JobQueue after AppContext is created
+    let weak_context = Arc::downgrade(&app_context);
+    let job_queue = sglang_router_rs::core::JobQueue::new(
+        sglang_router_rs::core::JobQueueConfig::default(),
+        weak_context,
+    );
+    app_context
+        .worker_job_queue
+        .set(job_queue)
+        .expect("JobQueue should only be initialized once");
+
+    // Initialize WorkflowEngine and register workflows
+    use sglang_router_rs::core::workflow::{
+        create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
+    };
+    let engine = Arc::new(WorkflowEngine::new());
+    engine.register_workflow(create_worker_registration_workflow());
+    engine.register_workflow(create_worker_removal_workflow());
+    app_context
+        .workflow_engine
+        .set(engine)
+        .expect("WorkflowEngine should only be initialized once");
+
+    // Initialize MCP manager from config file
+    let mcp_config = McpConfig::from_file(mcp_config_path)
+        .await
+        .expect("Failed to load MCP config from file");
+    let mcp_manager = McpManager::with_defaults(mcp_config)
+        .await
+        .expect("Failed to create MCP manager");
+    app_context
+        .mcp_manager
+        .set(Arc::new(mcp_manager))
+        .ok()
+        .expect("McpManager should only be initialized once");
 
     app_context
 }

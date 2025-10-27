@@ -1,12 +1,37 @@
 //! Handler functions for /v1/responses endpoints
 //!
-//! This module contains all the actual implementation logic for:
-//! - POST /v1/responses (route_responses)
-//! - GET /v1/responses/{response_id} (get_response_impl)
-//! - POST /v1/responses/{response_id}/cancel (cancel_response_impl)
+//! # Public API
+//!
+//! - `route_responses()` - POST /v1/responses (main entry point)
+//! - `get_response_impl()` - GET /v1/responses/{response_id}
+//! - `cancel_response_impl()` - POST /v1/responses/{response_id}/cancel
+//!
+//! # Architecture
+//!
+//! This module orchestrates all request handling for the /v1/responses endpoint.
+//! It supports three execution modes:
+//!
+//! 1. **Synchronous** - Returns complete response immediately
+//! 2. **Background** - Returns queued response, executes in background task
+//! 3. **Streaming** - Returns SSE stream with real-time events
+//!
+//! # Request Flow
+//!
+//! ```text
+//! route_responses()
+//!   ├─► route_responses_sync()       → route_responses_internal()
+//!   ├─► route_responses_background() → spawn(route_responses_internal())
+//!   └─► route_responses_streaming()  → convert_chat_stream_to_responses_stream()
+//!
+//! route_responses_internal()
+//!   ├─► load_conversation_history()
+//!   ├─► execute_tool_loop() (if MCP tools)
+//!   │   └─► pipeline.execute_chat_for_responses() [loop]
+//!   └─► execute_without_mcp() (if no MCP tools)
+//!       └─► pipeline.execute_chat_for_responses()
+//! ```
 
 use std::{
-    collections::HashMap,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -27,13 +52,12 @@ use uuid::Uuid;
 use super::{
     conversions,
     streaming::ResponseStreamEventEmitter,
-    tool_loop::{create_mcp_manager_from_request, execute_tool_loop, execute_tool_loop_streaming},
+    tool_loop::{execute_tool_loop, execute_tool_loop_streaming},
     types::BackgroundTaskInfo,
 };
 use crate::{
     data_connector::{
-        ConversationId, ResponseId, SharedConversationItemStorage, SharedConversationStorage,
-        SharedResponseStorage,
+        ConversationId, ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage,
     },
     protocols::{
         chat::ChatCompletionStreamResponse,
@@ -42,10 +66,7 @@ use crate::{
             ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
-    routers::{
-        grpc::{context::SharedComponents, pipeline::RequestPipeline},
-        openai::conversations::persist_conversation_items,
-    },
+    routers::openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
 };
 
 // ============================================================================
@@ -55,18 +76,39 @@ use crate::{
 /// Main handler for POST /v1/responses
 ///
 /// Validates request, determines execution mode (sync/async/streaming), and delegates
-#[allow(clippy::too_many_arguments)]
 pub async fn route_responses(
-    pipeline: &RequestPipeline,
+    ctx: &super::context::ResponsesContext,
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    components: Arc<SharedComponents>,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
-    background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 ) -> Response {
+    // 0. Fast worker validation (fail-fast before expensive operations)
+    let requested_model: Option<&str> = model_id.as_deref().or(Some(request.model.as_str()));
+
+    if let Some(model) = requested_model {
+        // Check if any workers support this model
+        let available_models = ctx.worker_registry.get_models();
+
+        if !available_models.contains(&model.to_string()) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({
+                    "error": {
+                        "message": format!(
+                            "No workers available for model '{}'. Available models: {}",
+                            model,
+                            available_models.join(", ")
+                        ),
+                        "type": "service_unavailable",
+                        "param": "model",
+                        "code": "no_available_workers"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // 1. Validate mutually exclusive parameters
     if request.previous_response_id.is_some() && request.conversation.is_some() {
         return (
@@ -104,44 +146,11 @@ pub async fn route_responses(
 
     // 3. Route based on execution mode
     if is_streaming {
-        route_responses_streaming(
-            pipeline,
-            request,
-            headers,
-            model_id,
-            components,
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
-        )
-        .await
+        route_responses_streaming(ctx, request, headers, model_id).await
     } else if is_background {
-        route_responses_background(
-            pipeline,
-            request,
-            headers,
-            model_id,
-            components,
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
-            background_tasks,
-        )
-        .await
+        route_responses_background(ctx, request, headers, model_id).await
     } else {
-        route_responses_sync(
-            pipeline,
-            request,
-            headers,
-            model_id,
-            components,
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
-            None, // No response_id for sync
-            None, // No background_tasks for sync
-        )
-        .await
+        route_responses_sync(ctx, request, headers, model_id, None).await
     }
 }
 
@@ -157,113 +166,71 @@ pub async fn route_responses(
 /// 3. Executes chat pipeline
 /// 4. Converts back to ResponsesResponse
 /// 5. Persists to storage
-#[allow(clippy::too_many_arguments)]
 async fn route_responses_sync(
-    pipeline: &RequestPipeline,
+    ctx: &super::context::ResponsesContext,
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    components: Arc<SharedComponents>,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
     response_id: Option<String>,
-    background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Response {
-    match route_responses_internal(
-        pipeline,
-        request,
-        headers,
-        model_id,
-        components,
-        response_storage,
-        conversation_storage,
-        conversation_item_storage,
-        response_id,
-        background_tasks,
-    )
-    .await
-    {
+    match route_responses_internal(ctx, request, headers, model_id, response_id).await {
         Ok(responses_response) => axum::Json(responses_response).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({
-                "error": {
-                    "message": e,
-                    "type": "internal_error"
-                }
-            })),
-        )
-            .into_response(),
+        Err(response) => response, // Already a Response with proper status code
     }
 }
 
 /// Internal implementation that returns Result for background task compatibility
-#[allow(clippy::too_many_arguments)]
 async fn route_responses_internal(
-    pipeline: &RequestPipeline,
+    ctx: &super::context::ResponsesContext,
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    components: Arc<SharedComponents>,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
     response_id: Option<String>,
-    background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
-) -> Result<ResponsesResponse, String> {
+) -> Result<ResponsesResponse, Response> {
     // 1. Load conversation history and build modified request
-    let modified_request = load_conversation_history(
-        &request,
-        &response_storage,
-        &conversation_storage,
-        &conversation_item_storage,
-    )
-    .await?;
+    let modified_request = load_conversation_history(ctx, &request).await?;
 
     // 2. Check if request has MCP tools - if so, use tool loop
     let responses_response = if let Some(tools) = &request.tools {
-        if let Some(mcp_manager) = create_mcp_manager_from_request(tools).await {
+        // Ensure dynamic MCP client is registered for request-scoped tools
+        if ensure_request_mcp_client(&ctx.mcp_manager, tools)
+            .await
+            .is_some()
+        {
             debug!("MCP tools detected, using tool loop");
 
             // Execute with MCP tool loop
             execute_tool_loop(
-                pipeline,
+                ctx,
                 modified_request,
                 &request,
                 headers,
                 model_id,
-                components,
-                mcp_manager,
                 response_id.clone(),
-                background_tasks,
             )
             .await?
         } else {
-            // No MCP manager, execute normally
+            debug!("Failed to create MCP client from request tools");
+            // Fall through to non-MCP execution
             execute_without_mcp(
-                pipeline,
+                ctx,
                 &modified_request,
                 &request,
                 headers,
                 model_id,
-                components,
                 response_id.clone(),
-                background_tasks,
             )
             .await?
         }
     } else {
         // No tools, execute normally
         execute_without_mcp(
-            pipeline,
+            ctx,
             &modified_request,
             &request,
             headers,
             model_id,
-            components,
             response_id.clone(),
-            background_tasks,
         )
         .await?
     };
@@ -272,9 +239,9 @@ async fn route_responses_internal(
     if request.store.unwrap_or(true) {
         if let Ok(response_json) = serde_json::to_value(&responses_response) {
             if let Err(e) = persist_conversation_items(
-                conversation_storage,
-                conversation_item_storage,
-                response_storage,
+                ctx.conversation_storage.clone(),
+                ctx.conversation_item_storage.clone(),
+                ctx.response_storage.clone(),
                 &response_json,
                 &request,
             )
@@ -295,15 +262,10 @@ async fn route_responses_internal(
 /// Execute responses request in background mode
 #[allow(clippy::too_many_arguments)]
 async fn route_responses_background(
-    pipeline: &RequestPipeline,
+    ctx: &super::context::ResponsesContext,
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    components: Arc<SharedComponents>,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
-    background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 ) -> Response {
     // Generate response_id for background tracking
     let response_id = format!("resp_{}", Uuid::new_v4());
@@ -324,11 +286,7 @@ async fn route_responses_background(
         incomplete_details: None,
         instructions: request.instructions.clone(),
         max_output_tokens: request.max_output_tokens,
-        model: if request.model.is_empty() {
-            "default".to_string()
-        } else {
-            request.model.clone()
-        },
+        model: request.model.clone(),
         output: Vec::new(),
         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
         previous_response_id: request.previous_response_id.clone(),
@@ -348,9 +306,9 @@ async fn route_responses_background(
     // Persist queued response to storage
     if let Ok(response_json) = serde_json::to_value(&queued_response) {
         if let Err(e) = persist_conversation_items(
-            conversation_storage.clone(),
-            conversation_item_storage.clone(),
-            response_storage.clone(),
+            ctx.conversation_storage.clone(),
+            ctx.conversation_item_storage.clone(),
+            ctx.response_storage.clone(),
             &response_json,
             &request,
         )
@@ -361,16 +319,11 @@ async fn route_responses_background(
     }
 
     // Spawn background task
-    let pipeline = pipeline.clone();
+    let ctx_clone = ctx.clone();
     let request_clone = request.clone();
     let headers_clone = headers.clone();
     let model_id_clone = model_id.clone();
-    let components_clone = components.clone();
-    let response_storage_clone = response_storage.clone();
-    let conversation_storage_clone = conversation_storage.clone();
-    let conversation_item_storage_clone = conversation_item_storage.clone();
     let response_id_clone = response_id.clone();
-    let background_tasks_clone = background_tasks.clone();
 
     let handle = tokio::task::spawn(async move {
         // Execute synchronously (set background=false to prevent recursion)
@@ -378,16 +331,11 @@ async fn route_responses_background(
         background_request.background = Some(false);
 
         match route_responses_internal(
-            &pipeline,
+            &ctx_clone,
             Arc::new(background_request),
             headers_clone,
             model_id_clone,
-            components_clone,
-            response_storage_clone,
-            conversation_storage_clone,
-            conversation_item_storage_clone,
             Some(response_id_clone.clone()),
-            Some(background_tasks_clone.clone()),
         )
         .await
         {
@@ -397,20 +345,25 @@ async fn route_responses_background(
                     response_id_clone
                 );
             }
-            Err(e) => {
-                warn!("Background response {} failed: {}", response_id_clone, e);
+            Err(response) => {
+                warn!(
+                    "Background response {} failed with status {}",
+                    response_id_clone,
+                    response.status()
+                );
             }
         }
 
         // Clean up task handle when done
-        background_tasks_clone
+        ctx_clone
+            .background_tasks
             .write()
             .await
             .remove(&response_id_clone);
     });
 
     // Store task info for cancellation support
-    background_tasks.write().await.insert(
+    ctx.background_tasks.write().await.insert(
         response_id.clone(),
         BackgroundTaskInfo {
             handle,
@@ -430,57 +383,28 @@ async fn route_responses_background(
 /// Execute streaming responses request
 #[allow(clippy::too_many_arguments)]
 async fn route_responses_streaming(
-    pipeline: &RequestPipeline,
+    ctx: &super::context::ResponsesContext,
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    components: Arc<SharedComponents>,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
 ) -> Response {
     // 1. Load conversation history
-    let modified_request = match load_conversation_history(
-        &request,
-        &response_storage,
-        &conversation_storage,
-        &conversation_item_storage,
-    )
-    .await
-    {
+    let modified_request = match load_conversation_history(ctx, &request).await {
         Ok(req) => req,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(json!({
-                    "error": {
-                        "message": e,
-                        "type": "invalid_request_error"
-                    }
-                })),
-            )
-                .into_response();
-        }
+        Err(response) => return response, // Already a Response with proper status code
     };
 
     // 2. Check if request has MCP tools - if so, use streaming tool loop
     if let Some(tools) = &request.tools {
-        if let Some(mcp_manager) = create_mcp_manager_from_request(tools).await {
+        // Ensure dynamic MCP client is registered for request-scoped tools
+        if ensure_request_mcp_client(&ctx.mcp_manager, tools)
+            .await
+            .is_some()
+        {
             debug!("MCP tools detected in streaming mode, using streaming tool loop");
 
-            return execute_tool_loop_streaming(
-                pipeline,
-                modified_request,
-                &request,
-                headers,
-                model_id,
-                components,
-                mcp_manager,
-                response_storage,
-                conversation_storage,
-                conversation_item_storage,
-            )
-            .await;
+            return execute_tool_loop_streaming(ctx, modified_request, &request, headers, model_id)
+                .await;
         }
     }
 
@@ -502,18 +426,7 @@ async fn route_responses_streaming(
     };
 
     // 4. Execute chat pipeline and convert streaming format (no MCP tools)
-    convert_chat_stream_to_responses_stream(
-        pipeline,
-        chat_request,
-        headers,
-        model_id,
-        components,
-        &request,
-        response_storage,
-        conversation_storage,
-        conversation_item_storage,
-    )
-    .await
+    convert_chat_stream_to_responses_stream(ctx, chat_request, headers, model_id, &request).await
 }
 
 /// Convert chat streaming response to responses streaming format
@@ -526,21 +439,23 @@ async fn route_responses_streaming(
 /// 5. Emits transformed SSE events in responses format
 #[allow(clippy::too_many_arguments)]
 async fn convert_chat_stream_to_responses_stream(
-    pipeline: &RequestPipeline,
+    ctx: &super::context::ResponsesContext,
     chat_request: Arc<crate::protocols::chat::ChatCompletionRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    components: Arc<SharedComponents>,
     original_request: &ResponsesRequest,
-    response_storage: SharedResponseStorage,
-    _conversation_storage: SharedConversationStorage,
-    _conversation_item_storage: SharedConversationItemStorage,
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
 
     // Get chat streaming response
-    let chat_response = pipeline
-        .execute_chat(chat_request.clone(), headers, model_id, components)
+    let chat_response = ctx
+        .pipeline
+        .execute_chat(
+            chat_request.clone(),
+            headers,
+            model_id,
+            ctx.components.clone(),
+        )
         .await;
 
     // Extract body and headers from chat response
@@ -552,18 +467,18 @@ async fn convert_chat_stream_to_responses_stream(
     // Spawn background task to transform stream
     let original_request_clone = original_request.clone();
     let chat_request_clone = chat_request.clone();
-    let response_storage_clone = response_storage.clone();
-    let conversation_storage_clone = _conversation_storage.clone();
-    let conversation_item_storage_clone = _conversation_item_storage.clone();
+    let response_storage = ctx.response_storage.clone();
+    let conversation_storage = ctx.conversation_storage.clone();
+    let conversation_item_storage = ctx.conversation_item_storage.clone();
 
     tokio::spawn(async move {
         if let Err(e) = process_and_transform_sse_stream(
             body,
             original_request_clone,
             chat_request_clone,
-            response_storage_clone,
-            conversation_storage_clone,
-            conversation_item_storage_clone,
+            response_storage,
+            conversation_storage,
+            conversation_item_storage,
             tx.clone(),
         )
         .await
@@ -613,9 +528,9 @@ async fn process_and_transform_sse_stream(
     body: Body,
     original_request: ResponsesRequest,
     _chat_request: Arc<crate::protocols::chat::ChatCompletionRequest>,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     // Create accumulator for final response
@@ -623,11 +538,7 @@ async fn process_and_transform_sse_stream(
 
     // Create event emitter for OpenAI-compatible streaming
     let response_id = format!("resp_{}", Uuid::new_v4());
-    let model = if original_request.model.is_empty() {
-        "default".to_string()
-    } else {
-        original_request.model.clone()
-    };
+    let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
 
@@ -700,9 +611,9 @@ async fn process_and_transform_sse_stream(
 
         if let Ok(response_json) = serde_json::to_value(&final_response) {
             if let Err(e) = persist_conversation_items(
-                conversation_storage,
-                conversation_item_storage,
-                response_storage,
+                conversation_storage.clone(),
+                conversation_item_storage.clone(),
+                response_storage.clone(),
                 &response_json,
                 &original_request,
             )
@@ -915,75 +826,88 @@ impl StreamingResponseAccumulator {
 // ============================================================================
 
 /// Execute request without MCP tool loop (simple pipeline execution)
-#[allow(clippy::too_many_arguments)]
 async fn execute_without_mcp(
-    pipeline: &RequestPipeline,
+    ctx: &super::context::ResponsesContext,
     modified_request: &ResponsesRequest,
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    components: Arc<SharedComponents>,
     response_id: Option<String>,
-    background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
-) -> Result<ResponsesResponse, String> {
+) -> Result<ResponsesResponse, Response> {
+    use crate::routers::grpc::utils;
+
     // Convert ResponsesRequest → ChatCompletionRequest
     let chat_request = conversions::responses_to_chat(modified_request)
-        .map_err(|e| format!("Failed to convert request: {}", e))?;
+        .map_err(|e| utils::bad_request_error(format!("Failed to convert request: {}", e)))?;
 
-    // Execute chat pipeline
-    let chat_response = pipeline
+    // Execute chat pipeline (errors already have proper HTTP status codes)
+    let chat_response = ctx
+        .pipeline
         .execute_chat_for_responses(
             Arc::new(chat_request),
             headers,
             model_id,
-            components,
+            ctx.components.clone(),
             response_id.clone(),
-            background_tasks,
+            Some(ctx.background_tasks.clone()),
         )
-        .await
-        .map_err(|e| format!("Pipeline execution failed: {}", e))?;
+        .await?; // Preserve the Response error as-is
 
     // Convert ChatCompletionResponse → ResponsesResponse
-    conversions::chat_to_responses(&chat_response, original_request, response_id)
-        .map_err(|e| format!("Failed to convert to responses format: {}", e))
+    conversions::chat_to_responses(&chat_response, original_request, response_id).map_err(|e| {
+        utils::internal_error_message(format!("Failed to convert to responses format: {}", e))
+    })
 }
 
 /// Load conversation history and response chains, returning modified request
 async fn load_conversation_history(
+    ctx: &super::context::ResponsesContext,
     request: &ResponsesRequest,
-    response_storage: &SharedResponseStorage,
-    conversation_storage: &SharedConversationStorage,
-    conversation_item_storage: &SharedConversationItemStorage,
-) -> Result<ResponsesRequest, String> {
+) -> Result<ResponsesRequest, Response> {
     let mut modified_request = request.clone();
     let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
 
     // Handle previous_response_id by loading response chain
     if let Some(ref prev_id_str) = modified_request.previous_response_id {
         let prev_id = ResponseId::from(prev_id_str.as_str());
-        match response_storage.get_response_chain(&prev_id, None).await {
+        match ctx
+            .response_storage
+            .get_response_chain(&prev_id, None)
+            .await
+        {
             Ok(chain) => {
                 let mut items = Vec::new();
                 for stored in chain.responses.iter() {
-                    // Convert input to conversation item
-                    items.push(ResponseInputOutputItem::Message {
-                        id: format!("msg_u_{}", stored.id.0.trim_start_matches("resp_")),
-                        role: "user".to_string(),
-                        content: vec![ResponseContentPart::InputText {
-                            text: stored.input.clone(),
-                        }],
-                        status: Some("completed".to_string()),
-                    });
+                    // Convert input items from stored input (which is now a JSON array)
+                    if let Some(input_arr) = stored.input.as_array() {
+                        for item in input_arr {
+                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
+                                Ok(input_item) => {
+                                    items.push(input_item);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to deserialize stored input item: {}. Item: {}",
+                                        e, item
+                                    );
+                                }
+                            }
+                        }
+                    }
 
-                    // Convert output to conversation items
-                    if let Some(output_arr) =
-                        stored.raw_response.get("output").and_then(|v| v.as_array())
-                    {
+                    // Convert output items from stored output (which is now a JSON array)
+                    if let Some(output_arr) = stored.output.as_array() {
                         for item in output_arr {
-                            if let Ok(output_item) =
-                                serde_json::from_value::<ResponseInputOutputItem>(item.clone())
-                            {
-                                items.push(output_item);
+                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
+                                Ok(output_item) => {
+                                    items.push(output_item);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to deserialize stored output item: {}. Item: {}",
+                                        e, item
+                                    );
+                                }
                             }
                         }
                     }
@@ -1005,7 +929,7 @@ async fn load_conversation_history(
         let conv_id = ConversationId::from(conv_id_str.as_str());
 
         // Auto-create conversation if it doesn't exist (OpenAI behavior)
-        if let Ok(None) = conversation_storage.get_conversation(&conv_id).await {
+        if let Ok(None) = ctx.conversation_storage.get_conversation(&conv_id).await {
             debug!(
                 "Creating new conversation with user-provided ID: {}",
                 conv_id_str
@@ -1018,25 +942,34 @@ async fn load_conversation_history(
                     .collect::<serde_json::Map<String, serde_json::Value>>()
             });
 
-            let new_conv = crate::data_connector::conversations::NewConversation {
+            let new_conv = crate::data_connector::NewConversation {
                 id: Some(conv_id.clone()), // Use user-provided conversation ID
                 metadata,
             };
-            conversation_storage
+            ctx.conversation_storage
                 .create_conversation(new_conv)
                 .await
-                .map_err(|e| format!("Failed to create conversation: {}", e))?;
+                .map_err(|e| {
+                    crate::routers::grpc::utils::internal_error_message(format!(
+                        "Failed to create conversation: {}",
+                        e
+                    ))
+                })?;
         }
 
         // Load conversation history
         const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
-        let params = crate::data_connector::conversation_items::ListParams {
+        let params = crate::data_connector::ListParams {
             limit: MAX_CONVERSATION_HISTORY_ITEMS,
-            order: crate::data_connector::conversation_items::SortOrder::Asc,
+            order: crate::data_connector::SortOrder::Asc,
             after: None,
         };
 
-        match conversation_item_storage.list_items(&conv_id, params).await {
+        match ctx
+            .conversation_item_storage
+            .list_items(&conv_id, params)
+            .await
+        {
             Ok(stored_items) => {
                 let mut items: Vec<ResponseInputOutputItem> = Vec::new();
                 for item in stored_items.into_iter() {
@@ -1065,7 +998,12 @@ async fn load_conversation_history(
                         });
                     }
                     ResponseInput::Items(current_items) => {
-                        items.extend_from_slice(current_items);
+                        // Process all item types, converting SimpleInputMessage to Message
+                        for item in current_items.iter() {
+                            let normalized =
+                                crate::protocols::responses::normalize_input_item(item);
+                            items.push(normalized);
+                        }
                     }
                 }
 
@@ -1096,7 +1034,11 @@ async fn load_conversation_history(
                 });
             }
             ResponseInput::Items(current_items) => {
-                items.extend_from_slice(current_items);
+                // Process all item types, converting SimpleInputMessage to Message
+                for item in current_items.iter() {
+                    let normalized = crate::protocols::responses::normalize_input_item(item);
+                    items.push(normalized);
+                }
             }
         }
 
@@ -1112,13 +1054,13 @@ async fn load_conversation_history(
 
 /// Implementation for GET /v1/responses/{response_id}
 pub async fn get_response_impl(
-    response_storage: &SharedResponseStorage,
+    ctx: &super::context::ResponsesContext,
     response_id: &str,
 ) -> Response {
     let resp_id = ResponseId::from(response_id);
 
     // Retrieve response from storage
-    match response_storage.get_response(&resp_id).await {
+    match ctx.response_storage.get_response(&resp_id).await {
         Ok(Some(stored_response)) => axum::Json(stored_response.raw_response).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -1150,14 +1092,13 @@ pub async fn get_response_impl(
 
 /// Implementation for POST /v1/responses/{response_id}/cancel
 pub async fn cancel_response_impl(
-    response_storage: &SharedResponseStorage,
-    background_tasks: &Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
+    ctx: &super::context::ResponsesContext,
     response_id: &str,
 ) -> Response {
     let resp_id = ResponseId::from(response_id);
 
     // Retrieve response from storage to check if it exists and get current status
-    match response_storage.get_response(&resp_id).await {
+    match ctx.response_storage.get_response(&resp_id).await {
         Ok(Some(stored_response)) => {
             // Check current status - only queued or in_progress responses can be cancelled
             let current_status = stored_response
@@ -1169,7 +1110,7 @@ pub async fn cancel_response_impl(
             match current_status {
                 "queued" | "in_progress" => {
                     // Attempt to abort the background task
-                    let mut tasks = background_tasks.write().await;
+                    let mut tasks = ctx.background_tasks.write().await;
                     if let Some(task_info) = tasks.remove(response_id) {
                         // Abort the Rust task immediately
                         task_info.handle.abort();

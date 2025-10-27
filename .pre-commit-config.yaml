@@ -30,7 +30,7 @@ repos:
         args:
           - --select=F401,F821
           - --fix
-        files: ^(benchmark/|docs/|examples/|python/sglang/)
+        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-router/py_*)
         exclude: __init__\.py$|\.ipynb$|^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$
   - repo: https://github.com/psf/black
     rev: 24.10.0

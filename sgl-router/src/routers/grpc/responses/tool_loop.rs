@@ -13,7 +13,7 @@ use axum::{
 };
 use bytes::Bytes;
 use serde_json::json;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -21,25 +21,14 @@ use uuid::Uuid;
 use super::{
     conversions,
     streaming::{OutputItemType, ResponseStreamEventEmitter},
-    types::BackgroundTaskInfo,
 };
-/// This is a re-export of the shared implementation from openai::mcp
-pub(super) use crate::routers::openai::mcp::mcp_manager_from_request_tools as create_mcp_manager_from_request;
-use crate::{
-    data_connector::{
-        SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
+use crate::protocols::{
+    chat::ChatCompletionResponse,
+    common::{Tool, ToolChoice, ToolChoiceValue},
+    responses::{
+        McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
+        ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest, ResponsesResponse,
     },
-    mcp::McpClientManager,
-    protocols::{
-        chat::ChatCompletionResponse,
-        common::{Tool, ToolChoice, ToolChoiceValue},
-        responses::{
-            McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-            ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest,
-            ResponsesResponse,
-        },
-    },
-    routers::grpc::{context::SharedComponents, pipeline::RequestPipeline},
 };
 
 /// Extract function call from a chat completion response
@@ -98,63 +87,6 @@ fn extract_all_tool_calls_from_chat(
     } else {
         Vec::new()
     }
-}
-
-/// Execute an MCP tool call
-async fn execute_mcp_call(
-    mcp_mgr: &Arc<McpClientManager>,
-    tool_name: &str,
-    args_json_str: &str,
-) -> Result<String, String> {
-    // Parse arguments JSON string to Value
-    let mut args_value: serde_json::Value =
-        serde_json::from_str::<serde_json::Value>(args_json_str)
-            .map_err(|e| format!("parse tool args: {}", e))?;
-
-    // Get tool info to access schema for type coercion
-    let tool_info = mcp_mgr
-        .get_tool(tool_name)
-        .ok_or_else(|| format!("tool not found: {}", tool_name))?;
-
-    // Coerce string numbers to actual numbers based on schema (LLMs often output numbers as strings)
-    if let Some(params) = &tool_info.parameters {
-        let properties = params.get("properties").and_then(|p| p.as_object());
-        let args_obj = args_value.as_object_mut();
-
-        if let (Some(props), Some(args)) = (properties, args_obj) {
-            for (key, val) in args.iter_mut() {
-                let should_be_number = props
-                    .get(key)
-                    .and_then(|s| s.get("type"))
-                    .and_then(|t| t.as_str())
-                    .is_some_and(|t| matches!(t, "number" | "integer"));
-
-                if should_be_number {
-                    if let Some(s) = val.as_str() {
-                        if let Ok(num) = s.parse::<f64>() {
-                            *val = json!(num);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let args_obj = args_value.as_object().cloned();
-
-    debug!(
-        "Calling MCP tool '{}' with args: {}",
-        tool_name, args_json_str
-    );
-
-    let result = mcp_mgr
-        .call_tool(tool_name, args_obj)
-        .await
-        .map_err(|e| format!("tool call failed: {}", e))?;
-
-    let output_str = serde_json::to_string(&result)
-        .map_err(|e| format!("Failed to serialize tool result: {}", e))?;
-    Ok(output_str)
 }
 
 /// State for tracking multi-turn tool calling loop
@@ -222,7 +154,7 @@ fn generate_mcp_id(prefix: &str) -> String {
 
 /// Build mcp_list_tools output item
 fn build_mcp_list_tools_item(
-    mcp: &Arc<McpClientManager>,
+    mcp: &Arc<crate::mcp::McpManager>,
     server_label: &str,
 ) -> ResponseOutputItem {
     let tools = mcp.list_tools();
@@ -279,18 +211,14 @@ fn build_mcp_call_item(
 /// 2. Checks if response has tool calls
 /// 3. If yes, executes MCP tools and builds resume request
 /// 4. Repeats until no more tool calls or limit reached
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_tool_loop(
-    pipeline: &RequestPipeline,
+    ctx: &super::context::ResponsesContext,
     mut current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    components: Arc<SharedComponents>,
-    mcp_manager: Arc<McpClientManager>,
     response_id: Option<String>,
-    background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
-) -> Result<ResponsesResponse, String> {
+) -> Result<ResponsesResponse, Response> {
     // Get server label from original request tools
     let server_label = original_request
         .tools
@@ -315,31 +243,35 @@ pub(super) async fn execute_tool_loop(
     );
 
     // Get MCP tools and convert to chat format (do this once before loop)
-    let mcp_tools = mcp_manager.list_tools();
+    let mcp_tools = ctx.mcp_manager.list_tools();
     let chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
     debug!("Converted {} MCP tools to chat format", chat_tools.len());
 
     loop {
         // Convert to chat request
-        let mut chat_request = conversions::responses_to_chat(&current_request)
-            .map_err(|e| format!("Failed to convert request: {}", e))?;
+        let mut chat_request = conversions::responses_to_chat(&current_request).map_err(|e| {
+            crate::routers::grpc::utils::bad_request_error(format!(
+                "Failed to convert request: {}",
+                e
+            ))
+        })?;
 
         // Add MCP tools to chat request so LLM knows about them
         chat_request.tools = Some(chat_tools.clone());
         chat_request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
 
-        // Execute chat pipeline
-        let chat_response = pipeline
+        // Execute chat pipeline (errors already have proper HTTP status codes)
+        let chat_response = ctx
+            .pipeline
             .execute_chat_for_responses(
                 Arc::new(chat_request),
                 headers.clone(),
                 model_id.clone(),
-                components.clone(),
+                ctx.components.clone(),
                 response_id.clone(),
-                background_tasks.clone(),
+                Some(ctx.background_tasks.clone()),
             )
-            .await
-            .map_err(|e| format!("Pipeline execution failed: {}", e))?;
+            .await?;
 
         // Check for function calls
         if let Some((call_id, tool_name, args_json_str)) =
@@ -370,7 +302,12 @@ pub(super) async fn execute_tool_loop(
                     original_request,
                     response_id.clone(),
                 )
-                .map_err(|e| format!("Failed to convert to responses format: {}", e))?;
+                .map_err(|e| {
+                    crate::routers::grpc::utils::internal_error_message(format!(
+                        "Failed to convert to responses format: {}",
+                        e
+                    ))
+                })?;
 
                 // Mark as completed but with incomplete details
                 responses_response.status = ResponseStatus::Completed;
@@ -382,18 +319,33 @@ pub(super) async fn execute_tool_loop(
             // Increment after check
             state.total_calls += 1;
 
-            // Execute the MCP tool
-            let (output_str, success, error) =
-                match execute_mcp_call(&mcp_manager, &tool_name, &args_json_str).await {
+            // Execute the MCP tool - manager handles parsing and type coercion
+            debug!(
+                "Calling MCP tool '{}' with args: {}",
+                tool_name, args_json_str
+            );
+            let (output_str, success, error) = match ctx
+                .mcp_manager
+                .call_tool(tool_name.as_str(), args_json_str.as_str())
+                .await
+            {
+                Ok(result) => match serde_json::to_string(&result) {
                     Ok(output) => (output, true, None),
-                    Err(err) => {
-                        warn!("Tool execution failed: {}", err);
-                        let error_msg = err.clone();
-                        // Return error as output, let model decide how to proceed
-                        let error_json = json!({ "error": err }).to_string();
-                        (error_json, false, Some(error_msg))
+                    Err(e) => {
+                        let err = format!("Failed to serialize tool result: {}", e);
+                        warn!("{}", err);
+                        let error_json = json!({ "error": &err }).to_string();
+                        (error_json, false, Some(err))
                     }
-                };
+                },
+                Err(err) => {
+                    let err_str = format!("tool call failed: {}", err);
+                    warn!("Tool execution failed: {}", err_str);
+                    // Return error as output, let model decide how to proceed
+                    let error_json = json!({ "error": &err_str }).to_string();
+                    (error_json, false, Some(err_str))
+                }
+            };
 
             // Record the call in state
             state.record_call(
@@ -414,7 +366,10 @@ pub(super) async fn execute_tool_loop(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
-                ResponseInput::Items(items) => items.clone(),
+                ResponseInput::Items(items) => items
+                    .iter()
+                    .map(crate::protocols::responses::normalize_input_item)
+                    .collect(),
             };
 
             // Append all conversation history (function calls and outputs)
@@ -469,12 +424,17 @@ pub(super) async fn execute_tool_loop(
                 original_request,
                 response_id.clone(),
             )
-            .map_err(|e| format!("Failed to convert to responses format: {}", e))?;
+            .map_err(|e| {
+                crate::routers::grpc::utils::internal_error_message(format!(
+                    "Failed to convert to responses format: {}",
+                    e
+                ))
+            })?;
 
             // Inject MCP metadata into output
             if state.total_calls > 0 {
                 // Prepend mcp_list_tools item
-                let mcp_list_tools = build_mcp_list_tools_item(&mcp_manager, &server_label);
+                let mcp_list_tools = build_mcp_list_tools_item(&ctx.mcp_manager, &server_label);
                 responses_response.output.insert(0, mcp_list_tools);
 
                 // Append all mcp_call items at the end
@@ -496,52 +456,28 @@ pub(super) async fn execute_tool_loop(
 /// This streams each iteration's response to the client while accumulating
 /// to check for tool calls. If tool calls are found, executes them and
 /// continues with the next streaming iteration.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_tool_loop_streaming(
-    pipeline: &RequestPipeline,
+    ctx: &super::context::ResponsesContext,
     current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    components: Arc<SharedComponents>,
-    mcp_manager: Arc<McpClientManager>,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
 ) -> Response {
-    // Get server label
-    let server_label = original_request
-        .tools
-        .as_ref()
-        .and_then(|tools| {
-            tools
-                .iter()
-                .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-                .and_then(|t| t.server_label.clone())
-        })
-        .unwrap_or_else(|| "request-mcp".to_string());
-
     // Create SSE channel for client
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
 
     // Clone data for background task
-    let pipeline_clone = pipeline.clone();
+    let ctx_clone = ctx.clone();
     let original_request_clone = original_request.clone();
 
     // Spawn background task for tool loop
     tokio::spawn(async move {
         let result = execute_tool_loop_streaming_internal(
-            &pipeline_clone,
+            &ctx_clone,
             current_request,
             &original_request_clone,
             headers,
             model_id,
-            components,
-            mcp_manager,
-            server_label,
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
             tx.clone(),
         )
         .await;
@@ -587,32 +523,33 @@ pub(super) async fn execute_tool_loop_streaming(
 }
 
 /// Internal streaming tool loop implementation
-#[allow(clippy::too_many_arguments)]
 async fn execute_tool_loop_streaming_internal(
-    pipeline: &RequestPipeline,
+    ctx: &super::context::ResponsesContext,
     mut current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    components: Arc<SharedComponents>,
-    mcp_manager: Arc<McpClientManager>,
-    server_label: String,
-    _response_storage: SharedResponseStorage,
-    _conversation_storage: SharedConversationStorage,
-    _conversation_item_storage: SharedConversationItemStorage,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
+    // Extract server label from original request tools
+    let server_label = original_request
+        .tools
+        .as_ref()
+        .and_then(|tools| {
+            tools
+                .iter()
+                .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                .and_then(|t| t.server_label.clone())
+        })
+        .unwrap_or_else(|| "request-mcp".to_string());
+
     const MAX_ITERATIONS: usize = 10;
     let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Create response event emitter
     let response_id = format!("resp_{}", Uuid::new_v4());
-    let model = if current_request.model.is_empty() {
-        "default".to_string()
-    } else {
-        current_request.model.clone()
-    };
+    let model = current_request.model.clone();
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -626,7 +563,7 @@ async fn execute_tool_loop_streaming_internal(
     emitter.send_event(&event, &tx)?;
 
     // Get MCP tools and convert to chat format (do this once before loop)
-    let mcp_tools = mcp_manager.list_tools();
+    let mcp_tools = ctx.mcp_manager.list_tools();
     let chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
     debug!(
         "Streaming: Converted {} MCP tools to chat format",
@@ -715,12 +652,13 @@ async fn execute_tool_loop_streaming_internal(
         chat_request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
 
         // Execute chat streaming
-        let response = pipeline
+        let response = ctx
+            .pipeline
             .execute_chat(
                 Arc::new(chat_request),
                 headers.clone(),
                 model_id.clone(),
-                components.clone(),
+                ctx.components.clone(),
             )
             .await;
 
@@ -798,9 +736,17 @@ async fn execute_tool_loop_streaming_internal(
                     emitter.emit_mcp_call_arguments_done(output_index, &item_id, &args_json_str);
                 emitter.send_event(&event, &tx)?;
 
-                // Execute the MCP tool
-                let (output_str, success, error) =
-                    match execute_mcp_call(&mcp_manager, &tool_name, &args_json_str).await {
+                // Execute the MCP tool - manager handles parsing and type coercion
+                debug!(
+                    "Calling MCP tool '{}' with args: {}",
+                    tool_name, args_json_str
+                );
+                let (output_str, success, error) = match ctx
+                    .mcp_manager
+                    .call_tool(tool_name.as_str(), args_json_str.as_str())
+                    .await
+                {
+                    Ok(result) => match serde_json::to_string(&result) {
                         Ok(output) => {
                             // Emit mcp_call.completed
                             let event = emitter.emit_mcp_call_completed(output_index, &item_id);
@@ -824,8 +770,9 @@ async fn execute_tool_loop_streaming_internal(
                             emitter.complete_output_item(output_index);
                             (output, true, None)
                         }
-                        Err(err) => {
-                            warn!("Tool execution failed: {}", err);
+                        Err(e) => {
+                            let err = format!("Failed to serialize tool result: {}", e);
+                            warn!("{}", err);
                             // Emit mcp_call.failed
                             let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err);
                             emitter.send_event(&event, &tx)?;
@@ -838,7 +785,7 @@ async fn execute_tool_loop_streaming_internal(
                                 "server_label": state.server_label,
                                 "status": "failed",
                                 "arguments": args_json_str,
-                                "error": err
+                                "error": &err
                             });
 
                             // Emit output_item.done
@@ -846,11 +793,37 @@ async fn execute_tool_loop_streaming_internal(
                             emitter.send_event(&event, &tx)?;
 
                             emitter.complete_output_item(output_index);
-                            let error_msg = err.clone();
-                            let error_json = json!({ "error": err }).to_string();
-                            (error_json, false, Some(error_msg))
+                            let error_json = json!({ "error": &err }).to_string();
+                            (error_json, false, Some(err))
                         }
-                    };
+                    },
+                    Err(err) => {
+                        let err_str = format!("tool call failed: {}", err);
+                        warn!("Tool execution failed: {}", err_str);
+                        // Emit mcp_call.failed
+                        let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err_str);
+                        emitter.send_event(&event, &tx)?;
+
+                        // Build failed item
+                        let item_done = json!({
+                            "id": item_id,
+                            "type": "mcp_call",
+                            "name": tool_name,
+                            "server_label": state.server_label,
+                            "status": "failed",
+                            "arguments": args_json_str,
+                            "error": &err_str
+                        });
+
+                        // Emit output_item.done
+                        let event = emitter.emit_output_item_done(output_index, &item_done);
+                        emitter.send_event(&event, &tx)?;
+
+                        emitter.complete_output_item(output_index);
+                        let error_json = json!({ "error": &err_str }).to_string();
+                        (error_json, false, Some(err_str))
+                    }
+                };
 
                 // Record the call in state
                 state.record_call(
@@ -871,13 +844,14 @@ async fn execute_tool_loop_streaming_internal(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
-                ResponseInput::Items(items) => items.clone(),
+                ResponseInput::Items(items) => items
+                    .iter()
+                    .map(crate::protocols::responses::normalize_input_item)
+                    .collect(),
             };
 
-            // Append all conversation history
             input_items.extend_from_slice(&state.conversation_history);
 
-            // Build new request for next iteration
             current_request = ResponsesRequest {
                 input: ResponseInput::Items(input_items),
                 model: current_request.model.clone(),
@@ -886,8 +860,8 @@ async fn execute_tool_loop_streaming_internal(
                 max_output_tokens: current_request.max_output_tokens,
                 temperature: current_request.temperature,
                 top_p: current_request.top_p,
-                stream: Some(true), // Keep streaming enabled
-                store: Some(false), // Don't store intermediate responses
+                stream: Some(true),
+                store: Some(false),
                 background: Some(false),
                 max_tool_calls: current_request.max_tool_calls,
                 tool_choice: current_request.tool_choice.clone(),

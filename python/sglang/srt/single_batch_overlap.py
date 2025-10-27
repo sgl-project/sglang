@@ -85,7 +85,7 @@ def execute_sbo(
         _compute_overlap_args(dispatch_output, alt_stream, disable_sbo=disable_sbo)
     )
 
-    hidden_states = experts.run_moe_core(
+    combine_input = experts.run_moe_core(
         dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
     )
     if (e := meta_overlap_args.get("record_event_after_down")) is not None:
@@ -98,12 +98,7 @@ def execute_sbo(
         ):
             forward_shared_experts()
 
-    hidden_states = experts.dispatcher.combine(
-        hidden_states=hidden_states,
-        topk_ids=dispatch_output.topk_ids,
-        topk_weights=dispatch_output.topk_weights,
-        overlap_args=combine_overlap_args,
-    )
+    hidden_states = experts.dispatcher.combine(combine_input=combine_input)
 
     return hidden_states
 

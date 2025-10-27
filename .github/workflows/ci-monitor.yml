@@ -2,7 +2,7 @@ name: CI Monitor
 
 on:
   schedule:
-    - cron: '0 */12 * * *'
+    - cron: '0 */12 * * *'  # Every 12 hours for main analysis
   workflow_dispatch:
     inputs:
       limit:
@@ -39,7 +39,7 @@ jobs:
 
       - name: Run CI Analysis
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           PYTHONUNBUFFERED: 1
           PYTHONIOENCODING: utf-8
         run: |
@@ -48,7 +48,7 @@ jobs:
 
       - name: Run Performance Analysis
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           PYTHONUNBUFFERED: 1
           PYTHONIOENCODING: utf-8
         run: |
@@ -62,4 +62,39 @@ jobs:
           path: |
             scripts/ci_monitor/ci_analysis_*.json
             scripts/ci_monitor/performance_tables_*
+          retention-days: 30
+
+  ci-monitor-balance:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run Test Balance Analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          PYTHONUNBUFFERED: 1
+          PYTHONIOENCODING: utf-8
+        run: |
+          cd scripts/ci_monitor
+          python ci_analyzer_balance.py --token $GITHUB_TOKEN --limit ${{ inputs.limit || '1000' }} --output test_balance_report_$(date +%Y%m%d_%H%M%S).json
+
+      - name: Upload Balance Analysis Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-balance-results-${{ github.run_number }}
+          path: |
+            scripts/ci_monitor/test_balance_report_*.json
+            scripts/ci_monitor/test_balance_report_*.csv
           retention-days: 30

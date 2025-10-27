@@ -241,16 +241,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 )
 
     def op_experts(self, state):
-        state.hidden_states_experts_output = self.experts.run_moe_core(
+        state.combine_input = self.experts.run_moe_core(
             dispatch_output=state.dispatch_output,
         )
 
     def op_combine_a(self, state):
         if self.ep_size > 1:
             self.experts.dispatcher.combine_a(
-                hidden_states=state.pop("hidden_states_experts_output"),
-                topk_ids=state.dispatch_output.topk_ids,
-                topk_weights=state.dispatch_output.topk_weights,
+                combine_input=state.pop("combine_input"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
             state.pop("dispatch_output")

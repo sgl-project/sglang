@@ -47,7 +47,7 @@ jobs:
           docker build \
             ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
             ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
-            . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
+            . -f docker/xeon.Dockerfile  -t sglang_xeon --no-cache
 
       - name: Run container
         run: |
