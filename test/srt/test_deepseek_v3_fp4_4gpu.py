@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -83,6 +84,7 @@ class TestDeepseekV3FP4(CustomTestCase):
 class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
@@ -104,7 +106,6 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "4",
             "--kv-cache-dtype",
             "fp8_e4m3",
-            "--enable-beta-spec",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -116,6 +117,8 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        if "SGLANG_ENABLE_SPEC_V2" in os.environ:
+            del os.environ["SGLANG_ENABLE_SPEC_V2"]
 
     def test_a_gsm8k(
         self,
