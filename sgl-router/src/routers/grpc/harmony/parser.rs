@@ -63,54 +63,117 @@ impl HarmonyParserAdapter {
         let mut final_text = String::new();
 
         for msg in messages {
-            let channel = msg.channel.as_deref().unwrap_or("");
+            // Filter: Only process assistant messages (vLLM lines 294-298)
+            if msg.author.role != Role::Assistant {
+                continue;
+            }
 
-            // Extract text content
-            let text = msg
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    openai_harmony::chat::Content::Text(tc) => Some(tc.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
+            let channel = msg.channel.as_deref().unwrap_or("");
+            let recipient = msg.recipient.as_deref();
 
             match channel {
                 "analysis" => {
-                    analysis = Some(text);
+                    // vLLM lines 332-344: Process each content item
+                    // For Chat API, we join them into a single reasoning_content
+                    let text = msg
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            openai_harmony::chat::Content::Text(tc) => Some(tc.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+
+                    if !text.is_empty() {
+                        analysis = Some(text);
+                    }
                 }
                 "commentary" => {
-                    // Parse tool calls from commentary channel
-                    // Check if recipient indicates a function call (recipient = "functions.{name}")
-                    if let Some(recipient) = msg.recipient.as_deref() {
-                        if recipient.starts_with("functions.") {
-                            let function_name = recipient.strip_prefix("functions.").unwrap();
+                    // vLLM lines 345-377: Handle different recipient types
+                    if let Some(recipient_str) = recipient {
+                        if recipient_str.starts_with("functions.") {
+                            // vLLM lines 346-357: Function tool calls
+                            let function_name = recipient_str.strip_prefix("functions.").unwrap();
 
-                            // Create ToolCall with unique call_id
-                            let call_id = format!("call_{}", Uuid::new_v4());
-                            let tool_call = ToolCall {
-                                id: call_id,
-                                tool_type: "function".to_string(),
-                                function: FunctionCallResponse {
-                                    name: function_name.to_string(),
-                                    arguments: Some(text),
-                                },
-                            };
+                            // Process each content item separately (vLLM line 348)
+                            for content in &msg.content {
+                                if let openai_harmony::chat::Content::Text(tc) = content {
+                                    let call_id = format!("call_{}", Uuid::new_v4());
+                                    let tool_call = ToolCall {
+                                        id: call_id,
+                                        tool_type: "function".to_string(),
+                                        function: FunctionCallResponse {
+                                            name: function_name.to_string(),
+                                            arguments: Some(tc.text.clone()),
+                                        },
+                                    };
 
-                            // Initialize or append to commentary
-                            match commentary.as_mut() {
-                                Some(calls) => calls.push(tool_call),
-                                None => commentary = Some(vec![tool_call]),
+                                    match commentary.as_mut() {
+                                        Some(calls) => calls.push(tool_call),
+                                        None => commentary = Some(vec![tool_call]),
+                                    }
+                                }
+                            }
+                        } else if recipient_str.starts_with("python")
+                            || recipient_str.starts_with("browser")
+                            || recipient_str.starts_with("container")
+                        {
+                            // vLLM lines 358-375: Built-in tools → treat as reasoning
+                            // For Chat API, we add to analysis content
+                            let text = msg
+                                .content
+                                .iter()
+                                .filter_map(|c| match c {
+                                    openai_harmony::chat::Content::Text(tc) => {
+                                        Some(tc.text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("");
+
+                            if !text.is_empty() {
+                                // Append to analysis (built-in tools are reasoning)
+                                match analysis.as_mut() {
+                                    Some(existing) => {
+                                        existing.push('\n');
+                                        existing.push_str(&text);
+                                    }
+                                    None => analysis = Some(text),
+                                }
                             }
                         }
+                        // vLLM line 377: Unknown recipient would raise ValueError
+                        // For now, we silently ignore (can add logging later)
                     }
                 }
                 "final" => {
+                    // vLLM lines 378-395: Process final channel content
+                    let text = msg
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            openai_harmony::chat::Content::Text(tc) => Some(tc.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+
                     final_text.push_str(&text);
                 }
                 _ => {
                     // Unknown channel, append to final text as fallback
+                    let text = msg
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            openai_harmony::chat::Content::Text(tc) => Some(tc.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+
                     final_text.push_str(&text);
                 }
             }
@@ -225,52 +288,117 @@ impl HarmonyParserAdapter {
         let mut final_text = String::new();
 
         for msg in messages {
-            let channel = msg.channel.as_deref().unwrap_or("");
+            // Filter: Only process assistant messages (vLLM lines 294-298)
+            if msg.author.role != Role::Assistant {
+                continue;
+            }
 
-            let text = msg
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    openai_harmony::chat::Content::Text(tc) => Some(tc.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
+            let channel = msg.channel.as_deref().unwrap_or("");
+            let recipient = msg.recipient.as_deref();
 
             match channel {
                 "analysis" => {
-                    analysis = Some(text);
+                    // vLLM lines 332-344: Process each content item
+                    // For Chat API, we join them into a single reasoning_content
+                    let text = msg
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            openai_harmony::chat::Content::Text(tc) => Some(tc.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+
+                    if !text.is_empty() {
+                        analysis = Some(text);
+                    }
                 }
                 "commentary" => {
-                    // Parse tool calls from commentary channel
-                    // Check if recipient indicates a function call (recipient = "functions.{name}")
-                    if let Some(recipient) = msg.recipient.as_deref() {
-                        if recipient.starts_with("functions.") {
-                            let function_name = recipient.strip_prefix("functions.").unwrap();
+                    // vLLM lines 345-377: Handle different recipient types
+                    if let Some(recipient_str) = recipient {
+                        if recipient_str.starts_with("functions.") {
+                            // vLLM lines 346-357: Function tool calls
+                            let function_name = recipient_str.strip_prefix("functions.").unwrap();
 
-                            // Create ToolCall with unique call_id
-                            let call_id = format!("call_{}", Uuid::new_v4());
-                            let tool_call = ToolCall {
-                                id: call_id,
-                                tool_type: "function".to_string(),
-                                function: FunctionCallResponse {
-                                    name: function_name.to_string(),
-                                    arguments: Some(text),
-                                },
-                            };
+                            // Process each content item separately (vLLM line 348)
+                            for content in &msg.content {
+                                if let openai_harmony::chat::Content::Text(tc) = content {
+                                    let call_id = format!("call_{}", Uuid::new_v4());
+                                    let tool_call = ToolCall {
+                                        id: call_id,
+                                        tool_type: "function".to_string(),
+                                        function: FunctionCallResponse {
+                                            name: function_name.to_string(),
+                                            arguments: Some(tc.text.clone()),
+                                        },
+                                    };
 
-                            // Initialize or append to commentary
-                            match commentary.as_mut() {
-                                Some(calls) => calls.push(tool_call),
-                                None => commentary = Some(vec![tool_call]),
+                                    match commentary.as_mut() {
+                                        Some(calls) => calls.push(tool_call),
+                                        None => commentary = Some(vec![tool_call]),
+                                    }
+                                }
+                            }
+                        } else if recipient_str.starts_with("python")
+                            || recipient_str.starts_with("browser")
+                            || recipient_str.starts_with("container")
+                        {
+                            // vLLM lines 358-375: Built-in tools → treat as reasoning
+                            // For Chat API, we add to analysis content
+                            let text = msg
+                                .content
+                                .iter()
+                                .filter_map(|c| match c {
+                                    openai_harmony::chat::Content::Text(tc) => {
+                                        Some(tc.text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("");
+
+                            if !text.is_empty() {
+                                // Append to analysis (built-in tools are reasoning)
+                                match analysis.as_mut() {
+                                    Some(existing) => {
+                                        existing.push('\n');
+                                        existing.push_str(&text);
+                                    }
+                                    None => analysis = Some(text),
+                                }
                             }
                         }
+                        // vLLM line 377: Unknown recipient would raise ValueError
+                        // For now, we silently ignore (can add logging later)
                     }
                 }
                 "final" => {
+                    // vLLM lines 378-395: Process final channel content
+                    let text = msg
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            openai_harmony::chat::Content::Text(tc) => Some(tc.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+
                     final_text.push_str(&text);
                 }
                 _ => {
+                    // Unknown channel, append to final text as fallback
+                    let text = msg
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            openai_harmony::chat::Content::Text(tc) => Some(tc.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+
                     final_text.push_str(&text);
                 }
             }
