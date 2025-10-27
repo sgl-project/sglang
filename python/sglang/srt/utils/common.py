@@ -56,7 +56,6 @@ from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -93,9 +92,6 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +134,7 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
@@ -1105,9 +1102,9 @@ def add_api_key_middleware(app, api_key: str):
     async def authentication(request, call_next):
         if request.method == "OPTIONS":
             return await call_next(request)
-        if request.url.path.startswith("/health"):
-            return await call_next(request)
-        if request.url.path.startswith("/metrics"):
+        if request.url.path.startswith("/health") or request.url.path.startswith(
+            "/metrics"
+        ):
             return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
@@ -2099,78 +2096,78 @@ class MultiprocessingSerializer:
             # Decode base64 string to bytes
             data = pybase64.b64decode(data, validate=True)
 
-        class SafeUnpickler(pickle.Unpickler):
-            ALLOWED_MODULE_PREFIXES = {
-                # --- Python types ---
-                "builtins.",
-                "collections.",
-                "copyreg.",
-                "functools.",
-                "itertools.",
-                "operator.",
-                "types.",
-                "weakref.",
-                # --- PyTorch types ---
-                "torch.",
-                "torch._tensor.",
-                "torch.storage.",
-                "torch.nn.parameter.",
-                "torch.autograd.function.",
-                # --- torch distributed ---
-                "torch.distributed.",
-                "torch.distributed._shard.",
-                "torch.distributed._composable.",
-                "torch._C._distributed_c10d.",
-                "torch._C._distributed_fsdp.",
-                "torch.distributed.optim.",
-                # --- multiprocessing ---
-                "multiprocessing.resource_sharer.",
-                "multiprocessing.reduction.",
-                "pickletools.",
-                # --- PEFT / LoRA ---
-                "peft.",
-                "transformers.",
-                "huggingface_hub.",
-                # --- SGLang & Unitest ---
-                "sglang.srt.weight_sync.tensor_bucket.",
-                "sglang.srt.model_executor.model_runner.",
-                "sglang.srt.layers.",
-                "sglang.srt.utils.",
-            }
-
-            DENY_CLASSES = {
-                ("builtins", "eval"),
-                ("builtins", "exec"),
-                ("builtins", "compile"),
-                ("os", "system"),
-                ("subprocess", "Popen"),
-                ("subprocess", "run"),
-                ("codecs", "decode"),
-                ("types", "CodeType"),
-                ("types", "FunctionType"),
-            }
-
-            def find_class(self, module, name):
-                # Block deterministic attacks
-                if (module, name) in self.DENY_CLASSES:
-                    raise RuntimeError(
-                        f"Blocked unsafe class loading ({module}.{name}), "
-                        f"to prevent exploitation of CVE-2025-10164"
-                    )
-                # Allowlist of safe-to-load modules.
-                if any(
-                    (module + ".").startswith(prefix)
-                    for prefix in self.ALLOWED_MODULE_PREFIXES
-                ):
-                    return super().find_class(module, name)
-
-                # Block everything else. (Potential attack surface)
-                raise RuntimeError(
-                    f"Blocked unsafe class loading ({module}.{name}), "
-                    f"to prevent exploitation of CVE-2025-10164"
-                )
-
         return SafeUnpickler(io.BytesIO(data)).load()
+
+
+class SafeUnpickler(pickle.Unpickler):
+    ALLOWED_MODULE_PREFIXES = {
+        # --- Python types ---
+        "builtins.",
+        "collections.",
+        "copyreg.",
+        "functools.",
+        "itertools.",
+        "operator.",
+        "types.",
+        "weakref.",
+        # --- PyTorch types ---
+        "torch.",
+        "torch._tensor.",
+        "torch.storage.",
+        "torch.nn.parameter.",
+        "torch.autograd.function.",
+        # --- torch distributed ---
+        "torch.distributed.",
+        "torch.distributed._shard.",
+        "torch.distributed._composable.",
+        "torch._C._distributed_c10d.",
+        "torch._C._distributed_fsdp.",
+        "torch.distributed.optim.",
+        # --- multiprocessing ---
+        "multiprocessing.resource_sharer.",
+        "multiprocessing.reduction.",
+        "pickletools.",
+        # --- PEFT / LoRA ---
+        "peft.",
+        "transformers.",
+        "huggingface_hub.",
+        # --- SGLang & Unitest ---
+        "sglang.srt.weight_sync.tensor_bucket.",
+        "sglang.srt.model_executor.model_runner.",
+        "sglang.srt.layers.",
+        "sglang.srt.utils.",
+    }
+
+    DENY_CLASSES = {
+        ("builtins", "eval"),
+        ("builtins", "exec"),
+        ("builtins", "compile"),
+        ("os", "system"),
+        ("subprocess", "Popen"),
+        ("subprocess", "run"),
+        ("codecs", "decode"),
+        ("types", "CodeType"),
+        ("types", "FunctionType"),
+    }
+
+    def find_class(self, module, name):
+        # Block deterministic attacks
+        if (module, name) in self.DENY_CLASSES:
+            raise RuntimeError(
+                f"Blocked unsafe class loading ({module}.{name}), "
+                f"to prevent exploitation of CVE-2025-10164"
+            )
+        # Allowlist of safe-to-load modules.
+        if any(
+            (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
+        ):
+            return super().find_class(module, name)
+
+        # Block everything else. (Potential attack surface)
+        raise RuntimeError(
+            f"Blocked unsafe class loading ({module}.{name}), "
+            f"to prevent exploitation of CVE-2025-10164"
+        )
 
 
 def debug_timing(func):
@@ -2623,17 +2620,12 @@ def get_local_ip_auto(fallback: str = None) -> str:
     raise ValueError("Can not get local ip")
 
 
-def is_page_size_one(server_args):
-    return server_args.page_size == 1
-
-
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk == 1
-        and is_page_size_one(server_args)
+        server_args.speculative_eagle_topk == 1
+        and (server_args.page_size == 1 or server_args.page_size is None)
     )
 
 
@@ -3573,3 +3565,11 @@ def cached_triton_kernel(key_fn=None):
         return CachedKernel(fn, key_fn)
 
     return decorator
+
+
+# Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
+def calc_diff(x, y):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim

@@ -118,7 +118,7 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
-docker build -t <image_name> -f Dockerfile.npu .
+docker build -t <image_name> -f npu.Dockerfile .
 
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
