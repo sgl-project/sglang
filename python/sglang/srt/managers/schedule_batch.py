@@ -461,6 +461,10 @@ class Req:
         self.session_id = session_id
         self.input_embeds = input_embeds
 
+        # For req-level memory management
+        self.kv_committed_len = 0
+        self.kv_allocated_len = 0
+
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
@@ -1235,6 +1239,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
+            # update req-level memory management fields
+            req.kv_committed_len = seq_len
+            req.kv_allocated_len = seq_len
+
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # If req.input_embeds is already a list, append its content directly
@@ -1579,6 +1587,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+
+        # Update req-level memory management fields
+        for req in self.reqs:
+            req.kv_committed_len += 1
+            req.kv_allocated_len += 1
 
         # Update seq_lens after allocation
         if self.enable_overlap:
