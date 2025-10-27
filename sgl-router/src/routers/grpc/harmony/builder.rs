@@ -19,8 +19,8 @@ use crate::protocols::{
     common::{ContentPart, Tool},
     responses::{
         ReasoningEffort as ResponsesReasoningEffort, ResponseContentPart, ResponseInput,
-        ResponseInputOutputItem, ResponseReasoningContent, ResponseToolType, ResponsesRequest,
-        StringOrContentParts,
+        ResponseInputOutputItem, ResponseReasoningContent, ResponseTool, ResponseToolType,
+        ResponsesRequest, StringOrContentParts,
     },
 };
 
@@ -309,25 +309,59 @@ impl HarmonyBuilder {
     /// * `tools` - Optional list of tools
     fn get_developer_message_from_responses(
         &self,
-        _instructions: Option<&str>,
-        tools: Option<&Vec<crate::protocols::responses::ResponseTool>>,
+        instructions: Option<&str>,
+        tools: Option<&Vec<ResponseTool>>,
     ) -> HarmonyMessage {
-        let dev_content = DeveloperContent::new();
+        let mut dev_content = DeveloperContent::new();
+
+        // Add instructions if provided
+        if let Some(instructions) = instructions {
+            dev_content = dev_content.with_instructions(instructions.to_string());
+        }
 
         // Early return if no tools
         let Some(tools) = tools else {
             return HarmonyMessage::from_role_and_content(Role::Developer, dev_content);
         };
 
+        let mut function_tools = Vec::new();
+
         for tool in tools {
             match tool.r#type {
-                ResponseToolType::WebSearchPreview
-                | ResponseToolType::CodeInterpreter
-                | ResponseToolType::Mcp => {
+                ResponseToolType::WebSearchPreview | ResponseToolType::CodeInterpreter => {
                     // These are built-in tools that are added to the system message.
-                    // Skip them in developer message.
+                    // Skip them in the developer message.
+                    continue;
+                }
+                ResponseToolType::Mcp => {
+                    // We support MCP tools.
+                    // Add them as function tools if they have a function definition.
+                    if tool.function.is_some() {
+                        function_tools.push(tool);
+                    }
+                }
+                ResponseToolType::Function => {
+                    function_tools.push(tool);
                 }
             }
+        }
+
+        // Convert function tools to ToolDescription and add to developer content
+        if !function_tools.is_empty() {
+            let tool_descriptions: Vec<ToolDescription> = function_tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.function.as_ref().map(|func| {
+                        ToolDescription::new(
+                            func.name.clone(),
+                            func.description.clone().unwrap_or_default(),
+                            Some(func.parameters.clone()),
+                        )
+                    })
+                })
+                .collect();
+
+            dev_content = dev_content.with_function_tools(tool_descriptions);
         }
 
         HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
@@ -363,6 +397,7 @@ impl HarmonyBuilder {
                     tools
                         .iter()
                         .map(|tool| match tool.r#type {
+                            ResponseToolType::Function => "function",
                             ResponseToolType::WebSearchPreview => "web_search_preview",
                             ResponseToolType::CodeInterpreter => "code_interpreter",
                             ResponseToolType::Mcp => "mcp",
@@ -418,7 +453,6 @@ impl HarmonyBuilder {
             }
             ResponseInput::Items(items) => {
                 // Track function calls for looking up call_id → name mapping
-                // This matches vLLM's approach in serving_responses.py:976-991
                 let mut prev_outputs: Vec<&ResponseInputOutputItem> = Vec::new();
 
                 for item in items {
@@ -426,7 +460,6 @@ impl HarmonyBuilder {
                     all_messages.push(msg);
 
                     // Track function tool calls so that function_call_output can find the name
-                    // vLLM does: if type == "function_call": prev_outputs.append(response_msg)
                     if matches!(item, ResponseInputOutputItem::FunctionToolCall { .. }) {
                         prev_outputs.push(item);
                     }
@@ -549,12 +582,10 @@ impl HarmonyBuilder {
             }
 
             // Function call output (separate from call) - requires looking up the original call
-            // This matches vLLM's parse_response_input for type="function_call_output"
             ResponseInputOutputItem::FunctionCallOutput {
                 call_id, output, ..
             } => {
                 // Search prev_outputs in reverse order to find the matching function call
-                // vLLM does: for prev_response in reversed(prev_responses)
                 let call = prev_outputs
                     .iter()
                     .rev()
@@ -705,7 +736,6 @@ impl HarmonyBuilder {
                     tool_calls,
                     reasoning_content,
                 } => {
-                    // Following vLLM logic: if there are tool_calls, create separate messages
                     if let Some(calls) = tool_calls {
                         // Create one message per tool call with channel="commentary"
                         for call in calls {

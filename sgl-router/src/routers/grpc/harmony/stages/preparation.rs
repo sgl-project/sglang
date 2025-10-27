@@ -42,15 +42,17 @@ impl PipelineStage for HarmonyPreparationStage {
         // Clone Arc before match to avoid borrow checker issues
         // Arc clone is cheap (8 bytes) - avoids full request clone (15KB-200KB)
         let is_chat = matches!(&ctx.input.request_type, RequestType::Chat(_));
+        let is_responses = matches!(&ctx.input.request_type, RequestType::Responses(_));
 
         if is_chat {
             let request_arc = ctx.chat_request_arc();
             self.prepare_chat(ctx, &request_arc).await?;
+        } else if is_responses {
+            let request_arc = ctx.responses_request_arc();
+            self.prepare_responses(ctx, &request_arc).await?;
         } else {
-            // For non-chat requests in the gRPC pipeline, we currently only support Chat
-            // Responses API is handled separately (Phase 5: MCP Loop Integration)
             return Err(utils::bad_request_error(
-                "Only Chat requests are supported in Harmony gRPC pipeline (Phase 3)".to_string(),
+                "Only Chat and Responses requests supported in Harmony pipeline".to_string(),
             ));
         }
 

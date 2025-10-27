@@ -74,7 +74,7 @@ impl HarmonyParserAdapter {
         let mut final_text = String::new();
 
         for msg in messages {
-            // Filter: Only process assistant messages (vLLM lines 294-298)
+            // Filter: Only process assistant messages
             if msg.author.role != Role::Assistant {
                 continue;
             }
@@ -84,7 +84,7 @@ impl HarmonyParserAdapter {
 
             match channel {
                 "analysis" => {
-                    // vLLM lines 332-344: Process each content item
+                    // Process each content item
                     // For Chat API, we join them into a single reasoning_content
                     let text = msg
                         .content
@@ -101,13 +101,12 @@ impl HarmonyParserAdapter {
                     }
                 }
                 "commentary" => {
-                    // vLLM lines 345-377: Handle different recipient types
+                    // Handle different recipient types
                     if let Some(recipient_str) = recipient {
                         if recipient_str.starts_with("functions.") {
-                            // vLLM lines 346-357: Function tool calls
                             let function_name = recipient_str.strip_prefix("functions.").unwrap();
 
-                            // Process each content item separately (vLLM line 348)
+                            // Process each content item separately
                             for content in &msg.content {
                                 if let openai_harmony::chat::Content::Text(tc) = content {
                                     let call_id = format!("call_{}", Uuid::new_v4());
@@ -130,7 +129,7 @@ impl HarmonyParserAdapter {
                             || recipient_str.starts_with("browser")
                             || recipient_str.starts_with("container")
                         {
-                            // vLLM lines 358-375: Built-in tools → treat as reasoning
+                            // Built-in tools → treat as reasoning
                             // For Chat API, we add to analysis content
                             let text = msg
                                 .content
@@ -155,12 +154,12 @@ impl HarmonyParserAdapter {
                                 }
                             }
                         }
-                        // vLLM line 377: Unknown recipient would raise ValueError
+                        // Unknown recipient would raise ValueError
                         // For now, we silently ignore (can add logging later)
                     }
                 }
                 "final" => {
-                    // vLLM lines 378-395: Process final channel content
+                    // Process final channel content
                     let text = msg
                         .content
                         .iter()
@@ -269,7 +268,7 @@ impl HarmonyParserAdapter {
                         final_delta = Some(delta_text);
                     }
                     Some("commentary") => {
-                        // Accumulate delta for commentary (vLLM lines 716-717)
+                        // Accumulate delta for commentary
                         accumulated_delta.push_str(&delta_text);
                     }
                     _ => {}
@@ -277,13 +276,13 @@ impl HarmonyParserAdapter {
             }
         }
 
-        // Handle commentary channel tool call deltas (vLLM lines 748-803)
+        // Handle commentary channel tool call deltas
         if self.parser.current_channel().as_deref() == Some("commentary") {
             if let Some(cur_recipient) = self.parser.current_recipient() {
                 if cur_recipient.starts_with("functions.") {
                     has_delta = true;
 
-                    // Count completed tool calls for index (vLLM lines 762-770)
+                    // Count completed tool calls for index
                     let base_index = self
                         .parser
                         .messages()
@@ -297,11 +296,11 @@ impl HarmonyParserAdapter {
                         })
                         .count();
 
-                    // Check if recipient changed (new tool call) (vLLM line 771)
+                    // Check if recipient changed (new tool call)
                     let recipient_changed = self.prev_recipient.as_deref() != Some(&cur_recipient);
 
                     if recipient_changed {
-                        // NEW tool call: emit name + id (vLLM lines 772-784)
+                        // NEW tool call: emit name + id
                         let tool_name = cur_recipient.strip_prefix("functions.").unwrap();
                         let call_id = format!("call_{}", Uuid::new_v4());
 
@@ -317,7 +316,7 @@ impl HarmonyParserAdapter {
                         // Update prev_recipient
                         self.prev_recipient = Some(cur_recipient);
                     } else if !accumulated_delta.is_empty() {
-                        // CONTINUING tool call: emit arguments delta (vLLM lines 785-794)
+                        // CONTINUING tool call: emit arguments delta
                         commentary_delta = Some(super::types::ToolCallDelta {
                             index: base_index,
                             id: None,
@@ -373,7 +372,7 @@ impl HarmonyParserAdapter {
         let mut final_text = String::new();
 
         for msg in messages {
-            // Filter: Only process assistant messages (vLLM lines 294-298)
+            // Filter: Only process assistant messages
             if msg.author.role != Role::Assistant {
                 continue;
             }
@@ -383,7 +382,6 @@ impl HarmonyParserAdapter {
 
             match channel {
                 "analysis" => {
-                    // vLLM lines 332-344: Process each content item
                     // For Chat API, we join them into a single reasoning_content
                     let text = msg
                         .content
@@ -400,13 +398,11 @@ impl HarmonyParserAdapter {
                     }
                 }
                 "commentary" => {
-                    // vLLM lines 345-377: Handle different recipient types
                     if let Some(recipient_str) = recipient {
                         if recipient_str.starts_with("functions.") {
-                            // vLLM lines 346-357: Function tool calls
                             let function_name = recipient_str.strip_prefix("functions.").unwrap();
 
-                            // Process each content item separately (vLLM line 348)
+                            // Process each content item separately
                             for content in &msg.content {
                                 if let openai_harmony::chat::Content::Text(tc) = content {
                                     let call_id = format!("call_{}", Uuid::new_v4());
@@ -429,7 +425,7 @@ impl HarmonyParserAdapter {
                             || recipient_str.starts_with("browser")
                             || recipient_str.starts_with("container")
                         {
-                            // vLLM lines 358-375: Built-in tools → treat as reasoning
+                            // Built-in tools → treat as reasoning
                             // For Chat API, we add to analysis content
                             let text = msg
                                 .content
@@ -454,12 +450,12 @@ impl HarmonyParserAdapter {
                                 }
                             }
                         }
-                        // vLLM line 377: Unknown recipient would raise ValueError
+                        // Unknown recipient would raise ValueError
                         // For now, we silently ignore (can add logging later)
                     }
                 }
                 "final" => {
-                    // vLLM lines 378-395: Process final channel content
+                    // Process final channel content
                     let text = msg
                         .content
                         .iter()
