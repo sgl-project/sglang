@@ -2306,6 +2306,8 @@ class Scheduler(
         no_request = (
             len(self.waiting_queue) == 0
             and self.running_batch.is_empty()
+            and (self.last_batch is None or self.last_batch.is_empty())
+            and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
         )
