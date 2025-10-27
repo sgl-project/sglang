@@ -5,7 +5,7 @@ use serde_json::{from_str, to_string, to_value, to_vec};
 use sglang_router_rs::{
     core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent, TextMessageContent},
+        chat::{ChatCompletionRequest, ChatMessage, TextMessageContent, UserMessageContent},
         common::StringOrArray,
         completion::CompletionRequest,
         generate::GenerateRequest,
@@ -188,7 +188,9 @@ fn create_sample_completion_request() -> CompletionRequest {
 #[allow(deprecated)]
 fn create_large_chat_completion_request() -> ChatCompletionRequest {
     let mut messages = vec![ChatMessage::System {
-        content: TextMessageContent::Text("You are a helpful assistant with extensive knowledge.".to_string()),
+        content: TextMessageContent::Text(
+            "You are a helpful assistant with extensive knowledge.".to_string(),
+        ),
         name: None,
     }];
 
