@@ -22,6 +22,7 @@ fn get_harmony_encoding() -> &'static HarmonyEncoding {
 /// complete responses and streaming chunks.
 pub struct HarmonyParserAdapter {
     parser: StreamableParser,
+    prev_recipient: Option<String>,
 }
 
 impl HarmonyParserAdapter {
@@ -31,7 +32,10 @@ impl HarmonyParserAdapter {
         let parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
             .map_err(|e| format!("Failed to create StreamableParser: {}", e))?;
 
-        Ok(Self { parser })
+        Ok(Self {
+            parser,
+            prev_recipient: None,
+        })
     }
 
     /// Parse complete response
@@ -222,10 +226,14 @@ impl HarmonyParserAdapter {
     ) -> Result<Option<HarmonyChannelDelta>, String> {
         let mut has_delta = false;
         let mut analysis_delta = None;
+        let mut commentary_delta = None;
         let mut final_delta = None;
 
         // Track message count before processing
         let prev_message_count = self.parser.messages().len();
+
+        // Accumulate delta text for commentary channel
+        let mut accumulated_delta = String::new();
 
         // Process each token
         for &token_id in chunk_ids {
@@ -247,10 +255,64 @@ impl HarmonyParserAdapter {
                         final_delta = Some(delta_text);
                     }
                     Some("commentary") => {
-                        // TODO: Parse tool call deltas
-                        // For now, skip commentary deltas
+                        // Accumulate delta for commentary (vLLM lines 716-717)
+                        accumulated_delta.push_str(&delta_text);
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // Handle commentary channel tool call deltas (vLLM lines 748-803)
+        if self.parser.current_channel().as_deref() == Some("commentary") {
+            if let Some(cur_recipient) = self.parser.current_recipient() {
+                if cur_recipient.starts_with("functions.") {
+                    has_delta = true;
+
+                    // Count completed tool calls for index (vLLM lines 762-770)
+                    let base_index = self
+                        .parser
+                        .messages()
+                        .iter()
+                        .filter(|msg| {
+                            msg.channel.as_deref() == Some("commentary")
+                                && msg
+                                    .recipient
+                                    .as_deref()
+                                    .is_some_and(|r| r.starts_with("functions."))
+                        })
+                        .count();
+
+                    // Check if recipient changed (new tool call) (vLLM line 771)
+                    let recipient_changed = self.prev_recipient.as_deref() != Some(&cur_recipient);
+
+                    if recipient_changed {
+                        // NEW tool call: emit name + id (vLLM lines 772-784)
+                        let tool_name = cur_recipient.strip_prefix("functions.").unwrap();
+                        let call_id = format!("call_{}", Uuid::new_v4());
+
+                        commentary_delta = Some(super::types::ToolCallDelta {
+                            index: base_index,
+                            id: Some(call_id),
+                            function: Some(super::types::FunctionDelta {
+                                name: Some(tool_name.to_string()),
+                                arguments: Some(String::new()),
+                            }),
+                        });
+
+                        // Update prev_recipient
+                        self.prev_recipient = Some(cur_recipient);
+                    } else if !accumulated_delta.is_empty() {
+                        // CONTINUING tool call: emit arguments delta (vLLM lines 785-794)
+                        commentary_delta = Some(super::types::ToolCallDelta {
+                            index: base_index,
+                            id: None,
+                            function: Some(super::types::FunctionDelta {
+                                name: None,
+                                arguments: Some(accumulated_delta),
+                            }),
+                        });
+                    }
                 }
             }
         }
@@ -262,7 +324,7 @@ impl HarmonyParserAdapter {
         if has_delta {
             Ok(Some(HarmonyChannelDelta {
                 analysis_delta,
-                commentary_delta: None, // TODO: Implement tool call delta parsing
+                commentary_delta,
                 final_delta,
                 is_final,
             }))
@@ -437,6 +499,7 @@ impl HarmonyParserAdapter {
         let encoding = get_harmony_encoding();
         self.parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
             .map_err(|e| format!("Failed to reset parser: {}", e))?;
+        self.prev_recipient = None;
         Ok(())
     }
 }
