@@ -97,7 +97,6 @@ class DeepEPNormalCombineInput(NamedTuple):
     hidden_states: torch.Tensor
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
-    overlap_args: Optional[CombineOverlapArgs] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -110,7 +109,6 @@ class DeepEPLLCombineInput(NamedTuple):
     hidden_states: torch.Tensor
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
-    overlap_args: Optional[CombineOverlapArgs] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -463,7 +461,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional["CombineOverlapArgs"],
+        overlap_args: Optional[CombineOverlapArgs],
     ):
 
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
@@ -619,7 +617,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional["CombineOverlapArgs"],
+        overlap_args: Optional[CombineOverlapArgs],
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
@@ -762,16 +760,19 @@ class DeepEPDispatcher(BaseDispatcher):
         del self._dispatch_intermediate_state
         return self._get_impl().dispatch_b(*inner_state)
 
-    def combine(self, combine_input: CombineInput) -> Tuple:
-        self.combine_a(combine_input)
+    def combine(
+        self, combine_input: CombineInput, overlap_args: Optional[CombineOverlapArgs]
+    ) -> Tuple:
+        self.combine_a(combine_input, overlap_args)
         ret = self.combine_b()
         return ret
 
     def combine_a(
         self,
         combine_input: CombineInput,
+        overlap_args: Optional[CombineOverlapArgs],
     ):
-        hidden_states, topk_ids, topk_weights, overlap_args = combine_input
+        hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,

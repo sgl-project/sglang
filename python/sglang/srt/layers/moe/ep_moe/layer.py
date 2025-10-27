@@ -235,7 +235,6 @@ class DeepEPMoE(FusedMoE):
             hidden_states=output,
             topk_ids=dispatch_output.topk_ids,
             topk_weights=dispatch_output.topk_weights,
-            overlap_args=down_gemm_overlap_args,
         )
 
     def combine(
