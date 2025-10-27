@@ -73,26 +73,7 @@ impl HarmonyResponseProcessor {
                 utils::internal_error_message(format!("Failed to create Harmony parser: {}", e))
             })?;
 
-            let parsed = parser.parse_complete(&complete.output_ids).map_err(|e| {
-                utils::internal_error_message(format!("Harmony parsing failed: {}", e))
-            })?;
-
-            // Build response message (assistant)
-            let message = ChatCompletionMessage {
-                role: "assistant".to_string(),
-                content: (!parsed.final_text.is_empty()).then_some(parsed.final_text),
-                tool_calls: parsed.commentary, // TODO: parse tool calls from commentary channel
-                reasoning_content: parsed.analysis,
-            };
-
-            // Determine finish_reason (tool_calls overrides to OpenAI convention)
-            let finish_reason = if message.tool_calls.is_some() {
-                Some("tool_calls".to_string())
-            } else {
-                Some(complete.finish_reason.clone())
-            };
-
-            // Matched stop
+            // Convert matched_stop from proto to JSON
             let matched_stop = complete.matched_stop.as_ref().map(|m| match m {
                 proto::generate_complete::MatchedStop::MatchedTokenId(id) => {
                     serde_json::json!(id)
@@ -102,12 +83,31 @@ impl HarmonyResponseProcessor {
                 }
             });
 
+            // Parse Harmony channels with finish_reason and matched_stop
+            let parsed = parser
+                .parse_complete(
+                    &complete.output_ids,
+                    complete.finish_reason.clone(),
+                    matched_stop.clone(),
+                )
+                .map_err(|e| {
+                    utils::internal_error_message(format!("Harmony parsing failed: {}", e))
+                })?;
+
+            // Build response message (assistant)
+            let message = ChatCompletionMessage {
+                role: "assistant".to_string(),
+                content: (!parsed.final_text.is_empty()).then_some(parsed.final_text),
+                tool_calls: parsed.commentary,
+                reasoning_content: parsed.analysis,
+            };
+
             choices.push(ChatChoice {
                 index: index as u32,
                 message,
                 logprobs: None,
-                finish_reason,
-                matched_stop,
+                finish_reason: Some(parsed.finish_reason),
+                matched_stop: parsed.matched_stop,
                 hidden_states: None,
             });
         }
@@ -202,8 +202,22 @@ impl HarmonyResponseProcessor {
             utils::internal_error_message(format!("Failed to create Harmony parser: {}", e))
         })?;
 
+        // Convert matched_stop from proto to JSON
+        let matched_stop = complete.matched_stop.as_ref().map(|m| match m {
+            proto::generate_complete::MatchedStop::MatchedTokenId(id) => {
+                serde_json::json!(id)
+            }
+            proto::generate_complete::MatchedStop::MatchedStopStr(s) => {
+                serde_json::json!(s)
+            }
+        });
+
         let parsed = parser
-            .parse_complete(&complete.output_ids)
+            .parse_complete(
+                &complete.output_ids,
+                complete.finish_reason.clone(),
+                matched_stop,
+            )
             .map_err(|e| utils::internal_error_message(format!("Harmony parsing failed: {}", e)))?;
 
         // Check for tool calls in commentary channel

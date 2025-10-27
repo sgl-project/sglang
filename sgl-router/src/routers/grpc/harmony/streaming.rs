@@ -184,21 +184,15 @@ impl HarmonyStreamingProcessor {
 
                     // Finalize parser and emit final chunk
                     if let Some(parser) = parsers.get_mut(&index) {
+                        let matched_stop = matched_stops.get(&index).and_then(|m| m.clone());
                         let final_output = parser
-                            .finalize()
+                            .finalize(complete.finish_reason.clone(), matched_stop.clone())
                             .map_err(|e| format!("Finalize error: {}", e))?;
-
-                        // Determine final finish_reason
-                        let final_finish_reason = if final_output.commentary.is_some() {
-                            "tool_calls"
-                        } else {
-                            &complete.finish_reason
-                        };
 
                         Self::emit_final_chunk(
                             index,
-                            final_finish_reason,
-                            matched_stops.get(&index).and_then(|m| m.as_ref()),
+                            &final_output.finish_reason,
+                            final_output.matched_stop.as_ref(),
                             &dispatch,
                             &original_request,
                             tx,
@@ -322,20 +316,15 @@ impl HarmonyStreamingProcessor {
                         complete.completion_tokens as u32;
 
                     if let Some(parser) = parsers.get_mut(&index) {
+                        let matched_stop = matched_stops.get(&index).and_then(|m| m.clone());
                         let final_output = parser
-                            .finalize()
+                            .finalize(complete.finish_reason.clone(), matched_stop.clone())
                             .map_err(|e| format!("Finalize error: {}", e))?;
-
-                        let final_finish_reason = if final_output.commentary.is_some() {
-                            "tool_calls"
-                        } else {
-                            &complete.finish_reason
-                        };
 
                         Self::emit_final_chunk(
                             index,
-                            final_finish_reason,
-                            matched_stops.get(&index).and_then(|m| m.as_ref()),
+                            &final_output.finish_reason,
+                            final_output.matched_stop.as_ref(),
                             &dispatch,
                             &original_request,
                             tx,

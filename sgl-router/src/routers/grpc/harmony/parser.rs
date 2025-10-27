@@ -46,11 +46,18 @@ impl HarmonyParserAdapter {
     /// # Arguments
     ///
     /// * `output_ids` - The complete output token IDs from the model
+    /// * `finish_reason` - The finish reason from GenerateComplete ("stop", "length", etc.)
+    /// * `matched_stop` - Optional matched stop token information from GenerateComplete
     ///
     /// # Returns
     ///
     /// Complete HarmonyChannelOutput with all three channels parsed
-    pub fn parse_complete(&mut self, output_ids: &[u32]) -> Result<HarmonyChannelOutput, String> {
+    pub fn parse_complete(
+        &mut self,
+        output_ids: &[u32],
+        finish_reason: String,
+        matched_stop: Option<serde_json::Value>,
+    ) -> Result<HarmonyChannelOutput, String> {
         // Feed all tokens to the parser
         for &token_id in output_ids {
             self.parser
@@ -199,12 +206,19 @@ impl HarmonyParserAdapter {
             }
         }
 
+        // Determine finish reason: override to "tool_calls" if commentary has tool calls
+        let final_finish_reason = if commentary.is_some() {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
         Ok(HarmonyChannelOutput {
             analysis,
             commentary,
             final_text,
-            finish_reason: "stop".to_string(), // TODO: Determine actual finish reason
-            matched_stop: None,
+            finish_reason: final_finish_reason,
+            matched_stop,
         })
     }
 
@@ -338,10 +352,19 @@ impl HarmonyParserAdapter {
     /// Called at the end of streaming to get the final state and any
     /// remaining content.
     ///
+    /// # Arguments
+    ///
+    /// * `finish_reason` - The finish reason from GenerateComplete ("stop", "length", etc.)
+    /// * `matched_stop` - Optional matched stop token information from GenerateComplete
+    ///
     /// # Returns
     ///
     /// Final HarmonyChannelOutput with complete parsed content
-    pub fn finalize(&mut self) -> Result<HarmonyChannelOutput, String> {
+    pub fn finalize(
+        &mut self,
+        finish_reason: String,
+        matched_stop: Option<serde_json::Value>,
+    ) -> Result<HarmonyChannelOutput, String> {
         // Extract all completed messages
         let messages = self.parser.messages();
 
@@ -482,12 +505,19 @@ impl HarmonyParserAdapter {
             }
         }
 
+        // Determine finish reason: override to "tool_calls" if commentary has tool calls
+        let final_finish_reason = if commentary.is_some() {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
         Ok(HarmonyChannelOutput {
             analysis,
             commentary,
             final_text,
-            finish_reason: "stop".to_string(),
-            matched_stop: None,
+            finish_reason: final_finish_reason,
+            matched_stop,
         })
     }
 
