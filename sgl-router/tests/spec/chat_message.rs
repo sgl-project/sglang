@@ -1,6 +1,8 @@
 use serde_json::json;
-use sglang_router_rs::protocols::chat::{ChatMessage, TextMessageContent, UserMessageContent};
-use sglang_router_rs::protocols::common::ContentPart;
+use sglang_router_rs::protocols::{
+    chat::{ChatMessage, TextMessageContent, UserMessageContent},
+    common::ContentPart,
+};
 
 #[test]
 fn test_chat_message_tagged_by_role_system() {
