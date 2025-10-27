@@ -39,7 +39,7 @@ class SyncSchedulerClient:
 
         scheduler_endpoint = self.server_args.scheduler_endpoint()
         self.scheduler_socket.connect(scheduler_endpoint)
-        logger.info(
+        logger.debug(
             f"SyncSchedulerClient connected to backend scheduler at {scheduler_endpoint}"
         )
 

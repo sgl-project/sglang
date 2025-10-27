@@ -121,7 +121,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         scheduler_infos.append(data)
         reader.close()
 
-    logger.info("All workers are ready")
+    logger.debug("All workers are ready")
 
     if launch_http_server:
         logger.info("Starting FastAPI server.")

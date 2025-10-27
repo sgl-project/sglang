@@ -489,6 +489,55 @@ class DenoisingStage(PipelineStage):
         except Exception as e:
             logger.error(f"{e}")
 
+    def _manage_device_placement(
+        self,
+        model_to_use: torch.nn.Module,
+        model_to_offload: torch.nn.Module | None,
+        server_args: ServerArgs,
+    ):
+        """
+        Manages the offload / load behavior of dit
+        """
+        if not server_args.dit_cpu_offload:
+            return
+
+        # Offload the unused model if it's on CUDA
+        if (
+            model_to_offload is not None
+            and next(model_to_offload.parameters()).device.type == "cuda"
+        ):
+            model_to_offload.to("cpu")
+
+        # Load the model to use if it's on CPU
+        if (
+            model_to_use is not None
+            and next(model_to_use.parameters()).device.type == "cpu"
+        ):
+            model_to_use.to(get_local_torch_device())
+
+    def _select_and_manage_model(
+        self,
+        t_int: int,
+        boundary_timestep: float | None,
+        server_args: ServerArgs,
+        batch: Req,
+    ):
+        if boundary_timestep is None or t_int >= boundary_timestep:
+            # High-noise stage
+            current_model = self.transformer
+            model_to_offload = self.transformer_2
+            current_guidance_scale = batch.guidance_scale
+        else:
+            # Low-noise stage
+            current_model = self.transformer_2
+            model_to_offload = self.transformer
+            current_guidance_scale = batch.guidance_scale_2
+
+        self._manage_device_placement(current_model, model_to_offload, server_args)
+
+        assert current_model is not None, "The model for the current step is not set."
+        return current_model, current_guidance_scale
+
     @torch.no_grad()
     def forward(
         self,
@@ -551,27 +600,14 @@ class DenoisingStage(PipelineStage):
 
                     t_int = int(t_host.item())
                     t_device = timesteps[i]
-                    if boundary_timestep is None or t_int >= boundary_timestep:
-                        if (
-                            server_args.dit_cpu_offload
-                            and self.transformer_2 is not None
-                            and next(self.transformer_2.parameters()).device.type
-                            == "cuda"
-                        ):
-                            self.transformer_2.to("cpu")
-                        current_model = self.transformer
-                        current_guidance_scale = batch.guidance_scale
-                    else:
-                        # low-noise stage in wan2.2
-                        if (
-                            server_args.dit_cpu_offload
-                            and next(self.transformer.parameters()).device.type
-                            == "cuda"
-                        ):
-                            self.transformer.to("cpu")
-                        current_model = self.transformer_2
-                        current_guidance_scale = batch.guidance_scale_2
-                    assert current_model is not None, "current_model is None"
+                    current_model, current_guidance_scale = (
+                        self._select_and_manage_model(
+                            t_int=t_int,
+                            boundary_timestep=boundary_timestep,
+                            server_args=server_args,
+                            batch=batch,
+                        )
+                    )
 
                     # Expand latents for I2V
                     latent_model_input = latents.to(target_dtype)
