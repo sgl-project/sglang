@@ -35,12 +35,14 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 
 import copy
 import dataclasses
+import fcntl
 import logging
 import re
 import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
+from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -52,10 +54,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -89,115 +88,171 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 logger = logging.getLogger(__name__)
 
-MM_ITEM_VERIFY_BYTES = 8
 MM_FEATURE_CACHE_SIZE = 2 * 1024 * 1024 * 1024
+
+
+SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
+
+
+class ShmSyncBuffer:
+    def __init__(self, byte_size: int = 4):
+        self.buffer = shared_memory.SharedMemory(create=True, size=byte_size)
+        self.buffer_wrapper = np.ndarray(1, dtype=np.float32, buffer=self.buffer.buf)
+        self.buffer_wrapper *= 0
+        self.meta_data = {
+            "handle": self.buffer.name,
+            "shape": self.buffer_wrapper.shape,
+            "dtype": str(self.buffer_wrapper.dtype),
+        }
+
+    def __del__(self):
+        if isinstance(self.buffer, shared_memory.SharedMemory):
+            self.buffer.close()
+            self.buffer.unlink()
+
+
+class MmItemMemoryChunk:
+    def __init__(self, area: Tuple, sync_buffer: ShmSyncBuffer):
+        self.area = area
+        self.sync_flag = sync_buffer
+
+    @property
+    def mem_size(self):
+        return self.area[1] - self.area[0]
+
+    @property
+    def start(self):
+        return self.area[0]
+
+    @property
+    def end(self):
+        return self.area[1]
+
+    def try_to_recycle(self) -> bool:
+        try:
+            tp_num = get_global_server_args().tp_size
+        except:
+            logger.info(
+                "get_global_server_args has not been inited , skip this turn 's recycle"
+            )
+            tp_num = -1
+        if self.sync_flag.buffer_wrapper.item() == tp_num:
+            # print("can recycle , sync_flag is {}".format(self.sync_flag.buffer_wrapper))
+            self.sync_flag.buffer_wrapper *= 0
+            return True
+
+        # print("can not recycle , sync_flag is {}".format(self.sync_flag.buffer_wrapper))
+        # print("tp_num is {}".format(tp_num))
+
+        return False
 
 
 class MmItemMemoryPool:
     def __init__(self, memory_size):
         self.memory_pool = torch.empty(
-            memory_size + MM_ITEM_VERIFY_BYTES, dtype=torch.int8, device="cuda"
+            memory_size, dtype=torch.int8, device="cuda"
         ).contiguous()
 
-        self.available_chunks = [(0, memory_size + MM_ITEM_VERIFY_BYTES)]
-        self.occupied_chunks = []
-        self.verify_tensor = torch.zeros(
-            MM_ITEM_VERIFY_BYTES, dtype=torch.int8, device="cuda"
-        )
+        self.sync_flag_list = []
 
-    def get_available_chunk(self, src_tensor: torch.Tensor):
+        init_chunk = MmItemMemoryChunk((0, memory_size), self.pop_sync_buffer())
+        self.available_chunks = [init_chunk]
+        self.occupied_chunks = []
+
+    def pop_sync_buffer(self):
+        if len(self.sync_flag_list) == 0:
+            try:
+                new_sync_buffer = ShmSyncBuffer()
+                return new_sync_buffer
+            except:
+                logger.info("allocate shm buffer failed")
+                raise RuntimeError
+        else:
+            return self.sync_flag_list.pop()
+
+    def push_sync_buffer(self, sync_buffer):
+        self.sync_flag_list.append(sync_buffer)
+
+    def get_available_chunk(self, src_tensor: torch.Tensor) -> MmItemMemoryChunk:
         # find currently available_chunks contain a available chunk or not
         # if not, return None
-        src_tensor_size = (
-            src_tensor.numel() * src_tensor.element_size() + MM_ITEM_VERIFY_BYTES
-        )
+        src_tensor_size = src_tensor.numel() * src_tensor.element_size()
         min_size = self.memory_pool.numel() * self.memory_pool.element_size() + 1
         selected_chunk = None
         for chunk in self.available_chunks:
-            if (chunk[1] - chunk[0]) >= src_tensor_size:
-                if (chunk[1] - chunk[0]) < min_size:
-                    min_size = chunk[1] - chunk[0]
+            if chunk.mem_size >= src_tensor_size:
+                if chunk.mem_size < min_size:
+                    min_size = chunk.mem_size
                     selected_chunk = chunk
 
         if selected_chunk:
+            occupied_chunk_area = (
+                selected_chunk.start,
+                selected_chunk.start + src_tensor_size,
+            )
+            occupied_chunk_sync_flag = selected_chunk.sync_flag
+            new_occupied_chunk = MmItemMemoryChunk(
+                occupied_chunk_area, occupied_chunk_sync_flag
+            )
+
+            self.occupied_chunks.append(new_occupied_chunk)
             self.available_chunks.remove(selected_chunk)
-            occupied_chunk = (selected_chunk[0], selected_chunk[0] + src_tensor_size)
-            available_chunk = (occupied_chunk[1], selected_chunk[1])
-            if available_chunk[0] != available_chunk[1]:
-                self.available_chunks.append(available_chunk)
-            self.occupied_chunks.append(occupied_chunk)
-            self.memory_pool[occupied_chunk[0] : occupied_chunk[1]][
-                -MM_ITEM_VERIFY_BYTES:
-            ] = 1
-            return occupied_chunk
+
+            available_split_chunk_area = (new_occupied_chunk.end, selected_chunk.end)
+            # add a new chunk
+            if available_split_chunk_area[0] != available_split_chunk_area[1]:
+                split_available_chunk = MmItemMemoryChunk(
+                    available_split_chunk_area, self.pop_sync_buffer()
+                )
+                self.available_chunks.append(split_available_chunk)
+
+            return new_occupied_chunk
 
         return None
 
-    def return_a_slice_tensor(self, src_tensor: torch.Tensor):
+    def return_a_slice_tensor_with_flag(self, src_tensor: torch.Tensor):
         self.recycle_chunks()
         self.merge_chunks()
+        # self.print_available_chunk("after merge")
+        # self.print_occupied_chunk("after merge")
         available_chunk = self.get_available_chunk(src_tensor)
         # logger.info("src tensor shape {}. src tensor dtype {}  available_chunk {}".format(src_tensor.shape, src_tensor.dtype, available_chunk))
-        if available_chunk:
-            return self.memory_pool[available_chunk[0] : available_chunk[1]]
-
-        return None
+        if available_chunk is not None:
+            return (
+                available_chunk.sync_flag.meta_data,
+                self.memory_pool[available_chunk.start : available_chunk.end],
+            )
+        return None, None
 
     def recycle_chunks(self):
         """
         Optimized version of recycle_chunks that uses tensor vectorization
         to avoid a Python for-loop with repeated GPU operations.
         """
-        num_chunks = len(self.occupied_chunks)
-
-        # 1. If there's nothing to do, exit early.
-        if num_chunks == 0:
-            return
-
-        # Assuming MM_ITEM_VERIFY_BYTES is a constant or class member
-        N = MM_ITEM_VERIFY_BYTES
-        try:
-            chunks_tensor = torch.tensor(
-                self.occupied_chunks, device=self.memory_pool.device, dtype=torch.long
-            )
-            ends = chunks_tensor[:, 1]
-        except Exception as e:
-            print(f"Warning: Using slower tensor creation path. Error: {e}")
-            ends = torch.tensor(
-                [c[1] for c in self.occupied_chunks],
-                device=self.memory_pool.device,
-                dtype=torch.long,
-            )
-
-        offsets = torch.arange(N, device=self.memory_pool.device).unsqueeze(0)
-        verify_starts = (ends - N).unsqueeze(1)
-        indices = verify_starts + offsets
-        verify_data = self.memory_pool[indices]
-        chunk_sums = torch.sum(verify_data, dim=1)
-
-        reusable_mask = chunk_sums == 0
 
         new_occupied_chunks = []
-
-        for is_reusable, chunk in zip(reusable_mask.cpu(), self.occupied_chunks):
-            if is_reusable:
+        for chunk in self.occupied_chunks:
+            if chunk.try_to_recycle():
                 self.available_chunks.append(chunk)
             else:
                 new_occupied_chunks.append(chunk)
-
         self.occupied_chunks = new_occupied_chunks
 
     def merge_chunks(self):
         # merge_all_available_chunks
         merged_chunks = []
-        for chunk in sorted(self.available_chunks, key=lambda x: x[0]):
+        for chunk in sorted(self.available_chunks, key=lambda x: x.start):
             if len(merged_chunks) == 0:
                 merged_chunks.append(chunk)
             else:
-                if chunk[0] == (merged_chunks[-1][1]):
+                if chunk.start == merged_chunks[-1].end:
                     to_merge_chunk = merged_chunks.pop()
-                    merged_chunk = (to_merge_chunk[0], chunk[1])
-                    merged_chunks.append(merged_chunk)
+                    to_merge_chunk_sync = to_merge_chunk.sync_flag
+                    merged_chunk_area = (to_merge_chunk.start, chunk.end)
+                    merged_chunks.append(
+                        MmItemMemoryChunk(merged_chunk_area, to_merge_chunk_sync)
+                    )
+                    self.push_sync_buffer(chunk.sync_flag)
                 else:
                     merged_chunks.append(chunk)
 
@@ -206,14 +261,14 @@ class MmItemMemoryPool:
     def print_available_chunk(self, des: str = ""):
         logger.info("check available chunks @ {}:----->".format(des))
         for chunk in self.available_chunks:
-            logger.info("[{}, {}]".format(chunk[0], chunk[1]))
+            logger.info("[{}, {}]".format(chunk.start, chunk.end))
 
         logger.info("-----------check finish------------")
 
     def print_occupied_chunk(self, des: str = ""):
-        logger.info("occupied chunks @ {}:----->".format(des))
+        logger.info("check occupied chunks @ {}:----->".format(des))
         for chunk in self.occupied_chunks:
-            logger.info("[{}, {}]".format(chunk[0], chunk[1]))
+            logger.info("[{}, {}]".format(chunk.start, chunk.end))
         logger.info("-----------check finish------------")
 
 
@@ -299,6 +354,7 @@ class CudaIpcTensorTransportProxy:
         self,
         data: torch.Tensor,
         info_data: torch.Tensor,
+        sync_buffer_meta,
     ):
 
         if (not isinstance(data, torch.Tensor)) or (
@@ -310,6 +366,22 @@ class CudaIpcTensorTransportProxy:
 
         self.proxy_state = self.get_proxy(data, info_data)
         self.reconstruct_tensor = None
+        self.sync_data_meta = sync_buffer_meta
+        self.sync_buffer = None
+
+    @property
+    def get_sync_flag(self):
+        if not self.sync_buffer:
+            shm_name = self.sync_data_meta["handle"]
+            self.sync_buffer = shared_memory.SharedMemory(name=shm_name)
+
+        shape = self.sync_data_meta["shape"]
+        dtype = self.sync_data_meta["dtype"]
+        return np.ndarray(shape, dtype=dtype, buffer=self.sync_buffer.buf)
+
+    def close_shm(self):
+        self.sync_buffer.close()
+        self.sync_buffer = None
 
     def get_proxy(self, data, info_data):
         # acquire all serialize metadata from _metadata
@@ -378,25 +450,17 @@ class CudaIpcTensorTransportProxy:
                     reconstructed_tensor = torch.empty(
                         recons_shape, dtype=recons_dtype, device=rebuild_device
                     ).contiguous()
-                    reconstructed_tensor.view(torch.int8).view(-1).copy_(
-                        slice_tensor[:-MM_ITEM_VERIFY_BYTES]
-                    )
-                    # set as releaseable
-                    # print("device {} reset verify bits @ {}".format(rebuild_device, time.time()))
-                    tp_rank = get_tensor_model_parallel_rank()
-                    tp_size = get_tensor_model_parallel_world_size()
+                    reconstructed_tensor.view(torch.int8).view(-1).copy_(slice_tensor)
 
-                    assert MM_ITEM_VERIFY_BYTES % tp_size == 0, "verify_bit error"
-                    each_part_set_bit_num = MM_ITEM_VERIFY_BYTES // tp_size
+                    open(SHM_LOCK_FILE, "a").close()
+                    # write the shm_sync_buffer with a file lock
+                    with open(SHM_LOCK_FILE, "w+") as f:
+                        fcntl.flock(f, fcntl.LOCK_EX)
+                        sync_flag = self.get_sync_flag
+                        sync_flag += 1
+                        fcntl.flock(f, fcntl.LOCK_UN)
 
-                    if tp_rank == 0:
-                        slice_tensor[-each_part_set_bit_num:] *= 0
-                    else:
-                        start_set = each_part_set_bit_num * (tp_rank + 1)
-                        end_set = each_part_set_bit_num * tp_rank
-                        slice_tensor[-start_set:-end_set] *= 0
-                        # print("start_set : {} , end_set : {}".format(-start_set, -end_set))
-                    # print("check status {}".format(slice_tensor[-MM_ITEM_VERIFY_BYTES:]))
+                    self.close_shm()
 
             except Exception as e:
                 logger.info(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
