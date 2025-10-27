@@ -7,7 +7,7 @@ This module provides shared fixtures that can be used across all gRPC router tes
 import sys
 from pathlib import Path
 
-import pytest
+import pytest  # noqa: F401
 
 # Ensure router py_src is importable
 _ROUTER_ROOT = Path(__file__).resolve().parents[2]
