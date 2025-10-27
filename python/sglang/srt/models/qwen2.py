@@ -49,6 +49,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 Qwen2Config = None
@@ -89,6 +90,9 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        if get_global_server_args().rl_on_policy_target == "fsdp":
+            x = x.bfloat16()
+
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -275,6 +279,11 @@ class Qwen2Model(nn.Module):
                 quant_config=quant_config,
                 enable_tp=not is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
+                params_dtype=(
+                    torch.float32
+                    if get_global_server_args().rl_on_policy_target == "fsdp"
+                    else None
+                ),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -295,7 +304,19 @@ class Qwen2Model(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            norm_kwargs = (
+                dict(
+                    weight_dtype=torch.float32,
+                    cast_x_before_out_mul=True,
+                    override_orig_dtype=torch.float32,
+                    fp32_residual=True,
+                )
+                if get_global_server_args().rl_on_policy_target == "fsdp"
+                else {}
+            )
+            self.norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            )
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
@@ -330,7 +351,7 @@ class Qwen2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-        
+
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
@@ -360,7 +381,7 @@ class Qwen2Model(nn.Module):
 
         if len(aux_hidden_states) == 0:
             return hidden_states
-      
+
         return hidden_states, aux_hidden_states
 
     # If this function is called, it should always initialize KV cache scale
