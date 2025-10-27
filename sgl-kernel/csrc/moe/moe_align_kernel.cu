@@ -29,14 +29,17 @@ __global__ void count_and_sort_expert_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ cumsum_buffer,
-    size_t numel) {
+    size_t numel,
+    int32_t num_experts) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
 
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i] + 1;
-    int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
-    sorted_token_ids[rank_post_pad] = i;
+    int32_t expert_id = topk_ids[i];
+    if (expert_id < num_experts && expert_id >= 0) {
+          int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
+          sorted_token_ids[rank_post_pad] = i;
+    }
   }
 }
 
@@ -80,8 +83,10 @@ __global__ void moe_align_block_size_kernel(
   __syncthreads();
 
   for (size_t i = tid; i < numel; i += stride) {
-    int expert_id = topk_ids[i] + 1;
-    atomicAdd(&shared_counts[expert_id], 1);
+    int expert_id = topk_ids[i];
+    if (expert_id < num_experts && expert_id >= 0) {
+      atomicAdd(&shared_counts[expert_id], 1);
+    }
   }
 
   __syncthreads();
@@ -213,7 +218,7 @@ __global__ void moe_align_block_size_kernel(
         right = mid;
       }
     }
-    expert_ids[i] = left - 2;
+    expert_ids[i] = left - 1;
   }
 
   if (pad_sorted_token_ids) {
@@ -249,7 +254,10 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   for (size_t i = tid; i < numel; i += stride) {
-    ++tokens_cnts[(threadIdx.x + 1) * num_experts + topk_ids[i] + 1];
+    int32_t expert_id = topk_ids[i];
+    if (expert_id < num_experts && expert_id >= 0) {
+      ++tokens_cnts[(threadIdx.x + 1) * num_experts + expert_id];
+    }
   }
 
   __syncthreads();
@@ -275,7 +283,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 
   if (threadIdx.x < num_experts) {
     for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1]; i += block_size) {
-      expert_ids[i / block_size] = threadIdx.x - 1;
+      expert_ids[i / block_size] = threadIdx.x;
     }
   }
 
@@ -292,10 +300,12 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   __syncthreads();
 
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i] + 1;
-    int32_t rank_post_pad = tokens_cnts[threadIdx.x * num_experts + expert_id] + cumsum[expert_id];
-    sorted_token_ids[rank_post_pad] = i;
-    ++tokens_cnts[threadIdx.x * num_experts + expert_id];
+    int32_t expert_id = topk_ids[i];
+    if (expert_id < num_experts && expert_id >= 0) {
+      int32_t rank_post_pad = tokens_cnts[threadIdx.x * num_experts + expert_id] + cumsum[expert_id];
+      sorted_token_ids[rank_post_pad] = i;
+      ++tokens_cnts[threadIdx.x * num_experts + expert_id];
+    }
   }
 }
 
@@ -358,7 +368,8 @@ void moe_align_block_size(
           topk_ids.data_ptr<scalar_t>(),
           sorted_token_ids.data_ptr<int32_t>(),
           cumsum_buffer.data_ptr<int32_t>(),
-          topk_ids.numel());
+          topk_ids.numel(),
+          num_experts);
     }
   });
 }

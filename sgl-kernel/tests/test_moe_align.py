@@ -32,9 +32,10 @@ def moe_align_block_size_stage1(
 
     for i in range(tokens_per_thread):
         if start_idx + i < numel:
-            idx = tl.load(topk_ids_ptr + start_idx + i)
-            token_cnt = tl.load(tokens_cnts_ptr + off_c + idx)
-            tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
+            idx = tl.load(topk_ids_ptr + start_idx + i).to(tl.int32)
+            if (idx < num_experts and idx >= 0):
+                token_cnt = tl.load(tokens_cnts_ptr + off_c + idx)
+                tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
 
 
 @triton.jit
@@ -90,11 +91,12 @@ def moe_align_block_size_stage4(
     off_t = pid * num_experts
 
     for i in range(start_idx, tl.minimum(start_idx + tokens_per_thread, numel)):
-        expert_id = tl.load(topk_ids_ptr + i)
-        token_cnt = tl.load(tokens_cnts_ptr + off_t + expert_id)
-        rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
-        tl.store(sorted_token_ids_ptr + rank_post_pad, i)
-        tl.store(tokens_cnts_ptr + off_t + expert_id, token_cnt + 1)
+        expert_id = tl.load(topk_ids_ptr + i).to(tl.int32)
+        if (expert_id < num_experts and expert_id >= 0):
+            token_cnt = tl.load(tokens_cnts_ptr + off_t + expert_id)
+            rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
+            tl.store(sorted_token_ids_ptr + rank_post_pad, i)
+            tl.store(tokens_cnts_ptr + off_t + expert_id, token_cnt + 1)
 
 
 def moe_align_block_size_triton(
@@ -145,7 +147,7 @@ def moe_align_block_size_triton(
 
 
 @pytest.mark.parametrize(
-    "block_size,num_tokens,topk,num_experts,pad_sorted_token_ids",
+    "block_size,num_tokens,topk,num_experts,pad_sorted_token_ids,topk_id_Exceedance",
     list(
         itertools.product(
             [32, 64, 128, 256],  # block_size
@@ -153,16 +155,41 @@ def moe_align_block_size_triton(
             [1, 2, 4, 8, 16, 32, 64],  # topk
             [64, 160, 256, 257, 260, 264],  #  num_experts
             [True, False],  # pad_sorted_token_ids
+            [False, True],  # topk_id_Exceedance
         )
     ),
 )
+# @pytest.mark.parametrize(
+#     "block_size,num_tokens,topk,num_experts,pad_sorted_token_ids,topk_id_Exceedance",
+#     list(
+#         itertools.product(
+#             [256],  # block_size
+#             [4096],  # num_tokens
+#             [32],  # topk
+#             [260],  #  num_experts
+#             [True, False],  # pad_sorted_token_ids
+#             [False, True],  # topk_id_Exceedance
+#         )
+#     ),
+# )
 def test_moe_align_block_size_compare_implementations(
-    block_size, num_tokens, topk, num_experts, pad_sorted_token_ids
+    block_size, num_tokens, topk, num_experts, pad_sorted_token_ids, topk_id_Exceedance,
 ):
 
     topk_ids = torch.argsort(torch.rand(num_tokens, num_experts, device="cuda"), dim=1)[
         :, :topk
     ]
+    
+    # topk_id_Exceedance == True means some ids == -1 in topk_ids, 
+    # need to be skip in following process
+    if topk_id_Exceedance and topk >= 2:
+        indices = torch.stack([
+            torch.randperm(topk, device="cuda")[: topk // 2 ] 
+            for _ in range(num_tokens)
+        ])
+        
+        rows = torch.arange(num_tokens, device="cuda").unsqueeze(1).expand(-1, topk // 2)
+        topk_ids[rows, indices] = num_experts
 
     max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
 
@@ -189,7 +216,7 @@ def test_moe_align_block_size_compare_implementations(
 
     moe_align_block_size(
         topk_ids,
-        num_experts + 1,
+        num_experts,
         block_size,
         sorted_ids_cuda,
         expert_ids_cuda,
@@ -200,7 +227,7 @@ def test_moe_align_block_size_compare_implementations(
 
     moe_align_block_size_triton(
         topk_ids,
-        num_experts + 1,
+        num_experts,
         block_size,
         sorted_ids_triton,
         expert_ids_triton,
