@@ -203,8 +203,7 @@ class ModelConfig:
     ):
         # convert server arg in a string to layer index lists in integers
         if server_args.capture_states_of_layers:
-            capture_states_of_layers = server_args.capture_states_of_layers.split(",")
-            capture_states_of_layers = map(lambda i: int(i), capture_states_of_layers)
+            capture_states_of_layers = [int(i) for i in server_args.capture_states_of_layers.split(",")]
         else:
             capture_states_of_layers = None
 
