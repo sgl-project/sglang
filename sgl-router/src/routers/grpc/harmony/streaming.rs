@@ -381,12 +381,40 @@ impl HarmonyStreamingProcessor {
         original_request: &ChatCompletionRequest,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
+        // On first chunk, emit role announcement separately
+        if is_first {
+            let role_chunk = ChatCompletionStreamResponse {
+                id: dispatch.request_id.clone(),
+                object: "chat.completion.chunk".to_string(),
+                created: dispatch.created,
+                model: original_request.model.clone(),
+                system_fingerprint: dispatch.weight_version.clone(),
+                choices: vec![ChatStreamChoice {
+                    index,
+                    delta: ChatMessageDelta {
+                        role: Some("assistant".to_string()),
+                        content: Some(String::new()),
+                        tool_calls: None,
+                        reasoning_content: None,
+                    },
+                    logprobs: None,
+                    finish_reason: None,
+                    matched_stop: None,
+                }],
+                usage: None,
+            };
+
+            let chunk_json = serde_json::to_string(&role_chunk)
+                .map_err(|e| format!("JSON serialization error: {}", e))?;
+            let sse_data = format!("data: {}\n\n", chunk_json);
+
+            tx.send(Ok(Bytes::from(sse_data)))
+                .map_err(|_| "Failed to send role chunk".to_string())?;
+        }
+
+        // Emit content delta (role is always None for content chunks)
         let chat_delta = ChatMessageDelta {
-            role: if is_first {
-                Some("assistant".to_string())
-            } else {
-                None
-            },
+            role: None,
             content: delta.final_delta.clone(),
             tool_calls: delta.commentary_delta.as_ref().map(|tc_delta| {
                 vec![ToolCallDelta {
@@ -447,7 +475,7 @@ impl HarmonyStreamingProcessor {
             choices: vec![ChatStreamChoice {
                 index,
                 delta: ChatMessageDelta {
-                    role: Some("assistant".to_string()),
+                    role: None,
                     content: None,
                     tool_calls: None,
                     reasoning_content: None,
