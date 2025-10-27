@@ -481,7 +481,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             * self.dtype.itemsize
         )
         for index in range(0, len(indices), self.page_size):
-            for head_id in range(0, self.head_num, split_factor):
+            for head_id in range(0, self.head_num, self.head_num // split_factor):
                 k_ptr = (
                     kv_buffer_data_ptr
                     + indices[index]
@@ -499,11 +499,12 @@ class MHATokenToKVPoolHost(HostKVCache):
                 ptr_list.append(k_ptr)
                 ptr_list.append(v_ptr)
         element_size = (
-            self.dtype.itemsize
+            self.layer_num
+            * self.dtype.itemsize
             * self.page_size
             * self.head_num
-            // split_factor
             * self.head_dim
+            // split_factor
         )
         element_size_list = [element_size] * len(ptr_list)
         return ptr_list, element_size_list
