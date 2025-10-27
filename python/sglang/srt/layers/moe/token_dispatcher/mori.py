@@ -18,7 +18,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.utils import MoRIEPMode, get_deepep_config, is_tbo_enabled
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -38,12 +37,6 @@ try:
         EpDispatchCombineKernelType,
         EpDispatchCombineOp,
     )
-
-    # NOTE: Could we need to support 'npu' devices?
-    if not _is_npu:
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
 
     use_mori = True
 except ImportError:
