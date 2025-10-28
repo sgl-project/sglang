@@ -737,14 +737,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .subscribe(Arc::new(LoggingSubscriber))
         .await;
 
-    engine.register_workflow(create_worker_registration_workflow());
+    engine.register_workflow(create_worker_registration_workflow(&config.router_config));
     engine.register_workflow(create_worker_removal_workflow());
     engine.register_workflow(create_mcp_registration_workflow());
     app_context
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
-    info!("Workflow engine initialized with worker and MCP registration workflows");
+    info!(
+        "Workflow engine initialized with worker and MCP registration workflows (health check timeout: {}s)",
+        config.router_config.health_check.timeout_secs
+    );
 
     info!(
         "Initializing workers for routing mode: {:?}",
@@ -763,6 +766,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .submit(job)
         .await
         .map_err(|e| format!("Failed to submit worker initialization job: {}", e))?;
+
+    info!("Worker initialization job submitted (will complete in background)");
 
     if let Some(mcp_config) = &config.router_config.mcp_config {
         info!("Found {} MCP server(s) in config", mcp_config.servers.len());

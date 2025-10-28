@@ -19,7 +19,7 @@ pub mod tool_args;
 // Re-export the main types for convenience
 pub use config::{
     InventoryConfig, McpConfig, McpPoolConfig, McpProxyConfig, McpServerConfig, McpTransport,
-    PromptInfo, ResourceInfo, ToolInfo, WarmupServer,
+    Prompt, RawResource, Tool, WarmupServer,
 };
 pub use connection_pool::{CachedConnection, McpConnectionPool, PoolStats};
 pub use error::{McpError, McpResult};

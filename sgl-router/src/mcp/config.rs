@@ -1,38 +1,8 @@
 use std::collections::HashMap;
 
+// Re-export rmcp types for convenient access
+pub use rmcp::model::{Prompt, RawResource, Tool};
 use serde::{Deserialize, Serialize};
-
-// ============================================================================
-// MCP Data Structures
-// ============================================================================
-
-/// Information about an available tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolInfo {
-    pub name: String,
-    pub description: String,
-    pub server: String,
-    pub parameters: Option<serde_json::Value>,
-}
-
-/// Information about an available prompt
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptInfo {
-    pub name: String,
-    pub description: Option<String>,
-    pub server: String,
-    pub arguments: Option<Vec<serde_json::Value>>,
-}
-
-/// Information about an available resource
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceInfo {
-    pub uri: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub mime_type: Option<String>,
-    pub server: String,
-}
 
 // ============================================================================
 // Configuration Structures

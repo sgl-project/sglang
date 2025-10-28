@@ -373,13 +373,18 @@ async fn test_tool_info_structure() {
     let tools = manager.list_tools();
     let brave_search = tools
         .iter()
-        .find(|t| t.name == "brave_web_search")
+        .find(|t| t.name.as_ref() == "brave_web_search")
         .expect("Should have brave_web_search tool");
 
-    assert_eq!(brave_search.name, "brave_web_search");
-    assert!(brave_search.description.contains("Mock web search"));
-    assert_eq!(brave_search.server, "mock_server");
-    assert!(brave_search.parameters.is_some());
+    assert_eq!(brave_search.name.as_ref(), "brave_web_search");
+    assert!(brave_search
+        .description
+        .as_ref()
+        .map(|d| d.contains("Mock web search"))
+        .unwrap_or(false));
+    // Note: server information is now maintained separately in the inventory,
+    // not in the Tool type itself
+    assert!(!brave_search.input_schema.is_empty());
 }
 
 // SSE Parsing Tests (simplified since we don't expose parse_sse_event)
