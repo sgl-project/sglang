@@ -10,9 +10,9 @@ use crate::{
     config::RouterConfig,
     core::{workflow::WorkflowEngine, ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry},
     data_connector::{
-        create_storage, SharedConversationItemStorage, SharedConversationStorage,
-        SharedResponseStorage,
+        create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     },
+    mcp::McpManager,
     middleware::TokenBucket,
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
@@ -48,14 +48,15 @@ pub struct AppContext {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
-    pub response_storage: SharedResponseStorage,
-    pub conversation_storage: SharedConversationStorage,
-    pub conversation_item_storage: SharedConversationItemStorage,
+    pub response_storage: Arc<dyn ResponseStorage>,
+    pub conversation_storage: Arc<dyn ConversationStorage>,
+    pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
     pub load_monitor: Option<Arc<LoadMonitor>>,
     pub configured_reasoning_parser: Option<String>,
     pub configured_tool_parser: Option<String>,
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
     pub workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
+    pub mcp_manager: Arc<OnceLock<Arc<McpManager>>>,
 }
 
 pub struct AppContextBuilder {
@@ -68,12 +69,13 @@ pub struct AppContextBuilder {
     worker_registry: Option<Arc<WorkerRegistry>>,
     policy_registry: Option<Arc<PolicyRegistry>>,
     router_manager: Option<Arc<RouterManager>>,
-    response_storage: Option<SharedResponseStorage>,
-    conversation_storage: Option<SharedConversationStorage>,
-    conversation_item_storage: Option<SharedConversationItemStorage>,
+    response_storage: Option<Arc<dyn ResponseStorage>>,
+    conversation_storage: Option<Arc<dyn ConversationStorage>>,
+    conversation_item_storage: Option<Arc<dyn ConversationItemStorage>>,
     load_monitor: Option<Arc<LoadMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engine: Option<Arc<OnceLock<Arc<WorkflowEngine>>>>,
+    mcp_manager: Option<Arc<OnceLock<Arc<McpManager>>>>,
 }
 
 impl AppContext {
@@ -112,6 +114,7 @@ impl AppContextBuilder {
             load_monitor: None,
             worker_job_queue: None,
             workflow_engine: None,
+            mcp_manager: None,
         }
     }
 
@@ -163,19 +166,22 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn response_storage(mut self, response_storage: SharedResponseStorage) -> Self {
+    pub fn response_storage(mut self, response_storage: Arc<dyn ResponseStorage>) -> Self {
         self.response_storage = Some(response_storage);
         self
     }
 
-    pub fn conversation_storage(mut self, conversation_storage: SharedConversationStorage) -> Self {
+    pub fn conversation_storage(
+        mut self,
+        conversation_storage: Arc<dyn ConversationStorage>,
+    ) -> Self {
         self.conversation_storage = Some(conversation_storage);
         self
     }
 
     pub fn conversation_item_storage(
         mut self,
-        conversation_item_storage: SharedConversationItemStorage,
+        conversation_item_storage: Arc<dyn ConversationItemStorage>,
     ) -> Self {
         self.conversation_item_storage = Some(conversation_item_storage);
         self
@@ -193,6 +199,11 @@ impl AppContextBuilder {
 
     pub fn workflow_engine(mut self, workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>) -> Self {
         self.workflow_engine = Some(workflow_engine);
+        self
+    }
+
+    pub fn mcp_manager(mut self, mcp_manager: Arc<OnceLock<Arc<McpManager>>>) -> Self {
+        self.mcp_manager = Some(mcp_manager);
         self
     }
 
@@ -235,6 +246,9 @@ impl AppContextBuilder {
             workflow_engine: self
                 .workflow_engine
                 .ok_or(AppContextBuildError("workflow_engine"))?,
+            mcp_manager: self
+                .mcp_manager
+                .ok_or(AppContextBuildError("mcp_manager"))?,
         })
     }
 
@@ -256,6 +270,8 @@ impl AppContextBuilder {
             .with_load_monitor(&router_config)
             .with_worker_job_queue()
             .with_workflow_engine()
+            .with_mcp_manager(&router_config)
+            .await?
             .router_config(router_config))
     }
 
@@ -456,6 +472,38 @@ impl AppContextBuilder {
     fn with_workflow_engine(mut self) -> Self {
         self.workflow_engine = Some(Arc::new(OnceLock::new()));
         self
+    }
+
+    /// Create and initialize MCP manager with empty config
+    ///
+    /// This initializes the MCP manager with an empty config and default settings.
+    /// MCP servers will be registered later via the InitializeMcpServers job.
+    async fn with_mcp_manager(mut self, _router_config: &RouterConfig) -> Result<Self, String> {
+        // Create OnceLock container
+        let mcp_manager_lock = Arc::new(OnceLock::new());
+
+        // Always create with empty config and defaults
+        info!("Initializing MCP manager with empty config and default settings (5 min TTL, 100 max connections)");
+
+        let empty_config = crate::mcp::McpConfig {
+            servers: Vec::new(),
+            pool: Default::default(),
+            proxy: None,
+            warmup: Vec::new(),
+            inventory: Default::default(),
+        };
+
+        let manager = McpManager::with_defaults(empty_config)
+            .await
+            .map_err(|e| format!("Failed to initialize MCP manager with defaults: {}", e))?;
+
+        // Store the initialized manager in the OnceLock
+        mcp_manager_lock
+            .set(Arc::new(manager))
+            .map_err(|_| "Failed to set MCP manager in OnceLock".to_string())?;
+
+        self.mcp_manager = Some(mcp_manager_lock);
+        Ok(self)
     }
 }
 
