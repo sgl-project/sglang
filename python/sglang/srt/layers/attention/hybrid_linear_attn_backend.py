@@ -275,6 +275,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
@@ -283,6 +284,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             activation,
             conv_state_indices=cache_indices,
         )
+
         query, key, value = torch.split(
             mixed_qkv,
             [
@@ -298,6 +300,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query = query.view(1, seq_len, num_heads, head_k_dim)
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
+
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -313,6 +316,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             softplus_beta=1.0,
             softplus_threshold=20.0,
         )
+
         return core_attn_out
 
     def forward_extend(
@@ -349,7 +353,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = mamba_cache_params.conv
         ssm_states = mamba_cache_params.temporal
-        batch_size = forward_batch.batch_size
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -396,6 +399,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
+
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
 
@@ -450,6 +454,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
+
         return core_attn_out
 
 
