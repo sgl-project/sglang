@@ -67,6 +67,7 @@ suites = {
         TestFile("quant/test_int8_kernel.py", 8),
         TestFile("quant/test_triton_scaled_mm.py", 8),
         TestFile("quant/test_w8a8_quantization.py", 46),
+        TestFile("quant/test_autoround.py", 60),
         TestFile("rl/test_fp32_lm_head.py", 30),
         TestFile("rl/test_update_weights_from_disk.py", 114),
         TestFile("rl/test_update_weights_from_tensor.py", 48),
@@ -118,6 +119,7 @@ suites = {
         TestFile("test_retract_decode.py", 90),
         TestFile("test_score_api.py", 310),
         TestFile("test_server_args.py", 1),
+        TestFile("test_speculative_registry.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 261),
@@ -172,14 +174,14 @@ suites = {
         TestFile("test_disaggregation_hybrid_attention.py", 200),
     ],
     "per-commit-8-gpu-h20": [
-        TestFile("quant/test_w4a8_deepseek_v3.py", 371),
+        TestFile("quant/test_w4a8_deepseek_v3.py", 520),
         TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
-        # TestFile("test_flash_attention_4.py"),
-        # TestFile("test_gpt_oss_4gpu.py", 600),
-        # TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_flash_attention_4.py", 300),
+        TestFile("test_gpt_oss_4gpu.py", 600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -191,6 +193,7 @@ suites = {
     "per-commit-8-gpu-h200-deepseek-v32": [
         TestFile("test_deepseek_v32_basic.py", 275),
         TestFile("test_deepseek_v32_mtp.py", 275),
+        TestFile("test_deepseek_v32_nsabackend.py", 600),
     ],
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),
