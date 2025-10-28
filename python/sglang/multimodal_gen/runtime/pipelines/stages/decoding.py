@@ -129,10 +129,14 @@ class DecodingStage(PipelineStage):
         with torch.autocast(
             device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
         ):
-            if server_args.pipeline_config.vae_tiling:
-                self.vae.enable_tiling()
-            if server_args.pipeline_config.vae_sp:
-                self.vae.enable_parallel()
+            try:
+                #TODO: make it more specific
+                if server_args.pipeline_config.vae_tiling:
+                    self.vae.enable_tiling()
+                if server_args.pipeline_config.vae_sp:
+                    self.vae.enable_parallel()
+            except Exception:
+                pass
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
             image = self.vae.decode(latents)

@@ -9,7 +9,11 @@ import torch.nn as nn
 from sglang.multimodal_gen.api.configs.models.dits import HunyuanVideoConfig
 from sglang.multimodal_gen.api.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import (
+    LocalAttention,
+    UlyssesAttention,
+    USPAttention,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     ScaleResidual,
@@ -194,7 +198,7 @@ class MMDoubleStreamBlock(nn.Module):
         self.txt_mlp = MLP(hidden_size, mlp_hidden_dim, bias=True, dtype=dtype)
 
         # USPAttention
-        self.attn = USPAttention(
+        self.attn = UlyssesAttention(
             num_heads=num_attention_heads,
             head_size=head_dim,
             causal=False,
@@ -368,7 +372,7 @@ class MMSingleStreamBlock(nn.Module):
         )
 
         # USPAttention
-        self.attn = USPAttention(
+        self.attn = UlyssesAttention(
             num_heads=num_attention_heads,
             head_size=head_dim,
             causal=False,
