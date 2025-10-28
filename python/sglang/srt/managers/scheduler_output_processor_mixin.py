@@ -227,6 +227,15 @@ class SchedulerOutputProcessorMixin:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
 
+        # Log prefill stats after batch execution
+        if self.current_scheduler_metrics_enabled() and batch.prefill_adder is not None:
+            self.log_prefill_stats(
+                batch.prefill_adder,
+                batch.prefill_can_run_list,
+                batch.prefill_running_bs,
+                batch.prefill_running_bs_offline_batch,
+            )
+
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     def _resolve_spec_overlap_token_ids(
