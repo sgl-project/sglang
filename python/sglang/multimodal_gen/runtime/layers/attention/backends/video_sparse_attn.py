@@ -159,6 +159,13 @@ class VideoSparseAttentionMetadata(AttentionMetadata):
     variable_block_sizes: torch.LongTensor
     non_pad_index: torch.LongTensor
 
+    # adaption for FastWan2.1-T2V-1.3B-Diffusers
+    # Sequence lengths for the forward batch
+    # Maximum sequence length for query
+    max_seqlen_q: int = 1
+    # Maximum sequence length for key
+    max_seqlen_k: int = 0
+
 
 class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
