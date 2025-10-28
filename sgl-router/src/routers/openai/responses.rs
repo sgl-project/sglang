@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use super::utils::event_types;
+use super::utils::{event_types, web_search_constants};
 use crate::{
     data_connector::{ResponseId, StoredResponse},
     protocols::responses::{ResponseToolType, ResponsesRequest},
@@ -325,7 +325,7 @@ pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesReque
         let mut ws = serde_json::Map::new();
         ws.insert(
             "type".to_string(),
-            Value::String("web_search_preview".to_string()),
+            Value::String(web_search_constants::WEB_SEARCH_PREVIEW_SERVER_NAME.to_string()),
         );
         response_tools.push(Value::Object(ws));
     }

@@ -30,7 +30,10 @@ use super::{
         send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
-    utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction, ToolContext},
+    utils::{
+        event_types, web_search_constants, FunctionCallInProgress, OutputIndexMapper,
+        StreamAction, ToolContext,
+    },
 };
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
@@ -601,7 +604,8 @@ pub(super) fn apply_event_transformations_inplace(
             if response_obj.get("tools").is_some() {
                 // For web_search_preview, always use simplified tool format
                 if tool_context.is_web_search() {
-                    let web_search_tool = json!([{"type": "web_search_preview"}]);
+                    let web_search_tool =
+                        json!([{"type": web_search_constants::WEB_SEARCH_PREVIEW_SERVER_NAME}]);
                     response_obj.insert("tools".to_string(), web_search_tool);
                     response_obj
                         .entry("tool_choice".to_string())

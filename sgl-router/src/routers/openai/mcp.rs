@@ -319,7 +319,9 @@ pub(super) fn prepare_mcp_payload_for_streaming(
             // Only include tools from web_search_preview server
             tools
                 .into_iter()
-                .filter(|(_, server_name, _)| server_name == "web_search_preview")
+                .filter(|(_, server_name, _)| {
+                    server_name == web_search_constants::WEB_SEARCH_PREVIEW_SERVER_NAME
+                })
                 .collect()
         } else {
             tools
@@ -816,7 +818,10 @@ pub(super) fn build_incomplete_response(
         .ok_or_else(|| "response not an object".to_string())?;
 
     // Set status to completed (not failed - partial success)
-    obj.insert("status".to_string(), Value::String("completed".to_string()));
+    obj.insert(
+        "status".to_string(),
+        Value::String(web_search_constants::STATUS_COMPLETED.to_string()),
+    );
 
     // Set incomplete_details
     obj.insert(
@@ -1034,7 +1039,11 @@ pub(super) fn build_mcp_call_item(
         json!({
             "id": generate_id("mcp"),
             "type": event_types::ITEM_TYPE_MCP_CALL,
-            "status": if success { "completed" } else { "failed" },
+            "status": if success {
+                web_search_constants::STATUS_COMPLETED
+            } else {
+                web_search_constants::STATUS_FAILED
+            },
             "approval_request_id": Value::Null,
             "arguments": arguments,
             "error": error,
