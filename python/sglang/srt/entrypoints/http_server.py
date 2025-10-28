@@ -501,11 +501,6 @@ async def get_server_info():
     internal_states: List[Dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
     )
-
-    # This field is not serializable.
-    if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
-        del _global_state.tokenizer_manager.server_args.model_config
-
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
