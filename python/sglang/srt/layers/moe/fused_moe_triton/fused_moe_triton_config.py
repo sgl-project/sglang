@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import triton
-from sglang.srt.server_args import get_global_server_args
 
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_device_name, is_hip
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,9 @@ def get_moe_configs(
     be picked and the associated configuration chosen to invoke the kernel.
     """
     if get_global_server_args().enable_deterministic_inference:
-        logger.info("Deterministic inference is enabled, using default MoE kernel config.")
+        logger.info(
+            "Deterministic inference is enabled, using default MoE kernel config."
+        )
         return None
     # Supported Triton versions, should be sorted from the newest to the oldest
     supported_triton_versions = ["3.4.0", "3.3.1", "3.2.0", "3.1.0"]

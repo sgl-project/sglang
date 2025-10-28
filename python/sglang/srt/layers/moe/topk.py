@@ -29,9 +29,8 @@ from typing import (
 )
 
 import torch
-import torch.nn.functional as F
 import torch._inductor.config as inductor_config
-from sglang.srt.server_args import get_global_server_args
+import torch.nn.functional as F
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.eplb import expert_location_dispatch
@@ -44,6 +43,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -489,7 +489,7 @@ def grouped_topk_gpu(
         # Force pointwise kernels
         inductor_config.triton.persistent_reductions = False
         inductor_config.triton.max_tiles = 1  # Further restrict to simple kernels
-    
+
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = torch.softmax(gating_output, dim=-1)
