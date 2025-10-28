@@ -154,7 +154,7 @@ jobs:
   pytest-rust-2:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: 4-gpu-a10
-    timeout-minutes: 16
+    timeout-minutes: 32
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -179,6 +179,35 @@ jobs:
         run: |
           sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
 
+      - name: Setup Oracle Instant Client
+        run: |
+          sudo apt-get install -y unzip
+          INSTANT_CLIENT_DIR="/home/ubuntu/instant-client"
+          INSTANT_CLIENT_ZIP="instantclient-basic-linux.x64-23.9.0.25.07.zip"
+
+          if [ ! -d "$INSTANT_CLIENT_DIR/instantclient_23_9" ]; then
+            echo "Downloading Oracle Instant Client..."
+            mkdir -p "$INSTANT_CLIENT_DIR"
+            cd "$INSTANT_CLIENT_DIR"
+            wget https://download.oracle.com/otn_software/linux/instantclient/2390000/$INSTANT_CLIENT_ZIP
+            unzip $INSTANT_CLIENT_ZIP
+            rm $INSTANT_CLIENT_ZIP
+          else
+            echo "Oracle Instant Client already exists, skipping download"
+          fi
+
+          echo "LD_LIBRARY_PATH=/home/ubuntu/instant-client/instantclient_23_9:\$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+      - name: Start Oracle Database
+        run: |
+          docker run -d -p 1521:1521 -e ORACLE_PASSWORD=oracle --name oracle-db gvenzl/oracle-xe:21-slim
+          echo "Starting Oracle DB..."
+
+          # Export Oracle connection environment variables
+          echo "ATP_USER=system" >> $GITHUB_ENV
+          echo "ATP_PASSWORD=oracle" >> $GITHUB_ENV
+          echo "ATP_DSN=localhost:1521/XEPDB1" >> $GITHUB_ENV
+
       - name: Build python binding
         run: |
           source "$HOME/.cargo/env"
@@ -199,6 +228,12 @@ jobs:
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
           SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
+
+      - name: Cleanup Oracle Database
+        if: always()
+        run: |
+          docker stop oracle-db || true
+          docker rm oracle-db || true
 
 
   finish:

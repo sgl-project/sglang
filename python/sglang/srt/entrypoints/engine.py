@@ -143,10 +143,13 @@ class Engine(EngineBase):
 
         # Enable tracing
         if server_args.enable_trace:
-            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-            if server_args.disaggregation_mode == "null":
-                thread_label = "Tokenizer"
-                trace_set_thread_info(thread_label)
+            process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+            thread_label = "Tokenizer"
+            if server_args.disaggregation_mode == "prefill":
+                thread_label = "Prefill Tokenizer"
+            elif server_args.disaggregation_mode == "decode":
+                thread_label = "Decode Tokenizer"
+            trace_set_thread_info(thread_label)
 
         try:
             self.loop = asyncio.get_running_loop()

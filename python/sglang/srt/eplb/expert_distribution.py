@@ -20,6 +20,7 @@ import time
 from abc import ABC
 from collections import deque
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Type
 
 import einops
@@ -868,7 +869,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
 
 def _dump_to_file(name, data):
-    save_dir = envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()
+    save_dir = Path(envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get())
     path_output = save_dir / name
     logger.info(f"Write expert distribution to {path_output}")
     if not save_dir.exists():

@@ -119,6 +119,7 @@ suites = {
         TestFile("test_retract_decode.py", 90),
         TestFile("test_score_api.py", 310),
         TestFile("test_server_args.py", 1),
+        TestFile("test_speculative_registry.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 261),
