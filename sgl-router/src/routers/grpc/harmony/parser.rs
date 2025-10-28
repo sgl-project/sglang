@@ -60,9 +60,16 @@ impl HarmonyParserAdapter {
     ) -> Result<HarmonyChannelOutput, String> {
         // Feed all tokens to the parser
         for &token_id in output_ids {
-            self.parser
-                .process(token_id)
-                .map_err(|e| format!("Failed to process token {}: {}", token_id, e))?;
+            self.parser.process(token_id).map_err(|e| {
+                // Log the full output_ids context on error
+                tracing::error!(
+                    token_id = token_id,
+                    output_ids = ?output_ids,
+                    error = %e,
+                    "Harmony parser failed to process token"
+                );
+                format!("Failed to process token {}: {}", token_id, e)
+            })?;
         }
 
         // Extract all completed messages from the parser
