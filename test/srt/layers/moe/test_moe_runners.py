@@ -117,7 +117,7 @@ class TestMoERunner(CustomTestCase):
             ],
         },
         "moe_runner_flashinfer_trtllm": {
-            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,  # modelopt_fp4 or fp8 quantization is required for Flashinfer trtllm MOE
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
