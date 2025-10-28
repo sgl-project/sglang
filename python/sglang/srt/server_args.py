@@ -52,7 +52,6 @@ from sglang.srt.utils.common import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
-    is_triton_kernels_available,
     is_valid_ipv6_address,
     json_list_type,
     nullable_str,
@@ -885,11 +884,6 @@ class ServerArgs:
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
                     )
-                if self.moe_a2a_backend == "none" and self.moe_runner_backend == "auto":
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
-                    )
                     if self.quantization is None:
                         # Default DeepSeek V3/R1 native FP8 when not explicitly set,
                         # Because we need this condition for an assertion in
@@ -934,26 +928,6 @@ class ServerArgs:
                 quantization_config is not None
                 and quantization_config.get("quant_method") == "mxfp4"
             )
-
-            if is_blackwell_supported() and is_mxfp4_quant_format:
-                self.moe_runner_backend = "flashinfer_mxfp4"
-                logger.warning(
-                    "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
-                )
-            else:
-                if self.moe_runner_backend == "triton_kernel":
-                    assert (
-                        self.ep_size == 1
-                    ), "Triton kernel MoE is only supported when ep_size == 1"
-                if (
-                    self.moe_runner_backend == "auto"
-                    and self.ep_size == 1
-                    and is_triton_kernels_available()
-                ):
-                    self.moe_runner_backend = "triton_kernel"
-                    logger.warning(
-                        "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
-                    )
             self.disable_hybrid_swa_memory = True
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
@@ -970,11 +944,6 @@ class ServerArgs:
                 self.attention_backend = "trtllm_mha"
                 logger.warning(
                     "Use trtllm_mha as attention backend on sm100 for Llama4 model"
-                )
-            if is_sm100_supported() and self.moe_runner_backend == "auto":
-                self.moe_runner_backend = "flashinfer_trtllm"
-                logger.info(
-                    "Use flashinfer_trtllm as MoE runner backend on SM100 for Llama4"
                 )
         elif model_arch in [
             "Gemma2ForCausalLM",
