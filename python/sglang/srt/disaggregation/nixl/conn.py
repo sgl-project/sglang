@@ -231,8 +231,8 @@ class NixlKVManager(CommonKVManager):
             ]
             for k in keys_to_remove:
                 del self.connection_pool[k]
-            if failed_bootstrap_addr in self.prefill_tp_size_table:
-                del self.prefill_tp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_attn_tp_size_table:
+                del self.prefill_attn_tp_size_table[failed_bootstrap_addr]
             if failed_bootstrap_addr in self.prefill_dp_size_table:
                 del self.prefill_dp_size_table[failed_bootstrap_addr]
             if failed_bootstrap_addr in self.prefill_pp_size_table:
@@ -762,6 +762,13 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
+        if self.bootstrap_infos is None:
+            logger.error(
+                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"

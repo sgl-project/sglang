@@ -34,7 +34,14 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
-from sglang.srt.mem_cache.evict_policy import EvictionStrategy, LFUStrategy, LRUStrategy
+from sglang.srt.mem_cache.evict_policy import (
+    EvictionStrategy,
+    FIFOStrategy,
+    FILOStrategy,
+    LFUStrategy,
+    LRUStrategy,
+    MRUStrategy,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
@@ -76,6 +83,7 @@ class TreeNode:
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
+        self.creation_time = time.monotonic()
 
         self.hit_count = 0
         # indicating the node is locked to protect from eviction
@@ -216,9 +224,15 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = LRUStrategy()
         elif eviction_policy.lower() == "lfu":
             self.eviction_strategy: EvictionStrategy = LFUStrategy()
+        elif eviction_policy.lower() == "fifo":
+            self.eviction_strategy: EvictionStrategy = FIFOStrategy()
+        elif eviction_policy.lower() == "mru":
+            self.eviction_strategy: EvictionStrategy = MRUStrategy()
+        elif eviction_policy.lower() == "filo":
+            self.eviction_strategy: EvictionStrategy = FILOStrategy()
         else:
             raise ValueError(
-                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu'."
+                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'."
             )
         self.reset()
 
@@ -519,6 +533,10 @@ class RadixCache(BasePrefixCache):
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
             node.lock_ref -= 1
+            if node.parent is None:
+                assert (
+                    node is self.root_node
+                ), f"This request holds the node from another tree"
             node = node.parent
         return delta
 

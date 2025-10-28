@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import tqdm
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -44,6 +45,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -55,6 +57,7 @@ from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
+from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -74,7 +77,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
-    get_deepep_mode,
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
     should_use_flashinfer_trtllm_moe,
@@ -82,7 +84,12 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.quantization import CompressedTensorsConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    CompressedTensorsWNA16AMXEPMoEMethod,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
@@ -92,9 +99,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
-    input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
+    quant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
+    transform_scale_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
@@ -111,10 +119,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.single_batch_overlap import SboFlags
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.two_batch_overlap import (
-    MaybeTboDeepEPDispatcher,
-    model_forward_maybe_tbo,
-)
+from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -126,13 +131,11 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cpu,
     is_cuda,
-    is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
     is_nvidia_cublas_cu12_version_ge_12_9,
-    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -185,13 +188,14 @@ elif _is_npu:
     import custom_ops  # noqa: F401
     import sgl_kernel_npu  # noqa: F401
     import torch_npu  # noqa: F401
+
+    from sglang.srt.layers.quantization.awq_triton import (
+        awq_dequantize_decomposition as awq_dequantize,
+    )
 else:
     pass
 
-_is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and is_sm100_supported()
 _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
-
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +237,10 @@ class AttnForwardMethod(IntEnum):
     # Use multi-head attention, but with KV cache chunked.
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
+
+    # Use multi-head attention, execute the MHA for prefix and extended kv in one shot
+    # when the sequence lengths are below the threshold.
+    MHA_ONE_SHOT = auto()
 
     # Use MLA but with fused RoPE
     MLA_FUSED_ROPE = auto()
@@ -299,6 +307,14 @@ def _is_extend_without_speculative(forward_batch):
     )
 
 
+def _support_mha_one_shot(attn: DeepseekV2AttentionMLA, forward_batch, backend_name):
+    attn_supported = backend_name in ["fa3", "flashinfer", "flashmla"]
+    sum_seq_lens = (
+        sum(forward_batch.seq_lens_cpu) if forward_batch.seq_lens_cpu is not None else 0
+    )
+    return attn_supported and sum_seq_lens <= forward_batch.get_max_chunk_capacity()
+
+
 def _handle_attention_backend(
     attn: DeepseekV2AttentionMLA, forward_batch, backend_name
 ):
@@ -318,6 +334,8 @@ def _handle_attention_backend(
             or sum_extend_prefix_lens == 0
         )
     ):
+        if _support_mha_one_shot(attn, forward_batch, backend_name):
+            return AttnForwardMethod.MHA_ONE_SHOT
         return AttnForwardMethod.MHA_CHUNKED_KV
     else:
         return _dispatch_mla_subtype(attn, forward_batch)
@@ -328,7 +346,11 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 
 def handle_attention_fa3(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "fa3")
+    # when deterministic inference is enabled, use MLA
+    if get_global_server_args().enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)
+    else:
+        return _handle_attention_backend(attn, forward_batch, "fa3")
 
 
 def handle_attention_flashmla(attn, forward_batch):
@@ -372,6 +394,10 @@ def handle_attention_nsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
+    # when deterministic inference is enabled, use MLA
+    if get_global_server_args().enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)
+
     if (
         _is_extend_without_speculative(forward_batch)
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
@@ -648,19 +674,6 @@ class DeepseekV2MoE(nn.Module):
                 else None
             )
 
-            self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=self.num_experts,
-                num_local_experts=config.n_routed_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=get_deepep_mode(),
-                async_finish=True,
-                return_recv_hook=True,
-            )
-
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
@@ -723,6 +736,10 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
+            if isinstance(
+                self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
+            ):
+                topk_output.topk_weights.mul_(self.routed_scaling_factor)
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
@@ -873,7 +890,7 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states)
             if not self._fuse_shared_experts_inside_sbo:
                 shared_output = self._forward_shared_experts(hidden_states)
-            topk_weights, topk_idx, _ = self.topk(
+            topk_output = self.topk(
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
@@ -882,9 +899,7 @@ class DeepseekV2MoE(nn.Module):
                 ),
             )
         else:
-            topk_weights, topk_idx, _ = self.topk.empty_topk_output(
-                hidden_states.device
-            )
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         if self._fuse_shared_experts_inside_sbo:
             shared_output = None
@@ -895,13 +910,13 @@ class DeepseekV2MoE(nn.Module):
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            forward_batch=forward_batch,
+            topk_output=topk_output,
             **(
                 dict(
                     forward_shared_experts=_forward_shared_experts_and_put_results,
                     alt_stream=self.alt_stream,
+                    # SBO is not yet implemented for NextN
+                    disable_sbo=self.is_nextn,
                 )
                 if self._fuse_shared_experts_inside_sbo
                 else {}
@@ -957,7 +972,7 @@ class DeepseekV2MoE(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                state.topk_weights_local, state.topk_idx_local, _ = self.topk(
+                state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
@@ -966,21 +981,13 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
         else:
-            state.topk_idx_local = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            state.topk_weights_local = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
+            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
-            self.experts.deepep_dispatcher.dispatch_a(
+            self.experts.dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
-                input_global_scale=None,
-                topk_idx=state.pop("topk_idx_local"),
-                topk_weights=state.pop("topk_weights_local"),
-                forward_batch=state.forward_batch,
+                topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -989,32 +996,27 @@ class DeepseekV2MoE(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
+                state.dispatch_output = self.experts.dispatcher.dispatch_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
 
     def op_experts(self, state):
-        state.hidden_states_experts_output = self.experts.moe_impl(
+        state.combine_input = self.experts.run_moe_core(
             dispatch_output=state.dispatch_output,
         )
 
     def op_combine_a(self, state):
         if self.ep_size > 1:
-            self.experts.deepep_dispatcher.combine_a(
-                hidden_states=state.pop("hidden_states_experts_output"),
-                topk_idx=state.dispatch_output.topk_idx,
-                topk_weights=state.dispatch_output.topk_weights,
-                forward_batch=state.forward_batch,
+            self.experts.dispatcher.combine_a(
+                combine_input=state.pop("combine_input"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
             state.pop("dispatch_output")
 
     def op_combine_b(self, state):
         if self.ep_size > 1:
-            state.hidden_states_after_combine = (
-                self.experts.deepep_dispatcher.combine_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
+            state.hidden_states_after_combine = self.experts.dispatcher.combine_b(
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
     def op_output(self, state):
@@ -1077,6 +1079,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
@@ -1096,7 +1099,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=self._get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
@@ -1253,7 +1256,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
             and _is_cuda
-            and _device_sm >= 90
+            and 90 <= _device_sm < 120
         )
 
         self.qkv_proj_with_rope_is_int8 = (
@@ -1374,6 +1377,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             inner_state = self.forward_normal_chunked_kv_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
+        elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
+            inner_state = self.forward_normal_one_shot_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
         elif attn_forward_method == AttnForwardMethod.MLA:
             if not self.is_mla_preprocess_enabled:
                 inner_state = self.forward_absorb_prepare(
@@ -1425,6 +1432,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_normal_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             return self.forward_normal_chunked_kv_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
+            return self.forward_normal_one_shot_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:
             return self.forward_absorb_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
@@ -1459,41 +1468,24 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
         kv_a = self.kv_a_layernorm(kv_a)
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q[..., self.qk_nope_head_dim :] = q_pe
+
+        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        if (
+            forward_batch.mha_one_shot
+            and sum(forward_batch.extend_prefix_lens_cpu) != 0
+        ):
+            kv_a, k_pe = self._get_mla_kv_buffer(
+                forward_batch.fetch_mha_one_shot_kv_indices(), q.dtype, forward_batch
+            )
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
-        k = torch.empty_like(q)
 
-        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
-        if (
-            _is_cuda
-            and (self.num_local_heads == 128)
-            and (self.qk_nope_head_dim == 128)
-            and (self.qk_rope_head_dim == 64)
-        ):
-            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
-        else:
-            k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
-
-        if not _is_npu:
-            latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-            latent_cache[:, :, self.kv_lora_rank :] = k_pe
-
-            # Save latent cache
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-            )
-        else:
-            # To reduce a time-costing split operation
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-            )
-
+        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
     def forward_normal_core(self, q, k, v, forward_batch):
@@ -1619,15 +1611,15 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.w_kc.to(torch.bfloat16) * self.w_scale,
                 )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
-            # TODO fix the per_tensor_quant_mla_fp8 for cublas 12.9
-            if _is_cublas_ge_129:
-                q_nope_val, q_nope_scale = input_to_float8(
-                    q_nope.transpose(0, 1), torch.float8_e4m3fn
-                )
-            else:
-                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                    q_nope.transpose(0, 1), zero_allocator.allocate(1)
-                )
+            # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
+            q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+                q_nope.transpose(0, 1),
+                (
+                    torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
+                    if _is_cublas_ge_129
+                    else zero_allocator.allocate(1)
+                ),
+            )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
             )
@@ -1768,14 +1760,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
-            if _is_cublas_ge_129:
-                attn_output_val, attn_output_scale = input_to_float8(
-                    attn_output.transpose(0, 1), torch.float8_e4m3fn
-                )
-            else:
-                attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
-                    attn_output.transpose(0, 1), zero_allocator.allocate(1)
-                )
+            attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
+                attn_output.transpose(0, 1),
+                (
+                    torch.zeros((1,), dtype=torch.float32, device=attn_output.device)
+                    if _is_cublas_ge_129
+                    else zero_allocator.allocate(1)
+                ),
+            )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
                 self.w_vc,
@@ -2303,20 +2295,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         for i in range(forward_batch.num_prefix_chunks):
             forward_batch.set_prefix_chunk_idx(i)
 
+            kv_indices = forward_batch.prefix_chunk_kv_indices[i]
             # Fetch latent cache from memory pool with precomputed chunked kv indices
-            latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
-                self.attn_mha.layer_id
+            kv_a_normed, k_pe = self._get_mla_kv_buffer(
+                kv_indices, q.dtype, forward_batch
             )
-            latent_cache = (
-                latent_cache_buf[forward_batch.prefix_chunk_kv_indices[i]]
-                .contiguous()
-                .to(q.dtype)
-            )
-
-            kv_a_normed, k_pe = latent_cache.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
-            kv_a_normed = kv_a_normed.squeeze(1).contiguous()
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -2390,6 +2373,118 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def forward_normal_one_shot_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        forward_batch.mha_one_shot = True
+        return self.forward_normal_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+
+    def forward_normal_one_shot_core(self, q, k, v, forward_batch):
+        has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        # Only initialize the info once
+        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
+            forward_batch.num_prefix_chunks = 0
+            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
+                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+        forward_batch.mha_return_lse = False
+        # Do mha for extended part without prefix
+        forward_batch.set_attn_attend_prefix_cache(False)
+        return self.forward_normal_core(q, k, v, forward_batch)
+
+    def _set_mla_kv_buffer(
+        self,
+        latent_cache: torch.Tensor,
+        kv_a: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if _is_cuda:
+            # Save latent cache
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
+        elif _is_npu:
+            # To reduce a time-costing split operation
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
+        else:
+            latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
+            latent_cache[:, :, self.kv_lora_rank :] = k_pe
+
+            # Save latent cache
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+            )
+
+    def _get_mla_kv_buffer(
+        self,
+        kv_indices: torch.Tensor,
+        dst_dtype: torch.dtype,
+        forward_batch: ForwardBatch,
+    ):
+        if _is_cuda:
+            kv_a, k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+                self.attn_mha, kv_indices, dst_dtype
+            )
+            kv_a = kv_a.squeeze(1)
+        else:
+            latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
+                self.attn_mha.layer_id
+            )
+            latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
+
+            kv_a, k_pe = latent_cache.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            kv_a = kv_a.squeeze(1).contiguous()
+        return kv_a, k_pe
+
+    def _concat_and_cast_mha_k(self, k_nope, k_pe, forward_batch):
+        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
+        k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
+        if (
+            _is_cuda
+            and (self.num_local_heads == 128)
+            and (self.qk_nope_head_dim == 128)
+            and (self.qk_rope_head_dim == 64)
+        ):
+            k = k_nope.new_empty(*k_shape)
+            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
+        elif _is_cuda:
+            # fa3 mha support fp8 inputs
+            if (
+                self.current_attention_backend == "fa3"
+                and self.kv_cache_dtype != "auto"
+            ):
+                attn_dtype = forward_batch.token_to_kv_pool.dtype
+            else:
+                attn_dtype = k_nope.dtype
+            k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
+            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+        else:
+            k = k_nope.new_empty(*k_shape)
+            k[..., : self.qk_nope_head_dim] = k_nope
+            k[..., self.qk_nope_head_dim :] = k_pe
+        return k
+
+    @staticmethod
+    def _get_q_b_proj_quant_config(quant_config):
+        if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
+            # refer to real DeepSeek V3 quant config
+            return Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[128, 128],
+            )
+        else:
+            return quant_config
 
 
 class DeepseekV2DecoderLayer(nn.Module):
@@ -2855,6 +2950,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
+            CompressedTensorsConfig.DeepSeekFP8Config = Fp8Config(
+                True, "dynamic", None, [128, 128]
+            )
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -2968,7 +3067,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             )
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # AWQ compatible
-                if _is_cuda or _is_hip:
+                if _is_cuda or _is_hip or _is_npu:
                     w = awq_dequantize(
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,
@@ -2994,11 +3093,13 @@ class DeepseekV2ForCausalLM(nn.Module):
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
-                if (
-                    hasattr(self.quant_config, "weight_block_size")
-                    and self.quant_config.weight_block_size is not None
-                ):
-                    weight_block_size = self.quant_config.weight_block_size
+                selected_quant_config = getattr(
+                    self.quant_config, "DeepSeekFP8Config", self.quant_config
+                )
+                weight_block_size = getattr(
+                    selected_quant_config, "weight_block_size", None
+                )
+                if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
                     if _is_fp8_fnuz:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
@@ -3128,6 +3229,13 @@ class DeepseekV2ForCausalLM(nn.Module):
         ):
             self._weight_requant_ue8m0(is_nextn)
 
+        # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN")
+        ):
+            self._transform_scale_ue8m0(is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             self._transform_scale_nextn_moe_ue8m0()
 
@@ -3196,6 +3304,25 @@ class DeepseekV2ForCausalLM(nn.Module):
                         module.weight, module.weight_scale_inv, weight_block_size
                     )
 
+    # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
+    def _transform_scale_ue8m0(self, is_nextn=False):
+        num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
+
+        for layer_id in range(num_hidden_layers):
+            if is_nextn:
+                layer = self.model.decoder
+            else:
+                layer = self.model.layers[layer_id]
+
+            module_list = []
+            if self.config.q_lora_rank is not None:
+                module_list.append(layer.self_attn.q_b_proj)
+
+            for module in module_list:
+                transform_scale_ue8m0_inplace(
+                    module.weight_scale_inv, mn=module.weight.shape[-2]
+                )
+
     # TODO avoid code dup (currently combine from weight_requant_ue8m0 and transform_scale_ue8m0)
     def _transform_scale_nextn_moe_ue8m0(self):
         layer = self.model.decoder
@@ -3233,6 +3360,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
+        if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
+            weights = self._quant_attn_to_fp8_ue8m0(weights, is_nextn=is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             weights = self._quant_nextn_moe_to_fp8_ue8m0(
                 weights, nextn_layer_id=nextn_layer_id
@@ -3466,6 +3595,30 @@ class DeepseekV2ForCausalLM(nn.Module):
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+    def _quant_attn_to_fp8_ue8m0(self, weights, is_nextn):
+        weights_dict = dict(weights)
+
+        # temporarily only support DeepSeek V3/R1
+        weight_block_size = [128, 128]
+
+        for layer_id in tqdm.trange(
+            self.config.num_hidden_layers + int(is_nextn),
+            desc="quant attn to fp8 ue8m0",
+        ):
+            for stem in [
+                # may put tensors like `o_proj` here for DeepSeek FP4 ckpt v1
+                "q_b_proj",
+            ]:
+                partial_name = f"model.layers.{layer_id}.self_attn.{stem}"
+                original_weight = weights_dict[f"{partial_name}.weight"]
+                out_w, out_s = quant_weight_ue8m0(
+                    original_weight, weight_block_size=weight_block_size
+                )
+                weights_dict[f"{partial_name}.weight"] = out_w
+                weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
+
+        return list(weights_dict.items())
 
     # TODO avoid code dup
     def _quant_nextn_moe_to_fp8_ue8m0(self, weights, nextn_layer_id: int):
