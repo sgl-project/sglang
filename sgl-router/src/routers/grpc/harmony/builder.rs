@@ -552,11 +552,12 @@ impl HarmonyBuilder {
                 // If there's an output, this represents the tool result
                 // Otherwise, it's the tool call itself
                 if let Some(output_str) = output {
-                    // Tool result - use Tool role
+                    // Tool result - use Tool role with "functions.{name}" as author name
+                    // This matches vLLM's pattern: Author.new(Role.TOOL, f"functions.{name}")
                     Ok(HarmonyMessage {
                         author: Author {
                             role: Role::Tool,
-                            name: Some(name.clone()),
+                            name: Some(format!("functions.{}", name)),
                         },
                         recipient: None,
                         content: vec![Content::Text(TextContent {
@@ -566,17 +567,20 @@ impl HarmonyBuilder {
                         content_type: None,
                     })
                 } else {
-                    // Tool call - assistant message in commentary channel
-                    let call_text = format!("{}({})", name, arguments);
+                    // Tool call - assistant message in commentary channel with recipient
+                    // This matches vLLM's pattern:
+                    // msg.with_channel("commentary").with_recipient(f"functions.{name}")
                     Ok(HarmonyMessage {
                         author: Author {
                             role: Role::Assistant,
                             name: None,
                         },
-                        recipient: None,
-                        content: vec![Content::Text(TextContent { text: call_text })],
+                        recipient: Some(format!("functions.{}", name)),
+                        content: vec![Content::Text(TextContent {
+                            text: arguments.clone(),
+                        })],
                         channel: Some("commentary".to_string()),
-                        content_type: None,
+                        content_type: Some("json".to_string()),
                     })
                 }
             }
@@ -599,11 +603,12 @@ impl HarmonyBuilder {
                     })
                     .ok_or_else(|| format!("No function call found for call_id: {}", call_id))?;
 
-                // Create Tool message with the function name from the original call
+                // Create Tool message with "functions.{name}" prefix
+                // This matches vLLM's pattern: Author.new(Role.TOOL, f"functions.{name}")
                 Ok(HarmonyMessage {
                     author: Author {
                         role: Role::Tool,
-                        name: Some(call),
+                        name: Some(format!("functions.{}", call)),
                     },
                     recipient: None,
                     content: vec![Content::Text(TextContent {
