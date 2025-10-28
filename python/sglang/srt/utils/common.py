@@ -188,7 +188,16 @@ is_hopper_with_cuda_12_3 = lambda: _check(9)
 def is_blackwell():
     if not is_cuda():
         return False
-    return torch.cuda.get_device_capability()[0] == 10
+    return torch.cuda.get_device_capability()[0] in [10, 12]
+
+
+@lru_cache(maxsize=1)
+def is_blackwell_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
+    return (torch.cuda.get_device_capability(device)[0] in [10, 12]) and (
+        torch.version.cuda >= "12.8"
+    )
 
 
 @lru_cache(maxsize=1)
