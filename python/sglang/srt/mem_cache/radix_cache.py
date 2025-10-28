@@ -195,6 +195,7 @@ class RadixCache(BasePrefixCache):
         eviction_policy: str = "lru",
         is_eagle: bool = False,
     ):
+        assert(page_size > 0, "Page size must be greater than zero")
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
