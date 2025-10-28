@@ -10,6 +10,8 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
 
+ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
+
 ARG SGL_KERNEL_VERSION=0.3.16.post4
 ARG GDRCOPY_VERSION=2.5.1
 ARG NVSHMEM_VERSION=3.4.5
@@ -130,7 +132,7 @@ RUN set -eux; \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git && \
       cd DeepEP && \
-      git checkout gb200_blog_part_2 && \
+      git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
       sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
       cd .. ; \
     else \
@@ -193,14 +195,16 @@ RUN if [ "$CUDA_VERSION" != "13.0.1" ]; then \
 # latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
 RUN python3 -m pip install --no-cache-dir --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0"
 
-# For cuda 13, we need to install Triton from source to solve sm103 issue
-# Go back to official after >3.4.5 is released
+# For cuda 13, we install triton from source to fix some sm103 issues
+# This can be reverted after >3.4.5 is released
+# See the conversation in: https://github.com/triton-lang/triton/pull/8536
 RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
-    git clone --depth=1 https://github.com/triton-lang/triton.git && \
+    git clone https://github.com/triton-lang/triton.git && \
     cd triton && \
-        pip install --break-system-packages -r python/requirements.txt && \
-        MAX_JOBS=20 pip install --break-system-packages -e .; \
-    fi
+    git checkout ${TRITON_LANG_COMMIT} && \
+    pip install --break-system-packages -r python/requirements.txt && \
+    MAX_JOBS=20 pip install --break-system-packages -e .; \
+fi
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
