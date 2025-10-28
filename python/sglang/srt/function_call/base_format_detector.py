@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
 
@@ -9,6 +8,7 @@ from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -78,7 +78,7 @@ class BaseFormatDetector(ABC):
             name = act.get("name")
             if not (name and name in tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
-                if os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS") != "TRUE":
+                if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.value:
                     continue  # Skip unknown tools (default legacy behavior)
 
             results.append(

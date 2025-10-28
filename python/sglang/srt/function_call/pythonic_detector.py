@@ -1,11 +1,11 @@
 import ast
 import json
 import logging
-import os
 import re
 from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -92,7 +92,7 @@ class PythonicDetector(BaseFormatDetector):
                     logger.warning(
                         f"Model attempted to call undefined function: {function_name}"
                     )
-                    if os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS") != "TRUE":
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.value:
                         continue  # Skip unknown tools (default legacy behavior)
 
                 arguments = {}

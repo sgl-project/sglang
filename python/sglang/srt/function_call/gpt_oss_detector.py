@@ -1,10 +1,10 @@
 import json
 import logging
-import os
 import re
 from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -221,7 +221,7 @@ class GptOssDetector(BaseFormatDetector):
         # Check if tool exists
         if function_name not in tool_indices:
             logger.debug(f"Function {function_name} not in available tools")
-            if os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS") != "TRUE":
+            if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.value:
                 return None  # Skip unknown tools (default legacy behavior)
 
         # Parse JSON arguments

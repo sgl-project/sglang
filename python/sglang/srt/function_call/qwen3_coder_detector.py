@@ -2,11 +2,11 @@ import ast
 import html
 import json
 import logging
-import os
 import re
 from typing import Any, Dict, List, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -124,7 +124,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     is_valid = function_name in self._tool_indices
                     if not is_valid:
                         logger.warning(f"Invalid function name: {function_name}")
-                        if os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS") != "TRUE":
+                        if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.value:
                             # Reset state and skip (default legacy behavior)
                             self._reset_streaming_state()
                             normal += self._buf
