@@ -29,6 +29,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
+from sglang.srt.metrics.collector import ExpertDispatchCollector
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, is_npu
@@ -669,7 +670,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self._expert_dispatch_collector = ExpertDispatchCollector(
                 self._expert_location_metadata.ep_size
             )
-            self.collection_counter = 0
+            self._collection_counter = 0
 
     def append(
         self,
@@ -722,7 +723,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         # sglang:eplb_gpu_physical_count metric is disabled if SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0
         if (
             SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL > 0
-            and self.collection_counter % SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL == 0
+            and self._collection_counter % SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL == 0
         ):
             for layer_idx in range(self._expert_location_metadata.num_layers):
                 count_of_layer = (
@@ -740,7 +741,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                     if count > 0:
                         count_of_layer._sum.inc(count * gpu_rank)
                         count_of_layer._buckets[gpu_rank].inc(count)
-        self.collection_counter += 1
+        self._collection_counter += 1
 
 
 class _DequeCollection:
