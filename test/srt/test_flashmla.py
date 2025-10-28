@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -18,7 +19,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
-    run_bench_one_batch,
+    write_github_step_summary,
 )
 
 
@@ -31,7 +32,6 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
-                    "--enable-torch-compile",
                     "--cuda-graph-max-bs",
                     "2",
                     "--attention-backend",
@@ -66,21 +66,39 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
 
 
 class TestFlashMLAAttnLatency(unittest.TestCase):
-    def test_latency(self):
-        _, output_throughput, _ = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST_MLA,
-            [
-                "--attention-backend",
-                "flashmla",
-                "--enable-torch-compile",
-                "--cuda-graph-max-bs",
-                "16",
-                "--trust-remote-code",
-            ],
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--attention-backend",
+            "flashmla",
+            "--cuda-graph-max-bs",
+            "16",
+            "--trust-remote-code",
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
         )
 
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_bs_1_speed(self):
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        acc_length, speed = send_one_prompt(args)
+
+        print(f"{speed=:.2f}")
+
         if is_in_ci():
-            self.assertGreater(output_throughput, 100)
+            write_github_step_summary(
+                f"### test_bs_1_speed (flashmla)\n" f"{speed=:.2f} token/s\n"
+            )
+            self.assertGreater(speed, 140)
 
 
 class TestFlashMLAMTP(CustomTestCase):
