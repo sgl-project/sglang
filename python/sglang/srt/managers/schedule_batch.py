@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import enum
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -70,11 +72,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
@@ -396,13 +394,23 @@ class MultimodalInputs:
 
 
 class RequestStage(str, enum.Enum):
-    # prefill
+    # Tokenizer
+    TOKENIZE = "tokenize"
+    TOKENIZER_DISPATCH = "dispatch"
+
+    # DP controller
+    DC_DISPATCH = "dc_dispatch"
+
+    # common/non-disaggregation
     PREFILL_WAITING = "prefill_waiting"
+    REQUEST_PROCESS = "request_process"
+    DECODE_LOOP = "decode_loop"
+    PREFILL_FORWARD = "prefill_forward"
+    PREFILL_CHUNKED_FORWARD = "chunked_prefill"
 
     # disaggregation prefill
     PREFILL_PREPARE = "prefill_prepare"
     PREFILL_BOOTSTRAP = "prefill_bootstrap"
-    PREFILL_FORWARD = "prefill_forward"
     PREFILL_TRANSFER_KV_CACHE = "prefill_transfer_kv_cache"
 
     # disaggregation decode
@@ -410,6 +418,8 @@ class RequestStage(str, enum.Enum):
     DECODE_BOOTSTRAP = "decode_bootstrap"
     DECODE_WAITING = "decode_waiting"
     DECODE_TRANSFERRED = "decode_transferred"
+    DECODE_FAKE_OUTPUT = "fake_output"
+    DECODE_QUICK_FINISH = "quick_finish"
 
 
 class Req:

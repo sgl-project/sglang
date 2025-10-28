@@ -14,7 +14,13 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
 )
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    BaseFinishReason,
+    Req,
+    RequestStage,
+    ScheduleBatch,
+)
+from sglang.srt.tracing.trace import trace_slice
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
@@ -160,6 +166,14 @@ class SchedulerOutputProcessorMixin:
                             )
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
+
+                    trace_slice(
+                        RequestStage.PREFILL_FORWARD,
+                        req.rid,
+                        auto_next_anon=not req.finished(),
+                        thread_finish_flag=req.finished(),
+                    )
+
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
@@ -187,6 +201,12 @@ class SchedulerOutputProcessorMixin:
                                     last_prefill_chunk=False,
                                 )
                             logprob_pt += num_input_logprobs
+
+                    trace_slice(
+                        RequestStage.PREFILL_CHUNKED_FORWARD,
+                        req.rid,
+                        auto_next_anon=True,
+                    )
 
         else:  # embedding or reward model
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
@@ -226,6 +246,13 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
+
+                trace_slice(
+                    RequestStage.PREFILL_FORWARD,
+                    req.rid,
+                    auto_next_anon=not req.finished(),
+                    thread_finish_flag=req.finished(),
+                )
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
