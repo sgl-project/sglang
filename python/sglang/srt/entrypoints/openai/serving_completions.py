@@ -14,6 +14,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     ErrorResponse,
+    UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -271,6 +272,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     choices=[choice_data],
                     model=request.model,
                 )
+                
+                # Add usage stats if continuous_usage_stats is enabled
+                if request.stream_options and request.stream_options.continuous_usage_stats:
+                    chunk.usage = UsageInfo(
+                        prompt_tokens=prompt_tokens.get(index, 0),
+                        completion_tokens=completion_tokens.get(index, 0),
+                        total_tokens=prompt_tokens.get(index, 0) + completion_tokens.get(index, 0),
+                    )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
 
