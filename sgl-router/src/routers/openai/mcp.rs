@@ -524,15 +524,21 @@ pub(super) fn send_mcp_call_completion_events_with_error(
         tool_context,
     );
 
-    // Get the mcp_call item_id
+    // Get the item_id
     let item_id = mcp_call_item
         .get("id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Event 1: response.mcp_call.completed
+    // Event 1: response.{web_search_call|mcp_call}.completed
+    let completed_event_type = if tool_context.is_web_search() {
+        event_types::WEB_SEARCH_CALL_COMPLETED
+    } else {
+        event_types::MCP_CALL_COMPLETED
+    };
+
     let completed_payload = json!({
-        "type": event_types::MCP_CALL_COMPLETED,
+        "type": completed_event_type,
         "sequence_number": *sequence_number,
         "output_index": effective_output_index,
         "item_id": item_id
@@ -541,7 +547,7 @@ pub(super) fn send_mcp_call_completion_events_with_error(
 
     let completed_event = format!(
         "event: {}\ndata: {}\n\n",
-        event_types::MCP_CALL_COMPLETED,
+        completed_event_type,
         completed_payload
     );
     if tx.send(Ok(Bytes::from(completed_event))).is_err() {

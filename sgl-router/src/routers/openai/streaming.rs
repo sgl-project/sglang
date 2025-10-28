@@ -553,6 +553,7 @@ pub(super) fn apply_event_transformations_inplace(
     server_label: &str,
     original_request: &ResponsesRequest,
     previous_response_id: Option<&str>,
+    tool_context: ToolContext,
 ) -> bool {
     let mut changed = false;
 
@@ -598,23 +599,34 @@ pub(super) fn apply_event_transformations_inplace(
 
             // Mask tools from function to MCP format (optimized without cloning)
             if response_obj.get("tools").is_some() {
-                let requested_mcp = original_request
-                    .tools
-                    .as_ref()
-                    .map(|tools| {
-                        tools
-                            .iter()
-                            .any(|t| matches!(t.r#type, ResponseToolType::Mcp))
-                    })
-                    .unwrap_or(false);
+                // For web_search_preview, always use simplified tool format
+                if tool_context.is_web_search() {
+                    let web_search_tool = json!([{"type": "web_search_preview"}]);
+                    response_obj.insert("tools".to_string(), web_search_tool);
+                    response_obj
+                        .entry("tool_choice".to_string())
+                        .or_insert(Value::String("auto".to_string()));
+                    changed = true;
+                } else {
+                    // Regular MCP tools - only if requested
+                    let requested_mcp = original_request
+                        .tools
+                        .as_ref()
+                        .map(|tools| {
+                            tools
+                                .iter()
+                                .any(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                        })
+                        .unwrap_or(false);
 
-                if requested_mcp {
-                    if let Some(mcp_tools) = build_mcp_tools_value(original_request) {
-                        response_obj.insert("tools".to_string(), mcp_tools);
-                        response_obj
-                            .entry("tool_choice".to_string())
-                            .or_insert(Value::String("auto".to_string()));
-                        changed = true;
+                    if requested_mcp {
+                        if let Some(mcp_tools) = build_mcp_tools_value(original_request) {
+                            response_obj.insert("tools".to_string(), mcp_tools);
+                            response_obj
+                                .entry("tool_choice".to_string())
+                                .or_insert(Value::String("auto".to_string()));
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -629,13 +641,26 @@ pub(super) fn apply_event_transformations_inplace(
                     if item_type == event_types::ITEM_TYPE_FUNCTION_CALL
                         || item_type == event_types::ITEM_TYPE_FUNCTION_TOOL_CALL
                     {
-                        item["type"] = json!(event_types::ITEM_TYPE_MCP_CALL);
-                        item["server_label"] = json!(server_label);
+                        // Use web_search_call for web_search_preview, mcp_call for regular MCP
+                        if tool_context.is_web_search() {
+                            item["type"] = json!(event_types::ITEM_TYPE_WEB_SEARCH_CALL);
+                            // Don't include server_label for web_search_call
+                            // Remove internal implementation fields
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.remove("arguments");
+                                obj.remove("call_id");
+                                obj.remove("name");
+                            }
+                        } else {
+                            item["type"] = json!(event_types::ITEM_TYPE_MCP_CALL);
+                            item["server_label"] = json!(server_label);
+                        }
 
-                        // Transform ID from fc_* to mcp_*
+                        // Transform ID from fc_* to ws_* or mcp_*
                         if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
                             if let Some(stripped) = id.strip_prefix("fc_") {
-                                let new_id = format!("mcp_{}", stripped);
+                                let prefix = if tool_context.is_web_search() { "ws" } else { "mcp" };
+                                let new_id = format!("{}_{}", prefix, stripped);
                                 item["id"] = json!(new_id);
                             }
                         }
@@ -693,6 +718,7 @@ pub(super) fn forward_streaming_event(
     original_request: &ResponsesRequest,
     previous_response_id: Option<&str>,
     sequence_number: &mut u64,
+    tool_context: ToolContext,
 ) -> bool {
     // Skip individual function_call_arguments.delta events - we'll send them as one
     if event_name == Some(event_types::FUNCTION_CALL_ARGUMENTS_DELTA) {
@@ -757,37 +783,40 @@ pub(super) fn forward_streaming_event(
                 };
 
                 // Emit a synthetic MCP arguments delta event before the done event
-                let mut delta_event = json!({
-                    "type": event_types::MCP_CALL_ARGUMENTS_DELTA,
-                    "sequence_number": *sequence_number,
-                    "output_index": assigned_index,
-                    "item_id": mcp_item_id,
-                    "delta": arguments_value,
-                });
+                // Skip for web_search_preview - we don't expose tool call arguments
+                if !tool_context.is_web_search() {
+                    let mut delta_event = json!({
+                        "type": event_types::MCP_CALL_ARGUMENTS_DELTA,
+                        "sequence_number": *sequence_number,
+                        "output_index": assigned_index,
+                        "item_id": mcp_item_id,
+                        "delta": arguments_value,
+                    });
 
-                if let Some(obfuscation) = call.last_obfuscation.as_ref() {
-                    if let Some(obj) = delta_event.as_object_mut() {
-                        obj.insert(
-                            "obfuscation".to_string(),
-                            Value::String(obfuscation.clone()),
-                        );
+                    if let Some(obfuscation) = call.last_obfuscation.as_ref() {
+                        if let Some(obj) = delta_event.as_object_mut() {
+                            obj.insert(
+                                "obfuscation".to_string(),
+                                Value::String(obfuscation.clone()),
+                            );
+                        }
+                    } else if let Some(obfuscation) = parsed_data.get("obfuscation").cloned() {
+                        if let Some(obj) = delta_event.as_object_mut() {
+                            obj.insert("obfuscation".to_string(), obfuscation);
+                        }
                     }
-                } else if let Some(obfuscation) = parsed_data.get("obfuscation").cloned() {
-                    if let Some(obj) = delta_event.as_object_mut() {
-                        obj.insert("obfuscation".to_string(), obfuscation);
+
+                    let delta_block = format!(
+                        "event: {}\ndata: {}\n\n",
+                        event_types::MCP_CALL_ARGUMENTS_DELTA,
+                        delta_event
+                    );
+                    if tx.send(Ok(Bytes::from(delta_block))).is_err() {
+                        return false;
                     }
-                }
 
-                let delta_block = format!(
-                    "event: {}\ndata: {}\n\n",
-                    event_types::MCP_CALL_ARGUMENTS_DELTA,
-                    delta_event
-                );
-                if tx.send(Ok(Bytes::from(delta_block))).is_err() {
-                    return false;
+                    *sequence_number += 1;
                 }
-
-                *sequence_number += 1;
             }
         }
     }
@@ -813,6 +842,7 @@ pub(super) fn forward_streaming_event(
         server_label,
         original_request,
         previous_response_id,
+        tool_context,
     );
 
     if let Some(response_obj) = parsed_data
@@ -844,16 +874,23 @@ pub(super) fn forward_streaming_event(
     let mut final_block = String::new();
     if let Some(evt) = event_name {
         // Update event name for function_call_arguments events
-        if evt == event_types::FUNCTION_CALL_ARGUMENTS_DELTA {
+        // Skip for web_search_preview - we don't expose tool call arguments
+        if evt == event_types::FUNCTION_CALL_ARGUMENTS_DELTA && !tool_context.is_web_search() {
             final_block.push_str(&format!(
                 "event: {}\n",
                 event_types::MCP_CALL_ARGUMENTS_DELTA
             ));
-        } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE {
+        } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE && !tool_context.is_web_search() {
             final_block.push_str(&format!(
                 "event: {}\n",
                 event_types::MCP_CALL_ARGUMENTS_DONE
             ));
+        } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DELTA && tool_context.is_web_search() {
+            // Skip this event entirely for web_search_preview
+            return true;
+        } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE && tool_context.is_web_search() {
+            // Skip this event entirely for web_search_preview
+            return true;
         } else {
             final_block.push_str(&format!("event: {}\n", evt));
         }
@@ -865,29 +902,62 @@ pub(super) fn forward_streaming_event(
         return false;
     }
 
-    // After sending output_item.added for mcp_call, inject mcp_call.in_progress event
+    // After sending output_item.added for mcp_call/web_search_call, inject in_progress event
     if event_name == Some(event_types::OUTPUT_ITEM_ADDED) {
         if let Some(item) = parsed_data.get("item") {
-            if item.get("type").and_then(|v| v.as_str()) == Some(event_types::ITEM_TYPE_MCP_CALL) {
-                // Already transformed to mcp_call
+            let item_type = item.get("type").and_then(|v| v.as_str());
+
+            // Check if it's an mcp_call or web_search_call
+            let is_mcp_or_web_search = item_type == Some(event_types::ITEM_TYPE_MCP_CALL)
+                || item_type == Some(event_types::ITEM_TYPE_WEB_SEARCH_CALL);
+
+            if is_mcp_or_web_search {
                 if let (Some(item_id), Some(output_index)) = (
                     item.get("id").and_then(|v| v.as_str()),
                     parsed_data.get("output_index").and_then(|v| v.as_u64()),
                 ) {
+                    // Choose event type based on tool_context
+                    let in_progress_event_type = if tool_context.is_web_search() {
+                        event_types::WEB_SEARCH_CALL_IN_PROGRESS
+                    } else {
+                        event_types::MCP_CALL_IN_PROGRESS
+                    };
+
                     let in_progress_event = json!({
-                        "type": event_types::MCP_CALL_IN_PROGRESS,
+                        "type": in_progress_event_type,
                         "sequence_number": *sequence_number,
                         "output_index": output_index,
                         "item_id": item_id
                     });
                     *sequence_number += 1;
+
                     let in_progress_block = format!(
                         "event: {}\ndata: {}\n\n",
-                        event_types::MCP_CALL_IN_PROGRESS,
+                        in_progress_event_type,
                         in_progress_event
                     );
                     if tx.send(Ok(Bytes::from(in_progress_block))).is_err() {
                         return false;
+                    }
+
+                    // For web_search_call, also send a "searching" event
+                    if tool_context.is_web_search() {
+                        let searching_event = json!({
+                            "type": event_types::WEB_SEARCH_CALL_SEARCHING,
+                            "sequence_number": *sequence_number,
+                            "output_index": output_index,
+                            "item_id": item_id
+                        });
+                        *sequence_number += 1;
+
+                        let searching_block = format!(
+                            "event: {}\ndata: {}\n\n",
+                            event_types::WEB_SEARCH_CALL_SEARCHING,
+                            searching_event
+                        );
+                        if tx.send(Ok(Bytes::from(searching_block))).is_err() {
+                            return false;
+                        }
                     }
                 }
             }
@@ -1158,7 +1228,10 @@ pub(super) async fn handle_streaming_with_tool_interception(
     // Spawn the streaming loop task
     tokio::spawn(async move {
         let mut state = ToolLoopState::new(original_request.input.clone());
-        let loop_config = McpLoopConfig::default();
+        let loop_config = McpLoopConfig {
+            tool_context,
+            ..Default::default()
+        };
         let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
         let tools_json = payload_clone.get("tools").cloned().unwrap_or(json!([]));
         let base_payload = payload_clone.clone();
@@ -1277,6 +1350,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                             &original_request,
                                             previous_response_id.as_deref(),
                                             &mut sequence_number,
+                                            loop_config.tool_context,
                                         ) {
                                             // Client disconnected
                                             return;
@@ -1292,7 +1366,8 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                                 == Some(event_types::RESPONSE_IN_PROGRESS)
                                             {
                                                 seen_in_progress = true;
-                                                if !mcp_list_tools_sent {
+                                                // Skip mcp_list_tools for web_search_preview
+                                                if !mcp_list_tools_sent && !loop_config.tool_context.is_web_search() {
                                                     let list_tools_index =
                                                         handler.allocate_synthetic_output_index();
                                                     if !send_mcp_list_tools_events(
@@ -1325,6 +1400,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                         &original_request,
                                         previous_response_id.as_deref(),
                                         &mut sequence_number,
+                                        loop_config.tool_context,
                                     ) {
                                         // Client disconnected
                                         return;
