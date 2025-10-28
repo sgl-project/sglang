@@ -70,6 +70,7 @@ class RMSNorm(CustomOp):
         shape = x.shape
         x = x.view(-1, shape[-1])
         if residual is not None:
+            residual_shape = residual.shape
             residual = residual.view(-1, shape[-1])
 
         if x.dtype == torch.float:
@@ -79,7 +80,7 @@ class RMSNorm(CustomOp):
             return self.forward_native(x, residual)
         elif residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x, residual
+            return x.view(shape), residual.view(residual_shape)
         else:
             out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
