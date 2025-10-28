@@ -39,6 +39,7 @@ from sglang.srt.utils.common import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
+    is_blackwell_supported,
     is_cuda,
     is_fa3_default_architecture,
     is_flashinfer_available,
@@ -98,6 +99,7 @@ QUANTIZATION_CHOICES = [
     "qoq",
     "w4afp8",
     "mxfp4",
+    "auto-round",
     "compressed-tensors",  # for Ktransformers
 ]
 
@@ -133,7 +135,16 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
-NSA_CHOICES = ["flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "aiter"]
+DEFAULT_LORA_EVICTION_POLICY = "lru"
+
+NSA_CHOICES = [
+    "flashmla_sparse",
+    "flashmla_kv",
+    "flashmla_auto",
+    "fa3",
+    "tilelang",
+    "aiter",
+]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
@@ -288,7 +299,7 @@ class ServerArgs:
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
     enable_trace: bool = False
-    oltp_traces_endpoint: str = "localhost:4317"
+    otlp_traces_endpoint: str = "localhost:4317"
 
     # API related
     api_key: Optional[str] = None
@@ -329,7 +340,7 @@ class ServerArgs:
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_eviction_policy: str = "lru"
-    lora_backend: str = "triton"
+    lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
 
     # Kernel backend
@@ -912,7 +923,7 @@ class ServerArgs:
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-            if is_sm100_supported():
+            if is_blackwell_supported():
                 if not self.enable_dp_attention:
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
@@ -924,7 +935,7 @@ class ServerArgs:
                 and quantization_config.get("quant_method") == "mxfp4"
             )
 
-            if is_sm100_supported() and is_mxfp4_quant_format:
+            if is_blackwell_supported() and is_mxfp4_quant_format:
                 self.moe_runner_backend = "flashinfer_mxfp4"
                 logger.warning(
                     "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
@@ -1020,16 +1031,30 @@ class ServerArgs:
                 import torch
 
                 major, _ = torch.cuda.get_device_capability()
-                if major >= 10:
-                    self.kv_cache_dtype = "fp8_e4m3"
-                    logger.warning("Setting KV cache dtype to fp8.")
+                if self.kv_cache_dtype == "auto":
+                    self.kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
+                    logger.warning(
+                        f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek NSA."
+                    )
+                if self.kv_cache_dtype == "bf16":
+                    self.kv_cache_dtype = "bfloat16"
+                assert self.kv_cache_dtype in [
+                    "bfloat16",
+                    "fp8_e4m3",
+                ], "DeepSeek NSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
                 if self.kv_cache_dtype == "fp8_e4m3":
-                    self.nsa_prefill_backend = "flashmla_kv"
+                    # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+                    self.nsa_prefill_backend = "flashmla_auto"
                     self.nsa_decode_backend = "flashmla_kv"
                     logger.warning(
-                        "Setting NSA backend to flashmla_kv for FP8 KV Cache."
+                        "Setting NSA backend to flashmla_auto for prefill and flashmla_kv for decode for FP8 KV Cache."
                     )
+                else:
+                    # set prefill/decode backends for Blackwell. The default settings are for Hopper.
+                    if major >= 10:
+                        self.nsa_prefill_backend = "flashmla_sparse"
+                        self.nsa_decode_backend = "flashmla_sparse"
 
                 # Logging env vars for NSA
                 from sglang.srt.layers.attention.nsa.utils import (
@@ -1144,7 +1169,7 @@ class ServerArgs:
             self.attention_backend == "trtllm_mla"
             or self.decode_attention_backend == "trtllm_mla"
         ):
-            if not is_sm100_supported():
+            if not is_blackwell_supported():
                 raise ValueError(
                     "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
                 )
@@ -2315,7 +2340,7 @@ class ServerArgs:
             help="Enable opentelemetry trace",
         )
         parser.add_argument(
-            "--oltp-traces-endpoint",
+            "--otlp-traces-endpoint",
             type=str,
             default="localhost:4317",
             help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
