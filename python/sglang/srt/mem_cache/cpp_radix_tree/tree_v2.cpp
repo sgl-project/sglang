@@ -35,7 +35,7 @@ RadixTree::~RadixTree() = default;
 
 std::tuple<std::vector<at::Tensor>, std::size_t, NodeHandle, NodeHandle>
 RadixTree::match_prefix(const token_vec_t& _key) {
-  if (m_impl->disabled) return {};
+  if (m_impl->disabled || _key.size() < m_impl->page_size) return {};
 
   const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
   const auto [host_node, _] = m_impl->tree_walk(key);

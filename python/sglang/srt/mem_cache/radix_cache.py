@@ -299,15 +299,12 @@ class RadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
-        if self.disable or len(key) == 0:
+        if self.disable or len(key) < self.page_size:
             return empty_match_result()
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
-
-        if len(key) == 0:
-            return empty_match_result()
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
