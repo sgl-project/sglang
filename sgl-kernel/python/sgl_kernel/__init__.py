@@ -1,9 +1,9 @@
 import ctypes
 import logging
 import os
-import platform
 import shutil
 from pathlib import Path
+from typing import List
 
 import torch
 
@@ -81,6 +81,8 @@ def _load_architecture_specific_ops():
     logger.debug(f"[sgl_kernel] Found files: {raw_matching_files}")
     logger.debug(f"[sgl_kernel] Prioritized files: {matching_files}")
 
+    previous_import_errors: List[Exception] = []
+
     # Try to load from the architecture-specific directory
     if matching_files:
         ops_path = Path(matching_files[0])  # Use the first prioritized file
@@ -102,6 +104,7 @@ def _load_architecture_specific_ops():
             return common_ops
 
         except Exception as e:
+            previous_import_errors.append(e)
             logger.debug(
                 f"[sgl_kernel] ✗ Failed to load from {ops_path}: {type(e).__name__}: {e}"
             )
@@ -138,6 +141,7 @@ def _load_architecture_specific_ops():
             return common_ops
 
         except Exception as e:
+            previous_import_errors.append(e)
             logger.debug(
                 f"[sgl_kernel] ✗ Failed to load fallback from {alt_path}: {type(e).__name__}: {e}"
             )
@@ -157,7 +161,12 @@ def _load_architecture_specific_ops():
         logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
         return common_ops
     except ImportError as e:
+        previous_import_errors.append(e)
         logger.debug(f"[sgl_kernel] ✗ Standard Python import failed: {e}")
+
+    attempt_error_msg = "\n".join(
+        f"- {type(err).__name__}: {err}" for err in previous_import_errors
+    )
 
     # All attempts failed
     error_msg = f"""
@@ -174,6 +183,9 @@ GPU Info:
 
 Please ensure sgl_kernel is properly installed with:
 pip install --upgrade sgl_kernel
+
+Error details from previous import attempts:
+{attempt_error_msg}
 """
     logger.debug(error_msg)
     raise ImportError(error_msg)
@@ -265,11 +277,20 @@ from sgl_kernel.gemm import (
     scaled_fp4_quant,
     sgl_per_tensor_quant_fp8,
     sgl_per_token_group_quant_8bit,
+    sgl_per_token_group_quant_fp8,
+    sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
     shuffle_rows,
     silu_and_mul_scaled_fp4_grouped_quant,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.hadamard import (
+    hadamard_transform,
+    hadamard_transform_12n,
+    hadamard_transform_20n,
+    hadamard_transform_28n,
+    hadamard_transform_40n,
+)
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
@@ -318,7 +339,12 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
-from sgl_kernel.top_k import fast_topk, fast_topk_transform_fused, fast_topk_v2
+from sgl_kernel.top_k import (
+    fast_topk,
+    fast_topk_transform_fused,
+    fast_topk_transform_ragged_fused,
+    fast_topk_v2,
+)
 from sgl_kernel.version import __version__
 
 if torch.version.hip is not None:

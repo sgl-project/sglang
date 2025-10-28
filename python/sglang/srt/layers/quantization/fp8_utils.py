@@ -2,10 +2,10 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.utils import is_sm100_supported, offloader
+from sglang.srt.utils import ceil_div, is_blackwell_supported, offloader
 
 try:
     from vllm import _custom_ops as ops
@@ -129,7 +129,7 @@ def cutlass_block_fp8_supported() -> bool:
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
 ENABLE_FLASHINFER_GEMM = (
     get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM")
-    and is_sm100_supported()
+    and is_blackwell_supported()
     and is_flashinfer_available()
 )
 if ENABLE_FLASHINFER_GEMM:
@@ -441,23 +441,53 @@ def _requant_weight_ue8m0(
         torch.bfloat16,
     )
 
+    out_w, out_s = quant_weight_ue8m0(
+        weight_dequant=weight_dequant,
+        weight_block_size=weight_block_size,
+    )
+
+    out_s = _transform_scale_ue8m0(out_s, mn=out_w.shape[-2])
+
+    return out_w, out_s
+
+
+def quant_weight_ue8m0(
+    weight_dequant: torch.Tensor,
+    weight_block_size: List[int],
+):
+    assert weight_block_size == [128, 128]
+    assert (
+        weight_dequant.dtype == torch.bfloat16
+    ), f"{weight_dequant.dtype=} {weight_dequant.shape=}"
+
+    *batch_dims, n, k = weight_dequant.shape
+
     weight_dequant_flat = weight_dequant.view((-1, k))
     out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
 
-    out_w = out_w_flat.view(weight.shape)
-    out_s = out_s_flat.view(weight_scale_inv.shape)
-
-    # NOTE copy and modified from DeepGEMM
-    def _transform_scale(sf, mn: int):
-        import deep_gemm.utils.layout
-
-        sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
-        sf = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
-        return sf
-
-    out_s = _transform_scale(out_s, mn=out_w.shape[-2])
+    out_w = out_w_flat.view((*batch_dims, n, k))
+    out_s = out_s_flat.view(
+        (
+            *batch_dims,
+            ceil_div(n, weight_block_size[0]),
+            ceil_div(k, weight_block_size[1]),
+        )
+    )
 
     return out_w, out_s
+
+
+def transform_scale_ue8m0_inplace(param, mn):
+    param.data = _transform_scale_ue8m0(param.data, mn=mn)
+
+
+# NOTE copy and modified from DeepGEMM
+def _transform_scale_ue8m0(sf, mn):
+    import deep_gemm.utils.layout
+
+    sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
+    sf = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
+    return sf
 
 
 # COPIED FROM DeepGEMM

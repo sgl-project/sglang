@@ -19,9 +19,8 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
-import json
 import logging
-import multiprocessing as multiprocessing
+import multiprocessing
 import os
 import tempfile
 import threading
@@ -51,6 +50,7 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ClassifyRequest,
     CompletionRequest,
     DetokenizeRequest,
     EmbeddingRequest,
@@ -63,6 +63,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     V1RerankReqInput,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
@@ -95,6 +96,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
@@ -128,6 +130,7 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
 
 
 # Store global states
@@ -148,23 +151,27 @@ def set_global_state(global_state: _GlobalState):
 
 async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
-    pid = os.getpid()
-    main_pid = get_main_process_id()
-    logger.info(f"current worker_id: {pid}, main processID: {main_pid}")
 
     # Read configuration from shared memory
+    main_pid = get_main_process_id()
     port_args, server_args, scheduler_info = read_from_shared_memory(
         f"multi_tokenizer_args_{main_pid}"
     )
     server_args: ServerArgs
+    port_args: PortArgs
 
     # API key authentication is not supported in multi-tokenizer mode
     assert (
         server_args.api_key is None
     ), "API key is not supported in multi-tokenizer mode"
 
+    # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+    )
+    logger.info(
+        f"Start multi-tokenizer worker process {os.getpid()}, "
+        f"ipc_name={port_args.tokenizer_ipc_name}"
     )
 
     # Launch multi-tokenizer manager process
@@ -176,10 +183,9 @@ async def init_multi_tokenizer() -> ServerArgs:
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
-    # Register this tokenizer with the main tokenizer manager
-    await tokenizer_manager.register_to_main_tokenizer_manager()
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
@@ -188,36 +194,38 @@ async def init_multi_tokenizer() -> ServerArgs:
         )
     )
 
-    if server_args.enable_trace:
-        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-        if server_args.disaggregation_mode == "null":
-            thread_label = f"MultiTokenizer-{tokenizer_manager.worker_id}"
-            trace_set_thread_info(thread_label)
-
     return server_args
 
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    if not getattr(fast_api_app, "is_single_tokenizer_mode", False):
+    if getattr(fast_api_app, "is_single_tokenizer_mode", False):
+        server_args = fast_api_app.server_args
+        warmup_thread_args = fast_api_app.warmup_thread_args
+        thread_label = "Tokenizer"
+    else:
         # Initialize multi-tokenizer support for worker processes
-        fast_api_app.server_args: ServerArgs = await init_multi_tokenizer()
-
-        # only metrics middleware is supported in multi-tokenizer mode
-        worker_pid = os.getpid()
-        if fast_api_app.server_args.enable_metrics:
-            add_prometheus_middleware(app)
-            enable_func_timer()
-
-        logger.info(f"Worker {worker_pid} added prometheus middleware")
-        fast_api_app.warmup_thread = threading.Thread(
-            target=_wait_and_warmup,
-            args=(
-                fast_api_app.server_args,
-                None,  # pipe_finish_writer not needed in worker
-                None,  # launch_callback not needed in worker
-            ),
+        server_args = await init_multi_tokenizer()
+        warmup_thread_args = (
+            server_args,
+            None,
+            None,
         )
+        thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
+
+    # Add prometheus middleware
+    if server_args.enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
+
+    # Init tracing
+    if server_args.enable_trace:
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill" + thread_label
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode" + thread_label
+        trace_set_thread_info(thread_label)
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -227,6 +235,9 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
@@ -242,8 +253,7 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
 
-    server_args: ServerArgs = fast_api_app.server_args
-
+    # Launch tool server
     tool_server = None
     if server_args.tool_server == "demo":
         from sglang.srt.entrypoints.openai.tool_server import DemoToolServer
@@ -267,12 +277,11 @@ async def lifespan(fast_api_app: FastAPI):
             enable_force_include_usage=True,
             tool_server=tool_server,
         )
-    except Exception as e:
-        import traceback
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
 
-        traceback.print_exc()
-        logger.warning(f"Can not initialize OpenAIServingResponses, error: {e}")
-
+    # Execute custom warmups
     if server_args.warmups is not None:
         await execute_warmups(
             server_args.disaggregation_mode,
@@ -281,18 +290,18 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    warmup_thread = getattr(fast_api_app, "warmup_thread", None)
-    if warmup_thread is not None:
-        warmup_thread.start()
+    # Execute the general warmup
+    warmup_thread = threading.Thread(
+        target=_wait_and_warmup,
+        args=warmup_thread_args,
+    )
+    warmup_thread.start()
 
+    # Start the HTTP server
     try:
         yield
     finally:
-        if server_args.tokenizer_worker_num > 1:
-            pid = os.getpid()
-            logger.info(f"uvicorn worker {pid} ending...")
-            warmup_thread.join()
-            logger.info(f"uvicorn worker {pid} ended.")
+        warmup_thread.join()
 
 
 # Fast API
@@ -492,6 +501,11 @@ async def get_server_info():
     internal_states: List[Dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
     )
+
+    # This field is not serializable.
+    if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
+        del _global_state.tokenizer_manager.server_args.model_config
+
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
@@ -833,6 +847,27 @@ async def update_weights_from_distributed(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@app.post("/update_weights_from_ipc")
+async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
+    """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
+    success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
+        obj, request
+    )
+
+    # Update weight version if provided and weights update was successful
+    if success and obj.weight_version is not None:
+        _update_weight_version_if_provided(obj.weight_version)
+        message += f" Weight version updated to {obj.weight_version}."
+
+    content = {"success": success, "message": message}
+    if success:
+        if _global_state.tokenizer_manager.initial_weights_loaded is False:
+            _global_state.tokenizer_manager.initial_weights_loaded = True
+        return ORJSONResponse(content)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/update_weight_version")
 async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
     """Update the weight version. This operation requires no active requests."""
@@ -1084,6 +1119,18 @@ async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
 
 
 @app.post(
+    "/v1/classify",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
+    """OpenAI-compatible classification endpoint."""
+    return await raw_request.app.state.openai_serving_classify.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
     "/v1/tokenize",
     response_class=ORJSONResponse,
     dependencies=[Depends(validate_json_request)],
@@ -1124,6 +1171,8 @@ async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
     served_model_names = [_global_state.tokenizer_manager.served_model_name]
     model_cards = []
+
+    # Add base model
     for served_model_name in served_model_names:
         model_cards.append(
             ModelCard(
@@ -1132,6 +1181,20 @@ async def available_models():
                 max_model_len=_global_state.tokenizer_manager.model_config.context_len,
             )
         )
+
+    # Add loaded LoRA adapters
+    if _global_state.tokenizer_manager.server_args.enable_lora:
+        lora_registry = _global_state.tokenizer_manager.lora_registry
+        for _, lora_ref in lora_registry.get_all_adapters().items():
+            model_cards.append(
+                ModelCard(
+                    id=lora_ref.lora_name,
+                    root=lora_ref.lora_path,
+                    parent=served_model_names[0],
+                    max_model_len=None,
+                )
+            )
+
     return ModelList(data=model_cards)
 
 
@@ -1288,27 +1351,12 @@ def launch_server(
         3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
-    1. The HTTP server, Engine, and TokenizerManager both run in the main process.
+    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    if server_args.tokenizer_worker_num > 1:
-        port_args = PortArgs.init_new(server_args)
-        port_args.tokenizer_worker_ipc_name = (
-            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        )
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-            server_args=server_args, port_args=port_args
-        )
-    else:
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-            server_args=server_args,
-        )
-
-        if server_args.enable_trace:
-            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-            if server_args.disaggregation_mode == "null":
-                thread_label = "Tokenizer"
-                trace_set_thread_info(thread_label)
+    tokenizer_manager, template_manager, scheduler_info, port_args = (
+        _launch_subprocesses(server_args=server_args)
+    )
 
     set_global_state(
         _GlobalState(
@@ -1318,40 +1366,45 @@ def launch_server(
         )
     )
 
-    if server_args.tokenizer_worker_num > 1:
-        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args,
+    # Pass additional arguments to the lifespan function.
+    # They will be used for additional initialization setups.
+    if server_args.tokenizer_worker_num == 1:
+        # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
+        app.is_single_tokenizer_mode = True
+        app.server_args = server_args
+        app.warmup_thread_args = (
             server_args,
-            scheduler_info,
+            pipe_finish_writer,
+            launch_callback,
         )
-    else:
+
         # Add api key authorization
+        # This is only supported in single tokenizer mode.
         if server_args.api_key:
             add_api_key_middleware(app, server_args.api_key)
-
-        # Add prometheus middleware
-        if server_args.enable_metrics:
-            add_prometheus_middleware(app)
-            enable_func_timer()
-
-        # Send a warmup request - we will create the thread launch it
-        # in the lifespan after all other warmups have fired.
-        warmup_thread = threading.Thread(
-            target=_wait_and_warmup,
-            args=(
-                server_args,
-                pipe_finish_writer,
-                launch_callback,
-            ),
+    else:
+        # If it is multi-tokenizer mode, we need to write the arguments to shared memory
+        # for other worker processes to read.
+        app.is_single_tokenizer_mode = False
+        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+            port_args, server_args, scheduler_info
         )
-        app.warmup_thread = warmup_thread
 
     try:
         # Update logging configs
         set_uvicorn_logging_configs()
-        app.server_args = server_args
+
         # Listen for HTTP requests
-        if server_args.tokenizer_worker_num > 1:
+        if server_args.tokenizer_worker_num == 1:
+            uvicorn.run(
+                app,
+                host=server_args.host,
+                port=server_args.port,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=5,
+                loop="uvloop",
+            )
+        else:
             from uvicorn.config import LOGGING_CONFIG
 
             LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
@@ -1359,7 +1412,6 @@ def launch_server(
                 "level": "INFO",
                 "propagate": False,
             }
-
             monkey_patch_uvicorn_multiprocessing()
 
             uvicorn.run(
@@ -1371,22 +1423,10 @@ def launch_server(
                 loop="uvloop",
                 workers=server_args.tokenizer_worker_num,
             )
-        else:
-            app.is_single_tokenizer_mode = True
-            uvicorn.run(
-                app,
-                host=server_args.host,
-                port=server_args.port,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
-                loop="uvloop",
-            )
     finally:
         if server_args.tokenizer_worker_num > 1:
             multi_tokenizer_args_shm.unlink()
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
-        else:
-            warmup_thread.join()
 
 
 def _execute_server_warmup(
@@ -1513,6 +1553,8 @@ def _wait_and_warmup(
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
     launch_callback: Optional[Callable[[], None]] = None,
 ):
+    if server_args.checkpoint_engine_wait_weights_before_ready:
+        _wait_weights_ready()
     if not server_args.skip_server_warmup:
         if not _execute_server_warmup(
             server_args,
@@ -1535,3 +1577,24 @@ def _wait_and_warmup(
 
     if launch_callback is not None:
         launch_callback()
+
+
+def _wait_weights_ready():
+    """Wait for weights to be ready within the specified timeout."""
+    timeout = WAIT_WEIGHTS_READY_TIMEOUT
+    start_time = time.time()
+
+    for _ in range(timeout):
+        if _global_state.tokenizer_manager.initial_weights_loaded:
+            logger.info(
+                f"Weights are ready after {time.time() - start_time:.2f} seconds"
+            )
+            return
+        time.sleep(1)
+
+    # Timeout reached without weights being ready
+    logger.error(
+        f"Weights are not ready after waiting {timeout} seconds. "
+        f"Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT environment variable. "
+        f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
+    )

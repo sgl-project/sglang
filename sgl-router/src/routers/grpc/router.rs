@@ -11,21 +11,26 @@ use axum::{
 };
 use tracing::debug;
 
-use crate::config::types::RetryConfig;
-use crate::core::WorkerRegistry;
-use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest,
+use super::{context::SharedComponents, pipeline::RequestPipeline, responses};
+use crate::{
+    app_context::AppContext,
+    config::types::RetryConfig,
+    core::WorkerRegistry,
+    policies::PolicyRegistry,
+    protocols::{
+        chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    routers::RouterTrait,
+    tokenizer::traits::Tokenizer,
+    tool_parser::ParserFactory as ToolParserFactory,
 };
-use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
-use crate::routers::RouterTrait;
-use crate::server::AppContext;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserFactory as ToolParserFactory;
-
-use super::context::SharedComponents;
-use super::pipeline::RequestPipeline;
 
 /// gRPC router implementation for SGLang
 #[derive(Clone)]
@@ -43,6 +48,8 @@ pub struct GrpcRouter {
     configured_tool_parser: Option<String>,
     pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
+    // Responses context (bundles all /v1/responses dependencies: storage, MCP, background_tasks)
+    responses_context: responses::ResponsesContext,
 }
 
 impl GrpcRouter {
@@ -86,6 +93,20 @@ impl GrpcRouter {
             ctx.configured_reasoning_parser.clone(),
         );
 
+        // Create responses context with all dependencies
+        let responses_context = responses::ResponsesContext::new(
+            Arc::new(pipeline.clone()),
+            shared_components.clone(),
+            worker_registry.clone(),
+            ctx.response_storage.clone(),
+            ctx.conversation_storage.clone(),
+            ctx.conversation_item_storage.clone(),
+            ctx.mcp_manager
+                .get()
+                .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
+                .clone(),
+        );
+
         Ok(GrpcRouter {
             worker_registry,
             policy_registry,
@@ -99,6 +120,7 @@ impl GrpcRouter {
             configured_tool_parser: ctx.configured_tool_parser.clone(),
             pipeline,
             shared_components,
+            responses_context,
         })
     }
 
@@ -212,23 +234,38 @@ impl RouterTrait for GrpcRouter {
 
     async fn route_responses(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ResponsesRequest,
-        _model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        responses::route_responses(
+            &self.responses_context,
+            Arc::new(body.clone()),
+            headers.cloned(),
+            model_id.map(|s| s.to_string()),
+        )
+        .await
     }
 
     async fn get_response(
         &self,
         _headers: Option<&HeaderMap>,
-        _response_id: &str,
+        response_id: &str,
         _params: &ResponsesGetParams,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        responses::get_response_impl(&self.responses_context, response_id).await
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        responses::cancel_response_impl(&self.responses_context, response_id).await
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
