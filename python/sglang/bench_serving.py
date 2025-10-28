@@ -1014,7 +1014,7 @@ async def get_mooncake_request_over_time(
 def sample_mmmu_requests(
     num_requests: int,
     processor: AutoProcessor | AutoTokenizer,
-    backend: str,
+    backend: str = "sglang",
     fixed_output_len: Optional[int] = None,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
