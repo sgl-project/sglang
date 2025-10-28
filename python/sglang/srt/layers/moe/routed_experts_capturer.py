@@ -1,81 +1,173 @@
 import logging
 from abc import ABC
+from typing import Optional
 import torch
+import numpy as np
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+# from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+# from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 
 logger = logging.getLogger(__name__)
 
-_experts_capturer_host_buffer = None
-_experts_capturer_device_buffer = None
+GB = 1024 * 1024 * 1024
+MB = 1024 * 1024
+
+def get_tensor_size_bytes(t: torch.Tensor):
+    return np.prod(t.shape) * t.dtype.itemsize
+
+class RoutedExpertsDeviceCache:
+    def __init__(
+        self, 
+        model_config: ModelConfig, 
+        max_running_requests: int, 
+        device: str
+    ) -> None:
+        self.buffer = torch.zeros(
+            (
+                max(
+                    get_global_server_args().chunked_prefill_size,
+                    max_running_requests
+                ),
+                model_config.hf_text_config.num_hidden_layers,
+                model_config.hf_text_config.num_experts_per_tok
+            ),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._finalize_allocation_log()
+
+    def get_buffer_size_bytes(self):
+        assert hasattr(self, "buffer")
+        return get_tensor_size_bytes(self.buffer)
+    
+    def capture_fwd_routed_experts(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor
+    ):
+        assert layer_id is not None, "capturing routing experts but get layer_id None"
+        batch, _ = topk_ids.shape
+        self.buffer[:batch, layer_id, :] = topk_ids
+
+    def get_experts_buffer(self, layer_id: int):
+        return self.buffer
+
+    def _finalize_allocation_log(self):
+        """Common logging and memory usage computation for captured experts buffers.
+        """
+        buffer_size_MB = self.get_buffer_size_bytes() / MB
+        logger.info(
+            f"Routing experts device buffer allocated. #shape: {tuple(self.buffer.shape)}, size: {buffer_size_MB:.2f} MB"
+        )
+
+class RoutedExpertsHostCache:
+    def __init__(
+        self, 
+        model_config: ModelConfig, 
+        num_tokens: int, 
+    ) -> None:
+        self.num_tokens = num_tokens
+        self.buffer = torch.zeros(
+            (
+                num_tokens,
+                model_config.hf_text_config.num_hidden_layers,
+                model_config.hf_text_config.num_experts_per_tok
+            ),
+            dtype=torch.int32,
+            device="cpu",
+        )
+        self._finalize_allocation_log()
+
+    def get_buffer_size_bytes(self):
+        assert hasattr(self, "buffer")
+        return get_tensor_size_bytes(self.buffer)
+    
+    def set_experts_buffer(
+        self, 
+        layer_id: int,
+        loc: torch.Tensor,
+        top_k: torch.Tensor
+    ):
+        self.buffer[layer_id, loc, :] = top_k.cpu()
+    
+    def get_experts_buffer(self, layer_id: int):
+        return self.buffer
+
+    def _finalize_allocation_log(self):
+        """Common logging and memory usage computation for captured experts buffers.
+        """
+        buffer_size_GB = self.get_buffer_size_bytes() / GB
+        logger.info(
+            f"Routing experts host buffer allocated. #tokens: {self.num_tokens}, size: {buffer_size_GB:.2f} GB"
+        )
 
 class RoutedExpertsCapturer(ABC):
     @staticmethod
-    def create(enable: bool):
+    def create(
+        enable: bool, 
+        model_config: ModelConfig,
+        num_tokens: int,
+        max_running_requests: int,
+        device: str
+    ):
         if enable:
-            return _RoutedExpertsCapturerReal()
+            return _RoutedExpertsCapturerReal(
+                model_config,
+                num_tokens=num_tokens,
+                max_running_requests=max_running_requests,
+                device=device
+            )
         else:
             return _RoutedExpertsCapturerNoop()
 
-    def init_buffer(self, max_running_requests: int, model_config: ModelConfig):
-        raise NotImplementedError
-
-    def is_initialized(self):
-        raise NotImplementedError
-
-    def capture(self, layer_id: int, topk_output: StandardTopKOutput):
-        raise NotImplementedError
-
-    def clear_buffer(self):
+    def capture(self, layer_id: int, topk_ids: torch.Tensor):
         raise NotImplementedError
     
-    def get_captured_experts(self):
+    def get_host_cache(self):
         raise NotImplementedError
-
+    
+    def get_device_cache(self):
+        raise NotImplementedError
 
 class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     """Capturer for routed experts with host buffer"""
-    def init_buffer(self, max_running_requests: int, model_config: ModelConfig):
-        global _experts_capturer_host_buffer
-        if (
-            get_global_server_args().enable_return_routed_experts
-            and _experts_capturer_host_buffer is None
-        ):
-            _experts_capturer_host_buffer = torch.zeros(
-                (
-                    max_running_requests, 
-                    model_config.hf_text_config.num_hidden_layers, 
-                    model_config.hf_text_config.num_experts_per_tok
-                ),
-                dtype=torch.int32,
-                device="cpu",
-            )
-            logger.debug(
-                f"Initialized routed experts capturer host buffer with shape {_experts_capturer_host_buffer.shape}."
-            )
-            print(f"{_experts_capturer_host_buffer.shape=}")
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        num_tokens: int,
+        max_running_requests: int,
+        device: str
+    ):
 
-    def capture(self, layer_id: int, topk_output: StandardTopKOutput):
-        batch_size, num_routed_experts = topk_output.topk_ids.shape
-        _experts_capturer_host_buffer[:batch_size, layer_id, :] = topk_output.topk_ids.cpu()
+        self.host_cache = RoutedExpertsHostCache(
+            model_config,
+            num_tokens
+        )
 
-    def clear_buffer(self):
-        global _experts_capturer_host_buffer
-        _experts_capturer_host_buffer.zero_()
-    
-    def get_captured_experts(self):
-        global _experts_capturer_host_buffer
-        return _experts_capturer_host_buffer
+        self.device_cache = RoutedExpertsDeviceCache(
+            model_config,
+            max_running_requests,
+            device
+        )
+
+    def capture(self, layer_id: int, topk_ids: torch.Tensor):
+        self.device_cache.capture_fwd_routed_experts(
+            layer_id,
+            topk_ids
+        )
+
+    def get_host_cache(self):
+        return self.host_cache
+
+    def get_device_cache(self):
+        return self.device_cache
 
 class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
-    def init_buffer(self, max_running_requests: int, model_config: ModelConfig):
+    def __init__(self):
         pass
 
-    def is_initialized(self):
-        pass
-
-    def capture(self, layer_id: int, topk_output: StandardTopKOutput):
+    def capture(self, layer_id: int, topk_ids: torch.Tensor):
         pass
 
     def clear_buffer(self):
@@ -83,3 +175,26 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     
     def get_captured_experts(self):
         pass
+
+_global_expert_capturer: Optional[RoutedExpertsCapturer] = (
+    _RoutedExpertsCapturerNoop()
+)
+
+def get_global_experts_capturer():
+    return _global_expert_capturer
+
+def set_global_experts_capturer(capturer: RoutedExpertsCapturer):
+    global _global_expert_capturer
+    _global_expert_capturer = capturer
+
+def sync_fwd_experts_buffer_DtoH():
+    capturer = get_global_experts_capturer()
+    if isinstance(capturer, _RoutedExpertsCapturerReal):
+        device_cache = capturer.get_device_cache()
+        host_cache = capturer.get_host_cache()
+        for layer_id in range(device_cache.buffer.shape[0]):
+            host_cache.set_experts_buffer(
+                layer_id,
+                torch.arange(host_cache.num_tokens),
+                device_cache.get_experts_buffer(layer_id).cpu()
+            )

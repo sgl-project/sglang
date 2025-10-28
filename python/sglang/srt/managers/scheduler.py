@@ -193,6 +193,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 from sglang.srt.layers.moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    set_global_experts_capturer,
 )
 
 logger = logging.getLogger(__name__)
@@ -691,6 +692,17 @@ class Scheduler(
             get_int_env_var(env_var, default_size) if env_var else None
         )
 
+    def init_routed_experts_capturer(self):
+        set_global_experts_capturer(
+            RoutedExpertsCapturer.create(
+                get_global_server_args().enable_return_routed_experts,
+                self.model_config,
+                self.max_total_num_tokens + self.page_size,
+                self.max_running_requests,
+                self.device,
+            )
+        )
+
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
@@ -714,16 +726,6 @@ class Scheduler(
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
-
-    def init_routed_experts_capturer(self):
-        if self.server_args.enable_return_routed_experts:
-            self.routed_experts_capturer = RoutedExpertsCapturer.create(
-                self.server_args.enable_return_routed_experts
-            )
-            self.routed_experts_capturer.init_buffer(
-                max_running_requests=self.max_running_requests,
-                model_config=self.model_config,
-            )
     
     def init_memory_pool_and_cache(self):
         server_args = self.server_args

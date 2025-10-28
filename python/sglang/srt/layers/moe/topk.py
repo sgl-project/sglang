@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -193,6 +194,7 @@ class TopK(CustomOp):
         self,
         top_k: int,
         *,
+        layer_id: Optional[int] = None,
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
@@ -213,6 +215,7 @@ class TopK(CustomOp):
         if use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
 
+        self.layer_id = layer_id
         self.topk_config = TopKConfig(
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
@@ -238,6 +241,7 @@ class TopK(CustomOp):
         self.topk_config.torch_native = True
         return select_experts(
             hidden_states=hidden_states,
+            layer_id=self.layer_id,
             router_logits=router_logits,
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
@@ -284,6 +288,7 @@ class TopK(CustomOp):
             self.topk_config.torch_native = False
             return select_experts(
                 hidden_states=hidden_states,
+                layer_id=self.layer_id,
                 router_logits=router_logits,
                 topk_config=self.topk_config,
                 num_token_non_padded=num_token_non_padded,
@@ -300,6 +305,7 @@ class TopK(CustomOp):
     ) -> TopKOutput:
         return select_experts(
             hidden_states=hidden_states,
+            layer_id=self.layer_id,
             router_logits=router_logits,
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
@@ -356,6 +362,7 @@ class TopK(CustomOp):
             self.topk_config.torch_native = True
             return select_experts(
                 hidden_states=hidden_states,
+                layer_id=self.layer_id,
                 router_logits=router_logits,
                 topk_config=self.topk_config,
                 num_token_non_padded=num_token_non_padded,
@@ -789,6 +796,7 @@ def select_experts(
     router_logits: torch.Tensor,
     topk_config: TopKConfig,
     *,
+    layer_id: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
@@ -886,5 +894,8 @@ def select_experts(
         )
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-
+    get_global_experts_capturer().capture(
+            layer_id=layer_id,
+            topk_ids=topk_ids,
+    )
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
