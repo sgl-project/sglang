@@ -558,7 +558,8 @@ impl HarmonyBuilder {
                 // Otherwise, it's the tool call itself
                 if let Some(output_str) = output {
                     // Tool result - use Tool role with "functions.{name}" as author name
-                    // This matches vLLM's pattern: Author.new(Role.TOOL, f"functions.{name}")
+                    // IMPORTANT: Must include channel="commentary" and recipient="assistant"
+                    // to help the parser recognize this as a tool message when parsing back
                     let author_name = format!("functions.{}", name);
                     debug!(
                         tool_name = %name,
@@ -571,11 +572,11 @@ impl HarmonyBuilder {
                             role: Role::Tool,
                             name: Some(author_name),
                         },
-                        recipient: None,
+                        recipient: Some("assistant".to_string()),
                         content: vec![Content::Text(TextContent {
                             text: output_str.clone(),
                         })],
-                        channel: None,
+                        channel: Some("commentary".to_string()),
                         content_type: None,
                     })
                 } else {
@@ -622,17 +623,17 @@ impl HarmonyBuilder {
                     .ok_or_else(|| format!("No function call found for call_id: {}", call_id))?;
 
                 // Create Tool message with "functions.{name}" prefix
-                // This matches vLLM's pattern: Author.new(Role.TOOL, f"functions.{name}")
+                // IMPORTANT: Must include channel="commentary" and recipient="assistant"
                 Ok(HarmonyMessage {
                     author: Author {
                         role: Role::Tool,
                         name: Some(format!("functions.{}", call)),
                     },
-                    recipient: None,
+                    recipient: Some("assistant".to_string()),
                     content: vec![Content::Text(TextContent {
                         text: output.clone(),
                     })],
-                    channel: None,
+                    channel: Some("commentary".to_string()),
                     content_type: None,
                 })
             }
@@ -812,12 +813,13 @@ impl HarmonyBuilder {
                         .cloned()
                         .unwrap_or_else(|| tool_call_id.clone());
 
+                    // Tool result needs recipient="assistant" for parser to recognize it
                     let harmony_msg = HarmonyMessage {
                         author: Author {
                             role: Role::Tool,
                             name: Some(format!("functions.{}", function_name)),
                         },
-                        recipient: None,
+                        recipient: Some("assistant".to_string()),
                         content: vec![Content::Text(TextContent {
                             text: content.clone(),
                         })],
@@ -829,12 +831,13 @@ impl HarmonyBuilder {
 
                 ChatMessage::Function { content, name } => {
                     // Function messages also use Role::Tool
+                    // Tool result needs recipient="assistant" for parser to recognize it
                     let harmony_msg = HarmonyMessage {
                         author: Author {
                             role: Role::Tool,
                             name: Some(format!("functions.{}", name)),
                         },
-                        recipient: None,
+                        recipient: Some("assistant".to_string()),
                         content: vec![Content::Text(TextContent {
                             text: content.clone(),
                         })],
