@@ -65,7 +65,6 @@ def send_one_batch(base_url, num_prompts, batch_size, tokenizer, is_multimodal):
             backend=backend,
             fixed_output_len=512,
         )
-
     else:
         padded_prompts = (prompts * ((num_prompts + len(prompts) - 1) // len(prompts)))[
             :num_prompts
