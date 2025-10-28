@@ -211,8 +211,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
     ) -> torch.Tensor:
 
         from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.ep_moe.kernels import (
-            silu_and_mul_masked_post_quant_fwd,
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_8bit,
         )
 
         hidden_states = runner_input.hidden_states
@@ -257,32 +257,17 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states_scale)
 
         # Act
-        down_input = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2,
-            ),
-            device=hidden_states_device,
-            dtype=torch.float8_e4m3fn,
-        )
         scale_block_size = 128
-        down_input_scale = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2 // scale_block_size,
-            ),
-            device=hidden_states_device,
-            dtype=torch.float32,
-        )
-        silu_and_mul_masked_post_quant_fwd(
-            gateup_output,
-            down_input,
-            down_input_scale,
-            scale_block_size,
-            masked_m,
+        down_input, down_input_scale = sglang_per_token_group_quant_8bit(
+            x=gateup_output,
+            dst_dtype=torch.float8_e4m3fn,
+            group_size=scale_block_size,
+            masked_m=masked_m,
+            column_major_scales=True,
+            scale_tma_aligned=True,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            fuse_silu_and_mul=True,
+            enable_v2=True,
         )
         del gateup_output
 
