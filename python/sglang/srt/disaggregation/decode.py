@@ -615,6 +615,8 @@ class DecodePreallocQueue:
             kv_loc = self.token_to_kv_pool_allocator.alloc(
                 len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
             )
+            req.kv_allocated_len = len(kv_loc)
+            req.kv_committed_len = len(kv_loc)
         else:
             num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
             kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
