@@ -229,7 +229,11 @@ class TextEncodingStage(PipelineStage):
             encoder_config = encoder_cfgs[i]
             preprocess_func = preprocess_funcs[i]
             postprocess_func = postprocess_funcs[i]
-            text_encoder_extra_arg = text_encoder_extra_args[i] or {}
+            text_encoder_extra_arg = (
+                text_encoder_extra_args[i]
+                if i < len(text_encoder_extra_args) and text_encoder_extra_args[i]
+                else {}
+            )
 
             processed_texts: list[str] = []
             for prompt_str in texts:
