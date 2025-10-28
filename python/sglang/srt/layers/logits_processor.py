@@ -135,10 +135,7 @@ class LogitsMetadata:
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
-            (
-                forward_batch.forward_mode.is_extend()
-                or forward_batch.forward_mode.is_split_prefill()
-            )
+            forward_batch.forward_mode.is_extend()
             and forward_batch.return_logprob
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_simple_draft()
@@ -392,8 +389,8 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices = None
         elif (
             logits_metadata.forward_mode.is_extend()
-            or logits_metadata.forward_mode.is_split_prefill()
-        ) and not logits_metadata.extend_return_logprob:
+            and not logits_metadata.extend_return_logprob
+        ):
             # Prefill without input logprobs.
             if logits_metadata.padded_static_len < 0:
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
@@ -595,6 +592,11 @@ class LogitsProcessor(nn.Module):
                     lm_head.weight,
                     None,  # bias
                     True,  # is_vnni
+                )
+            elif get_global_server_args().rl_on_policy_target == "fsdp":
+                # Due to tie-weight, we may not be able to change lm_head's weight dtype
+                logits = torch.matmul(
+                    hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
                 logits = torch.matmul(
