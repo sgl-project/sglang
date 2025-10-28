@@ -39,6 +39,7 @@ from sglang.srt.utils.common import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
+    is_blackwell_supported,
     is_cuda,
     is_fa3_default_architecture,
     is_flashinfer_available,
@@ -98,6 +99,7 @@ QUANTIZATION_CHOICES = [
     "qoq",
     "w4afp8",
     "mxfp4",
+    "auto-round",
     "compressed-tensors",  # for Ktransformers
 ]
 
@@ -329,7 +331,7 @@ class ServerArgs:
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_eviction_policy: str = "lru"
-    lora_backend: str = "triton"
+    lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
 
     # Kernel backend
@@ -912,7 +914,7 @@ class ServerArgs:
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-            if is_sm100_supported():
+            if is_blackwell_supported():
                 if not self.enable_dp_attention:
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
@@ -924,7 +926,7 @@ class ServerArgs:
                 and quantization_config.get("quant_method") == "mxfp4"
             )
 
-            if is_sm100_supported() and is_mxfp4_quant_format:
+            if is_blackwell_supported() and is_mxfp4_quant_format:
                 self.moe_runner_backend = "flashinfer_mxfp4"
                 logger.warning(
                     "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
@@ -1144,7 +1146,7 @@ class ServerArgs:
             self.attention_backend == "trtllm_mla"
             or self.decode_attention_backend == "trtllm_mla"
         ):
-            if not is_sm100_supported():
+            if not is_blackwell_supported():
                 raise ValueError(
                     "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
                 )
