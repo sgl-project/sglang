@@ -54,8 +54,8 @@ use crate::{
         generate::GenerateRequest,
         rerank::RerankRequest,
         responses::{
-            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
-            ResponsesRequest,
+            generate_id, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
+            ResponsesGetParams, ResponsesRequest,
         },
     },
     routers::header_utils::apply_request_headers,
@@ -1067,10 +1067,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         if item.get("id").is_none() {
                             // Generate ID if not present using centralized utility
                             if let Some(obj) = item.as_object_mut() {
-                                obj.insert(
-                                    "id".to_string(),
-                                    json!(super::utils::generate_id("msg")),
-                                );
+                                obj.insert("id".to_string(), json!(generate_id("msg")));
                             }
                         }
                         item
