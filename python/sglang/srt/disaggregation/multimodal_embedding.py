@@ -77,6 +77,19 @@ class MultimodalEmbeddingBootstrapQueue:
         )
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
+
+        # Set required fields for multimodal (embedding mode doesn't use KV cache)
+        kv_args.kv_data_ptrs = []
+        kv_args.kv_data_lens = []
+        kv_args.kv_item_lens = []
+        kv_args.decode_tp_size = 0
+        kv_args.kv_head_num = 0
+        kv_args.page_size = 0
+        kv_args.prefill_pp_size = 1
+        kv_args.pp_rank = 0
+        kv_args.prefill_start_layer = 0
+        kv_args.system_dp_rank = 0
+
         data_manager_class = get_kv_class(
             self.transfer_backend, KVClassType.MANAGER, is_multimodal=True
         )
@@ -84,6 +97,7 @@ class MultimodalEmbeddingBootstrapQueue:
             kv_args,
             DisaggregationMode.ENCODE,
             self.scheduler.server_args,
+            is_multimodal=True,
         )
         return data_manager
 
