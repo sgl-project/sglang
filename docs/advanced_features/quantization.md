@@ -40,6 +40,81 @@ python3 -m sglang.launch_server \
 
 ### Examples of Offline Model Quantization
 
+#### Using [auto-round](https://github.com/intel/auto-round)
+
+```bash
+# Install
+pip install auto-round
+```
+
+- LLM quantization
+
+```py
+# for LLM
+from auto_round import AutoRound
+model_id = "meta-llama/Llama-3.2-1B-Instruct"
+quant_path = "Llama-3.2-1B-Instruct-autoround-4bit"
+# Scheme examples: "W2A16", "W3A16", "W4A16", "W8A16", "NVFP4", "MXFP4" (no real kernels), "GGUF:Q4_K_M", etc.
+scheme = "W4A16"
+format = "auto_round"
+autoround = AutoRound(model_id, scheme=scheme)
+autoround.quantize_and_save(quant_path, format=format) # quantize and save
+
+```
+
+- VLM quantization
+```py
+# for VLMs
+from auto_round import AutoRoundMLLM
+model_name = "Qwen/Qwen2-VL-2B-Instruct"
+quant_path = "Qwen2-VL-2B-Instruct-autoround-4bit"
+scheme = "W4A16"
+format = "auto_round"
+autoround = AutoRoundMLLM(model_name, scheme)
+autoround.quantize_and_save(quant_path, format=format) # quantize and save
+
+```
+
+- Command Line Usage (Gaudi/CPU/Intel GPU/CUDA)
+
+```bash
+auto-round \
+    --model meta-llama/Llama-3.2-1B-Instruct \
+    --bits 4 \
+    --group_size 128 \
+    --format "auto_round" \
+    --output_dir ./tmp_autoround
+```
+
+- known issues
+
+Several limitations currently affect offline quantized model loading in sglang, These issues might be resolved in future updates of sglang. If you experience any problems, consider using Hugging Face Transformers as an alternative.
+
+1. Mixed-bit Quantization Limitations
+
+    Mixed-bit quantization is not fully supported. Due to vLLM's layer fusion (e.g., QKV fusion), applying different bit-widths to components within the same fused layer can lead to compatibility issues.
+
+
+2. Limited Support for Quantized MoE Models
+
+    Quantized MoE models may encounter inference issues due to kernel limitations (e.g., lack of support for mlp.gate layer quantization). please try to skip quantizing these layers to avoid such errors.
+
+
+3. Limited Support for Quantized VLMs
+    <details>
+        <summary>VLM failure cases</summary>
+
+    Qwen2.5-VL-7B
+
+    auto_round:auto_gptq format:  Accuracy is close to zero.
+
+    GPTQ format:  Fails with:
+    ```
+    The output size is not aligned with the quantized weight shape
+    ```
+    auto_round:auto_awq and AWQ format:  These work as expected.
+    </details>
+
 #### Using [GPTQModel](https://github.com/ModelCloud/GPTQModel)
 
 ```bash
@@ -302,3 +377,4 @@ python3 -m sglang.launch_server \
 - [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
 - [Torchao: PyTorch Architecture Optimization](https://github.com/pytorch/ao)
 - [vLLM Quantization](https://docs.vllm.ai/en/latest/quantization/)
+- [auto-round](https://github.com/intel/auto-round)
