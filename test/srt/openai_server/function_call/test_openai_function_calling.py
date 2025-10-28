@@ -9,9 +9,11 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_TIMEOUT_FOR_ROUTER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    popen_launch_router_with_grpc_worker,
 )
 
 
@@ -947,6 +949,70 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
 
 #     def test_function_calling_multiturn(self):
 #         self._test_function_calling_multiturn()
+
+
+class TestOpenAIServerFunctionCallingGRPCRouter(TestOpenAIServerFunctionCalling):
+    """Inherits all tests from parent, changes architecture to router+gRPC"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+
+        cls.router_process, cls.worker_process = (
+            popen_launch_router_with_grpc_worker(
+                cls.model,
+                cls.base_url,
+                router_timeout=DEFAULT_TIMEOUT_FOR_ROUTER_LAUNCH,
+                worker_timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                api_key=cls.api_key,
+                worker_other_args=[
+                    "--tool-call-parser", 
+                    "llama3"
+                ],
+                router_other_args=[],
+            )
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.router_process.pid)
+        kill_process_tree(cls.worker_process.pid)
+
+
+class TestOpenAIPythonicFunctionCallingGRPCRouter(TestOpenAIPythonicFunctionCalling):
+    """Inherits all tests from parent, changes architecture to router+gRPC"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+
+        cls.router_process, cls.worker_process = (
+            popen_launch_router_with_grpc_worker(
+                cls.model,
+                cls.base_url,
+                router_timeout=DEFAULT_TIMEOUT_FOR_ROUTER_LAUNCH,
+                worker_timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                api_key=cls.api_key,
+                worker_other_args=[
+                    "--tool-call-parser", 
+                    "pythonic"
+                ],
+                router_other_args=[],
+            )
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.router_process.pid)
+        kill_process_tree(cls.worker_process.pid)
 
 
 if __name__ == "__main__":
