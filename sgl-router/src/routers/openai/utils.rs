@@ -32,17 +32,12 @@ pub(crate) mod event_types {
     pub const MCP_LIST_TOOLS_IN_PROGRESS: &str = "response.mcp_list_tools.in_progress";
     pub const MCP_LIST_TOOLS_COMPLETED: &str = "response.mcp_list_tools.completed";
 
-    // Web search events
-    pub const WEB_SEARCH_CALL_IN_PROGRESS: &str = "response.web_search_call.in_progress";
-    pub const WEB_SEARCH_CALL_COMPLETED: &str = "response.web_search_call.completed";
-
     // Item types
     pub const ITEM_TYPE_FUNCTION_CALL: &str = "function_call";
     pub const ITEM_TYPE_FUNCTION_TOOL_CALL: &str = "function_tool_call";
     pub const ITEM_TYPE_MCP_CALL: &str = "mcp_call";
     pub const ITEM_TYPE_FUNCTION: &str = "function";
     pub const ITEM_TYPE_MCP_LIST_TOOLS: &str = "mcp_list_tools";
-    pub const ITEM_TYPE_WEB_SEARCH_CALL: &str = "web_search_call";
 }
 
 // ============================================================================
