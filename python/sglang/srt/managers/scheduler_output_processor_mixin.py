@@ -312,7 +312,8 @@ class SchedulerOutputProcessorMixin:
                         # Free the one extra delayed token
                         assert (
                             req.kv_allocated_len == req.kv_freed_len
-                        ), f"{req.kv_allocated_len=}, {req.kv_freed_len=}"
+                            and req.kv_committed_len == req.kv_freed_len
+                        ), f"{req.kv_allocated_len=}, {req.kv_committed_len=}, {req.kv_freed_len=},"
                     else:
                         if (
                             len(req.origin_input_ids) + len(req.output_ids) - 1
