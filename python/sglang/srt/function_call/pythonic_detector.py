@@ -1,6 +1,7 @@
 import ast
 import json
 import logging
+import os
 import re
 from typing import List, Optional
 
@@ -91,7 +92,9 @@ class PythonicDetector(BaseFormatDetector):
                     logger.warning(
                         f"Model attempted to call undefined function: {function_name}"
                     )
-                    continue
+                    if os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS") != "TRUE":
+                        continue  # Skip unknown tools (default legacy behavior)
+
                 arguments = {}
                 for keyword in call.keywords:
                     arguments[keyword.arg] = self._get_parameter_value(keyword.value)

@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 from typing import List, Optional
 
@@ -220,7 +221,8 @@ class GptOssDetector(BaseFormatDetector):
         # Check if tool exists
         if function_name not in tool_indices:
             logger.debug(f"Function {function_name} not in available tools")
-            return None
+            if os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS") != "TRUE":
+                return None  # Skip unknown tools (default legacy behavior)
 
         # Parse JSON arguments
         try:
