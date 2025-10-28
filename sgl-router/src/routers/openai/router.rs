@@ -717,10 +717,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     StatusCode::BAD_REQUEST,
                     Json(json!({
                         "error": {
-                            "message": "Web search preview requested but MCP server 'web_search_preview' is not available. Please configure the MCP server.",
+                            "message": "Web search preview is currently unavailable. Please contact your server administrator.",
                             "type": "invalid_request_error",
                             "param": "tools",
-                            "code": "mcp_server_unavailable"
+                            "code": "web_search_unavailable"
                         }
                     })),
                 )

@@ -164,6 +164,16 @@ pub async fn ensure_request_mcp_client(
         .server_label
         .clone()
         .unwrap_or_else(|| "request-mcp".to_string());
+
+    // Validate that web_search_preview is not used as it's a reserved name
+    if name == web_search_constants::WEB_SEARCH_PREVIEW_SERVER_NAME {
+        warn!(
+            "Rejecting request MCP with reserved server name: {}",
+            name
+        );
+        return None;
+    }
+
     let token = tool.authorization.clone();
     let transport = if server_url.contains("/sse") {
         mcp::McpTransport::Sse {
