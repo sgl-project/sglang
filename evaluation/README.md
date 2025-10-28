@@ -2,9 +2,9 @@
 
 1. Docker image:
    For MI30X:
-   '''
+   ```
    rocm/sgl-dev:v0.5.3.post1-rocm700-mi30x-20251011
-   '''
+   ```
    For MI35X:
    ```
    rocm/sgl-dev:v0.5.3.post1-rocm700-mi35x-20251011
