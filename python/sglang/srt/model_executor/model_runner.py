@@ -2076,18 +2076,29 @@ class ModelRunner:
         from cutlass.cute.runtime import from_dlpack
         
         def create_c_tensor_mc(torch_tensor_cpu):
-            torch_symm_tensor = symm_mem.empty(
-                torch_tensor_cpu.shape, device="cuda", dtype=torch_tensor_cpu.dtype
-            )
-            torch_symm_tensor.copy_(torch_tensor_cpu)
-            symm = symm_mem.rendezvous(torch_symm_tensor, group=dist.group.WORLD.group_name)
-            mc_ptr = symm.multicast_ptr
+            # Try NVSHMEM first, fallback to torch symm_mem  
+            from sglang.srt.distributed.device_communicators.nvshmem_communicator import get_nvshmem_comm
+            nvshmem_comm = get_nvshmem_comm()
+        
+            if nvshmem_comm:
+                # Use NVSHMEM_SYMM_MEM
+                symm_tensor = nvshmem_comm.create_symmetric_tensor(torch_tensor_cpu.shape, dtype=torch_tensor_cpu.dtype)
+                mc_ptr = nvshmem_comm.create_multicast_pointer(symm_tensor)
+            else:
+                # Use TORCH_SYMM_MEM
+                symm_tensor = symm_mem.empty(
+                    torch_tensor_cpu.shape, device="cuda", dtype=torch_tensor_cpu.dtype
+                )
+                symm_tensor.copy_(torch_tensor_cpu)
+                symm = symm_mem.rendezvous(symm_tensor, group=dist.group.WORLD.group_name)
+                mc_ptr = symm.multicast_ptr
+
             cute_tensor_mc = from_dlpack(
                 cutlass_torch.as_tensor(mc_ptr, torch_tensor_cpu.shape, torch_tensor_cpu.dtype),
                 assumed_align=16,
             )
             cute_tensor_mc = cute_tensor_mc.mark_layout_dynamic(leading_dim=1)  # is_dynamic_layout=True
-            return torch_symm_tensor, cute_tensor_mc
+            return symm_tensor, cute_tensor_mc
 
         dtype_map = {
             torch.float16: cutlass.Float16,

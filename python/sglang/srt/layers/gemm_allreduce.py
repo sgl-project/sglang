@@ -2033,17 +2033,24 @@ class GemmARLayer:
         problem_shape_ntile_mn = (m // cta_tile_shape_mn[0], self.N // cta_tile_shape_mn[1])
         num_tiles = problem_shape_ntile_mn[0] * problem_shape_ntile_mn[1]
         num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-    
-        barrier_flag = symm_mem.empty(
-            (num_tiles + num_sms,), 
-            device=f"cuda", 
-            dtype=torch.int32
-        )
-        barrier_flag.fill_(0)
-        symm = symm_mem.rendezvous(barrier_flag, group=self.tp_group.group_name)
-        # symm = symm_mem.rendezvous(barrier_flag, group=dist.group.WORLD.group_name)        
-        barrier_flag_mc = symm.multicast_ptr
-            
+
+        # Try NVSHMEM first, fallback to torch symm_mem  
+        from cuda.core.experimental import Device, system
+        import nvshmem.core
+        from sglang.srt.distributed.device_communicators.nvshmem_communicator import get_nvshmem_comm
+        nvshmem_comm = get_nvshmem_comm()
+        
+        if nvshmem_comm:
+            # Use NVSHMEM_SYMM_MEM
+            barrier_flag = nvshmem_comm.create_symmetric_tensor((num_tiles + num_sms,), dtype=torch.int32)
+            barrier_flag_mc = nvshmem_comm.create_multicast_pointer(barrier_flag)
+        else:
+            # Use TORCH_SYMM_MEM
+            barrier_flag = symm_mem.empty((num_tiles + num_sms,), device="cuda", dtype=torch.int32)
+            barrier_flag.fill_(0)
+            symm = symm_mem.rendezvous(barrier_flag, group=dist.group.WORLD.group_name)
+            barrier_flag_mc = symm.multicast_ptr
+
         barrier_flag_memref = from_dlpack(barrier_flag)
         barrier_flag_memref = barrier_flag_memref.mark_layout_dynamic()
         barrier_flag_mc_memref = from_dlpack(
