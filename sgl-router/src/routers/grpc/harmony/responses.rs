@@ -688,9 +688,10 @@ fn inject_mcp_metadata(
     tracking: &McpCallTracking,
     mcp_manager: &Arc<McpManager>,
 ) {
-    use crate::protocols::responses::{McpToolInfo, ResponseOutputItem};
     use serde_json::{json, Value};
     use uuid::Uuid;
+
+    use crate::protocols::responses::{McpToolInfo, ResponseOutputItem};
 
     // Build mcp_list_tools item
     let tools = mcp_manager.list_tools();

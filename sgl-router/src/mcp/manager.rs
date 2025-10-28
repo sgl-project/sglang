@@ -600,7 +600,7 @@ impl McpManager {
                 }
             }
         })
-        .await
+            .await
     }
 
     /// Determine if an error is permanent (should not retry) or transient
@@ -644,7 +644,7 @@ impl McpManager {
                             .stderr(std::process::Stdio::inherit());
                     }),
                 )
-                .map_err(|e| McpError::Transport(format!("create stdio transport: {}", e)))?;
+                    .map_err(|e| McpError::Transport(format!("create stdio transport: {}", e)))?;
 
                 let client = ().serve(transport).await.map_err(|e| {
                     McpError::ConnectionFailed(format!("initialize stdio client: {}", e))
