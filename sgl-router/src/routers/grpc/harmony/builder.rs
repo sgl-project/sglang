@@ -144,7 +144,11 @@ impl HarmonyBuilder {
             .collect();
 
         // Decode tokens to see what the model actually receives
-        let decoded_text = self.encoding.tokenizer().decode_utf8(&token_ids).unwrap_or_else(|_| "<decode error>".to_string());
+        let decoded_text = self
+            .encoding
+            .tokenizer()
+            .decode_utf8(&token_ids)
+            .unwrap_or_else(|_| "<decode error>".to_string());
         debug!(
             token_count = token_ids.len(),
             token_preview = ?&token_ids[..token_ids.len().min(20)],

@@ -143,12 +143,16 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             _ => unreachable!(),
         };
 
-        // Inject Harmony stop token IDs into sampling params (Chat only - Responses already has them)
-        if matches!(&ctx.input.request_type, RequestType::Chat(_)) {
-            if let Some(harmony_stops) = &prep.harmony_stop_ids {
-                if let Some(params) = proto_request.sampling_params.as_mut() {
-                    params.stop_token_ids.extend_from_slice(harmony_stops);
-                }
+        // Inject Harmony stop token IDs into sampling params for ALL Harmony requests
+        // These stop tokens (<|return|> and <|call|>) prevent the model from generating
+        // malformed Harmony sequences
+        if let Some(harmony_stops) = &prep.harmony_stop_ids {
+            if let Some(params) = proto_request.sampling_params.as_mut() {
+                params.stop_token_ids.extend_from_slice(harmony_stops);
+                debug!(
+                    stop_token_count = harmony_stops.len(),
+                    "Injected Harmony stop tokens into sampling params"
+                );
             }
         }
 
