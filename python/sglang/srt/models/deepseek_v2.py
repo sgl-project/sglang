@@ -36,9 +36,11 @@ from sglang.srt.configs.model_config import (
     is_deepseek_nsa,
 )
 from sglang.srt.distributed import (
+    divide,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
@@ -142,6 +144,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -2832,9 +2835,10 @@ class DeepseekV2Model(nn.Module):
             allocate_size = 0
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
-                    allocate_size = self.layers[
-                        i
-                    ].mlp.shared_experts.gate_up_proj.output_size_per_partition
+                    tp_size = get_tensor_model_parallel_world_size()
+                    intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+                    share_expert_output_size_per_partition = divide(intermediate_size * 2, tp_size)
+                    allocate_size = share_expert_output_size_per_partition
                     break
 
             self.gemm_output_zero_allocator_size = (
