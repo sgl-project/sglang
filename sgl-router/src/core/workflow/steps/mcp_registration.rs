@@ -204,7 +204,7 @@ impl StepExecutor for ValidateRegistrationStep {
             .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
 
         let client_registered = context
-            .get::<Arc<RunningService<RoleClient, ()>>>("mcp_client")
+            .get::<RunningService<RoleClient, ()>>("mcp_client")
             .is_some();
 
         if client_registered {
