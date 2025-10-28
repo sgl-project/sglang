@@ -31,7 +31,6 @@ use super::{
     },
     responses::{
         mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block,
-        transform_web_search_output_items,
     },
     utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
 };
@@ -912,6 +911,7 @@ pub(super) fn send_final_response_event(
     original_request: &ResponsesRequest,
     previous_response_id: Option<&str>,
     server_label: &str,
+    is_web_search: bool,
 ) -> bool {
     let mut final_response = match handler.snapshot_final_response() {
         Some(resp) => resp,
@@ -928,10 +928,9 @@ pub(super) fn send_final_response_event(
     }
 
     if let Some(mcp) = active_mcp {
-        inject_mcp_metadata_streaming(&mut final_response, state, mcp, server_label);
+        inject_mcp_metadata_streaming(&mut final_response, state, mcp, server_label, is_web_search);
     }
 
-    transform_web_search_output_items(&mut final_response);
     mask_tools_as_mcp(&mut final_response, original_request);
     patch_streaming_response_json(&mut final_response, original_request, previous_response_id);
 
@@ -1366,6 +1365,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     &original_request,
                     previous_response_id.as_deref(),
                     server_label,
+                    is_web_search,
                 ) {
                     return;
                 }
@@ -1387,9 +1387,9 @@ pub(super) async fn handle_streaming_with_tool_interception(
                         &state,
                         &active_mcp_clone,
                         server_label,
+                        is_web_search,
                     );
 
-                    transform_web_search_output_items(&mut response_json);
                     mask_tools_as_mcp(&mut response_json, &original_request);
                     patch_streaming_response_json(
                         &mut response_json,
@@ -1449,6 +1449,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                 &mut state,
                 server_label,
                 &mut sequence_number,
+                is_web_search,
             )
             .await
             {

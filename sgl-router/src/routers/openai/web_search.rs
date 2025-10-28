@@ -1,13 +1,15 @@
 //! Web Search Preview Integration (MVP - Minimal)
 //!
-//! This module handles transformation between OpenAI's web_search_preview format
-//! and MCP-based web search tool calls.
+//! This module handles the web_search_preview tool type, which provides a simplified
+//! interface for web search capabilities via MCP servers.
 //!
-//! MVP Scope:
+//! Key responsibilities:
 //! - Detect web_search_preview tool in requests
 //! - Check MCP server availability
-//! - Transform to/from function calls
-//! - Build minimal web_search_call output items (status only)
+//! - Build web_search_call output items (status only, MVP)
+//!
+//! The actual transformation logic (MCP tools → function tools, mcp_call → web_search_call)
+//! happens in other modules (prepare_mcp_payload_for_streaming, build_mcp_call_item).
 //!
 //! Future: search_context_size, user_location, results exposure
 
@@ -19,7 +21,7 @@ use crate::mcp::McpManager;
 use crate::protocols::responses::{generate_id, ResponseTool, ResponseToolType};
 
 // ============================================================================
-// Tool Detection & Transformation
+// Tool Detection
 // ============================================================================
 
 /// Detect if request has web_search_preview tool
@@ -35,27 +37,6 @@ pub async fn is_web_search_mcp_available(mcp_manager: &Arc<McpManager>) -> bool 
         .get_client("web_search_preview")
         .await
         .is_some()
-}
-
-/// Transform web_search_preview tool to MCP function tools
-/// Returns function tools from the "web_search_preview" MCP server
-pub fn transform_web_search_to_mcp_functions(mcp_manager: &Arc<McpManager>) -> Vec<Value> {
-    // Get tools from inventory with server names
-    // Returns Vec<(tool_name, server_name, Tool)>
-    let tools = mcp_manager.inventory().list_tools();
-
-    tools
-        .iter()
-        .filter(|(_, server_name, _)| server_name == "web_search_preview")
-        .map(|(_, _, tool)| {
-            json!({
-                "type": "function",
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.input_schema.clone()
-            })
-        })
-        .collect()
 }
 
 // ============================================================================
@@ -88,26 +69,6 @@ pub fn build_web_search_call_item_failed(error: &str) -> Value {
         },
         "error": error
     })
-}
-
-/// Convert mcp_call item to web_search_call item (MVP - minimal)
-pub fn mcp_call_to_web_search_call(mcp_call_item: &Value) -> Value {
-    let status = mcp_call_item
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("completed");
-
-    if status != "completed" {
-        // Return failed web_search_call
-        let error = mcp_call_item
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown error");
-        return build_web_search_call_item_failed(error);
-    }
-
-    // Return successful web_search_call (status only, no results)
-    build_web_search_call_item()
 }
 
 // ============================================================================
@@ -163,35 +124,5 @@ mod tests {
         assert_eq!(item["status"], "failed");
         assert_eq!(item["error"], "Test error");
         assert_eq!(item["action"]["type"], "search");
-    }
-
-    #[test]
-    fn test_mcp_call_to_web_search_call_success() {
-        let mcp_call = json!({
-            "type": "mcp_call",
-            "status": "completed",
-            "server_label": "web_search_preview",
-            "output": "search results here"
-        });
-
-        let ws_call = mcp_call_to_web_search_call(&mcp_call);
-        assert_eq!(ws_call["type"], "web_search_call");
-        assert_eq!(ws_call["status"], "completed");
-        assert!(ws_call.get("results").is_none()); // MVP: no results
-    }
-
-    #[test]
-    fn test_mcp_call_to_web_search_call_failed() {
-        let mcp_call = json!({
-            "type": "mcp_call",
-            "status": "failed",
-            "server_label": "web_search_preview",
-            "error": "Search failed"
-        });
-
-        let ws_call = mcp_call_to_web_search_call(&mcp_call);
-        assert_eq!(ws_call["type"], "web_search_call");
-        assert_eq!(ws_call["status"], "failed");
-        assert_eq!(ws_call["error"], "Search failed");
     }
 }

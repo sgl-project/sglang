@@ -269,24 +269,6 @@ pub(super) fn rewrite_streaming_block(
     Some(rebuilt_lines.join("\n"))
 }
 
-/// Transform mcp_call items to web_search_call items if web_search_preview was used
-pub(super) fn transform_web_search_output_items(response: &mut Value) {
-    if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
-        for item in output_array.iter_mut() {
-            if item.get("type").and_then(|t| t.as_str()) == Some("mcp_call") {
-                // Check if this mcp_call is from web_search_preview server
-                let server_label = item.get("server_label").and_then(|s| s.as_str());
-
-                if server_label == Some("web_search_preview") {
-                    // Transform to web_search_call (minimal, status only)
-                    let ws_item = crate::routers::openai::web_search::mcp_call_to_web_search_call(item);
-                    *item = ws_item;
-                }
-            }
-        }
-    }
-}
-
 /// Mask function tools as MCP tools in response for client
 pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
     // Check for MCP tool

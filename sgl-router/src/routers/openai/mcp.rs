@@ -202,6 +202,7 @@ pub(super) async fn execute_streaming_tool_calls(
     state: &mut ToolLoopState,
     server_label: &str,
     sequence_number: &mut u64,
+    is_web_search: bool,
 ) -> bool {
     // Execute all pending tool calls (sequential, as PR3 is skipped)
     for call in pending_calls {
@@ -258,6 +259,7 @@ pub(super) async fn execute_streaming_tool_calls(
             success,
             error_msg.as_deref(),
             sequence_number,
+            is_web_search,
         ) {
             // Client disconnected, no point continuing tool execution
             return false;
@@ -489,6 +491,7 @@ pub(super) fn send_mcp_call_completion_events_with_error(
     success: bool,
     error_msg: Option<&str>,
     sequence_number: &mut u64,
+    is_web_search: bool,
 ) -> bool {
     let effective_output_index = call.effective_output_index();
 
@@ -500,6 +503,7 @@ pub(super) fn send_mcp_call_completion_events_with_error(
         server_label,
         success,
         error_msg,
+        is_web_search,
     );
 
     // Get the mcp_call item_id
@@ -553,28 +557,40 @@ pub(super) fn inject_mcp_metadata_streaming(
     state: &ToolLoopState,
     mcp: &Arc<mcp::McpManager>,
     server_label: &str,
+    is_web_search: bool,
 ) {
     if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
         output_array.retain(|item| {
             item.get("type").and_then(|t| t.as_str()) != Some(event_types::ITEM_TYPE_MCP_LIST_TOOLS)
         });
 
-        let list_tools_item = build_mcp_list_tools_item(mcp, server_label);
-        output_array.insert(0, list_tools_item);
+        let mut insert_pos = 0;
+
+        // Only add mcp_list_tools for non-web-search cases
+        if !is_web_search {
+            let list_tools_item = build_mcp_list_tools_item(mcp, server_label);
+            output_array.insert(0, list_tools_item);
+            insert_pos = 1;
+        }
 
         let mcp_call_items =
-            build_executed_mcp_call_items(&state.conversation_history, server_label);
-        let mut insert_pos = 1;
+            build_executed_mcp_call_items(&state.conversation_history, server_label, is_web_search);
         for item in mcp_call_items {
             output_array.insert(insert_pos, item);
             insert_pos += 1;
         }
     } else if let Some(obj) = response.as_object_mut() {
         let mut output_items = Vec::new();
-        output_items.push(build_mcp_list_tools_item(mcp, server_label));
+
+        // Only add mcp_list_tools for non-web-search cases
+        if !is_web_search {
+            output_items.push(build_mcp_list_tools_item(mcp, server_label));
+        }
+
         output_items.extend(build_executed_mcp_call_items(
             &state.conversation_history,
             server_label,
+            is_web_search,
         ));
         obj.insert("output".to_string(), Value::Array(output_items));
     }
@@ -593,6 +609,7 @@ pub(super) async fn execute_tool_loop(
     original_body: &ResponsesRequest,
     active_mcp: &Arc<mcp::McpManager>,
     config: &McpLoopConfig,
+    is_web_search: bool,
 ) -> Result<Value, String> {
     let mut state = ToolLoopState::new(original_body.input.clone());
 
@@ -673,6 +690,7 @@ pub(super) async fn execute_tool_loop(
                     "max_tool_calls",
                     active_mcp,
                     original_body,
+                    is_web_search,
                 );
             }
 
@@ -731,22 +749,25 @@ pub(super) async fn execute_tool_loop(
                     })
                     .unwrap_or("mcp");
 
-                // Build mcp_list_tools item
-                let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
-
                 // Insert at beginning of output array
                 if let Some(output_array) = response_json
                     .get_mut("output")
                     .and_then(|v| v.as_array_mut())
                 {
-                    output_array.insert(0, list_tools_item);
+                    let mut insert_pos = 0;
 
-                    // Build mcp_call items using helper function
+                    // Only add mcp_list_tools for non-web-search cases
+                    if !is_web_search {
+                        let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
+                        output_array.insert(0, list_tools_item);
+                        insert_pos = 1;
+                    }
+
+                    // Build mcp_call items (will be web_search_call for web search tools)
                     let mcp_call_items =
-                        build_executed_mcp_call_items(&state.conversation_history, server_label);
+                        build_executed_mcp_call_items(&state.conversation_history, server_label, is_web_search);
 
-                    // Insert mcp_call items after mcp_list_tools using mutable position
-                    let mut insert_pos = 1;
+                    // Insert call items after mcp_list_tools (if present)
                     for item in mcp_call_items {
                         output_array.insert(insert_pos, item);
                         insert_pos += 1;
@@ -766,6 +787,7 @@ pub(super) fn build_incomplete_response(
     reason: &str,
     active_mcp: &Arc<mcp::McpManager>,
     original_body: &ResponsesRequest,
+    is_web_search: bool,
 ) -> Result<Value, String> {
     let obj = response
         .as_object_mut()
@@ -814,6 +836,7 @@ pub(super) fn build_incomplete_response(
                     server_label,
                     false, // Not successful
                     Some("Not executed - response stopped due to limit"),
+                    is_web_search,
                 );
                 mcp_call_items.push(mcp_call_item);
             }
@@ -821,20 +844,25 @@ pub(super) fn build_incomplete_response(
 
         // Add mcp_list_tools and executed mcp_call items at the beginning
         if state.total_calls > 0 || !mcp_call_items.is_empty() {
-            let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
-            output_array.insert(0, list_tools_item);
+            let mut insert_pos = 0;
 
-            // Add mcp_call items for executed calls using helper
+            // Only add mcp_list_tools for non-web-search cases
+            if !is_web_search {
+                let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
+                output_array.insert(0, list_tools_item);
+                insert_pos = 1;
+            }
+
+            // Add mcp_call items for executed calls (will be web_search_call for web search)
             let executed_items =
-                build_executed_mcp_call_items(&state.conversation_history, server_label);
+                build_executed_mcp_call_items(&state.conversation_history, server_label, is_web_search);
 
-            let mut insert_pos = 1;
             for item in executed_items {
                 output_array.insert(insert_pos, item);
                 insert_pos += 1;
             }
 
-            // Add incomplete mcp_call items
+            // Add incomplete mcp_call items (will be web_search_call for web search)
             for item in mcp_call_items {
                 output_array.insert(insert_pos, item);
                 insert_pos += 1;
@@ -899,24 +927,39 @@ pub(super) fn build_mcp_call_item(
     server_label: &str,
     success: bool,
     error: Option<&str>,
+    is_web_search: bool,
 ) -> Value {
-    json!({
-        "id": generate_id("mcp"),
-        "type": event_types::ITEM_TYPE_MCP_CALL,
-        "status": if success { "completed" } else { "failed" },
-        "approval_request_id": Value::Null,
-        "arguments": arguments,
-        "error": error,
-        "name": tool_name,
-        "output": output,
-        "server_label": server_label
-    })
+    // Check if this is a web_search_preview context - if so, build web_search_call format
+    if is_web_search {
+        // Build web_search_call item (MVP - status only, no results)
+        if success {
+            crate::routers::openai::web_search::build_web_search_call_item()
+        } else {
+            crate::routers::openai::web_search::build_web_search_call_item_failed(
+                error.unwrap_or("Tool execution failed"),
+            )
+        }
+    } else {
+        // Regular mcp_call item
+        json!({
+            "id": generate_id("mcp"),
+            "type": event_types::ITEM_TYPE_MCP_CALL,
+            "status": if success { "completed" } else { "failed" },
+            "approval_request_id": Value::Null,
+            "arguments": arguments,
+            "error": error,
+            "name": tool_name,
+            "output": output,
+            "server_label": server_label
+        })
+    }
 }
 
 /// Helper function to build mcp_call items from executed tool calls in conversation history
 pub(super) fn build_executed_mcp_call_items(
     conversation_history: &[Value],
     server_label: &str,
+    is_web_search: bool,
 ) -> Vec<Value> {
     let mut mcp_call_items = Vec::new();
 
@@ -955,6 +998,7 @@ pub(super) fn build_executed_mcp_call_items(
                 } else {
                     None
                 },
+                is_web_search,
             );
             mcp_call_items.push(mcp_call_item);
         }

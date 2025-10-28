@@ -34,7 +34,7 @@ use super::{
         McpLoopConfig,
     },
     responses::{
-        mask_tools_as_mcp, patch_streaming_response_json, transform_web_search_output_items,
+        mask_tools_as_mcp, patch_streaming_response_json,
     },
     streaming::handle_streaming_response,
     utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model},
@@ -282,6 +282,7 @@ impl OpenAIRouter {
                 original_body,
                 mcp,
                 &config,
+                is_web_search,
             )
             .await
             {
@@ -344,7 +345,6 @@ impl OpenAIRouter {
         }
 
         // Patch response with metadata
-        transform_web_search_output_items(&mut response_json);
         mask_tools_as_mcp(&mut response_json, original_body);
         patch_streaming_response_json(
             &mut response_json,

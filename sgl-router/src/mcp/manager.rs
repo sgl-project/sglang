@@ -237,10 +237,23 @@ impl McpManager {
 
         // Convert args with type coercion based on schema
         let tool_schema = Some(serde_json::Value::Object((*tool_info.input_schema).clone()));
+
+        debug!(
+            "Tool '{}' schema: {}",
+            tool_name,
+            serde_json::to_string_pretty(&tool_schema).unwrap_or_default()
+        );
+
         let args_map = args
             .into()
             .into_map(tool_schema.as_ref())
             .map_err(McpError::InvalidArguments)?;
+
+        debug!(
+            "Tool '{}' arguments after type coercion: {}",
+            tool_name,
+            serde_json::to_string_pretty(&args_map).unwrap_or_default()
+        );
 
         // Get client for that server
         let client = self
@@ -253,6 +266,13 @@ impl McpManager {
             name: Cow::Owned(tool_name.to_string()),
             arguments: args_map,
         };
+
+        debug!(
+            "Sending MCP request to server '{}': tool={}, args={}",
+            server_name,
+            tool_name,
+            serde_json::to_string(&request.arguments).unwrap_or_default()
+        );
 
         client
             .call_tool(request)
