@@ -678,7 +678,7 @@ class RadixCache(BasePrefixCache):
         while stack:
             cur_node = stack.pop()
             if len(cur_node.children) == 0:
-                if (cur_node.lock_ref == 0):
+                if cur_node.lock_ref == 0:
                     ret_list.append(cur_node)
             else:
                 stack.extend(cur_node.children.values())
