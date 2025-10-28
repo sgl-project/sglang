@@ -1,19 +1,28 @@
-use super::{CircuitBreaker, WorkerError, WorkerResult};
-use crate::core::CircuitState;
-use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder};
-use crate::grpc::SglangSchedulerClient;
-use crate::metrics::RouterMetrics;
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, LazyLock,
+    },
+    time::{Duration, Instant},
+};
+
 use async_trait::async_trait;
-use futures;
+use serde::{Deserialize, Serialize};
 use serde_json;
-use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
-use tokio::sync::Mutex;
+use tokio::{sync::RwLock, time};
+
+use super::{CircuitBreaker, WorkerError, WorkerResult};
+use crate::{
+    core::{BasicWorkerBuilder, CircuitState, DPAwareWorkerBuilder},
+    grpc_client::SglangSchedulerClient,
+    metrics::RouterMetrics,
+    protocols::worker_spec::WorkerInfo,
+};
 
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
         .build()
         .expect("Failed to create worker HTTP client")
 });
@@ -30,6 +39,18 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get the worker's connection mode (HTTP or gRPC)
     fn connection_mode(&self) -> ConnectionMode;
+
+    /// Get the bootstrap hostname for PD mode
+    /// Returns cached hostname parsed from URL at construction time
+    fn bootstrap_host(&self) -> &str {
+        &self.metadata().bootstrap_host
+    }
+
+    /// Get the bootstrap port for PD mode
+    /// Returns cached port from WorkerType::Prefill
+    fn bootstrap_port(&self) -> Option<u16> {
+        self.metadata().bootstrap_port
+    }
 
     /// Check if the worker is currently healthy
     fn is_healthy(&self) -> bool;
@@ -147,21 +168,6 @@ pub trait Worker: Send + Sync + fmt::Debug {
         true
     }
 
-    // TODO: - Enhanced Worker Discovery
-    // The Worker trait should handle async discovery of metadata from the worker itself
-    // rather than having service discovery or other components query /get_server_info.
-    // This keeps service discovery decoupled from worker-specific APIs.
-    //
-    // Proposed additions:
-    // - async fn discover_metadata(&mut self) -> Result<(), Error>
-    //   Query /get_server_info and populate metadata labels with model_id, priority, cost, etc.
-    // - async fn validate_configuration(&self) -> Result<(), Error>
-    //   Ensure worker has required configuration for its mode (e.g., tokenizer for gRPC)
-    // - Make worker creation async to allow metadata discovery during initialization
-    //
-    // This way service discovery just calls router.add_worker() and the worker
-    // handles its own metadata discovery internally.
-
     /// Get the model ID this worker serves
     fn model_id(&self) -> &str {
         self.metadata()
@@ -220,18 +226,48 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .get("chat_template")
             .map(|s| s.as_str())
     }
+
+    /// Get or create a gRPC client for this worker
+    /// Returns None for HTTP workers, Some(client) for gRPC workers
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>>;
+
+    /// Reset the gRPC client connection (for reconnection scenarios)
+    /// No-op for HTTP workers
+    async fn reset_grpc_client(&self) -> WorkerResult<()> {
+        Ok(())
+    }
+    async fn grpc_health_check(&self) -> WorkerResult<bool>;
+    async fn http_health_check(&self) -> WorkerResult<bool>;
 }
 
 /// Connection mode for worker communication
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum ConnectionMode {
     /// HTTP/REST connection
+    #[default]
     Http,
     /// gRPC connection
     Grpc {
         /// Optional port for gRPC endpoint (if different from URL)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         port: Option<u16>,
     },
+}
+
+impl ConnectionMode {
+    /// Check if this connection mode matches another, with special handling for gRPC
+    /// This allows matching any gRPC connection regardless of port when comparing
+    /// Grpc { port: None } as a wildcard
+    pub fn matches(&self, filter: &ConnectionMode) -> bool {
+        match (self, filter) {
+            (ConnectionMode::Http, ConnectionMode::Http) => true,
+            (ConnectionMode::Grpc { .. }, ConnectionMode::Grpc { port: None }) => true,
+            (ConnectionMode::Grpc { port: p1 }, ConnectionMode::Grpc { port: p2 }) => p1 == p2,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for ConnectionMode {
@@ -315,6 +351,10 @@ pub struct WorkerMetadata {
     pub health_config: HealthConfig,
     /// API key
     pub api_key: Option<String>,
+    /// Cached bootstrap hostname (parsed from URL at construction time)
+    pub bootstrap_host: String,
+    /// Cached bootstrap port (from WorkerType::Prefill)
+    pub bootstrap_port: Option<u16>,
 }
 
 /// Basic worker implementation
@@ -327,8 +367,8 @@ pub struct BasicWorker {
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
-    /// Optional gRPC client for gRPC workers
-    pub grpc_client: Option<Arc<Mutex<SglangSchedulerClient>>>,
+    /// Lazily initialized gRPC client for gRPC workers
+    pub grpc_client: Arc<RwLock<Option<Arc<SglangSchedulerClient>>>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -337,7 +377,7 @@ impl fmt::Debug for BasicWorker {
             .field("metadata", &self.metadata)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
             .field("circuit_breaker", &self.circuit_breaker)
-            .field("has_grpc_client", &self.grpc_client.is_some())
+            .field("grpc_client", &"<RwLock>")
             .finish()
     }
 }
@@ -345,17 +385,22 @@ impl fmt::Debug for BasicWorker {
 impl BasicWorker {
     pub fn normalised_url(&self) -> WorkerResult<&str> {
         if self.url().contains("@") {
-            let parts: Vec<&str> = self.url().split('@').collect();
-            if parts.len() != 2 {
-                return Err(WorkerError::InvalidUrl {
-                    url: self.url().to_string(),
-                });
-            }
-            match parts[1].parse::<usize>() {
-                Ok(_) => Ok(parts[0]),
-                Err(_) => Err(WorkerError::InvalidUrl {
-                    url: self.url().to_string(),
-                }),
+            // Use rfind to split from the right, handling IPv6 addresses with brackets
+            // e.g., "http://[::1]:8080@0" -> "http://[::1]:8080" and "0"
+            if let Some(at_pos) = self.url().rfind('@') {
+                let base_url = &self.url()[..at_pos];
+                let rank_str = &self.url()[at_pos + 1..];
+
+                // Validate that the rank part is actually a number
+                match rank_str.parse::<usize>() {
+                    Ok(_) => Ok(base_url),
+                    Err(_) => {
+                        // The '@' is not a DP rank separator, return full URL
+                        Ok(self.url())
+                    }
+                }
+            } else {
+                Ok(self.url())
             }
         } else {
             Ok(self.url())
@@ -391,51 +436,9 @@ impl Worker for BasicWorker {
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
-        use std::time::Duration;
-
         let health_result = match &self.metadata.connection_mode {
-            ConnectionMode::Http => {
-                let url = self.normalised_url()?;
-                let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
-                let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-
-                let mut request = WORKER_CLIENT.get(&health_url).timeout(timeout);
-
-                if let Some(ref api_key) = self.metadata.api_key {
-                    request = request.header("Authorization", format!("Bearer {}", api_key));
-                }
-
-                match request.send().await {
-                    Ok(response) => response.status().is_success(),
-                    Err(_) => false,
-                }
-            }
-            ConnectionMode::Grpc { .. } => {
-                if let Some(grpc_client) = &self.grpc_client {
-                    let mut client = grpc_client.lock().await;
-                    match client.health_check().await {
-                        Ok(response) => {
-                            tracing::debug!(
-                                "gRPC health check succeeded for {}: healthy={}",
-                                self.metadata.url,
-                                response.healthy
-                            );
-                            response.healthy
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "gRPC health check RPC failed for {}: {:?}",
-                                self.metadata.url,
-                                e
-                            );
-                            false
-                        }
-                    }
-                } else {
-                    tracing::error!("No gRPC client available for worker {}", self.metadata.url);
-                    false
-                }
-            }
+            ConnectionMode::Http => self.http_health_check().await?,
+            ConnectionMode::Grpc { .. } => self.grpc_health_check().await?,
         };
 
         if health_result {
@@ -501,6 +504,121 @@ impl Worker for BasicWorker {
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
+    }
+
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>> {
+        match self.metadata.connection_mode {
+            ConnectionMode::Http => Ok(None),
+            ConnectionMode::Grpc { .. } => {
+                {
+                    let client_guard = self.grpc_client.read().await;
+                    if let Some(ref client) = *client_guard {
+                        return Ok(Some(client.clone()));
+                    }
+                }
+
+                let mut client_guard = self.grpc_client.write().await;
+
+                if let Some(ref client) = *client_guard {
+                    return Ok(Some(client.clone()));
+                }
+
+                tracing::info!(
+                    "Lazily initializing gRPC client for worker: {}",
+                    self.metadata.url
+                );
+                match SglangSchedulerClient::connect(&self.metadata.url).await {
+                    Ok(client) => {
+                        let client_arc = Arc::new(client);
+                        *client_guard = Some(client_arc.clone());
+                        tracing::info!(
+                            "Successfully connected gRPC client for worker: {}",
+                            self.metadata.url
+                        );
+                        Ok(Some(client_arc))
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to connect gRPC client for worker {}: {}",
+                            self.metadata.url,
+                            e
+                        );
+                        Err(WorkerError::ConnectionFailed {
+                            url: self.metadata.url.clone(),
+                            reason: format!("Failed to connect to gRPC server: {}", e),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    async fn reset_grpc_client(&self) -> WorkerResult<()> {
+        match self.metadata.connection_mode {
+            ConnectionMode::Http => Ok(()),
+            ConnectionMode::Grpc { .. } => {
+                let mut client_guard = self.grpc_client.write().await;
+                if client_guard.is_some() {
+                    tracing::info!("Resetting gRPC client for worker: {}", self.metadata.url);
+                    *client_guard = None;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn grpc_health_check(&self) -> WorkerResult<bool> {
+        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+        let maybe = self.get_grpc_client().await?;
+        let Some(grpc_client) = maybe else {
+            tracing::error!(
+                "Worker {} is not a gRPC worker but connection mode is gRPC",
+                self.metadata.url
+            );
+            return Ok(false);
+        };
+
+        match time::timeout(timeout, grpc_client.health_check()).await {
+            Ok(Ok(resp)) => {
+                tracing::debug!(
+                    "gRPC health OK for {}: healthy={}",
+                    self.metadata.url,
+                    resp.healthy
+                );
+                Ok(resp.healthy)
+            }
+            Ok(Err(err)) => {
+                tracing::warn!("gRPC health RPC error for {}: {err:?}", self.metadata.url);
+                Ok(false)
+            }
+            Err(_) => {
+                tracing::warn!("gRPC health timed out for {}", self.metadata.url);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn http_health_check(&self) -> WorkerResult<bool> {
+        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+
+        let url = self.normalised_url()?;
+        let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
+
+        let mut req = WORKER_CLIENT.get(health_url).timeout(timeout);
+        if let Some(api_key) = &self.metadata.api_key {
+            req = req.bearer_auth(api_key);
+        }
+
+        match req.send().await {
+            Ok(resp) => Ok(resp.status().is_success()),
+            Err(err) => {
+                tracing::warn!(
+                    "HTTP health check failed for {}: {err:?}",
+                    self.metadata.url
+                );
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -630,6 +748,22 @@ impl Worker for DPAwareWorker {
     fn endpoint_url(&self, route: &str) -> String {
         format!("{}{}", self.base_url, route)
     }
+
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>> {
+        self.base_worker.get_grpc_client().await
+    }
+
+    async fn reset_grpc_client(&self) -> WorkerResult<()> {
+        self.base_worker.reset_grpc_client().await
+    }
+
+    async fn grpc_health_check(&self) -> WorkerResult<bool> {
+        self.base_worker.grpc_health_check().await
+    }
+
+    async fn http_health_check(&self) -> WorkerResult<bool> {
+        self.base_worker.http_health_check().await
+    }
 }
 
 /// Worker factory for creating workers of different types
@@ -655,10 +789,8 @@ impl WorkerFactory {
     /// Static health validation before creating a worker
     /// This replaces wait_for_worker_health in handlers
     pub async fn validate_health(url: &str, timeout_secs: u64) -> WorkerResult<()> {
-        use std::time::Instant;
-
         let start_time = Instant::now();
-        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let timeout = Duration::from_secs(timeout_secs);
 
         loop {
             if start_time.elapsed() > timeout {
@@ -675,7 +807,7 @@ impl WorkerFactory {
             // API key authentication is handled in the worker instance's check_health_async method
             match WORKER_CLIENT
                 .get(format!("{}/health", url))
-                .timeout(std::time::Duration::from_secs(5))
+                .timeout(Duration::from_secs(5))
                 .send()
                 .await
             {
@@ -695,7 +827,7 @@ impl WorkerFactory {
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            time::sleep(Duration::from_secs(1)).await;
         }
     }
 }
@@ -782,96 +914,45 @@ impl HealthChecker {
     }
 }
 
-/// Start an async background health checker for a collection of workers
-pub fn start_health_checker(
-    workers: Arc<std::sync::RwLock<Vec<Arc<dyn Worker>>>>,
-    check_interval_secs: u64,
-) -> HealthChecker {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
+/// Helper to convert Worker trait object to WorkerInfo struct
+pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
+    let worker_type_str = match worker.worker_type() {
+        WorkerType::Regular => "regular",
+        WorkerType::Prefill { .. } => "prefill",
+        WorkerType::Decode => "decode",
+    };
 
-    let handle = tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
+    let bootstrap_port = match worker.worker_type() {
+        WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+        _ => None,
+    };
 
-        // Counter for periodic load reset (every 10 health check cycles)
-        let mut check_count = 0u64;
-        const LOAD_RESET_INTERVAL: u64 = 10;
-
-        loop {
-            interval.tick().await;
-
-            // Check for shutdown signal
-            if shutdown_clone.load(Ordering::Acquire) {
-                tracing::debug!("Health checker shutting down");
-                break;
-            }
-
-            check_count += 1;
-
-            // Check health of all workers
-            let workers_to_check = match workers.read() {
-                Ok(guard) => guard.clone(),
-                Err(poisoned) => {
-                    tracing::error!("Worker lock poisoned: {}", poisoned);
-                    continue;
-                }
-            };
-
-            // Periodically reset load counters to prevent drift
-            // Only do this when we believe all workers should be idle
-            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
-                // Only reset if load appears to be very low (likely drift)
-                if max_load <= 2 {
-                    tracing::debug!(
-                        "Resetting load counters to prevent drift (max_load: {})",
-                        max_load
-                    );
-                    for worker in &workers_to_check {
-                        worker.reset_load();
-                    }
-                }
-            }
-
-            // Perform health checks concurrently
-            let health_checks = workers_to_check.iter().map(|worker| {
-                let worker_url = worker.url().to_string();
-                let was_healthy = worker.is_healthy();
-
-                async move {
-                    match worker.check_health_async().await {
-                        Ok(_) => {
-                            if !was_healthy {
-                                tracing::info!("Worker {} is now healthy", worker_url);
-                            }
-                        }
-                        Err(e) => {
-                            if was_healthy {
-                                tracing::warn!("Worker {} health check failed: {}", worker_url, e);
-                            } else {
-                                // Worker was already unhealthy, log at debug level
-                                tracing::debug!("Worker {} remains unhealthy: {}", worker_url, e);
-                            }
-                        }
-                    }
-                }
-            });
-
-            // Execute all health checks concurrently
-            futures::future::join_all(health_checks).await;
-        }
-    });
-
-    HealthChecker { handle, shutdown }
+    WorkerInfo {
+        id: worker.url().to_string(),
+        url: worker.url().to_string(),
+        model_id: worker.model_id().to_string(),
+        priority: worker.priority(),
+        cost: worker.cost(),
+        worker_type: worker_type_str.to_string(),
+        is_healthy: worker.is_healthy(),
+        load: worker.load(),
+        connection_mode: format!("{:?}", worker.connection_mode()),
+        tokenizer_path: worker.tokenizer_path().map(String::from),
+        reasoning_parser: worker.reasoning_parser().map(String::from),
+        tool_parser: worker.tool_parser().map(String::from),
+        chat_template: worker.chat_template().map(String::from),
+        bootstrap_port,
+        metadata: worker.metadata().labels.clone(),
+        job_status: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{thread, time::Duration};
+
     use super::*;
     use crate::core::CircuitBreakerConfig;
-    use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn test_worker_type_display() {
@@ -1164,7 +1245,7 @@ mod tests {
             let worker_clone = Arc::clone(&worker);
             let handle = tokio::spawn(async move {
                 worker_clone.set_healthy(i % 2 == 0);
-                tokio::time::sleep(Duration::from_micros(10)).await;
+                time::sleep(Duration::from_micros(10)).await;
             });
             handles.push(handle);
         }
@@ -1346,8 +1427,9 @@ mod tests {
 
     #[test]
     fn test_load_counter_performance() {
-        use crate::core::BasicWorkerBuilder;
         use std::time::Instant;
+
+        use crate::core::BasicWorkerBuilder;
 
         let worker = BasicWorkerBuilder::new("http://test:8080")
             .worker_type(WorkerType::Regular)
@@ -1468,19 +1550,16 @@ mod tests {
             .worker_type(WorkerType::Regular)
             .build();
 
-        // Test health status
         assert!(dp_worker.is_healthy());
         dp_worker.set_healthy(false);
         assert!(!dp_worker.is_healthy());
 
-        // Test load tracking
         assert_eq!(dp_worker.load(), 0);
         dp_worker.increment_load();
         assert_eq!(dp_worker.load(), 1);
         dp_worker.decrement_load();
         assert_eq!(dp_worker.load(), 0);
 
-        // Test processed tracking
         assert_eq!(dp_worker.processed_requests(), 0);
         dp_worker.increment_processed();
         assert_eq!(dp_worker.processed_requests(), 1);

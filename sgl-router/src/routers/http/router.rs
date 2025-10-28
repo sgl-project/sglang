@@ -1,33 +1,39 @@
-use crate::config::types::RetryConfig;
-use crate::core::{
-    is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerManager, WorkerRegistry,
-    WorkerType,
-};
-use crate::metrics::RouterMetrics;
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesGetParams, ResponsesRequest,
-};
-use crate::routers::header_utils;
-use crate::routers::RouterTrait;
-use axum::body::to_bytes;
+use std::{sync::Arc, time::Instant};
+
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::Request,
     http::{
-        header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
     },
     response::{IntoResponse, Response},
     Json,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
+
+use crate::{
+    config::types::RetryConfig,
+    core::{
+        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
+    },
+    metrics::RouterMetrics,
+    policies::PolicyRegistry,
+    protocols::{
+        chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
+        common::GenerationRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::{RerankRequest, RerankResponse, RerankResult},
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    routers::{header_utils, RouterTrait},
+};
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -38,13 +44,11 @@ pub struct Router {
     dp_aware: bool,
     enable_igw: bool,
     retry_config: RetryConfig,
-    _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
-    _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
 
 impl Router {
     /// Create a new router with injected policy and client
-    pub async fn new(ctx: &Arc<crate::server::AppContext>) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
         let workers = ctx.worker_registry.get_workers_filtered(
             None, // any model
             Some(WorkerType::Regular),
@@ -54,42 +58,6 @@ impl Router {
 
         RouterMetrics::set_active_workers(workers.len());
 
-        let worker_urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
-
-        let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
-        let worker_loads = Arc::new(rx);
-
-        let default_policy = ctx.policy_registry.get_default_policy();
-
-        let load_monitor_handle = if default_policy.name() == "power_of_two" {
-            let monitor_urls = worker_urls.clone();
-            let monitor_api_keys = monitor_urls
-                .iter()
-                .map(|url| {
-                    ctx.worker_registry
-                        .get_by_url(url)
-                        .and_then(|w| w.api_key().clone())
-                })
-                .collect::<Vec<Option<String>>>();
-            let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
-            let policy_clone = default_policy.clone();
-            let client_clone = ctx.client.clone();
-
-            Some(Arc::new(tokio::spawn(async move {
-                Self::monitor_worker_loads(
-                    monitor_urls,
-                    monitor_api_keys,
-                    tx,
-                    monitor_interval,
-                    policy_clone,
-                    client_clone,
-                )
-                .await;
-            })))
-        } else {
-            None
-        };
-
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
@@ -97,8 +65,6 @@ impl Router {
             dp_aware: ctx.router_config.dp_aware,
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
-            _worker_loads: worker_loads,
-            _load_monitor_handle: load_monitor_handle,
         })
     }
 
@@ -137,7 +103,7 @@ impl Router {
 
                         match res.bytes().await {
                             Ok(body) => {
-                                let mut response = Response::new(axum::body::Body::from(body));
+                                let mut response = Response::new(Body::from(body));
                                 *response.status_mut() = status;
                                 *response.headers_mut() = response_headers;
                                 response
@@ -357,7 +323,7 @@ impl Router {
                     let response_headers = header_utils::preserve_response_headers(res.headers());
                     match res.bytes().await {
                         Ok(body) => {
-                            let mut response = Response::new(axum::body::Body::from(body));
+                            let mut response = Response::new(Body::from(body));
                             *response.status_mut() = status;
                             *response.headers_mut() = response_headers;
                             if status.is_success() {
@@ -538,7 +504,7 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
-                    let mut response = Response::new(axum::body::Body::from(body));
+                    let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
                     response
@@ -661,42 +627,6 @@ impl Router {
         }
     }
 
-    // Background task to monitor worker loads
-    async fn monitor_worker_loads(
-        worker_urls: Vec<String>,
-        worker_api_keys: Vec<Option<String>>,
-        tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
-        interval_secs: u64,
-        policy: Arc<dyn LoadBalancingPolicy>,
-        client: Client,
-    ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-
-        loop {
-            interval.tick().await;
-
-            let mut loads = HashMap::new();
-            for (url, api_key) in worker_urls.iter().zip(worker_api_keys.iter()) {
-                // Use WorkerManager for consistent load fetching
-                if let Some(load) =
-                    WorkerManager::get_worker_load(url, api_key.as_deref(), &client).await
-                {
-                    loads.insert(url.clone(), load);
-                }
-            }
-
-            if !loads.is_empty() {
-                // Update policy with new loads
-                policy.update_loads(&loads);
-
-                // Send to watchers
-                if let Err(e) = tx.send(loads) {
-                    error!("Failed to send load update: {}", e);
-                }
-            }
-        }
-    }
-
     async fn build_rerank_response(
         req: &RerankRequest,
         response: Response,
@@ -706,7 +636,7 @@ impl Router {
         let rerank_results = serde_json::from_slice::<Vec<RerankResult>>(&body_bytes)?;
         let mut rerank_response =
             RerankResponse::new(rerank_results, req.model.clone(), req.rid.clone());
-        rerank_response.sort_by_score();
+        // Sorting is handled by Python worker (serving_rerank.py)
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
         }
@@ -820,15 +750,36 @@ impl RouterTrait for Router {
         res
     }
 
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        // Record classification-specific metrics in addition to general request metrics
+        let start = Instant::now();
+        let res = self
+            .route_typed_request(headers, body, "/v1/classify", model_id)
+            .await;
+
+        // Classification specific metrics
+        if res.status().is_success() {
+            RouterMetrics::record_classify_request();
+            RouterMetrics::record_classify_duration(start.elapsed());
+        } else {
+            let error_type = format!("http_{}", res.status().as_u16());
+            RouterMetrics::record_classify_error(&error_type);
+        }
+
+        res
+    }
+
     async fn route_rerank(
         &self,
         headers: Option<&HeaderMap>,
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        if let Err(e) = body.validate() {
-            return (StatusCode::BAD_REQUEST, e).into_response();
-        }
         let response = self
             .route_typed_request(headers, body, "/v1/rerank", model_id)
             .await;
@@ -858,7 +809,6 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use crate::core::BasicWorkerBuilder;
-    use std::collections::HashMap;
 
     fn create_test_regular_router() -> Router {
         // Create registries
@@ -877,15 +827,12 @@ mod tests {
         worker_registry.register(Arc::new(worker1));
         worker_registry.register(Arc::new(worker2));
 
-        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
             worker_registry,
             policy_registry,
             dp_aware: false,
             client: Client::new(),
             retry_config: RetryConfig::default(),
-            _worker_loads: Arc::new(rx),
-            _load_monitor_handle: None,
             enable_igw: false,
         }
     }

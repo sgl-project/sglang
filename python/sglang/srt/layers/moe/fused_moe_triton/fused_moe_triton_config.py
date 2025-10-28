@@ -16,14 +16,21 @@ _is_hip = is_hip()
 
 
 def get_config_file_name(
-    E: int, N: int, dtype: Optional[str], block_shape: Optional[int] = None
+    E: int,
+    N: int,
+    dtype: Optional[str],
+    block_shape: Optional[int] = None,
+    per_channel_quant: bool = False,
+    down_moe: bool = False,
 ) -> str:
     device_name = get_device_name().replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
     )
-    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"
+    per_channel_quant_selector = ",per_channel_quant=True" if per_channel_quant else ""
+    down_moe_selector = "_down" if down_moe else ""
+    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}{per_channel_quant_selector}{down_moe_selector}.json"
 
 
 @functools.lru_cache
@@ -33,6 +40,8 @@ def get_moe_configs(
     dtype: Optional[str],
     block_n: Optional[int] = 0,
     block_k: Optional[int] = 0,
+    per_channel_quant: bool = False,
+    down_moe: bool = False,
 ) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
@@ -47,14 +56,25 @@ def get_moe_configs(
 
     # First look up if an optimized configuration is available in the configs
     # directory
-    json_file_name = get_config_file_name(E, N, dtype, [block_n, block_k])
+    json_file_name = get_config_file_name(
+        E,
+        N,
+        dtype,
+        [block_n, block_k],
+        per_channel_quant,
+        down_moe=down_moe,
+    )
 
     # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,
     # so we also include the Triton version as a key for finding the fused_moe_kernel config to achieve the best performance.
+    config_dir = os.environ.get(
+        "SGLANG_MOE_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__))
+    )
+
     triton_version = triton.__version__
     version_dir = f"triton_{triton_version.replace('.', '_')}"
     config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)),
+        config_dir,
         "configs",
         version_dir,
         json_file_name,
@@ -75,7 +95,7 @@ def get_moe_configs(
         if try_triton_version == triton_version:
             continue
         try_config_file_path = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)),
+            config_dir,
             "configs",
             f"triton_{try_triton_version.replace('.', '_')}",
             json_file_name,
@@ -165,9 +185,12 @@ def try_get_optimal_moe_config(
     M: int,
     is_marlin: bool = False,
     block_shape: Optional[List[int]] = None,
+    return_down_config: bool = False,
 ):
     from sglang.srt.layers.moe.fused_moe_triton import get_config
 
+    down_config = None
+    max_block_m = None
     override_config = get_config()
     if override_config:
         config = override_config
@@ -176,7 +199,7 @@ def try_get_optimal_moe_config(
         E, _, N = w2_shape
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
-        configs = get_moe_configs(E, N, dtype, block_n, block_k)
+        configs = get_moe_configs(E, N, dtype, block_n, block_k, down_moe=False)
 
         if configs:
             # If an optimal configuration map has been found, look up the
@@ -187,6 +210,21 @@ def try_get_optimal_moe_config(
             config = get_default_config(
                 M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
             )
+        if return_down_config:
+            down_configs = get_moe_configs(E, N, dtype, block_n, block_k, down_moe=True)
+            if down_configs:
+                down_config = down_configs[
+                    min(down_configs.keys(), key=lambda x: abs(x - M))
+                ]
+                down_config = dict(**down_config)
+                max_block_m = max(
+                    [cfg["BLOCK_SIZE_M"] for cfg in down_configs.values()]
+                )
+    if return_down_config:
+        assert (
+            down_config is None or config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]
+        )
+        return config, (down_config, max_block_m)
     return config
 
 

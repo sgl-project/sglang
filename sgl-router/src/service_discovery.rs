@@ -1,25 +1,25 @@
-use crate::core::WorkerManager;
-use crate::protocols::worker_spec::WorkerConfigRequest;
-use crate::server::AppContext;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     api::Api,
-    runtime::watcher::{watcher, Config},
-    runtime::WatchStreamExt,
+    runtime::{
+        watcher::{watcher, Config},
+        WatchStreamExt,
+    },
     Client,
 };
-use std::collections::{HashMap, HashSet};
-
 use rustls;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::task;
-use tokio::time;
+use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
-/// Represents the service discovery configuration
+use crate::{app_context::AppContext, core::Job, protocols::worker_spec::WorkerConfigRequest};
+
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
     pub enabled: bool,
@@ -41,8 +41,8 @@ impl Default for ServiceDiscoveryConfig {
             enabled: false,
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
-            port: 8000,      // Standard port for modern services
-            namespace: None, // None means watch all namespaces
+            port: 8000,
+            namespace: None,
             pd_mode: false,
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
@@ -51,7 +51,6 @@ impl Default for ServiceDiscoveryConfig {
     }
 }
 
-/// Pod type for PD mode service discovery
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PodType {
     Prefill,
@@ -59,7 +58,6 @@ pub enum PodType {
     Regular,
 }
 
-/// Represents a Kubernetes pod's information used for worker management
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PodInfo {
     pub name: String,
@@ -71,7 +69,6 @@ pub struct PodInfo {
 }
 
 impl PodInfo {
-    /// Check if a pod matches any of the given selectors
     fn matches_selector(pod: &Pod, selector: &HashMap<String, String>) -> bool {
         if selector.is_empty() {
             return false;
@@ -83,19 +80,15 @@ impl PodInfo {
             .is_some_and(|labels| selector.iter().all(|(k, v)| labels.get(k) == Some(v)))
     }
 
-    /// Check if a pod should be included in service discovery
     pub fn should_include(pod: &Pod, config: &ServiceDiscoveryConfig) -> bool {
         if config.pd_mode {
-            // In PD mode, at least one selector must be non-empty
             if config.prefill_selector.is_empty() && config.decode_selector.is_empty() {
                 warn!("PD mode enabled but both prefill_selector and decode_selector are empty");
                 return false;
             }
-            // In PD mode, pod must match either prefill or decode selector
             Self::matches_selector(pod, &config.prefill_selector)
                 || Self::matches_selector(pod, &config.decode_selector)
         } else {
-            // In regular mode, pod must match the general selector
             if config.selector.is_empty() {
                 warn!("Regular mode enabled but selector is empty");
                 return false;
@@ -104,7 +97,6 @@ impl PodInfo {
         }
     }
 
-    /// Unified PodInfo creation with optional PD configuration
     pub fn from_pod(pod: &Pod, config: Option<&ServiceDiscoveryConfig>) -> Option<Self> {
         let name = pod.metadata.name.clone()?;
         let status = pod.status.clone()?;
@@ -120,10 +112,8 @@ impl PodInfo {
 
         let pod_status = status.phase.unwrap_or_else(|| "Unknown".to_string());
 
-        // Determine pod type based on labels if config is provided and in PD mode
         let pod_type = if let Some(config) = config {
             if config.pd_mode {
-                // Use simplified helper methods for cleaner logic
                 if Self::matches_selector(pod, &config.prefill_selector) {
                     Some(PodType::Prefill)
                 } else if Self::matches_selector(pod, &config.decode_selector) {
@@ -135,11 +125,9 @@ impl PodInfo {
                 Some(PodType::Regular)
             }
         } else {
-            // No config provided, default to None (for backwards compatibility)
             None
         };
 
-        // Extract bootstrap port from annotations for prefill pods
         let bootstrap_port = if matches!(pod_type, Some(PodType::Prefill)) {
             if let Some(config) = config {
                 pod.metadata
@@ -164,13 +152,12 @@ impl PodInfo {
         })
     }
 
-    /// Returns true if the pod is in a state where it can accept traffic
     pub fn is_healthy(&self) -> bool {
         self.is_ready && self.status == "Running"
     }
 
-    /// Generates a worker URL for this pod
     pub fn worker_url(&self, port: u16) -> String {
+        // Default to http:// prefix; workflow will detect actual protocol (HTTP vs gRPC)
         format!("http://{}:{}", self.ip, port)
     }
 }
@@ -179,9 +166,7 @@ pub async fn start_service_discovery(
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
-    // Don't initialize anything if service discovery is disabled
     if !config.enabled {
-        // Return a generic error when service discovery is disabled
         return Err(kube::Error::Api(kube::error::ErrorResponse {
             status: "Disabled".to_string(),
             message: "Service discovery is disabled".to_string(),
@@ -192,7 +177,6 @@ pub async fn start_service_discovery(
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Initialize Kubernetes client
     let client = Client::try_default().await?;
 
     // Log the appropriate selectors based on mode
@@ -229,12 +213,9 @@ pub async fn start_service_discovery(
         );
     }
 
-    // Create the task that will run in the background
     let handle = task::spawn(async move {
-        // We'll track pods we've already added to avoid duplicates
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
 
-        // Create a watcher for pods
         let pods: Api<Pod> = if let Some(namespace) = &config.namespace {
             Api::namespaced(client, namespace)
         } else {
@@ -243,23 +224,19 @@ pub async fn start_service_discovery(
 
         debug!("K8s service discovery initialized");
 
-        // Create Arcs for configuration data
         let config_arc = Arc::new(config.clone());
         let port = config.port;
 
         let mut retry_delay = Duration::from_secs(1);
-        const MAX_RETRY_DELAY: Duration = Duration::from_secs(300); // 5 minutes max
+        const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 
         loop {
-            // Create a watcher with the proper parameters according to the kube-rs API
             let watcher_config = Config::default();
             let watcher_stream = watcher(pods.clone(), watcher_config).applied_objects();
 
-            // Clone Arcs for the closures
             let config_clone = Arc::clone(&config_arc);
             let tracked_pods_clone = Arc::clone(&tracked_pods);
 
-            // Simplified label selector filter using helper method
             let filtered_stream = watcher_stream.filter_map(move |obj_res| {
                 let config_inner = Arc::clone(&config_clone);
 
@@ -277,7 +254,6 @@ pub async fn start_service_discovery(
                 }
             });
 
-            // Clone again for the next closure
             let tracked_pods_clone2 = Arc::clone(&tracked_pods_clone);
             let app_context_clone = Arc::clone(&app_context);
             let config_clone2 = Arc::clone(&config_arc);
@@ -317,7 +293,6 @@ pub async fn start_service_discovery(
                 .await
             {
                 Ok(_) => {
-                    // Reset retry delay on success
                     retry_delay = Duration::from_secs(1);
                 }
                 Err(err) => {
@@ -328,12 +303,10 @@ pub async fn start_service_discovery(
                     );
                     time::sleep(retry_delay).await;
 
-                    // Exponential backoff with jitter
                     retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
                 }
             }
 
-            // If the watcher exits for some reason, wait a bit before restarting
             warn!(
                 "Kubernetes watcher exited, restarting in {} seconds",
                 config_arc.check_interval.as_secs()
@@ -354,9 +327,7 @@ async fn handle_pod_event(
 ) {
     let worker_url = pod_info.worker_url(port);
 
-    // If pod is healthy, try to add it (with atomic check-and-insert)
     if pod_info.is_healthy() {
-        // Atomic check-and-insert to prevent race conditions
         let should_add = {
             let mut tracker = match tracked_pods.lock() {
                 Ok(tracker) => tracker,
@@ -367,9 +338,8 @@ async fn handle_pod_event(
             };
 
             if tracker.contains(pod_info) {
-                false // Already tracked
+                false
             } else {
-                // Reserve the spot to prevent other threads from adding the same pod
                 tracker.insert(pod_info.clone());
                 true
             }
@@ -381,7 +351,6 @@ async fn handle_pod_event(
                 pod_info.name, pod_info.pod_type, worker_url
             );
 
-            // Build worker config based on pod type and routing mode
             let worker_type = if pd_mode {
                 match &pod_info.pod_type {
                     Some(PodType::Prefill) => Some("prefill".to_string()),
@@ -392,7 +361,6 @@ async fn handle_pod_event(
                 None
             };
 
-            // Only set bootstrap_port for prefill workers in PD mode
             let bootstrap_port = if pd_mode {
                 match &pod_info.pod_type {
                     Some(PodType::Prefill) => pod_info.bootstrap_port,
@@ -414,22 +382,43 @@ async fn handle_pod_event(
                 reasoning_parser: None,
                 tool_parser: None,
                 chat_template: None,
-                api_key: None,
+                api_key: app_context.router_config.api_key.clone(),
+                health_check_timeout_secs: app_context.router_config.health_check.timeout_secs,
+                health_check_interval_secs: app_context
+                    .router_config
+                    .health_check
+                    .check_interval_secs,
+                health_success_threshold: app_context.router_config.health_check.success_threshold,
+                health_failure_threshold: app_context.router_config.health_check.failure_threshold,
+                max_connection_attempts: app_context.router_config.health_check.success_threshold
+                    * 20,
+                dp_aware: false,
             };
 
-            let result = WorkerManager::add_worker_from_config(&config, &app_context).await;
+            let job = Job::AddWorker {
+                config: Box::new(config.clone()),
+            };
 
-            match result {
-                Ok(_) => {
-                    debug!("Worker added: {}", worker_url);
-                }
-                Err(e) => {
-                    error!("Failed to add worker {} to router: {}", worker_url, e);
-                    // Remove from tracking since addition failed
-                    if let Ok(mut tracker) = tracked_pods.lock() {
-                        tracker.remove(pod_info);
+            if let Some(job_queue) = app_context.worker_job_queue.get() {
+                match job_queue.submit(job).await {
+                    Ok(_) => {
+                        debug!("Worker addition job submitted for: {}", worker_url);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to submit worker addition job for {}: {}",
+                            worker_url, e
+                        );
+                        if let Ok(mut tracker) = tracked_pods.lock() {
+                            tracker.remove(pod_info);
+                        }
                     }
                 }
+            } else {
+                debug!(
+                    "JobQueue not initialized, skipping async worker addition for: {}",
+                    worker_url
+                );
             }
         }
     }
@@ -460,12 +449,26 @@ async fn handle_pod_deletion(
             pod_info.name, pod_info.pod_type, worker_url
         );
 
-        if let Err(e) = WorkerManager::remove_worker(&worker_url, &app_context) {
-            error!("Failed to remove worker {}: {}", worker_url, e);
+        let job = Job::RemoveWorker {
+            url: worker_url.clone(),
+        };
+
+        if let Some(job_queue) = app_context.worker_job_queue.get() {
+            if let Err(e) = job_queue.submit(job).await {
+                error!(
+                    "Failed to submit worker removal job for {}: {}",
+                    worker_url, e
+                );
+            } else {
+                debug!("Submitted worker removal job for {}", worker_url);
+            }
+        } else {
+            error!(
+                "JobQueue not initialized, cannot remove worker {}",
+                worker_url
+            );
         }
     } else {
-        // This case might occur if a pod is deleted before it was ever marked healthy and added.
-        // Or if the event is duplicated. No action needed on the router if it wasn't tracked (and thus not added).
         debug!(
             "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
             pod_info.name, pod_info.pod_type, worker_url
@@ -475,12 +478,13 @@ async fn handle_pod_deletion(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use k8s_openapi::api::core::v1::{Pod, PodCondition, PodSpec, PodStatus};
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use k8s_openapi::{
+        api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
+        apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
+    };
 
-    // Helper function to create a Pod for testing PodInfo::from_pod
+    use super::*;
+
     fn create_k8s_pod(
         name: Option<&str>,
         ip: Option<&str>,
@@ -523,7 +527,6 @@ mod tests {
         pod
     }
 
-    // Helper function to create a Pod with PD-specific labels and annotations
     fn create_pd_k8s_pod(name: &str, ip: &str, pod_type: &str, bootstrap_port: Option<u16>) -> Pod {
         let mut labels = std::collections::BTreeMap::new();
         labels.insert("app".to_string(), "sglang".to_string());
@@ -559,35 +562,41 @@ mod tests {
         }
     }
 
-    // Helper to create an AppContext instance for testing event handlers
     async fn create_test_app_context() -> Arc<AppContext> {
-        use crate::config::RouterConfig;
-        use crate::middleware::TokenBucket;
+        use crate::{config::RouterConfig, middleware::TokenBucket};
 
-        // Create a minimal RouterConfig for testing with very short timeout
-        let router_config = RouterConfig {
-            worker_startup_timeout_secs: 1,
-            ..Default::default()
-        }; // Very short timeout for tests
+        let router_config = RouterConfig::builder()
+            .worker_startup_timeout_secs(1)
+            .build_unchecked();
 
-        // Create AppContext with minimal components
+        // Note: Using uninitialized queue for tests to avoid spawning background workers
+        // Jobs submitted during tests will queue but not be processed
         Arc::new(AppContext {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
-            rate_limiter: Arc::new(TokenBucket::new(1000, 1000)),
+            rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             worker_registry: Arc::new(crate::core::WorkerRegistry::new()),
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
             )),
-            tokenizer: None,                // HTTP mode doesn't need tokenizer
-            reasoning_parser_factory: None, // HTTP mode doesn't need reasoning parser
-            tool_parser_registry: None,     // HTTP mode doesn't need tool parser
-            router_manager: None,           // Test doesn't need router manager
+            tokenizer: None,
+            reasoning_parser_factory: None,
+            tool_parser_factory: None,
+            router_manager: None,
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
+            conversation_storage: Arc::new(crate::data_connector::MemoryConversationStorage::new()),
+            conversation_item_storage: Arc::new(
+                crate::data_connector::MemoryConversationItemStorage::new(),
+            ),
+            load_monitor: None,
+            configured_reasoning_parser: None,
+            configured_tool_parser: None,
+            worker_job_queue: Arc::new(std::sync::OnceLock::new()),
+            workflow_engine: Arc::new(std::sync::OnceLock::new()),
+            mcp_manager: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
-    // Helper to create a PD config for testing
     fn create_pd_config() -> ServiceDiscoveryConfig {
         let mut prefill_selector = HashMap::new();
         prefill_selector.insert("app".to_string(), "sglang".to_string());
@@ -614,19 +623,15 @@ mod tests {
     fn test_pod_info_should_include() {
         let config = create_pd_config();
 
-        // Test prefill pod should be included
         let prefill_pod = create_pd_k8s_pod("prefill-pod", "10.0.0.1", "prefill", Some(8081));
         assert!(PodInfo::should_include(&prefill_pod, &config));
 
-        // Test decode pod should be included
         let decode_pod = create_pd_k8s_pod("decode-pod", "10.0.0.2", "decode", None);
         assert!(PodInfo::should_include(&decode_pod, &config));
 
-        // Test unmatched pod should not be included
         let unmatched_pod = create_pd_k8s_pod("other-pod", "10.0.0.3", "other", None);
         assert!(!PodInfo::should_include(&unmatched_pod, &config));
 
-        // Test regular mode
         let mut regular_config = ServiceDiscoveryConfig::default();
         regular_config
             .selector
@@ -653,7 +658,6 @@ mod tests {
 
     #[test]
     fn test_pod_type_enum() {
-        // Test that PodType enum has expected variants
         let prefill = PodType::Prefill;
         let decode = PodType::Decode;
         let regular = PodType::Regular;
@@ -713,7 +717,7 @@ mod tests {
     fn test_pod_info_from_pod_with_pd_config_regular_mode() {
         let k8s_pod = create_pd_k8s_pod("regular-pod", "10.0.0.3", "worker", None);
         let mut config = create_pd_config();
-        config.pd_mode = false; // Set to regular mode
+        config.pd_mode = false;
 
         let pod_info = PodInfo::from_pod(&k8s_pod, Some(&config)).unwrap();
         assert_eq!(pod_info.name, "regular-pod");
@@ -741,7 +745,6 @@ mod tests {
     #[test]
     fn test_pod_info_from_pod_with_pd_config_invalid_bootstrap_port() {
         let mut pod = create_pd_k8s_pod("prefill-pod", "10.0.0.1", "prefill", None);
-        // Add invalid bootstrap port annotation
         pod.metadata.annotations.as_mut().unwrap().insert(
             "sglang.ai/bootstrap-port".to_string(),
             "invalid".to_string(),
@@ -750,7 +753,7 @@ mod tests {
 
         let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
         assert_eq!(pod_info.pod_type, Some(PodType::Prefill));
-        assert!(pod_info.bootstrap_port.is_none()); // Should be None for invalid port
+        assert!(pod_info.bootstrap_port.is_none());
     }
 
     #[test]
@@ -836,19 +839,6 @@ mod tests {
             bootstrap_port: None,
         };
         assert!(!not_running_pod.is_healthy());
-    }
-
-    #[test]
-    fn test_pod_info_worker_url() {
-        let pod_info = PodInfo {
-            name: "p1".into(),
-            ip: "1.2.3.4".into(),
-            status: "Running".into(),
-            is_ready: true,
-            pod_type: None,
-            bootstrap_port: None,
-        };
-        assert_eq!(pod_info.worker_url(8080), "http://1.2.3.4:8080");
     }
 
     #[test]
@@ -949,8 +939,6 @@ mod tests {
         };
         let port = 8080u16;
 
-        // This test validates the structure but won't actually add workers since
-        // the test worker URL won't be reachable
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
@@ -960,8 +948,12 @@ mod tests {
         )
         .await;
 
-        // Pod should not be tracked since add_worker_from_config will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // With fully async control plane, pod is tracked and job is queued
+        // Worker registration and validation happen in background job
+        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+
+        // Note: In tests with uninitialized queue, background jobs don't process
+        // Worker won't appear in registry until background job runs (in production)
     }
 
     #[tokio::test]
@@ -987,8 +979,12 @@ mod tests {
         )
         .await;
 
-        // Pod should not be tracked since add_worker_from_config will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // With fully async control plane, pod is tracked and job is queued
+        // Worker registration and validation happen in background job
+        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+
+        // Note: In tests with uninitialized queue, background jobs don't process
+        // Worker won't appear in registry until background job runs (in production)
     }
 
     #[tokio::test]
@@ -1066,7 +1062,6 @@ mod tests {
         };
         let port = 8080u16;
 
-        // Test that unified handler works for regular mode
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
@@ -1076,8 +1071,13 @@ mod tests {
         )
         .await;
 
-        // Pod should not be tracked since add_worker_from_url will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // With fully async control plane, pod is tracked and job is queued
+        // In regular mode (pd_mode=false), worker_type defaults to Regular
+        // Worker registration and validation happen in background job
+        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+
+        // Note: In tests with uninitialized queue, background jobs don't process
+        // Worker won't appear in registry until background job runs (in production)
     }
 
     #[tokio::test]
@@ -1094,7 +1094,6 @@ mod tests {
         };
         let port = 8080u16;
 
-        // Test that unified handler works for PD mode with prefill
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
@@ -1104,8 +1103,12 @@ mod tests {
         )
         .await;
 
-        // Pod should not be tracked since add_worker_from_config will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // With fully async control plane, pod is tracked and job is queued
+        // Worker registration and validation happen in background job
+        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+
+        // Note: In tests with uninitialized queue, background jobs don't process
+        // Worker won't appear in registry until background job runs (in production)
     }
 
     #[tokio::test]
@@ -1129,7 +1132,6 @@ mod tests {
 
         let port = 8080u16;
 
-        // Test that unified handler works for deletion in PD mode
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
