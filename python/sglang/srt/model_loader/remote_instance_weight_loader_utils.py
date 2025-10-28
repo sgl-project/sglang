@@ -13,6 +13,7 @@ def trigger_init_weights_send_group_for_remote_instance_request(
     remote_instance_weight_loader_seed_instance_service_port: int,
     remote_instance_weight_loader_send_weights_group_ports: List[int],
     remote_instance_weight_loader_client_id: str,
+    is_draft_model: bool,
 ):
     seed_instance_service_url = f"http://{remote_instance_weight_loader_seed_instance_ip}:{remote_instance_weight_loader_seed_instance_service_port}"
     # Only support loading weights from instance with same parallelism strategy.
@@ -34,6 +35,7 @@ def trigger_init_weights_send_group_for_remote_instance_request(
                 "world_size": 2,
                 "group_name": f"send_weights_{remote_instance_weight_loader_client_id}",
                 "backend": "nccl",
+                "is_draft_model": is_draft_model,
             },
         )
     except Exception as e:
@@ -48,6 +50,7 @@ def trigger_transferring_weights_request(
     remote_instance_weight_loader_seed_instance_service_port: int,
     remote_instance_weight_loader_send_weights_group_ports: List[int],
     remote_instance_weight_loader_client_id: str,
+    is_draft_model: bool,
 ):
     seed_instance_service_url = f"http://{remote_instance_weight_loader_seed_instance_ip}:{remote_instance_weight_loader_seed_instance_service_port}"
     try:
@@ -62,6 +65,7 @@ def trigger_transferring_weights_request(
                     )
                 ),
                 "group_name": f"send_weights_{remote_instance_weight_loader_client_id}",
+                "is_draft_model": is_draft_model,
             },
         )
     except Exception as e:
