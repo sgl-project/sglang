@@ -1178,4 +1178,5 @@ class AutoencoderKLStepvideo(nn.Module, ParallelTiledVAE):
         dec = self.decode(z)
         return dec
 
+
 EntryClass = AutoencoderKLStepvideo
