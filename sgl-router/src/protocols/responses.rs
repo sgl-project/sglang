@@ -686,9 +686,6 @@ impl GenerationRequest for ResponsesRequest {
 }
 
 /// Validate conversation ID format
-///
-/// OpenAI enforces that conversation IDs must only contain letters, numbers,
-/// underscores, or dashes.
 pub fn validate_conversation_id(conv_id: &str) -> Result<(), validator::ValidationError> {
     if !conv_id.starts_with("conv_") {
         let mut error = validator::ValidationError::new("invalid_conversation_id");

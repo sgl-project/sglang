@@ -955,21 +955,22 @@ async fn load_conversation_history(
         let conv_id = ConversationId::from(conv_id_str.as_str());
 
         // Check if conversation exists - return error if not found
-        match ctx.conversation_storage.get_conversation(&conv_id).await {
-            Ok(Some(_)) => {
-                // Conversation exists, continue to load history
-            }
-            Ok(None) => {
-                return Err(crate::routers::grpc::utils::bad_request_error(format!(
-                    "Conversation '{}' not found. Please create the conversation first using the conversations API.",
-                    conv_id_str
-                )));
-            }
-            Err(e) => {
-                return Err(crate::routers::grpc::utils::internal_error_message(
-                    format!("Failed to check conversation: {}", e),
-                ));
-            }
+        let conversation = ctx
+            .conversation_storage
+            .get_conversation(&conv_id)
+            .await
+            .map_err(|e| {
+                crate::routers::grpc::utils::internal_error_message(format!(
+                    "Failed to check conversation: {}",
+                    e
+                ))
+            })?;
+
+        if conversation.is_none() {
+            return Err(crate::routers::grpc::utils::bad_request_error(format!(
+                "Conversation '{}' not found. Please create the conversation first using the conversations API.",
+                conv_id_str
+            )));
         }
 
         // Load conversation history
