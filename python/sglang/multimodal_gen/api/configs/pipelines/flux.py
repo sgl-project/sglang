@@ -160,7 +160,7 @@ class FluxPipelineConfig(PipelineConfig):
             ),
         }
 
-    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb):
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {
             "freqs_cis": self.get_freqs_cis(
                 batch.negative_prompt_embeds[1],

@@ -153,10 +153,10 @@ class PipelineConfig:
     def post_denoising_loop(self, latents, batch):
         return latents
 
-    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb):
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
 
-    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb):
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
 
     @staticmethod
