@@ -7,6 +7,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Generate both client and server code
         .build_server(true)
         .build_client(true)
+        // Allow proto3 optional fields
+        .protoc_arg("--experimental_allow_proto3_optional")
         // Compile the proto file
         .compile_protos(&["src/proto/sglang_scheduler.proto"], &["src/proto"])?;
 
