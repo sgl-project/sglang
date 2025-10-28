@@ -574,6 +574,7 @@ class GenerateReqInput(BaseReq):
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            http_worker_ipc=self.http_worker_ipc,
         )
 
 
@@ -694,6 +695,9 @@ class EmbeddingReqInput(BaseReq):
     # tracing context
     trace_context: Optional[Dict] = None
 
+    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    dimensions: Optional[int] = None
+
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
@@ -759,6 +763,7 @@ class EmbeddingReqInput(BaseReq):
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
                 is_cross_encoder_request=True,
+                http_worker_ipc=self.http_worker_ipc,
             )
 
         return EmbeddingReqInput(
@@ -769,6 +774,8 @@ class EmbeddingReqInput(BaseReq):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            dimensions=self.dimensions,
+            http_worker_ipc=self.http_worker_ipc,
         )
 
 
@@ -788,6 +795,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     data_parallel_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
+    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    dimensions: Optional[int] = None
 
 
 @dataclass
@@ -1078,6 +1087,24 @@ class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     group_name: str = "weight_send_group"
     # The backend
     backend: str = "nccl"
+
+
+# Now UpdateWeightsFromIPCReqInput and UpdateWeightsFromIPCReqOutput
+# are only used by Checkpoint Engine (https://github.com/MoonshotAI/checkpoint-engine)
+@dataclass
+class UpdateWeightsFromIPCReqInput(BaseReq):
+    # ZMQ socket paths for each device UUID
+    zmq_handles: Dict[str, str]
+    # Whether to flush cache after weight update
+    flush_cache: bool = True
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+
+
+@dataclass
+class UpdateWeightsFromIPCReqOutput(BaseReq):
+    success: bool
+    message: str
 
 
 @dataclass

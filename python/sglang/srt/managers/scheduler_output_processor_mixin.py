@@ -77,13 +77,26 @@ class SchedulerOutputProcessorMixin:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if req.is_retracted:
+                if self.enable_overlap and req.is_retracted and len(req.output_ids) > 0:
+                    req_idx = batch.req_pool_indices[i]
+                    seq_len = len(req.origin_input_ids) + len(req.output_ids)
+                    pos = batch.req_to_token_pool.req_to_token[req_idx][
+                        seq_len - 1 : seq_len
+                    ]
+                    self.token_to_kv_pool_allocator.free(pos)
                     continue
 
-                if self.is_mixed_chunk and self.enable_overlap and req.finished():
+                if (
+                    self.is_mixed_chunk
+                    and self.enable_overlap
+                    and (req.finished() or req.is_retracted)
+                ):
                     # Free the one delayed token for the mixed decode batch
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
+                    continue
+
+                if req.is_retracted:
                     continue
 
                 if req.is_chunked <= 0:
@@ -190,7 +203,10 @@ class SchedulerOutputProcessorMixin:
                         i
                     ].item()
             else:
-                embeddings = embeddings.tolist()
+                if isinstance(embeddings, torch.Tensor):
+                    embeddings = embeddings.tolist()
+                else:
+                    embeddings = [tensor.tolist() for tensor in embeddings]
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -269,10 +285,8 @@ class SchedulerOutputProcessorMixin:
         # We should ignore using next_token_ids for spec decoding cases.
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
-            if req.is_retracted:
-                continue
 
-            if self.enable_overlap and req.finished():
+            if self.enable_overlap and (req.finished() or req.is_retracted):
                 indices_to_free = None
                 if batch.spec_algorithm.is_eagle():
                     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -299,6 +313,9 @@ class SchedulerOutputProcessorMixin:
 
                 if indices_to_free is not None:
                     self.token_to_kv_pool_allocator.free(indices_to_free)
+                continue
+
+            if req.is_retracted:
                 continue
 
             new_accepted_len = 1
