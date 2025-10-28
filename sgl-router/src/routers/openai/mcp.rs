@@ -936,26 +936,40 @@ pub(super) async fn is_web_search_mcp_available(mcp_manager: &Arc<mcp::McpManage
 ///
 /// The MCP search results are passed to the LLM internally via function_call_output,
 /// but we don't expose them in the web_search_call item to the client.
-fn build_web_search_call_item() -> Value {
+fn build_web_search_call_item(query: Option<String>) -> Value {
+    let mut action = serde_json::Map::new();
+    action.insert(
+        "type".to_string(),
+        Value::String(web_search_constants::ACTION_TYPE_SEARCH.to_string()),
+    );
+    if let Some(q) = query {
+        action.insert("query".to_string(), Value::String(q));
+    }
+
     json!({
         "id": generate_id("ws"),
         "type": event_types::ITEM_TYPE_WEB_SEARCH_CALL,
         "status": web_search_constants::STATUS_COMPLETED,
-        "action": {
-            "type": web_search_constants::ACTION_TYPE_SEARCH
-        }
+        "action": action
     })
 }
 
 /// Build a failed web_search_call output item
-fn build_web_search_call_item_failed(error: &str) -> Value {
+fn build_web_search_call_item_failed(error: &str, query: Option<String>) -> Value {
+    let mut action = serde_json::Map::new();
+    action.insert(
+        "type".to_string(),
+        Value::String(web_search_constants::ACTION_TYPE_SEARCH.to_string()),
+    );
+    if let Some(q) = query {
+        action.insert("query".to_string(), Value::String(q));
+    }
+
     json!({
         "id": generate_id("ws"),
         "type": event_types::ITEM_TYPE_WEB_SEARCH_CALL,
         "status": web_search_constants::STATUS_FAILED,
-        "action": {
-            "type": web_search_constants::ACTION_TYPE_SEARCH
-        },
+        "action": action,
         "error": error
     })
 }
@@ -1001,11 +1015,16 @@ pub(super) fn build_mcp_call_item(
 ) -> Value {
     // Check if this is a web_search_preview context - if so, build web_search_call format
     if tool_context.is_web_search() {
+        // Extract query from arguments for web_search_call
+        let query = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|v| v.get("query").and_then(|q| q.as_str().map(|s| s.to_string())));
+
         // Build web_search_call item (MVP - status only, no results)
         if success {
-            build_web_search_call_item()
+            build_web_search_call_item(query)
         } else {
-            build_web_search_call_item_failed(error.unwrap_or("Tool execution failed"))
+            build_web_search_call_item_failed(error.unwrap_or("Tool execution failed"), query)
         }
     } else {
         // Regular mcp_call item
