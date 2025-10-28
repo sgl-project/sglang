@@ -17,6 +17,12 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../killall_sglang.sh"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
+if command -v python3 &> /dev/null; then
+    # Sometimes python3 is missing, link python to python3.
+    PYTHON_PATH=`which python`
+    ln -s $PYTHON_PATH ${PYTHON_PATH}3
+fi
+
 # Clear torch compilation cache
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 rm -rf /root/.cache/flashinfer
