@@ -34,7 +34,7 @@ servers:
     protocol: sse
     url: http://localhost:8001/sse
     # token: "${WEB_SEARCH_MCP_TOKEN}"
-    required: true  # Don't fail startup if unavailable
+    required: false  # Don't fail startup if unavailable
 
   # Example: Additional MCP server
   # - name: "another-mcp-server"

@@ -30,14 +30,14 @@ use super::conversations::{
 };
 use super::{
     mcp::{
-        ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
-        McpLoopConfig,
+        ensure_request_mcp_client, execute_tool_loop, has_web_search_preview_tool,
+        is_web_search_mcp_available, prepare_mcp_payload_for_streaming, McpLoopConfig,
     },
     responses::{
         mask_tools_as_mcp, patch_streaming_response_json,
     },
     streaming::handle_streaming_response,
-    utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model},
+    utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model, ToolContext},
 };
 use crate::{
     core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
@@ -250,7 +250,7 @@ impl OpenAIRouter {
         mut payload: Value,
         original_body: &ResponsesRequest,
         original_previous_response_id: Option<String>,
-        is_web_search: bool,
+        tool_context: ToolContext,
     ) -> Response {
         // Check if MCP is active for this request
         // Ensure dynamic client is created if needed
@@ -272,7 +272,7 @@ impl OpenAIRouter {
             let config = McpLoopConfig::default();
 
             // Transform MCP tools to function tools
-            prepare_mcp_payload_for_streaming(&mut payload, mcp, is_web_search);
+            prepare_mcp_payload_for_streaming(&mut payload, mcp, tool_context);
 
             match execute_tool_loop(
                 &self.client,
@@ -282,7 +282,7 @@ impl OpenAIRouter {
                 original_body,
                 mcp,
                 &config,
-                is_web_search,
+                tool_context,
             )
             .await
             {
@@ -700,17 +700,19 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let url = format!("{}/v1/responses", base_url);
 
         // Detect web_search_preview tool and verify MCP server availability
-        let has_web_search = if let Some(ref tools) = body.tools {
-            crate::routers::openai::web_search::has_web_search_preview_tool(tools)
+        let tool_context = if let Some(ref tools) = body.tools {
+            if has_web_search_preview_tool(tools) {
+                ToolContext::WebSearchPreview
+            } else {
+                ToolContext::Regular
+            }
         } else {
-            false
+            ToolContext::Regular
         };
 
-        if has_web_search {
+        if tool_context.is_web_search() {
             // Check if web_search_preview MCP server is available
-            if !crate::routers::openai::web_search::is_web_search_mcp_available(&self.mcp_manager)
-                .await
-            {
+            if !is_web_search_mcp_available(&self.mcp_manager).await {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({
@@ -993,7 +995,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 payload,
                 body,
                 original_previous_response_id,
-                has_web_search,
+                tool_context,
             )
             .await
         } else {
@@ -1003,7 +1005,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 payload,
                 body,
                 original_previous_response_id,
-                has_web_search,
+                tool_context,
             )
             .await
         }

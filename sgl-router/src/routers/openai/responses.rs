@@ -282,7 +282,7 @@ pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesReque
     let has_web_search = original_body
         .tools
         .as_ref()
-        .map(|tools| crate::routers::openai::web_search::has_web_search_preview_tool(tools))
+        .map(|tools| crate::routers::openai::mcp::has_web_search_preview_tool(tools))
         .unwrap_or(false);
 
     // If neither MCP nor web_search_preview, return early

@@ -32,7 +32,7 @@ use super::{
     responses::{
         mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block,
     },
-    utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
+    utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction, ToolContext},
 };
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
@@ -911,7 +911,7 @@ pub(super) fn send_final_response_event(
     original_request: &ResponsesRequest,
     previous_response_id: Option<&str>,
     server_label: &str,
-    is_web_search: bool,
+    tool_context: ToolContext,
 ) -> bool {
     let mut final_response = match handler.snapshot_final_response() {
         Some(resp) => resp,
@@ -928,7 +928,7 @@ pub(super) fn send_final_response_event(
     }
 
     if let Some(mcp) = active_mcp {
-        inject_mcp_metadata_streaming(&mut final_response, state, mcp, server_label, is_web_search);
+        inject_mcp_metadata_streaming(&mut final_response, state, mcp, server_label, tool_context);
     }
 
     mask_tools_as_mcp(&mut final_response, original_request);
@@ -1140,10 +1140,10 @@ pub(super) async fn handle_streaming_with_tool_interception(
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<String>,
     active_mcp: &Arc<crate::mcp::McpManager>,
-    is_web_search: bool,
+    tool_context: ToolContext,
 ) -> Response {
     // Transform MCP tools to function tools in payload
-    prepare_mcp_payload_for_streaming(&mut payload, active_mcp, is_web_search);
+    prepare_mcp_payload_for_streaming(&mut payload, active_mcp, tool_context);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
     let should_store = original_body.store.unwrap_or(false);
@@ -1365,7 +1365,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     &original_request,
                     previous_response_id.as_deref(),
                     server_label,
-                    is_web_search,
+                    tool_context,
                 ) {
                     return;
                 }
@@ -1387,7 +1387,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                         &state,
                         &active_mcp_clone,
                         server_label,
-                        is_web_search,
+                        tool_context,
                     );
 
                     mask_tools_as_mcp(&mut response_json, &original_request);
@@ -1449,7 +1449,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                 &mut state,
                 server_label,
                 &mut sequence_number,
-                is_web_search,
+                tool_context,
             )
             .await
             {
@@ -1505,7 +1505,7 @@ pub(super) async fn handle_streaming_response(
     payload: Value,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<String>,
-    is_web_search: bool,
+    tool_context: ToolContext,
 ) -> Response {
     // Check if MCP is active for this request
     // Ensure dynamic client is created if needed
@@ -1553,7 +1553,7 @@ pub(super) async fn handle_streaming_response(
         original_body,
         original_previous_response_id,
         active_mcp,
-        is_web_search,
+        tool_context,
     )
     .await
 }
