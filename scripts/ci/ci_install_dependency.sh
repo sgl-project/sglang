@@ -17,12 +17,10 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../killall_sglang.sh"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
-if command -v python3 &> /dev/null; then
-    echo "python3 is OK"
-else
-    # Sometimes python3 is missing, link python to python3.
-    PYTHON_PATH=`which python`
-    ln -s $PYTHON_PATH ${PYTHON_PATH}3
+if ! command -v python3 &> /dev/null; then
+    # If python3 is not found, create a symlink from python.
+    PYTHON_EXECUTABLE=$(command -v python)
+    ln -sf "$PYTHON_EXECUTABLE" "$(dirname "$PYTHON_EXECUTABLE")/python3"
 fi
 
 # Clear torch compilation cache
