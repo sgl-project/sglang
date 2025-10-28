@@ -196,7 +196,7 @@ class TestMoERunner(CustomTestCase):
                 "--moe-runner-backend",
                 "cutlass",
                 "--quantization",
-                "w8a8",
+                "w8a8_int8",
                 "--tp",
                 "2",
                 "--max-total-tokens",
