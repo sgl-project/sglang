@@ -1,15 +1,11 @@
-# Test build workflow for SGLang Router - builds on all platforms
+# Nightly release workflow for SGLang Router
 
-name: Test Build SGLang Model Gateway
+name: Nightly Release SGLang Router to PyPI
 
 on:
-  # schedule:
-  #   # Run at 2 AM UTC every day
-  #   - cron: '0 2 * * *'
-  pull_request:
-    paths:
-      - 'sgl-router/**'
-      - '.github/workflows/nightly-release-router.yml'
+  schedule:
+    # Run at 2 AM UTC every day
+    - cron: '0 2 * * *'
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
@@ -29,10 +25,10 @@ jobs:
             ls: dir
             target: x86_64
             python-architecture: x64
-            interpreter: 3.9 3.10 3.11 3.12 3.13
+            interpreter: 3.8 3.9 3.10 3.11 3.12 3.13
           - os: macos
             target: aarch64
-            interpreter: 3.9 3.10 3.11 3.12 3.13
+            interpreter: 3.8 3.9 3.10 3.11 3.12 3.13
           - os: ubuntu
             platform: linux
             target: aarch64
@@ -98,7 +94,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: --release --out dist --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13' }}
+          args: --release --out dist --interpreter ${{ matrix.interpreter || '3.8 3.9 3.10 3.11 3.12 3.13' }}
           rust-toolchain: stable
           docker-options: -e CI -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           before-script-linux: |
@@ -179,21 +175,21 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
-  # upload:
-  #   name: Upload to TestPyPI
-  #   if: github.repository == 'sgl-project/sglang'  # Ensure this job only runs for the sgl-project/sglang repository
-  #   needs: [build, build-sdist]
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/download-artifact@v4
-  #       with:
-  #         path: dist
-  #         merge-multiple: true
+  upload:
+    name: Upload to TestPyPI
+    if: github.repository == 'sgl-project/sglang'  # Ensure this job only runs for the sgl-project/sglang repository
+    needs: [build, build-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
-  #     - name: Upload to TestPyPI
-  #       env:
-  #         TWINE_USERNAME: __token__
-  #         TWINE_PASSWORD: ${{ secrets.TEST_PYPI_TOKEN_ROUTER }}
-  #       run: |
-  #         pip install twine
-  #         twine upload --repository testpypi dist/* --verbose
+      - name: Upload to TestPyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_TOKEN_ROUTER }}
+        run: |
+          pip install twine
+          twine upload --repository testpypi dist/* --verbose
