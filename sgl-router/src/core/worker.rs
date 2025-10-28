@@ -418,17 +418,6 @@ impl Default for EngineLoad {
 }
 
 impl EngineLoad {
-    pub fn new() -> Self {
-        Self {
-            num_reqs: AtomicU32::new(0),
-            num_waiting_reqs: AtomicU32::new(0),
-            num_tokens: AtomicU32::new(0),
-            max_req_limit: 1024 * 1024 * 1024,
-            max_waiting_req_limit: 1024 * 1024 * 1024,
-            max_token_limit: 1024 * 1024 * 1024,
-        }
-    }
-
     pub fn new_with_limits(max_req: u32, max_waiting_reqs: u32, max_token: u32) -> Self {
         Self {
             num_reqs: AtomicU32::new(0),
@@ -1038,7 +1027,7 @@ impl Worker for DPAwareWorker {
                                     self.base_worker.metadata.url,
                                     self.dp_rank
                                 );
-                                Err(WorkerError::HealthCheckFailed {
+                                Err(WorkerError::GetLoadFailed {
                                     url: load_url,
                                     reason: format!("No load info for dp_rank {}", self.dp_rank),
                                 })
@@ -1049,7 +1038,7 @@ impl Worker for DPAwareWorker {
                                 "Failed to parse load response from {}: {err:?}",
                                 self.base_worker.metadata.url
                             );
-                            Err(WorkerError::HealthCheckFailed {
+                            Err(WorkerError::GetLoadFailed {
                                 url: load_url,
                                 reason: format!("Failed to parse load response: {}", err),
                             })
@@ -1061,7 +1050,7 @@ impl Worker for DPAwareWorker {
                         self.base_worker.metadata.url,
                         resp.status()
                     );
-                    Err(WorkerError::HealthCheckFailed {
+                    Err(WorkerError::GetLoadFailed {
                         url: load_url,
                         reason: format!("Load check failed with status: {}", resp.status()),
                     })
@@ -1072,7 +1061,7 @@ impl Worker for DPAwareWorker {
                     "HTTP load check failed for {}: {err:?}",
                     self.base_worker.metadata.url
                 );
-                Err(WorkerError::HealthCheckFailed {
+                Err(WorkerError::GetLoadFailed {
                     url: load_url,
                     reason: format!("HTTP request failed: {}", err),
                 })
