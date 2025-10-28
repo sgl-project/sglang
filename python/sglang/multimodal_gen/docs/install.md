@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 # Install sgl-diffusion
 
 You can install sgl-diffusion using one of the methods below.

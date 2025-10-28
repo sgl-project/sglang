@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 # SPDX-License-Identifier: Apache-2.0
 # Copied from https://github.com/huggingface/diffusers/blob/v0.31.0/src/diffusers/schedulers/scheduling_unipc_multistep.py
 # Convert unipc for flow matching

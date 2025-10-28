@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 from dataclasses import dataclass, field
 from typing import Callable
 

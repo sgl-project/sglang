@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 from typing import Dict, Optional, Tuple, Union
 
 import torch

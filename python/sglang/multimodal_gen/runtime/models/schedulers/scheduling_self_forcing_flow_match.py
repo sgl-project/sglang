@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 # SPDX-License-Identifier: Apache-2.0
 import torch
 from diffusers.configuration_utils import ConfigMixin, register_to_config

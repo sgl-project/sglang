@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 import zmq
 
 from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req

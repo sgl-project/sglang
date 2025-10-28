@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 import random
 from collections.abc import Callable
 from typing import cast

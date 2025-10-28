@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 """
     Testing the performance of generate command of sgl_diffusion' CLI
 """

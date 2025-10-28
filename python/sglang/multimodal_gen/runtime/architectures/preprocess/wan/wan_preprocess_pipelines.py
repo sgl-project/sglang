@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
     ComposedPipelineBase,
 )

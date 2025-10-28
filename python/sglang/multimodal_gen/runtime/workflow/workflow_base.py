@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 

@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 # TODO: for temporary usage, expecting a refactor
 from typing import Optional
 

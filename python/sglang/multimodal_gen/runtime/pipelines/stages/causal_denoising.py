@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 import torch  # type: ignore
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device

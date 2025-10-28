@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 # Adding a New Custom Pipeline
 
 Please see documentation [here](https://hao-ai-lab.github.io/sgl-diffusion/contributing/add_pipeline.html)

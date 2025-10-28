@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 # SPDX-License-Identifier: Apache-2.0
 
 # Copyright 2024 Stability AI, Katherine Crowson and The HuggingFace Team. All rights reserved.

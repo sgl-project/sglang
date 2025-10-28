@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 # SPDX-License-Identifier: Apache-2.0
 # copied from https://pypi.org/project/nvidia-ml-py
 # version 12.570.86

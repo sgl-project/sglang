@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 from typing import Literal, get_args
 
 from sglang.multimodal_gen.runtime.layers.quantization.base_config import (

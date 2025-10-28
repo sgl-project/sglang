@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 from sglang.multimodal_gen.api.configs.models.vaes.hunyuanvae import HunyuanVAEConfig
 from sglang.multimodal_gen.api.configs.models.vaes.stepvideovae import (
     StepVideoVAEConfig,

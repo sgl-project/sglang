@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
 <div align="center">
 <img src=assets/logos/logo.svg width="30%"/>
 </div>
