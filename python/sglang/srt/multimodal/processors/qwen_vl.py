@@ -5,6 +5,7 @@ import re
 import time
 from typing import List, Union
 
+import numpy as np
 import torch
 import torchvision
 from PIL import Image
@@ -180,9 +181,11 @@ async def preprocess_video(
     ele = {}
     total_frames, video_fps = len(vr), vr.get_avg_fps()
     nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
-    idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
-    video = vr.get_batch(idx).asnumpy()
-    video = torch.tensor(video).permute(0, 3, 1, 2)  # Convert to TCHW format
+    idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
+    idx = np.unique(idx)
+    video_np = vr.get_batch(idx).asnumpy()
+    video = torch.from_numpy(video_np)
+    video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
     nframes, _, height, width = video.shape
     min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
     total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
@@ -191,7 +194,7 @@ async def preprocess_video(
         int(min_pixels * 1.05),
     )
 
-    process1_time = time.perf_counter()
+    get_batch_time = time.perf_counter()
 
     max_pixels_supposed = ele.get("max_pixels", max_pixels)
     if max_pixels_supposed > max_pixels:
@@ -214,13 +217,12 @@ async def preprocess_video(
             max_pixels=max_pixels,
         )
 
-    process2_time = time.perf_counter()
+    smart_resize_time = time.perf_counter()
     video = torchvision.transforms.functional.resize(
         video,
         [resized_height, resized_width],
-        interpolation=InterpolationMode.BICUBIC,
-        antialias=True,
-    ).float()
+        interpolation=InterpolationMode.BILINEAR,
+    )
     video_metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,
@@ -228,13 +230,13 @@ async def preprocess_video(
         "frames_indices": idx,
         "video_backend": "torchvision",
     }
-    process3_time = time.perf_counter()
+    torchvision_resize_time = time.perf_counter()
     logger.info(
         f"[preprocess_video Perf], "
-        f"get_batch_time: {(process1_time - entry_time) * 1000:.2f} ms, "
-        f"smart_resize_time: {(process2_time - process1_time) * 1000:.2f} ms, "
-        f"torchvision_resize_time: {(process3_time - process2_time) * 1000:.2f} ms, "
-        f"total_time: {(process3_time - entry_time) * 1000:.2f} ms"
+        f"get_batch_time: {(get_batch_time - entry_time) * 1000:.2f} ms, "
+        f"smart_resize_time: {(smart_resize_time - get_batch_time) * 1000:.2f} ms, "
+        f"torchvision_resize_time: {(torchvision_resize_time - smart_resize_time) * 1000:.2f} ms, "
+        f"total_time: {(torchvision_resize_time - entry_time) * 1000:.2f} ms"
     )
     return video, video_metadata
 
@@ -340,13 +342,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
 
         process_time = time.perf_counter()
-        logger.info(
-            f"[QwenVLProcessor Perf] {rid=}, "
-            f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
-            f"preprocess_time: {(preprocess_time - load_time) * 1000:.2f} ms, "
-            f"process_time: {(process_time - preprocess_time) * 1000:.2f} ms, "
-            f"total_time: {(process_time - entry_time) * 1000:.2f} ms"
-        )
 
         input_ids = input_ids.flatten()
 
@@ -372,6 +367,17 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             ),
         )
         mrope_positions = mrope_positions.squeeze(1)
+
+        get_rope_index_time = time.perf_counter()
+
+        logger.debug(
+            f"[QwenVLProcessor Perf] {rid=}, "
+            f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
+            f"preprocess_time: {(preprocess_time - load_time) * 1000:.2f} ms, "
+            f"process_time: {(process_time - preprocess_time) * 1000:.2f} ms, "
+            f"get_rope_index_time: {(get_rope_index_time - process_time) * 1000:.2f} ms, "
+            f"total_time: {(get_rope_index_time - entry_time) * 1000:.2f} ms"
+        )
 
         return {
             "input_ids": input_ids.tolist(),
