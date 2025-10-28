@@ -142,7 +142,7 @@ impl HarmonyBuilder {
                 content_type = ?msg.content_type,
                 content_preview = ?msg.content.iter()
                     .filter_map(|c| match c {
-                        openai_harmony::chat::Content::Text(tc) => Some(tc.text.chars().take(150).collect::<String>()),
+                        Content::Text(tc) => Some(tc.text.chars().take(150).collect::<String>()),
                         _ => None,
                     })
                     .collect::<Vec<_>>(),
@@ -587,14 +587,15 @@ impl HarmonyBuilder {
                 // Otherwise, it's the tool call itself
                 if let Some(output_str) = output {
                     // Tool result - use Tool role with "functions.{name}" as author name
-                    // IMPORTANT: Must include channel="commentary" and recipient="assistant"
-                    // to help the parser recognize this as a tool message when parsing back
+                    // IMPORTANT: Must include recipient="assistant" to help the parser
+                    // recognize this as a tool message. We DON'T set channel to prevent
+                    // the model from copying the Tool role pattern in its responses.
                     let author_name = format!("functions.{}", name);
                     debug!(
                         tool_name = %name,
                         author_name = %author_name,
                         output_preview = %output_str.chars().take(100).collect::<String>(),
-                        "Building tool result message with Tool role"
+                        "Building tool result message with Tool role (no channel)"
                     );
                     Ok(HarmonyMessage {
                         author: Author {
@@ -605,7 +606,7 @@ impl HarmonyBuilder {
                         content: vec![Content::Text(TextContent {
                             text: output_str.clone(),
                         })],
-                        channel: Some("commentary".to_string()),
+                        channel: None,
                         content_type: None,
                     })
                 } else {
@@ -652,7 +653,9 @@ impl HarmonyBuilder {
                     .ok_or_else(|| format!("No function call found for call_id: {}", call_id))?;
 
                 // Create Tool message with "functions.{name}" prefix
-                // IMPORTANT: Must include channel="commentary" and recipient="assistant"
+                // IMPORTANT: Must include recipient="assistant" to help the parser
+                // recognize this as a tool message. We DON'T set channel to prevent
+                // the model from copying the Tool role pattern in its responses.
                 Ok(HarmonyMessage {
                     author: Author {
                         role: Role::Tool,
@@ -662,7 +665,7 @@ impl HarmonyBuilder {
                     content: vec![Content::Text(TextContent {
                         text: output.clone(),
                     })],
-                    channel: Some("commentary".to_string()),
+                    channel: None,
                     content_type: None,
                 })
             }
@@ -843,6 +846,7 @@ impl HarmonyBuilder {
                         .unwrap_or_else(|| tool_call_id.clone());
 
                     // Tool result needs recipient="assistant" for parser to recognize it
+                    // We DON'T set channel to prevent the model from copying the Tool role pattern
                     let harmony_msg = HarmonyMessage {
                         author: Author {
                             role: Role::Tool,
@@ -852,7 +856,7 @@ impl HarmonyBuilder {
                         content: vec![Content::Text(TextContent {
                             text: content.clone(),
                         })],
-                        channel: Some("commentary".to_string()),
+                        channel: None,
                         content_type: None,
                     };
                     harmony_messages.push(harmony_msg);
@@ -861,6 +865,7 @@ impl HarmonyBuilder {
                 ChatMessage::Function { content, name } => {
                     // Function messages also use Role::Tool
                     // Tool result needs recipient="assistant" for parser to recognize it
+                    // We DON'T set channel to prevent the model from copying the Tool role pattern
                     let harmony_msg = HarmonyMessage {
                         author: Author {
                             role: Role::Tool,
@@ -870,7 +875,7 @@ impl HarmonyBuilder {
                         content: vec![Content::Text(TextContent {
                             text: content.clone(),
                         })],
-                        channel: Some("commentary".to_string()),
+                        channel: None,
                         content_type: None,
                     };
                     harmony_messages.push(harmony_msg);
