@@ -45,18 +45,18 @@ python -m sglang.launch_server \
 
 **Terminal 2 - Run Checkpoint Engine:**
 
-Using torchrun directly:
+Using sglang entrypoint:
 ```bash
-torchrun --nproc-per-node 8 \
-    examples/checkpoint_engine/update.py \
+python -m sglang.srt.checkpoint_engine.update \
     --update-method broadcast \
     --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
     --inference-parallel-size 8
 ```
 
-Using integrated entry point (automatically handles torchrun):
+Using torchrun directly:
 ```bash
-python -m sglang.srt.checkpoint_engine.update \
+torchrun --nproc-per-node 8 \
+    examples/checkpoint_engine/update.py \
     --update-method broadcast \
     --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
     --inference-parallel-size 8
@@ -77,6 +77,16 @@ python -m sglang.launch_server \
 ```
 
 Run checkpoint engine:
+
+Using sglang entrypoint (recommended):
+```bash
+python -m sglang.srt.checkpoint_engine.update \
+    --update-method broadcast \
+    --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
+    --inference-parallel-size 8
+```
+
+Using torchrun directly:
 ```bash
 torchrun --nproc-per-node 8 \
     --nnodes 2 \
@@ -102,6 +112,16 @@ python -m sglang.launch_server \
 ```
 
 Run checkpoint engine:
+
+Using sglang entrypoint (recommended):
+```bash
+python -m sglang.srt.checkpoint_engine.update \
+    --update-method broadcast \
+    --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
+    --inference-parallel-size 8
+```
+
+Using torchrun directly:
 ```bash
 torchrun --nproc-per-node 8 \
     --nnodes 2 \
@@ -132,6 +152,16 @@ python -m sglang.launch_server \
 ```
 
 Run checkpoint engine:
+
+Using sglang entrypoint (recommended):
+```bash
+python -m sglang.srt.checkpoint_engine.update \
+    --update-method broadcast \
+    --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
+    --inference-parallel-size 16
+```
+
+Using torchrun directly:
 ```bash
 torchrun --nproc-per-node 8 \
     --nnodes 2 \
@@ -157,6 +187,29 @@ python -m sglang.launch_server \
     --dist-init-addr [IP]:9120 \
     --nnodes 2 \
     --node-rank 1
+```
+
+Run checkpoint engine:
+
+Using sglang entrypoint (recommended):
+```bash
+python -m sglang.srt.checkpoint_engine.update \
+    --update-method broadcast \
+    --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
+    --inference-parallel-size 16
+```
+
+Using torchrun directly:
+```bash
+torchrun --nproc-per-node 8 \
+    --nnodes 2 \
+    --node-rank 1 \
+    --master-addr [IP] \
+    --master-port 29500 \
+    examples/checkpoint_engine/update.py \
+    --update-method broadcast \
+    --checkpoint-path /path/to/Qwen/Qwen3-8B/ \
+    --inference-parallel-size 16
 ```
 
 ## Configuration Options
