@@ -8,8 +8,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_npu
 
 if is_npu():
-    import sgl_kernel_npu
-    import torch_npu
+    import sgl_kernel_npu  # noqa: F401
+    import torch_npu  # noqa: F401
 
 
 class AscendLoRABackend(BaseLoRABackend):
@@ -46,7 +46,7 @@ class AscendLoRABackend(BaseLoRABackend):
             .repeat_interleave(self.batch_info.seg_lens, output_size=total_seq_len)
             .unsqueeze(-1)
         )
-        output_tensor = output_tensor * scaling
+        output_tensor *= scaling
 
         return output_tensor
 
@@ -124,7 +124,7 @@ class AscendLoRABackend(BaseLoRABackend):
             .repeat_interleave(self.batch_info.seg_lens, output_size=total_seq_len)
             .unsqueeze(-1)
         )
-        lora_a_output = lora_a_output * scaling
+        lora_a_output *= scaling
 
         for slice_id in range(num_slices):
             slice_offset = output_offset_cpu[slice_id]
@@ -186,7 +186,7 @@ class AscendLoRABackend(BaseLoRABackend):
             .repeat_interleave(self.batch_info.seg_lens, output_size=total_seq_len)
             .unsqueeze(-1)
         )
-        lora_a_output = lora_a_output * scaling
+        lora_a_output *= scaling
 
         slice_offset = 0
         for slice_id in range(num_slices):
@@ -199,7 +199,7 @@ class AscendLoRABackend(BaseLoRABackend):
                 slice_offset,
                 slice_size,
             )
-            slice_offset += slice_offset
+            slice_offset += slice_size
 
         return output_tensor
 
@@ -268,7 +268,7 @@ class AscendLoRABackend(BaseLoRABackend):
                     (bs,), dtype=torch.int32, device=self.device
                 ),
                 lora_ranks=torch.empty(
-                    (self.max_loras_per_batch,), dtype=torch.int64, device=self.device
+                    (self.max_loras_per_batch,), dtype=torch.int32, device=self.device
                 ),
                 scalings=torch.empty(
                     (self.max_loras_per_batch,), dtype=torch.float, device=self.device
