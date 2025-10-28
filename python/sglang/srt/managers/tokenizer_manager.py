@@ -289,13 +289,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
         self.log_request_metadata = self.get_log_request_metadata()
+        self.crash_dump_request_list: deque[Tuple] = deque()
+        self.crash_dump_performed = False  # Flag to ensure dump is only called once
+
         # Initialize performance metrics loggers with proper skip names
         _, obj_skip_names, out_skip_names = self.log_request_metadata
         self.request_metrics_exporter_manager = RequestMetricsExporterManager(
             self.server_args, obj_skip_names, out_skip_names
         )
-        self.crash_dump_request_list: deque[Tuple] = deque()
-        self.crash_dump_performed = False  # Flag to ensure dump is only called once
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
@@ -957,10 +958,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                     logger.info(msg)
 
-                # Asynchronously write performance metrics for this request using the exporter manager.
-                asyncio.create_task(
-                    self.request_metrics_exporter_manager.write_record(obj, out)
-                )
+                if self.request_metrics_exporter_manager.exporter_enabled():
+                    # Asynchronously write metrics for this request using the exporter manager.
+                    asyncio.create_task(
+                        self.request_metrics_exporter_manager.write_record(obj, out)
+                    )
 
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):

@@ -183,6 +183,10 @@ class RequestMetricsExporterManager:
         except ImportError:
             pass
 
+    def exporter_enabled(self) -> bool:
+        """Return true if at least one RequestMetricsExporter is enabled."""
+        return len(self._exporters) > 0
+
     async def write_record(self, obj, out_dict: dict) -> None:
         """Write a record using all configured exporters."""
         for exporter in self._exporters:
