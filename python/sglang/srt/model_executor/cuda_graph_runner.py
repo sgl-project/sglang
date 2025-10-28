@@ -406,18 +406,15 @@ class CudaGraphRunner:
             cuda_graph_bs = forward_batch.batch_size
 
         if self.enable_pdmux:
-            current_stream_idx = get_current_stream_idx()
-            is_bs_supported = (
-                f"{current_stream_idx}_{cuda_graph_bs}" in self.graphs
-                if self.disable_padding
-                else cuda_graph_bs <= self.max_bs
-            )
+            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
         else:
-            is_bs_supported = (
-                cuda_graph_bs in self.graphs
-                if self.disable_padding
-                else cuda_graph_bs <= self.max_bs
-            )
+            graph_key = cuda_graph_bs
+
+        is_bs_supported = (
+            graph_key in self.graphs
+            if self.disable_padding
+            else cuda_graph_bs <= self.max_bs
+        )
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -872,11 +869,11 @@ class CudaGraphRunner:
 
         # Replay
         if self.enable_pdmux:
-            self.graphs[f"{get_current_stream_idx()}_{self.bs}"].replay()
-            output = self.output_buffers[f"{get_current_stream_idx()}_{self.bs}"]
+            graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
-            self.graphs[self.bs].replay()
-            output = self.output_buffers[self.bs]
+            graph_key = self.bs
+        self.graphs[graph_key].replay()
+        output = self.output_buffers[graph_key]
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_token],
