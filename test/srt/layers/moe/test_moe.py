@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -16,10 +15,9 @@ from sglang.test.test_utils import (
 )
 
 
-class TestMoERunnerTriton(CustomTestCase):
+class TestMoERunner(CustomTestCase):
     BASE_URL = DEFAULT_URL_FOR_TEST
     TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-    DEFAULT_MODEL = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT
     DEFAULT_EVAL_KWARGS = {
         "eval_name": "mmlu",
         "num_examples": 5,
@@ -63,11 +61,6 @@ class TestMoERunnerTriton(CustomTestCase):
                 "--speculative-num-draft-tokens",
                 "2",
             ],
-            "eval_kwargs": {"num_examples": 3},
-            "env": {
-                "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
-                "SGLANG_ENABLE_JIT_DEEPGEMM": "0",
-            },
         },
         "moe_runner_triton_kernel_unquant_standard": {
             "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
@@ -98,7 +91,6 @@ class TestMoERunnerTriton(CustomTestCase):
                 "--mem-fraction-static",
                 "0.95",
             ],
-            "eval_kwargs": {"num_examples": 3},
         },
         "moe_runner_flashinfer_trtllm_mxfp4_quantization": {
             "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
@@ -115,7 +107,6 @@ class TestMoERunnerTriton(CustomTestCase):
                 "--mem-fraction-static",
                 "0.95",
             ],
-            "eval_kwargs": {"num_examples": 2},
         },
         # Speculative decoding (NGRAM) with FlashInfer MXFP4 backend (differs from main path)
         "moe_runner_flashinfer_mxfp4_quantization_spec_ngram": {
@@ -137,11 +128,6 @@ class TestMoERunnerTriton(CustomTestCase):
                 "--speculative-num-draft-tokens",
                 "8",
             ],
-            "eval_kwargs": {"num_examples": 2},
-            "env": {
-                "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
-                "SGLANG_ENABLE_JIT_DEEPGEMM": "0",
-            },
         },
         "moe_runner_flashinfer_mxfp4_fp8_quantization": {
             "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
@@ -158,7 +144,6 @@ class TestMoERunnerTriton(CustomTestCase):
                 "--mem-fraction-static",
                 "0.95",
             ],
-            "eval_kwargs": {"num_examples": 2},
         },
         "moe_runner_flashinfer_cutedsl_fp8_quantization": {
             "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
@@ -175,7 +160,6 @@ class TestMoERunnerTriton(CustomTestCase):
                 "--mem-fraction-static",
                 "0.95",
             ],
-            "eval_kwargs": {"num_examples": 2},
         },
         "moe_runner_cutlass_w8a8_quantization": {
             "model": DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
@@ -192,18 +176,13 @@ class TestMoERunnerTriton(CustomTestCase):
                 "--mem-fraction-static",
                 "0.95",
             ],
-            "eval_kwargs": {"num_examples": 2},
         },
     }
 
     def _run_config(self, config: dict) -> None:
-        model = config.get("model", self.DEFAULT_MODEL)
+        model = config["model"]
         other_args = config.get("other_args", [])
-        eval_kwargs = self.DEFAULT_EVAL_KWARGS | config.get("eval_kwargs", {})
-
-        env_overrides = config.get("env", {})
-        saved_env = {k: os.environ.get(k) for k in env_overrides}
-        os.environ.update(env_overrides)
+        eval_kwargs = self.DEFAULT_EVAL_KWARGS
 
         process = popen_launch_server(
             model,
@@ -222,23 +201,14 @@ class TestMoERunnerTriton(CustomTestCase):
             self.assertGreaterEqual(metrics["score"], 0.0)
         finally:
             kill_process_tree(process.pid)
-            for key, previous in saved_env.items():
-                if previous is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = previous
 
 
-def _make_test(config_name: str, config: dict):
-    def test(self):
-        self._run_config(config)
-
-    test.__name__ = f"test_{config_name}"
-    return test
-
-
-for _name, _config in TestMoERunnerTriton.CONFIGS.items():
-    setattr(TestMoERunnerTriton, f"test_{_name}", _make_test(_name, _config))
+for _name, _cfg in TestMoERunner.CONFIGS.items():
+    setattr(
+        TestMoERunner,
+        f"test_{_name}",
+        (lambda self, cfg=_cfg: self._run_config(cfg)),
+    )
 
 
 if __name__ == "__main__":
