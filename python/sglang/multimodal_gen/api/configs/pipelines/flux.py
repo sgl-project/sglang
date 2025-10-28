@@ -152,7 +152,7 @@ class FluxPipelineConfig(PipelineConfig):
         latents = latents.reshape(batch_size, channels // (2 * 2), height, width)
         return latents
 
-    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb):
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {
             "freqs_cis": self.get_freqs_cis(
                 batch.prompt_embeds[1], batch.width, batch.height, device, rotary_emb
