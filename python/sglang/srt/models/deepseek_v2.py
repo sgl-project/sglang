@@ -1260,7 +1260,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
             and _is_cuda
             and 90 <= _device_sm < 120
-            and not get_global_server_args().enable_deterministic_inference
         )
 
         self.qkv_proj_with_rope_is_int8 = (
@@ -1578,7 +1577,6 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if (
             self.use_deep_gemm_bmm
-            and not get_global_server_args().enable_deterministic_inference
         ):
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
@@ -2462,7 +2460,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             and (self.num_local_heads == 128)
             and (self.qk_nope_head_dim == 128)
             and (self.qk_rope_head_dim == 64)
-            and not get_global_server_args().enable_deterministic_inference
         ):
             k = k_nope.new_empty(*k_shape)
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
@@ -3008,8 +3005,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
         elif self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
-        elif get_global_server_args().enable_deterministic_inference:
-            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization with deterministic inference."
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
@@ -3191,7 +3186,6 @@ class DeepseekV2ForCausalLM(nn.Module):
 
             if (
                 not use_deep_gemm_bmm
-                or get_global_server_args().enable_deterministic_inference
             ):
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)

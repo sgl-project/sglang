@@ -486,9 +486,8 @@ def grouped_topk_gpu(
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
     if get_global_server_args().enable_deterministic_inference:
-        # Force pointwise kernels
         inductor_config.triton.persistent_reductions = False
-        inductor_config.triton.max_tiles = 1  # Further restrict to simple kernels
+        inductor_config.triton.max_tiles = 1
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
