@@ -423,16 +423,16 @@ class MambaRadixCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req) -> None:
         """Cache request when it finishes."""
+        kv_committed_len = req.free_committed_kv_cache()
+
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx,
-                : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
+                req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        kv_committed_len = req.free_committed_kv_cache()
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
