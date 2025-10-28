@@ -70,7 +70,11 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
@@ -438,6 +442,7 @@ class Req:
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
     ):
         # Input and output info
@@ -645,6 +650,9 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+
+        # For Matryoshka embeddings
+        self.dimensions = dimensions
 
     @property
     def seqlen(self):
@@ -1010,6 +1018,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     encoder_lens_cpu: Optional[List[int]] = None
     encoder_out_cache_loc: Optional[torch.Tensor] = None
 
+    # For matryoshka embeddings
+    dimensions: Optional[list[int]] = None
+
+    # For split prefill
+    split_index: int = 0
+    split_prefill_finished: bool = False
+    split_forward_count: int = 1
+    split_forward_batch: ForwardBatch = None
+    seq_lens_cpu_cache: torch.Tensor = None
+
     # Stream
     has_stream: bool = False
 
@@ -1165,6 +1183,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
+
+        # For matryoshka embeddings
+        if self.model_config.is_matryoshka and any(
+            r.dimensions is not None for r in reqs
+        ):
+            self.dimensions = [
+                r.dimensions if r.dimensions else self.model_config.hidden_size
+                for r in reqs
+            ]
 
         token_type_ids = [
             r.token_type_ids for r in reqs if r.token_type_ids is not None
@@ -1754,6 +1781,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
+            dimensions=self.dimensions,
         )
 
     def copy(self):
@@ -1861,6 +1889,9 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
+
+    # For matryoshka embeddings
+    dimensions: Optional[list[int]] = None
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
