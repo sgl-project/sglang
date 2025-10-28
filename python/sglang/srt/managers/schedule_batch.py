@@ -623,6 +623,9 @@ class Req:
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
 
+        # The number of times this request has been retracted / preempted.
+        self.retraction_count = 0
+
         # For metrics
         self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
@@ -883,6 +886,10 @@ class Req:
             return
 
     def reset_for_retract(self):
+        # Increment retraction count before resetting other state. We should not reset this
+        # since we are tracking the total number of retractions for each request.
+        self.retraction_count += 1
+
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.last_node = None
         self.swa_uuid_for_lock = None
