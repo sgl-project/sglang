@@ -30,6 +30,8 @@ from typing import (
 
 import torch
 import torch.nn.functional as F
+import torch._inductor.config as inductor_config
+from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.eplb import expert_location_dispatch
@@ -42,7 +44,6 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -484,6 +485,11 @@ def grouped_topk_gpu(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
+    if get_global_server_args().enable_deterministic_inference:
+        # Force pointwise kernels
+        inductor_config.triton.persistent_reductions = False
+        inductor_config.triton.max_tiles = 1  # Further restrict to simple kernels
+    
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = torch.softmax(gating_output, dim=-1)
@@ -687,7 +693,6 @@ def biased_grouped_topk_gpu(
         and gating_output.shape[1] // num_expert_group
         <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and is_power_of_two(correction_bias.shape[0])
-        and not get_global_server_args().enable_deterministic_inference
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),
