@@ -33,9 +33,7 @@ use super::{
     utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
 };
 use crate::{
-    data_connector::{
-        SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
-    },
+    data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     protocols::responses::{ResponseToolType, ResponsesRequest},
     routers::header_utils::{apply_request_headers, preserve_response_headers},
 };
@@ -961,9 +959,9 @@ pub(super) fn send_final_response_event(
 pub(super) async fn handle_simple_streaming_passthrough(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     url: String,
     headers: Option<&HeaderMap>,
     payload: Value,
@@ -996,10 +994,10 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
     if !status.is_success() {
         circuit_breaker.record_failure();
-        let error_body = match response.text().await {
-            Ok(body) => body,
-            Err(err) => format!("Failed to read upstream error body: {}", err),
-        };
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|err| format!("Failed to read upstream error body: {}", err));
         return (status_code, error_body).into_response();
     }
 
@@ -1130,9 +1128,9 @@ pub(super) async fn handle_simple_streaming_passthrough(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_streaming_with_tool_interception(
     client: &reqwest::Client,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     url: String,
     headers: Option<&HeaderMap>,
     mut payload: Value,
@@ -1492,9 +1490,9 @@ pub(super) async fn handle_streaming_response(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,
     mcp_manager: Option<&Arc<crate::mcp::McpManager>>,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     url: String,
     headers: Option<&HeaderMap>,
     payload: Value,
