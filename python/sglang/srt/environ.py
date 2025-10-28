@@ -239,6 +239,9 @@ class Envs:
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
 
+    # Release & Resume Memory
+    SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
+
     # Ktransformers
     SGLANG_KT_MOE_NUM_GPU_EXPERTS = EnvInt(None)
     SGLANG_KT_MOE_CPUINFER = EnvInt(None)
