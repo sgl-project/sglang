@@ -74,9 +74,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
-from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import Modality, RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
