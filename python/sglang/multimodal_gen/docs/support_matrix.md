@@ -1,5 +1,3 @@
-# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
 # Compatibility Matrix
 
 The table below shows every supported model and the optimizations supported for them.

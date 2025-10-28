@@ -1,5 +1,3 @@
-# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
 # sgl-diffusion CLI Inference
 
 The sgl-diffusion CLI provides a quick way to access the sgl-diffusion inference pipeline for image and video generation.
