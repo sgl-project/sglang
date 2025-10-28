@@ -68,6 +68,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -79,6 +80,7 @@ from sglang.srt.tracing.trace import (
     trace_get_proc_propagate_context,
     trace_req_finish,
     trace_req_start,
+    trace_set_remote_propagate_context,
     trace_slice_end,
     trace_slice_start,
 )
@@ -384,6 +386,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
+        if request:
+            if "trace_context" in request.headers:
+                trace_set_remote_propagate_context(request.headers["trace_context"])
+
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
@@ -606,7 +612,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
-        trace_slice_end("tokenize", obj.rid)
+        trace_slice_end(RequestStage.TOKENIZE, obj.rid)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -667,6 +673,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 )
                 raise ValueError(error_msg)
 
+        # Matryoshka embeddings validations
+        if isinstance(obj, EmbeddingReqInput):
+            self._validate_for_matryoshka_dim(obj)
+
         if isinstance(obj, GenerateReqInput):
             if (
                 obj.return_hidden_states
@@ -684,6 +694,34 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+
+    def _validate_for_matryoshka_dim(self, obj: EmbeddingReqInput) -> None:
+        """Validate the request for Matryoshka dim if it has the field set."""
+        if obj.dimensions is None:
+            return
+
+        if not self.model_config.is_matryoshka:
+            raise ValueError(
+                f"Model '{self.model_config.model_path}' does not support matryoshka representation, "
+                f"changing output dimensions will lead to poor results."
+            )
+
+        if obj.dimensions < 1:
+            raise ValueError("Requested dimensions must be greater than 0")
+
+        if (
+            self.model_config.matryoshka_dimensions
+            and obj.dimensions not in self.model_config.matryoshka_dimensions
+        ):
+            raise ValueError(
+                f"Model '{self.model_config.model_path}' only supports {self.model_config.matryoshka_dimensions} matryoshka dimensions, "
+                f"using other output dimensions will lead to poor results."
+            )
+
+        if obj.dimensions > self.model_config.hidden_size:
+            raise ValueError(
+                f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}"
+            )
 
     def _validate_input_ids_in_vocab(
         self, input_ids: List[int], vocab_size: int
@@ -753,6 +791,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 sampling_params,
                 rid=obj.rid,
                 priority=obj.priority,
+                dimensions=obj.dimensions,
                 http_worker_ipc=obj.http_worker_ipc,
             )
 
@@ -799,7 +838,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     req, req.text, input_ids_list[i], None, None, token_type_ids
                 )
             )
-            trace_slice_end("tokenize", req.rid)
+            trace_slice_end(RequestStage.TOKENIZE, req.rid)
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
@@ -851,12 +890,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
-        trace_slice_start("dispatch", obj.rid)
+        trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
-        trace_slice_end("dispatch", obj.rid, thread_finish_flag=True)
+        trace_slice_end(
+            RequestStage.TOKENIZER_DISPATCH, obj.rid, thread_finish_flag=True
+        )
         return state
 
     def _send_batch_request(
@@ -1358,6 +1399,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
+                "total_retractions": recv_obj.retraction_counts[i],
             }
 
             if getattr(state.obj, "return_logprob", False):
@@ -1650,6 +1692,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 or state.obj.sampling_params.get("ebnf", None)
                 or state.obj.sampling_params.get("structural_tag", None)
             )
+
+            retraction_count = (
+                recv_obj.retraction_counts[i]
+                if getattr(recv_obj, "retraction_counts", None)
+                and i < len(recv_obj.retraction_counts)
+                else 0
+            )
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -1657,6 +1707,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 recv_obj.cached_tokens[i],
                 state.finished_time - state.created_time,
                 has_grammar,
+                retraction_count,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
@@ -2089,7 +2140,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             bootstrap_room = (
                 obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
             )
-            trace_req_start(obj.rid, bootstrap_room, ts=int(created_time * 1e9))
+            trace_req_start(
+                obj.rid,
+                bootstrap_room,
+                ts=int(created_time * 1e9),
+                role=self.server_args.disaggregation_mode,
+            )
             trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
         else:
             for i in range(len(obj.rid)):
@@ -2098,7 +2154,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
                     else None
                 )
-                trace_req_start(obj.rid[i], bootstrap_room, ts=int(created_time * 1e9))
+                trace_req_start(
+                    obj.rid[i],
+                    bootstrap_room,
+                    ts=int(created_time * 1e9),
+                    role=self.server_args.disaggregation_mode,
+                )
                 trace_slice_start(
                     "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
                 )

@@ -112,6 +112,9 @@ class RouterArgs:
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
     ca_cert_paths: List[str] = dataclasses.field(default_factory=list)
+    # Trace
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
 
     @staticmethod
     def add_cli_args(
@@ -607,6 +610,17 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="Path(s) to CA certificate(s) for verifying worker TLS certificates. Can specify multiple CAs.",
+        )
+        parser.add_argument(
+            f"--{prefix}enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            f"--{prefix}otlp-traces-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         )
 
     @classmethod
