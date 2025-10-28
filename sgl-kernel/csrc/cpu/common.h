@@ -128,6 +128,8 @@ namespace {
 
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
 
+#define CHECK_GE(a, b) TORCH_CHECK((a) >= (b), "CHECK_GE(" #a ", " #b ") failed. ", a, " vs ", b)
+
 // [NB] Parallel Routines
 //
 //  * at::parallel_for - applies for most of generic use cases, this will be compiled
