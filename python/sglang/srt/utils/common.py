@@ -2359,16 +2359,14 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     )
     server = uvicorn.Server(config=config)
 
-    try:
-        loop = asyncio.get_running_loop()
-        logger.info(
-            f"Dummy health check server scheduled on existing loop at {host}:{port}"
-        )
-        loop.create_task(server.serve())
-
-    except RuntimeError:
-        logger.info(f"Starting dummy health check server at {host}:{port}")
-        server.run()
+    # Run server in a background daemon thread with its own event loop
+    # This prevents blocking the main thread while still serving health checks
+    def run_server():
+        asyncio.run(server.serve())
+    
+    thread = threading.Thread(target=run_server, daemon=True, name="health-check-server")
+    thread.start()
+    logger.info(f"Dummy health check server started in background thread at {host}:{port}")
 
 
 def create_checksum(directory: str):
