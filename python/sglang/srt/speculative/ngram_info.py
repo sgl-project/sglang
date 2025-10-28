@@ -195,7 +195,9 @@ class NgramVerifyInput(SpecInput):
             logits_output.hidden_states = logits_output.hidden_states[self.accept_index]
         self.verified_id = self.predict[self.accept_index]
 
-    def _free_cache(self, batch: ScheduleBatch, page_size: int):
+    def _free_cache(
+        self, batch: ScheduleBatch, page_size: int, accept_length_cpu: torch.Tensor
+    ):
         bs = batch.batch_size()
         # Free the KV cache for unaccepted tokens
         if page_size == 1:
@@ -204,6 +206,11 @@ class NgramVerifyInput(SpecInput):
             evict_mask[self.accept_index] = False
             batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
             batch.out_cache_loc = batch.out_cache_loc[self.accept_index]
+
+            accept_length_list = accept_length_cpu.tolist()
+            for i, req in enumerate(batch.reqs):
+                req.kv_committed_len += accept_length_list[i] + 1
+                req.kv_allocated_len = req.kv_committed_len
         else:
             # Shift the accepted tokens to the beginning.
             # Only evict the last part
@@ -416,10 +423,11 @@ class NgramVerifyInput(SpecInput):
             # self._sampling_verify(batch, logits_output, sampling_info)
 
         self._fill_requests(batch, logits_output)
-        self._free_cache(batch, page_size)
 
         accept_length_cpu = self.accept_length.cpu()
         num_accepted_tokens = accept_length_cpu.sum().item()
+
+        self._free_cache(batch, page_size, accept_length_cpu)
 
         batch.seq_lens.add_(self.accept_length + 1)
         batch.seq_lens_cpu.add_(accept_length_cpu + 1)
