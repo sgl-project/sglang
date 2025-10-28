@@ -228,6 +228,14 @@ impl HarmonyParserAdapter {
         })
     }
 
+    /// Get all messages from the parser
+    ///
+    /// Returns the raw messages extracted by the Harmony parser.
+    /// Used for validation checks.
+    pub fn get_messages(&self) -> Vec<openai_harmony::chat::Message> {
+        self.parser.messages().to_vec()
+    }
+
     /// Parse streaming chunk
     ///
     /// Parses incremental token IDs and returns a delta with any new content

@@ -223,6 +223,22 @@ impl HarmonyResponseProcessor {
             )
             .map_err(|e| utils::internal_error_message(format!("Harmony parsing failed: {}", e)))?;
 
+        // VALIDATION: Check if model incorrectly generated Tool role messages
+        // This happens when the model copies the format of tool result messages
+        // instead of continuing as assistant. This is a model hallucination bug.
+        let messages = parser.get_messages();
+        let tool_messages_generated = messages.iter().any(|msg| {
+            msg.author.role == openai_harmony::chat::Role::Tool
+                && msg.recipient.as_deref() == Some("assistant")
+        });
+
+        if tool_messages_generated {
+            tracing::warn!(
+                "Model generated Tool->Assistant message instead of Assistant message. \
+                This is a model hallucination bug where it copies tool result format."
+            );
+        }
+
         // Check for tool calls in commentary channel
         if let Some(tool_calls) = parsed.commentary {
             // Tool calls found - return for MCP loop execution
