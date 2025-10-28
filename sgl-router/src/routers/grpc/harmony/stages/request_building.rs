@@ -94,8 +94,10 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         };
 
         // Build gRPC request using token_ids directly (Harmony encoding already handled message rendering)
-        // We still leverage the ChatCompletionRequest to build sampling params.
-        let (body_for_params, tool_constraint) = match &ctx.input.request_type {
+        // Use a placeholder for original_text; Harmony uses input_ids for tokenization
+        let placeholder_processed_text = "[harmony]".to_string();
+
+        let mut proto_request = match &ctx.input.request_type {
             RequestType::Chat(request) => {
                 // Prefer filtered request if present; otherwise use the original
                 let body = prep
@@ -105,7 +107,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     .clone();
 
                 // Generate tool constraints if tools are present
-                let constraint = if let Some(tools) = body.tools.as_ref() {
+                let tool_constraint = if let Some(tools) = body.tools.as_ref() {
                     utils::generate_tool_constraints(tools, &body.tool_choice, &body.model)
                         .map_err(|e| {
                             utils::bad_request_error(format!("Invalid tool configuration: {}", e))
@@ -114,36 +116,39 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     None
                 };
 
-                (body, constraint)
+                builder_client
+                    .build_generate_request(
+                        request_id,
+                        &body,
+                        placeholder_processed_text,
+                        prep.token_ids.clone(),
+                        None,
+                        tool_constraint,
+                    )
+                    .map_err(|e| {
+                        utils::bad_request_error(format!("Invalid request parameters: {}", e))
+                    })?
             }
-            // Responses path is handled in Phase 5; unreachable here for Harmony gRPC pipeline
-            RequestType::Responses(_) => {
-                return Err(utils::bad_request_error(
-                    "Responses requests are not supported in Harmony gRPC pipeline (Phase 3)"
-                        .to_string(),
-                ));
-            }
+            RequestType::Responses(request) => builder_client
+                .build_generate_request_from_responses(
+                    request_id,
+                    request.as_ref(),
+                    placeholder_processed_text,
+                    prep.token_ids.clone(),
+                    prep.harmony_stop_ids.clone(),
+                )
+                .map_err(|e| {
+                    utils::bad_request_error(format!("Invalid request parameters: {}", e))
+                })?,
             _ => unreachable!(),
         };
 
-        // Use a placeholder for original_text; Harmony uses input_ids for tokenization
-        let placeholder_processed_text = "[harmony]".to_string();
-
-        let mut proto_request = builder_client
-            .build_generate_request(
-                request_id,
-                &body_for_params,
-                placeholder_processed_text,
-                prep.token_ids.clone(),
-                None,
-                tool_constraint,
-            )
-            .map_err(|e| utils::bad_request_error(format!("Invalid request parameters: {}", e)))?;
-
-        // Inject Harmony stop token IDs into sampling params
-        if let Some(harmony_stops) = &prep.harmony_stop_ids {
-            if let Some(params) = proto_request.sampling_params.as_mut() {
-                params.stop_token_ids.extend_from_slice(harmony_stops);
+        // Inject Harmony stop token IDs into sampling params (Chat only - Responses already has them)
+        if matches!(&ctx.input.request_type, RequestType::Chat(_)) {
+            if let Some(harmony_stops) = &prep.harmony_stop_ids {
+                if let Some(params) = proto_request.sampling_params.as_mut() {
+                    params.stop_token_ids.extend_from_slice(harmony_stops);
+                }
             }
         }
 
