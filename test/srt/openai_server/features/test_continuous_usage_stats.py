@@ -51,7 +51,10 @@ class TestContinuousUsageStats(CustomTestCase):
         assert chunks_with_usage >= chunks_with_content
         assert last_usage.prompt_tokens > 0
         assert last_usage.completion_tokens > 0
-        assert last_usage.total_tokens == last_usage.prompt_tokens + last_usage.completion_tokens
+        assert (
+            last_usage.total_tokens
+            == last_usage.prompt_tokens + last_usage.completion_tokens
+        )
 
     async def test_continuous_usage_stats_async(self):
         stream = await self.aclient.chat.completions.create(
@@ -100,4 +103,3 @@ class TestContinuousUsageStats(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
