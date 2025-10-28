@@ -21,12 +21,14 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -38,8 +40,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -53,7 +58,6 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     get_bool_env_var,
-    get_device_memory_capacity,
     is_hip,
     log_info_on_rank0,
     require_attn_tp_gather,
@@ -62,6 +66,14 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+try:
+    from kt_kernel import AMXMoEWrapper
+
+    KTRANSFORMERS_AVAILABLE = True
+except ImportError:
+    KTRANSFORMERS_AVAILABLE = False
 
 _is_hip = is_hip()
 
@@ -241,9 +253,13 @@ class CudaGraphRunner:
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
+        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
+        if KTRANSFORMERS_AVAILABLE:
+            AMXMoEWrapper.set_capture_batch_sizes(self.capture_bs)
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
@@ -274,7 +290,6 @@ class CudaGraphRunner:
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
 
-        # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
@@ -308,11 +323,11 @@ class CudaGraphRunner:
                 self.pp_proxy_tensors = {
                     "hidden_states": torch.zeros(
                         (self.max_bs, self.model_runner.model_config.hidden_size),
-                        dtype=torch.bfloat16,
+                        dtype=self.model_runner.model_config.dtype,
                     ),
                     "residual": torch.zeros(
                         (self.max_bs, self.model_runner.model_config.hidden_size),
-                        dtype=torch.bfloat16,
+                        dtype=self.model_runner.model_config.dtype,
                     ),
                 }
 
@@ -506,7 +521,16 @@ class CudaGraphRunner:
             logger.info(log_message)
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with self.device_module.graph(graph, pool=pool, stream=stream):
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.model_runner.server_args.enable_memory_saver
+            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+        )
+        graph_fn = (
+            partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+            if memory_saver_adapter.enabled
+            else self.device_module.graph
+        )
+        with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
             out = run_once_fn()
         return out
 
@@ -637,6 +661,7 @@ class CudaGraphRunner:
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            set_is_extend_in_batch(False)
 
             kwargs = {}
             if (
@@ -654,6 +679,8 @@ class CudaGraphRunner:
                 **kwargs,
             )
             return logits_output_or_pp_proxy_tensors
+
+        self.deepep_adapter.capture(is_extend_in_batch=False)
 
         for _ in range(2):
             self.device_module.synchronize()
@@ -798,6 +825,8 @@ class CudaGraphRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        self.deepep_adapter.replay()
+
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
@@ -874,3 +903,23 @@ CUDA_GRAPH_CAPTURE_FAILED_MSG = (
     "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
     "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
 )
+
+
+class DeepEPCudaGraphRunnerAdapter:
+    def __init__(self):
+        # Record DeepEP mode used during capture to ensure replay consistency
+        self._captured_deepep_mode = None
+
+    def capture(self, is_extend_in_batch: bool):
+        if not get_moe_a2a_backend().is_deepep():
+            return
+        self._captured_deepep_mode = get_deepep_mode().resolve(
+            is_extend_in_batch=is_extend_in_batch
+        )
+        DeepEPBuffer.set_dispatch_mode(self._captured_deepep_mode)
+
+    def replay(self):
+        if not get_moe_a2a_backend().is_deepep():
+            return
+        assert self._captured_deepep_mode is not None
+        DeepEPBuffer.set_dispatch_mode(self._captured_deepep_mode)

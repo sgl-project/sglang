@@ -34,18 +34,27 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, RequestStage
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
     ServerArgs,
 )
+from sglang.srt.tracing.trace import (
+    process_tracing_init,
+    trace_get_proc_propagate_context,
+    trace_set_proc_propagate_context,
+    trace_set_thread_info,
+    trace_slice_end,
+    trace_slice_start,
+)
 from sglang.srt.utils import (
     bind_port,
     configure_logger,
     get_zmq_socket,
     kill_itself_when_parent_died,
+    maybe_reindex_device_id,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -139,6 +148,9 @@ class DataParallelController:
         # Load balance budget
         self.dp_budget = DPBudget()
 
+        # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
+        self.env_lock = threading.Lock()
+
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
@@ -166,11 +178,22 @@ class DataParallelController:
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
 
+    def dispatching_with_trace(self, req: Req):
+        if self.server_args.enable_trace:
+            trace_set_proc_propagate_context(req.rid, req.trace_context)
+            trace_slice_start(RequestStage.DC_DISPATCH, req.rid)
+            req.trace_context = trace_get_proc_propagate_context(req.rid)
+
+        self.dispatching(req)
+
+        if self.server_args.enable_trace:
+            trace_slice_end(RequestStage.DC_DISPATCH, req.rid, thread_finish_flag=True)
+
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
-                (TokenizedGenerateReqInput, self.dispatching),
-                (TokenizedEmbeddingReqInput, self.dispatching),
+                (TokenizedGenerateReqInput, self.dispatching_with_trace),
+                (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
                 (BlockReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
             ]
@@ -399,21 +422,22 @@ class DataParallelController:
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-                proc = mp.Process(
-                    target=run_scheduler_process,
-                    args=(
-                        server_args,
-                        rank_port_args,
-                        gpu_id,
-                        tp_rank,
-                        moe_ep_rank,
-                        pp_rank,
-                        dp_rank,
-                        writer,
-                    ),
-                )
-                with memory_saver_adapter.configure_subprocess():
-                    proc.start()
+                with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
+                    proc = mp.Process(
+                        target=run_scheduler_process,
+                        args=(
+                            server_args,
+                            rank_port_args,
+                            gpu_id,
+                            tp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            dp_rank,
+                            writer,
+                        ),
+                    )
+                    with memory_saver_adapter.configure_subprocess():
+                        proc.start()
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 
@@ -442,6 +466,9 @@ class DataParallelController:
                 self.workers
             )
         else:
+            assert (
+                req.bootstrap_room is not None
+            ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, req):
@@ -479,6 +506,14 @@ def run_data_parallel_controller_process(
     pipe_writer,
 ):
     kill_itself_when_parent_died()
+    if server_args.enable_trace:
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        thread_label = "DP Controller"
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill DP Controller"
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode DP Controller"
+        trace_set_thread_info(thread_label)
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
     configure_logger(server_args)
