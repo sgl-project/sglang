@@ -89,6 +89,7 @@ def write_cache_indices(
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
+            dtype=torch.uint64,
         )
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
         write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
