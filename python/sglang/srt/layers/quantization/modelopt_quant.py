@@ -28,7 +28,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
-    is_sm100_supported,
+    is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -49,8 +49,10 @@ if TYPE_CHECKING:
     )
     from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
-if is_cuda():
-    from sgl_kernel import scaled_fp4_quant
+try:
+    from flashinfer import fp4_quantize
+except ImportError:
+    fp4_quantize = None
 
 try:
     from flashinfer import mm_fp4 as fp4_gemm
@@ -90,7 +92,50 @@ CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
 ACTIVATION_SCHEMES = ["static"]
 
 
-class ModelOptFp8Config(QuantizationConfig):
+class ModelOptQuantConfig(QuantizationConfig):
+    def __init__(
+        self,
+        kv_cache_quant_algo: Optional[str],
+        exclude_modules: Optional[List[str]],
+        packed_modules_mapping: Optional[Dict[str, List[str]]],
+    ):
+        super().__init__()
+        self.packed_modules_mapping = packed_modules_mapping
+        self.exclude_modules = exclude_modules or []
+        self.kv_cache_quant_algo = kv_cache_quant_algo
+
+    def _get_quant_method(
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
+        *,
+        Linear: type[LinearMethodBase],
+        Moe: type[FusedMoEMethodBase],
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, LinearBase):
+            if is_layer_skipped(
+                prefix, self.exclude_modules, self.packed_modules_mapping
+            ) or self.is_layer_excluded(prefix):
+                return UnquantizedLinearMethod()
+            return Linear(self)
+        elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
+            return ModelOptFp8KVCacheMethod(self)
+        elif isinstance(layer, FusedMoE):
+            return Moe(self)
+        return None
+
+    @classmethod
+    def get_config_filenames(cls) -> List[str]:
+        return ["hf_quant_config.json"]
+
+    def get_scaled_act_names(self) -> List[str]:
+        return []
+
+
+class ModelOptFp8Config(ModelOptQuantConfig):
     """Configuration for ModelOpt FP8 quantization, including serialization and compatibility checks."""
 
     def __init__(
@@ -98,14 +143,14 @@ class ModelOptFp8Config(QuantizationConfig):
         is_checkpoint_fp8_serialized: bool = False,
         kv_cache_quant_method: Optional[str] = None,
         exclude_modules: Optional[List[str]] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         """
         Args:
             is_checkpoint_fp8_serialized (bool): Indicates if the checkpoint uses serialized FP8 format.
         """
+        super().__init__(kv_cache_quant_method, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
-        self.kv_cache_quant_method = kv_cache_quant_method
-        self.exclude_modules = exclude_modules
         if is_checkpoint_fp8_serialized:
             logger.warning(
                 "Detected ModelOpt FP8 checkpoint. The format is experimental and subject to change."
@@ -127,10 +172,6 @@ class ModelOptFp8Config(QuantizationConfig):
     @classmethod
     def get_min_capability(cls) -> int:
         return 89  # Minimum hardware capability (e.g., Hopper GPUs).
-
-    @classmethod
-    def get_config_filenames(cls) -> List[str]:
-        return ["hf_quant_config.json"]
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> ModelOptFp8Config:
@@ -186,37 +227,27 @@ class ModelOptFp8Config(QuantizationConfig):
             is_checkpoint_fp8_serialized=True,
             kv_cache_quant_method=kv_cache_quant_method,
             exclude_modules=exclude_modules,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
         )
 
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[QuantizeMethodBase]:
-
-        from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
-        if self.exclude_modules and any(
+    def is_layer_excluded(self, prefix: str) -> bool:
+        if len(self.exclude_modules) == 0:
+            return False
+        return any(
             module in prefix
             or (
                 prefix.startswith("language_model.")
                 and module in prefix.removeprefix("language_model.")
             )
             for module in self.exclude_modules
-        ):
-            return None
+        )
 
-        if isinstance(layer, LinearBase):
-            return ModelOptFp8LinearMethod(self)
-        if self.kv_cache_quant_method and isinstance(layer, RadixAttention):
-            return ModelOptFp8KVCacheMethod(self)
-
-        if isinstance(layer, FusedMoE):
-            return ModelOptFp8MoEMethod(self)
-
-        return None
-
-    def get_scaled_act_names(self) -> List[str]:
-        return []
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
+        return self._get_quant_method(
+            layer, prefix, Linear=ModelOptFp8LinearMethod, Moe=ModelOptFp8MoEMethod
+        )
 
 
 class ModelOptFp8LinearMethod(LinearMethodBase):
@@ -512,7 +543,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         return self.runner.run(dispatch_output, quant_info)
 
 
-class ModelOptFp4Config(QuantizationConfig):
+class ModelOptFp4Config(ModelOptQuantConfig):
     """Config class for FP4."""
 
     def __init__(
@@ -521,7 +552,9 @@ class ModelOptFp4Config(QuantizationConfig):
         kv_cache_quant_algo: str = None,
         group_size: int = None,
         exclude_modules: List[str] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
+        super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
             logger.warning(
@@ -529,8 +562,6 @@ class ModelOptFp4Config(QuantizationConfig):
                 "format is experimental and subject to change."
             )
         self.group_size = group_size
-        self.kv_cache_quant_algo = kv_cache_quant_algo
-        self.exclude_modules = exclude_modules
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -548,10 +579,6 @@ class ModelOptFp4Config(QuantizationConfig):
     @classmethod
     def get_min_capability(cls) -> int:
         return 100
-
-    @classmethod
-    def get_config_filenames(cls) -> List[str]:
-        return ["hf_quant_config.json"]
 
     @staticmethod
     def common_group_size(cfg: dict) -> int:
@@ -668,14 +695,15 @@ class ModelOptFp4Config(QuantizationConfig):
             kv_cache_quant_algo,
             group_size,
             exclude_modules,
+            config.get("packed_modules_mapping"),
         )
 
-    def is_layer_excluded(self, prefix: str, exclude_modules: list):
+    def is_layer_excluded(self, prefix: str):
         import regex as re
 
         fused_patterns = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]
         prefix_split = prefix.split(".")
-        for pattern in exclude_modules:
+        for pattern in self.exclude_modules:
             regex_str = pattern.replace(".", r"\.").replace("*", r".*")
             pattern_split = pattern.split(".")
             if re.fullmatch(regex_str, prefix):
@@ -691,30 +719,13 @@ class ModelOptFp4Config(QuantizationConfig):
                 return True
         return False
 
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[QuantizeMethodBase]:
-        from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFP4MoE
-
-        if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.exclude_modules) or self.is_layer_excluded(
-                prefix, self.exclude_modules
-            ):
-                return UnquantizedLinearMethod()
-            return ModelOptFp4LinearMethod(self)
-        if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
-            return ModelOptFp8KVCacheMethod(self)
-        elif isinstance(layer, FlashInferFP4MoE):
-            # FlashInferFP4MoE needs the same quantization method but with compatible attribute handling
-            return ModelOptNvFp4FusedMoEMethod(self)
-        elif isinstance(layer, FusedMoE):
-            return ModelOptNvFp4FusedMoEMethod(self)
-        return None
-
-    def get_scaled_act_names(self) -> List[str]:
-        return []
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        return self._get_quant_method(
+            layer,
+            prefix,
+            Linear=ModelOptFp4LinearMethod,
+            Moe=ModelOptNvFp4FusedMoEMethod,  # FlashInferFP4MoE needs the same quantization method but with compatible attribute handling
+        )
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):
@@ -858,10 +869,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         output_shape = [x_m, w_n]
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_scale_interleaved = scaled_fp4_quant(x, layer.input_scale_inv)
+        x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
 
         assert x_fp4.dtype == torch.uint8
-        assert x_scale_interleaved.dtype == torch.float8_e4m3fn
         assert layer.weight.dtype == torch.uint8
         assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
         assert layer.alpha.dtype == torch.float32
@@ -894,7 +904,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        if not is_sm100_supported():
+        if not is_blackwell_supported():
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization. Please use Blackwell and"
@@ -1401,7 +1411,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             output_dtype = x.dtype
             x_sf = None
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
-                from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
+                from flashinfer import nvfp4_block_scale_interleave
 
                 # Quantize before comm, swizzle after.
                 if x.shape[0] > 0:

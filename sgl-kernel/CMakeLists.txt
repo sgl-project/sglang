@@ -225,6 +225,12 @@ if (ENABLE_BELOW_SM90)
         "-gencode=arch=compute_80,code=sm_80"
         "-gencode=arch=compute_89,code=sm_89"
     )
+    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_87,code=sm_87"
+        )
+    endif()
+
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
@@ -232,19 +238,24 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120a,code=sm_120a"
     )
-
     # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
     if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
             "-gencode=arch=compute_103a,code=sm_103a"
-            "-gencode=arch=compute_110a,code=sm_110a"
-            "-gencode=arch=compute_121a,code=sm_121a"
             "--compress-mode=size"
         )
+        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+            list(APPEND SGL_KERNEL_CUDA_FLAGS
+                "-gencode=arch=compute_110a,code=sm_110a"
+                "-gencode=arch=compute_121a,code=sm_121a"
+            )
+        endif()
     else()
-        list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_101a,code=sm_101a"
-        )
+        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+            list(APPEND SGL_KERNEL_CUDA_FLAGS
+                "-gencode=arch=compute_101a,code=sm_101a"
+            )
+        endif()
     endif()
 endif()
 
