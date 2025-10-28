@@ -155,7 +155,6 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "triton_kernel",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
-    "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "cutlass",
 ]
@@ -936,7 +935,9 @@ class ServerArgs:
             )
 
             if is_blackwell_supported() and is_mxfp4_quant_format:
-                self.moe_runner_backend = "flashinfer_mxfp4"
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                self.quantization = "mxfp4"
                 logger.warning(
                     "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                 )
@@ -1332,8 +1333,8 @@ class ServerArgs:
     def _handle_moe_kernel_config(self):
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert (
-                self.quantization == "modelopt_fp4"
-            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+                self.quantization == "modelopt_fp4" or self.quantization == "mxfp4"
+            ), "modelopt_fp4 or mxfp4 quantization is required for Flashinfer MOE"
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -1343,11 +1344,18 @@ class ServerArgs:
             assert (
                 self.quantization == "modelopt_fp4"
                 or self.quantization == "modelopt_fp8"
+                or self.quantization == "mxfp4"
                 or self.quantization == "fp8"
-            ), "modelopt_fp4, modelopt_fp8 or fp8 quantization is required for Flashinfer TRTLLM MoE"
+            ), "modelopt_fp4, modelopt_fp8, mxfp4 or fp8 quantization is required for Flashinfer TRTLLM MoE"
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+
+        if self.moe_runner_backend == "flashinfer_mxfp4":
+            self.moe_runner_backend = "flashinfer_trtllm"
+            print_deprecated_warning(
+                "NOTE: --moe-runner-backend=flashinfer_mxfp4 is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead."
             )
 
     def _handle_a2a_moe(self):
