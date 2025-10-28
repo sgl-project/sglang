@@ -6,13 +6,11 @@ use validator::Validate;
 fn test_validate_conversation_id_valid() {
     let valid_ids = vec![
         "conv_123",
-        "conversation-456",
-        "my_conversation_123",
-        "conv-test-123_abc",
-        "ABC123",
-        "test_123_conv",
-        "conv123",
-        "CONV_ABC_123",
+        "conv_test-123_abc",
+        "conv_ABC_123",
+        "conv_my_conversation_123",
+        "conv_456",
+        "conv_test123",
     ];
 
     for id in valid_ids {
@@ -34,27 +32,35 @@ fn test_validate_conversation_id_valid() {
 #[test]
 fn test_validate_conversation_id_invalid() {
     let invalid_ids = vec![
-        "conv.test",     // contains dot
-        "conv test",     // contains space
-        "conv@test",     // contains @
-        "conv/test",     // contains /
-        "conv\\test",    // contains backslash
-        "conv:test",     // contains colon
-        "conv;test",     // contains semicolon
-        "conv,test",     // contains comma
-        "conv+test",     // contains plus
-        "conv=test",     // contains equals
-        "conv[test]",    // contains brackets
-        "conv{test}",    // contains braces
-        "conv(test)",    // contains parentheses
-        "conv!test",     // contains exclamation
-        "conv?test",     // contains question mark
-        "conv#test",     // contains hash
-        "conv$test",     // contains dollar sign
-        "conv%test",     // contains percent
-        "conv&test",     // contains ampersand
-        "conv*test",     // contains asterisk
-        "conv test-123", // contains space
+        // Missing 'conv_' prefix
+        "test-conv-streaming",
+        "conversation-456",
+        "my_conversation_123",
+        "ABC123",
+        "test_123_conv",
+        "conv123", // missing underscore
+        // Invalid characters
+        "conv_.test",     // contains dot
+        "conv_ test",     // contains space
+        "conv_@test",     // contains @
+        "conv_/test",     // contains /
+        "conv_\\test",    // contains backslash
+        "conv_:test",     // contains colon
+        "conv_;test",     // contains semicolon
+        "conv_,test",     // contains comma
+        "conv_+test",     // contains plus
+        "conv_=test",     // contains equals
+        "conv_[test]",    // contains brackets
+        "conv_{test}",    // contains braces
+        "conv_(test)",    // contains parentheses
+        "conv_!test",     // contains exclamation
+        "conv_?test",     // contains question mark
+        "conv_#test",     // contains hash
+        "conv_$test",     // contains dollar sign
+        "conv_%test",     // contains percent
+        "conv_&test",     // contains ampersand
+        "conv_*test",     // contains asterisk
+        "conv_ test-123", // contains space
     ];
 
     for id in invalid_ids {
@@ -119,10 +125,10 @@ fn test_validate_conversation_id_none() {
     );
 }
 
-/// Test the exact error format matches OpenAI's error message
+/// Test the exact error format matches OpenAI's error message for invalid characters
 #[test]
 fn test_validate_conversation_id_error_message_format() {
-    let invalid_id = "conv.test-conv-streaming";
+    let invalid_id = "conv_.test-conv-streaming";
     let request = ResponsesRequest {
         conversation: Some(invalid_id.to_string()),
         input: ResponseInput::Text("test".to_string()),
@@ -149,6 +155,45 @@ fn test_validate_conversation_id_error_message_format() {
         assert!(
             error_msg.contains("letters, numbers, underscores, or dashes"),
             "Error should mention valid characters"
+        );
+        assert!(
+            error_msg.contains(invalid_id),
+            "Error should include the invalid conversation ID"
+        );
+    }
+}
+
+/// Test the exact error format for missing 'conv_' prefix
+#[test]
+fn test_validate_conversation_id_missing_prefix() {
+    let invalid_id = "test-conv-streaming";
+    let request = ResponsesRequest {
+        conversation: Some(invalid_id.to_string()),
+        input: ResponseInput::Text("test".to_string()),
+        ..Default::default()
+    };
+
+    let result = request.validate();
+    assert!(result.is_err());
+
+    if let Err(errors) = result {
+        let error_msg = errors
+            .field_errors()
+            .get("conversation")
+            .and_then(|errs| errs.first())
+            .and_then(|err| err.message.as_ref())
+            .map(|msg| msg.to_string())
+            .unwrap();
+
+        // Verify the error message matches OpenAI's format
+        assert!(
+            error_msg.starts_with("Invalid 'conversation':"),
+            "Error should start with \"Invalid 'conversation':\""
+        );
+        assert!(
+            error_msg.contains("begins with 'conv_'"),
+            "Error should mention the required prefix, got: {}",
+            error_msg
         );
         assert!(
             error_msg.contains(invalid_id),
