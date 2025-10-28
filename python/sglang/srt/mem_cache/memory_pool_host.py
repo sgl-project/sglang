@@ -245,7 +245,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         if self.pin_memory:
             ptr = buffer.data_ptr()
-            torch.cuda.cudart().cudaHostRegister(ptr, buffer.numel() * buffer.element_size(), 0);
+            torch.cuda.cudart().cudaHostRegister(
+                ptr, buffer.numel() * buffer.element_size(), 0
+            )
         return buffer
 
     @property
@@ -561,7 +563,9 @@ class MLATokenToKVPoolHost(HostKVCache):
         )
         if self.pin_memory:
             ptr = buffer.data_ptr()
-            torch.cuda.cudart().cudaHostRegister(ptr, buffer.numel() * buffer.element_size(), 0);
+            torch.cuda.cudart().cudaHostRegister(
+                ptr, buffer.numel() * buffer.element_size(), 0
+            )
         return buffer
 
     def load_to_device_per_layer(
