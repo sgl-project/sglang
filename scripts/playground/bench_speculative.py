@@ -64,7 +64,6 @@ def send_one_batch(base_url, num_prompts, batch_size, tokenizer, is_multimodal):
             tokenizer,
             backend=backend,
             fixed_output_len=512,
-            apply_chat_template=False,
         )
 
     else:
