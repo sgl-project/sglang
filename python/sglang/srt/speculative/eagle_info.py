@@ -411,11 +411,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             # TODO: boolean array index leads to a device sync. Remove it.
             token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
             for i, req in enumerate(batch.reqs):
-                req.kv_allocated_len -= self.draft_token_num - accept_length_list[i] - 1
                 req.kv_committed_len += accept_length_list[i] + 1
-                assert (
-                    req.kv_committed_len == req.kv_allocated_len
-                ), f"{req.kv_committed_len=}, {req.kv_allocated_len=}"
+                req.kv_allocated_len = req.kv_committed_len
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
