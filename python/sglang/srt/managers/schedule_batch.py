@@ -691,7 +691,8 @@ class Req:
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
-    def free_committed_kv_cache(self):
+    def pop_committed_kv_cache(self) -> int:
+        """Return the length of committed KV cache and mark them as freed."""
         page_size = get_global_server_args().page_size
         if page_size == 1:
             assert (
@@ -701,6 +702,11 @@ class Req:
             return self.kv_committed_len
         else:
             return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
+
+    def pop_all_kv_cache(self) -> Tuple[int, int]:
+        """Return the range of unreleased KV cache and mark them as freed.
+        Used when when over-allocating with speculative decoding."""
+        raise NotImplementedError()
 
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:

@@ -224,7 +224,7 @@ class LMCRadixCache(RadixCache):
         if not is_insert:
             return
 
-        kv_committed_len = req.free_committed_kv_cache()
+        kv_committed_len = req.pop_committed_kv_cache()
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len

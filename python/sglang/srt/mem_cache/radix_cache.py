@@ -337,7 +337,7 @@ class RadixCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
-        committed_kv_len = req.free_committed_kv_cache()
+        committed_kv_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :committed_kv_len
