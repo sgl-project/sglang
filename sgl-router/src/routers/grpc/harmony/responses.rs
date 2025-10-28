@@ -46,8 +46,7 @@ use crate::{
     protocols::{
         common::{Function, ToolCall},
         responses::{
-            ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse,
-            StringOrContentParts,
+            ResponseInput, ResponseTool, ResponsesRequest, ResponsesResponse, StringOrContentParts,
         },
     },
     routers::grpc::{
@@ -153,21 +152,45 @@ pub async fn serve_harmony_responses(
     let mut current_request = request;
     let mut iteration_count = 0;
 
-    // Get MCP tools and add to request (do this once before loop)
-    // This ensures the model knows about available MCP tools
-    let mcp_tools = ctx.mcp_manager.list_tools();
-    let mcp_response_tools = convert_mcp_tools_to_response_tools(&mcp_tools);
+    // Check if request has MCP tools - if so, ensure dynamic client is registered
+    // and add static MCP tools to the request
+    use crate::{
+        protocols::responses::ResponseToolType, routers::openai::mcp::ensure_request_mcp_client,
+    };
 
-    // Merge with user-provided tools
-    let mut all_tools = current_request.tools.clone().unwrap_or_default();
-    all_tools.extend(mcp_response_tools);
-    current_request.tools = Some(all_tools);
+    let has_mcp_tools = current_request
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .any(|t| matches!(t.r#type, ResponseToolType::Mcp))
+        })
+        .unwrap_or(false);
 
-    tracing::debug!(
-        mcp_tool_count = mcp_tools.len(),
-        total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-        "Added MCP tools to Harmony Responses request"
-    );
+    if has_mcp_tools {
+        // Ensure dynamic MCP client is registered for request-scoped tools
+        if let Some(tools) = &current_request.tools {
+            ensure_request_mcp_client(&ctx.mcp_manager, tools).await;
+        }
+
+        // Add static MCP tools from inventory to the request
+        // (similar to non-Harmony pipeline pattern)
+        let mcp_tools = ctx.mcp_manager.list_tools();
+        if !mcp_tools.is_empty() {
+            let mcp_response_tools = convert_mcp_tools_to_response_tools(&mcp_tools);
+
+            let mut all_tools = current_request.tools.clone().unwrap_or_default();
+            all_tools.extend(mcp_response_tools);
+            current_request.tools = Some(all_tools);
+
+            tracing::debug!(
+                mcp_tool_count = mcp_tools.len(),
+                total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+                "Request has MCP tools - added static MCP tools to Harmony Responses request"
+            );
+        }
+    }
 
     loop {
         iteration_count += 1;
@@ -211,43 +234,13 @@ pub async fn serve_harmony_responses(
                     "Tool calls found in commentary channel"
                 );
 
-                // Check if ALL tools exist in MCP inventory before executing
-                // If ANY tool is not found, treat this as a completed response (single turn)
-                let all_tools_available = tool_calls
-                    .iter()
-                    .all(|call| ctx.mcp_manager.get_tool(&call.function.name).is_some());
-
-                if !all_tools_available {
-                    // At least one tool not found - return final response immediately
-                    let unavailable_tools: Vec<_> = tool_calls
-                        .iter()
-                        .filter(|call| ctx.mcp_manager.get_tool(&call.function.name).is_none())
-                        .map(|call| call.function.name.as_str())
-                        .collect();
-
-                    tracing::info!(
-                        unavailable_tools = ?unavailable_tools,
-                        "Tool calls requested but tools not available - returning single-turn response"
-                    );
-
-                    // Build final response with reasoning, partial text, and failed tool calls
-                    // This matches the vLLM/OpenAI behavior: if tools aren't available,
-                    // return what the model generated including tool calls marked as "failed"
-                    return build_final_response_without_tools(
-                        &current_request,
-                        tool_calls,
-                        analysis,
-                        partial_text,
-                    )
-                    .map_err(|e| *e);
-                }
-
                 // TODO: Streaming support - emit intermediate chunks
                 // if let Some(tx) = &ctx.stream_tx {
                 //     emit_intermediate_chunks(tx, &analysis, &partial_text, iteration_count).await?;
                 // }
 
-                // All tools available - execute MCP tools via MCP manager
+                // Execute MCP tools via MCP manager
+                // If tools don't exist, call_tool() will return error naturally
                 let tool_results = execute_mcp_tools(&ctx.mcp_manager, &tool_calls).await?;
 
                 // Build next request with appended history
@@ -276,143 +269,6 @@ pub async fn serve_harmony_responses(
             }
         }
     }
-}
-
-/// Build final response without executing tools
-///
-/// When tool calls are detected but the tools are not available in MCP,
-/// we return a single-turn response containing:
-/// - Reasoning (if present from analysis channel)
-/// - Message (if present from final channel)
-/// - FunctionToolCall items with status "failed" (tool not available)
-///
-/// This matches the vLLM/OpenAI behavior: if tools aren't available,
-/// return what the model generated including the tool calls, but mark them
-/// as failed without entering the MCP loop.
-///
-/// # Arguments
-///
-/// * `request` - Current Responses API request
-/// * `tool_calls` - Tool calls from commentary channel
-/// * `analysis` - Analysis channel content (reasoning)
-/// * `partial_text` - Final channel content (message text)
-///
-/// # Returns
-///
-/// ResponsesResponse with reasoning, message, and failed tool call output items
-fn build_final_response_without_tools(
-    request: &ResponsesRequest,
-    tool_calls: Vec<ToolCall>,
-    analysis: Option<String>,
-    partial_text: String,
-) -> Result<ResponsesResponse, Box<Response>> {
-    use uuid::Uuid;
-
-    use crate::protocols::responses::{
-        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
-        ResponseUsage, ResponsesUsage,
-    };
-
-    let mut output: Vec<ResponseOutputItem> = Vec::new();
-    let response_id = format!("responses-{}", Uuid::new_v4());
-
-    // Add reasoning output if analysis present
-    if let Some(analysis_text) = analysis {
-        output.push(ResponseOutputItem::Reasoning {
-            id: format!("reasoning_{}", response_id),
-            summary: vec![],
-            content: vec![ResponseReasoningContent::ReasoningText {
-                text: analysis_text,
-            }],
-            status: Some("completed".to_string()),
-        });
-    }
-
-    // Add message output if partial text present
-    if !partial_text.is_empty() {
-        output.push(ResponseOutputItem::Message {
-            id: format!("msg_{}", response_id),
-            role: "assistant".to_string(),
-            content: vec![ResponseContentPart::OutputText {
-                text: partial_text,
-                annotations: vec![],
-                logprobs: None,
-            }],
-            status: "completed".to_string(),
-        });
-    }
-
-    // Add tool calls with "failed" status (tools not available in MCP)
-    for tool_call in tool_calls {
-        output.push(ResponseOutputItem::FunctionToolCall {
-            id: tool_call.id,
-            name: tool_call.function.name,
-            arguments: tool_call
-                .function
-                .arguments
-                .unwrap_or_else(|| "{}".to_string()),
-            output: Some(
-                serde_json::json!({
-                    "error": "Tool not available in MCP inventory"
-                })
-                .to_string(),
-            ),
-            status: "failed".to_string(),
-        });
-    }
-
-    // Build ResponsesResponse
-    // Note: We don't have usage info available here since we're in the serving loop
-    // and don't have access to the execution result. This is acceptable as this is
-    // a fallback path for unavailable tools.
-
-    // Serialize tool_choice to string (matching response format)
-    let tool_choice = request
-        .tool_choice
-        .as_ref()
-        .and_then(|tc| serde_json::to_value(tc).ok())
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| "auto".to_string());
-
-    // Serialize truncation to string if present
-    let truncation = request
-        .truncation
-        .as_ref()
-        .and_then(|t| serde_json::to_string(t).ok());
-
-    let response = ResponsesResponse {
-        id: response_id,
-        object: "response".to_string(),
-        created_at: chrono::Utc::now().timestamp(),
-        status: ResponseStatus::Completed,
-        error: None,
-        incomplete_details: None,
-        instructions: request.instructions.clone(),
-        max_output_tokens: request.max_output_tokens,
-        model: request.model.clone(),
-        output,
-        parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
-        previous_response_id: request.previous_response_id.clone(),
-        reasoning: None,
-        store: request.store.unwrap_or(false),
-        temperature: request.temperature,
-        text: None, // ResponsesResponse doesn't have text field in request
-        tool_choice,
-        tools: request.tools.clone().unwrap_or_default(),
-        top_p: request.top_p,
-        truncation,
-        user: request.user.clone(),
-        usage: Some(ResponsesUsage::Modern(ResponseUsage {
-            input_tokens: 0,             // Not available in serving loop
-            output_tokens: 0,            // Not available in serving loop
-            total_tokens: 0,             // Not available in serving loop
-            input_tokens_details: None,  // Not available
-            output_tokens_details: None, // Not available
-        })),
-        metadata: request.metadata.clone().unwrap_or_default(),
-    };
-
-    Ok(response)
 }
 
 /// Execute MCP tools and collect results
@@ -663,10 +519,12 @@ struct ToolResult {
 ///
 /// Vector of ResponseTool entries in function format
 fn convert_mcp_tools_to_response_tools(mcp_tools: &[crate::mcp::ToolInfo]) -> Vec<ResponseTool> {
+    use crate::protocols::responses::ResponseToolType;
+
     mcp_tools
         .iter()
         .map(|tool_info| ResponseTool {
-            r#type: ResponseToolType::Function,
+            r#type: ResponseToolType::Mcp,
             function: Some(Function {
                 name: tool_info.name.clone(),
                 description: Some(tool_info.description.clone()),
@@ -681,7 +539,7 @@ fn convert_mcp_tools_to_response_tools(mcp_tools: &[crate::mcp::ToolInfo]) -> Ve
             }),
             server_url: Some(tool_info.server.clone()),
             authorization: None,
-            server_label: None,
+            server_label: Some(tool_info.server.clone()),
             server_description: Some(tool_info.description.clone()),
             require_approval: None,
             allowed_tools: None,
