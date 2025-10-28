@@ -587,13 +587,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        backend = get_moe_runner_backend()
-        if backend.is_auto():
-            backend = (
-                MoeRunnerBackend.TRITON_KERNELS
-                if self.use_triton_kernels
-                else MoeRunnerBackend.TRITON
-            )
+        backend = (
+            MoeRunnerBackend.TRITON_KERNELS
+            if self.use_triton_kernels
+            else MoeRunnerBackend.TRITON
+        )
         self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(

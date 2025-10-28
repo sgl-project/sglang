@@ -8,98 +8,79 @@ use crate::core::ConnectionMode;
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
-    /// Routing mode configuration
     pub mode: RoutingMode,
-    /// Worker connection mode
     #[serde(default)]
     pub connection_mode: ConnectionMode,
-    /// Policy configuration
     pub policy: PolicyConfig,
-    /// Server host address
     pub host: String,
-    /// Server port
     pub port: u16,
-    /// Maximum payload size in bytes
     pub max_payload_size: usize,
-    /// Request timeout in seconds
     pub request_timeout_secs: u64,
-    /// Worker startup timeout in seconds
     pub worker_startup_timeout_secs: u64,
-    /// Worker health check interval in seconds
     pub worker_startup_check_interval_secs: u64,
-    /// Enable data parallelism aware schedule
     pub dp_aware: bool,
-    /// The api key used for the authorization with the worker
     pub api_key: Option<String>,
-    /// Service discovery configuration (optional)
     pub discovery: Option<DiscoveryConfig>,
-    /// Metrics configuration (optional)
     pub metrics: Option<MetricsConfig>,
-    /// Log directory (None = stdout only)
     pub log_dir: Option<String>,
-    /// Log level (None = info)
     pub log_level: Option<String>,
-    /// Custom request ID headers to check (defaults to common headers)
     pub request_id_headers: Option<Vec<String>>,
-    /// Maximum concurrent requests allowed (for rate limiting). Set to -1 to disable rate limiting.
+    /// Set to -1 to disable rate limiting
     pub max_concurrent_requests: i32,
-    /// Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)
     pub queue_size: usize,
-    /// Maximum time (in seconds) a request can wait in queue before timing out
     pub queue_timeout_secs: u64,
-    /// Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    /// If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
-    /// CORS allowed origins
     pub cors_allowed_origins: Vec<String>,
-    /// Retry configuration
     pub retry: RetryConfig,
-    /// Circuit breaker configuration
     pub circuit_breaker: CircuitBreakerConfig,
-    /// Disable retries (overrides retry.max_retries to 1 when true)
+    /// When true, overrides retry.max_retries to 1
     #[serde(default)]
     pub disable_retries: bool,
-    /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
+    /// When true, overrides circuit_breaker.failure_threshold to u32::MAX
     #[serde(default)]
     pub disable_circuit_breaker: bool,
-    /// Health check configuration
     pub health_check: HealthCheckConfig,
-    /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
     #[serde(default)]
     pub enable_igw: bool,
-    /// Model path for loading tokenizer (can be a HuggingFace model ID or local path)
+    /// Can be a HuggingFace model ID or local path
     pub model_path: Option<String>,
-    /// Explicit tokenizer path (overrides model_path tokenizer if provided)
+    /// Overrides model_path tokenizer if provided
     pub tokenizer_path: Option<String>,
-    /// Chat template path (optional)
     pub chat_template: Option<String>,
-    /// History backend configuration (memory or none, default: memory)
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
-    /// Oracle history backend configuration (required when `history_backend` = "oracle")
+    /// Required when history_backend = "oracle"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle: Option<OracleConfig>,
-    /// Parser for reasoning models (e.g., deepseek-r1, qwen3)
+    /// For reasoning models (e.g., deepseek-r1, qwen3)
     pub reasoning_parser: Option<String>,
-    /// Parser for handling tool-call interactions
+    /// For tool-call interactions
     pub tool_call_parser: Option<String>,
-    /// Tokenizer cache configuration
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
+    /// Combined certificate + key in PEM format, loaded from client_cert_path and client_key_path during config creation
+    #[serde(skip)]
+    pub client_identity: Option<Vec<u8>>,
+    /// PEM format, loaded from ca_cert_paths during config creation
+    #[serde(default)]
+    pub ca_certificates: Vec<Vec<u8>>,
+    /// Loaded from mcp_config_path during config creation
+    #[serde(skip)]
+    pub mcp_config: Option<crate::mcp::McpConfig>,
 }
 
 /// Tokenizer cache configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TokenizerCacheConfig {
-    /// Enable L0 cache (whole-string exact match)
+    /// Whole-string exact match cache
     #[serde(default = "default_enable_l0")]
     pub enable_l0: bool,
-    /// Maximum number of entries in L0 cache
     #[serde(default = "default_l0_max_entries")]
     pub l0_max_entries: usize,
-    /// Enable L1 cache (prefix matching at fixed boundaries)
+    /// Prefix matching at fixed boundaries
     #[serde(default = "default_enable_l1")]
     pub enable_l1: bool,
-    /// Maximum memory for L1 cache in bytes
     #[serde(default = "default_l1_max_memory")]
     pub l1_max_memory: usize,
 }
@@ -139,33 +120,25 @@ fn default_history_backend() -> HistoryBackend {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum HistoryBackend {
-    /// In-memory storage (default)
     Memory,
-    /// No history storage
     None,
-    /// Oracle ATP-backed storage
     Oracle,
 }
 
 /// Oracle history backend configuration
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct OracleConfig {
-    /// Directory containing the ATP wallet or TLS config files (optional)
+    /// ATP wallet or TLS config files directory
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallet_path: Option<String>,
-    /// Connection descriptor / DSN (e.g. `tcps://host:port/service`)
+    /// DSN (e.g. `tcps://host:port/service`)
     pub connect_descriptor: String,
-    /// Database username
     pub username: String,
-    /// Database password
     pub password: String,
-    /// Minimum number of pooled connections to keep ready
     #[serde(default = "default_pool_min")]
     pub pool_min: usize,
-    /// Maximum number of pooled connections
     #[serde(default = "default_pool_max")]
     pub pool_max: usize,
-    /// Maximum time to wait for a connection from the pool (seconds)
     #[serde(default = "default_pool_timeout_secs")]
     pub pool_timeout_secs: u64,
 }
@@ -214,28 +187,19 @@ impl std::fmt::Debug for OracleConfig {
 #[serde(tag = "type")]
 pub enum RoutingMode {
     #[serde(rename = "regular")]
-    Regular {
-        /// List of worker URLs
-        worker_urls: Vec<String>,
-    },
+    Regular { worker_urls: Vec<String> },
     #[serde(rename = "prefill_decode")]
     PrefillDecode {
-        /// Prefill worker URLs with optional bootstrap ports
+        /// With optional bootstrap ports
         prefill_urls: Vec<(String, Option<u16>)>,
-        /// Decode worker URLs
         decode_urls: Vec<String>,
-        /// Optional separate policy for prefill workers
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
-        /// Optional separate policy for decode workers
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
     },
     #[serde(rename = "openai")]
-    OpenAI {
-        /// OpenAI-compatible API base(s), provided via worker URLs
-        worker_urls: Vec<String>,
-    },
+    OpenAI { worker_urls: Vec<String> },
 }
 
 impl RoutingMode {
@@ -290,23 +254,15 @@ pub enum PolicyConfig {
 
     #[serde(rename = "cache_aware")]
     CacheAware {
-        /// Minimum prefix match ratio to use cache-based routing
         cache_threshold: f32,
-        /// Absolute load difference threshold for load balancing
         balance_abs_threshold: usize,
-        /// Relative load ratio threshold for load balancing
         balance_rel_threshold: f32,
-        /// Interval between cache eviction cycles (seconds)
         eviction_interval_secs: u64,
-        /// Maximum cache tree size per tenant
         max_tree_size: usize,
     },
 
     #[serde(rename = "power_of_two")]
-    PowerOfTwo {
-        /// Interval for load monitoring (seconds)
-        load_check_interval_secs: u64,
-    },
+    PowerOfTwo { load_check_interval_secs: u64 },
 }
 
 impl PolicyConfig {
@@ -323,21 +279,17 @@ impl PolicyConfig {
 /// Service discovery configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryConfig {
-    /// Enable service discovery
     pub enabled: bool,
-    /// Kubernetes namespace (None = all namespaces)
+    /// None = all namespaces
     pub namespace: Option<String>,
-    /// Service discovery port
     pub port: u16,
-    /// Check interval for service discovery
     pub check_interval_secs: u64,
-    /// Regular mode selector
+    /// Regular mode
     pub selector: HashMap<String, String>,
-    /// PD mode prefill selector
+    /// PD mode prefill
     pub prefill_selector: HashMap<String, String>,
-    /// PD mode decode selector
+    /// PD mode decode
     pub decode_selector: HashMap<String, String>,
-    /// Bootstrap port annotation key
     pub bootstrap_port_annotation: String,
 }
 
@@ -359,16 +311,11 @@ impl Default for DiscoveryConfig {
 /// Retry configuration for request handling
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryConfig {
-    /// Maximum number of retry attempts
     pub max_retries: u32,
-    /// Initial backoff delay in milliseconds
     pub initial_backoff_ms: u64,
-    /// Maximum backoff delay in milliseconds
     pub max_backoff_ms: u64,
-    /// Backoff multiplier for exponential backoff
     pub backoff_multiplier: f32,
-    /// Jitter factor applied to backoff (0.0 - 1.0)
-    /// Effective delay D' = D * (1 + U[-j, +j])
+    /// D' = D * (1 + U[-j, +j]) where j is jitter factor
     #[serde(default = "default_retry_jitter_factor")]
     pub jitter_factor: f32,
 }
@@ -392,15 +339,10 @@ fn default_retry_jitter_factor() -> f32 {
 /// Health check configuration for worker monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
-    /// Number of consecutive failures before marking unhealthy
     pub failure_threshold: u32,
-    /// Number of consecutive successes before marking healthy
     pub success_threshold: u32,
-    /// Timeout for health check requests in seconds
     pub timeout_secs: u64,
-    /// Interval between health checks in seconds
     pub check_interval_secs: u64,
-    /// Health check endpoint path
     pub endpoint: String,
 }
 
@@ -419,13 +361,9 @@ impl Default for HealthCheckConfig {
 /// Circuit breaker configuration for worker reliability
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitBreakerConfig {
-    /// Number of consecutive failures before opening circuit
     pub failure_threshold: u32,
-    /// Number of consecutive successes before closing circuit
     pub success_threshold: u32,
-    /// Time before attempting to recover from open state (in seconds)
     pub timeout_duration_secs: u64,
-    /// Window duration for failure tracking (in seconds)
     pub window_duration_secs: u64,
 }
 
@@ -443,9 +381,7 @@ impl Default for CircuitBreakerConfig {
 /// Metrics configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsConfig {
-    /// Prometheus metrics port
     pub port: u16,
-    /// Prometheus metrics host
     pub host: String,
 }
 
@@ -498,6 +434,9 @@ impl Default for RouterConfig {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
+            client_identity: None,
+            ca_certificates: vec![],
+            mcp_config: None,
         }
     }
 }

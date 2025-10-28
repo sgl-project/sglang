@@ -27,6 +27,7 @@ Its core features include:
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
    basic_usage/deepseek.md
+   basic_usage/deepseek_v32.md
    basic_usage/gpt_oss.md
    basic_usage/llama4.md
    basic_usage/qwen3.md
@@ -98,3 +99,9 @@ Its core features include:
    references/custom_chat_template.md
    references/frontend/frontend_index.rst
    references/learn_more.md
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Security Acknowledgement
+
+   security/acknowledgements.md

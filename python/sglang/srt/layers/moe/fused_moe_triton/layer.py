@@ -232,7 +232,7 @@ class FusedMoE(torch.nn.Module):
             self.quant_method, ModelOptNvFp4FusedMoEMethod
         ) or (
             isinstance(self.quant_method, Fp8MoEMethod)
-            and self.quant_method.use_cutlass_fused_experts_fp8
+            and self.quant_method._should_use_cutlass_fused_experts()
         )
 
     def _load_per_tensor_weight_scale(
@@ -839,7 +839,7 @@ class FusedMoE(torch.nn.Module):
             dispatch_output=dispatch_output,
             **kwargs,
         )
-        final_hidden_states = self.dispatcher.combine(combine_input)
+        final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
         # TODO: should we add some conditions here?
         final_hidden_states = final_hidden_states[
