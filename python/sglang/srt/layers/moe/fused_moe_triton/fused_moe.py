@@ -13,6 +13,7 @@ import torch
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     direct_register_custom_op,
@@ -51,6 +52,9 @@ elif _is_hip:
         from vllm import _custom_ops as vllm_ops
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+
+cache: torch.tensor = None
+intermediate_cache_global: torch.Tensor = None
 
 
 def inplace_fused_experts(
@@ -406,19 +410,64 @@ def fused_experts_impl(
 
     config = get_config_func(M)
 
-    cache = torch.empty(
-        M * topk_ids.shape[1] * max(N, w2.shape[1]),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
+    def get_safe_cache_size(M, topk_shape, N, w2_shape, chunked_prefill_size=None):
+        if chunked_prefill_size:
+            effective_M = max(M, chunked_prefill_size)
+        else:
+            effective_M = M
+
+        return effective_M * topk_shape * max(N, w2_shape)
+
+    global cache
+    chunked_prefill_size = get_global_server_args().chunked_prefill_size
+    cache_size = get_safe_cache_size(
+        M, topk_ids.shape[1], N, w2.shape[1], chunked_prefill_size
     )
+
+    if chunked_prefill_size:
+        if cache is None or cache.numel() < cache_size:
+            cache = torch.empty(
+                cache_size,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+    else:
+        cache = torch.empty(
+            cache_size,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
     intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
         (M, topk_ids.shape[1], N),
     )
-    intermediate_cache2 = torch.empty(
-        (M * topk_ids.shape[1], N // 2),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+
+    global intermediate_cache_global
+    if chunked_prefill_size:
+        required_size = M * topk_ids.shape[1] * (N // 2)
+        max_size = chunked_prefill_size * topk_ids.shape[1] * (N // 2)
+        cache_size = max(required_size, max_size)
+
+        if (
+            intermediate_cache_global is None
+            or intermediate_cache_global.numel() < cache_size
+        ):
+            intermediate_cache_global = torch.empty(
+                cache_size,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+
+        intermediate_cache2 = intermediate_cache_global[:required_size].view(
+            (M * topk_ids.shape[1], N // 2),
+        )
+    else:
+        intermediate_cache2 = torch.empty(
+            (M * topk_ids.shape[1], N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
     intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
         (M, topk_ids.shape[1], w2.shape[1]),
     )
