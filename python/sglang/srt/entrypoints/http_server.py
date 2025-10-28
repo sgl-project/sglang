@@ -220,9 +220,12 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Init tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-        if server_args.disaggregation_mode == "null":
-            trace_set_thread_info(thread_label)
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill" + thread_label
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode" + thread_label
+        trace_set_thread_info(thread_label)
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -1168,6 +1171,8 @@ async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
     served_model_names = [_global_state.tokenizer_manager.served_model_name]
     model_cards = []
+
+    # Add base model
     for served_model_name in served_model_names:
         model_cards.append(
             ModelCard(
@@ -1176,6 +1181,20 @@ async def available_models():
                 max_model_len=_global_state.tokenizer_manager.model_config.context_len,
             )
         )
+
+    # Add loaded LoRA adapters
+    if _global_state.tokenizer_manager.server_args.enable_lora:
+        lora_registry = _global_state.tokenizer_manager.lora_registry
+        for _, lora_ref in lora_registry.get_all_adapters().items():
+            model_cards.append(
+                ModelCard(
+                    id=lora_ref.lora_name,
+                    root=lora_ref.lora_path,
+                    parent=served_model_names[0],
+                    max_model_len=None,
+                )
+            )
+
     return ModelList(data=model_cards)
 
 
