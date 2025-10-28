@@ -6,6 +6,7 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+    DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
     DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -109,7 +110,7 @@ class TestMoERunner(CustomTestCase):
             ],
         },
         "moe_runner_flashinfer_trtllm_mxfp4_quantization": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
@@ -126,7 +127,7 @@ class TestMoERunner(CustomTestCase):
         },
         # Speculative decoding (NGRAM) with FlashInfer MXFP4 backend (differs from main path)
         "moe_runner_flashinfer_mxfp4_quantization_spec_ngram": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
@@ -149,8 +150,8 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
-        "moe_runner_flashinfer_mxfp4_fp8_quantization": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+        "moe_runner_flashinfer_mxfp4_quantization": {
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
