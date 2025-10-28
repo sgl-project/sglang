@@ -69,7 +69,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
 
     let app_context = Arc::new(
         AppContext::builder()
-            .router_config(config)
+            .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
             .tokenizer(None) // tokenizer
@@ -104,7 +104,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
-    engine.register_workflow(create_worker_registration_workflow());
+    engine.register_workflow(create_worker_registration_workflow(&config));
     engine.register_workflow(create_worker_removal_workflow());
     app_context
         .workflow_engine
@@ -180,7 +180,7 @@ pub async fn create_test_context_with_mcp_config(
 
     let app_context = Arc::new(
         AppContext::builder()
-            .router_config(config)
+            .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
             .tokenizer(None) // tokenizer
@@ -215,7 +215,7 @@ pub async fn create_test_context_with_mcp_config(
         create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
-    engine.register_workflow(create_worker_registration_workflow());
+    engine.register_workflow(create_worker_registration_workflow(&config));
     engine.register_workflow(create_worker_removal_workflow());
     app_context
         .workflow_engine

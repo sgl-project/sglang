@@ -280,6 +280,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_hidden_states=recv_obj.output_hidden_states,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
         )
 
