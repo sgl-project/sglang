@@ -621,7 +621,6 @@ class RadixCache(BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
-                break
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
