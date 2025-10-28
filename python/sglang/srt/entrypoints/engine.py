@@ -143,10 +143,13 @@ class Engine(EngineBase):
 
         # Enable tracing
         if server_args.enable_trace:
-            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-            if server_args.disaggregation_mode == "null":
-                thread_label = "Tokenizer"
-                trace_set_thread_info(thread_label)
+            process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+            thread_label = "Tokenizer"
+            if server_args.disaggregation_mode == "prefill":
+                thread_label = "Prefill Tokenizer"
+            elif server_args.disaggregation_mode == "decode":
+                thread_label = "Decode Tokenizer"
+            trace_set_thread_info(thread_label)
 
         try:
             self.loop = asyncio.get_running_loop()
@@ -312,6 +315,7 @@ class Engine(EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        dimensions: Optional[int] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
@@ -322,6 +326,7 @@ class Engine(EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            dimensions=dimensions,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = self.loop.run_until_complete(generator.__anext__())
@@ -333,6 +338,7 @@ class Engine(EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        dimensions: Optional[int] = None,
     ) -> Dict:
         """
         Asynchronous version of encode method.
@@ -345,6 +351,7 @@ class Engine(EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            dimensions=dimensions,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
