@@ -39,6 +39,7 @@ else:
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -52,6 +53,7 @@ class BaseReq(ABC):
 @dataclass
 class BaseBatchReq(ABC):
     rids: Optional[List[str]] = field(default=None, kw_only=True)
+    http_worker_ipcs: Optional[List[str]] = field(default=None, kw_only=True)
 
     def regenerate_rids(self):
         """Generate new request IDs and return them."""
@@ -169,6 +171,9 @@ class GenerateReqInput(BaseReq):
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
+
+    # Whether to return entropy
+    return_entropy: bool = False
 
     def contains_mm_input(self) -> bool:
         return (
@@ -568,6 +573,8 @@ class GenerateReqInput(BaseReq):
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
+            return_entropy=self.return_entropy,
+            http_worker_ipc=self.http_worker_ipc,
         )
 
 
@@ -633,6 +640,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
+    # Whether to return entropy
+    return_entropy: bool = False
+
 
 @dataclass
 class BatchTokenizedGenerateReqInput(BaseBatchReq):
@@ -684,6 +694,9 @@ class EmbeddingReqInput(BaseReq):
 
     # tracing context
     trace_context: Optional[Dict] = None
+
+    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    dimensions: Optional[int] = None
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -750,6 +763,7 @@ class EmbeddingReqInput(BaseReq):
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
                 is_cross_encoder_request=True,
+                http_worker_ipc=self.http_worker_ipc,
             )
 
         return EmbeddingReqInput(
@@ -760,6 +774,8 @@ class EmbeddingReqInput(BaseReq):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            dimensions=self.dimensions,
+            http_worker_ipc=self.http_worker_ipc,
         )
 
 
@@ -779,6 +795,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     data_parallel_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
+    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    dimensions: Optional[int] = None
 
 
 @dataclass
@@ -831,6 +849,7 @@ class BatchTokenIDOutput(BaseBatchReq):
     input_token_ids_logprobs_idx: List[List]
     output_token_ids_logprobs_val: List[List]
     output_token_ids_logprobs_idx: List[List]
+    output_token_entropy_val: List[float]
 
     # Hidden states
     output_hidden_states: List[List[float]]
@@ -840,6 +859,12 @@ class BatchTokenIDOutput(BaseBatchReq):
     # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
+
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_steps: List[List[int]] = None
 
 
 @dataclass
@@ -862,11 +887,16 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
     completion_tokens: List[int]
     cached_tokens: List[int]
 
-    # Placeholder token info
+    # The information of placeholder tokens (e.g., image token)
+    # idx is the index of the token in the prompt after expansion.
+    # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
-    return_bytes: bool = False
+    return_bytes: List[bool]
+
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_steps: List[List[int]] = None
 
 
 @dataclass
@@ -898,12 +928,22 @@ class BatchStrOutput(BaseBatchReq):
     input_token_ids_logprobs_idx: List[List]
     output_token_ids_logprobs_val: List[List]
     output_token_ids_logprobs_idx: List[List]
+    output_token_entropy_val: List[float]
 
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The information of placeholder tokens (e.g., image token)
+    # idx is the index of the token in the prompt after expansion.
+    # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
+
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_steps: List[List[int]] = None
 
 
 @dataclass
@@ -936,13 +976,16 @@ class BatchEmbeddingOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
-    embeddings: List[List[float]]
+    embeddings: Union[List[List[float]], List[Dict[int, float]]]
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
 
 
 @dataclass
@@ -981,6 +1024,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_step: int = 0
 
 
 @dataclass
@@ -1051,6 +1096,24 @@ class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     group_name: str = "weight_send_group"
     # The backend
     backend: str = "nccl"
+
+
+# Now UpdateWeightsFromIPCReqInput and UpdateWeightsFromIPCReqOutput
+# are only used by Checkpoint Engine (https://github.com/MoonshotAI/checkpoint-engine)
+@dataclass
+class UpdateWeightsFromIPCReqInput(BaseReq):
+    # ZMQ socket paths for each device UUID
+    zmq_handles: Dict[str, str]
+    # Whether to flush cache after weight update
+    flush_cache: bool = True
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+
+
+@dataclass
+class UpdateWeightsFromIPCReqOutput(BaseReq):
+    success: bool
+    message: str
 
 
 @dataclass
@@ -1209,6 +1272,8 @@ class ProfileReqInput(BaseReq):
     profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
 
 
 class ProfileReqType(Enum):
@@ -1227,6 +1292,8 @@ class ProfileReq(BaseReq):
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
 
 
 @dataclass
@@ -1378,18 +1445,6 @@ class LoRAUpdateOutput(BaseReq):
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateOutput
 
 
-@dataclass
-class MultiTokenizerRegisterReq(BaseBatchReq):
-    ipc_name: Optional[str] = None
-
-
-@dataclass
-class MultiTokenizerWrapper:
-    # FIXME(lsyin): remove this
-    worker_id: int
-    obj: Optional[Any] = None
-
-
 class BlockReqType(Enum):
     BLOCK = 1
     UNBLOCK = 2
@@ -1416,6 +1471,16 @@ class GetLoadReqOutput(BaseReq):
 @dataclass
 class WatchLoadUpdateReq(BaseReq):
     loads: List[GetLoadReqOutput]
+
+
+@dataclass
+class LazyDumpTensorsReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class LazyDumpTensorsReqOutput(BaseReq):
+    success: bool
 
 
 def _check_all_req_types():

@@ -34,6 +34,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     GrammarStats,
 )
+from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -167,6 +168,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         tokenizer,
         vocab_size: int,
         model_eos_token_ids: Optional[List[int]] = None,
+        any_whitespace: bool = True,
     ):
         super().__init__()
 
@@ -188,6 +190,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
+        self.any_whitespace = any_whitespace
 
     def _from_context(
         self, ctx: CompiledGrammar, key_string: str, grammar_stats: GrammarStats
@@ -212,7 +215,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
-                ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
+                ctx = self.grammar_compiler.compile_json_schema(
+                    schema=key_string, any_whitespace=self.any_whitespace
+                )
 
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logging.error(f"Hit invalid json_schema: {key_string=}, {e=}")
@@ -237,18 +242,22 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
+            # TODO(dark): it's REALLY stupid to construct object from string and decode it again
             structural_tag = json.loads(key_string)
-            tags = [
-                StructuralTagItem(
-                    begin=structure["begin"],
-                    schema=json.dumps(structure["schema"]),
-                    end=structure["end"],
+            if is_legacy_structural_tag(structural_tag):
+                tags = [
+                    StructuralTagItem(
+                        begin=structure["begin"],
+                        schema=json.dumps(structure["schema"]),
+                        end=structure["end"],
+                    )
+                    for structure in structural_tag["structures"]
+                ]
+                ctx = self.grammar_compiler.compile_structural_tag(
+                    tags, structural_tag["triggers"]
                 )
-                for structure in structural_tag["structures"]
-            ]
-            ctx = self.grammar_compiler.compile_structural_tag(
-                tags, structural_tag["triggers"]
-            )
+            else:
+                ctx = self.grammar_compiler.compile_structural_tag(key_string)
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ

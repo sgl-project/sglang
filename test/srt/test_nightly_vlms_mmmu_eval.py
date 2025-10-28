@@ -1,7 +1,6 @@
 import json
 import unittest
 import warnings
-from functools import partial
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
@@ -22,20 +21,26 @@ MODEL_THRESHOLDS = {
         0.330, 56.1
     ),
     ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 40.3),
-    ModelLaunchSettings(
-        "Efficient-Large-Model/NVILA-Lite-2B-hf-0626"
-    ): ModelEvalMetrics(0.305, 23.8),
+    ModelLaunchSettings("Efficient-Large-Model/NVILA-8B-hf"): ModelEvalMetrics(
+        0.270, 56.7
+    ),
+    ModelLaunchSettings("Efficient-Large-Model/NVILA-Lite-2B-hf"): ModelEvalMetrics(
+        0.270, 23.8
+    ),
     ModelLaunchSettings("google/gemma-3-4b-it"): ModelEvalMetrics(0.360, 10.9),
-    ModelLaunchSettings("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.360, 15.3),
+    ModelLaunchSettings("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.360, 17.7),
     ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 16.6),
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
         0.330, 22.3
     ),
     ModelLaunchSettings("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 29.3),
-    ModelLaunchSettings("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.270, 24.5),
-    ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 14.0),
+    ModelLaunchSettings("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.259, 36.3),
+    ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 17.0),
     ModelLaunchSettings("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.310, 83.3),
     ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.340, 31.9),
+    ModelLaunchSettings(
+        "Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]
+    ): ModelEvalMetrics(0.29, 37.0),
     ModelLaunchSettings(
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
     ): ModelEvalMetrics(0.310, 16.7),
