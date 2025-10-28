@@ -83,15 +83,15 @@ jobs:
           rust-toolchain: stable
           docker-options: -e CI -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           before-script-linux: |
-            # Install OpenSSL development libraries and protoc for gRPC code generation
+            # Install build dependencies (perl/make for vendored OpenSSL, protoc for gRPC)
             if command -v yum &> /dev/null; then
-              yum update -y && yum install -y openssl-devel wget unzip gcc gcc-c++
+              yum update -y && yum install -y wget unzip gcc gcc-c++ perl-core make
               # Install cross-compilation toolchain for aarch64 if needed
               if [ "${{ matrix.target }}" = "aarch64" ]; then
                 yum install -y gcc-aarch64-linux-gnu gcc-c++-aarch64-linux-gnu || true
               fi
             elif command -v apt-get &> /dev/null; then
-              apt-get update && apt-get install -y libssl-dev wget unzip gcc g++
+              apt-get update && apt-get install -y wget unzip gcc g++ perl make
               # Install cross-compilation toolchain for aarch64 if needed
               if [ "${{ matrix.target }}" = "aarch64" ]; then
                 apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu || true
