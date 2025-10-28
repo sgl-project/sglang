@@ -331,7 +331,7 @@ class ServerArgs:
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_eviction_policy: str = "lru"
-    lora_backend: str = "triton"
+    lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
 
     # Kernel backend

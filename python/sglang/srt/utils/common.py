@@ -3571,7 +3571,17 @@ def cached_triton_kernel(key_fn=None):
     """
 
     def decorator(fn):
-        return CachedKernel(fn, key_fn)
+        if envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.get():
+            logger.debug(
+                f"{envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.name} = True. Using custom triton kernel cache."
+            )
+            return CachedKernel(fn, key_fn)
+        else:
+            # Fallback to the native triton cache.
+            logger.debug(
+                f"{envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.name} = False. Using native triton kernel cache."
+            )
+            return fn
 
     return decorator
 
