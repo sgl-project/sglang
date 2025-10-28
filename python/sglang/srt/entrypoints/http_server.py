@@ -1168,7 +1168,7 @@ async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
     served_model_names = [_global_state.tokenizer_manager.served_model_name]
     model_cards = []
-    
+
     # Add base model
     for served_model_name in served_model_names:
         model_cards.append(
@@ -1178,7 +1178,7 @@ async def available_models():
                 max_model_len=_global_state.tokenizer_manager.model_config.context_len,
             )
         )
-    
+
     # Add loaded LoRA adapters
     if _global_state.tokenizer_manager.server_args.enable_lora:
         lora_registry = _global_state.tokenizer_manager.lora_registry
@@ -1191,7 +1191,7 @@ async def available_models():
                     max_model_len=None,
                 )
             )
-    
+
     return ModelList(data=model_cards)
 
 
