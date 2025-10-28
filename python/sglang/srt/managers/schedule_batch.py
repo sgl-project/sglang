@@ -679,9 +679,13 @@ class Req:
         return self.output_ids
 
     def free_committed_kv_cache(self):
-        assert self.kv_freed_len == 0, "Committed KV cache already freed"
-        self.kv_freed_len = self.kv_committed_len
-        return self.kv_committed_len
+        page_size = get_global_server_args().page_size
+        if page_size == 1:
+            assert self.kv_freed_len == 0, "Committed KV cache already freed"
+            self.kv_freed_len = self.kv_committed_len
+            return self.kv_committed_len
+        else:
+            return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
 
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:
