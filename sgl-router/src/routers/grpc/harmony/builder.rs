@@ -12,7 +12,7 @@ use openai_harmony::{
     },
     HarmonyEncoding, HarmonyEncodingName,
 };
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::types::HarmonyBuildOutput;
 use crate::protocols::{
