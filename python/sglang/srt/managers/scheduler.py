@@ -157,6 +157,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
+    trace_event_batch,
     trace_set_proc_propagate_context,
     trace_set_thread_info,
     trace_slice_batch,
@@ -1354,7 +1355,7 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
-            trace_slice_end("process req", req.rid, auto_next_anon=True)
+            trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1617,6 +1618,10 @@ class Scheduler(
         # Handle DP attention
         if need_dp_attn_preparation:
             ret = self.prepare_mlp_sync_batch(ret)
+
+        if ret:
+            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
+            trace_event_batch("schedule", ret.reqs, attrs=attrs)
 
         return ret
 
@@ -1993,13 +1998,10 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
-            if self.enable_trace:
-                trace_slice_batch("decode loop", batch.reqs)
+            trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
 
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
-            if self.enable_trace:
-                trace_slice_batch("prefill", batch.reqs)
 
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
@@ -2741,10 +2743,13 @@ def run_scheduler_process(
 
     # Set up tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-        if server_args.disaggregation_mode == "null":
-            thread_label = "Scheduler"
-            trace_set_thread_info(thread_label, tp_rank, dp_rank)
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        thread_label = "Scheduler"
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill Scheduler"
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode Scheduler"
+        trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
     # Create a scheduler and run the event loop
     try:
