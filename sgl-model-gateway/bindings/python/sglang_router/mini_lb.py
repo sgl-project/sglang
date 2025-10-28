@@ -69,7 +69,7 @@ class MiniLoadBalancer:
             )
             self.enable_trace = False
         self.encode_urls = router_args.encode_urls
-        
+
         self.encode_idx = list(range(len(self.encode_urls)))
 
     def _validate_router_args(self, router_args: RouterArgs):
@@ -108,47 +108,48 @@ class MiniLoadBalancer:
             self.prefill_bootstrap_ports[pidx],
             self.decode_urls[didx],
         )
-        
-    async def encode(
-        self, request_data, encode_urls, endpoint
-    ):
-        messages = request_data.get('messages')
+
+    async def encode(self, request_data, encode_urls, endpoint):
+        messages = request_data.get("messages")
         if messages is None or len(encode_urls) == 0:
             return
-        
+
         # Extract mm_items
         img_list = []
         for message in messages:
-            for item in message.get('content'):
-                if item.get('type') == 'image_url':
-                    img_url = item.get('image_url').get('url')
+            for item in message.get("content"):
+                if item.get("type") == "image_url":
+                    img_url = item.get("image_url").get("url")
                     img_list.append(img_url)
-        
+
         if len(img_list) == 0:
             return
-        
+
         # Split mm_items
         encode_requests = []
         random.shuffle(self.encode_idx)
-        num_items_assigned = [(idx+len(img_list)) // len(self.encode_urls) for idx in self.encode_idx]
+        num_items_assigned = [
+            (idx + len(img_list)) // len(self.encode_urls) for idx in self.encode_idx
+        ]
         num_parts = sum(1 for x in num_items_assigned if x != 0)
         cum_num_items = 0
         cum_idx = 0
-        for idx,assigned_num in enumerate(num_items_assigned):
+        for idx, assigned_num in enumerate(num_items_assigned):
             if assigned_num == 0:
                 continue
             encode_requests.append(
                 {
-                'encoder_idx':idx,
-                'mm_items':img_list[cum_num_items:cum_num_items+assigned_num],
-                'num_parts': num_parts,
-                'part_idx': cum_idx,
-                'req_id': request_data.get('bootstrap_room'),
-                'bootstrap_host': request_data.get('bootstrap_host'),
-                })
+                    "encoder_idx": idx,
+                    "mm_items": img_list[cum_num_items : cum_num_items + assigned_num],
+                    "num_parts": num_parts,
+                    "part_idx": cum_idx,
+                    "req_id": request_data.get("bootstrap_room"),
+                    "bootstrap_host": request_data.get("bootstrap_host"),
+                }
+            )
             cum_idx += 1
             cum_num_items += assigned_num
-        
+
         # Send encode requests
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
@@ -156,7 +157,10 @@ class MiniLoadBalancer:
             )  # Add timeout for request reliability
         ) as session:
             tasks = [
-                session.post(f"{encode_urls[encode_request['encoder_idx']]}/{endpoint}", json=encode_request)
+                session.post(
+                    f"{encode_urls[encode_request['encoder_idx']]}/{endpoint}",
+                    json=encode_request,
+                )
                 for encode_request in encode_requests
             ]
 
@@ -470,13 +474,17 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     bootstrap_room = _generate_bootstrap_room()
-    
+
     # Send requests to encode server
     encode_request = request_data.copy()
-    encode_request.update({"bootstrap_room": bootstrap_room,
-                           "bootstrap_host": hostname,})
-    asyncio.create_task(lb.encode(encode_request, lb.encode_urls, 'encode'))
-    
+    encode_request.update(
+        {
+            "bootstrap_room": bootstrap_room,
+            "bootstrap_host": hostname,
+        }
+    )
+    asyncio.create_task(lb.encode(encode_request, lb.encode_urls, "encode"))
+
     modified_request = encode_request.copy()
     modified_request.update({"bootstrap_port": bootstrap_port})
 

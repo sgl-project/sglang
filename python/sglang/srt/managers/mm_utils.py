@@ -351,7 +351,7 @@ def _get_precomputed_embedding(
     If none have precomputed_embeddings, return None.
     """
     precomputed_embeddings = []
-    for idx,item in enumerate(items):
+    for idx, item in enumerate(items):
         if item.precomputed_embeddings is None:
             precomputed_embeddings.append(None)
             continue
@@ -363,17 +363,27 @@ def _get_precomputed_embedding(
             if mm_start_idx > seq_end_idx:
                 break
             if seq_start_idx > mm_start_idx:
-                prefix_embedding_length.append(min(seq_start_idx - mm_start_idx, mm_end_idx - mm_start_idx + 1))
+                prefix_embedding_length.append(
+                    min(seq_start_idx - mm_start_idx, mm_end_idx - mm_start_idx + 1)
+                )
             if mm_end_idx >= seq_start_idx:
-                extend_embedding_length.append(min(mm_end_idx - seq_start_idx + 1, 
-                                                   seq_end_idx - mm_start_idx + 1, 
-                                                   mm_end_idx - mm_start_idx + 1,
-                                                   seq_end_idx - seq_start_idx + 1))
+                extend_embedding_length.append(
+                    min(
+                        mm_end_idx - seq_start_idx + 1,
+                        seq_end_idx - mm_start_idx + 1,
+                        mm_end_idx - mm_start_idx + 1,
+                        seq_end_idx - seq_start_idx + 1,
+                    )
+                )
         prefix_embedding_length = int(np.sum(prefix_embedding_length))
         extend_embedding_length = int(np.sum(extend_embedding_length))
         precomputed_embeddings.append(
-            item.precomputed_embeddings[prefix_embedding_length:prefix_embedding_length+extend_embedding_length])
-        
+            item.precomputed_embeddings[
+                prefix_embedding_length : prefix_embedding_length
+                + extend_embedding_length
+            ]
+        )
+
     if any(feature is not None for feature in precomputed_embeddings):
         if not all(feature is not None for feature in precomputed_embeddings):
             raise NotImplementedError(
@@ -499,7 +509,9 @@ def get_embedding_and_mask(
         - A boolean mask tensor indicating where these embeddings should be placed
     """
     # 1. Get embedding
-    embedding = _get_precomputed_embedding(embedding_items, prefix_length, extend_length, items_offset_list)
+    embedding = _get_precomputed_embedding(
+        embedding_items, prefix_length, extend_length, items_offset_list
+    )
     if embedding is None:
         embedding = _get_chunked_prefill_embedding(
             data_embedding_func,

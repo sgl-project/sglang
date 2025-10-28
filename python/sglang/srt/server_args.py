@@ -253,7 +253,7 @@ class ServerArgs:
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
-    
+
     # Encode prefill disaggregation
     mm_only: bool = False
     language_only: bool = False
@@ -2242,23 +2242,23 @@ class ServerArgs:
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
             "before serving inference requests.",
         )
-        
+
         # Encode prefill disaggregation
         parser.add_argument(
             "--mm-only",
-            action='store_true',
-            help="For VLM, launch encode server only for multimodal part."
+            action="store_true",
+            help="For VLM, launch encode server only for multimodal part.",
         )
         parser.add_argument(
             "--language-only",
-            action='store_true',
-            help="For VLM, load weights for the language model only."
+            action="store_true",
+            help="For VLM, load weights for the language model only.",
         )
         parser.add_argument(
             "--embedding-port",
             type=int,
             default=54213,
-            help="The port for multimodal embedding transmission."
+            help="The port for multimodal embedding transmission.",
         )
 
         # Quantization and data type

@@ -217,7 +217,7 @@ class ModelConfig:
         self.image_token_id = getattr(
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
-        
+
         self.hf_config.mm_only = mm_only
         self.hf_config.language_only = language_only
 

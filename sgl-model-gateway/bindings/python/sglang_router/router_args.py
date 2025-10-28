@@ -181,7 +181,6 @@ class RouterArgs:
             choices=["random", "round_robin", "cache_aware", "power_of_two"],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
-        
 
         # PD-specific arguments
         parser.add_argument(
@@ -792,7 +791,7 @@ class RouterArgs:
 
         # decode_list is a list of single-element lists due to nargs=1
         return [url[0] for url in decode_list]
-    
+
     @staticmethod
     def _parse_encode_urls(encode_list):
         """Parse encode URLs from --encode arguments.
