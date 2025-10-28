@@ -265,7 +265,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
-    mm_config: Dict = {}
+    mm_process_config: Dict = {}
 
     # Logging
     log_level: str = "info"
@@ -2176,10 +2176,10 @@ class ServerArgs:
             help="Reduce CPU usage when sglang is idle.",
         )
         parser.add_argument(
-            "--mm-config",
+            "--mm-process-config",
             type=json.loads,
-            default=ServerArgs.mm_config,
-            help="Multimodal preprocessing config, a json config contains keys: image, video, audio",
+            default=ServerArgs.mm_process_config,
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
         )
 
         # Logging
