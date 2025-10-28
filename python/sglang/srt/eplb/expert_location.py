@@ -132,7 +132,7 @@ class ExpertLocationMetadata:
             server_args=server_args,
             physical_to_logical_map=physical_to_logical_map,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
-            num_gpus=common["ep_size"],
+            ep_size=common["ep_size"],
             moe_ep_rank=moe_ep_rank,
         )
 
@@ -313,7 +313,7 @@ def _compute_logical_to_all_physical_map(
     server_args: ServerArgs,
     physical_to_logical_map: torch.Tensor,
     num_logical_experts: int,
-    num_gpus: int,
+    ep_size: int,
     moe_ep_rank: int,
 ):
     # This is rarely called, so we use for loops for maximum clarity
@@ -337,7 +337,7 @@ def _compute_logical_to_all_physical_map(
     # Replace by the physical expert on local GPU or node if possible
     if moe_ep_rank is not None:
         num_gpus_per_node = server_args.ep_size // server_args.nnodes
-        num_local_gpu_physical_experts = num_physical_experts // num_gpus
+        num_local_gpu_physical_experts = num_physical_experts // ep_size
         num_local_node_physical_experts = (
             num_local_gpu_physical_experts * num_gpus_per_node
         )
