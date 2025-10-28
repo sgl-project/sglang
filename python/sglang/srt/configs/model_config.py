@@ -597,7 +597,9 @@ class ModelConfig:
         ]
 
         if not modelopt_quantization_specified:
-            raise ValueError("quantize_and_serve requires ModelOpt quantization")
+            raise ValueError(
+                "quantize_and_serve requires ModelOpt quantization (set with --quantization {modelopt, modelopt_fp8, modelopt_fp4})"
+            )
 
         # quantize_and_serve is disabled due to compatibility issues
         raise NotImplementedError(
