@@ -1,5 +1,12 @@
 import os
 import subprocess
+import sys
+from pathlib import Path
+
+# Ensure local imports and relative paths resolve when run under PEP 517
+ROOT_DIR = Path(__file__).resolve().parent
+os.chdir(ROOT_DIR)
+sys.path.insert(0, str(ROOT_DIR))
 
 from config_sta import kernels, sources, target
 from setuptools import find_packages, setup
@@ -85,7 +92,7 @@ setup(
     author=AUTHOR,
     description=DESCRIPTION,
     url=URL,
-    packages=find_packages(),
+    packages=["st_attn"],
     ext_modules=[
         CUDAExtension(
             "st_attn_cuda",

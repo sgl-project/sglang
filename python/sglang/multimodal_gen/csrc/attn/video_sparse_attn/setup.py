@@ -1,5 +1,12 @@
 import os
 import subprocess
+import sys
+from pathlib import Path
+
+# Ensure local imports and relative paths resolve when run under PEP 517
+ROOT_DIR = Path(__file__).resolve().parent
+os.chdir(ROOT_DIR)
+sys.path.insert(0, str(ROOT_DIR))
 
 from config_vsa import kernels, sources, target
 from setuptools import find_packages, setup
@@ -16,10 +23,27 @@ URL = (
     "https://github.com/hao-ai-lab/sgl-diffusion/tree/main/csrc/attn/video_sparse_attn"
 )
 
-# Set environment variables
-tk_root = os.getenv(
-    "THUNDERKITTENS_ROOT", os.path.abspath(os.path.join(os.getcwd(), "tk/"))
-)
+# Resolve ThunderKittens root
+_tk_env = os.getenv("THUNDERKITTENS_ROOT", "").strip()
+candidate_tk_roots = [
+    Path(_tk_env) if _tk_env else None,
+    ROOT_DIR / "tk",
+    (ROOT_DIR / "../sliding_tile_attn/tk").resolve(),
+]
+candidate_tk_roots = [p for p in candidate_tk_roots if p]
+
+tk_root = None
+for cand in candidate_tk_roots:
+    if (cand / "include" / "kittens.cuh").exists():
+        tk_root = str(cand.resolve())
+        break
+
+if tk_root is None:
+    raise RuntimeError(
+        "ThunderKittens headers not found. Set THUNDERKITTENS_ROOT to the 'tk' directory containing include/kittens.cuh"
+    )
+
+# Python and Torch include paths
 python_include = (
     subprocess.check_output(
         ["python", "-c", "import sysconfig; print(sysconfig.get_path('include'))"]
@@ -38,7 +62,7 @@ torch_include = (
     .decode()
     .strip()
 )
-print("vsa root:", tk_root)
+print("vsa tk root:", tk_root)
 print("Python include:", python_include)
 print("Torch include directories:", torch_include)
 
@@ -85,6 +109,7 @@ ext_modules = [
         "vsa_cuda",
         sources=source_files,
         extra_compile_args={"cxx": cpp_flags, "nvcc": cuda_flags},
+        include_dirs=[python_include, f"{tk_root}/include", f"{tk_root}/prototype"],
         libraries=["cuda"],
     )
 ]
@@ -96,7 +121,7 @@ setup(
     author=AUTHOR,
     description=DESCRIPTION,
     url=URL,
-    packages=find_packages(),
+    packages=["vsa"],
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
     classifiers=[
