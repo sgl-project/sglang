@@ -26,5 +26,5 @@ jobs:
           version=$(cat sgl-router/py_src/sglang_router/version.py | cut -d'"' -f2)
           tag=v${version}
 
-          docker build . -f docker/Dockerfile.router -t lmsysorg/sglang-router:${tag} --no-cache
+          docker build . -f docker/router.Dockerfile -t lmsysorg/sglang-router:${tag} --no-cache
           docker push lmsysorg/sglang-router:${tag}

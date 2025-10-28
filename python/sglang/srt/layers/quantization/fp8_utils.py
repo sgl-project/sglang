@@ -5,7 +5,7 @@ import torch
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.utils import ceil_div, is_sm100_supported, offloader
+from sglang.srt.utils import ceil_div, is_blackwell_supported, offloader
 
 try:
     from vllm import _custom_ops as ops
@@ -129,7 +129,7 @@ def cutlass_block_fp8_supported() -> bool:
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
 ENABLE_FLASHINFER_GEMM = (
     get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM")
-    and is_sm100_supported()
+    and is_blackwell_supported()
     and is_flashinfer_available()
 )
 if ENABLE_FLASHINFER_GEMM:
