@@ -26,7 +26,7 @@ class TestMoERunner(CustomTestCase):
     }
 
     CONFIGS = {
-        "moe_runner_triton_unquant_standard": {
+        "moe_runner_auto": {
             "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
                 "--trust-remote-code",
@@ -44,7 +44,25 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
-        "moe_runner_triton_kernel_unquant_standard": {
+        "moe_runner_triton": {
+            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "triton",
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "2048",
+                "--mem-fraction-static",
+                "0.95",
+                "--attention-backend",
+                "torch_native",
+                "--sampling-backend",
+                "pytorch",
+            ],
+        },
+        "moe_runner_triton_kernel": {
             "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
                 "--trust-remote-code",
@@ -62,14 +80,30 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
-        "moe_runner_deep_gemm_awq_quantization": {
-            "model": DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST,
+        "moe_runner_flashinfer_cutlass": {
+            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "flashinfer_cutlass",
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "2048",
+                "--mem-fraction-static",
+                "0.95",
+                "--attention-backend",
+                "torch_native",
+                "--sampling-backend",
+                "pytorch",
+            ],
+        },
+        "moe_runner_deep_gemm": {
+            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "deep_gemm",
-                "--quantization",
-                "awq",
                 "--tp",
                 "2",
                 "--max-total-tokens",
@@ -82,14 +116,12 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
-        "moe_runner_flashinfer_trtllm_mxfp4_quantization": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
+        "moe_runner_flashinfer_trtllm": {
+            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "flashinfer_trtllm",
-                "--quantization",
-                "mxfp4",
                 "--tp",
                 "2",
                 "--max-total-tokens",
@@ -98,32 +130,7 @@ class TestMoERunner(CustomTestCase):
                 "0.95",
             ],
         },
-        # Speculative decoding (NGRAM) with FlashInfer MXFP4 backend (differs from main path)
-        "moe_runner_flashinfer_mxfp4_quantization_spec_ngram": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
-            "other_args": [
-                "--trust-remote-code",
-                "--moe-runner-backend",
-                "flashinfer_mxfp4",
-                "--quantization",
-                "mxfp4",
-                "--tp",
-                "2",
-                "--max-total-tokens",
-                "2048",
-                "--mem-fraction-static",
-                "0.95",
-                "--speculative-algorithm",
-                "NGRAM",
-                "--speculative-num-draft-tokens",
-                "8",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
-            ],
-        },
-        "moe_runner_flashinfer_mxfp4_quantization": {
+        "moe_runner_flashinfer_mxfp4": {
             "model": DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
             "other_args": [
                 "--trust-remote-code",
@@ -143,14 +150,12 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
-        "moe_runner_flashinfer_cutedsl_fp8_quantization": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+        "moe_runner_flashinfer_cutedsl": {
+            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "flashinfer_cutedsl",
-                "--quantization",
-                "fp8",
                 "--tp",
                 "2",
                 "--max-total-tokens",
@@ -163,14 +168,12 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
-        "moe_runner_cutlass_w8a8_quantization": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
+        "moe_runner_cutlass": {
+            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "cutlass",
-                "--quantization",
-                "w8a8_int8",
                 "--tp",
                 "2",
                 "--max-total-tokens",
