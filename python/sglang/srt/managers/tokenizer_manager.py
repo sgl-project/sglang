@@ -46,7 +46,6 @@ from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchT
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BaseReq,
     BatchEmbeddingOutput,
     BatchMultimodalOutput,
     BatchStrOutput,
@@ -69,6 +68,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -80,6 +80,7 @@ from sglang.srt.tracing.trace import (
     trace_get_proc_propagate_context,
     trace_req_finish,
     trace_req_start,
+    trace_set_remote_propagate_context,
     trace_slice_end,
     trace_slice_start,
 )
@@ -171,7 +172,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
-
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -180,9 +180,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if speculative_algorithm.is_none()
             else server_args.speculative_num_draft_tokens
         )
-        # Initialize delimiter text for multi-item scoring (will be set after tokenizer is loaded)
-        self.multi_item_delimiter_text = None
 
+        # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
             try:
@@ -237,6 +236,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     revision=server_args.revision,
                 )
                 self._initialize_multi_item_delimiter_text()
+
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
             server_args.enable_dynamic_batch_tokenizer
@@ -255,24 +255,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        if self.server_args.tokenizer_worker_num > 1:
+        if self.server_args.tokenizer_worker_num == 1:
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            )
+        else:
+            from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
+
             # Use tokenizer_worker_ipc_name in multi-tokenizer mode
             send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
 
-            class SenderWrapper:
-                def send_pyobj(self, obj):
-                    if isinstance(obj, BaseReq):
-                        obj.http_worker_ipc = port_args.tokenizer_ipc_name
-                    send_to_scheduler.send_pyobj(obj)
-
             # Make sure that each request carries the tokenizer_ipc_name for response routing
-            self.send_to_scheduler = SenderWrapper()
-        else:
-            self.send_to_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-            )
+            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
 
         # Request states
         self._chosen_loop = None
@@ -320,6 +316,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # LoRA updates and inference to overlap.
         self.lora_update_lock = asyncio.Lock()
 
+        # Disaggregation
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -388,10 +385,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        if self.server_args.tokenizer_worker_num > 1:
-            from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
+        if request:
+            if "trace_context" in request.headers:
+                trace_set_remote_propagate_context(request.headers["trace_context"])
 
-            assert isinstance(self, TokenizerWorker)
+        if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
         if self.enable_trace:
@@ -613,7 +611,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
-        trace_slice_end("tokenize", obj.rid)
+        trace_slice_end(RequestStage.TOKENIZE, obj.rid)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -674,6 +672,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 )
                 raise ValueError(error_msg)
 
+        # Matryoshka embeddings validations
+        if isinstance(obj, EmbeddingReqInput):
+            self._validate_for_matryoshka_dim(obj)
+
         if isinstance(obj, GenerateReqInput):
             if (
                 obj.return_hidden_states
@@ -691,6 +693,34 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+
+    def _validate_for_matryoshka_dim(self, obj: EmbeddingReqInput) -> None:
+        """Validate the request for Matryoshka dim if it has the field set."""
+        if obj.dimensions is None:
+            return
+
+        if not self.model_config.is_matryoshka:
+            raise ValueError(
+                f"Model '{self.model_config.model_path}' does not support matryoshka representation, "
+                f"changing output dimensions will lead to poor results."
+            )
+
+        if obj.dimensions < 1:
+            raise ValueError("Requested dimensions must be greater than 0")
+
+        if (
+            self.model_config.matryoshka_dimensions
+            and obj.dimensions not in self.model_config.matryoshka_dimensions
+        ):
+            raise ValueError(
+                f"Model '{self.model_config.model_path}' only supports {self.model_config.matryoshka_dimensions} matryoshka dimensions, "
+                f"using other output dimensions will lead to poor results."
+            )
+
+        if obj.dimensions > self.model_config.hidden_size:
+            raise ValueError(
+                f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}"
+            )
 
     def _validate_input_ids_in_vocab(
         self, input_ids: List[int], vocab_size: int
@@ -760,6 +790,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 sampling_params,
                 rid=obj.rid,
                 priority=obj.priority,
+                dimensions=obj.dimensions,
                 http_worker_ipc=obj.http_worker_ipc,
             )
 
@@ -806,7 +837,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     req, req.text, input_ids_list[i], None, None, token_type_ids
                 )
             )
-            trace_slice_end("tokenize", req.rid)
+            trace_slice_end(RequestStage.TOKENIZE, req.rid)
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
@@ -858,12 +889,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
-        trace_slice_start("dispatch", obj.rid)
+        trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
-        trace_slice_end("dispatch", obj.rid, thread_finish_flag=True)
+        trace_slice_end(
+            RequestStage.TOKENIZER_DISPATCH, obj.rid, thread_finish_flag=True
+        )
         return state
 
     def _send_batch_request(
@@ -1365,6 +1398,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
+                "total_retractions": recv_obj.retraction_counts[i],
             }
 
             if getattr(state.obj, "return_logprob", False):
@@ -1657,6 +1691,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 or state.obj.sampling_params.get("ebnf", None)
                 or state.obj.sampling_params.get("structural_tag", None)
             )
+
+            retraction_count = (
+                recv_obj.retraction_counts[i]
+                if getattr(recv_obj, "retraction_counts", None)
+                and i < len(recv_obj.retraction_counts)
+                else 0
+            )
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -1664,6 +1706,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 recv_obj.cached_tokens[i],
                 state.finished_time - state.created_time,
                 has_grammar,
+                retraction_count,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
@@ -2096,7 +2139,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             bootstrap_room = (
                 obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
             )
-            trace_req_start(obj.rid, bootstrap_room, ts=int(created_time * 1e9))
+            trace_req_start(
+                obj.rid,
+                bootstrap_room,
+                ts=int(created_time * 1e9),
+                role=self.server_args.disaggregation_mode,
+            )
             trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
         else:
             for i in range(len(obj.rid)):
@@ -2105,7 +2153,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
                     else None
                 )
-                trace_req_start(obj.rid[i], bootstrap_room, ts=int(created_time * 1e9))
+                trace_req_start(
+                    obj.rid[i],
+                    bootstrap_room,
+                    ts=int(created_time * 1e9),
+                    role=self.server_args.disaggregation_mode,
+                )
                 trace_slice_start(
                     "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
                 )

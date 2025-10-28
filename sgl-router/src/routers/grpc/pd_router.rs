@@ -13,6 +13,7 @@ use tracing::debug;
 
 use super::{context::SharedComponents, pipeline::RequestPipeline};
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
     core::{ConnectionMode, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
@@ -27,7 +28,6 @@ use crate::{
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::RouterTrait,
-    server::AppContext,
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
 };

@@ -159,7 +159,6 @@ jobs:
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
       CI: true
     steps:
       - uses: actions/checkout@v4

@@ -3,6 +3,11 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    import tomli as tomllib  # Fallback for older Python versions
+
 
 def normalize_version(version: str) -> str:
     """Remove 'v' prefix from version string if present."""
@@ -93,12 +98,30 @@ def replace_in_file(file_path: Path, old_version: str, new_version: str) -> bool
 
     content = file_path.read_text()
 
-    # For TOML files, use regex to match version field regardless of current value
+    # For TOML files, parse and update only the [project] version field
     if file_path.suffix == ".toml":
-        # Match: version = "X.Y.Z..." (with optional quotes and whitespace)
-        # Captures quotes (or lack thereof) to preserve original quoting style
-        pattern = r'(version\s*=\s*)(["\']?)([^"\'\n]+)(["\']?)'
-        new_content = re.sub(pattern, rf"\g<1>\g<2>{new_version}\g<4>", content)
+        try:
+            # Parse TOML to verify structure
+            toml_data = tomllib.loads(content)
+
+            # Check if [project] section exists and has version field
+            if "project" not in toml_data or "version" not in toml_data["project"]:
+                print(
+                    f"Warning: {file_path} does not have [project] version field, skipping"
+                )
+                return False
+
+            # Use regex to replace only the version field in [project] section
+            # This pattern matches the version field that comes after [project]
+            # and before any other section marker
+            pattern = r'(\[project\].*?version\s*=\s*)["\']([^"\']+)["\']'
+            new_content = re.sub(
+                pattern, rf'\g<1>"{new_version}"', content, flags=re.DOTALL
+            )
+        except Exception as e:
+            print(f"Warning: Failed to parse {file_path} as TOML: {e}")
+            print("Falling back to simple string replacement")
+            new_content = content.replace(old_version, new_version)
     else:
         # For non-TOML files, use simple string replacement
         new_content = content.replace(old_version, new_version)

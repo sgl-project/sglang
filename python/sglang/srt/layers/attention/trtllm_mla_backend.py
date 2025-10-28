@@ -423,14 +423,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PAGED_SIZE=self.page_size,
         )
 
-        # Record the true maximum sequence length for this capture batch so that
-        # the kernel launch path (which requires an int not a tensor) can reuse
-        # it safely during both capture and replay.
-        max_seq_len_val = int(seq_lens.max().item())
-
         metadata = TRTLLMMLADecodeMetadata(
             block_kv_indices,
-            max_seq_len_val,
+            self.max_context_len,
         )
         if forward_mode.is_draft_extend(include_v2=True):
             num_tokens_per_bs = num_tokens // bs
@@ -508,13 +503,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.block_kv_indices.shape[1],
             PAGED_SIZE=self.page_size,
         )
-
-        # Update stored max_seq_len so subsequent kernel calls use the correct value
-        # Prefer CPU tensor to avoid GPU synchronization when available.
-        if seq_lens_cpu is not None:
-            metadata.max_seq_len = int(seq_lens_cpu.max().item())
-        else:
-            metadata.max_seq_len = int(seq_lens.max().item())
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""

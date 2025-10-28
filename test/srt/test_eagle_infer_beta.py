@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kit_matched_stop import MatchedStopMixin
@@ -29,7 +30,6 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         launch_args = [
-            "--enable-beta-spec",
             "--trust-remote-code",
             "--attention-backend",
             cls.attention_backend,
@@ -53,12 +53,13 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
             *[str(i) for i in range(1, cls.max_running_requests + 1)],
         ]
         launch_args.extend(cls.other_launch_args)
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=launch_args,
-        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=launch_args,
+            )
 
     @classmethod
     def tearDownClass(cls):

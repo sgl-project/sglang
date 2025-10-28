@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-SGLang CI Analyzer
-Simple tool to analyze CI failures for SGLang project
-"""
 
 import argparse
 import json
@@ -17,7 +13,6 @@ import requests
 
 
 class SGLangCIAnalyzer:
-    """SGLang CI Analyzer"""
 
     def __init__(self, token: str):
         self.token = token
@@ -32,7 +27,6 @@ class SGLangCIAnalyzer:
         self.session.headers.update(self.headers)
 
     def get_recent_runs(self, limit: int = 100, branch: str = None) -> List[Dict]:
-        """Get recent CI run data"""
         branch_info = f" from branch '{branch}'" if branch else ""
         print(f"Fetching {limit} recent CI runs{branch_info}...")
 
@@ -61,7 +55,7 @@ class SGLangCIAnalyzer:
                     break
 
                 page += 1
-                time.sleep(0.1)  # Avoid API rate limits
+                time.sleep(0.1)
 
             except requests.exceptions.RequestException as e:
                 print(f"Error fetching CI data: {e}")
@@ -70,10 +64,10 @@ class SGLangCIAnalyzer:
         return all_runs[:limit]
 
     def analyze_ci_failures(self, runs: List[Dict]) -> Dict:
-        """Analyze CI failure patterns (CUDA jobs only)"""
-        print("Analyzing CI failure data (CUDA only)...")
+        print(
+            "Analyzing CI failure data (pr-test.yml, vllm-dependency-test.yml, nightly-test.yml jobs only)..."
+        )
 
-        # SGLang specific job categories (CUDA only)
         job_categories = {
             "build": [
                 "build-test",
@@ -137,7 +131,6 @@ class SGLangCIAnalyzer:
 
         total_runs = len(runs)
         for i, run in enumerate(runs, 1):
-            # Show progress every 10% or every 50 runs, whichever is smaller
             if i % max(1, min(50, total_runs // 10)) == 0 or i == total_runs:
                 progress = (i / total_runs) * 100
                 print(f"Progress: {i}/{total_runs} ({progress:.1f}%)")
@@ -148,7 +141,6 @@ class SGLangCIAnalyzer:
             run_number = run.get("run_number")
             created_at = run.get("created_at")
 
-            # Count run status
             if run_status == "failure":
                 stats["failed_runs"] += 1
             elif run_status == "success":
@@ -158,7 +150,6 @@ class SGLangCIAnalyzer:
             elif run_status == "skipped":
                 stats["skipped_runs"] += 1
 
-            # Get detailed job information for all runs
             jobs = self._get_job_details(run_id)
             run_url = f"https://github.com/{self.repo}/actions/runs/{run_id}"
             pr_info = self._get_pr_info(run)
@@ -167,27 +158,37 @@ class SGLangCIAnalyzer:
                 job_name = job.get("name", "Unknown")
                 job_conclusion = job.get("conclusion", "unknown")
 
-                # Filter out non-specific CI jobs and non-CUDA jobs
-                # Skip meta jobs and AMD/NPU related jobs
-                if (
-                    job_name
-                    not in [
-                        "check-changes",
-                        "pr-test-finish",
-                        "pr-test-h20-finish",
-                        "pr-test-amd-finish",
-                        "pr-test-b200-finish",
-                        "lint",
-                        "Set up job",
-                    ]
-                    and "-amd" not in job_name.lower()
-                    and "mi300" not in job_name.lower()
-                    and "mi325" not in job_name.lower()
-                    and "gfx" not in job_name.lower()
-                    and "-npu" not in job_name.lower()
-                    and "ascend" not in job_name.lower()
-                ):
-                    # Record successful jobs (update last success)
+                target_jobs = [
+                    "check-changes",
+                    "sgl-kernel-build-wheels",
+                    "sgl-kernel-unit-test",
+                    "sgl-kernel-mla-test",
+                    "sgl-kernel-benchmark-test",
+                    "unit-test-frontend",
+                    "unit-test-backend-1-gpu",
+                    "unit-test-backend-2-gpu",
+                    "unit-test-backend-4-gpu",
+                    "unit-test-backend-8-gpu-h200",
+                    "unit-test-backend-8-gpu-h20",
+                    "performance-test-1-gpu-part-1",
+                    "performance-test-1-gpu-part-2",
+                    "performance-test-1-gpu-part-3",
+                    "performance-test-2-gpu",
+                    "accuracy-test-1-gpu",
+                    "accuracy-test-2-gpu",
+                    "unit-test-deepep-4-gpu",
+                    "unit-test-deepep-8-gpu",
+                    "unit-test-backend-8-gpu-deepseek-v32",
+                    "unit-test-backend-4-gpu-b200",
+                    "vllm-dependency-test",
+                    "nightly-test-eval-text-models",
+                    "nightly-test-perf-text-models",
+                    "nightly-test-eval-vlms",
+                    "nightly-test-perf-vlms",
+                    "nightly-test-1-gpu",
+                ]
+
+                if job_name in target_jobs:
                     if job_conclusion == "success":
                         stats["job_last_success"][job_name] = {
                             "url": run_url,
@@ -196,11 +197,9 @@ class SGLangCIAnalyzer:
                             "pr_info": pr_info,
                         }
 
-                    # Record failed jobs
                     elif job_conclusion == "failure":
                         stats["job_failures"][job_name] += 1
 
-                        # Store failure link (keep only last 3 for each job)
                         if len(stats["job_failure_links"][job_name]) < 3:
                             stats["job_failure_links"][job_name].append(
                                 {
@@ -211,7 +210,6 @@ class SGLangCIAnalyzer:
                                 }
                             )
 
-                        # Categorize failed jobs
                         for category, jobs_list in job_categories.items():
                             if any(
                                 job_pattern in job_name for job_pattern in jobs_list
@@ -219,15 +217,13 @@ class SGLangCIAnalyzer:
                                 stats["category_failures"][category] += 1
                                 break
 
-                        # Analyze failure patterns
                         self._analyze_failure_pattern(job, stats)
 
-            time.sleep(0.1)  # Avoid API rate limits
+            time.sleep(0.1)
 
         return stats
 
     def _get_job_details(self, run_id: int) -> List[Dict]:
-        """Get job details for a specific run"""
         url = f"{self.base_url}/repos/{self.repo}/actions/runs/{run_id}/jobs"
         try:
             response = self.session.get(url)
@@ -237,7 +233,6 @@ class SGLangCIAnalyzer:
             return []
 
     def _get_pr_info(self, run: Dict) -> Dict:
-        """Get PR information from a run"""
         pr_info = {
             "pr_number": None,
             "author": run.get("head_commit", {})
@@ -247,7 +242,6 @@ class SGLangCIAnalyzer:
             "head_branch": run.get("head_branch", ""),
         }
 
-        # Try to extract PR number from pull_requests
         pull_requests = run.get("pull_requests", [])
         if pull_requests:
             pr_info["pr_number"] = pull_requests[0].get("number")
@@ -255,7 +249,6 @@ class SGLangCIAnalyzer:
         return pr_info
 
     def _analyze_failure_pattern(self, job: Dict, stats: Dict):
-        """Analyze failure patterns (CUDA jobs only)"""
         job_name = job.get("name", "")
         steps = job.get("steps", [])
 
@@ -263,7 +256,6 @@ class SGLangCIAnalyzer:
             if step.get("conclusion") == "failure":
                 step_name = step.get("name", "")
 
-                # SGLang specific failure pattern recognition (CUDA only)
                 if "timeout" in step_name.lower():
                     stats["failure_patterns"]["Timeout"] += 1
                 elif "build" in step_name.lower() or "build" in job_name.lower():
@@ -296,12 +288,10 @@ class SGLangCIAnalyzer:
                     stats["failure_patterns"]["Other"] += 1
 
     def generate_report(self, stats: Dict):
-        """Generate CI analysis report"""
         print("\n" + "=" * 60)
-        print("SGLang CI Analysis Report (CUDA Only)")
+        print("SGLang CI Analysis Report (Target Workflows Only)")
         print("=" * 60)
 
-        # Overall statistics
         total = stats["total_runs"]
         failed = stats["failed_runs"]
         success = stats["successful_runs"]
@@ -317,7 +307,6 @@ class SGLangCIAnalyzer:
         print(f"  Skipped: {skipped}")
         print(f"  Success rate: {success_rate:.1f}%")
 
-        # Category failure statistics
         if stats["category_failures"]:
             print(f"\nCategory Failure Statistics:")
             for category, count in sorted(
@@ -325,7 +314,6 @@ class SGLangCIAnalyzer:
             ):
                 print(f"  {category}: {count} failures")
 
-        # Most frequently failed jobs with links
         if stats["job_failures"]:
             print(f"\nMost Frequently Failed Jobs (Top 50):")
             for i, (job, count) in enumerate(
@@ -336,7 +324,6 @@ class SGLangCIAnalyzer:
             ):
                 print(f"  {i:2d}. {job}: {count} times")
 
-                # Show last successful run
                 if job in stats["job_last_success"]:
                     last_success = stats["job_last_success"][job]
                     success_date = datetime.fromisoformat(
@@ -356,7 +343,6 @@ class SGLangCIAnalyzer:
                         f"      Last Success: Run #{last_success['run_number']} ({success_date.strftime('%Y-%m-%d %H:%M')}){pr_text}: {last_success['url']}"
                     )
 
-                # Show recent failure links
                 if (
                     job in stats["job_failure_links"]
                     and stats["job_failure_links"][job]
@@ -367,7 +353,6 @@ class SGLangCIAnalyzer:
                             link_info["created_at"].replace("Z", "+00:00")
                         )
 
-                        # Format PR info for failures
                         pr_info = link_info.get("pr_info", {})
                         pr_text = ""
                         if pr_info.get("pr_number"):
@@ -379,7 +364,6 @@ class SGLangCIAnalyzer:
                             f"        - Run #{link_info['run_number']} ({created_at.strftime('%Y-%m-%d %H:%M')}){pr_text}: {link_info['url']}"
                         )
 
-        # Failure pattern analysis
         if stats["failure_patterns"]:
             print(f"\nFailure Pattern Analysis:")
             for pattern, count in sorted(
@@ -390,13 +374,11 @@ class SGLangCIAnalyzer:
         print("\n" + "=" * 60)
 
     def save_detailed_report(self, stats: Dict, output_file: str = "ci_analysis.json"):
-        """Save detailed report to file"""
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
         print(f"\nDetailed report saved to: {output_file}")
 
     def generate_github_summary(self, stats: Dict):
-        """Generate GitHub Actions summary"""
         try:
             github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
             if not github_step_summary:
@@ -406,10 +388,11 @@ class SGLangCIAnalyzer:
             print("📊 Generating GitHub Actions summary for CI Analysis...")
 
             summary_lines = []
-            summary_lines.append("# 🔍 SGLang CI Analysis Report (CUDA Only)")
+            summary_lines.append(
+                "# 🔍 SGLang CI Analysis Report (Target Workflows Only)"
+            )
             summary_lines.append("")
 
-            # Overall statistics
             total = stats["total_runs"]
             failed = stats["failed_runs"]
             success = stats["successful_runs"]
@@ -435,7 +418,6 @@ class SGLangCIAnalyzer:
             summary_lines.append(f"| **Success Rate** | **{success_rate:.1f}%** | - |")
             summary_lines.append("")
 
-            # Category failure statistics
             if stats["category_failures"]:
                 summary_lines.append("## 📁 Category Failure Statistics")
                 summary_lines.append("")
@@ -447,7 +429,6 @@ class SGLangCIAnalyzer:
                     summary_lines.append(f"| {category} | {count} |")
                 summary_lines.append("")
 
-            # Most frequently failed jobs (Top 20)
             if stats["job_failures"]:
                 summary_lines.append("## 🔴 Most Frequently Failed Jobs (Top 20)")
                 summary_lines.append("")
@@ -460,7 +441,6 @@ class SGLangCIAnalyzer:
                     summary_lines.append(f"### {i}. `{job}` ({count} failures)")
                     summary_lines.append("")
 
-                    # Show last successful run
                     if job in stats["job_last_success"]:
                         last_success = stats["job_last_success"][job]
                         success_date = datetime.fromisoformat(
@@ -481,7 +461,6 @@ class SGLangCIAnalyzer:
                         )
                         summary_lines.append("")
 
-                    # Show recent failure links
                     if (
                         job in stats["job_failure_links"]
                         and stats["job_failure_links"][job]
@@ -504,7 +483,6 @@ class SGLangCIAnalyzer:
                             )
                         summary_lines.append("")
 
-            # Failure pattern analysis
             if stats["failure_patterns"]:
                 summary_lines.append("## 🔬 Failure Pattern Analysis")
                 summary_lines.append("")
@@ -516,10 +494,9 @@ class SGLangCIAnalyzer:
                     summary_lines.append(f"| {pattern} | {count} |")
                 summary_lines.append("")
 
-            # Write summary to GitHub Actions
             with open(github_step_summary, "w", encoding="utf-8") as f:
                 f.write("\n".join(summary_lines))
-                f.write("\n\n---\n\n")  # Add separator between reports
+                f.write("\n\n---\n\n")
 
             print("✅ GitHub Actions summary generated successfully")
 
@@ -549,12 +526,9 @@ def main():
 
     args = parser.parse_args()
 
-    # Create analyzer
     analyzer = SGLangCIAnalyzer(args.token)
 
     try:
-        # Get CI run data
-        # Use None for branch if empty string is provided (to scan all branches)
         branch = args.branch if args.branch else None
         runs = analyzer.get_recent_runs(args.limit, branch)
 
@@ -562,16 +536,12 @@ def main():
             print("No CI run data found")
             return
 
-        # Analyze failures
         stats = analyzer.analyze_ci_failures(runs)
 
-        # Generate report
         analyzer.generate_report(stats)
 
-        # Save detailed report
         analyzer.save_detailed_report(stats, args.output)
 
-        # Generate GitHub summary
         analyzer.generate_github_summary(stats)
 
     except Exception as e:

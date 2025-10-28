@@ -4,6 +4,7 @@ import unittest
 
 import torch
 
+from sglang.srt.batch_invariant_ops import batch_invariant_ops
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,6 +17,14 @@ with set_batch_invariant_mode(True):
 
 
 class TestBatchInvariantOps(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        batch_invariant_ops._ENABLE_MM_COMPARISON_TEST = True
+
+    @classmethod
+    def tearDownClass(cls):
+        batch_invariant_ops._ENABLE_MM_COMPARISON_TEST = False
+
     def _test_batch_invariance(self, M, K, N, dtype):
         """
         Test that matrix operations produce identical results for:

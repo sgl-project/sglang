@@ -4,12 +4,13 @@
 
 ### Step 1: Start a docker container.
 
-You can mount a folder for the shared huggingface model weights cache. The command below uses `/tmp/huggingface` as an example.
+**You can mount a folder for the shared huggingface model weights cache. **
+The command below uses `/tmp/huggingface` as an example.
 
 ```
-docker pull nvidia/cuda:12.1.1-devel-ubuntu22.04
+docker pull nvidia/cuda:12.9.1-devel-ubuntu22.04
 # Nvidia
-docker run --shm-size 128g -it -v /tmp/huggingface:/hf_home --gpus all nvidia/cuda:12.1.1-devel-ubuntu22.04 /bin/bash
+docker run --shm-size 128g -it -v /tmp/huggingface:/hf_home --gpus all nvidia/cuda:12.9.1-devel-ubuntu22.04 /bin/bash
 # AMD
 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video --shm-size 128g -it -v /tmp/huggingface:/hf_home lmsysorg/sglang:v0.5.0rc1-rocm630 /bin/bash
 # AMD just the last 2 GPUs
@@ -22,6 +23,7 @@ Run these commands inside the container.
 
 ```
 apt update && apt install -y curl python3-pip git
+pip install upgrade pip
 export RUNNER_ALLOW_RUNASROOT=1
 ```
 

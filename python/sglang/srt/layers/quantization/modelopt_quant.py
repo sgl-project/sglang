@@ -28,7 +28,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
-    is_sm100_supported,
+    is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -49,8 +49,10 @@ if TYPE_CHECKING:
     )
     from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
-if is_cuda():
-    from sgl_kernel import scaled_fp4_quant
+try:
+    from flashinfer import fp4_quantize
+except ImportError:
+    fp4_quantize = None
 
 try:
     from flashinfer import mm_fp4 as fp4_gemm
@@ -867,10 +869,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         output_shape = [x_m, w_n]
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_scale_interleaved = scaled_fp4_quant(x, layer.input_scale_inv)
+        x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
 
         assert x_fp4.dtype == torch.uint8
-        assert x_scale_interleaved.dtype == torch.float8_e4m3fn
         assert layer.weight.dtype == torch.uint8
         assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
         assert layer.alpha.dtype == torch.float32
@@ -903,7 +904,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        if not is_sm100_supported():
+        if not is_blackwell_supported():
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization. Please use Blackwell and"
@@ -1410,7 +1411,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             output_dtype = x.dtype
             x_sf = None
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
-                from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
+                from flashinfer import nvfp4_block_scale_interleave
 
                 # Quantize before comm, swizzle after.
                 if x.shape[0] > 0:
