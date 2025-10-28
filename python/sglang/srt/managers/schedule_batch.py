@@ -909,6 +909,9 @@ class Req:
         self.is_chunked = 0
         self.mamba_pool_idx = None
         self.already_computed = 0
+        self.kv_allocated_len = 0
+        self.kv_committed_len = 0
+        self.kv_freed_len = 0
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
