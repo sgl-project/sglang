@@ -209,6 +209,58 @@ FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = 448.0
 
 
+def cutlass_moe_fp8(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    c: torch.Tensor,
+    m_indices: torch.Tensor,
+) -> None:
+    '''Performs EP MoE computation using CUTLASS-like kernels with per-block-fp8-quant weights and per-token-group-fp8-quant activations. 
+    '''
+    device = a.device
+    num_experts, k_g, n_g = w.shape
+    layout_sfa = torch.zeros((num_experts, 5), device=device, dtype=torch.int32)
+    layout_sfb = torch.zeros((num_experts, 5), device=device, dtype=torch.int32)
+    a_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    b_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    out_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    a_scales_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    b_scales_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    workspace = torch.empty((1024 * 1024 * 1024), device=device, dtype=torch.uint8)
+    a_strides = torch.full((num_experts,), a.stride(0), device=device, dtype=torch.int64)
+    c_strides = torch.full((num_experts,), c.stride(0), device=device, dtype=torch.int64)
+    m_tensor = m_indices[1:] - m_indices[:-1]
+    n_tensor = torch.full_like(m_tensor, fill_value=n_g)
+    k_tensor = torch.full_like(m_tensor, fill_value=k_g)
+    problem_sizes = torch.stack([m_tensor, n_tensor, k_tensor], dim=1)
+    # (E, K, N):(K*N, N, 1) -> (E, N, K):(N*K, 1, N) -> (E, N, K):(N*K, K, 1)
+    # w_scale = w_scale.transpose(1, 2).contiguous()
+    # TODO: a_scale
+    
+    fp8_blockwise_scaled_grouped_mm(
+        c,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        w,
+        a_scale,
+        w_scale,
+        a_strides,
+        a_strides,
+        c_strides,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        m_indices[:-1],
+        workspace,
+    )
+    
+
 def cutlass_moe_fp4(
     a: torch.Tensor,
     a1_gscale: torch.Tensor,
