@@ -83,7 +83,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
  && rm -rf /tmp/local_src
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
+RUN  --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
  && cd sglang \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
@@ -160,7 +160,7 @@ RUN cd /sgl-workspace/nvshmem && \
 
 # Install DeepEP
 # CTK13 requires the cccl include
-RUN cd /sgl-workspace/DeepEP && \
+RUN --mount=type=cache,target=/root/.cache/pip cd /sgl-workspace/DeepEP && \
     case "$CUDA_VERSION" in \
       12.6.1) \
         CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
@@ -180,12 +180,12 @@ RUN cd /sgl-workspace/DeepEP && \
 
 # In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
 # latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
-RUN python3 -m pip install --no-cache-dir --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0"
+RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0"
 
 # For cuda 13, we install triton from source to fix some sm103 issues
 # This can be reverted after >3.4.5 is released
 # See the conversation in: https://github.com/triton-lang/triton/pull/8536
-RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
+RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]; then \
     git clone https://github.com/triton-lang/triton.git && \
     cd triton && \
     git checkout ${TRITON_LANG_COMMIT} && \
@@ -194,7 +194,7 @@ RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
 fi
 
 # Python tools
-RUN python3 -m pip install --no-cache-dir \
+RUN  --mount=type=cache,target=/root/.cache/pip python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
     mooncake-transfer-engine==0.3.6.post1 \
     pre-commit \
@@ -249,7 +249,7 @@ ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
 # Install minimal Python packages
-RUN python3 -m pip install --no-cache-dir --break-system-packages \
+RUN  --mount=type=cache,target=/root/.cache/pip python3 -m pip install --no-cache-dir --break-system-packages \
     pytest \
     black \
     isort \
