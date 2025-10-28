@@ -37,11 +37,16 @@ pub(crate) struct McpLoopConfig {
     /// Maximum iterations as safety limit (internal only, default: 10)
     /// Prevents infinite loops when max_tool_calls is not set
     pub max_iterations: usize,
+    /// Tool context for handling web_search_preview vs regular tools
+    pub tool_context: ToolContext,
 }
 
 impl Default for McpLoopConfig {
     fn default() -> Self {
-        Self { max_iterations: 10 }
+        Self {
+            max_iterations: 10,
+            tool_context: ToolContext::Regular,
+        }
     }
 }
 
@@ -305,7 +310,8 @@ pub(super) fn prepare_mcp_payload_for_streaming(
         // Filter tools based on context
         let filtered_tools: Vec<_> = if tool_context.is_web_search() {
             // Only include tools from web_search_preview server
-            tools.into_iter()
+            tools
+                .into_iter()
                 .filter(|(_, server_name, _)| server_name == "web_search_preview")
                 .collect()
         } else {
@@ -484,6 +490,7 @@ pub(super) fn send_mcp_list_tools_events(
 
 /// Send mcp_call completion events after tool execution
 /// Returns false if client disconnected
+#[allow(clippy::too_many_arguments)]
 pub(super) fn send_mcp_call_completion_events_with_error(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     call: &FunctionCallInProgress,
@@ -610,7 +617,6 @@ pub(super) async fn execute_tool_loop(
     original_body: &ResponsesRequest,
     active_mcp: &Arc<mcp::McpManager>,
     config: &McpLoopConfig,
-    tool_context: ToolContext,
 ) -> Result<Value, String> {
     let mut state = ToolLoopState::new(original_body.input.clone());
 
@@ -691,7 +697,7 @@ pub(super) async fn execute_tool_loop(
                     "max_tool_calls",
                     active_mcp,
                     original_body,
-                    tool_context,
+                    config.tool_context,
                 );
             }
 
@@ -758,15 +764,18 @@ pub(super) async fn execute_tool_loop(
                     let mut insert_pos = 0;
 
                     // Only add mcp_list_tools for non-web-search cases
-                    if !tool_context.is_web_search() {
+                    if !config.tool_context.is_web_search() {
                         let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
                         output_array.insert(0, list_tools_item);
                         insert_pos = 1;
                     }
 
                     // Build mcp_call items (will be web_search_call for web search tools)
-                    let mcp_call_items =
-                        build_executed_mcp_call_items(&state.conversation_history, server_label, tool_context);
+                    let mcp_call_items = build_executed_mcp_call_items(
+                        &state.conversation_history,
+                        server_label,
+                        config.tool_context,
+                    );
 
                     // Insert call items after mcp_list_tools (if present)
                     for item in mcp_call_items {
@@ -855,8 +864,11 @@ pub(super) fn build_incomplete_response(
             }
 
             // Add mcp_call items for executed calls (will be web_search_call for web search)
-            let executed_items =
-                build_executed_mcp_call_items(&state.conversation_history, server_label, tool_context);
+            let executed_items = build_executed_mcp_call_items(
+                &state.conversation_history,
+                server_label,
+                tool_context,
+            );
 
             for item in executed_items {
                 output_array.insert(insert_pos, item);

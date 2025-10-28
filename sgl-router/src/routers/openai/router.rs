@@ -33,9 +33,7 @@ use super::{
         ensure_request_mcp_client, execute_tool_loop, has_web_search_preview_tool,
         is_web_search_mcp_available, prepare_mcp_payload_for_streaming, McpLoopConfig,
     },
-    responses::{
-        mask_tools_as_mcp, patch_streaming_response_json,
-    },
+    responses::{mask_tools_as_mcp, patch_streaming_response_json},
     streaming::handle_streaming_response,
     utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model, ToolContext},
 };
@@ -269,7 +267,10 @@ impl OpenAIRouter {
 
         // If MCP is active, execute tool loop
         if let Some(mcp) = active_mcp {
-            let config = McpLoopConfig::default();
+            let config = McpLoopConfig {
+                tool_context,
+                ..Default::default()
+            };
 
             // Transform MCP tools to function tools
             prepare_mcp_payload_for_streaming(&mut payload, mcp, tool_context);
@@ -282,7 +283,6 @@ impl OpenAIRouter {
                 original_body,
                 mcp,
                 &config,
-                tool_context,
             )
             .await
             {
