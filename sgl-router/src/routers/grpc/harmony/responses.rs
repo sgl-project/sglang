@@ -508,17 +508,19 @@ struct ToolResult {
 
 /// Convert MCP tools to Responses API tool format
 ///
-/// Converts MCP ToolInfo entries to ResponseTool format so the model
+/// Converts MCP Tool entries (from rmcp SDK) to ResponseTool format so the model
 /// knows about available MCP tools when making tool calls.
 ///
 /// # Arguments
 ///
-/// * `mcp_tools` - MCP tools from the MCP manager inventory
+/// * `mcp_tools` - MCP tools from the MCP manager inventory (rmcp::model::Tool)
 ///
 /// # Returns
 ///
-/// Vector of ResponseTool entries in function format
-fn convert_mcp_tools_to_response_tools(mcp_tools: &[crate::mcp::ToolInfo]) -> Vec<ResponseTool> {
+/// Vector of ResponseTool entries in MCP format
+fn convert_mcp_tools_to_response_tools(mcp_tools: &[crate::mcp::Tool]) -> Vec<ResponseTool> {
+    use serde_json::Value;
+
     use crate::protocols::responses::ResponseToolType;
 
     mcp_tools
@@ -526,21 +528,15 @@ fn convert_mcp_tools_to_response_tools(mcp_tools: &[crate::mcp::ToolInfo]) -> Ve
         .map(|tool_info| ResponseTool {
             r#type: ResponseToolType::Mcp,
             function: Some(Function {
-                name: tool_info.name.clone(),
-                description: Some(tool_info.description.clone()),
-                parameters: tool_info.parameters.clone().unwrap_or_else(|| {
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    })
-                }),
+                name: tool_info.name.to_string(),
+                description: tool_info.description.as_ref().map(|d| d.to_string()),
+                parameters: Value::Object((*tool_info.input_schema).clone()),
                 strict: None,
             }),
-            server_url: Some(tool_info.server.clone()),
+            server_url: None, // MCP tools from inventory don't have individual server URLs
             authorization: None,
-            server_label: Some(tool_info.server.clone()),
-            server_description: Some(tool_info.description.clone()),
+            server_label: None,
+            server_description: tool_info.description.as_ref().map(|d| d.to_string()),
             require_approval: None,
             allowed_tools: None,
         })
