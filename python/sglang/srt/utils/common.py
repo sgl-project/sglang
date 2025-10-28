@@ -2362,15 +2362,17 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     # Run server in a background daemon thread with its own event loop
     # This prevents blocking the main thread while still serving health checks
     def run_server():
-        asyncio.run(server.serve())
+        try:
+            asyncio.run(server.serve())
+        except Exception as e:
+            logger.error(f"Dummy health check server failed to start: {e}")
+            raise
+        finally:
+            logger.info(f"Dummy health check server stopped at {host}:{port}")
 
-    thread = threading.Thread(
-        target=run_server, daemon=True, name="health-check-server"
-    )
+    thread = threading.Thread(target=run_server, daemon=True, name="health-check-server")
     thread.start()
-    logger.info(
-        f"Dummy health check server started in background thread at {host}:{port}"
-    )
+    logger.info(f"Dummy health check server started in background thread at {host}:{port}")
 
 
 def create_checksum(directory: str):
