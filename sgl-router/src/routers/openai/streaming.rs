@@ -31,8 +31,8 @@ use super::{
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
     utils::{
-        event_types, web_search_constants, FunctionCallInProgress, OutputIndexMapper,
-        StreamAction, ToolContext,
+        event_types, web_search_constants, FunctionCallInProgress, OutputIndexMapper, StreamAction,
+        ToolContext,
     },
 };
 use crate::{
