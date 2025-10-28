@@ -1,5 +1,7 @@
 // OAuth authentication support for MCP servers
 
+use std::{net::SocketAddr, sync::Arc};
+
 use axum::{
     extract::{Query, State},
     response::Html,
@@ -8,7 +10,6 @@ use axum::{
 };
 use rmcp::transport::auth::OAuthState;
 use serde::Deserialize;
-use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::{oneshot, Mutex};
 
 use crate::mcp::error::{McpError, McpResult};
@@ -93,7 +94,7 @@ impl OAuthHelper {
             .map_err(|e| McpError::Auth(format!("Failed to initialize OAuth: {}", e)))?;
 
         oauth_state
-            .start_authorization(scopes, &self.redirect_uri)
+            .start_authorization(scopes, &self.redirect_uri, None)
             .await
             .map_err(|e| McpError::Auth(format!("Failed to start authorization: {}", e)))?;
 
@@ -110,7 +111,7 @@ impl OAuthHelper {
 
         // Exchange code for token
         oauth_state
-            .handle_callback(&auth_code)
+            .handle_callback(&auth_code, "")
             .await
             .map_err(|e| McpError::Auth(format!("Failed to handle OAuth callback: {}", e)))?;
 

@@ -39,11 +39,13 @@ import triton
 import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 
@@ -75,17 +77,24 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
 
+    DRAFT_EXTEND_V2 = auto()
+
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
     def is_prefill(self):
         return self.is_extend()
 
-    def is_extend(self):
+    def is_extend(self, include_draft_extend_v2: bool = False):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
+            or (
+                self == ForwardMode.DRAFT_EXTEND_V2
+                if include_draft_extend_v2
+                else False
+            )
             or self == ForwardMode.TARGET_VERIFY
         )
 
@@ -104,14 +113,23 @@ class ForwardMode(IntEnum):
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
-    def is_draft_extend(self):
+    def is_draft_extend(self, include_v2: bool = False):
+        if include_v2:
+            return (
+                self == ForwardMode.DRAFT_EXTEND_V2 or self == ForwardMode.DRAFT_EXTEND
+            )
         return self == ForwardMode.DRAFT_EXTEND
+
+    def is_draft_extend_v2(self):
+        # For fixed shape logits output in v2 eagle worker
+        return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.MIXED
+            or self == ForwardMode.SPLIT_PREFILL
         )
 
     def is_cuda_graph(self):
@@ -233,6 +251,8 @@ class ForwardBatch:
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether lse needs to be returned
     mha_return_lse: Optional[bool] = None
+    mha_one_shot_kv_indices: Optional[torch.Tensor] = None
+    mha_one_shot: Optional[bool] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -299,6 +319,9 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For matryoshka embeddings
+    dimensions: Optional[list[int]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -340,6 +363,7 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            dimensions=batch.dimensions,
         )
         device = model_runner.device
 
@@ -393,10 +417,12 @@ class ForwardBatch:
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode():
+        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
+            assert isinstance(batch.extend_seq_lens, list)
+            assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
@@ -553,9 +579,15 @@ class ForwardBatch:
                         device=model_runner.device,
                     )
                 else:
-                    mrope_position_deltas = mm_input.mrope_position_delta.flatten().to(
-                        model_runner.device, non_blocking=True
-                    )
+                    if mm_input.mrope_position_delta.device.type != model_runner.device:
+                        # transfer mrope_position_delta to device when the first running,
+                        # avoiding successvie host-to-device data transfer
+                        mm_input.mrope_position_delta = (
+                            mm_input.mrope_position_delta.to(
+                                model_runner.device, non_blocking=True
+                            )
+                        )
+                    mrope_position_deltas = mm_input.mrope_position_delta.flatten()
                     mrope_positions_list[batch_idx] = (
                         (mrope_position_deltas + self.seq_lens[batch_idx] - 1)
                         .unsqueeze(0)
@@ -679,6 +711,7 @@ class ForwardBatch:
 
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(buffer_len, num_tokens, global_num_tokens)
+        set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size
 
@@ -727,9 +760,8 @@ class ForwardBatch:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
         self.global_num_tokens_cpu = global_num_tokens
-        self.global_num_tokens_gpu = self.global_num_tokens_gpu.new_tensor(
-            global_num_tokens
-        )
+        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
+        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
@@ -844,6 +876,10 @@ class ForwardBatch:
             self.token_to_kv_pool, MLATokenToKVPool
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
+        if not any(self.extend_prefix_lens_cpu):
+            self.num_prefix_chunks = 0
+            return
+
         if self.prefix_chunk_len is not None:
             # Chunked kv cache info already prepared by prior modules
             return
@@ -897,6 +933,34 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
+
+    def fetch_mha_one_shot_kv_indices(self):
+        if self.mha_one_shot_kv_indices is not None:
+            return self.mha_one_shot_kv_indices
+        batch_size = self.batch_size
+        paged_kernel_lens_sum = sum(self.seq_lens_cpu)
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum,
+            dtype=torch.int32,
+            device=self.req_pool_indices.device,
+        )
+        kv_indptr = torch.zeros(
+            batch_size + 1,
+            dtype=torch.int32,
+            device=self.req_pool_indices.device,
+        )
+        kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+        create_flashinfer_kv_indices_triton[(self.batch_size,)](
+            self.req_to_token_pool.req_to_token,
+            self.req_pool_indices,
+            self.seq_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token_pool.req_to_token.shape[1],
+        )
+        self.mha_one_shot_kv_indices = kv_indices
+        return kv_indices
 
 
 def enable_num_token_non_padded(server_args):

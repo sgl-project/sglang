@@ -18,8 +18,8 @@ from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Union
 from uuid import uuid4
 
-from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.utils import ConcurrentCounter
+from sglang.srt.utils.aio_rwlock import RWLock
 
 
 @dataclass(frozen=True)
@@ -205,3 +205,12 @@ class LoRARegistry:
         Returns the total number of LoRA adapters currently registered.
         """
         return len(self._registry)
+
+    def get_all_adapters(self) -> Dict[str, LoRARef]:
+        """
+        Returns a dictionary of all registered LoRA adapters.
+
+        Returns:
+            Dict[str, LoRARef]: A dictionary mapping LoRA names to LoRARef objects.
+        """
+        return dict(self._registry)

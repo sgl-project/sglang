@@ -1,17 +1,7 @@
 // PD (Prefill-Decode) gRPC Router Implementation
 
-use crate::config::types::RetryConfig;
-use crate::core::{ConnectionMode, WorkerRegistry, WorkerType};
-use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest,
-};
-use crate::reasoning_parser::ReasoningParserFactory;
-use crate::routers::RouterTrait;
-use crate::server::AppContext;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ToolParserFactory;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -19,9 +9,28 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use std::sync::Arc;
-
 use tracing::debug;
+
+use super::{context::SharedComponents, pipeline::RequestPipeline};
+use crate::{
+    app_context::AppContext,
+    config::types::RetryConfig,
+    core::{ConnectionMode, WorkerRegistry, WorkerType},
+    policies::PolicyRegistry,
+    protocols::{
+        chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    routers::RouterTrait,
+    tokenizer::traits::Tokenizer,
+    tool_parser::ParserFactory as ToolParserFactory,
+};
 
 /// gRPC PD (Prefill-Decode) router implementation for SGLang
 #[derive(Clone)]
@@ -37,8 +46,8 @@ pub struct GrpcPDRouter {
     retry_config: RetryConfig,
     configured_reasoning_parser: Option<String>,
     configured_tool_parser: Option<String>,
-    pipeline: super::pipeline::ChatCompletionPipeline,
-    shared_components: Arc<super::context::SharedComponents>,
+    pipeline: RequestPipeline,
+    shared_components: Arc<SharedComponents>,
 }
 
 impl GrpcPDRouter {
@@ -66,36 +75,21 @@ impl GrpcPDRouter {
             .clone();
 
         // Create shared components for pipeline
-        let shared_components = Arc::new(super::context::SharedComponents {
+        let shared_components = Arc::new(SharedComponents {
             tokenizer: tokenizer.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
         });
 
-        // Create response processor
-        let processor = super::processing::ResponseProcessor::new(
-            tokenizer.clone(),
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            ctx.configured_tool_parser.clone(),
-            ctx.configured_reasoning_parser.clone(),
-        );
-
-        // Create streaming processor
-        let streaming_processor = Arc::new(super::streaming::StreamingProcessor::new(
-            tokenizer.clone(),
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            ctx.configured_tool_parser.clone(),
-            ctx.configured_reasoning_parser.clone(),
-        ));
-
         // Create PD pipeline
-        let pipeline = super::pipeline::ChatCompletionPipeline::new_pd(
+        let pipeline = RequestPipeline::new_pd(
             worker_registry.clone(),
             policy_registry.clone(),
-            processor,
-            streaming_processor,
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            ctx.configured_tool_parser.clone(),
+            ctx.configured_reasoning_parser.clone(),
         );
 
         Ok(GrpcPDRouter {
@@ -258,6 +252,15 @@ impl RouterTrait for GrpcPDRouter {
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 

@@ -17,6 +17,7 @@ def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
     urls = urls_slow + urls_fast
     ids = ids_slow + ids_fast
     slow_id = ids_slow[0]
+    slow_url = urls_slow[0]
 
     rh = router_manager.start_router(
         worker_urls=urls,
