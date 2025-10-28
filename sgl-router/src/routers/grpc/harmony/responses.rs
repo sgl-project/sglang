@@ -192,12 +192,42 @@ pub async fn serve_harmony_responses(
                     "Tool calls found in commentary channel"
                 );
 
+                // Check if ALL tools exist in MCP inventory before executing
+                // If ANY tool is not found, treat this as a completed response (single turn)
+                let all_tools_available = tool_calls
+                    .iter()
+                    .all(|call| ctx.mcp_manager.get_tool(&call.function.name).is_some());
+
+                if !all_tools_available {
+                    // At least one tool not found - return final response immediately
+                    let unavailable_tools: Vec<_> = tool_calls
+                        .iter()
+                        .filter(|call| ctx.mcp_manager.get_tool(&call.function.name).is_none())
+                        .map(|call| call.function.name.as_str())
+                        .collect();
+
+                    tracing::info!(
+                        unavailable_tools = ?unavailable_tools,
+                        "Tool calls requested but tools not available - returning single-turn response"
+                    );
+
+                    // Build final response with reasoning, partial text, and failed tool calls
+                    // This matches the vLLM/OpenAI behavior: if tools aren't available,
+                    // return what the model generated including tool calls marked as "failed"
+                    return build_final_response_without_tools(
+                        &current_request,
+                        tool_calls,
+                        analysis,
+                        partial_text,
+                    );
+                }
+
                 // TODO: Streaming support - emit intermediate chunks
                 // if let Some(tx) = &ctx.stream_tx {
                 //     emit_intermediate_chunks(tx, &analysis, &partial_text, iteration_count).await?;
                 // }
 
-                // Execute MCP tools via MCP manager
+                // All tools available - execute MCP tools via MCP manager
                 let tool_results = execute_mcp_tools(&ctx.mcp_manager, &tool_calls).await?;
 
                 // Build next request with appended history
@@ -226,6 +256,143 @@ pub async fn serve_harmony_responses(
             }
         }
     }
+}
+
+/// Build final response without executing tools
+///
+/// When tool calls are detected but the tools are not available in MCP,
+/// we return a single-turn response containing:
+/// - Reasoning (if present from analysis channel)
+/// - Message (if present from final channel)
+/// - FunctionToolCall items with status "failed" (tool not available)
+///
+/// This matches the vLLM/OpenAI behavior: if tools aren't available,
+/// return what the model generated including the tool calls, but mark them
+/// as failed without entering the MCP loop.
+///
+/// # Arguments
+///
+/// * `request` - Current Responses API request
+/// * `tool_calls` - Tool calls from commentary channel
+/// * `analysis` - Analysis channel content (reasoning)
+/// * `partial_text` - Final channel content (message text)
+///
+/// # Returns
+///
+/// ResponsesResponse with reasoning, message, and failed tool call output items
+fn build_final_response_without_tools(
+    request: &ResponsesRequest,
+    tool_calls: Vec<crate::protocols::common::ToolCall>,
+    analysis: Option<String>,
+    partial_text: String,
+) -> Result<ResponsesResponse, Response> {
+    use uuid::Uuid;
+
+    use crate::protocols::responses::{
+        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
+        ResponseUsage, ResponsesUsage,
+    };
+
+    let mut output: Vec<ResponseOutputItem> = Vec::new();
+    let response_id = format!("responses-{}", Uuid::new_v4());
+
+    // Add reasoning output if analysis present
+    if let Some(analysis_text) = analysis {
+        output.push(ResponseOutputItem::Reasoning {
+            id: format!("reasoning_{}", response_id),
+            summary: vec![],
+            content: vec![ResponseReasoningContent::ReasoningText {
+                text: analysis_text,
+            }],
+            status: Some("completed".to_string()),
+        });
+    }
+
+    // Add message output if partial text present
+    if !partial_text.is_empty() {
+        output.push(ResponseOutputItem::Message {
+            id: format!("msg_{}", response_id),
+            role: "assistant".to_string(),
+            content: vec![ResponseContentPart::OutputText {
+                text: partial_text,
+                annotations: vec![],
+                logprobs: None,
+            }],
+            status: "completed".to_string(),
+        });
+    }
+
+    // Add tool calls with "failed" status (tools not available in MCP)
+    for tool_call in tool_calls {
+        output.push(ResponseOutputItem::FunctionToolCall {
+            id: tool_call.id,
+            name: tool_call.function.name,
+            arguments: tool_call
+                .function
+                .arguments
+                .unwrap_or_else(|| "{}".to_string()),
+            output: Some(
+                serde_json::json!({
+                    "error": "Tool not available in MCP inventory"
+                })
+                .to_string(),
+            ),
+            status: "failed".to_string(),
+        });
+    }
+
+    // Build ResponsesResponse
+    // Note: We don't have usage info available here since we're in the serving loop
+    // and don't have access to the execution result. This is acceptable as this is
+    // a fallback path for unavailable tools.
+
+    // Serialize tool_choice to string (matching response format)
+    let tool_choice = request
+        .tool_choice
+        .as_ref()
+        .and_then(|tc| serde_json::to_value(tc).ok())
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "auto".to_string());
+
+    // Serialize truncation to string if present
+    let truncation = request
+        .truncation
+        .as_ref()
+        .and_then(|t| serde_json::to_string(t).ok());
+
+    let response = ResponsesResponse {
+        id: response_id,
+        object: "response".to_string(),
+        created_at: chrono::Utc::now().timestamp(),
+        status: ResponseStatus::Completed,
+        error: None,
+        incomplete_details: None,
+        instructions: request.instructions.clone(),
+        max_output_tokens: request.max_output_tokens,
+        model: request.model.clone(),
+        output,
+        parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
+        previous_response_id: request.previous_response_id.clone(),
+        reasoning: None,
+        store: request.store.unwrap_or(false),
+        temperature: request.temperature,
+        text: None, // ResponsesResponse doesn't have text field in request
+        tool_choice,
+        tools: request.tools.clone().unwrap_or_default(),
+        top_p: request.top_p,
+        truncation,
+        user: request.user.clone(),
+        usage: Some(ResponsesUsage::Modern(ResponseUsage {
+            input_tokens: 0,             // Not available in serving loop
+            output_tokens: 0,            // Not available in serving loop
+            total_tokens: 0,             // Not available in serving loop
+            input_tokens_details: None,  // Not available
+            output_tokens_details: None, // Not available
+        })),
+        metadata: request.metadata.clone().unwrap_or_default(),
+    };
+
+    Ok(response)
 }
 
 /// Execute MCP tools and collect results
