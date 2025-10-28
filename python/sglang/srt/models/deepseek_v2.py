@@ -1406,7 +1406,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
             inner_state = self.forward_normal_one_shot_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, attn_inputs, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
             if not self.is_mla_preprocess_enabled:
@@ -2403,13 +2403,13 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_normal_one_shot_prepare(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        attn_inputs: AttentionInputs,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
         forward_batch.mha_one_shot = True
         return self.forward_normal_prepare(
-            positions, hidden_states, forward_batch, zero_allocator
+            positions, attn_inputs, forward_batch, zero_allocator
         )
 
     def forward_normal_one_shot_core(self, q, k, v, forward_batch):
