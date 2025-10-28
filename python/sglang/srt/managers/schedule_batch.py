@@ -694,7 +694,9 @@ class Req:
     def free_committed_kv_cache(self):
         page_size = get_global_server_args().page_size
         if page_size == 1:
-            assert self.kv_freed_len == 0, "Committed KV cache already freed"
+            assert (
+                self.kv_freed_len == 0
+            ), f"Committed KV cache already freed ({self.kv_freed_len=}, {self.kv_committed_len=})"
             self.kv_freed_len = self.kv_committed_len
             return self.kv_committed_len
         else:
