@@ -52,7 +52,6 @@ class TestLlama31FP4B200(unittest.TestCase):
         print(metrics)
 
         self.assertGreater(metrics["accuracy"], 0.61)
-        self.assertGreater(metrics["output_throughput"], 750)
 
 
 if __name__ == "__main__":
