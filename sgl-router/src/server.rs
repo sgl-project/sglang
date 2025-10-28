@@ -803,7 +803,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
     // TODO: engine load checker interval should be configurable
     let _engine_load_checker = app_context.worker_registry.start_engine_load_checker(10);
-    info!("Started health checker for workers with {}s interval", 10);
+    info!("Started engine load checker for workers with {}s interval", 10);
 
     if let Some(ref load_monitor) = app_context.load_monitor {
         load_monitor.start().await;
