@@ -25,7 +25,7 @@ import triton.language as tl
 
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
-    align,
+    ceil_align,
     direct_register_custom_op,
     get_bool_env_var,
     get_device_core_count,
@@ -442,8 +442,8 @@ def create_per_token_group_quant_fp8_output_scale(
         assert column_major_scales and scale_tma_aligned
         *x_batch, x_q_mn, x_q_k = x_shape
         x_s_mn, x_s_k = x_q_mn, x_q_k // 128
-        aligned_mn = align(x_s_mn, 4)
-        aligned_k = align(x_s_k, 4)
+        aligned_mn = ceil_align(x_s_mn, 4)
+        aligned_k = ceil_align(x_s_k, 4)
         # TODO(FIXME): Fix cuda kernel and recover here to empty.
         return torch.empty(
             (*x_batch, aligned_k // 4, aligned_mn),
