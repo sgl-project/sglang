@@ -112,6 +112,9 @@ class SGLangCIAnalyzer:
             "b200": [
                 "unit-test-backend-4-gpu-b200",
             ],
+            "gb200": [
+                "unit-test-backend-4-gpu-gb200",
+            ],
         }
 
         stats = {
@@ -180,6 +183,7 @@ class SGLangCIAnalyzer:
                     "unit-test-deepep-8-gpu",
                     "unit-test-backend-8-gpu-deepseek-v32",
                     "unit-test-backend-4-gpu-b200",
+                    "unit-test-backend-4-gpu-gb200",
                     "vllm-dependency-test",
                     "nightly-test-eval-text-models",
                     "nightly-test-perf-text-models",
