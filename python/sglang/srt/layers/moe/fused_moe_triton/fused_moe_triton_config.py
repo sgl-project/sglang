@@ -50,7 +50,7 @@ def get_moe_configs(
     be picked and the associated configuration chosen to invoke the kernel.
     """
     if get_global_server_args().enable_deterministic_inference:
-        logger.info(
+        logger.warning(
             "Deterministic inference is enabled, using default MoE kernel config."
         )
         return None
