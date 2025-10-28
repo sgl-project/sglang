@@ -16,10 +16,12 @@ use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::utils::{event_types, generate_id};
+use super::utils::event_types;
 use crate::{
     mcp,
-    protocols::responses::{ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
+    protocols::responses::{
+        generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
+    },
     routers::header_utils::apply_request_headers,
 };
 
