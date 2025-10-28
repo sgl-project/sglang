@@ -57,7 +57,7 @@ jobs:
       - name: Build package
         uses: pypa/cibuildwheel@v2.21.3
         env:
-          CIBW_BUILD: "cp38-manylinux_x86_64 cp39-manylinux_x86_64 cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64"
+          CIBW_BUILD: "cp38-manylinux_x86_64 cp39-manylinux_x86_64 cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64"
           CIBW_BEFORE_ALL: |
             yum update -y && yum install -y openssl-devel wget unzip && \
             # Install latest protoc (v32.0) that supports proto3
