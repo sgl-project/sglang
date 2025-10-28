@@ -90,8 +90,9 @@ diffusion = [
 "remote-pdb",
 "torchcodec==0.5.0",
 "openai==2.6.1",
-"st_attn @ file:./sglang/multimodal_gen/csrc/attn/sliding_tile_attn",
-"vsa @ file:./sglang/multimodal_gen/csrc/attn/video_sparse_attn",
+    # we should publish these packages
+"st_attn @ file:./python/sglang/multimodal_gen/csrc/attn/sliding_tile_attn",
+"vsa @ file:./python/sglang/multimodal_gen/csrc/attn/video_sparse_attn",
 ]
 
 test = [

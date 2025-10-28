@@ -11,19 +11,19 @@ It is recommended to use uv for a faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install sgl-diffusion --prerelease=allow
+uv pip install sglang[.diffusion] --prerelease=allow
 ```
 
 ## Method 2: From source
 
 ```bash
 # Use the latest release branch
-git clone -b v0.5.4 https://github.com/sgl-project/sgl-diffusion.git
-cd sgl-diffusion
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
 
 # Install the Python packages
 pip install --upgrade pip
-pip install -e "."
+pip install -e "python/.[diffusion]"
 ```
 
 **Quick fixes for common problems:**
@@ -42,7 +42,7 @@ docker run --gpus all \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<secret>" \
     --ipc=host \
-    lmsysorg/sgl-diffusion:latest \
+    lmsysorg/sglang:diffusion \
     sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
           --use-fsdp-inference \
           --text-encoder-cpu-offload --pin-cpu-memory \

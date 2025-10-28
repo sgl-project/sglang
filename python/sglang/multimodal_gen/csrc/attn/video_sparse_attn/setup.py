@@ -23,24 +23,39 @@ URL = (
     "https://github.com/hao-ai-lab/sgl-diffusion/tree/main/csrc/attn/video_sparse_attn"
 )
 
-# Resolve ThunderKittens root
 _tk_env = os.getenv("THUNDERKITTENS_ROOT", "").strip()
 candidate_tk_roots = [
-    Path(_tk_env) if _tk_env else None,
-    ROOT_DIR / "tk",
+    (ROOT_DIR / "tk"),
     (ROOT_DIR / "../sliding_tile_attn/tk").resolve(),
+    (Path(_tk_env) if _tk_env else None),
 ]
 candidate_tk_roots = [p for p in candidate_tk_roots if p]
 
-tk_root = None
-for cand in candidate_tk_roots:
-    if (cand / "include" / "kittens.cuh").exists():
-        tk_root = str(cand.resolve())
-        break
+def _find_tk_root() -> str | None:
+    for cand in candidate_tk_roots:
+        if (cand / "include" / "kittens.cuh").exists():
+            return str(cand.resolve())
+    return None
+
+tk_root = _find_tk_root()
+if tk_root is None:
+    # Try to initialize submodules if available
+    repo = ROOT_DIR
+    while repo != repo.parent and not (repo / ".git").exists():
+        repo = repo.parent
+    if (repo / ".git").exists():
+        try:
+            subprocess.run(
+                ["git", "submodule", "update", "--init", "--recursive"],
+                cwd=str(repo), check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+        except Exception:
+            pass
+        tk_root = _find_tk_root()
 
 if tk_root is None:
     raise RuntimeError(
-        "ThunderKittens headers not found. Set THUNDERKITTENS_ROOT to the 'tk' directory containing include/kittens.cuh"
+        "ThunderKittens headers not found. Set THUNDERKITTENS_ROOT or ensure tk submodule exists under video_sparse_attn/tk or sliding_tile_attn/tk"
     )
 
 # Python and Torch include paths

@@ -24,9 +24,40 @@ URL = (
 )
 
 # Set environment variables
-tk_root = os.getenv(
-    "THUNDERKITTENS_ROOT", os.path.abspath(os.path.join(os.getcwd(), "tk/"))
-)
+_tk_env = os.getenv("THUNDERKITTENS_ROOT", "").strip()
+candidate_tk_roots = [
+    (ROOT_DIR / "tk"),
+    (ROOT_DIR / "../video_sparse_attn/tk").resolve(),
+    (Path(_tk_env) if _tk_env else None),
+]
+candidate_tk_roots = [p for p in candidate_tk_roots if p]
+
+def _find_tk_root() -> str | None:
+    for cand in candidate_tk_roots:
+        if (cand / "include" / "kittens.cuh").exists():
+            return str(cand.resolve())
+    return None
+
+tk_root = _find_tk_root()
+if tk_root is None:
+    # Try to initialize submodules if available
+    repo = ROOT_DIR
+    while repo != repo.parent and not (repo / ".git").exists():
+        repo = repo.parent
+    if (repo / ".git").exists():
+        try:
+            subprocess.run(
+                ["git", "submodule", "update", "--init", "--recursive"],
+                cwd=str(repo), check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+        except Exception:
+            pass
+        tk_root = _find_tk_root()
+
+if tk_root is None:
+    raise RuntimeError(
+        "ThunderKittens headers not found. Set THUNDERKITTENS_ROOT or ensure tk submodule exists under sliding_tile_attn/tk or video_sparse_attn/tk"
+    )
 python_include = (
     subprocess.check_output(
         ["python", "-c", "import sysconfig; print(sysconfig.get_path('include'))"]
@@ -98,6 +129,7 @@ setup(
             "st_attn_cuda",
             sources=source_files,
             extra_compile_args={"cxx": cpp_flags, "nvcc": cuda_flags},
+            include_dirs=[python_include, f"{tk_root}/include", f"{tk_root}/prototype"],
             libraries=["cuda"],
         )
     ],
