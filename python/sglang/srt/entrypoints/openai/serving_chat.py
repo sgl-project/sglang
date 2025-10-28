@@ -30,7 +30,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
-    UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -542,11 +541,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             request.stream_options
                             and request.stream_options.continuous_usage_stats
                         ):
-                            chunk.usage = UsageInfo(
+                            chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
-                                total_tokens=prompt_tokens.get(index, 0)
-                                + completion_tokens.get(index, 0),
                             )
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
@@ -599,11 +596,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             request.stream_options
                             and request.stream_options.continuous_usage_stats
                         ):
-                            chunk.usage = UsageInfo(
+                            chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
-                                total_tokens=prompt_tokens.get(index, 0)
-                                + completion_tokens.get(index, 0),
                             )
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1088,10 +1083,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.stream_options and request.stream_options.continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
-                chunk.usage = UsageInfo(
+                chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1139,10 +1133,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.stream_options and request.stream_options.continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
-                chunk.usage = UsageInfo(
+                chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
