@@ -75,24 +75,6 @@ impl HarmonyParserAdapter {
         // Extract all completed messages from the parser
         let messages = self.parser.messages();
 
-        // Log all parsed messages for debugging
-        tracing::debug!(message_count = messages.len(), "Parsing Harmony messages");
-        for (idx, msg) in messages.iter().enumerate() {
-            tracing::debug!(
-                idx = idx,
-                role = ?msg.author.role,
-                channel = ?msg.channel,
-                recipient = ?msg.recipient,
-                content_preview = ?msg.content.iter()
-                    .filter_map(|c| match c {
-                        openai_harmony::chat::Content::Text(tc) => Some(tc.text.chars().take(100).collect::<String>()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>(),
-                "Parsed message"
-            );
-        }
-
         // Parse messages into channel outputs
         let mut analysis = None;
         let mut commentary: Option<Vec<ToolCall>> = None;
@@ -101,21 +83,11 @@ impl HarmonyParserAdapter {
         for msg in messages {
             // Filter: Only process assistant messages
             if msg.author.role != Role::Assistant {
-                tracing::debug!(
-                    role = ?msg.author.role,
-                    "Skipping non-assistant message"
-                );
                 continue;
             }
 
             let channel = msg.channel.as_deref().unwrap_or("");
             let recipient = msg.recipient.as_deref();
-
-            tracing::debug!(
-                channel = channel,
-                recipient = ?recipient,
-                "Processing assistant message"
-            );
 
             match channel {
                 "analysis" => {
@@ -246,17 +218,6 @@ impl HarmonyParserAdapter {
         } else {
             finish_reason
         };
-
-        tracing::debug!(
-            has_analysis = analysis.is_some(),
-            analysis_len = analysis.as_ref().map(|s| s.len()).unwrap_or(0),
-            has_commentary = commentary.is_some(),
-            commentary_count = commentary.as_ref().map(|c| c.len()).unwrap_or(0),
-            final_text_len = final_text.len(),
-            final_text_preview = final_text.chars().take(200).collect::<String>(),
-            finish_reason = %final_finish_reason,
-            "Parsed Harmony channel output (parse_complete)"
-        );
 
         Ok(HarmonyChannelOutput {
             analysis,
