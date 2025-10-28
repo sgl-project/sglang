@@ -1575,9 +1575,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if (
-            self.use_deep_gemm_bmm
-        ):
+        if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             )
@@ -3184,9 +3182,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )
 
-            if (
-                not use_deep_gemm_bmm
-            ):
+            if not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
