@@ -131,13 +131,11 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cpu,
     is_cuda,
-    is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
     is_nvidia_cublas_cu12_version_ge_12_9,
-    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -197,8 +195,6 @@ elif _is_npu:
 else:
     pass
 
-_is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and is_sm100_supported()
 _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
 logger = logging.getLogger(__name__)
@@ -1260,7 +1256,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
             and _is_cuda
-            and _device_sm >= 90
+            and 90 <= _device_sm < 120
         )
 
         self.qkv_proj_with_rope_is_int8 = (
