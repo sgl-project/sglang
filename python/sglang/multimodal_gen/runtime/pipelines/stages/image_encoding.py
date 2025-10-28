@@ -15,6 +15,8 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import (
 )
 
 from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
+    QwenImageEditPipelineConfig,
+    QwenImagePipelineConfig,
     _pack_latents,
     qwen_image_postprocess_text,
 )
@@ -151,10 +153,13 @@ class ImageEncodingStage(PipelineStage):
             image, self.vae_image_processor
         )
 
-        if batch.prompt:
+        if batch.prompt and (
+            isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig)
+            or isinstance(server_args.pipeline_config, QwenImagePipelineConfig)
+        ):
+            assert False
             prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
             txt = prompt_template_encode.format(batch.prompt)
-
             image_processor_kwargs = dict(text=[txt], padding=True)
         else:
             image_processor_kwargs = {}

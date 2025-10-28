@@ -181,6 +181,7 @@ class SamplingParams:
         )
 
         sampling_cls = get_sampling_param_cls_for_name(model_path)
+        logger.debug(f"Using pretrained SamplingParam: {sampling_cls}")
         if sampling_cls is not None:
             sampling_params: SamplingParams = sampling_cls(**kwargs)
         else:
