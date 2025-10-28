@@ -167,10 +167,7 @@ pub async fn ensure_request_mcp_client(
 
     // Validate that web_search_preview is not used as it's a reserved name
     if name == web_search_constants::WEB_SEARCH_PREVIEW_SERVER_NAME {
-        warn!(
-            "Rejecting request MCP with reserved server name: {}",
-            name
-        );
+        warn!("Rejecting request MCP with reserved server name: {}", name);
         return None;
     }
 
@@ -547,8 +544,7 @@ pub(super) fn send_mcp_call_completion_events_with_error(
 
     let completed_event = format!(
         "event: {}\ndata: {}\n\n",
-        completed_event_type,
-        completed_payload
+        completed_event_type, completed_payload
     );
     if tx.send(Ok(Bytes::from(completed_event))).is_err() {
         return false;
@@ -1022,9 +1018,10 @@ pub(super) fn build_mcp_call_item(
     // Check if this is a web_search_preview context - if so, build web_search_call format
     if tool_context.is_web_search() {
         // Extract query from arguments for web_search_call
-        let query = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|v| v.get("query").and_then(|q| q.as_str().map(|s| s.to_string())));
+        let query = serde_json::from_str::<Value>(arguments).ok().and_then(|v| {
+            v.get("query")
+                .and_then(|q| q.as_str().map(|s| s.to_string()))
+        });
 
         // Build web_search_call item (MVP - status only, no results)
         if success {

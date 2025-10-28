@@ -659,7 +659,11 @@ pub(super) fn apply_event_transformations_inplace(
                         // Transform ID from fc_* to ws_* or mcp_*
                         if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
                             if let Some(stripped) = id.strip_prefix("fc_") {
-                                let prefix = if tool_context.is_web_search() { "ws" } else { "mcp" };
+                                let prefix = if tool_context.is_web_search() {
+                                    "ws"
+                                } else {
+                                    "mcp"
+                                };
                                 let new_id = format!("{}_{}", prefix, stripped);
                                 item["id"] = json!(new_id);
                             }
@@ -880,16 +884,17 @@ pub(super) fn forward_streaming_event(
                 "event: {}\n",
                 event_types::MCP_CALL_ARGUMENTS_DELTA
             ));
-        } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE && !tool_context.is_web_search() {
+        } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE && !tool_context.is_web_search()
+        {
             final_block.push_str(&format!(
                 "event: {}\n",
                 event_types::MCP_CALL_ARGUMENTS_DONE
             ));
-        } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DELTA && tool_context.is_web_search() {
-            // Skip this event entirely for web_search_preview
-            return true;
-        } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE && tool_context.is_web_search() {
-            // Skip this event entirely for web_search_preview
+        } else if (evt == event_types::FUNCTION_CALL_ARGUMENTS_DELTA
+            || evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE)
+            && tool_context.is_web_search()
+        {
+            // Skip these events entirely for web_search_preview
             return true;
         } else {
             final_block.push_str(&format!("event: {}\n", evt));
@@ -933,8 +938,7 @@ pub(super) fn forward_streaming_event(
 
                     let in_progress_block = format!(
                         "event: {}\ndata: {}\n\n",
-                        in_progress_event_type,
-                        in_progress_event
+                        in_progress_event_type, in_progress_event
                     );
                     if tx.send(Ok(Bytes::from(in_progress_block))).is_err() {
                         return false;
@@ -1367,7 +1371,9 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                             {
                                                 seen_in_progress = true;
                                                 // Skip mcp_list_tools for web_search_preview
-                                                if !mcp_list_tools_sent && !loop_config.tool_context.is_web_search() {
+                                                if !mcp_list_tools_sent
+                                                    && !loop_config.tool_context.is_web_search()
+                                                {
                                                     let list_tools_index =
                                                         handler.allocate_synthetic_output_index();
                                                     if !send_mcp_list_tools_events(
