@@ -5,7 +5,7 @@ from sgl_kernel.elementwise import copy_to_gpu_no_ce
 
 
 @pytest.mark.parametrize("size", [64, 72])
-def test_fused_silu_mul(size):
+def test_copy_to_gpu_no_ce(size):
     tensor_cpu = torch.randint(0, 1000000, (size,), dtype=torch.int32, device="cpu")
     tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
     copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
