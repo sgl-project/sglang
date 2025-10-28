@@ -459,7 +459,7 @@ def create_per_token_group_quant_fp8_output_scale(
                 x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
                 device=device,
                 dtype=torch.float32,
-            ).permute(-1, -2)[: x_shape[-2], :]
+            ).transpose(-1, -2)[: x_shape[-2], :]
         else:
             return torch.empty(
                 (x_shape[-1] // group_size,) + x_shape[:-1],
