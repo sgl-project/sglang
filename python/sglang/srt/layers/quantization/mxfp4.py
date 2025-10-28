@@ -41,7 +41,6 @@ from sglang.srt.utils import (
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
-    next_power_of_2,
     round_up,
     set_weight_attrs,
 )
@@ -262,25 +261,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.prefix = prefix
         self.topk_indices_dtype = None
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
-
-        self.triton_kernel_moe_forward = None
-        self.triton_kernel_moe_with_bias_forward = None
-        if torch.cuda.is_available() and has_triton_kernels:
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_forward as _tk_forward,
-            )
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_with_bias_forward as _tk_with_bias_forward,
-            )
-
-            self.triton_kernel_moe_forward = _tk_forward
-            self.triton_kernel_moe_with_bias_forward = _tk_with_bias_forward
 
     def create_weights(
         self,
@@ -597,35 +583,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
-    def _get_tile_tokens_dim(self, x: torch.Tensor, top_k: int):
-        # Number of tokens in the input tensor.
-        num_tokens = x.shape[0]
-        # Factor to account for the imbalance of the experts.
-        # factor equals to the
-        # max_real_num_tokens_per_expert / perfect_num_tokens_per_expert
-        # - 1.0 means perfect expert distribution.
-        # - > 1.0 means some experts have more
-        #     tokens than the perfect distribution.
-        # - < 1.0 does not make sense.
-        imbalance_factor = 1.3
-        # Calculate the number of tokens per expert
-        # assuming perfect distribution.
-        num_tokens_per_expert = (num_tokens * top_k) // self.num_experts
-        # Apply the imbalance factor.
-        num_tokens_per_expert = int(num_tokens_per_expert * imbalance_factor)
-        # And pad the number to the next power of 2.
-        tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
-        # Cap to 8-64 tokens per CTA tile
-        # as it's the range supported by the kernel.
-        tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-
-        return tile_tokens_dim
-
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        backend = (
+            MoeRunnerBackend.TRITON_KERNELS
+            if self.use_triton_kernels
+            else MoeRunnerBackend.TRITON
+        )
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
         self,
@@ -696,37 +663,37 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
                 None,
-                self._get_tile_tokens_dim(x, top_k),
+                None,  # tile_tokens_dim
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
 
-        if self.use_triton_kernels:
+        backend = self.runner.runner_backend
+        if backend.is_triton_kernels():
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
             assert (
                 layer.moe_ep_size == 1
             ), "Expert parallel is not supported when using triton kernels"
-            if self.with_bias:
-                output = self.triton_kernel_moe_with_bias_forward(
-                    hidden_states=x,
-                    w1=self.w13_weight_triton_tensor,
-                    w1_pcg=self.w13_precision_config,
-                    w2=self.w2_weight_triton_tensor,
-                    w2_pcg=self.w2_precision_config,
-                    b1=layer.w13_weight_bias,
-                    b2=layer.w2_weight_bias,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                )
-            else:
-                output = self.triton_kernel_moe_forward(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                )
-            return StandardCombineInput(hidden_states=output)
+            quant_info = TritonKernelsQuantInfo(
+                w13_weight=(
+                    self.w13_weight_triton_tensor
+                    if self.w13_weight_triton_tensor is not None
+                    else layer.w13_weight
+                ),
+                w2_weight=(
+                    self.w2_weight_triton_tensor
+                    if self.w2_weight_triton_tensor is not None
+                    else layer.w2_weight
+                ),
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+                w13_precision_config=getattr(self, "w13_precision_config", None),
+                w2_precision_config=getattr(self, "w2_precision_config", None),
+            )
         else:
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
@@ -734,7 +701,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
             )
-            return self.runner.run(dispatch_output, quant_info)
+        return self.runner.run(dispatch_output, quant_info)
 
 
 class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):

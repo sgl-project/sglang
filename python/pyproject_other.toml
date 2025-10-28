@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.3.post3"
+version = "0.5.4.post1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -80,7 +80,7 @@ srt_hip = [
   "sglang[runtime_common]",
   "torch",
   "petit_kernel==0.0.2",
-  "wave-lang==3.7.0",
+  "wave-lang==3.8.0",
 ]
 
 # https://docs.sglang.ai/platforms/ascend_npu.html
