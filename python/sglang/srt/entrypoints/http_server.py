@@ -220,9 +220,12 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Init tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-        if server_args.disaggregation_mode == "null":
-            trace_set_thread_info(thread_label)
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill" + thread_label
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode" + thread_label
+        trace_set_thread_info(thread_label)
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
