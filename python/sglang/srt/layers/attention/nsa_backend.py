@@ -1225,8 +1225,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                     # TODO(hlu1): enable MTP
                     is_blackwell()
                     and forward_batch is not None
-                    and forward_batch.forward_mode.is_extend()
-                    and forward_batch.spec_algorithm.is_none()
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
                 ):
                     total_kv_tokens = forward_batch.seq_lens_sum
                     total_q_tokens = forward_batch.extend_num_tokens
