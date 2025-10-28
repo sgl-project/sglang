@@ -237,7 +237,6 @@ impl McpManager {
 
         // Convert args with type coercion based on schema
         let tool_schema = Some(serde_json::Value::Object((*tool_info.input_schema).clone()));
-
         let args_map = args
             .into()
             .into_map(tool_schema.as_ref())
