@@ -1,18 +1,24 @@
 ARG CUDA_VERSION=12.9.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
-ARG TARGETARCH
 
-ARG GRACE_BLACKWELL=0
+ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
+ARG GRACE_BLACKWELL=0
+
+ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
-ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
-ARG CMAKE_BUILD_PARALLEL_LEVEL=2
+
+ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
+
 ARG SGL_KERNEL_VERSION=0.3.16.post4
+ARG GDRCOPY_VERSION=2.5.1
+ARG NVSHMEM_VERSION=3.4.5
+
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
+    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
     NVSHMEM_DIR=/sgl-workspace/nvshmem/install
 # Add GKE default lib and bin locations.
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
@@ -55,7 +61,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
- && git clone https://github.com/NVIDIA/gdrcopy.git -b v2.4.4 \
+ && git clone https://github.com/NVIDIA/gdrcopy.git -b v${GDRCOPY_VERSION} \
  && cd gdrcopy/packages \
  && CUDA=/usr/local/cuda ./build-deb-packages.sh \
  && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb gdrcopy-tests_*.deb gdrcopy_*.deb \
@@ -69,6 +75,7 @@ COPY . /src
 
 FROM base AS build-image
 # Install SGLang
+# Until torch 2.9 and cu13 are stable we manually update torch if you are on CUDA 13
 WORKDIR /sgl-workspace
 ARG BRANCH_TYPE
 COPY --from=local_src /src /tmp/local_src
@@ -84,36 +91,64 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       12.6.1) CUINDEX=126 ;; \
       12.8.1) CUINDEX=128 ;; \
       12.9.1) CUINDEX=129 ;; \
+      13.0.1) CUINDEX=130 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
  && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-     python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
-   fi \
-&& if [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-     python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+   ; \
+   elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
+      python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} \
+   ; \
+   elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+   ; \
+   else \
+      echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+   ; \
    fi \
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
- && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
+ && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+      python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
+    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      python3 -m pip install --no-cache-dir nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+      python3 -m pip uninstall -y torch torchaudio torchvision ; \
+      python3 -m pip install --no-cache-dir torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
+    else \
+      echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
+    fi \
  && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
-
 
 # Download NVSHMEM source files
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    if [ "$GRACE_BLACKWELL" = "1" ]; then \
-      git clone https://github.com/fzyzcjy/DeepEP.git \
-      && cd DeepEP && git checkout 1fd57b0276311d035d16176bb0076426166e52f3 && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
+RUN set -eux; \
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      wget "https://github.com/NVIDIA/nvshmem/releases/download/v${NVSHMEM_VERSION}-0/nvshmem_src_cuda-all-all-${NVSHMEM_VERSION}.tar.gz"; \
+      NVSHMEM_TARBALL="nvshmem_src_cuda-all-all-${NVSHMEM_VERSION}.tar.gz"; \
     else \
-      git clone https://github.com/deepseek-ai/DeepEP.git \
-      && cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
-    fi \
-    && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
-    && mv nvshmem_src nvshmem \
-    && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+      wget "https://developer.download.nvidia.com/compute/redist/nvshmem/${NVSHMEM_VERSION}/source/nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz"; \
+      NVSHMEM_TARBALL="nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz"; \
+    fi && \
+    if [ "$GRACE_BLACKWELL" = "1" ]; then \
+      git clone https://github.com/fzyzcjy/DeepEP.git && \
+      cd DeepEP && \
+      git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
+    else \
+      git clone https://github.com/deepseek-ai/DeepEP.git && \
+      cd DeepEP && \
+      git checkout "${DEEPEP_COMMIT}" && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
+    fi && \
+    tar -xf "${NVSHMEM_TARBALL}" && \
+    mv nvshmem_src nvshmem && \
+    rm -f "/sgl-workspace/${NVSHMEM_TARBALL}"
 
 # Build and install NVSHMEM
 RUN cd /sgl-workspace/nvshmem && \
-    if [ "$GRACE_BLACKWELL" = "1" ]; then CUDA_ARCH="90;100;120"; else CUDA_ARCH="90"; fi && \
+    if [ "$GRACE_BLACKWELL" = "1" ]; then CUDA_ARCH="90;100;103;120"; else CUDA_ARCH="90"; fi && \
     NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
@@ -126,29 +161,50 @@ RUN cd /sgl-workspace/nvshmem && \
     cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
 
 # Install DeepEP
+# CTK13 requires the cccl include
 RUN cd /sgl-workspace/DeepEP && \
     case "$CUDA_VERSION" in \
       12.6.1) \
         CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
         ;; \
-      12.8.1|12.9.1) \
-        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
+      12.8.1|12.9.1|13.0.1) \
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
         ;; \
       *) \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
         ;; \
     esac && \
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
+    fi && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
 
 # Install flashmla
-RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
+RUN if [ "$CUDA_VERSION" != "13.0.1" ]; then \
+    git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
       cd flash-mla && \
       git checkout ${FLASHMLA_COMMIT} && \
       git submodule update --init --recursive && \
       if [ "$CUDA_VERSION" = "12.6.1" ]; then \
         export FLASH_MLA_DISABLE_SM100=1; \
       fi && \
-      pip install --no-build-isolation -v . ;
+      pip install --no-build-isolation -v . ; \
+    fi
+
+# In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
+# latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
+RUN python3 -m pip install --no-cache-dir --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0"
+
+# For cuda 13, we install triton from source to fix some sm103 issues
+# This can be reverted after >3.4.5 is released
+# See the conversation in: https://github.com/triton-lang/triton/pull/8536
+RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
+    git clone https://github.com/triton-lang/triton.git && \
+    cd triton && \
+    git checkout ${TRITON_LANG_COMMIT} && \
+    pip install --break-system-packages -r python/requirements.txt && \
+    MAX_JOBS=20 pip install --break-system-packages -e .; \
+fi
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \

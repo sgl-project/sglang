@@ -11,14 +11,14 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use super::{responses::build_stored_response, utils::generate_id};
+use super::responses::build_stored_response;
 use crate::{
     data_connector::{
         Conversation, ConversationId, ConversationItemId, ConversationItemStorage,
         ConversationStorage, ListParams, NewConversation, NewConversationItem, ResponseId,
         ResponseStorage, SortOrder,
     },
-    protocols::responses::{ResponseInput, ResponsesRequest},
+    protocols::responses::{generate_id, ResponseInput, ResponsesRequest},
 };
 
 /// Maximum number of properties allowed in conversation metadata
