@@ -127,11 +127,40 @@ impl HarmonyBuilder {
     ) -> Result<HarmonyBuildOutput, String> {
         let all_messages = self.construct_input_messages_with_harmony(request)?;
 
+        // Log all input messages being sent to the model
+        tracing::debug!(
+            message_count = all_messages.len(),
+            "Building Harmony conversation from messages"
+        );
+        for (idx, msg) in all_messages.iter().enumerate() {
+            tracing::debug!(
+                idx = idx,
+                role = ?msg.author.role,
+                author_name = ?msg.author.name,
+                channel = ?msg.channel,
+                recipient = ?msg.recipient,
+                content_type = ?msg.content_type,
+                content_preview = ?msg.content.iter()
+                    .filter_map(|c| match c {
+                        openai_harmony::chat::Content::Text(tc) => Some(tc.text.chars().take(150).collect::<String>()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                "Input message to model"
+            );
+        }
+
         let conversation = Conversation::from_messages(all_messages.clone());
         let token_ids = self
             .encoding
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
             .map_err(|e| format!("Failed to encode Harmony conversation: {}", e))?;
+
+        tracing::debug!(
+            token_count = token_ids.len(),
+            token_preview = ?token_ids.iter().take(20).copied().collect::<Vec<_>>(),
+            "Encoded conversation to tokens"
+        );
 
         let selection_text = self.extract_selection_text(&all_messages);
 
