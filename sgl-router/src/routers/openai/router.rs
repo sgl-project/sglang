@@ -2,6 +2,7 @@
 
 use std::{
     any::Any,
+    collections::HashSet,
     sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
@@ -15,6 +16,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::StreamExt;
+use once_cell::sync::Lazy;
 use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -38,8 +40,8 @@ use super::{
 use crate::{
     core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
     data_connector::{
-        ConversationId, ListParams, ResponseId, SharedConversationItemStorage,
-        SharedConversationStorage, SharedResponseStorage, SortOrder,
+        ConversationId, ConversationItemStorage, ConversationStorage, ListParams, ResponseId,
+        ResponseStorage, SortOrder,
     },
     mcp::McpManager,
     protocols::{
@@ -50,8 +52,8 @@ use crate::{
         generate::GenerateRequest,
         rerank::RerankRequest,
         responses::{
-            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
-            ResponsesRequest,
+            generate_id, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
+            ResponsesGetParams, ResponsesRequest,
         },
     },
     routers::header_utils::apply_request_headers,
@@ -60,6 +62,32 @@ use crate::{
 // ============================================================================
 // OpenAIRouter Struct
 // ============================================================================
+
+/// Fields specific to SGLang that should be stripped when forwarding to OpenAI-compatible endpoints
+static SGLANG_FIELDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    HashSet::from([
+        "request_id",
+        "priority",
+        "top_k",
+        "min_p",
+        "min_tokens",
+        "regex",
+        "ebnf",
+        "stop_token_ids",
+        "no_stop_trim",
+        "ignore_eos",
+        "continue_final_message",
+        "skip_special_tokens",
+        "lora_path",
+        "session_params",
+        "separate_reasoning",
+        "stream_reasoning",
+        "chat_template_kwargs",
+        "return_hidden_states",
+        "repetition_penalty",
+        "sampling_seed",
+    ])
+});
 
 /// Cached endpoint information
 #[derive(Clone, Debug)]
@@ -81,11 +109,11 @@ pub struct OpenAIRouter {
     /// Health status
     healthy: AtomicBool,
     /// Response storage for managing conversation history
-    response_storage: SharedResponseStorage,
+    response_storage: Arc<dyn ResponseStorage>,
     /// Conversation storage backend
-    conversation_storage: SharedConversationStorage,
+    conversation_storage: Arc<dyn ConversationStorage>,
     /// Conversation item storage backend
-    conversation_item_storage: SharedConversationItemStorage,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     /// MCP manager (handles both static and dynamic servers)
     mcp_manager: Arc<McpManager>,
 }
@@ -547,29 +575,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         };
         if let Some(obj) = payload.as_object_mut() {
             // Always remove SGLang-specific fields (unsupported by OpenAI)
-            for key in [
-                "top_k",
-                "min_p",
-                "min_tokens",
-                "regex",
-                "ebnf",
-                "stop_token_ids",
-                "no_stop_trim",
-                "ignore_eos",
-                "continue_final_message",
-                "skip_special_tokens",
-                "lora_path",
-                "session_params",
-                "separate_reasoning",
-                "stream_reasoning",
-                "chat_template_kwargs",
-                "return_hidden_states",
-                "repetition_penalty",
-                "sampling_seed",
-            ] {
-                obj.remove(key);
-            }
-
+            obj.retain(|k, _| !SGLANG_FIELDS.contains(&k.as_str()));
             // Remove logprobs if false (Gemini don't accept it)
             if obj.get("logprobs").and_then(|v| v.as_bool()) == Some(false) {
                 obj.remove("logprobs");
@@ -899,30 +905,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         // Remove SGLang-specific fields only
         if let Some(obj) = payload.as_object_mut() {
             // Remove SGLang-specific fields (not part of OpenAI API)
-            for key in [
-                "request_id",
-                "priority",
-                "top_k",
-                "min_p",
-                "min_tokens",
-                "regex",
-                "ebnf",
-                "stop_token_ids",
-                "no_stop_trim",
-                "ignore_eos",
-                "continue_final_message",
-                "skip_special_tokens",
-                "lora_path",
-                "session_params",
-                "separate_reasoning",
-                "stream_reasoning",
-                "chat_template_kwargs",
-                "return_hidden_states",
-                "repetition_penalty",
-                "sampling_seed",
-            ] {
-                obj.remove(key);
-            }
+            obj.retain(|k, _| !SGLANG_FIELDS.contains(&k.as_str()));
             // XAI (Grok models) requires special handling of input items
             // Check if model is a Grok model
             let is_grok_model = obj
@@ -1051,10 +1034,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         if item.get("id").is_none() {
                             // Generate ID if not present using centralized utility
                             if let Some(obj) = item.as_object_mut() {
-                                obj.insert(
-                                    "id".to_string(),
-                                    json!(super::utils::generate_id("msg")),
-                                );
+                                obj.insert("id".to_string(), json!(generate_id("msg")));
                             }
                         }
                         item

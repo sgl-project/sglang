@@ -320,6 +320,9 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For matryoshka embeddings
+    dimensions: Optional[list[int]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -361,6 +364,7 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            dimensions=batch.dimensions,
         )
         device = model_runner.device
 
@@ -576,9 +580,15 @@ class ForwardBatch:
                         device=model_runner.device,
                     )
                 else:
-                    mrope_position_deltas = mm_input.mrope_position_delta.flatten().to(
-                        model_runner.device, non_blocking=True
-                    )
+                    if mm_input.mrope_position_delta.device.type != model_runner.device:
+                        # transfer mrope_position_delta to device when the first running,
+                        # avoiding successvie host-to-device data transfer
+                        mm_input.mrope_position_delta = (
+                            mm_input.mrope_position_delta.to(
+                                model_runner.device, non_blocking=True
+                            )
+                        )
+                    mrope_position_deltas = mm_input.mrope_position_delta.flatten()
                     mrope_positions_list[batch_idx] = (
                         (mrope_position_deltas + self.seq_lens[batch_idx] - 1)
                         .unsqueeze(0)
