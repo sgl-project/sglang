@@ -351,7 +351,7 @@ class ModelRunner:
                 compute_initial_expert_location_metadata(
                     server_args=server_args,
                     model_config=self.model_config,
-                    gpu_id=self.moe_ep_rank,
+                    moe_ep_rank=self.moe_ep_rank,
                 )
             )
             if self.tp_rank == 0 and get_bool_env_var(
