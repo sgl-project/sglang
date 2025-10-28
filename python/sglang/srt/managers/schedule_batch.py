@@ -66,11 +66,15 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
@@ -438,6 +442,8 @@ class Req:
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        dimensions: Optional[int] = None,
+        http_worker_ipc: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -460,6 +466,9 @@ class Req:
 
         # The length of KV that have been removed in local attention chunked prefill
         self.evicted_seqlen_local = 0
+
+        # For multi-http worker
+        self.http_worker_ipc = http_worker_ipc
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -614,6 +623,9 @@ class Req:
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
 
+        # The number of times this request has been retracted / preempted.
+        self.retraction_count = 0
+
         # For metrics
         self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
@@ -641,6 +653,9 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+
+        # For Matryoshka embeddings
+        self.dimensions = dimensions
 
     @property
     def seqlen(self):
@@ -871,6 +886,10 @@ class Req:
             return
 
     def reset_for_retract(self):
+        # Increment retraction count before resetting other state. We should not reset this
+        # since we are tracking the total number of retractions for each request.
+        self.retraction_count += 1
+
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.last_node = None
         self.swa_uuid_for_lock = None
@@ -881,7 +900,6 @@ class Req:
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
-        self.req_pool_idx = None
         self.mamba_pool_idx = None
         self.already_computed = 0
 
@@ -1007,6 +1025,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     encoder_lens_cpu: Optional[List[int]] = None
     encoder_out_cache_loc: Optional[torch.Tensor] = None
 
+    # For matryoshka embeddings
+    dimensions: Optional[list[int]] = None
+
+    # For split prefill
+    split_index: int = 0
+    split_prefill_finished: bool = False
+    split_forward_count: int = 1
+    split_forward_batch: ForwardBatch = None
+    seq_lens_cpu_cache: torch.Tensor = None
+
     # Stream
     has_stream: bool = False
 
@@ -1076,27 +1104,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
-
-    def alloc_req_slots(self, num_reqs: int, reqs: Optional[List[Req]] = None):
-        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
-            mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
-            if mamba_available_size < num_reqs:
-                if self.tree_cache is not None and isinstance(
-                    self.tree_cache, MambaRadixCache
-                ):
-                    mamba_num = max(0, num_reqs - mamba_available_size)
-                    self.tree_cache.evict_mamba(mamba_num)
-            req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
-        else:
-            req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
-        if req_pool_indices is None:
-            raise RuntimeError(
-                "alloc_req_slots runs out of memory. "
-                "Please set a smaller number for `--max-running-requests`. "
-                f"{self.req_to_token_pool.available_size()=}, "
-                f"{num_reqs=}, "
-            )
-        return req_pool_indices
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
@@ -1183,6 +1190,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
+
+        # For matryoshka embeddings
+        if self.model_config.is_matryoshka and any(
+            r.dimensions is not None for r in reqs
+        ):
+            self.dimensions = [
+                r.dimensions if r.dimensions else self.model_config.hidden_size
+                for r in reqs
+            ]
 
         token_type_ids = [
             r.token_type_ids for r in reqs if r.token_type_ids is not None
@@ -1478,7 +1494,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_estimate_ratio = (
             total_decoded_tokens
             + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(self.reqs)
-        ) / total_max_new_tokens
+        ) / (
+            total_max_new_tokens + 1
+        )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio, []
@@ -1770,12 +1788,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
+            dimensions=self.dimensions,
         )
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result
         return ScheduleBatch(
             reqs=self.reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
@@ -1875,6 +1896,9 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
+
+    # For matryoshka embeddings
+    dimensions: Optional[list[int]] = None
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
