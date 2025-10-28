@@ -18,6 +18,8 @@ bash "${SCRIPT_DIR}/../killall_sglang.sh"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
 if command -v python3 &> /dev/null; then
+    echo "python3 is OK"
+else
     # Sometimes python3 is missing, link python to python3.
     PYTHON_PATH=`which python`
     ln -s $PYTHON_PATH ${PYTHON_PATH}3
