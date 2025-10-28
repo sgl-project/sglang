@@ -826,7 +826,7 @@ def get_rotary_pos_embed(
             # pop least-recently-used
             _ND_ROPE_CACHE.pop(next(iter(_ND_ROPE_CACHE)))
 
-    freqs_cos, freqs_sin = rope_emb.forward(
+    freqs_cos, freqs_sin = rope_emb.forward_from_grid(
         grid_size=_to_tuple(rope_sizes, dim=3),
         shard_dim=shard_dim,
         start_frame=start_frame,
