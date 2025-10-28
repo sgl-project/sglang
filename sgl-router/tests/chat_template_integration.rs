@@ -1,7 +1,12 @@
-use sglang_router_rs::protocols::spec;
-use sglang_router_rs::tokenizer::chat_template::{
-    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
-    ChatTemplateProcessor,
+use sglang_router_rs::{
+    protocols::{
+        chat::{ChatMessage, UserMessageContent},
+        common::{ContentPart, ImageUrl},
+    },
+    tokenizer::chat_template::{
+        detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
+        ChatTemplateProcessor,
+    },
 };
 
 #[test]
@@ -17,9 +22,8 @@ fn test_simple_chat_template() {
 
     let processor = ChatTemplateProcessor::new(template.to_string());
 
-    let messages = [spec::ChatMessage::User {
-        role: "user".to_string(),
-        content: spec::UserMessageContent::Text("Test".to_string()),
+    let messages = [ChatMessage::User {
+        content: UserMessageContent::Text("Test".to_string()),
         name: None,
     }];
 
@@ -52,9 +56,8 @@ fn test_chat_template_with_tokens() {
 
     let processor = ChatTemplateProcessor::new(template.to_string());
 
-    let messages = [spec::ChatMessage::User {
-        role: "user".to_string(),
-        content: spec::UserMessageContent::Text("Test".to_string()),
+    let messages = [ChatMessage::User {
+        content: UserMessageContent::Text("Test".to_string()),
         name: None,
     }];
 
@@ -89,7 +92,6 @@ fn test_chat_template_with_tokens() {
 
 #[test]
 fn test_llama_style_template() {
-    // Test a Llama-style chat template
     let template = r#"
 {%- if messages[0]['role'] == 'system' -%}
     {%- set system_message = messages[0]['content'] -%}
@@ -114,15 +116,13 @@ fn test_llama_style_template() {
 
     let processor = ChatTemplateProcessor::new(template.to_string());
 
-    let messages = vec![
-        spec::ChatMessage::System {
-            role: "system".to_string(),
+    let messages = [
+        ChatMessage::System {
             content: "You are a helpful assistant".to_string(),
             name: None,
         },
-        spec::ChatMessage::User {
-            role: "user".to_string(),
-            content: spec::UserMessageContent::Text("What is 2+2?".to_string()),
+        ChatMessage::User {
+            content: UserMessageContent::Text("What is 2+2?".to_string()),
             name: None,
         },
     ];
@@ -160,7 +160,6 @@ fn test_llama_style_template() {
 
 #[test]
 fn test_chatml_template() {
-    // Test a ChatML-style template
     let template = r#"
 {%- for message in messages %}
     {{- '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n' }}
@@ -173,22 +172,18 @@ fn test_chatml_template() {
     let processor = ChatTemplateProcessor::new(template.to_string());
 
     let messages = vec![
-        spec::ChatMessage::User {
-            role: "user".to_string(),
-            content: spec::UserMessageContent::Text("Hello".to_string()),
+        ChatMessage::User {
+            content: UserMessageContent::Text("Hello".to_string()),
             name: None,
         },
-        spec::ChatMessage::Assistant {
-            role: "assistant".to_string(),
+        ChatMessage::Assistant {
             content: Some("Hi there!".to_string()),
             name: None,
             tool_calls: None,
-            function_call: None,
             reasoning_content: None,
         },
-        spec::ChatMessage::User {
-            role: "user".to_string(),
-            content: spec::UserMessageContent::Text("How are you?".to_string()),
+        ChatMessage::User {
+            content: UserMessageContent::Text("How are you?".to_string()),
             name: None,
         },
     ];
@@ -229,9 +224,8 @@ assistant:
 
     let processor = ChatTemplateProcessor::new(template.to_string());
 
-    let messages = [spec::ChatMessage::User {
-        role: "user".to_string(),
-        content: spec::UserMessageContent::Text("Test".to_string()),
+    let messages = [ChatMessage::User {
+        content: UserMessageContent::Text("Test".to_string()),
         name: None,
     }];
 
@@ -241,13 +235,11 @@ assistant:
         .map(|msg| serde_json::to_value(msg).unwrap())
         .collect();
 
-    // Test without generation prompt
     let result = processor
         .apply_chat_template(&json_messages, ChatTemplateParams::default())
         .unwrap();
     assert_eq!(result.trim(), "user: Test");
 
-    // Test with generation prompt
     let result_with_prompt = processor
         .apply_chat_template(
             &json_messages,
@@ -275,7 +267,6 @@ fn test_empty_messages_template() {
 
 #[test]
 fn test_content_format_detection() {
-    // Test string format detection
     let string_template = r#"
 {%- for message in messages -%}
 {{ message.role }}: {{ message.content }}
@@ -286,7 +277,6 @@ fn test_content_format_detection() {
         ChatTemplateContentFormat::String
     );
 
-    // Test OpenAI format detection
     let openai_template = r#"
 {%- for message in messages -%}
   {%- for content in message.content -%}
@@ -302,7 +292,6 @@ fn test_content_format_detection() {
 
 #[test]
 fn test_template_with_multimodal_content() {
-    // Test that multimodal messages work correctly when serialized to JSON
     let template = r#"
 {%- for message in messages %}
 {{ message.role }}:
@@ -322,14 +311,13 @@ fn test_template_with_multimodal_content() {
 
     let processor = ChatTemplateProcessor::new(template.to_string());
 
-    let messages = [spec::ChatMessage::User {
-        role: "user".to_string(),
-        content: spec::UserMessageContent::Parts(vec![
-            spec::ContentPart::Text {
+    let messages = [ChatMessage::User {
+        content: UserMessageContent::Parts(vec![
+            ContentPart::Text {
                 text: "Look at this:".to_string(),
             },
-            spec::ContentPart::ImageUrl {
-                image_url: spec::ImageUrl {
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
                     url: "https://example.com/image.jpg".to_string(),
                     detail: None,
                 },
