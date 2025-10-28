@@ -764,7 +764,7 @@ class LoRAUpdateTestSessionBase:
         max_lora_rank: Optional[int],
         enable_lora: Optional[bool] = None,
         lora_target_modules: Optional[List[str]] = None,
-        lora_backend: str = "triton",
+        lora_backend: str = "csgmv",
         disable_cuda_graph: bool = False,
         cuda_graph_max_bs: int = 4,
     ):

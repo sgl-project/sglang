@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.4"
+version = "0.5.4.post1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,7 +38,7 @@ dependencies = [
   "numpy",
   "nvidia-cutlass-dsl==4.2.1",
   "openai-harmony==0.0.4",
-  "openai==1.99.1",
+  "openai==2.6.1",
   "orjson",
   "outlines==0.1.11",
   "packaging",
@@ -56,7 +56,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.16.post3",
+  "sgl-kernel==0.3.16.post4",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
@@ -81,7 +81,6 @@ modelopt = ["nvidia-modelopt"]
 test = [
   "accelerate",
   "expecttest",
-  "gguf",
   "jsonlines",
   "matplotlib",
   "pandas",
