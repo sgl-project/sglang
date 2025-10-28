@@ -44,8 +44,11 @@ use serde_json::Value as JsonValue;
 use crate::{
     mcp::McpManager,
     protocols::{
-        common::ToolCall,
-        responses::{ResponseInput, ResponsesRequest, ResponsesResponse, StringOrContentParts},
+        common::{Function, ToolCall},
+        responses::{
+            ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse,
+            StringOrContentParts,
+        },
     },
     routers::grpc::{
         context::SharedComponents, harmony::processor::ResponsesIterationResult,
@@ -150,6 +153,22 @@ pub async fn serve_harmony_responses(
     let mut current_request = request;
     let mut iteration_count = 0;
 
+    // Get MCP tools and add to request (do this once before loop)
+    // This ensures the model knows about available MCP tools
+    let mcp_tools = ctx.mcp_manager.list_tools();
+    let mcp_response_tools = convert_mcp_tools_to_response_tools(&mcp_tools);
+
+    // Merge with user-provided tools
+    let mut all_tools = current_request.tools.clone().unwrap_or_default();
+    all_tools.extend(mcp_response_tools);
+    current_request.tools = Some(all_tools);
+
+    tracing::debug!(
+        mcp_tool_count = mcp_tools.len(),
+        total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+        "Added MCP tools to Harmony Responses request"
+    );
+
     loop {
         iteration_count += 1;
 
@@ -219,7 +238,8 @@ pub async fn serve_harmony_responses(
                         tool_calls,
                         analysis,
                         partial_text,
-                    );
+                    )
+                    .map_err(|e| *e);
                 }
 
                 // TODO: Streaming support - emit intermediate chunks
@@ -282,10 +302,10 @@ pub async fn serve_harmony_responses(
 /// ResponsesResponse with reasoning, message, and failed tool call output items
 fn build_final_response_without_tools(
     request: &ResponsesRequest,
-    tool_calls: Vec<crate::protocols::common::ToolCall>,
+    tool_calls: Vec<ToolCall>,
     analysis: Option<String>,
     partial_text: String,
-) -> Result<ResponsesResponse, Response> {
+) -> Result<ResponsesResponse, Box<Response>> {
     use uuid::Uuid;
 
     use crate::protocols::responses::{
@@ -628,6 +648,45 @@ struct ToolResult {
 
     /// Whether this is an error result
     is_error: bool,
+}
+
+/// Convert MCP tools to Responses API tool format
+///
+/// Converts MCP ToolInfo entries to ResponseTool format so the model
+/// knows about available MCP tools when making tool calls.
+///
+/// # Arguments
+///
+/// * `mcp_tools` - MCP tools from the MCP manager inventory
+///
+/// # Returns
+///
+/// Vector of ResponseTool entries in function format
+fn convert_mcp_tools_to_response_tools(mcp_tools: &[crate::mcp::ToolInfo]) -> Vec<ResponseTool> {
+    mcp_tools
+        .iter()
+        .map(|tool_info| ResponseTool {
+            r#type: ResponseToolType::Function,
+            function: Some(Function {
+                name: tool_info.name.clone(),
+                description: Some(tool_info.description.clone()),
+                parameters: tool_info.parameters.clone().unwrap_or_else(|| {
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    })
+                }),
+                strict: None,
+            }),
+            server_url: Some(tool_info.server.clone()),
+            authorization: None,
+            server_label: None,
+            server_description: Some(tool_info.description.clone()),
+            require_approval: None,
+            allowed_tools: None,
+        })
+        .collect()
 }
 
 // TODO: Implement streaming support
