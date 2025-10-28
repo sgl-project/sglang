@@ -75,6 +75,29 @@ class TestXaiBackend(StateManagementTests):
         kill_process_tree(cls.cluster["router"].pid)
 
 
+class TestOracleStore(ResponseCRUDBaseTest, ConversationCRUDBaseTest):
+    """End to end tests for Oracle database storage backend."""
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "gpt-5-nano"
+        cls.base_url_port = "http://127.0.0.1:30040"
+
+        cls.cluster = popen_launch_openai_xai_router(
+            backend="openai",
+            base_url=cls.base_url_port,
+            history_backend="oracle",
+        )
+
+        cls.base_url = cls.cluster["base_url"]
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.cluster["router"].pid)
+
+
 class TestGrpcBackend(StateManagementTests, MCPTests):
     """End to end tests for gRPC backend."""
 
