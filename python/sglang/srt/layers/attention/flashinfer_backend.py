@@ -26,8 +26,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
+    is_blackwell_supported,
     is_flashinfer_available,
-    is_sm100_supported,
     next_power_of_2,
 )
 
@@ -194,7 +194,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         if init_new_workspace:
             self.workspace_buffer = torch.empty(
-                global_config.flashinfer_workspace_size,
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
@@ -229,8 +229,17 @@ class FlashInferAttnBackend(AttentionBackend):
             ]
 
         fmha_backend = "auto"
-        if is_sm100_supported():
-            fmha_backend = "cutlass"
+        if is_blackwell_supported():
+            # Disable CUTLASS backend when piecewise cuda graph is enabled
+            # due to TMA descriptor initialization issues on B200
+            if model_runner.server_args.enable_piecewise_cuda_graph:
+                logger.warning(
+                    "CUTLASS backend is disabled when piecewise cuda graph is enabled "
+                    "due to TMA descriptor initialization issues on B200. "
+                    "Using auto backend instead for stability."
+                )
+            else:
+                fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )

@@ -130,6 +130,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             rid=request.rid,
             priority=request.priority,
             custom_request_attributes=custom_request_attributes,
+            dimensions=request.dimensions,
         )
 
         return adapted_request, request
