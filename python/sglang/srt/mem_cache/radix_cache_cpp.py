@@ -154,16 +154,16 @@ class RadixCacheCpp(BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
-        allocated_len = req.pop_to_free_kv_cache()
-        token_ids = (req.origin_input_ids + req.output_ids)[:allocated_len]
+        kv_committed_len = req.free_committed_kv_cache()
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :allocated_len
+            req.req_pool_idx, :kv_committed_len
         ]
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        page_aligned_overall_len = allocated_len // self.page_size * self.page_size
+        page_aligned_overall_len = kv_committed_len // self.page_size * self.page_size
 
         if is_insert:
             new_prefix_len = self._insert(
@@ -180,7 +180,7 @@ class RadixCacheCpp(BasePrefixCache):
             )
 
         # need to free the unaligned part, since it cannot be inserted into the radix tree
-        if page_aligned_overall_len < allocated_len:
+        if page_aligned_overall_len < kv_committed_len:
             # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
             self.token_to_kv_pool.free(kv_indices[page_aligned_overall_len:])
 

@@ -52,10 +52,10 @@ class ChunkCache(BasePrefixCache):
         )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
-        allocated_len = req.pop_to_free_kv_cache()
+        kv_committed_len = req.free_committed_kv_cache()
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :allocated_len
+            req.req_pool_idx, :kv_committed_len
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)

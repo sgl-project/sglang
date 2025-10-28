@@ -678,11 +678,10 @@ class Req:
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
-    def pop_to_free_kv_cache(self):
-        # We assume we only free all allocated kv cache at once
-        assert self.kv_freed_len == 0
-        self.kv_freed_len = self.kv_allocated_len
-        return self.kv_allocated_len
+    def free_committed_kv_cache(self):
+        assert self.kv_freed_len == 0, "Committed KV cache already freed"
+        self.kv_freed_len = self.kv_committed_len
+        return self.kv_committed_len
 
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:

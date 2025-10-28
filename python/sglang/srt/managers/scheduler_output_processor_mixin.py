@@ -295,11 +295,18 @@ class SchedulerOutputProcessorMixin:
                     start_p = end_p - EagleDraftInput.ALLOC_LEN_PER_DECODE
                     if self.page_size > 1:
                         start_p = ceil_div(start_p, self.page_size) * self.page_size
-
-                    indices_to_free = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx
-                    ][start_p:end_p]
-
+                        indices_to_free = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx
+                        ][start_p:end_p]
+                    else:
+                        assert (
+                            req.kv_committed_len == req.kv_freed_len
+                        ), f"{req.kv_committed_len=}, {req.kv_freed_len=}"
+                        start_p = req.kv_freed_len
+                        end_p = req.kv_allocated_len
+                        indices_to_free = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx
+                        ][start_p:end_p]
                 else:
                     if self.page_size == 1:
                         # Free the one extra delayed token
@@ -340,11 +347,12 @@ class SchedulerOutputProcessorMixin:
 
                     if self.page_size > 1:
                         start_p = ceil_div(start_p, self.page_size) * self.page_size
-
-                    indices_to_free = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx
-                    ][start_p:end_p]
-                    self.token_to_kv_pool_allocator.free(indices_to_free)
+                        indices_to_free = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx
+                        ][start_p:end_p]
+                        self.token_to_kv_pool_allocator.free(indices_to_free)
+                    else:
+                        pass
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; cache_finished_req will be called after Device->Host transfer completes

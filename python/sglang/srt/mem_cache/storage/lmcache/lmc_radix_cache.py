@@ -224,10 +224,10 @@ class LMCRadixCache(RadixCache):
         if not is_insert:
             return
 
-        allocated_len = req.pop_to_free_kv_cache()
-        token_ids = (req.origin_input_ids + req.output_ids)[:allocated_len]
+        kv_committed_len = req.free_committed_kv_cache()
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :allocated_len
+            req.req_pool_idx, :kv_committed_len
         ]
 
         _, new_last_node, _, _ = self.match_prefix(RadixKey(token_ids, req.extra_key))
