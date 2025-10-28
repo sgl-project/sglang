@@ -29,7 +29,10 @@ use super::{
         inject_mcp_metadata_streaming, prepare_mcp_payload_for_streaming,
         send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
     },
-    responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
+    responses::{
+        mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block,
+        transform_web_search_output_items,
+    },
     utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
 };
 use crate::{
@@ -928,6 +931,7 @@ pub(super) fn send_final_response_event(
         inject_mcp_metadata_streaming(&mut final_response, state, mcp, server_label);
     }
 
+    transform_web_search_output_items(&mut final_response);
     mask_tools_as_mcp(&mut final_response, original_request);
     patch_streaming_response_json(&mut final_response, original_request, previous_response_id);
 
@@ -1137,9 +1141,10 @@ pub(super) async fn handle_streaming_with_tool_interception(
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<String>,
     active_mcp: &Arc<crate::mcp::McpManager>,
+    is_web_search: bool,
 ) -> Response {
     // Transform MCP tools to function tools in payload
-    prepare_mcp_payload_for_streaming(&mut payload, active_mcp);
+    prepare_mcp_payload_for_streaming(&mut payload, active_mcp, is_web_search);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
     let should_store = original_body.store.unwrap_or(false);
@@ -1384,6 +1389,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                         server_label,
                     );
 
+                    transform_web_search_output_items(&mut response_json);
                     mask_tools_as_mcp(&mut response_json, &original_request);
                     patch_streaming_response_json(
                         &mut response_json,
@@ -1498,6 +1504,7 @@ pub(super) async fn handle_streaming_response(
     payload: Value,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<String>,
+    is_web_search: bool,
 ) -> Response {
     // Check if MCP is active for this request
     // Ensure dynamic client is created if needed
@@ -1545,6 +1552,7 @@ pub(super) async fn handle_streaming_response(
         original_body,
         original_previous_response_id,
         active_mcp,
+        is_web_search,
     )
     .await
 }

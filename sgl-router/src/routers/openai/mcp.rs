@@ -275,6 +275,7 @@ pub(super) async fn execute_streaming_tool_calls(
 pub(super) fn prepare_mcp_payload_for_streaming(
     payload: &mut Value,
     active_mcp: &Arc<mcp::McpManager>,
+    is_web_search: bool,
 ) {
     if let Some(obj) = payload.as_object_mut() {
         // Remove any non-function tools from outgoing payload
@@ -289,10 +290,21 @@ pub(super) fn prepare_mcp_payload_for_streaming(
             }
         }
 
-        // Build function tools for all discovered MCP tools
+        // Build function tools for discovered MCP tools
         let mut tools_json = Vec::new();
         let tools = active_mcp.list_tools();
-        for t in tools {
+
+        // Filter tools based on context
+        let filtered_tools: Vec<_> = if is_web_search {
+            // Only include tools from web_search_preview server
+            tools.into_iter()
+                .filter(|t| t.server == "web_search_preview")
+                .collect()
+        } else {
+            tools
+        };
+
+        for t in filtered_tools {
             let parameters = t.parameters.clone().unwrap_or(serde_json::json!({
                 "type": "object",
                 "properties": {},

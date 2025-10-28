@@ -269,43 +269,87 @@ pub(super) fn rewrite_streaming_block(
     Some(rebuilt_lines.join("\n"))
 }
 
+/// Transform mcp_call items to web_search_call items if web_search_preview was used
+pub(super) fn transform_web_search_output_items(response: &mut Value) {
+    if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
+        for item in output_array.iter_mut() {
+            if item.get("type").and_then(|t| t.as_str()) == Some("mcp_call") {
+                // Check if this mcp_call is from web_search_preview server
+                let server_label = item.get("server_label").and_then(|s| s.as_str());
+
+                if server_label == Some("web_search_preview") {
+                    // Transform to web_search_call (minimal, status only)
+                    let ws_item = crate::routers::openai::web_search::mcp_call_to_web_search_call(item);
+                    *item = ws_item;
+                }
+            }
+        }
+    }
+}
+
 /// Mask function tools as MCP tools in response for client
 pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
+    // Check for MCP tool
     let mcp_tool = original_body.tools.as_ref().and_then(|tools| {
         tools
             .iter()
             .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())
     });
-    let Some(t) = mcp_tool else {
-        return;
-    };
 
-    let mut m = serde_json::Map::new();
-    m.insert("type".to_string(), Value::String("mcp".to_string()));
-    if let Some(label) = &t.server_label {
-        m.insert("server_label".to_string(), Value::String(label.clone()));
+    // Check for web_search_preview tool
+    let has_web_search = original_body
+        .tools
+        .as_ref()
+        .map(|tools| crate::routers::openai::web_search::has_web_search_preview_tool(tools))
+        .unwrap_or(false);
+
+    // If neither MCP nor web_search_preview, return early
+    if mcp_tool.is_none() && !has_web_search {
+        return;
     }
-    if let Some(url) = &t.server_url {
-        m.insert("server_url".to_string(), Value::String(url.clone()));
+
+    let mut response_tools = Vec::new();
+
+    // Add MCP tool if present
+    if let Some(t) = mcp_tool {
+        let mut m = serde_json::Map::new();
+        m.insert("type".to_string(), Value::String("mcp".to_string()));
+        if let Some(label) = &t.server_label {
+            m.insert("server_label".to_string(), Value::String(label.clone()));
+        }
+        if let Some(url) = &t.server_url {
+            m.insert("server_url".to_string(), Value::String(url.clone()));
+        }
+        if let Some(desc) = &t.server_description {
+            m.insert(
+                "server_description".to_string(),
+                Value::String(desc.clone()),
+            );
+        }
+        if let Some(req) = &t.require_approval {
+            m.insert("require_approval".to_string(), Value::String(req.clone()));
+        }
+        if let Some(allowed) = &t.allowed_tools {
+            m.insert(
+                "allowed_tools".to_string(),
+                Value::Array(allowed.iter().map(|s| Value::String(s.clone())).collect()),
+            );
+        }
+        response_tools.push(Value::Object(m));
     }
-    if let Some(desc) = &t.server_description {
-        m.insert(
-            "server_description".to_string(),
-            Value::String(desc.clone()),
+
+    // Add web_search_preview tool if present
+    if has_web_search {
+        let mut ws = serde_json::Map::new();
+        ws.insert(
+            "type".to_string(),
+            Value::String("web_search_preview".to_string()),
         );
-    }
-    if let Some(req) = &t.require_approval {
-        m.insert("require_approval".to_string(), Value::String(req.clone()));
-    }
-    if let Some(allowed) = &t.allowed_tools {
-        m.insert(
-            "allowed_tools".to_string(),
-            Value::Array(allowed.iter().map(|s| Value::String(s.clone())).collect()),
-        );
+        response_tools.push(Value::Object(ws));
     }
 
     if let Some(obj) = resp.as_object_mut() {
-        obj.insert("tools".to_string(), Value::Array(vec![Value::Object(m)]));
+        obj.insert("tools".to_string(), Value::Array(response_tools));
         obj.entry("tool_choice")
             .or_insert(Value::String("auto".to_string()));
     }

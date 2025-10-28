@@ -33,7 +33,9 @@ use super::{
         ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
         McpLoopConfig,
     },
-    responses::{mask_tools_as_mcp, patch_streaming_response_json},
+    responses::{
+        mask_tools_as_mcp, patch_streaming_response_json, transform_web_search_output_items,
+    },
     streaming::handle_streaming_response,
     utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model},
 };
@@ -248,6 +250,7 @@ impl OpenAIRouter {
         mut payload: Value,
         original_body: &ResponsesRequest,
         original_previous_response_id: Option<String>,
+        is_web_search: bool,
     ) -> Response {
         // Check if MCP is active for this request
         // Ensure dynamic client is created if needed
@@ -269,7 +272,7 @@ impl OpenAIRouter {
             let config = McpLoopConfig::default();
 
             // Transform MCP tools to function tools
-            prepare_mcp_payload_for_streaming(&mut payload, mcp);
+            prepare_mcp_payload_for_streaming(&mut payload, mcp, is_web_search);
 
             match execute_tool_loop(
                 &self.client,
@@ -341,6 +344,7 @@ impl OpenAIRouter {
         }
 
         // Patch response with metadata
+        transform_web_search_output_items(&mut response_json);
         mask_tools_as_mcp(&mut response_json, original_body);
         patch_streaming_response_json(
             &mut response_json,
@@ -695,6 +699,33 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
         let url = format!("{}/v1/responses", base_url);
 
+        // Detect web_search_preview tool and verify MCP server availability
+        let has_web_search = if let Some(ref tools) = body.tools {
+            crate::routers::openai::web_search::has_web_search_preview_tool(tools)
+        } else {
+            false
+        };
+
+        if has_web_search {
+            // Check if web_search_preview MCP server is available
+            if !crate::routers::openai::web_search::is_web_search_mcp_available(&self.mcp_manager)
+                .await
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "message": "Web search preview requested but MCP server 'web_search_preview' is not available. Please configure the MCP server.",
+                            "type": "invalid_request_error",
+                            "param": "tools",
+                            "code": "mcp_server_unavailable"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+
         // Validate mutually exclusive params: previous_response_id and conversation
         // TODO: this validation logic should move the right place, also we need a proper error message module
         if body.previous_response_id.is_some() && body.conversation.is_some() {
@@ -962,6 +993,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 payload,
                 body,
                 original_previous_response_id,
+                has_web_search,
             )
             .await
         } else {
@@ -971,6 +1003,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 payload,
                 body,
                 original_previous_response_id,
+                has_web_search,
             )
             .await
         }

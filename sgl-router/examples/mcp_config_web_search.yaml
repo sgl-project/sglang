@@ -1,0 +1,50 @@
+# Example MCP Configuration with Web Search Preview
+#
+# This configuration demonstrates how to set up the web_search_preview tool
+# for the OpenAI router.
+#
+# Usage:
+#   export SGLANG_MCP_CONFIG=/path/to/this/mcp_config_web_search.yaml
+#   export WEB_SEARCH_MCP_URL="https://your-search-server.com/sse"
+#   export WEB_SEARCH_MCP_TOKEN="your-token"
+
+# Global proxy configuration (optional)
+# proxy:
+#   http: "http://proxy:8080"
+#   https: "http://proxy:8080"
+#   no_proxy: "localhost,127.0.0.1,*.internal"
+
+# Connection pool settings
+pool:
+  max_connections: 100
+  idle_timeout: 300
+
+# Tool inventory settings
+inventory:
+  enable_refresh: true
+  tool_ttl: 300          # 5 minutes
+  refresh_interval: 60    # 1 minute
+  refresh_on_error: true
+
+# MCP Servers
+servers:
+  # Web Search Preview Server
+  # This server provides web search capabilities to the LLM
+  - name: "web_search_preview"
+    protocol: sse
+    url: http://localhost:8001/sse
+    # token: "${WEB_SEARCH_MCP_TOKEN}"
+    required: true  # Don't fail startup if unavailable
+
+  # Example: Additional MCP server
+  # - name: "another-mcp-server"
+  #   protocol: stdio
+  #   command: "node"
+  #   args: ["./mcp-server.js"]
+  #   required: false
+
+# Pre-warm connections at startup (optional)
+# warmup:
+#   - url: "${WEB_SEARCH_MCP_URL}"
+#     label: "web_search_preview"
+#     token: "${WEB_SEARCH_MCP_TOKEN}"

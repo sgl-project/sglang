@@ -13,6 +13,7 @@ mod responses;
 mod router;
 mod streaming;
 mod utils;
+pub(crate) mod web_search;
 
 // Re-export the main router type for external use
 pub use router::OpenAIRouter;
