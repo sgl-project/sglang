@@ -413,11 +413,6 @@ def save_configs(
 def main(args: argparse.Namespace):
     print(args)
 
-    assert args.ep_size in [
-        1,
-        args.tp_size,
-    ], "The expert parallel size must be 1 or the same as the tensor parallel size"
-
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     if config.architectures[0] == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts // args.ep_size
