@@ -489,7 +489,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
-        
+
         if not self.config.language_only:
             self.visual = Qwen2_5_VisionTransformer(
                 config.vision_config,
@@ -499,7 +499,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("visual", prefix),
             )
-        
+
         if not self.config.mm_only:
             self.model = Qwen2Model(
                 config,
@@ -634,9 +634,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Skip loading visual/language model weights
-                if (self.config.mm_only or self.config.language_only
-                        ) and name not in params_dict:
-                        continue
+                if (
+                    self.config.mm_only or self.config.language_only
+                ) and name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -651,8 +652,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     # Skip loading visual/language model weights
-                    if (self.config.mm_only or self.config.language_only
-                        ) and name not in params_dict:
+                    if (
+                        self.config.mm_only or self.config.language_only
+                    ) and name not in params_dict:
                         continue
                     param = params_dict[name]
                 except KeyError:
