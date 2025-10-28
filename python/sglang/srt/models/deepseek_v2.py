@@ -224,6 +224,17 @@ def add_forward_absorb_core_attention_backend(backend_name):
         logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
 
 
+def is_nsa_indexer_wk_and_weights_proj_fused(config, quant_config):
+    """
+    NSA Indexer wk and weights_proj can be fused in FP4 model because they are both in BF16
+    """
+    return (
+        is_deepseek_nsa(config)
+        and quant_config is not None
+        and quant_config.get_name() == "modelopt_fp4"
+    )
+
+
 class AttnForwardMethod(IntEnum):
     # Use multi-head attention
     MHA = auto()
@@ -1140,6 +1151,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 quant_config=quant_config,
                 layer_id=layer_id,
                 alt_stream=alt_stream,
+                fuse_wk_and_weights_proj=is_nsa_indexer_wk_and_weights_proj_fused(
+                    config, quant_config
+                ),
             )
 
         self.kv_b_proj = ColumnParallelLinear(
@@ -3394,11 +3408,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
-        # NSA Indexer wk and weights_proj can be fused in FP4 model because they are both in BF16
-        fuse_wk_and_weights_proj = (
-            is_deepseek_nsa(self.config)
-            and self.quant_config is not None
-            and self.quant_config.get_name() == "modelopt_fp4"
+        fuse_wk_and_weights_proj = is_nsa_indexer_wk_and_weights_proj_fused(
+            self.config, self.quant_config
         )
         cached_wk_and_weights_proj = {} if fuse_wk_and_weights_proj else None
 

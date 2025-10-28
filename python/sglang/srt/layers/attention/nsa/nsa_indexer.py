@@ -119,6 +119,7 @@ class Indexer(CustomOp):
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        fuse_wk_and_weights_proj: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -129,6 +130,7 @@ class Indexer(CustomOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.fuse_wk_and_weights_proj = fuse_wk_and_weights_proj
         if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = align(self.sm_count // 2, 8)
@@ -139,9 +141,6 @@ class Indexer(CustomOp):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("wq_b", prefix),
-        )
-        self.fuse_wk_and_weights_proj = (
-            quant_config is not None and quant_config.get_name() == "modelopt_fp4"
         )
         if self.fuse_wk_and_weights_proj:
             self.fused_wk_and_weights_proj = ReplicatedLinear(
