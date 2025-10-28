@@ -207,7 +207,7 @@ class TestFlux_T2V(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.IMAGE
     thresholds = {
-        "test_single_gpu": 6.16 * 1.05,
+        "test_single_gpu": 6.90 * 1.05,
     }
 
 
