@@ -420,9 +420,12 @@ def handle_attention_nsa(attn, forward_batch):
         else:
             max_kv_len = 0
 
+        # Only enable MHA on SM90 for now
+        is_h_card = _device_sm == 90
+
         return (
             AttnForwardMethod.MHA_CHUNKED_KV
-            if max_kv_len <= NSA_THRESHOLD
+            if (max_kv_len <= NSA_THRESHOLD and is_h_card)
             else AttnForwardMethod.MLA
         )
 
