@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
 from sglang.srt.layers.quantization.w8a8_int8 import npu_fused_experts
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, use_intel_amx_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -44,6 +45,8 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
 
@@ -65,12 +68,17 @@ elif _is_hip:
     )
 
     warnings.warn(f"HIP does not support fused_marlin_moe currently.")
+elif _is_cpu and _is_cpu_amx_available:
+    from sglang.srt.layers.amx_utils import (
+        CPUMoECompMethod,
+        _amx_process_weight_after_loading,
+    )
 elif _is_xpu:
     from sgl_kernel import awq_dequantize
 
     warnings.warn(f"XPU does not support fused_marlin_moe currently.")
 else:
-    warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+    warnings.warn(f"Only CUDA, HIP, CPU and XPU support AWQ currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +131,10 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        return [torch.float16] if not _is_npu else [torch.float16, torch.bfloat16]
+        if _is_cpu and _is_cpu_amx_available:
+            return [torch.half, torch.bfloat16]
+        else:
+            return [torch.float16] if not _is_npu else [torch.float16, torch.bfloat16]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -172,6 +183,8 @@ class AWQConfig(QuantizationConfig):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
+        elif isinstance(layer, FusedMoE):
+            return AWQMoEMethod(self)
         return None
 
 
@@ -423,9 +436,17 @@ class AWQLinearMethod(LinearMethodBase):
         layer.register_parameter("scales", scales)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
-        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+        if _is_cpu:
+            assert (
+                _is_cpu_amx_available
+            ), "AWQLinearMethod on CPU requires that CPU has AMX support"
+            _amx_process_weight_after_loading(
+                layer, ["qweight", "qzeros", "scales"], None, "awq"
+            )
+        else:
+            layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+            layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+            layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
     def apply(
         self,
@@ -433,6 +454,15 @@ class AWQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if use_intel_amx_backend(layer):
+            return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+                x,
+                layer.qweight,
+                layer.qzeros,
+                layer.scales,
+                bias,
+            )
+
         qweight = layer.qweight
         scales = layer.scales
         qzeros = layer.qzeros
@@ -756,10 +786,21 @@ class AWQMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
         device = layer.w13_qweight.device
-        if not _is_npu:
+        if not _is_npu and not _is_cpu:
             layer.workspace = marlin_make_workspace(device, 4)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_cpu:
+            assert (
+                _is_cpu_amx_available
+            ), "AWQLinearMethod on CPU requires that CPU has AMX support"
+            _amx_process_weight_after_loading(
+                layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "awq"
+            )
+            _amx_process_weight_after_loading(
+                layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "awq"
+            )
+            return
         num_experts = layer.w13_qweight.shape[0]
         device = layer.w13_qweight.device
 
@@ -840,6 +881,29 @@ class AWQMoEMethod(FusedMoEMethodBase):
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
+        if use_intel_amx_backend(layer):
+            x = dispatch_output.hidden_states
+            topk_output = dispatch_output.topk_output
+            topk_weights, topk_ids, _ = topk_output
+            return torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_qweight,
+                layer.w2_qweight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace See [Note] inplace should be False in fused_experts.
+                CPUMoECompMethod.INT4_W4A8_GEMM,
+                layer.w13_scales,  # w1_scale
+                layer.w2_scales,  # w2_scale
+                layer.w13_qzeros,
+                layer.w2_qzeros,
+                None,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                True,  # is_vnni
+            )
+
+        # The input must currently be float16
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         orig_dtype = x.dtype
