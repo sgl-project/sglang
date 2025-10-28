@@ -131,13 +131,11 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cpu,
     is_cuda,
-    is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
     is_nvidia_cublas_cu12_version_ge_12_9,
-    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -197,8 +195,6 @@ elif _is_npu:
 else:
     pass
 
-_is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and is_sm100_supported()
 _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
 logger = logging.getLogger(__name__)
@@ -350,7 +346,11 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 
 def handle_attention_fa3(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "fa3")
+    # when deterministic inference is enabled, use MLA
+    if get_global_server_args().enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)
+    else:
+        return _handle_attention_backend(attn, forward_batch, "fa3")
 
 
 def handle_attention_flashmla(attn, forward_batch):
@@ -394,6 +394,10 @@ def handle_attention_nsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
+    # when deterministic inference is enabled, use MLA
+    if get_global_server_args().enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)
+
     if (
         _is_extend_without_speculative(forward_batch)
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
@@ -997,16 +1001,14 @@ class DeepseekV2MoE(nn.Module):
                 )
 
     def op_experts(self, state):
-        state.hidden_states_experts_output = self.experts.run_moe_core(
+        state.combine_input = self.experts.run_moe_core(
             dispatch_output=state.dispatch_output,
         )
 
     def op_combine_a(self, state):
         if self.ep_size > 1:
             self.experts.dispatcher.combine_a(
-                hidden_states=state.pop("hidden_states_experts_output"),
-                topk_ids=state.dispatch_output.topk_ids,
-                topk_weights=state.dispatch_output.topk_weights,
+                combine_input=state.pop("combine_input"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
             state.pop("dispatch_output")
@@ -1254,7 +1256,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
             and _is_cuda
-            and _device_sm >= 90
+            and 90 <= _device_sm < 120
         )
 
         self.qkv_proj_with_rope_is_int8 = (

@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get version
         id: get_version
@@ -26,10 +28,8 @@ jobs:
           echo "TAG=v$version" >> $GITHUB_OUTPUT
 
       - name: Create and push fake tag
-        env:
-          GITHUB_TOKEN: ${{ secrets.REPO_TOKEN }}
         run: |
-          git config user.name zhyncs
-          git config user.email me@zhyncs.com
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
           git checkout -b ${{ steps.get_version.outputs.TAG }}
           git push --set-upstream origin ${{ steps.get_version.outputs.TAG }}
