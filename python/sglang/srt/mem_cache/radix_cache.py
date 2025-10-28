@@ -337,9 +337,7 @@ class RadixCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
-        allocated_len = req.kv_allocated_len
-        assert req.kv_freed_len == 0
-        req.kv_freed_len = allocated_len
+        allocated_len = req.pop_to_free_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :allocated_len

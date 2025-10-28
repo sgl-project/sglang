@@ -432,9 +432,10 @@ class MambaRadixCache(BasePrefixCache):
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        allocated_len = req.pop_to_free_kv_cache()
+        token_ids = (req.origin_input_ids + req.output_ids)[:allocated_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :allocated_len
         ]
 
         page_aligned_len = len(kv_indices)
