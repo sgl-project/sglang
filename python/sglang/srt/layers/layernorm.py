@@ -18,6 +18,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from packaging.version import Version
 
 from sglang.srt.batch_invariant_ops import (
@@ -303,16 +304,18 @@ class LayerNorm(CustomOp):
         eps: float = 1e-6,
         elementwise_affine: bool = True,
         bias: bool = True,
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
         self.elementwise_affine = elementwise_affine
+        self.dtype = dtype
         
         if self.elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
+            self.weight = nn.Parameter(torch.ones(hidden_size, dtype=self.dtype))
             if bias:
-                self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+                self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=self.dtype))
             else:
                 self.register_parameter("bias", None)
         else:
@@ -326,7 +329,7 @@ class LayerNorm(CustomOp):
         if not self.elementwise_affine:
             return self.forward_native(x)
         
-        if _flashinfer_layernorm_available:
+        if _flashinfer_layernorm_available and x.dtype == torch.bfloat16 and self.dtype == torch.float32:
             beta = self.bias if self.bias is not None else torch.zeros_like(self.weight)
             return layernorm(
                 x, self.weight, beta, self.variance_epsilon
@@ -338,19 +341,15 @@ class LayerNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.elementwise_affine:
+            return F.layer_norm(x, (self.hidden_size,), eps=self.variance_epsilon)
+        
         orig_dtype = x.dtype
-        x = x.to(torch.float32)
+        x = x.to(self.dtype)
+        if self.bias is not None:
+            return F.layer_norm(x, (self.hidden_size,), weight=self.weight, bias=self.bias, eps=self.variance_epsilon).to(orig_dtype)
         
-        mean = x.mean(dim=-1, keepdim=True)
-        variance = (x - mean).pow(2).mean(dim=-1, keepdim=True)
-        x = (x - mean) * torch.rsqrt(variance + self.variance_epsilon)
-        
-        if self.elementwise_affine:
-            x = x * self.weight.to(torch.float32)
-            if self.bias is not None:
-                x = x + self.bias.to(torch.float32)
-        
-        return x.to(orig_dtype)
+        return F.layer_norm(x, (self.hidden_size,), weight=self.weight, eps=self.variance_epsilon).to(orig_dtype)
 
     def forward_hip(
         self,
@@ -362,7 +361,19 @@ class LayerNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        orig_dtype = x.dtype
+        x = x.to(self.dtype)
+        
+        mean = x.mean(dim=-1, keepdim=True)
+        variance = (x - mean).pow(2).mean(dim=-1, keepdim=True)
+        x = (x - mean) * torch.rsqrt(variance + self.variance_epsilon)
+        
+        if self.elementwise_affine:
+            x = x * self.weight.to(self.dtype)
+            if self.bias is not None:
+                x = x + self.bias.to(self.dtype)
+        
+        return x.to(orig_dtype)
 
     def forward_cpu(
         self,

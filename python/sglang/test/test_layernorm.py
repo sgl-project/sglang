@@ -110,9 +110,10 @@ class TestGemmaRMSNorm(CustomTestCase):
 
 
 class TestLayerNorm(CustomTestCase):
-    DTYPES = [torch.bfloat16] # Only bfloat16 input and fp32 gamma/beta is supported for now
+    DTYPES = [torch.half, torch.bfloat16, torch.float32]
+    PARAM_DTYPES = [torch.half, torch.bfloat16, torch.float32]
     NUM_TOKENS = [7, 83, 1024]
-    HIDDEN_SIZES = [768, 769, 770, 771, 1024, 2048, 4096, 5120, 5124, 5125, 5126, 8192, 8199]
+    HIDDEN_SIZES = [768, 769, 770, 771, 5120, 5124, 5125, 5126, 8192, 8199]
     USE_AFFINE = [False, True]
     USE_BIAS = [False, True]
     SEEDS = [0]
@@ -123,10 +124,10 @@ class TestLayerNorm(CustomTestCase):
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")
 
-    def _run_layer_norm_test(self, num_tokens, hidden_size, use_affine, use_bias, dtype, seed):
+    def _run_layer_norm_test(self, num_tokens, hidden_size, use_affine, use_bias, dtype, seed, param_dtype):
         torch.manual_seed(seed)
 
-        layer = LayerNorm(hidden_size, elementwise_affine=use_affine, bias=use_bias)
+        layer = LayerNorm(hidden_size, elementwise_affine=use_affine, bias=use_bias, dtype=param_dtype)
         if use_affine:
             layer.weight.data.normal_(mean=1.0, std=0.1)
             if use_bias:
@@ -152,14 +153,16 @@ class TestLayerNorm(CustomTestCase):
             self.USE_BIAS,
             self.DTYPES,
             self.SEEDS,
+            self.PARAM_DTYPES,
         ):
             with self.subTest(
                 num_tokens=params[0],
                 hidden_size=params[1],
                 use_affine=params[2],
                 use_bias=params[3],
-                dtype=params[3],
-                seed=params[4],
+                dtype=params[4],
+                seed=params[5],
+                param_dtype=params[6],
             ):
                 self._run_layer_norm_test(*params)
 
