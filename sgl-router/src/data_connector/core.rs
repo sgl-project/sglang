@@ -465,15 +465,15 @@ pub trait ResponseStorage: Send + Sync {
         max_depth: Option<usize>,
     ) -> ResponseResult<ResponseChain>;
 
-    /// List recent responses for a user
-    async fn list_user_responses(
+    /// List recent responses for a safety identifier
+    async fn list_identifier_responses(
         &self,
-        user: &str,
+        identifier: &str,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>>;
 
-    /// Delete all responses for a user
-    async fn delete_user_responses(&self, user: &str) -> ResponseResult<usize>;
+    /// Delete all responses for a safety identifier
+    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize>;
 }
 
 impl Default for StoredResponse {

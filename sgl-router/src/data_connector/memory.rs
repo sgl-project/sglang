@@ -292,7 +292,7 @@ impl MemoryResponseStorage {
         let store = self.store.read();
         MemoryStoreStats {
             response_count: store.responses.len(),
-            user_count: store.identifier_index.len(),
+            identifier_count: store.identifier_index.len(),
         }
     }
 
@@ -409,14 +409,14 @@ impl ResponseStorage for MemoryResponseStorage {
         Ok(chain)
     }
 
-    async fn list_user_responses(
+    async fn list_identifier_responses(
         &self,
-        user: &str,
+        identifier: &str,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
         let store = self.store.read();
 
-        if let Some(user_response_ids) = store.identifier_index.get(user) {
+        if let Some(user_response_ids) = store.identifier_index.get(identifier) {
             // Collect responses with their timestamps for sorting
             let mut responses_with_time: Vec<_> = user_response_ids
                 .iter()
@@ -440,10 +440,10 @@ impl ResponseStorage for MemoryResponseStorage {
         }
     }
 
-    async fn delete_user_responses(&self, user: &str) -> ResponseResult<usize> {
+    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
         let mut store = self.store.write();
 
-        if let Some(user_response_ids) = store.identifier_index.remove(user) {
+        if let Some(user_response_ids) = store.identifier_index.remove(identifier) {
             let count = user_response_ids.len();
             for id in user_response_ids {
                 store.responses.remove(&id);
@@ -459,7 +459,7 @@ impl ResponseStorage for MemoryResponseStorage {
 #[derive(Debug, Clone)]
 pub struct MemoryStoreStats {
     pub response_count: usize,
-    pub user_count: usize,
+    pub identifier_count: usize,
 }
 
 #[cfg(test)]
@@ -676,22 +676,34 @@ mod tests {
         store.store_response(response3).await.unwrap();
 
         // List user1's responses
-        let user1_responses = store.list_user_responses("user1", None).await.unwrap();
+        let user1_responses = store
+            .list_identifier_responses("user1", None)
+            .await
+            .unwrap();
         assert_eq!(user1_responses.len(), 2);
 
         // List user2's responses
-        let user2_responses = store.list_user_responses("user2", None).await.unwrap();
+        let user2_responses = store
+            .list_identifier_responses("user2", None)
+            .await
+            .unwrap();
         assert_eq!(user2_responses.len(), 1);
 
         // Delete user1's responses
-        let deleted_count = store.delete_user_responses("user1").await.unwrap();
+        let deleted_count = store.delete_identifier_responses("user1").await.unwrap();
         assert_eq!(deleted_count, 2);
 
-        let user1_responses_after = store.list_user_responses("user1", None).await.unwrap();
+        let user1_responses_after = store
+            .list_identifier_responses("user1", None)
+            .await
+            .unwrap();
         assert_eq!(user1_responses_after.len(), 0);
 
         // User2's responses should still be there
-        let user2_responses_after = store.list_user_responses("user2", None).await.unwrap();
+        let user2_responses_after = store
+            .list_identifier_responses("user2", None)
+            .await
+            .unwrap();
         assert_eq!(user2_responses_after.len(), 1);
     }
 
@@ -713,6 +725,6 @@ mod tests {
 
         let stats = store.stats();
         assert_eq!(stats.response_count, 2);
-        assert_eq!(stats.user_count, 2);
+        assert_eq!(stats.identifier_count, 2);
     }
 }

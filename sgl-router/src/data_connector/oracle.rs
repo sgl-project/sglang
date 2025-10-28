@@ -805,6 +805,9 @@ impl OracleResponseStorage {
                     &[],
                 )
                 .map_err(map_oracle_error)?;
+            } else {
+                Self::alter_safety_identifier_column(conn)?;
+                Self::remove_user_id_column_if_exists(conn)?;
             }
 
             // Create indexes
@@ -824,6 +827,61 @@ impl OracleResponseStorage {
         .map_err(ResponseStorageError::StorageError)?;
 
         Ok(Self { store })
+    }
+
+    // Alter safety_identifier column if missing
+    fn alter_safety_identifier_column(conn: &Connection) -> Result<(), String> {
+        let present: i64 = conn
+            .query_row_as(
+                "SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'RESPONSES' AND column_name = 'SAFETY_IDENTIFIER'",
+                &[],
+            )
+            .map_err(map_oracle_error)?;
+
+        if present == 0 {
+            if let Err(err) = conn.execute(
+                "ALTER TABLE responses ADD (safety_identifier VARCHAR2(128))",
+                &[],
+            ) {
+                let present_after: i64 = conn
+                    .query_row_as(
+                        "SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'RESPONSES' AND column_name = 'SAFETY_IDENTIFIER'",
+                        &[],
+                    )
+                    .map_err(map_oracle_error)?;
+                if present_after == 0 {
+                    return Err(map_oracle_error(err));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // Remove user_id column if exists
+    fn remove_user_id_column_if_exists(conn: &Connection) -> Result<(), String> {
+        let present: i64 = conn
+            .query_row_as(
+                "SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'RESPONSES' AND column_name = 'USER_ID'",
+                &[],
+            )
+            .map_err(map_oracle_error)?;
+
+        if present > 0 {
+            if let Err(err) = conn.execute("ALTER TABLE responses DROP COLUMN USER_ID", &[]) {
+                let present_after: i64 = conn
+                    .query_row_as(
+                        "SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'RESPONSES' AND column_name = 'USER_ID'",
+                        &[],
+                    )
+                    .map_err(map_oracle_error)?;
+                if present_after > 0 {
+                    return Err(map_oracle_error(err));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn build_response_from_row(row: &Row) -> Result<StoredResponse, String> {
@@ -981,12 +1039,12 @@ impl ResponseStorage for OracleResponseStorage {
         Ok(chain)
     }
 
-    async fn list_user_responses(
+    async fn list_identifier_responses(
         &self,
-        user: &str,
+        identifier: &str,
         limit: Option<usize>,
     ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
-        let user = user.to_string();
+        let identifier = identifier.to_string();
 
         self.store
             .execute(move |conn| {
@@ -1000,7 +1058,7 @@ impl ResponseStorage for OracleResponseStorage {
                 };
 
                 let mut stmt = conn.statement(&sql).build().map_err(map_oracle_error)?;
-                let mut rows = stmt.query(&[&user]).map_err(map_oracle_error)?;
+                let mut rows = stmt.query(&[&identifier]).map_err(map_oracle_error)?;
                 let mut results = Vec::new();
 
                 for row in &mut rows {
@@ -1014,14 +1072,17 @@ impl ResponseStorage for OracleResponseStorage {
             .map_err(ResponseStorageError::StorageError)
     }
 
-    async fn delete_user_responses(&self, user: &str) -> Result<usize, ResponseStorageError> {
-        let user = user.to_string();
+    async fn delete_identifier_responses(
+        &self,
+        identifier: &str,
+    ) -> Result<usize, ResponseStorageError> {
+        let identifier = identifier.to_string();
         let affected = self
             .store
             .execute(move |conn| {
                 conn.execute(
                     "DELETE FROM responses WHERE safety_identifier = :1",
-                    &[&user],
+                    &[&identifier],
                 )
                 .map_err(map_oracle_error)
             })
