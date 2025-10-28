@@ -254,19 +254,15 @@ impl ResponseStreamEventEmitter {
     pub(super) fn emit_mcp_list_tools_completed(
         &mut self,
         output_index: usize,
-        tools: &[crate::mcp::ToolInfo],
+        tools: &[crate::mcp::Tool],
     ) -> serde_json::Value {
         let tool_items: Vec<_> = tools
             .iter()
             .map(|t| {
                 json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.parameters.clone().unwrap_or_else(|| json!({
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }))
+                    "name": &t.name,
+                    "description": &t.description,
+                    "input_schema": t.input_schema.clone()
                 })
             })
             .collect();
