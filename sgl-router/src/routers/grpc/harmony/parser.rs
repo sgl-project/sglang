@@ -76,10 +76,7 @@ impl HarmonyParserAdapter {
         let messages = self.parser.messages();
 
         // Log all parsed messages for debugging
-        tracing::debug!(
-            message_count = messages.len(),
-            "Parsing Harmony messages"
-        );
+        tracing::debug!(message_count = messages.len(), "Parsing Harmony messages");
         for (idx, msg) in messages.iter().enumerate() {
             tracing::debug!(
                 idx = idx,

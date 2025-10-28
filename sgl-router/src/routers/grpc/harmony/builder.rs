@@ -587,22 +587,21 @@ impl HarmonyBuilder {
                 // Otherwise, it's the tool call itself
                 if let Some(output_str) = output {
                     // Tool result - use Tool role with "functions.{name}" as author name
-                    // IMPORTANT: Must include recipient="assistant" to help the parser
-                    // recognize this as a tool message. We DON'T set channel to prevent
-                    // the model from copying the Tool role pattern in its responses.
+                    // IMPORTANT: We use ONLY role=Tool with author name, no channel or recipient
+                    // to avoid the model copying these patterns in its responses.
                     let author_name = format!("functions.{}", name);
                     debug!(
                         tool_name = %name,
                         author_name = %author_name,
                         output_preview = %output_str.chars().take(100).collect::<String>(),
-                        "Building tool result message with Tool role (no channel)"
+                        "Building tool result message with Tool role (no channel, no recipient)"
                     );
                     Ok(HarmonyMessage {
                         author: Author {
                             role: Role::Tool,
                             name: Some(author_name),
                         },
-                        recipient: Some("assistant".to_string()),
+                        recipient: None,
                         content: vec![Content::Text(TextContent {
                             text: output_str.clone(),
                         })],
@@ -653,15 +652,14 @@ impl HarmonyBuilder {
                     .ok_or_else(|| format!("No function call found for call_id: {}", call_id))?;
 
                 // Create Tool message with "functions.{name}" prefix
-                // IMPORTANT: Must include recipient="assistant" to help the parser
-                // recognize this as a tool message. We DON'T set channel to prevent
-                // the model from copying the Tool role pattern in its responses.
+                // IMPORTANT: We use ONLY role=Tool with author name, no channel or recipient
+                // to avoid the model copying these patterns in its responses.
                 Ok(HarmonyMessage {
                     author: Author {
                         role: Role::Tool,
                         name: Some(format!("functions.{}", call)),
                     },
-                    recipient: Some("assistant".to_string()),
+                    recipient: None,
                     content: vec![Content::Text(TextContent {
                         text: output.clone(),
                     })],
@@ -845,14 +843,14 @@ impl HarmonyBuilder {
                         .cloned()
                         .unwrap_or_else(|| tool_call_id.clone());
 
-                    // Tool result needs recipient="assistant" for parser to recognize it
-                    // We DON'T set channel to prevent the model from copying the Tool role pattern
+                    // Tool result - use ONLY role=Tool with author name, no channel or recipient
+                    // to avoid the model copying these patterns in its responses
                     let harmony_msg = HarmonyMessage {
                         author: Author {
                             role: Role::Tool,
                             name: Some(format!("functions.{}", function_name)),
                         },
-                        recipient: Some("assistant".to_string()),
+                        recipient: None,
                         content: vec![Content::Text(TextContent {
                             text: content.clone(),
                         })],
@@ -864,14 +862,14 @@ impl HarmonyBuilder {
 
                 ChatMessage::Function { content, name } => {
                     // Function messages also use Role::Tool
-                    // Tool result needs recipient="assistant" for parser to recognize it
-                    // We DON'T set channel to prevent the model from copying the Tool role pattern
+                    // Tool result - use ONLY role=Tool with author name, no channel or recipient
+                    // to avoid the model copying these patterns in its responses
                     let harmony_msg = HarmonyMessage {
                         author: Author {
                             role: Role::Tool,
                             name: Some(format!("functions.{}", name)),
                         },
-                        recipient: Some("assistant".to_string()),
+                        recipient: None,
                         content: vec![Content::Text(TextContent {
                             text: content.clone(),
                         })],
