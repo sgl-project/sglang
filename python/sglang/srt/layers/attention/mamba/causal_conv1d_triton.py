@@ -11,6 +11,12 @@ import triton.language as tl
 PAD_SLOT_ID = -1
 
 
+@triton.heuristics(
+    {
+        "STORE_INTERMEDIATE": lambda args: args["intermediate_cache_indices"]
+        is not None,
+    }
+)
 @triton.jit()
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -22,6 +28,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     has_initial_states_ptr,
     query_start_loc_ptr,
     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
+    # intermediate cache
+    intermediate_positions,
+    intermediate_cu_seqlens,
+    intermediate_cache_indices,
     # Matrix dimensions
     dim: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
@@ -51,6 +61,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    STORE_INTERMEDIATE: tl.constexpr,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -84,6 +95,13 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
     if segment_len <= 0:
         return
+
+    if STORE_INTERMEDIATE:
+        intermediate_position_start_index = tl.load(intermediate_cu_seqlens + idx_seq)
+        intermediate_position_end_index = tl.load(intermediate_cu_seqlens + idx_seq + 1)
+        intermediate_position_seqlen = (
+            intermediate_position_end_index - intermediate_position_start_index
+        )
 
     # base of the sequence
     x_base = (
@@ -261,6 +279,133 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 ]
                 tl.store(conv_states_ptrs_target, new_conv_state, mask)
 
+        if STORE_INTERMEDIATE:
+            for i_i in range(intermediate_position_seqlen):
+                intermediate_seqlen = tl.load(
+                    intermediate_positions + intermediate_position_start_index + i_i
+                )
+                conv_intermediate_state_batch_coord = tl.load(
+                    intermediate_cache_indices + intermediate_position_start_index + i_i
+                ).to(tl.int64)
+                conv_intermediate_states_base = (
+                    conv_states_ptr
+                    + (conv_intermediate_state_batch_coord * stride_conv_state_seq)
+                    + (idx_feats * stride_conv_state_dim)
+                )  # [BLOCK_N,]
+                if (
+                    state_len <= intermediate_seqlen
+                ):  # SMALL_CACHE=True (only move part of 'x' into conv_state cache)
+                    # just read from 'x'
+                    # copy 'x' data to conv_state
+                    # load only 'x' data (and set 0 before 'x' if seqlen < state_len)
+                    idx_tokens_last = (intermediate_seqlen - state_len) + tl.arange(
+                        0, NP2_STATELEN
+                    )  # [BLOCK_M]
+                    x_ptrs = (
+                        x_ptr
+                        + ((sequence_start_index + idx_tokens_last) * stride_x_token)[
+                            :, None
+                        ]
+                        + (idx_feats * stride_x_dim)[None, :]
+                    )  # [BLOCK_M,BLOCK_N,]
+                    mask_x = (
+                        (idx_tokens_last >= 0)[:, None]
+                        & (idx_tokens_last < intermediate_seqlen)[:, None]
+                        & (idx_feats < dim)[None, :]
+                    )  # token-index  # token-index  # feature-index
+                    loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+                    new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
+                    idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
+                    conv_states_ptrs_target = (
+                        conv_intermediate_states_base[None, :]
+                        + (idx_tokens_conv * stride_conv_state_tok)[:, None]
+                    )
+
+                    mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
+                        None, :
+                    ]
+                    tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
+                    tl.store(conv_states_ptrs_target, new_conv_state, mask)
+
+                elif intermediate_seqlen >= 0:
+                    if load_init_state:
+                        # update conv_state by shifting left, i.e. take last few cols from conv_state + cols from 'x'
+                        idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
+
+                        conv_states_ptrs_source = (
+                            conv_intermediate_states_base
+                            + (
+                                conv_intermediate_state_batch_coord
+                                * stride_conv_state_seq
+                            )
+                            + (idx_feats * stride_conv_state_dim)[None, :]
+                            + (
+                                (idx_tokens_conv + intermediate_seqlen)
+                                * stride_conv_state_tok
+                            )[:, None]
+                        )  # [BLOCK_M, BLOCK_N]
+                        mask = (
+                            (conv_intermediate_state_batch_coord < num_cache_lines)
+                            & ((idx_tokens_conv + intermediate_seqlen) < state_len)[
+                                :, None
+                            ]
+                            & (idx_feats < dim)[None, :]
+                        )
+                        conv_state = tl.load(conv_states_ptrs_source, mask, other=0.0)
+
+                        VAL = state_len - intermediate_seqlen
+
+                        x_ptrs = (
+                            x_base[None, :]
+                            + ((idx_tokens_conv - VAL) * stride_x_token)[:, None]
+                        )  # [BLOCK_M, BLOCK_N]
+
+                        mask_x = (
+                            (idx_tokens_conv - VAL >= 0)[:, None]
+                            & (idx_tokens_conv - VAL < intermediate_seqlen)[:, None]
+                            & (idx_feats < dim)[None, :]
+                        )  # token-index  # token-index  # feature-index
+                        loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+
+                        tl.debug_barrier()  # need this due to the bug in tl.where not enforcing this when data is the result of another tl.load
+                        new_conv_state = tl.where(
+                            mask, conv_state, loaded_x
+                        )  # BUG in 'tl.where'  which requires a barrier before this
+                        conv_states_ptrs_target = (
+                            conv_states_base
+                            + (idx_tokens_conv * stride_conv_state_tok)[:, None]
+                        )  # [BLOCK_M, BLOCK_N]
+                        mask = (idx_tokens_conv < state_len)[:, None] & (
+                            idx_feats < dim
+                        )[None, :]
+                        tl.store(conv_states_ptrs_target, new_conv_state, mask)
+                    else:  # load_init_state == False
+                        # update conv_state by shifting left, BUT
+                        # set cols prior to 'x' as zeros + cols from 'x'
+                        idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
+
+                        VAL = state_len - intermediate_seqlen
+
+                        x_ptrs = (
+                            x_base[None, :]
+                            + ((idx_tokens_conv - VAL) * stride_x_token)[:, None]
+                        )  # [BLOCK_M, BLOCK_N]
+
+                        mask_x = (
+                            (idx_tokens_conv - VAL >= 0)[:, None]
+                            & (idx_tokens_conv - VAL < intermediate_seqlen)[:, None]
+                            & (idx_feats < dim)[None, :]
+                        )  # token-index  # token-index  # feature-index
+                        new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
+
+                        conv_states_ptrs_target = (
+                            conv_intermediate_states_base
+                            + (idx_tokens_conv * stride_conv_state_tok)[:, None]
+                        )  # [BLOCK_M, BLOCK_N]
+                        mask = (idx_tokens_conv < state_len)[:, None] & (
+                            idx_feats < dim
+                        )[None, :]
+                        tl.store(conv_states_ptrs_target, new_conv_state, mask)
     else:  # chunk_offset > 0
         # read prior-token data from `x`
         load_init_state = True
@@ -387,6 +532,9 @@ def causal_conv1d_fn(
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
+    intermediate_positions: Optional[torch.LongTensor] = None,
+    intermediate_cu_seqlens: Optional[torch.Tensor] = None,
+    intermediate_cache_indices: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -517,6 +665,10 @@ def causal_conv1d_fn(
         has_initial_state,
         query_start_loc,
         out,
+        # intermediate
+        intermediate_positions,
+        intermediate_cu_seqlens,
+        intermediate_cache_indices,
         # Matrix dimensions
         dim,
         cu_seqlen,

@@ -15,6 +15,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
 )
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
@@ -28,7 +29,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
-MAMBA_COPY_MASK_MOD = 256 # TODO: pass in properly
 
 
 class SchedulerOutputProcessorMixin:
@@ -104,6 +104,14 @@ class SchedulerOutputProcessorMixin:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
+
+                    # Update Mamba
+                    seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+                    page_size = get_global_server_args().page_size
+                    paged_aligned_seq_len = seq_len // page_size * page_size
+                    if req.mamba_pool_copy_ping_pong_idx is not None:
+                        req.mamba_pool_copy_next_idx = 1 - req.mamba_pool_copy_next_idx
+                        req.mamba_pool_copy_last_seqlen = paged_aligned_seq_len
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
@@ -328,9 +336,10 @@ class SchedulerOutputProcessorMixin:
 
             # Update Mamba
             seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+            page_size = get_global_server_args().page_size
             if (
                 req.mamba_pool_copy_ping_pong_idx is not None
-                and seq_len % MAMBA_COPY_MASK_MOD == 0
+                and seq_len % page_size == 0
             ):
                 req.mamba_pool_copy_next_idx = 1 - req.mamba_pool_copy_next_idx
                 req.mamba_pool_copy_last_seqlen = seq_len

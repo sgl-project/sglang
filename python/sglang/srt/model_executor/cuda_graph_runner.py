@@ -298,7 +298,7 @@ class CudaGraphRunner:
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
 
-        model_runner.is_hybrid_gdn = True # TODO: properly set it in model runner
+        model_runner.is_hybrid_gdn = True  # TODO: properly set it in model runner
 
         # Graph inputs
         with torch.device(self.device):

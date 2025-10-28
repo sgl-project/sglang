@@ -25,6 +25,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
         "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
         "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "STORE_INTERMEDIATE": lambda args: args["intermediate_state"] is not None,
     }
 )
 # @triton.autotune(
@@ -49,6 +50,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     ht,
     cu_seqlens,
     chunk_offsets,
+    intermediate_state,
+    intermediate_positions,
+    intermediate_cu_seqlens,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -61,6 +65,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    STORE_INTERMEDIATE: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -84,6 +89,23 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_h3 = tl.zeros([64, BV], dtype=tl.float32)
     if K > 192:
         b_h4 = tl.zeros([64, BV], dtype=tl.float32)
+
+    if STORE_INTERMEDIATE:
+        # [BK, BV]
+        boi, eoi = tl.load(intermediate_cu_seqlens + i_n).to(tl.int32), tl.load(
+            intermediate_cu_seqlens + i_n + 1
+        ).to(tl.int32)
+        intermediate_len = eoi - boi
+
+        b_h1_i = tl.zeros([64, BV], dtype=tl.float32)
+        if K > 64:
+            b_h2_i = tl.zeros([64, BV], dtype=tl.float32)
+        if K > 128:
+            b_h3_i = tl.zeros([64, BV], dtype=tl.float32)
+        if K > 192:
+            b_h4_i = tl.zeros([64, BV], dtype=tl.float32)
+
+        intermediate_state += (boi * H + i_h) * K * V
 
     # calculate offset
     h += (boh * H + i_h) * K * V
@@ -187,6 +209,139 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 p_v_new, b_v_new.to(p_v_new.dtype.element_ty), boundary_check=(0, 1)
             )
 
+        if STORE_INTERMEDIATE:
+            for i_i in range(intermediate_len):
+                intermediate_position = tl.load(
+                    intermediate_positions + (boi + i_i)
+                ).to(tl.int32)
+
+                if intermediate_position >= 0 and (
+                    (
+                        intermediate_position % BT != 0
+                        and intermediate_position // BT == i_t
+                    )
+                    or (
+                        intermediate_position % BT == 0
+                        and intermediate_position // BT == i_t + 1
+                    )
+                ):
+                    offset = intermediate_position % BT
+                    if (
+                        intermediate_position // BT == i_t + 1
+                        and intermediate_position % BT == 0
+                    ):
+                        offset = BT
+                    mask = tl.arange(0, BT)[:, None] < offset
+
+                    if USE_G:
+                        last_idx = intermediate_position - 1
+                        b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
+                        p_g = tl.make_block_ptr(
+                            g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+                        )
+                        b_g = tl.load(p_g, boundary_check=(0,))
+                        b_v_new_masked = b_v_new * safe_exp(b_g_last - b_g)[:, None]
+                        b_g_last = exp(b_g_last)
+                        b_h1_i = b_h1 * b_g_last
+                        if K > 64:
+                            b_h2_i = b_h2 * b_g_last
+                        if K > 128:
+                            b_h3_i = b_h3 * b_g_last
+                        if K > 192:
+                            b_h4_i = b_h4 * b_g_last
+                    else:
+                        b_v_new_masked = b_v_new
+                        b_h1_i = b_h1
+                        if K > 64:
+                            b_h2_i = b_h2
+                        if K > 128:
+                            b_h3_i = b_h3
+                        if K > 192:
+                            b_h4_i = b_h4
+
+                    b_v_new_masked = tl.where(mask, b_v_new_masked, 0.0).to(
+                        k.dtype.element_ty
+                    )  # [BT, BV]
+
+                    p_k = tl.make_block_ptr(
+                        k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+                    )
+                    b_k = tl.load(p_k, boundary_check=(0, 1))  # [64, BT]
+                    b_h1_i += tl.dot(b_k, b_v_new_masked)  # [64, BV]
+
+                    intermediate_offset = i_i * stride_h
+                    p_intermediate = tl.make_block_ptr(
+                        intermediate_state + intermediate_offset,
+                        (K, V),
+                        (V, 1),
+                        (0, i_v * BV),
+                        (64, BV),
+                        (1, 0),
+                    )
+                    tl.store(
+                        p_intermediate,
+                        b_h1_i.to(p_intermediate.dtype.element_ty),
+                        boundary_check=(0, 1),
+                    )
+                    if K > 64:
+                        p_k = tl.make_block_ptr(
+                            k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
+                        )
+                        b_k = tl.load(p_k, boundary_check=(0, 1))
+                        b_h2_i += tl.dot(b_k, b_v_new_masked)
+                        p_intermediate = tl.make_block_ptr(
+                            intermediate_state + intermediate_offset,
+                            (K, V),
+                            (V, 1),
+                            (64, i_v * BV),
+                            (64, BV),
+                            (1, 0),
+                        )
+                        tl.store(
+                            p_intermediate,
+                            b_h2_i.to(p_intermediate.dtype.element_ty),
+                            boundary_check=(0, 1),
+                        )
+                    if K > 128:
+                        p_k = tl.make_block_ptr(
+                            k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
+                        )
+                        b_k = tl.load(p_k, boundary_check=(0, 1))
+                        b_h3_i += tl.dot(b_k, b_v_new_masked)
+                        p_intermediate = tl.make_block_ptr(
+                            intermediate_state + intermediate_offset,
+                            (K, V),
+                            (V, 1),
+                            (128, i_v * BV),
+                            (64, BV),
+                            (1, 0),
+                        )
+                        tl.store(
+                            p_intermediate,
+                            b_h3_i.to(p_intermediate.dtype.element_ty),
+                            boundary_check=(0, 1),
+                        )
+                    if K > 192:
+                        p_k = tl.make_block_ptr(
+                            k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
+                        )
+                        b_k = tl.load(p_k, boundary_check=(0, 1))
+                        b_h4_i += tl.dot(b_k, b_v_new_masked)
+
+                        p_intermediate = tl.make_block_ptr(
+                            intermediate_state + intermediate_offset,
+                            (K, V),
+                            (V, 1),
+                            (192, i_v * BV),
+                            (64, BV),
+                            (1, 0),
+                        )
+                        tl.store(
+                            p_intermediate,
+                            b_h4_i.to(p_intermediate.dtype.element_ty),
+                            boundary_check=(0, 1),
+                        )
+
         if USE_G:
             last_idx = min((i_t + 1) * BT, T) - 1
             b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
@@ -259,6 +414,8 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    intermediate_positions: Optional[torch.LongTensor] = None,
+    intermediate_cu_seqlens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
@@ -285,6 +442,12 @@ def chunk_gated_delta_rule_fwd_h(
         k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
     )
 
+    intermediate_state = None
+    if intermediate_positions is not None:
+        intermediate_state = k.new_zeros(
+            len(intermediate_positions), H, K, V, dtype=torch.float32
+        )
+
     v_new = torch.empty_like(u) if save_new_value else None
 
     def grid(meta):
@@ -301,6 +464,9 @@ def chunk_gated_delta_rule_fwd_h(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
+        intermediate_state=intermediate_state,
+        intermediate_positions=intermediate_positions,
+        intermediate_cu_seqlens=intermediate_cu_seqlens,
         T=T,
         H=H,
         Hg=Hg,
@@ -311,4 +477,4 @@ def chunk_gated_delta_rule_fwd_h(
         num_warps=4,
         num_stages=2,
     )
-    return h, v_new, final_state
+    return h, v_new, final_state, intermediate_state

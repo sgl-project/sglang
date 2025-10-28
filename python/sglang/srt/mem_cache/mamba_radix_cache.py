@@ -21,8 +21,8 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 
 import heapq
 import time
-from functools import partial
 from collections import defaultdict
+from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -339,7 +339,7 @@ class MambaRadixCache(BasePrefixCache):
         else:
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = partial(get_child_key, page_size=page_size)
-        
+
         self.reset()
 
     ##### Public API #####
@@ -460,7 +460,7 @@ class MambaRadixCache(BasePrefixCache):
         if cache_len is None:
             cache_len = 0
         if cache_len != len(token_ids):
-            free_start_idx = max(cache_len, len(req.actual_prefix_indices))
+            free_start_idx = max(cache_len, len(req.prefix_indices))
             self.token_to_kv_pool_allocator.free(kv_indices[free_start_idx:])
             token_ids = token_ids[:cache_len]
             kv_indices = kv_indices[:cache_len]
@@ -494,7 +494,7 @@ class MambaRadixCache(BasePrefixCache):
         )
 
         self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.actual_prefix_indices) : new_prefix_len]
+            kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
 
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -516,8 +516,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
-        # if self.disable:
-        if True: # TODO: properly handle this with a flag
+        if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(req.fill_ids)
             ]
@@ -529,13 +528,22 @@ class MambaRadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
-        page_aligned_len = len(kv_indices)
-        page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+
+        if self.page_size != 1:
+            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
+        else:
+            page_aligned_len = len(kv_indices)
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
-        mamba_value = self.req_to_token_pool.get_mamba_indices(
-            req.req_pool_idx
-        ).unsqueeze(-1)
+        mamba_value = (
+            req.mamba_pool_copy_ping_pong_idx[1 - req.mamba_pool_copy_next_idx]
+            .unsqueeze(-1)
+            .clone()
+        )
         # radix tree mamba value is forked from req space
         mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
 

@@ -32,11 +32,12 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
 
 if is_cuda():
-    from sglang.srt.layers.attention.mamba.causal_conv1d import (
-        causal_conv1d_fn as causal_conv1d_fn_cuda,
-    )
+    pass
+#     from sglang.srt.layers.attention.mamba.causal_conv1d import (
+#         causal_conv1d_fn as causal_conv1d_fn_cuda,
+#     )
 
-    causal_conv1d_fn = causal_conv1d_fn_cuda
+#     causal_conv1d_fn = causal_conv1d_fn_cuda
 elif is_npu():
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
@@ -150,6 +151,7 @@ def copy_mamba_states_if_needed(
         ssm_state_numel_per_row,
         BLOCK_SIZE,
     )
+
 
 class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
@@ -463,6 +465,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             has_initial_states = forward_batch.extend_prefix_lens > 0
             conv_states_to_use = conv_states
 
+        intermediate_cu_seqlens = torch.arange(
+            forward_batch.batch_size + 1, device=forward_batch.input_ids.device
+        )
+
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
@@ -494,6 +500,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                intermediate_cache_indices=forward_batch.mamba_pool_copy_indices,
+                intermediate_positions=forward_batch.mamba_store_extend_seqlen - 1,
+                intermediate_cu_seqlens=intermediate_cu_seqlens,
             ).transpose(0, 1)[:seq_len]
 
         key_split_dim = key_dim // attn_tp_size
@@ -536,20 +545,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             recurrent_state = ssm_states[cache_indices]
-            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                cu_seqlens=query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
+            core_attn_out, last_recurrent_state, intermediate_state = (
+                chunk_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    output_final_state=True,
+                    cu_seqlens=query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                    intermediate_positions=forward_batch.mamba_store_extend_seqlen - 1,
+                    intermediate_cu_seqlens=intermediate_cu_seqlens,
+                )
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
+            mask = forward_batch.mamba_store_extend_seqlen - 1 > 0
+            ssm_states[forward_batch.mamba_pool_copy_indices[mask]] = (
+                intermediate_state[mask]
+            )
 
         return core_attn_out
 

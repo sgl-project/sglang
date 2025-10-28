@@ -82,7 +82,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
-MAMBA_COPY_MASK_MOD = 256 # TODO: pass in properly
 
 
 logger = logging.getLogger(__name__)
@@ -530,7 +529,6 @@ class Req:
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
-        self.actual_prefix_indices: torch.Tensor = [] # TODO: there should be a cleaner way to track this
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -717,7 +715,6 @@ class Req:
                 ),
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
-            self.actual_prefix_indices = self.prefix_indices.clone()
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -1351,6 +1348,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+        if self.is_hybrid_gdn_cache:
+            self.mamba_pool_copy_indices = torch.tensor(
+                [
+                    req.mamba_pool_copy_ping_pong_idx[req.mamba_pool_copy_next_idx]
+                    for req in self.reqs
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+
+            page_size = self.token_to_kv_pool_allocator.page_size
+            self.mamba_store_extend_seqlen = torch.tensor(
+                [
+                    sl // page_size * page_size - pl
+                    for pl, sl in zip(self.prefix_lens, self.seq_lens)
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
@@ -1594,7 +1611,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device=self.device,
             )
             self.mamba_copy_mask = torch.tensor(
-                [sl % MAMBA_COPY_MASK_MOD == 0 for sl in self.seq_lens],
+                [
+                    sl % self.token_to_kv_pool_allocator.page_size == 0
+                    for sl in self.seq_lens
+                ],
                 dtype=torch.bool,
                 device=self.device,
             )
@@ -1789,6 +1809,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             mamba_pool_copy_indices=self.mamba_pool_copy_indices,
             mamba_copy_mask=self.mamba_copy_mask,
+            mamba_store_extend_seqlen=self.mamba_store_extend_seqlen,
         )
 
     def copy(self):
@@ -1870,6 +1891,7 @@ class ModelWorkerBatch:
     # For mamba copy
     mamba_pool_copy_indices: Optional[torch.Tensor]  # shape: [b], int64
     mamba_copy_mask: Optional[torch.Tensor]  # shape: [b], bool
+    mamba_store_extend_seqlen: Optional[torch.Tensor]  # shape: [b], int64
 
     # For encoder-decoder
     encoder_cached: Optional[List[bool]]

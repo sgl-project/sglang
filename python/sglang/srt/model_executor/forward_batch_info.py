@@ -193,8 +193,10 @@ class ForwardBatch:
 
     # The indices of mamba copy
     mamba_pool_copy_indices: Optional[torch.Tensor] = None  # shape: [b], int64
-    # The mask of mamba copy
+    # The mask of mamba copy for decode
     mamba_copy_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+    # The position to store mamba state for extend
+    mamba_store_extend_seqlen: Optional[torch.Tensor] = None  # shape: [b], int64
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -341,6 +343,7 @@ class ForwardBatch:
             out_cache_loc=batch.out_cache_loc,
             mamba_pool_copy_indices=batch.mamba_pool_copy_indices,
             mamba_copy_mask=batch.mamba_copy_mask,
+            mamba_store_extend_seqlen=batch.mamba_store_extend_seqlen,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
