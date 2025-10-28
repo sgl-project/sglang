@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import time
 from abc import ABC
 from collections import deque
@@ -41,9 +40,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = int(
-    os.getenv("SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL", 0)
-)
 
 # --------------------------------------- Entrypoint -----------------------------------------
 
@@ -722,8 +718,9 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     def _collect_metrics_if_needed(self, gpu_physical_count: torch.Tensor):
         # sglang:eplb_gpu_physical_count metric is disabled if SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0
         if (
-            SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL > 0
-            and self._collection_counter % SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL == 0
+            envs.SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL > 0
+            and self._collection_counter % envs.SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL
+            == 0
         ):
             for layer_idx in range(self._expert_location_metadata.num_layers):
                 count_of_layer = (
