@@ -1,6 +1,7 @@
 import uvicorn
 import zmq
 import zmq.asyncio
+import asyncio
 import torch
 
 from fastapi import FastAPI
@@ -8,7 +9,6 @@ from fastapi.responses import ORJSONResponse
 from transformers import AutoImageProcessor
 from transformers.image_utils import load_images
 from typing import Optional
-from collections import deque
 
 from sglang.srt.server_args import PortArgs, ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.configs.model_config import ModelConfig
@@ -19,6 +19,7 @@ from sglang.srt.distributed.parallel_state import initialize_model_parallel, ini
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, Modality
 from sglang.srt.utils import get_zmq_socket
+from sglang.srt.multimodal.processors.qwen_vl import resize_image_async
 
 class EmbeddingData:
     def __init__(self, req_id, num_parts, part_idx, mm_embedding):
@@ -83,14 +84,14 @@ class ImageEncoder:
         
         self.context = zmq.asyncio.Context(2)
         self.send_to_prefill_sockets = dict()
-        
-        self.wait_queue = deque()
-        
-        self.encode_task = None
     
-    @torch.inference_mode()
-    def encode(self,mm_items):
+    async def encode(self,mm_items):
         images = load_images(mm_items)
+
+        # Qwen-specific: resize images
+        resize_tasks = [resize_image_async(image) for image in images]
+        images = await asyncio.gather(*resize_tasks)
+
         images_input = self.image_processor(images=images)
         mm_item = MultimodalDataItem.from_dict({
             'modality':Modality.IMAGE,
@@ -112,12 +113,9 @@ class ImageEncoder:
             self.send_to_prefill_sockets[prefill_ip] = socket
         socket.send_pyobj(send_data)
     
-    def add(self,request_data):
-        self.wait_queue.append(request_data)
-        
-    def step(self):
-        request_data = self.wait_queue.popleft()
-        mm_embeddings = self.encode(request_data["mm_items"])
+    @torch.inference_mode()
+    async def step(self, request_data):
+        mm_embeddings = await self.encode(request_data["mm_items"])
         send_data = EmbeddingData(request_data['req_id'],
                                   request_data['num_parts'],
                                   request_data['part_idx'],
@@ -135,6 +133,5 @@ def launch_server(server_args:ServerArgs):
 
 @app.post("/encode")
 async def handle_encode_request(request_data: dict):
-    encoder.add(request_data)
-    encoder.step()
+    await encoder.step(request_data)
     return ORJSONResponse(content=None)
