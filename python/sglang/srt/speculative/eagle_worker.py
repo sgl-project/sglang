@@ -28,6 +28,9 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative.eagle_draft_extend_npu_graph_runner import (
+    EAGLEDraftExtendNpuGraphRunner,
+)
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -52,6 +55,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     is_cuda,
+    is_npu,
     next_power_of_2,
 )
 
@@ -71,6 +75,7 @@ class EAGLEWorker(TpModelWorker):
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        cp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -125,6 +130,7 @@ class EAGLEWorker(TpModelWorker):
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
+                cp_rank=cp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
@@ -204,7 +210,7 @@ class EAGLEWorker(TpModelWorker):
             return
 
         # Capture draft
-        if self.speculative_num_steps > 1:
+        if self.speculative_num_steps > 1 and not is_npu():
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -223,8 +229,10 @@ class EAGLEWorker(TpModelWorker):
             logger.info(
                 f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
-                self
+            self.cuda_graph_runner_for_draft_extend = (
+                EAGLEDraftExtendCudaGraphRunner(self)
+                if not is_npu()
+                else EAGLEDraftExtendNpuGraphRunner(self)
             )
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -940,7 +948,7 @@ class EAGLEWorker(TpModelWorker):
         draft_input.hidden_states = logits_output.hidden_states
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=is_npu())
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,

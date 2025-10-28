@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -54,6 +55,7 @@ from sglang.srt.utils import (
     prepare_weight_cache,
 )
 
+logger = logging.getLogger(__name__)
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = is_cuda() and is_sm90_supported()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
@@ -649,6 +651,7 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(),
             hidden_states,
         )
+
         if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
             # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
