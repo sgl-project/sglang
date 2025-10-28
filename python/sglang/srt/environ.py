@@ -180,6 +180,7 @@ class Envs:
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
+    SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
@@ -237,6 +238,9 @@ class Envs:
     # VLM
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
+
+    # Release & Resume Memory
+    SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 
     # Ktransformers
     SGLANG_KT_MOE_NUM_GPU_EXPERTS = EnvInt(None)
