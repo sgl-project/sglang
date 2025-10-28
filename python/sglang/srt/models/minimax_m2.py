@@ -122,7 +122,7 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
         # Normalize and apply local weight shard
         x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = x.to(orig_dtype) * self.weight
+        x = (x * self.weight).to(orig_dtype)
 
         return x
 
