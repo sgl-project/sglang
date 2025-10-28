@@ -12,6 +12,7 @@ use openai_harmony::{
     },
     HarmonyEncoding, HarmonyEncodingName,
 };
+use tracing::{debug, info};
 
 use super::types::HarmonyBuildOutput;
 use crate::protocols::{
@@ -429,7 +430,7 @@ impl HarmonyBuilder {
             // 1. Access to msg_store from previous response
             // 2. Chain-of-thoughts cleanup logic
             // 3. Proper state management across turns
-            tracing::debug!(
+            debug!(
                 "Continuing conversation from previous response: {:?}",
                 request.previous_response_id
             );
@@ -467,6 +468,10 @@ impl HarmonyBuilder {
             }
         }
 
+        debug!(
+            message_count = all_messages.len(),
+            "Constructed Harmony messages for Responses API"
+        );
         Ok(all_messages)
     }
 
@@ -554,10 +559,17 @@ impl HarmonyBuilder {
                 if let Some(output_str) = output {
                     // Tool result - use Tool role with "functions.{name}" as author name
                     // This matches vLLM's pattern: Author.new(Role.TOOL, f"functions.{name}")
+                    let author_name = format!("functions.{}", name);
+                    debug!(
+                        tool_name = %name,
+                        author_name = %author_name,
+                        output_preview = %output_str.chars().take(100).collect::<String>(),
+                        "Building tool result message with Tool role"
+                    );
                     Ok(HarmonyMessage {
                         author: Author {
                             role: Role::Tool,
-                            name: Some(format!("functions.{}", name)),
+                            name: Some(author_name),
                         },
                         recipient: None,
                         content: vec![Content::Text(TextContent {
@@ -570,12 +582,18 @@ impl HarmonyBuilder {
                     // Tool call - assistant message in commentary channel with recipient
                     // This matches vLLM's pattern:
                     // msg.with_channel("commentary").with_recipient(f"functions.{name}")
+                    let recipient = format!("functions.{}", name);
+                    debug!(
+                        tool_name = %name,
+                        recipient = %recipient,
+                        "Building tool call message with recipient"
+                    );
                     Ok(HarmonyMessage {
                         author: Author {
                             role: Role::Assistant,
                             name: None,
                         },
-                        recipient: Some(format!("functions.{}", name)),
+                        recipient: Some(recipient),
                         content: vec![Content::Text(TextContent {
                             text: arguments.clone(),
                         })],
