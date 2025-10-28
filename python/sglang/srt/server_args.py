@@ -885,7 +885,7 @@ class ServerArgs:
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
                     )
-                if self.moe_runner_backend == "auto":
+                if self.moe_a2a_backend == "none" and self.moe_runner_backend == "auto":
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
@@ -970,6 +970,11 @@ class ServerArgs:
                 self.attention_backend = "trtllm_mha"
                 logger.warning(
                     "Use trtllm_mha as attention backend on sm100 for Llama4 model"
+                )
+            if is_sm100_supported() and self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_trtllm"
+                logger.info(
+                    "Use flashinfer_trtllm as MoE runner backend on SM100 for Llama4"
                 )
         elif model_arch in [
             "Gemma2ForCausalLM",
@@ -1336,8 +1341,10 @@ class ServerArgs:
 
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert (
-                self.quantization == "modelopt_fp4" or self.quantization == "fp8"
-            ), "modelopt_fp4 or fp8 quantization is required for Flashinfer TRTLLM MoE"
+                self.quantization == "modelopt_fp4"
+                or self.quantization == "modelopt_fp8"
+                or self.quantization == "fp8"
+            ), "modelopt_fp4, modelopt_fp8 or fp8 quantization is required for Flashinfer TRTLLM MoE"
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
