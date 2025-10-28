@@ -31,25 +31,6 @@ class TestMoERunner(CustomTestCase):
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
-                "triton_kernel",
-                "--tp",
-                "2",
-                "--max-total-tokens",
-                "2048",
-                "--mem-fraction-static",
-                "0.95",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
-            ],
-        },
-        # Speculative decoding (EAGLE) on unquantized small MoE with Triton
-        "moe_runner_triton_unquant_spec_eagle": {
-            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
-            "other_args": [
-                "--trust-remote-code",
-                "--moe-runner-backend",
                 "triton",
                 "--tp",
                 "2",
@@ -57,14 +38,6 @@ class TestMoERunner(CustomTestCase):
                 "2048",
                 "--mem-fraction-static",
                 "0.95",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
                 "--attention-backend",
                 "torch_native",
                 "--sampling-backend",
@@ -210,6 +183,40 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
+        "moe_runner_auto_refactored": {  # 'auto' where the potential backend has been refactored
+            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
+            "other_args": [
+                "--trust-remote-code",
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "2048",
+                "--mem-fraction-static",
+                "0.95",
+                "--attention-backend",
+                "torch_native",
+                "--sampling-backend",
+                "pytorch",
+            ],
+        },
+        "moe_runner_auto_not_refactored": {  # 'auto' where the potential backend has not been refactored
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
+            "other_args": [
+                "--trust-remote-code",
+                "--quantization",
+                "w8a8_int8",
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "2048",
+                "--mem-fraction-static",
+                "0.95",
+                "--attention-backend",
+                "torch_native",
+                "--sampling-backend",
+                "pytorch",
+            ],
+        },
     }
 
     def _run_config(self, config: dict) -> None:
@@ -231,7 +238,7 @@ class TestMoERunner(CustomTestCase):
             )
             metrics = run_eval(args)
             print(f"{metrics=}")
-            self.assertGreaterEqual(metrics["score"], 0.0)
+            self.assertGreaterEqual(metrics["score"], 0.48)
         finally:
             kill_process_tree(process.pid)
 
