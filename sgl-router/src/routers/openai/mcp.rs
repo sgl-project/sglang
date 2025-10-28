@@ -294,19 +294,22 @@ pub(super) fn prepare_mcp_payload_for_streaming(
 
         // Build function tools for discovered MCP tools
         let mut tools_json = Vec::new();
-        let tools = active_mcp.list_tools();
+
+        // Get tools with server names from inventory
+        // Returns Vec<(tool_name, server_name, Tool)>
+        let tools = active_mcp.inventory().list_tools();
 
         // Filter tools based on context
         let filtered_tools: Vec<_> = if is_web_search {
             // Only include tools from web_search_preview server
             tools.into_iter()
-                .filter(|t| t.server == "web_search_preview")
+                .filter(|(_, server_name, _)| server_name == "web_search_preview")
                 .collect()
         } else {
             tools
         };
 
-        for t in filtered_tools {
+        for (_, _, t) in filtered_tools {
             let parameters = Value::Object((*t.input_schema).clone());
             let tool = serde_json::json!({
                 "type": event_types::ITEM_TYPE_FUNCTION,

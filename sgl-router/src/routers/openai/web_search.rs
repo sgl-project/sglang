@@ -16,9 +16,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::mcp::McpManager;
-use crate::protocols::responses::{ResponseTool, ResponseToolType};
-
-use super::utils::generate_id;
+use crate::protocols::responses::{generate_id, ResponseTool, ResponseToolType};
 
 // ============================================================================
 // Tool Detection & Transformation
@@ -42,22 +40,19 @@ pub async fn is_web_search_mcp_available(mcp_manager: &Arc<McpManager>) -> bool 
 /// Transform web_search_preview tool to MCP function tools
 /// Returns function tools from the "web_search_preview" MCP server
 pub fn transform_web_search_to_mcp_functions(mcp_manager: &Arc<McpManager>) -> Vec<Value> {
-    // Get tools from the "web_search_preview" MCP server
-    let tools = mcp_manager.list_tools();
+    // Get tools from inventory with server names
+    // Returns Vec<(tool_name, server_name, Tool)>
+    let tools = mcp_manager.inventory().list_tools();
 
     tools
         .iter()
-        .filter(|t| t.server == "web_search_preview")
-        .map(|t| {
+        .filter(|(_, server_name, _)| server_name == "web_search_preview")
+        .map(|(_, _, tool)| {
             json!({
                 "type": "function",
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.parameters.clone().unwrap_or_else(|| json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                }))
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema.clone()
             })
         })
         .collect()
