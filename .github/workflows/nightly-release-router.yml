@@ -1,23 +1,53 @@
-# Nightly release workflow for SGLang Router
+# Test build workflow for SGLang Router - builds on all platforms
 
-name: Nightly Release SGLang Router to PyPI
+name: Test Build SGLang Model Gateway
 
 on:
-  schedule:
-    # Run at 2 AM UTC every day
-    - cron: '0 2 * * *'
+  # schedule:
+  #   # Run at 2 AM UTC every day
+  #   - cron: '0 2 * * *'
+  pull_request:
+    paths:
+      - 'sgl-router/**'
+      - '.github/workflows/nightly-release-router.yml'
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }} (${{ matrix.target }})
+    name: build on ${{ matrix.platform || matrix.os }} (${{ matrix.target }} - ${{ matrix.manylinux || 'auto' }})
     runs-on: ${{ matrix.os }}-latest
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu, macos, windows]
+        target: [x86_64, aarch64]
+        manylinux: [auto]
         include:
           - os: ubuntu
+            platform: linux
+          - os: windows
+            ls: dir
             target: x86_64
+            python-architecture: x64
+            interpreter: 3.9 3.10 3.11 3.12 3.13
+          - os: macos
+            target: aarch64
+            interpreter: 3.9 3.10 3.11 3.12 3.13
+          - os: ubuntu
+            platform: linux
+            target: aarch64
+          # musllinux
+          - os: ubuntu
+            platform: linux
+            target: x86_64
+            manylinux: musllinux_1_1
+          - os: ubuntu
+            platform: linux
+            target: aarch64
+            manylinux: musllinux_1_1
+        exclude:
+          - os: windows
+            target: aarch64
 
     steps:
       - uses: actions/checkout@v4
@@ -29,56 +59,71 @@ jobs:
           mv sglang-repo/sgl-router/* .
           rm -rf sglang-repo
           ls -alt
+        shell: bash
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
+          architecture: ${{ matrix.python-architecture || 'x64' }}
 
       - name: Modify version for nightly release
         run: |
           # Get current version from pyproject.toml
           CURRENT_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])" 2>/dev/null || python -c "import tomli; print(tomli.load(open('pyproject.toml', 'rb'))['project']['version'])")
-          # Create nightly version with date: e.g., 0.1.9.dev20250112
+          # Create nightly version with date: e.g., 0.2.1.dev20250128
           NIGHTLY_VERSION="${CURRENT_VERSION}.dev$(date +%Y%m%d)"
           echo "Nightly version: $NIGHTLY_VERSION"
 
           # Update pyproject.toml with nightly version (temporary, not committed)
-          sed -i "s/version = \"${CURRENT_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" pyproject.toml
+          sed -i.bak "s/version = \"${CURRENT_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" pyproject.toml
 
           # Verify the change
           cat pyproject.toml | grep "^version"
+        shell: bash
 
-      - name: Install build dependencies
-        run: |
-          python -m pip install -U pip
-          python -m pip install build twine auditwheel tomli
+      - name: Install twine and tomli
+        run: pip install -U twine tomli
 
-      - name: Build package
-        uses: pypa/cibuildwheel@v2.21.3
-        env:
-          CIBW_BUILD: "cp38-manylinux_x86_64 cp39-manylinux_x86_64 cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64"
-          CIBW_BEFORE_ALL: |
-            yum update -y && yum install -y openssl-devel wget unzip && \
-            # Install latest protoc (v32.0) that supports proto3
-            cd /tmp && \
-            wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip && \
-            unzip protoc-32.0-linux-x86_64.zip -d /usr/local && \
-            rm protoc-32.0-linux-x86_64.zip && \
-            # Install Rust
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          CIBW_ENVIRONMENT: "PATH=$HOME/.cargo/bin:$PATH"
+      - name: Install protoc (macOS)
+        if: matrix.os == 'macos'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: matrix.os == 'windows'
+        run: choco install protoc -y
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13' }}
+          rust-toolchain: stable
+          docker-options: -e CI
+          before-script-linux: |
+            # Install OpenSSL development libraries and protoc for gRPC code generation
+            if command -v yum &> /dev/null; then
+              yum update -y && yum install -y openssl-devel wget unzip
+            elif command -v apt-get &> /dev/null; then
+              apt-get update && apt-get install -y libssl-dev wget unzip
+            fi
+            (cd /tmp && \
+             wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip && \
+             unzip protoc-32.0-linux-x86_64.zip -d /usr/local && \
+             rm protoc-32.0-linux-x86_64.zip)
+            protoc --version
 
       - name: List built packages
-        run: ls -lh wheelhouse/
+        run: ${{ matrix.ls || 'ls -lh' }} dist/
 
       - name: Check packages
-        run: twine check --strict wheelhouse/*
+        run: twine check --strict dist/*
 
       - uses: actions/upload-artifact@v4
         with:
-          name: packages-${{ matrix.os }}-${{ matrix.target }}
-          path: wheelhouse/
+          name: packages-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'auto' }}
+          path: dist/
 
   build-sdist:
     name: Build SDist
@@ -98,49 +143,49 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
       - name: Modify version for nightly release
         run: |
           # Get current version from pyproject.toml
           CURRENT_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])" 2>/dev/null || python -c "import tomli; print(tomli.load(open('pyproject.toml', 'rb'))['project']['version'])")
-          # Create nightly version with date: e.g., 0.1.9.dev20250112
+          # Create nightly version with date: e.g., 0.2.1.dev20250128
           NIGHTLY_VERSION="${CURRENT_VERSION}.dev$(date +%Y%m%d)"
           echo "Nightly version: $NIGHTLY_VERSION"
 
           # Update pyproject.toml with nightly version (temporary, not committed)
-          sed -i "s/version = \"${CURRENT_VERSION}\"/version = \"${CURRENT_VERSION}\"/g" pyproject.toml
-          sed -i "0,/version = \"${CURRENT_VERSION}\"/s//version = \"${NIGHTLY_VERSION}\"/" pyproject.toml
+          sed -i "s/version = \"${CURRENT_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" pyproject.toml
 
           # Verify the change
           cat pyproject.toml | grep "^version"
 
       - name: Build SDist
-        run: |
-          pip install build
-          python -m pip install -U packaging tomli
-          python -m build --sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          rust-toolchain: stable
 
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
           path: dist/*.tar.gz
 
-  upload:
-    name: Upload to TestPyPI
-    if: github.repository == 'sgl-project/sglang'  # Ensure this job only runs for the sgl-project/sglang repository
-    needs: [build, build-sdist]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
+  # upload:
+  #   name: Upload to TestPyPI
+  #   if: github.repository == 'sgl-project/sglang'  # Ensure this job only runs for the sgl-project/sglang repository
+  #   needs: [build, build-sdist]
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/download-artifact@v4
+  #       with:
+  #         path: dist
+  #         merge-multiple: true
 
-      - name: Upload to TestPyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_TOKEN_ROUTER }}
-        run: |
-          pip install twine
-          twine upload --repository testpypi dist/* --verbose
+  #     - name: Upload to TestPyPI
+  #       env:
+  #         TWINE_USERNAME: __token__
+  #         TWINE_PASSWORD: ${{ secrets.TEST_PYPI_TOKEN_ROUTER }}
+  #       run: |
+  #         pip install twine
+  #         twine upload --repository testpypi dist/* --verbose
