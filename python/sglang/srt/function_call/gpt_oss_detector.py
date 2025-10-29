@@ -221,7 +221,7 @@ class GptOssDetector(BaseFormatDetector):
         # Check if tool exists
         if function_name not in tool_indices:
             logger.debug(f"Function {function_name} not in available tools")
-            if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.value:
+            if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                 return None  # Skip unknown tools (default legacy behavior)
 
         # Parse JSON arguments

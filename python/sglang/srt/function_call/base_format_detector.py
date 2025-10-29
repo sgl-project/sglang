@@ -78,7 +78,7 @@ class BaseFormatDetector(ABC):
             name = act.get("name")
             if not (name and name in tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
-                if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.value:
+                if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                     continue  # Skip unknown tools (default legacy behavior)
 
             results.append(

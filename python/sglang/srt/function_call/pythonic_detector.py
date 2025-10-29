@@ -92,7 +92,7 @@ class PythonicDetector(BaseFormatDetector):
                     logger.warning(
                         f"Model attempted to call undefined function: {function_name}"
                     )
-                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.value:
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                         continue  # Skip unknown tools (default legacy behavior)
 
                 arguments = {}

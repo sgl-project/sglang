@@ -124,7 +124,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     is_valid = function_name in self._tool_indices
                     if not is_valid:
                         logger.warning(f"Invalid function name: {function_name}")
-                        if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.value:
+                        if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                             # Reset state and skip (default legacy behavior)
                             self._reset_streaming_state()
                             normal += self._buf
