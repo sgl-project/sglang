@@ -14,12 +14,14 @@ use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use super::utils::{event_types, generate_id};
+use super::utils::event_types;
 use crate::{
     mcp,
-    protocols::responses::{ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
+    protocols::responses::{
+        generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
+    },
     routers::header_utils::apply_request_headers,
 };
 
@@ -191,31 +193,6 @@ pub async fn ensure_request_mcp_client(
 // Tool Execution
 // ============================================================================
 
-/// Execute an MCP tool call
-pub(super) async fn execute_mcp_call(
-    mcp_mgr: &Arc<mcp::McpManager>,
-    tool_name: &str,
-    args_json_str: &str,
-) -> Result<(String, String), String> {
-    let args_value: Value =
-        serde_json::from_str(args_json_str).map_err(|e| format!("parse tool args: {}", e))?;
-    let args_obj = args_value.as_object().cloned();
-
-    let server_name = mcp_mgr
-        .get_tool(tool_name)
-        .map(|t| t.server)
-        .ok_or_else(|| format!("tool not found: {}", tool_name))?;
-
-    let result = mcp_mgr
-        .call_tool(tool_name, args_obj)
-        .await
-        .map_err(|e| format!("tool call failed: {}", e))?;
-
-    let output_str = serde_json::to_string(&result)
-        .map_err(|e| format!("Failed to serialize tool result: {}", e))?;
-    Ok((server_name, output_str))
-}
-
 /// Execute detected tool calls and send completion events to client
 /// Returns false if client disconnected during execution
 pub(super) async fn execute_streaming_tool_calls(
@@ -249,12 +226,26 @@ pub(super) async fn execute_streaming_tool_calls(
             &call.arguments_buffer
         };
 
-        let call_result = execute_mcp_call(active_mcp, &call.name, args_str).await;
+        // Call tool directly - manager handles parsing and type coercion
+        debug!("Calling MCP tool '{}' with args: {}", call.name, args_str);
+        let call_result = active_mcp.call_tool(&call.name, args_str).await;
         let (output_str, success, error_msg) = match call_result {
-            Ok((_, output)) => (output, true, None),
+            Ok(result) => match serde_json::to_string(&result) {
+                Ok(output) => (output, true, None),
+                Err(e) => {
+                    let err = format!("Failed to serialize tool result: {}", e);
+                    warn!("{}", err);
+                    (json!({ "error": &err }).to_string(), false, Some(err))
+                }
+            },
             Err(err) => {
-                warn!("Tool execution failed during streaming: {}", err);
-                (json!({ "error": &err }).to_string(), false, Some(err))
+                let err_str = format!("tool call failed: {}", err);
+                warn!("Tool execution failed during streaming: {}", err_str);
+                (
+                    json!({ "error": &err_str }).to_string(),
+                    false,
+                    Some(err_str),
+                )
             }
         };
 
@@ -304,11 +295,7 @@ pub(super) fn prepare_mcp_payload_for_streaming(
         let mut tools_json = Vec::new();
         let tools = active_mcp.list_tools();
         for t in tools {
-            let parameters = t.parameters.clone().unwrap_or(serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }));
+            let parameters = Value::Object((*t.input_schema).clone());
             let tool = serde_json::json!({
                 "type": event_types::ITEM_TYPE_FUNCTION,
                 "name": t.name,
@@ -674,15 +661,27 @@ pub(super) async fn execute_tool_loop(
                 );
             }
 
-            // Execute tool
-            let call_result = execute_mcp_call(active_mcp, &tool_name, &args_json_str).await;
+            // Execute tool - manager handles parsing and type coercion
+            debug!(
+                "Calling MCP tool '{}' with args: {}",
+                tool_name, args_json_str
+            );
+            let call_result = active_mcp
+                .call_tool(&tool_name, args_json_str.as_str())
+                .await;
 
             let output_str = match call_result {
-                Ok((_, output)) => output,
+                Ok(result) => match serde_json::to_string(&result) {
+                    Ok(output) => output,
+                    Err(e) => {
+                        warn!("Failed to serialize tool result: {}", e);
+                        json!({ "error": format!("Serialization error: {}", e) }).to_string()
+                    }
+                },
                 Err(err) => {
                     warn!("Tool execution failed: {}", err);
                     // Return error as output, let model decide how to proceed
-                    json!({ "error": err }).to_string()
+                    json!({ "error": format!("tool call failed: {}", err) }).to_string()
                 }
             };
 
@@ -861,11 +860,7 @@ pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label
             json!({
                 "name": t.name,
                 "description": t.description,
-                "input_schema": t.parameters.clone().unwrap_or_else(|| json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                })),
+                "input_schema": Value::Object((*t.input_schema).clone()),
                 "annotations": {
                     "read_only": false
                 }

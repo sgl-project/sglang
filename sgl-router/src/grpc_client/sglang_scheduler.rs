@@ -20,7 +20,9 @@ use crate::protocols::{
 };
 
 // Include the generated protobuf code
+#[allow(clippy::all)]
 pub mod proto {
+    #![allow(clippy::all, unused_qualifications)]
     tonic::include_proto!("sglang.grpc.scheduler");
 }
 
