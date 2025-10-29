@@ -7,6 +7,7 @@ edition = "2021"
 default = ["grpc-client"]
 grpc-client = []
 grpc-server = []
+vendored-openssl = ["openssl/vendored"]
 
 [lints.rust]
 unused_qualifications = "warn"
@@ -67,7 +68,7 @@ tiktoken-rs = { version = "0.7.0" }
 minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins"] }
 minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-openssl = { version = "0.10.73", features = ["vendored"] }
+openssl = "0.10.73"
 hf-hub = { version = "0.4.3", features = ["tokio"] }
 rmcp = { version = "0.8.3", features = ["client", "server",
     "transport-child-process",
