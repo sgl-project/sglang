@@ -184,28 +184,51 @@ impl HarmonyPreparationStage {
     }
 
     /// Build structural tag for required tool call (at least one)
+    ///
+    /// Uses new xgrammar format with sequence + or to enforce from the start.
+    /// Forces <|start|>assistant then immediately one of the tool calls.
     fn build_harmony_required_tag(tools: &[Tool]) -> Result<String, Response> {
-        let mut tags = Vec::new();
+        let mut tool_options = Vec::new();
 
         for tool in tools {
             let tool_name = &tool.function.name;
             let params_schema = &tool.function.parameters;
 
-            // Each tool becomes a tag with begin/schema/end
-            tags.push(json!({
-                "begin": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
-                "schema": params_schema,
-                "end": "<|call|>"
+            // Each tool becomes a sequence: commentary header + json_schema + call marker
+            tool_options.push(json!({
+                "type": "sequence",
+                "elements": [
+                    {
+                        "type": "const_string",
+                        "value": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name)
+                    },
+                    {
+                        "type": "json_schema",
+                        "json_schema": params_schema
+                    },
+                    {
+                        "type": "const_string",
+                        "value": "<|call|>"
+                    }
+                ]
             }));
         }
 
-        // Use triggered_tags with at_least_one: true
+        // New xgrammar format with "format" field
         let structural_tag = json!({
-            "type": "triggered_tags",
-            "triggers": ["<|channel|>commentary"],
-            "tags": tags,
-            "at_least_one": true,
-            "stop_after_first": false
+            "format": {
+                "type": "sequence",
+                "elements": [
+                    {
+                        "type": "const_string",
+                        "value": "<|start|>assistant"
+                    },
+                    {
+                        "type": "or",
+                        "elements": tool_options
+                    }
+                ]
+            }
         });
 
         serde_json::to_string(&structural_tag)
@@ -221,19 +244,29 @@ impl HarmonyPreparationStage {
 
         let params_schema = &tool.function.parameters;
 
-        // Single tag for specific function
-        let tag = json!({
-            "begin": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", function_name),
-            "schema": params_schema,
-            "end": "<|call|>"
-        });
-
+        // New xgrammar format with "format" field
         let structural_tag = json!({
-            "type": "triggered_tags",
-            "triggers": ["<|channel|>commentary"],
-            "tags": [tag],
-            "at_least_one": true,
-            "stop_after_first": true
+            "format": {
+                "type": "sequence",
+                "elements": [
+                    {
+                        "type": "const_string",
+                        "value": "<|start|>assistant"
+                    },
+                    {
+                        "type": "const_string",
+                        "value": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", function_name)
+                    },
+                    {
+                        "type": "json_schema",
+                        "json_schema": params_schema
+                    },
+                    {
+                        "type": "const_string",
+                        "value": "<|call|>"
+                    }
+                ]
+            }
         });
 
         serde_json::to_string(&structural_tag)
