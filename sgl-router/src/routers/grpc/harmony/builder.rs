@@ -865,12 +865,12 @@ impl HarmonyBuilder {
 
     /// Extract selection text for worker routing
     ///
-    /// Uses the last user message (or a concise snippet) for load balancing
+    /// Uses the last user message for load balancing
     fn extract_selection_text(&self, messages: &[HarmonyMessage]) -> String {
         // Find the last user message
         if let Some(last_user_msg) = messages.iter().rev().find(|m| m.author.role == Role::User) {
-            // Extract text from content
-            let text = last_user_msg
+            // Extract full text from content
+            return last_user_msg
                 .content
                 .iter()
                 .filter_map(|c| match c {
@@ -879,12 +879,9 @@ impl HarmonyBuilder {
                 })
                 .collect::<Vec<_>>()
                 .join("");
-
-            // Return first 100 characters for routing
-            return text.chars().take(100).collect();
         }
 
-        // Fallback: concatenate all text and take first 100 chars
+        // Fallback: concatenate all text
         messages
             .iter()
             .flat_map(|m| &m.content)
@@ -894,9 +891,6 @@ impl HarmonyBuilder {
             })
             .collect::<Vec<_>>()
             .join(" ")
-            .chars()
-            .take(100)
-            .collect()
     }
 }
 
