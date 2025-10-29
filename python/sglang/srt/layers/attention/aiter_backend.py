@@ -614,11 +614,8 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
             qo_indptr = self.forward_metadata.qo_indptr
-            if self.kv_cache_dtype == fp8_dtype:
-                K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(torch.bfloat16)
-            else:
-                K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
+            K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             V_Buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
             kv_lora_rank = V_Buffer.shape[-1]
             qk_rope_head_dim = K_Buffer.shape[-1] - kv_lora_rank
@@ -651,6 +648,11 @@ class AiterAttnBackend(AttentionBackend):
                     kvc, k_pe = torch.split(
                         K_Buffer, [kv_lora_rank, qk_rope_head_dim], dim=-1
                     )
+
+                    if self.kv_cache_dtype == fp8_dtype:
+                        kvc  = kvc.to(torch.bfloat16)
+                        k_pe = k_pe.to(torch.bfloat16)
+
                     kvprefix = layer.kv_b_proj(kvc.contiguous())[0]
 
                     kvprefix = kvprefix.view(
@@ -659,7 +661,7 @@ class AiterAttnBackend(AttentionBackend):
                     k_prefix, v_prefix = torch.split(
                         kvprefix, [qk_nope_head_dim, layer.v_head_dim], dim=-1
                     )
-
+                    
                     k_prefix = torch.cat(
                         [
                             k_prefix,
@@ -717,7 +719,7 @@ class AiterAttnBackend(AttentionBackend):
                 o = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
                 mla_decode_fwd(
                     q,
-                    K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                    K_Buffer.view(-1, 1, 1, layer.qk_head_dim).to(torch.bfloat16),
                     o,
                     self.forward_metadata.qo_indptr,
                     self.forward_metadata.kv_indptr,
@@ -737,7 +739,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices = self.forward_metadata.kv_indices
                 mla_prefill_fwd(
                     q,
-                    K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                    K_Buffer.view(-1, 1, 1, layer.qk_head_dim).to(torch.bfloat16),
                     o,
                     self.forward_metadata.qo_indptr,
                     self.forward_metadata.kv_indptr,
@@ -875,14 +877,18 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_indptr,
                 reduce_final_map,
                 reduce_partial_map,
-                split_params=split_params
+                kv_granularity=max(page_size, 16),
+                max_seqlen_qo=self.forward_metadata.max_q_len,
+                uni_seqlen_qo=self.forward_metadata.max_q_len,
+                fast_mode=True,
             )
-
 
             if self.kv_cache_dtype == fp8_dtype:
                 q_input, q_scale = scaled_fp8_quant(
                     q,
                 )
+                q_scale = q_scale.to(torch.float)
+                kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
             else:
                 q_input = q
 
@@ -903,8 +909,10 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_indptr=reduce_indptr,
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
+                q_scale=q_scale,
+                kv_scale=kv_scale,
             )
-            k_buffer = k_buffer.view(-1, 1, layer.qk_head_dim)
+            #k_buffer = k_buffer.view(-1, 1, layer.qk_head_dim)
         else:
             self.logits_soft_cap = layer.logit_cap
             paged_attention_ragged(
