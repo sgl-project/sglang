@@ -87,7 +87,7 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
-            cudagraph = torch.npu.NPUGraph()
+            npugraph = torch.npu.NPUGraph()
 
             with ExitStack() as stack:
                 if not self.is_first_graph:
@@ -98,10 +98,10 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
                     # therefore, we only run gc for the first graph,
                     # and disable gc for the rest of the graphs.
                     stack.enter_context(patch("gc.collect", lambda: None))
-                    stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
+                    stack.enter_context(patch("torch.npu.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.npu.graph(cudagraph, pool=self.graph_pool):
+                with torch.npu.graph(npugraph, pool=self.graph_pool):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
                     if self.is_last_graph:
@@ -115,7 +115,7 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
             # here we always use weak ref for the output
             # to save memory
             entry.output = weak_ref_tensors(output)
-            entry.cudagraph = cudagraph
+            entry.cudagraph = npugraph
 
             compilation_counter.num_cudagraph_captured += 1
 
