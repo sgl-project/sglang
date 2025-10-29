@@ -131,6 +131,7 @@ impl McpManager {
             )
             .await?;
 
+        self.inventory.clear_server_tools(&server_key);
         Self::load_server_inventory(&self.inventory, &server_name, &client).await;
         Ok(client)
     }
