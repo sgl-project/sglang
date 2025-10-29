@@ -1,6 +1,10 @@
 name: Lint
 
-on: [pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
   lint:
@@ -19,7 +23,7 @@ jobs:
           pre-commit install
 
       - name: Run pre-commit checks
-        run: pre-commit run --all-files --show-diff-on-failure
+        run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
 
       - name: Run sgl-kernel clang-format checks
         uses: DoozyX/clang-format-lint-action@v0.18.1

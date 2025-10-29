@@ -855,14 +855,24 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
+                    cu_seqlens_k = (
+                        metadata.cu_seqlens_q
+                        if not forward_batch.mha_one_shot
+                        else metadata.cu_seqlens_k
+                    )
+                    max_seqlen_k = (
+                        metadata.max_seq_len_q
+                        if not forward_batch.mha_one_shot
+                        else metadata.max_seq_len_k
+                    )
                     output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
                         cu_seqlens_q=metadata.cu_seqlens_q,
-                        cu_seqlens_k=metadata.cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
                         max_seqlen_q=metadata.max_seq_len_q,
-                        max_seqlen_k=metadata.max_seq_len_q,
+                        max_seqlen_k=max_seqlen_k,
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
@@ -2320,7 +2330,7 @@ class FlashAttentionMultiStepBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends = []
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 FlashAttentionBackend(
                     model_runner,
@@ -2335,7 +2345,7 @@ class FlashAttentionMultiStepBackend:
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
     def init_forward_metadata_capture_cuda_graph(

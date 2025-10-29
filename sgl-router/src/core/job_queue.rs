@@ -3,21 +3,36 @@
 //! Provides non-blocking worker management by queuing operations and processing
 //! them asynchronously in background worker tasks.
 
-use crate::core::WorkerManager;
-use crate::protocols::worker_spec::{JobStatus, WorkerConfigRequest};
-use crate::server::AppContext;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+    time::{Duration, SystemTime},
+};
+
 use dashmap::DashMap;
-use metrics::{counter, gauge, histogram};
-use std::sync::{Arc, Weak};
-use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+use crate::{
+    app_context::AppContext,
+    config::{RouterConfig, RoutingMode},
+    core::workflow::{
+        steps::{McpServerConfigRequest, WorkerRemovalRequest},
+        WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus,
+    },
+    mcp::McpConfig,
+    metrics::RouterMetrics,
+    protocols::worker_spec::{JobStatus, WorkerConfigRequest},
+};
 
 /// Job types for control plane operations
 #[derive(Debug, Clone)]
 pub enum Job {
     AddWorker { config: Box<WorkerConfigRequest> },
     RemoveWorker { url: String },
+    InitializeWorkersFromConfig { router_config: Box<RouterConfig> },
+    InitializeMcpServers { mcp_config: Box<McpConfig> },
+    RegisterMcpServer { config: Box<McpServerConfigRequest> },
 }
 
 impl Job {
@@ -26,14 +41,20 @@ impl Job {
         match self {
             Job::AddWorker { .. } => "AddWorker",
             Job::RemoveWorker { .. } => "RemoveWorker",
+            Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
+            Job::InitializeMcpServers { .. } => "InitializeMcpServers",
+            Job::RegisterMcpServer { .. } => "RegisterMcpServer",
         }
     }
 
-    /// Get worker URL for logging
+    /// Get worker URL or MCP server name for logging
     pub fn worker_url(&self) -> &str {
         match self {
             Job::AddWorker { config } => &config.url,
             Job::RemoveWorker { url } => url,
+            Job::InitializeWorkersFromConfig { .. } => "startup",
+            Job::InitializeMcpServers { .. } => "startup",
+            Job::RegisterMcpServer { config } => &config.name,
         }
     }
 }
@@ -92,7 +113,7 @@ impl Default for JobQueueConfig {
     fn default() -> Self {
         Self {
             queue_capacity: 1000,
-            worker_count: 2,
+            worker_count: 10,
         }
     }
 }
@@ -123,7 +144,7 @@ impl JobQueue {
     pub fn new(config: JobQueueConfig, context: Weak<AppContext>) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(config.queue_capacity);
 
-        info!(
+        debug!(
             "Initializing worker job queue: capacity={}, workers={}",
             config.queue_capacity, config.worker_count
         );
@@ -160,7 +181,7 @@ impl JobQueue {
     pub async fn submit(&self, job: Job) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
         if self.context.upgrade().is_none() {
-            counter!("sgl_router_job_shutdown_rejected_total").increment(1);
+            RouterMetrics::record_job_shutdown_rejected();
             return Err("Job queue shutting down: AppContext dropped".to_string());
         }
 
@@ -177,17 +198,15 @@ impl JobQueue {
         match self.tx.send(job).await {
             Ok(_) => {
                 let queue_depth = self.tx.max_capacity() - self.tx.capacity();
-                gauge!("sgl_router_job_queue_depth").set(queue_depth as f64);
-
-                info!(
+                RouterMetrics::set_job_queue_depth(queue_depth);
+                debug!(
                     "Job submitted: type={}, worker={}, queue_depth={}",
                     job_type, worker_url, queue_depth
                 );
                 Ok(())
             }
             Err(_) => {
-                counter!("sgl_router_job_queue_full_total").increment(1);
-                // Remove status on failure
+                RouterMetrics::record_job_queue_full();
                 self.status_map.remove(&worker_url);
                 Err("Worker job queue full".to_string())
             }
@@ -211,7 +230,7 @@ impl JobQueue {
         context: Weak<AppContext>,
         status_map: Arc<DashMap<String, JobStatus>>,
     ) {
-        info!("Worker job queue worker {} started", worker_id);
+        debug!("Worker job queue worker {} started", worker_id);
 
         loop {
             // Lock the receiver and try to receive a job
@@ -232,7 +251,7 @@ impl JobQueue {
                         JobStatus::processing(&job_type, &worker_url),
                     );
 
-                    info!(
+                    debug!(
                         "Worker {} processing job: type={}, worker={}",
                         worker_id, job_type, worker_url
                     );
@@ -240,39 +259,16 @@ impl JobQueue {
                     // Upgrade weak reference to process job
                     match context.upgrade() {
                         Some(ctx) => {
-                            // Execute job
                             let result = Self::execute_job(&job, &ctx).await;
                             let duration = start.elapsed();
-
-                            // Record metrics
-                            histogram!("sgl_router_job_duration_seconds", "job_type" => job_type.clone())
-                                .record(duration.as_secs_f64());
-
-                            match result {
-                                Ok(message) => {
-                                    counter!("sgl_router_job_success_total", "job_type" => job_type.clone())
-                                        .increment(1);
-                                    // Remove status on success - worker in registry is sufficient
-                                    status_map.remove(&worker_url);
-                                    info!(
-                                        "Worker {} completed job: type={}, worker={}, duration={:.3}s, result={}",
-                                        worker_id, job_type, worker_url, duration.as_secs_f64(), message
-                                    );
-                                }
-                                Err(error) => {
-                                    counter!("sgl_router_job_failure_total", "job_type" => job_type.clone())
-                                        .increment(1);
-                                    // Keep failed status for API to report error details
-                                    status_map.insert(
-                                        worker_url.clone(),
-                                        JobStatus::failed(&job_type, &worker_url, error.clone()),
-                                    );
-                                    warn!(
-                                        "Worker {} failed job: type={}, worker={}, duration={:.3}s, error={}",
-                                        worker_id, job_type, worker_url, duration.as_secs_f64(), error
-                                    );
-                                }
-                            }
+                            Self::record_job_completion(
+                                &job_type,
+                                &worker_url,
+                                worker_id,
+                                duration,
+                                &result,
+                                &status_map,
+                            );
                         }
                         None => {
                             let error_msg = "AppContext dropped".to_string();
@@ -298,27 +294,354 @@ impl JobQueue {
             }
         }
 
-        warn!("Worker job queue worker {} stopped", worker_id);
+        debug!("Worker job queue worker {} stopped", worker_id);
     }
 
     /// Execute a specific job
     async fn execute_job(job: &Job, context: &Arc<AppContext>) -> Result<String, String> {
         match job {
             Job::AddWorker { config } => {
-                // Register worker with is_healthy=false
-                let worker =
-                    WorkerManager::add_worker_from_config(config.as_ref(), context).await?;
+                let engine = context
+                    .workflow_engine
+                    .get()
+                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
 
-                // Validate and activate
-                WorkerManager::validate_and_activate_worker(&worker, context).await
+                let instance_id = Self::start_worker_workflow(engine, config, context).await?;
+
+                debug!(
+                    "Started worker registration workflow for {} (instance: {})",
+                    config.url, instance_id
+                );
+
+                let timeout_duration =
+                    Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
+
+                Self::wait_for_workflow_completion(
+                    engine,
+                    instance_id,
+                    &config.url,
+                    timeout_duration,
+                )
+                .await
             }
             Job::RemoveWorker { url } => {
-                let result = WorkerManager::remove_worker(url, context);
+                let engine = context
+                    .workflow_engine
+                    .get()
+                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+
+                let instance_id = Self::start_worker_removal_workflow(engine, url, context).await?;
+
+                debug!(
+                    "Started worker removal workflow for {} (instance: {})",
+                    url, instance_id
+                );
+
+                let timeout_duration = Duration::from_secs(30);
+
+                let result =
+                    Self::wait_for_workflow_completion(engine, instance_id, url, timeout_duration)
+                        .await;
+
                 // Clean up job status when removing worker
                 if let Some(queue) = context.worker_job_queue.get() {
                     queue.remove_status(url);
                 }
+
                 result
+            }
+            Job::InitializeWorkersFromConfig { router_config } => {
+                let api_key = router_config.api_key.clone();
+                let mut worker_count = 0;
+
+                // Create iterator of (url, worker_type, bootstrap_port) tuples based on mode
+                let workers: Vec<(String, &str, Option<u16>)> = match &router_config.mode {
+                    RoutingMode::Regular { worker_urls } => worker_urls
+                        .iter()
+                        .map(|url| (url.clone(), "regular", None))
+                        .collect(),
+                    RoutingMode::PrefillDecode {
+                        prefill_urls,
+                        decode_urls,
+                        ..
+                    } => {
+                        let prefill_workers = prefill_urls
+                            .iter()
+                            .map(|(url, port)| (url.clone(), "prefill", *port));
+
+                        let decode_workers =
+                            decode_urls.iter().map(|url| (url.clone(), "decode", None));
+
+                        prefill_workers.chain(decode_workers).collect()
+                    }
+                    RoutingMode::OpenAI { .. } => {
+                        info!("OpenAI mode: no workers to initialize");
+                        return Ok("OpenAI mode: no workers to initialize".to_string());
+                    }
+                };
+
+                debug!(
+                    "Creating AddWorker jobs for {} workers from config",
+                    workers.len()
+                );
+
+                // Process all workers with unified loop
+                for (url, worker_type, bootstrap_port) in workers {
+                    let url_for_error = url.clone(); // Clone for error message
+                    let config = WorkerConfigRequest {
+                        url,
+                        api_key: api_key.clone(),
+                        worker_type: Some(worker_type.to_string()),
+                        labels: HashMap::new(),
+                        model_id: None,
+                        priority: None,
+                        cost: None,
+                        tokenizer_path: None,
+                        reasoning_parser: None,
+                        tool_parser: None,
+                        chat_template: None,
+                        bootstrap_port,
+                        health_check_timeout_secs: router_config.health_check.timeout_secs,
+                        health_check_interval_secs: router_config.health_check.check_interval_secs,
+                        health_success_threshold: router_config.health_check.success_threshold,
+                        health_failure_threshold: router_config.health_check.failure_threshold,
+                        max_connection_attempts: router_config.health_check.success_threshold * 10,
+                        dp_aware: router_config.dp_aware,
+                    };
+
+                    let job = Job::AddWorker {
+                        config: Box::new(config),
+                    };
+
+                    if let Some(queue) = context.worker_job_queue.get() {
+                        queue.submit(job).await.map_err(|e| {
+                            format!(
+                                "Failed to submit AddWorker job for {} worker {}: {}",
+                                worker_type, url_for_error, e
+                            )
+                        })?;
+                        worker_count += 1;
+                    } else {
+                        return Err("JobQueue not available".to_string());
+                    }
+                }
+
+                Ok(format!("Submitted {} AddWorker jobs", worker_count))
+            }
+            Job::InitializeMcpServers { mcp_config } => {
+                let mut server_count = 0;
+
+                debug!(
+                    "Creating RegisterMcpServer jobs for {} MCP servers from config",
+                    mcp_config.servers.len()
+                );
+
+                // Submit RegisterMcpServer jobs for each server in the config
+                for server_config in &mcp_config.servers {
+                    let mcp_server_request = McpServerConfigRequest {
+                        name: server_config.name.clone(),
+                        config: server_config.clone(),
+                    };
+
+                    let job = Job::RegisterMcpServer {
+                        config: Box::new(mcp_server_request),
+                    };
+
+                    if let Some(queue) = context.worker_job_queue.get() {
+                        queue.submit(job).await.map_err(|e| {
+                            format!(
+                                "Failed to submit RegisterMcpServer job for '{}': {}",
+                                server_config.name, e
+                            )
+                        })?;
+                        server_count += 1;
+                    } else {
+                        return Err("JobQueue not available".to_string());
+                    }
+                }
+
+                Ok(format!("Submitted {} RegisterMcpServer jobs", server_count))
+            }
+            Job::RegisterMcpServer { config } => {
+                let engine = context
+                    .workflow_engine
+                    .get()
+                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+
+                let instance_id =
+                    Self::start_mcp_registration_workflow(engine, config, context).await?;
+
+                debug!(
+                    "Started MCP registration workflow for {} (instance: {})",
+                    config.name, instance_id
+                );
+
+                let timeout_duration = Duration::from_secs(7200 + 30); // 2hr + margin
+
+                Self::wait_for_workflow_completion(
+                    engine,
+                    instance_id,
+                    &config.name,
+                    timeout_duration,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Start a workflow and return its instance ID
+    async fn start_worker_workflow(
+        engine: &Arc<WorkflowEngine>,
+        config: &WorkerConfigRequest,
+        context: &Arc<AppContext>,
+    ) -> Result<WorkflowInstanceId, String> {
+        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
+        workflow_context.set("worker_config", config.clone());
+        workflow_context.set_arc("app_context", Arc::clone(context));
+
+        engine
+            .start_workflow(WorkflowId::new("worker_registration"), workflow_context)
+            .await
+            .map_err(|e| format!("Failed to start worker registration workflow: {:?}", e))
+    }
+
+    /// Start worker removal workflow
+    async fn start_worker_removal_workflow(
+        engine: &Arc<WorkflowEngine>,
+        url: &str,
+        context: &Arc<AppContext>,
+    ) -> Result<WorkflowInstanceId, String> {
+        let removal_request = WorkerRemovalRequest {
+            url: url.to_string(),
+            dp_aware: context.router_config.dp_aware,
+        };
+
+        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
+        workflow_context.set("removal_request", removal_request);
+        workflow_context.set_arc("app_context", Arc::clone(context));
+
+        engine
+            .start_workflow(WorkflowId::new("worker_removal"), workflow_context)
+            .await
+            .map_err(|e| format!("Failed to start worker removal workflow: {:?}", e))
+    }
+
+    /// Start MCP server registration workflow
+    async fn start_mcp_registration_workflow(
+        engine: &Arc<WorkflowEngine>,
+        config: &McpServerConfigRequest,
+        context: &Arc<AppContext>,
+    ) -> Result<WorkflowInstanceId, String> {
+        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
+        workflow_context.set("mcp_server_config", config.clone());
+        workflow_context.set_arc("app_context", Arc::clone(context));
+
+        engine
+            .start_workflow(WorkflowId::new("mcp_registration"), workflow_context)
+            .await
+            .map_err(|e| format!("Failed to start MCP registration workflow: {:?}", e))
+    }
+
+    /// Wait for workflow completion with adaptive polling
+    async fn wait_for_workflow_completion(
+        engine: &Arc<WorkflowEngine>,
+        instance_id: WorkflowInstanceId,
+        worker_url: &str,
+        timeout_duration: Duration,
+    ) -> Result<String, String> {
+        let start = std::time::Instant::now();
+        let mut poll_interval = Duration::from_millis(100);
+        let max_poll_interval = Duration::from_millis(2000);
+        let poll_backoff = Duration::from_millis(200);
+
+        loop {
+            // Check timeout
+            if start.elapsed() > timeout_duration {
+                return Err(format!(
+                    "Workflow timeout after {}s for worker {}",
+                    timeout_duration.as_secs(),
+                    worker_url
+                ));
+            }
+
+            // Get workflow status
+            let state = engine
+                .get_status(instance_id)
+                .map_err(|e| format!("Failed to get workflow status: {:?}", e))?;
+
+            let result = match state.status {
+                WorkflowStatus::Completed => Ok(format!(
+                    "Worker {} registered and activated successfully via workflow",
+                    worker_url
+                )),
+                WorkflowStatus::Failed => {
+                    let current_step = state.current_step.as_ref();
+                    let step_name = current_step
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let error_msg = current_step
+                        .and_then(|step_id| state.step_states.get(step_id))
+                        .and_then(|s| s.last_error.as_deref())
+                        .unwrap_or("Unknown error");
+                    Err(format!(
+                        "Workflow failed at step {}: {}",
+                        step_name, error_msg
+                    ))
+                }
+                WorkflowStatus::Cancelled => {
+                    Err(format!("Workflow cancelled for worker {}", worker_url))
+                }
+                WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
+                    tokio::time::sleep(poll_interval).await;
+                    poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
+                    continue;
+                }
+            };
+
+            // Clean up terminal workflow states
+            engine.state_store().cleanup_if_terminal(instance_id);
+            return result;
+        }
+    }
+
+    /// Record job completion metrics and update status
+    fn record_job_completion(
+        job_type: &str,
+        worker_url: &str,
+        worker_id: usize,
+        duration: Duration,
+        result: &Result<String, String>,
+        status_map: &Arc<DashMap<String, JobStatus>>,
+    ) {
+        RouterMetrics::record_job_duration(job_type, duration);
+
+        match result {
+            Ok(message) => {
+                RouterMetrics::record_job_success(job_type);
+                status_map.remove(worker_url);
+                debug!(
+                    "Worker {} completed job: type={}, worker={}, duration={:.3}s, result={}",
+                    worker_id,
+                    job_type,
+                    worker_url,
+                    duration.as_secs_f64(),
+                    message
+                );
+            }
+            Err(error) => {
+                RouterMetrics::record_job_failure(job_type);
+                status_map.insert(
+                    worker_url.to_string(),
+                    JobStatus::failed(job_type, worker_url, error.clone()),
+                );
+                warn!(
+                    "Worker {} failed job: type={}, worker={}, duration={:.3}s, error={}",
+                    worker_id,
+                    job_type,
+                    worker_url,
+                    duration.as_secs_f64(),
+                    error
+                );
             }
         }
     }
@@ -344,17 +667,5 @@ impl JobQueue {
                 status_map.len()
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_job_queue_config_default() {
-        let config = JobQueueConfig::default();
-        assert_eq!(config.queue_capacity, 1000);
-        assert_eq!(config.worker_count, 2);
     }
 }

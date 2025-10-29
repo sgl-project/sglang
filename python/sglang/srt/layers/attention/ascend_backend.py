@@ -20,7 +20,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-import os
 
 import numpy as np
 
@@ -356,6 +355,11 @@ class AscendAttnBackend(AttentionBackend):
             assert (
                 layer.qk_head_dim != layer.v_head_dim
             ), "FIA only supports qk_head_dim != v_head_dim"
+            num_token_padding = q.shape[0]
+            q, k, v = [
+                data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+            ]
+
             q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -375,6 +379,18 @@ class AscendAttnBackend(AttentionBackend):
                 next_tokens=0,
             )
 
+            attn_output = attn_output.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                attn_output = torch.cat(
+                    [
+                        attn_output,
+                        attn_output.new_zeros(
+                            num_token_padding - attn_output.shape[0],
+                            *attn_output.shape[1:],
+                        ),
+                    ],
+                    dim=0,
+                )
         return attn_output
 
     def forward_decode_graph(

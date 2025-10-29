@@ -27,7 +27,7 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
+SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 
 
 class Sampler(nn.Module):
@@ -99,8 +99,16 @@ class Sampler(nn.Module):
             )
 
             # If requested, cache probabilities from original logits before temperature scaling.
-            if return_logprob and RETURN_ORIGINAL_LOGPROB:
+            if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
+
+            if get_global_server_args().rl_on_policy_target == "fsdp":
+                logits_div_temperature = (
+                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
+                )
+                logprobs_via_logsoftmax_kernel = torch.log_softmax(
+                    logits_div_temperature, dim=-1
+                )
 
             # Post process logits
             logits.div_(sampling_info.temperatures)
@@ -148,8 +156,11 @@ class Sampler(nn.Module):
                     )
 
             if return_logprob:
+                if get_global_server_args().rl_on_policy_target == "fsdp":
+                    logprobs = logprobs_via_logsoftmax_kernel
+                    del logprobs_via_logsoftmax_kernel
                 # clamp to avoid -inf
-                if RETURN_ORIGINAL_LOGPROB:
+                elif SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = torch.log(probs_without_temp_scaling).clamp(
                         min=torch.finfo(probs_without_temp_scaling.dtype).min
                     )
