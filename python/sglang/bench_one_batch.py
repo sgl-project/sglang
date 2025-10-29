@@ -135,13 +135,15 @@ def stop_profile(
             rank_print(f"Failed to stop CUDA profiler: {e}")
     elif profiler is not None:
         profiler.stop()
-    
+
     if save_trace:
         if profiler is not None:
             if trace_filename:
                 _save_profile_trace_results(profiler, trace_filename)
                 stage_desc = f"for {stage}" if stage else ""
-                rank_print(f"torch profiler chrome trace {stage_desc} saved to {trace_filename}")
+                rank_print(
+                    f"torch profiler chrome trace {stage_desc} saved to {trace_filename}"
+                )
         if "CUDA_PROFILER" in profiler_activities:
             rank_print(f"CUDA profiler trace for {stage} completed")
 
@@ -190,9 +192,7 @@ class BenchArgs:
             default=BenchArgs.log_decode_step,
             help="Log decode latency by step, default is set to zero to disable.",
         )
-        parser.add_argument(
-            "--profile", action="store_true", help="Enable profiling."
-        )
+        parser.add_argument("--profile", action="store_true", help="Enable profiling.")
         parser.add_argument(
             "--profile-record-shapes",
             action="store_true",
@@ -516,11 +516,13 @@ def latency_test_run_once(
 
     tot_latency = 0
 
-    profiler = start_profile(
-        bench_args.profiler_activities,
-        profile_record_shapes=profile_record_shapes,
-        rank_print=rank_print,
-    )
+    profiler = None
+    if profile:
+        profiler = start_profile(
+            bench_args.profiler_activities,
+            profile_record_shapes=profile_record_shapes,
+            rank_print=rank_print,
+        )
 
     synchronize(device)
     tic = time.perf_counter()
@@ -528,17 +530,18 @@ def latency_test_run_once(
     synchronize(device)
     prefill_latency = time.perf_counter() - tic
 
-    trace_filename = _create_torch_profiler_filename(
-        profile_filename_prefix, batch_size, input_len, output_len, "prefill"
-    )
-    stop_profile(
-        profiler,
-        bench_args.profiler_activities,
-        rank_print=rank_print,
-        save_trace=True,
-        trace_filename=trace_filename,
-        stage="prefill",
-    )
+    if profile:
+        trace_filename = _create_torch_profiler_filename(
+            profile_filename_prefix, batch_size, input_len, output_len, "prefill"
+        )
+        stop_profile(
+            profiler,
+            bench_args.profiler_activities,
+            rank_print=rank_print,
+            save_trace=True,
+            trace_filename=trace_filename,
+            stage="prefill",
+        )
 
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
@@ -552,7 +555,7 @@ def latency_test_run_once(
     for i in range(output_len - 1):
         synchronize(device)
         profiler = None
-        if i == output_len // 2:
+        if profile and i == output_len // 2:
             profiler = start_profile(
                 bench_args.profiler_activities,
                 profile_record_shapes=profile_record_shapes,
@@ -564,7 +567,7 @@ def latency_test_run_once(
         synchronize(device)
         latency = time.perf_counter() - tic
 
-        if i == output_len // 2:
+        if profile and i == output_len // 2:
             trace_filename = _create_torch_profiler_filename(
                 profile_filename_prefix, batch_size, input_len, output_len, "decode"
             )
@@ -680,7 +683,7 @@ def latency_test(
                     [bs_aligned_inputs[-1]] * (bs - custom_input_len)
                 )
 
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, ol, bs_aligned_inputs)
+        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
