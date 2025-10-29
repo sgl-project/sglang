@@ -590,7 +590,6 @@ impl HarmonyBuilder {
                     })
                 } else {
                     // Tool call - assistant message in commentary channel with recipient
-                    // This matches vLLM's pattern:
                     // msg.with_channel("commentary").with_recipient(f"functions.{name}")
                     let recipient = format!("functions.{}", name);
                     debug!(
