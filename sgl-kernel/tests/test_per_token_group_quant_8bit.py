@@ -13,7 +13,9 @@ from sgl_kernel.test_utils import (
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_8bit,
+)
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()

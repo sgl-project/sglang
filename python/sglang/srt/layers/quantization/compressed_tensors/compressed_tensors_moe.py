@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_cuda,
     is_hip,
+    is_npu,
     set_weight_attrs,
 )
 
@@ -400,7 +401,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 a2_scale=layer.w2_input_scale,
             )
             return self.runner.run(dispatch_output, quant_info)
-        
+
 
 class CompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
 
