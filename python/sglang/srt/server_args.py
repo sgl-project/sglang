@@ -971,9 +971,10 @@ class ServerArgs:
                 logger.warning(
                     "Use trtllm_mha as attention backend on sm100 for Llama4 model"
                 )
-                self.kv_cache_dtype = "bfloat16"
+            if is_sm100_supported() and self.attention_backend == "trtllm_mha":
                 # TODO(brayden): remove this once TRTLLM MHA kernel for FP8 w/ tileSizeKv=128 is available.
                 # This is a Llama 4 specific issue only.
+                self.kv_cache_dtype = "bfloat16"
                 logger.warning(
                     "Setting kv_cache_dtype to bfloat16 for Llama4 with trtllm_mha backend, due to a missing FlashInfer TRTLLM MHA kernel for FP8 KV Cache"
                 )
