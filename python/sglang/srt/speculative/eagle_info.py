@@ -246,7 +246,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         # Apply penalty
-        if sampling_info.penalizer_orchestrator.is_required:
+        if (
+            sampling_info.penalizer_orchestrator.is_required
+            or sampling_info.logit_bias is not None
+        ):
             # This is a relaxed version of penalties for speculative decoding.
             linear_penalty = torch.zeros(
                 (bs, logits_output.next_token_logits.shape[1]),

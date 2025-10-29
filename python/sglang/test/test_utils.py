@@ -92,6 +92,10 @@ DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST = "meta-llama/Llama-3.2-1B-I
 DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # Other use cases
+DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
+    "OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc",  # auto_round:auto_gptq
+    "Intel/Qwen2-0.5B-Instruct-int4-sym-AutoRound",  # auto_round:auto_awq
+)
 DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
     "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 )
@@ -129,6 +133,11 @@ def is_in_amd_ci():
     return get_bool_env_var("SGLANG_IS_IN_CI_AMD")
 
 
+def is_blackwell_system():
+    """Return whether it is running on a Blackwell (B200) system."""
+    return get_bool_env_var("IS_BLACKWELL")
+
+
 def _use_cached_default_models(model_repo: str):
     cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
     if cache_dir and model_repo:
@@ -149,6 +158,9 @@ else:
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+
+if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
 
 
@@ -611,7 +623,6 @@ def popen_launch_server(
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
-
             return_code = process.poll()
             if return_code is not None:
                 # Server failed to start (non-zero exit code) or crashed
@@ -1621,6 +1632,9 @@ class CustomTestCase(unittest.TestCase):
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
+
+    def setUp(self):
+        print(f"[Test Method] {self._testMethodName}", flush=True)
 
 
 def dump_bench_raw_result(

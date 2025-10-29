@@ -539,6 +539,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def draft_worker(self):
         return self._draft_worker
 
+    def clear_cache_pool(self):
+        # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
+        pass
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if model_worker_batch.forward_mode.is_decode():
             draft_input: EagleDraftInput = model_worker_batch.spec_info
