@@ -17,8 +17,6 @@ from sglang.srt.layers.attention.fla.utils import input_guard
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
     a,
-    a_stride_m,
-    a_stride_k,
     dt_bias,
     softplus_beta,
     softplus_threshold,
@@ -32,6 +30,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     cu_seqlens,
     scale,
     T,
+    a_stride_m: tl.constexpr,
+    a_stride_k: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
