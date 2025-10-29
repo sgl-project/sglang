@@ -18,8 +18,6 @@ from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
-from sglang.srt.distributed.parallel_state import get_pp_group
-from sglang.srt.layers.utils import get_layer_id
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -29,11 +27,13 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -749,6 +749,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
