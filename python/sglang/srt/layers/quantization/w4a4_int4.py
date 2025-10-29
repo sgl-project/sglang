@@ -1,21 +1,11 @@
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    List,
-    Mapping,
-    Optional,
-    cast,
-)
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
 
 import torch
 
-from sglang.srt.layers.parameter import (
-    PerTensorScaleParameter,
-)
+from sglang.srt.layers.parameter import PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
