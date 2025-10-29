@@ -49,11 +49,17 @@ jobs:
           rm protoc-32.0-linux-x86_64.zip
           protoc --version
 
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
       - name: Test maturin build
         uses: PyO3/maturin-action@v1
         with:
           args: --release --out dist
           rust-toolchain: stable
+          sccache: true
 
       - name: List built wheel
         run: ls -lh dist/
