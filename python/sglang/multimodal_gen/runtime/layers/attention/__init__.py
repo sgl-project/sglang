@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
     LocalAttention,
+    UlyssesAttention,
     UlyssesAttention_VSA,
     USPAttention,
 )
@@ -17,6 +18,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_bac
 __all__ = [
     "USPAttention",
     "LocalAttention",
+    "UlyssesAttention",
     "UlyssesAttention_VSA",
     "AttentionBackend",
     "AttentionMetadata",
