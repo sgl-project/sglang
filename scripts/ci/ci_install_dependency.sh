@@ -6,6 +6,10 @@ IS_BLACKWELL=${IS_BLACKWELL:-0}
 RUN_DEEPSEEK_V32=${RUN_DEEPSEEK_V32:-0}
 CU_VERSION="cu129"
 
+# Detect system architecture
+ARCH=$(uname -m)
+echo "Detected architecture: ${ARCH}"
+
 if [ "$CU_VERSION" = "cu130" ]; then
     NVRTC_SPEC="nvidia-cuda-nvrtc"
 else
@@ -38,9 +42,16 @@ if ! command -v protoc &> /dev/null; then
     fi
 
     cd /tmp
-    wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip
-    unzip protoc-32.0-linux-x86_64.zip -d /usr/local
-    rm protoc-32.0-linux-x86_64.zip
+    # Determine protoc architecture
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        PROTOC_ARCH="aarch_64"
+    else
+        PROTOC_ARCH="x86_64"
+    fi
+    PROTOC_ZIP="protoc-32.0-linux-${PROTOC_ARCH}.zip"
+    wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/${PROTOC_ZIP}
+    unzip ${PROTOC_ZIP} -d /usr/local
+    rm ${PROTOC_ZIP}
     protoc --version
     cd -
 else
@@ -94,7 +105,13 @@ echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNE
 
 if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     ls -alh sgl-kernel/dist
-    $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    # Determine wheel architecture
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        WHEEL_ARCH="aarch64"
+    else
+        WHEEL_ARCH="x86_64"
+    fi
+    $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
 else
     $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
 fi
