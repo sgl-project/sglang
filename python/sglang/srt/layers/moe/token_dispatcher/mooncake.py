@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Tuple
 
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -36,7 +37,7 @@ class MooncakeDispatchOutput(NamedTuple):
     """Mooncake EP dispatch output."""
 
     hidden_states: torch.Tensor
-    hidden_states_scale: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
@@ -61,14 +62,6 @@ class MooncakeCombineInput(NamedTuple):
 
 
 assert isinstance(MooncakeCombineInput, CombineInput)
-
-
-_ACTIVE_RANKS: Optional[torch.Tensor] = None
-
-
-def get_ep_active_ranks() -> torch.Tensor:
-    assert _ACTIVE_RANKS is not None, "_ACTIVE_RANKS is not initialized"
-    return _ACTIVE_RANKS
 
 
 class EPBuffer:
@@ -153,12 +146,7 @@ class _MooncakeEPDispatcherImpl:
         self.first_execution = True
         self.timeout_us = 10000000
 
-        global _ACTIVE_RANKS
-        if _ACTIVE_RANKS is None:
-            _ACTIVE_RANKS = torch.ones(
-                (self.num_experts,), dtype=torch.int32, device="cuda"
-            )
-        self.active_ranks = _ACTIVE_RANKS
+        self.active_ranks = ElasticEPStateManager.instance().active_ranks
 
         self.handle = None
 
@@ -205,8 +193,14 @@ class _MooncakeEPDispatcherImpl:
             masked_m
         )
 
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        else:
+            hidden_states_scale = None
+
         return MooncakeDispatchOutput(
             hidden_states,
+            hidden_states_scale,
             topk_ids,
             topk_weights,
             masked_m,

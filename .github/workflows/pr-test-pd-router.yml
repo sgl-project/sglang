@@ -1,4 +1,4 @@
-name: PR Test (PD Router)
+name: PR Benchmark (SMG PD Router)
 
 on:
   push:

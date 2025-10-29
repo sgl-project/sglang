@@ -121,6 +121,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             custom_labels=custom_labels,
+            custom_logit_processor=request.custom_logit_processor,
         )
 
         return adapted_request, request
@@ -149,6 +150,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "ignore_eos": request.ignore_eos,
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
+            "custom_params": request.custom_params,
         }
 
         # Handle response_format constraints
@@ -269,6 +271,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     choices=[choice_data],
                     model=request.model,
                 )
+
+                # Add usage stats if continuous_usage_stats is enabled
+                if (
+                    request.stream_options
+                    and request.stream_options.continuous_usage_stats
+                ):
+                    chunk.usage = UsageProcessor.calculate_token_usage(
+                        prompt_tokens=prompt_tokens.get(index, 0),
+                        completion_tokens=completion_tokens.get(index, 0),
+                    )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
 

@@ -6,14 +6,15 @@ SGLang supports various environment variables that can be used to configure its 
 
 ## General Configuration
 
-| Environment Variable | Description | Default Value |
-| --- | --- | --- |
-| `SGLANG_USE_MODELSCOPE` | Enable using models from ModelScope | `false` |
-| `SGLANG_HOST_IP` | Host IP address for the server | `0.0.0.0` |
-| `SGLANG_PORT` | Port for the server | auto-detected |
-| `SGLANG_LOGGING_CONFIG_PATH` | Custom logging configuration path | Not set |
-| `SGLANG_DISABLE_REQUEST_LOGGING` | Disable request logging | `false` |
-| `SGLANG_HEALTH_CHECK_TIMEOUT` | Timeout for health check in seconds | `20` |
+| Environment Variable                      | Description                                                                                                                      | Default Value |
+|-------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|---------------|
+| `SGLANG_USE_MODELSCOPE`                   | Enable using models from ModelScope                                                                                              | `false`       |
+| `SGLANG_HOST_IP`                          | Host IP address for the server                                                                                                   | `0.0.0.0`     |
+| `SGLANG_PORT`                             | Port for the server                                                                                                              | auto-detected |
+| `SGLANG_LOGGING_CONFIG_PATH`              | Custom logging configuration path                                                                                                | Not set       |
+| `SGLANG_DISABLE_REQUEST_LOGGING`          | Disable request logging                                                                                                          | `false`       |
+| `SGLANG_HEALTH_CHECK_TIMEOUT`             | Timeout for health check in seconds                                                                                              | `20`          |
+| `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL` | The interval of passes to collect the metric of selected count of physical experts on each layer and GPU rank. 0 means disabled. | `0`           |
 
 ## Performance Tuning
 
@@ -36,7 +37,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_JIT_DEEPGEMM_PRECOMPILE` | Enable precompilation of DeepGEMM kernels | `"true"` |
 | `SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS` | Number of workers for parallel DeepGEMM kernel compilation | `4` |
 | `SGL_IN_DEEPGEMM_PRECOMPILE_STAGE` | Indicator flag used during the DeepGEMM precompile script | `"false"` |
-| `SGL_DG_CACHE_DIR` | Directory for caching compiled DeepGEMM kernels | `~/.cache/deep_gemm` |
+| `SGLANG_DG_CACHE_DIR` | Directory for caching compiled DeepGEMM kernels | `~/.cache/deep_gemm` |
 | `SGL_DG_USE_NVRTC` | Use NVRTC (instead of Triton) for JIT compilation (Experimental) | `"0"` |
 | `SGL_USE_DEEPGEMM_BMM` | Use DeepGEMM for Batched Matrix Multiplication (BMM) operations | `"false"` |
 
@@ -95,9 +96,12 @@ SGLang supports various environment variables that can be used to configure its 
 | --- | --- | --- |
 | `SGLANG_TORCH_PROFILER_DIR` | Directory for PyTorch profiler output | `/tmp` |
 | `SGLANG_PROFILE_WITH_STACK` | Set `with_stack` option (bool) for PyTorch profiler (capture stack trace) | `true` |
+| `SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS` | Config BatchSpanProcessor.schedule_delay_millis if tracing is enabled | `500` |
+| `SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE` | Config BatchSpanProcessor.max_export_batch_size if tracing is enabled | `64` |
 
 ## Storage & Caching
 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
+| `SGLANG_WAIT_WEIGHTS_READY_TIMEOUT` | Timeout period for waiting on weights | `120` |
 | `SGLANG_DISABLE_OUTLINES_DISK_CACHE` | Disable Outlines disk cache | `true` |
