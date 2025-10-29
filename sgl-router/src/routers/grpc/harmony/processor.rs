@@ -78,9 +78,6 @@ impl HarmonyResponseProcessor {
             _ => false,
         };
 
-        // Count history tool calls for ID generation
-        let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
-
         // Build choices by parsing output
         let mut choices: Vec<ChatChoice> = Vec::new();
         for (index, complete) in all_responses.iter().enumerate() {
@@ -110,7 +107,7 @@ impl HarmonyResponseProcessor {
                     &output_text,
                     &chat_request.tool_choice,
                     &chat_request.model,
-                    history_tool_calls_count,
+                    0, // Harmony models don't need history tool call count
                 );
 
                 // Override finish reason if we have tool calls

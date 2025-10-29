@@ -99,31 +99,17 @@ impl PipelineStage for HarmonyRequestBuildingStage {
 
         let mut proto_request = match &ctx.input.request_type {
             RequestType::Chat(request) => {
-                // Prefer filtered request if present; otherwise use the original
-                let body = prep
-                    .filtered_request
-                    .as_ref()
-                    .unwrap_or(request.as_ref())
-                    .clone();
-
-                // Generate tool constraints if tools are present
-                let tool_constraint = if let Some(tools) = body.tools.as_ref() {
-                    utils::generate_tool_constraints(tools, &body.tool_choice, &body.model)
-                        .map_err(|e| {
-                            utils::bad_request_error(format!("Invalid tool configuration: {}", e))
-                        })?
-                } else {
-                    None
-                };
+                // Use filtered request if present from preparation; otherwise original
+                let body = prep.filtered_request.as_ref().unwrap_or(request.as_ref());
 
                 builder_client
                     .build_generate_request(
                         request_id,
-                        &body,
+                        body,
                         placeholder_processed_text,
                         prep.token_ids.clone(),
                         None,
-                        tool_constraint,
+                        prep.tool_constraints.clone(),
                     )
                     .map_err(|e| {
                         utils::bad_request_error(format!("Invalid request parameters: {}", e))

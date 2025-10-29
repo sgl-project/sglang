@@ -78,19 +78,34 @@ impl HarmonyPreparationStage {
             ));
         }
 
-        // Build via Harmony
+        // Step 1: Filter tools if needed
+        let body_ref = utils::filter_tools_for_request(request);
+
+        // Step 2: Build tool constraints if needed
+        let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
+            utils::generate_tool_constraints(tools, &body_ref.tool_choice, &body_ref.model)
+                .map_err(|e| utils::bad_request_error(format!("Invalid tool configuration: {}", e)))?
+        } else {
+            None
+        };
+
+        // Step 3: Build via Harmony
         let build_output = self
             .builder
-            .build_from_chat(request)
+            .build_from_chat(&body_ref)
             .map_err(|e| utils::bad_request_error(format!("Harmony build failed: {}", e)))?;
 
-        // Store results
+        // Step 4: Store results
         ctx.state.preparation = Some(PreparationOutput {
             original_text: None,
             token_ids: build_output.input_ids,
             processed_messages: None,
-            tool_constraints: None,
-            filtered_request: None,
+            tool_constraints,
+            filtered_request: if matches!(body_ref, std::borrow::Cow::Owned(_)) {
+                Some(body_ref.into_owned())
+            } else {
+                None
+            },
             harmony_mode: true,
             selection_text: Some(build_output.selection_text),
             harmony_messages: Some(build_output.harmony_messages),
