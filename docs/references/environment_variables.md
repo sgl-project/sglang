@@ -6,14 +6,15 @@ SGLang supports various environment variables that can be used to configure its 
 
 ## General Configuration
 
-| Environment Variable | Description | Default Value |
-| --- | --- | --- |
-| `SGLANG_USE_MODELSCOPE` | Enable using models from ModelScope | `false` |
-| `SGLANG_HOST_IP` | Host IP address for the server | `0.0.0.0` |
-| `SGLANG_PORT` | Port for the server | auto-detected |
-| `SGLANG_LOGGING_CONFIG_PATH` | Custom logging configuration path | Not set |
-| `SGLANG_DISABLE_REQUEST_LOGGING` | Disable request logging | `false` |
-| `SGLANG_HEALTH_CHECK_TIMEOUT` | Timeout for health check in seconds | `20` |
+| Environment Variable                      | Description                                                                                                                      | Default Value |
+|-------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|---------------|
+| `SGLANG_USE_MODELSCOPE`                   | Enable using models from ModelScope                                                                                              | `false`       |
+| `SGLANG_HOST_IP`                          | Host IP address for the server                                                                                                   | `0.0.0.0`     |
+| `SGLANG_PORT`                             | Port for the server                                                                                                              | auto-detected |
+| `SGLANG_LOGGING_CONFIG_PATH`              | Custom logging configuration path                                                                                                | Not set       |
+| `SGLANG_DISABLE_REQUEST_LOGGING`          | Disable request logging                                                                                                          | `false`       |
+| `SGLANG_HEALTH_CHECK_TIMEOUT`             | Timeout for health check in seconds                                                                                              | `20`          |
+| `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL` | The interval of passes to collect the metric of selected count of physical experts on each layer and GPU rank. 0 means disabled. | `0`           |
 
 ## Performance Tuning
 
