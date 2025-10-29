@@ -1,5 +1,4 @@
 import logging
-import os
 import socket
 import subprocess
 import time

@@ -1,6 +1,6 @@
 // gRPC Router Implementation
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{
@@ -9,20 +9,13 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use tokio::sync::RwLock;
 use tracing::debug;
 
-use super::{
-    context::SharedComponents,
-    pipeline::RequestPipeline,
-    responses::{self, BackgroundTaskInfo},
-};
+use super::{context::SharedComponents, pipeline::RequestPipeline, responses};
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
     core::WorkerRegistry,
-    data_connector::{
-        SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
-    },
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
@@ -35,7 +28,6 @@ use crate::{
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::RouterTrait,
-    server::AppContext,
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
 };
@@ -56,14 +48,8 @@ pub struct GrpcRouter {
     configured_tool_parser: Option<String>,
     pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
-    // Storage backends for /v1/responses support
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
-    // Optional MCP manager for tool execution (enabled via SGLANG_MCP_CONFIG env var)
-    mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
-    // Background task handles for cancellation support (includes gRPC client for Python abort)
-    background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
+    // Responses context (bundles all /v1/responses dependencies: storage, MCP, background_tasks)
+    responses_context: responses::ResponsesContext,
 }
 
 impl GrpcRouter {
@@ -89,31 +75,6 @@ impl GrpcRouter {
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        // Extract storage backends from context
-        let response_storage = ctx.response_storage.clone();
-        let conversation_storage = ctx.conversation_storage.clone();
-        let conversation_item_storage = ctx.conversation_item_storage.clone();
-
-        // Optional MCP manager activation via env var path (config-driven gate)
-        let mcp_manager = match std::env::var("SGLANG_MCP_CONFIG").ok() {
-            Some(path) if !path.trim().is_empty() => {
-                match crate::mcp::McpConfig::from_file(&path).await {
-                    Ok(cfg) => match crate::mcp::McpClientManager::new(cfg).await {
-                        Ok(mgr) => Some(Arc::new(mgr)),
-                        Err(err) => {
-                            tracing::warn!("Failed to initialize MCP manager: {}", err);
-                            None
-                        }
-                    },
-                    Err(err) => {
-                        tracing::warn!("Failed to load MCP config from '{}': {}", path, err);
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
-
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
             tokenizer: tokenizer.clone(),
@@ -132,6 +93,20 @@ impl GrpcRouter {
             ctx.configured_reasoning_parser.clone(),
         );
 
+        // Create responses context with all dependencies
+        let responses_context = responses::ResponsesContext::new(
+            Arc::new(pipeline.clone()),
+            shared_components.clone(),
+            worker_registry.clone(),
+            ctx.response_storage.clone(),
+            ctx.conversation_storage.clone(),
+            ctx.conversation_item_storage.clone(),
+            ctx.mcp_manager
+                .get()
+                .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
+                .clone(),
+        );
+
         Ok(GrpcRouter {
             worker_registry,
             policy_registry,
@@ -145,11 +120,7 @@ impl GrpcRouter {
             configured_tool_parser: ctx.configured_tool_parser.clone(),
             pipeline,
             shared_components,
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
-            mcp_manager,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            responses_context,
         })
     }
 
@@ -267,25 +238,11 @@ impl RouterTrait for GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Use responses module for ALL requests (streaming and non-streaming)
-        // Responses module handles:
-        // - Request validation (previous_response_id XOR conversation)
-        // - Loading response chain / conversation history from storage
-        // - Conversion: ResponsesRequest → ChatCompletionRequest
-        // - Execution through chat pipeline stages
-        // - Conversion: ChatCompletionResponse → ResponsesResponse
-        // - Response persistence
-        // - MCP tool loop wrapper (future)
         responses::route_responses(
-            &self.pipeline,
+            &self.responses_context,
             Arc::new(body.clone()),
             headers.cloned(),
             model_id.map(|s| s.to_string()),
-            self.shared_components.clone(),
-            self.response_storage.clone(),
-            self.conversation_storage.clone(),
-            self.conversation_item_storage.clone(),
-            self.background_tasks.clone(),
         )
         .await
     }
@@ -296,12 +253,11 @@ impl RouterTrait for GrpcRouter {
         response_id: &str,
         _params: &ResponsesGetParams,
     ) -> Response {
-        responses::get_response_impl(&self.response_storage, response_id).await
+        responses::get_response_impl(&self.responses_context, response_id).await
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        responses::cancel_response_impl(&self.response_storage, &self.background_tasks, response_id)
-            .await
+        responses::cancel_response_impl(&self.responses_context, response_id).await
     }
 
     async fn route_classify(

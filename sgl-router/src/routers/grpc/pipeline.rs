@@ -1098,10 +1098,15 @@ impl RequestPipeline {
         }
     }
 
-    /// Execute chat pipeline for responses endpoint (Result-based for easier composition)
+    /// Execute chat pipeline for responses endpoint
     ///
-    /// This is used by the responses module and returns Result instead of Response.
-    /// It also supports background mode cancellation via background_tasks.
+    /// TODO: The support for background tasks is not scalable. Consider replacing this with
+    /// a better design in the future.
+    /// Used by ALL non-streaming /v1/responses requests (both sync and background modes).
+    /// Uses the same 7 pipeline stages as execute_chat(), with three differences:
+    /// 1. Returns Result<ChatCompletionResponse, Response> for tool_loop composition
+    /// 2. Disallows streaming (responses endpoint uses different SSE format)
+    /// 3. Injects hooks for background task cancellation (only active when response_id provided)
     pub async fn execute_chat_for_responses(
         &self,
         request: Arc<ChatCompletionRequest>,
@@ -1110,7 +1115,7 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         response_id: Option<String>,
         background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
-    ) -> Result<ChatCompletionResponse, String> {
+    ) -> Result<ChatCompletionResponse, Response> {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
 
         // Execute each stage in sequence
@@ -1118,7 +1123,9 @@ impl RequestPipeline {
             match stage.execute(&mut ctx).await {
                 Ok(Some(_response)) => {
                     // Streaming not supported for responses sync mode
-                    return Err("Streaming is not supported in this context".to_string());
+                    return Err(utils::bad_request_error(
+                        "Streaming is not supported in this context".to_string(),
+                    ));
                 }
                 Ok(None) => {
                     let stage_name = stage.name();
@@ -1158,14 +1165,14 @@ impl RequestPipeline {
                     continue;
                 }
                 Err(response) => {
-                    // Error occurred
+                    // Error occurred - return the response as-is to preserve HTTP status codes
                     error!(
                         "Stage {} ({}) failed with status {}",
                         idx + 1,
                         stage.name(),
                         response.status()
                     );
-                    return Err(format!("Pipeline stage {} failed", stage.name()));
+                    return Err(response);
                 }
             }
         }
@@ -1173,10 +1180,10 @@ impl RequestPipeline {
         // Extract final response
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => Ok(response),
-            Some(FinalResponse::Generate(_)) => {
-                Err("Internal error: wrong response type".to_string())
-            }
-            None => Err("No response produced".to_string()),
+            Some(FinalResponse::Generate(_)) => Err(utils::internal_error_static(
+                "Internal error: wrong response type",
+            )),
+            None => Err(utils::internal_error_static("No response produced")),
         }
     }
 }
