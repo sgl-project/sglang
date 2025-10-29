@@ -79,7 +79,7 @@ impl HarmonyBuilder {
         let sys_msg = self.build_system_message_from_chat(request);
         all_messages.push(sys_msg);
 
-        let dev_msg = self.get_developer_message(request.tools.as_ref());
+        let dev_msg = self.build_developer_message_from_chat(request.tools.as_ref());
         all_messages.push(dev_msg);
 
         let mut user_messages = self.convert_chat_messages(&request.messages)?;
@@ -261,7 +261,7 @@ impl HarmonyBuilder {
     /// # Returns
     ///
     /// Harmony Message with Role::Developer containing tool descriptions
-    fn get_developer_message(&self, tools: Option<&Vec<Tool>>) -> HarmonyMessage {
+    fn build_developer_message_from_chat(&self, tools: Option<&Vec<Tool>>) -> HarmonyMessage {
         let mut dev_content = DeveloperContent::new();
 
         // Early return if no tools
@@ -312,12 +312,12 @@ impl HarmonyBuilder {
         HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
     }
 
-    /// Get developer message for Responses API
+    /// Build developer message from Responses request
     ///
     /// # Arguments
     /// * `instructions` - Optional instructions (Responses API specific, handled in system message)
     /// * `tools` - Optional list of tools
-    fn get_developer_message_from_responses(
+    fn build_developer_message_from_responses(
         &self,
         instructions: Option<&str>,
         tools: Option<&Vec<ResponseTool>>,
@@ -424,7 +424,7 @@ impl HarmonyBuilder {
 
             // Add developer message only if we have custom tools
             if with_custom_tools {
-                let dev_msg = self.get_developer_message_from_responses(
+                let dev_msg = self.build_developer_message_from_responses(
                     request.instructions.as_deref(),
                     request.tools.as_ref(),
                 );
