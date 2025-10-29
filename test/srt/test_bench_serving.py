@@ -11,12 +11,14 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     is_in_amd_ci,
     is_in_ci,
     run_bench_serving,
+    run_embeddings_benchmark,
     run_score_benchmark,
     write_github_step_summary,
 )
@@ -506,6 +508,101 @@ class TestBenchServing(CustomTestCase):
                 p95_latency_bound = 65
             else:
                 p95_latency_bound = 65
+            self.assertLess(res["p95_latency_ms"], p95_latency_bound)
+
+    def test_embeddings_api_latency_throughput(self):
+        """Test embeddings API latency and throughput performance"""
+        res = run_embeddings_benchmark(
+            model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+            num_requests=1000,
+            batch_size=1,
+            input_tokens=500,
+            other_server_args=[],
+            need_warmup=True,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_embeddings_api_throughput\n"
+                f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                f"Embeddings API throughput: {res['throughput']:.2f} req/s\n"
+                f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+            )
+
+        self.assertEqual(res["successful_requests"], res["total_requests"])
+        self.assertLess(res["avg_latency_ms"], 50)
+        self.assertLess(res["p95_latency_ms"], 60)
+        self.assertGreater(res["throughput"], 15)
+
+    def test_embeddings_api_matryoshka(self):
+        """Test embeddings API with matryoshka dimensions"""
+        matryoshka_dims = [512, 768, 1024]
+
+        for dims in matryoshka_dims:
+            res = run_embeddings_benchmark(
+                model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+                num_requests=500,
+                batch_size=1,
+                input_tokens=500,
+                matryoshka_dimensions=dims,
+                need_warmup=True,
+            )
+
+            if is_in_ci():
+                write_github_step_summary(
+                    f"### test_embeddings_api_matryoshka_dims_{dims}\n"
+                    f"Matryoshka dimensions: {dims}\n"
+                    f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                    f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                    f"Throughput: {res['throughput']:.2f} req/s\n"
+                    f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+                )
+
+            self.assertEqual(res["successful_requests"], res["total_requests"])
+            self.assertLess(res["avg_latency_ms"], 55)
+            self.assertLess(res["p95_latency_ms"], 65)
+
+    def test_embeddings_api_batch_scaling(self):
+        """Test embeddings API performance with different batch sizes"""
+        batch_sizes = [1, 5, 10]
+
+        for batch_size in batch_sizes:
+            res = run_embeddings_benchmark(
+                model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+                num_requests=500,
+                batch_size=batch_size,
+                input_tokens=500,
+            )
+
+            if is_in_ci():
+                write_github_step_summary(
+                    f"### test_embeddings_api_batch_scaling_size_{batch_size}\n"
+                    f"Batch size: {batch_size}\n"
+                    f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                    f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                    f"Throughput: {res['throughput']:.2f} req/s\n"
+                    f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+                )
+
+            self.assertEqual(res["successful_requests"], res["total_requests"])
+            if batch_size == 1:
+                avg_latency_bound = 50
+            elif batch_size == 5:
+                avg_latency_bound = 70
+            elif batch_size == 10:
+                avg_latency_bound = 100
+            else:
+                avg_latency_bound = 100
+            self.assertLess(res["avg_latency_ms"], avg_latency_bound)
+            if batch_size == 1:
+                p95_latency_bound = 60
+            elif batch_size == 5:
+                p95_latency_bound = 80
+            elif batch_size == 10:
+                p95_latency_bound = 110
+            else:
+                p95_latency_bound = 110
             self.assertLess(res["p95_latency_ms"], p95_latency_bound)
 
 
