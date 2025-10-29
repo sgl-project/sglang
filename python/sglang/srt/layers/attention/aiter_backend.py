@@ -4,18 +4,13 @@ from __future__ import annotations
 end to end attention solution with aiter kernels
 """
 
-import math
-import os
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
-import triton.language as tl
 
-from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
@@ -27,7 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInfo
+    from sglang.srt.speculative.spec_info import SpecInput
 
 try:
     from aiter import (
@@ -374,7 +369,7 @@ class AiterAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
     ):
         if forward_mode.is_decode_or_idle():
             qo_indptr = None
@@ -509,7 +504,7 @@ class AiterAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
@@ -619,7 +614,11 @@ class AiterAttnBackend(AttentionBackend):
             assert len(k.shape) == 3
             assert len(v.shape) == 3
 
-            if forward_batch.forward_mode.is_extend():
+            if (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+            ):
                 if kv_indices.shape[0] == 0:
                     o = flash_attn_varlen_func(
                         q,
@@ -884,7 +883,7 @@ class AiterIndicesUpdaterPrefill:
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -896,7 +895,7 @@ class AiterIndicesUpdaterPrefill:
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
     ):
 
         kv_start_idx = None
@@ -980,7 +979,7 @@ class AiterMlaIndicesUpdaterPrefill:
         extend_lens: torch.Tensor,
         max_q_len: int,
         max_kv_len: int,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -993,7 +992,7 @@ class AiterMlaIndicesUpdaterPrefill:
         extend_lens: torch.Tensor,
         max_q_len: int,
         max_kv_len: int,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
     ):
         bs = len(req_pool_indices)
 
@@ -1050,7 +1049,7 @@ class AiterMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -1065,7 +1064,7 @@ class AiterMultiStepDraftBackend:
             device=model_runner.device,
         )
         self.attn_backends = []
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 AiterAttnBackend(
                     model_runner,
@@ -1108,7 +1107,7 @@ class AiterMultiStepDraftBackend:
             self.page_size,
         )
 
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
                 : seq_lens_sum * self.topk + bs * (i + 1)
@@ -1142,7 +1141,7 @@ class AiterMultiStepDraftBackend:
             dtype=torch.int32,
             device=self.device,
         )
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
                 max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )

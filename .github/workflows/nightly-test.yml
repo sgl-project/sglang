@@ -54,7 +54,7 @@ jobs:
 
       - name: Publish traces to storage repo
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
@@ -62,7 +62,7 @@ jobs:
 
   nightly-test-eval-vlms:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-runner
+    runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -77,10 +77,9 @@ jobs:
           cd test/srt
           python3 test_nightly_vlms_mmmu_eval.py
 
-
   nightly-test-perf-vlms:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-runner
+    runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -100,8 +99,25 @@ jobs:
 
       - name: Publish traces to storage repo
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
           python3 scripts/ci/publish_traces.py --vlm
+
+  nightly-test-1-gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-1-gpu

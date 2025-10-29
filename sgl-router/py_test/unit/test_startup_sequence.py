@@ -6,8 +6,7 @@ including router initialization, configuration validation, and startup flow.
 """
 
 import logging
-from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sglang_router.launch_router import RouterArgs, launch_router

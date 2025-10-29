@@ -161,7 +161,7 @@ class StorageBackendFactory:
         if backend_name == "file":
             return backend_class(storage_config)
         elif backend_name == "nixl":
-            return backend_class()
+            return backend_class(storage_config)
         elif backend_name == "mooncake":
             backend = backend_class(storage_config)
             return backend
@@ -170,7 +170,7 @@ class StorageBackendFactory:
             return backend
         elif backend_name == "hf3fs":
             # Calculate bytes_per_page based on memory pool layout
-            if mem_pool_host.layout == "page_first":
+            if mem_pool_host.layout in ["page_first", "page_first_direct"]:
                 bytes_per_page = (
                     mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
                 )
@@ -181,6 +181,8 @@ class StorageBackendFactory:
 
             dtype = mem_pool_host.dtype
             return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
+        elif backend_name == "eic":
+            return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -212,4 +214,10 @@ StorageBackendFactory.register_backend(
     "aibrix",
     "sglang.srt.mem_cache.storage.aibrix_kvcache.aibrix_kvcache_storage",
     "AibrixKVCacheStorage",
+)
+
+StorageBackendFactory.register_backend(
+    "eic",
+    "sglang.srt.mem_cache.storage.eic.eic_storage",
+    "EICStorage",
 )

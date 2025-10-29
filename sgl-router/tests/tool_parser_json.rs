@@ -155,7 +155,7 @@ async fn test_json_invalid_format() {
 async fn test_json_format_detection() {
     let parser = JsonParser::new();
 
-    assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
-    assert!(parser.detect_format(r#"[{"name": "test"}]"#));
-    assert!(!parser.detect_format("plain text"));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "arguments": {}}"#));
+    assert!(parser.has_tool_markers(r#"[{"name": "test"}]"#));
+    assert!(!parser.has_tool_markers("plain text"));
 }
