@@ -795,9 +795,11 @@ class ServerArgs:
                 else 0.88
             )
 
-            # Multimodal models need more memory for the image processing,
-            # so we adjust the mem_fraction_static accordingly.
-            model_config = self.get_model_config()
+            # Lazy init to avoid circular import
+            # Multimodal models need more memory for the image processor
+            from sglang.srt.configs.model_config import ModelConfig
+
+            model_config = ModelConfig.from_server_args(self)
             if model_config.is_multimodal:
                 self.adjust_mem_fraction_for_vlm(model_config)
 
