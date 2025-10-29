@@ -64,9 +64,7 @@ class UlyssesAttention(nn.Module):
         attn_backend = get_attn_backend(
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
-        print(f"{supported_attention_backends=}")
         impl_cls = attn_backend.get_impl_cls()
-        print(f"{impl_cls=}")
 
         self.attn_impl = impl_cls(
             num_heads=num_heads,
