@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, ValueEnum};
-use postgres::Client;
 use sglang_router_rs::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
@@ -13,8 +12,6 @@ use sglang_router_rs::{
     server::{self, ServerConfig},
     service_discovery::ServiceDiscoveryConfig,
 };
-use tokio_postgres::NoTls;
-
 fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
     let mut prefill_entries = Vec::new();
@@ -316,6 +313,9 @@ struct CliArgs {
     postgres_db_url: Option<String>,
 
     #[arg(long)]
+    postgres_pool_max_size: Option<usize>,
+
+    #[arg(long)]
     reasoning_parser: Option<String>,
 
     #[arg(long)]
@@ -453,7 +453,10 @@ impl CliArgs {
 
     fn build_postgres_config(&self) -> ConfigResult<PostgresConfig> {
         let db_url = self.postgres_db_url.clone().unwrap_or_default();
-        Ok(PostgresConfig { db_url })
+        let pool_max = self
+            .postgres_pool_max_size
+            .unwrap_or_else(PostgresConfig::default_pool_max);
+        Ok(PostgresConfig { db_url, pool_max })
     }
 
     fn to_router_config(

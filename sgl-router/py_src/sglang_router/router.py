@@ -6,6 +6,7 @@ from sglang_router.sglang_router_rs import (
     HistoryBackendType,
     PolicyType,
     PyOracleConfig,
+    PyPostgresConfig,
 )
 from sglang_router.sglang_router_rs import Router as _Router
 
@@ -187,14 +188,16 @@ class Router:
             )
         args_dict["oracle_config"] = oracle_config
         args_dict["history_backend"] = history_backend
-        
+
         # Convert Postgres config if needed
+        postgres_config = None
         if history_backend == HistoryBackendType.Postgres:
-            postgres_dsn = args_dict.get("postgres_dsn")
-            if not postgres_dsn:
-                raise ValueError("Postgres DSN must be provided for Postgres history backend.")
-            args_dict["postgres_dsn"] = postgres_dsn
-            
+            postgres_config = PyPostgresConfig(
+                db_url=args_dict.get("postgres_db_url"),
+                pool_max=args_dict.get("postgres_pool_max", 16),
+            )
+        args_dict["postgres_config"] = postgres_config
+
         # Remove fields that shouldn't be passed to Rust Router constructor
         fields_to_remove = [
             "mini_lb",
