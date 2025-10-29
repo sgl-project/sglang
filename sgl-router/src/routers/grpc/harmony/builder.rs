@@ -41,6 +41,68 @@ pub(super) fn get_harmony_encoding() -> &'static HarmonyEncoding {
 /// Built-in tools that are added to the system message
 const BUILTIN_TOOLS: &[&str] = &["web_search_preview", "code_interpreter", "container"];
 
+/// Trait for tool-like objects that can be converted to Harmony ToolDescription
+trait ToolLike {
+    /// Check if this is a built-in tool (should be skipped in developer message)
+    #[allow(dead_code)]
+    fn is_builtin(&self) -> bool;
+
+    /// Check if this is a custom tool (function or MCP)
+    fn is_custom(&self) -> bool;
+
+    /// Convert to ToolDescription
+    fn to_tool_description(&self) -> Option<ToolDescription>;
+}
+
+/// Implement ToolLike for Chat Completion Tool
+impl ToolLike for Tool {
+    fn is_builtin(&self) -> bool {
+        matches!(
+            self.tool_type.as_str(),
+            "web_search_preview" | "code_interpreter" | "container"
+        )
+    }
+
+    fn is_custom(&self) -> bool {
+        matches!(self.tool_type.as_str(), "mcp" | "function")
+    }
+
+    fn to_tool_description(&self) -> Option<ToolDescription> {
+        Some(ToolDescription::new(
+            self.function.name.clone(),
+            self.function.description.clone().unwrap_or_default(),
+            Some(self.function.parameters.clone()),
+        ))
+    }
+}
+
+/// Implement ToolLike for Responses API Tool
+impl ToolLike for ResponseTool {
+    fn is_builtin(&self) -> bool {
+        matches!(
+            self.r#type,
+            ResponseToolType::WebSearchPreview | ResponseToolType::CodeInterpreter
+        )
+    }
+
+    fn is_custom(&self) -> bool {
+        matches!(
+            self.r#type,
+            ResponseToolType::Mcp | ResponseToolType::Function
+        )
+    }
+
+    fn to_tool_description(&self) -> Option<ToolDescription> {
+        self.function.as_ref().map(|func| {
+            ToolDescription::new(
+                func.name.clone(),
+                func.description.clone().unwrap_or_default(),
+                Some(func.parameters.clone()),
+            )
+        })
+    }
+}
+
 fn has_custom_tools(tool_types: &[&str]) -> bool {
     !tool_types.iter().all(|t| BUILTIN_TOOLS.contains(t))
 }
@@ -169,24 +231,29 @@ impl HarmonyBuilder {
     }
 
     /// Build system message from ChatCompletionRequest
-    fn build_system_message_from_chat(&self, request: &ChatCompletionRequest) -> HarmonyMessage {
+    /// Build system message with common logic
+    ///
+    /// # Arguments
+    /// * `reasoning_effort` - Optional reasoning effort level
+    /// * `has_tools` - Whether custom tools are present
+    fn build_system_message(
+        &self,
+        reasoning_effort: Option<ReasoningEffort>,
+        has_tools: bool,
+    ) -> HarmonyMessage {
         let mut sys_content = SystemContent::new();
 
         // Add reasoning_effort if provided
-        if let Some(effort) = request.reasoning_effort.as_deref() {
-            let effort_enum = match effort {
-                "high" => ReasoningEffort::High,
-                "medium" => ReasoningEffort::Medium,
-                "low" => ReasoningEffort::Low,
-                _ => ReasoningEffort::Medium,
-            };
-            sys_content = sys_content.with_reasoning_effort(effort_enum);
+        if let Some(effort) = reasoning_effort {
+            sys_content = sys_content.with_reasoning_effort(effort);
         }
+
+        // Set conversation start date (always current date)
         sys_content =
             sys_content.with_conversation_start_date(Local::now().format("%Y-%m-%d").to_string());
 
         // If no tools, remove "commentary" from valid channels
-        if request.tools.is_none() {
+        if !has_tools {
             if let Some(channel_config) = &sys_content.channel_config {
                 let valid_channels: Vec<String> = channel_config
                     .valid_channels
@@ -202,8 +269,22 @@ impl HarmonyBuilder {
         HarmonyMessage::from_role_and_content(Role::System, sys_content)
     }
 
+    fn build_system_message_from_chat(&self, request: &ChatCompletionRequest) -> HarmonyMessage {
+        let reasoning_effort = request
+            .reasoning_effort
+            .as_deref()
+            .map(|effort| match effort {
+                "high" => ReasoningEffort::High,
+                "medium" => ReasoningEffort::Medium,
+                "low" => ReasoningEffort::Low,
+                _ => ReasoningEffort::Medium,
+            });
+
+        let has_tools = request.tools.is_some();
+        self.build_system_message(reasoning_effort, has_tools)
+    }
+
     /// Build system message from ResponsesRequest
-    ///
     ///
     /// # Arguments
     /// * `request` - The ResponsesRequest
@@ -213,118 +294,34 @@ impl HarmonyBuilder {
         request: &ResponsesRequest,
         with_custom_tools: bool,
     ) -> HarmonyMessage {
-        let mut sys_content = SystemContent::new();
+        let reasoning_effort = request
+            .reasoning
+            .as_ref()
+            .and_then(|r| r.effort.as_ref())
+            .map(|effort| match effort {
+                ResponsesReasoningEffort::High => ReasoningEffort::High,
+                ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
+                ResponsesReasoningEffort::Low => ReasoningEffort::Low,
+            });
 
-        // Extract reasoning effort from Responses API
-        if let Some(reasoning) = &request.reasoning {
-            if let Some(effort) = &reasoning.effort {
-                let effort_enum = match effort {
-                    ResponsesReasoningEffort::High => ReasoningEffort::High,
-                    ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
-                    ResponsesReasoningEffort::Low => ReasoningEffort::Low,
-                };
-                sys_content = sys_content.with_reasoning_effort(effort_enum);
-            }
-        }
-
-        // Set conversation start date (current date)
-        sys_content =
-            sys_content.with_conversation_start_date(Local::now().format("%Y-%m-%d").to_string());
-
-        // If no custom tools, remove "commentary" from valid channels
-        if !with_custom_tools {
-            if let Some(channel_config) = &sys_content.channel_config {
-                let valid_channels: Vec<String> = channel_config
-                    .valid_channels
-                    .iter()
-                    .filter(|c| c.as_str() != "commentary")
-                    .cloned()
-                    .collect();
-                sys_content = sys_content
-                    .with_channel_config(ChannelConfig::require_channels(valid_channels));
-            }
-        }
-
-        HarmonyMessage::from_role_and_content(Role::System, sys_content)
+        self.build_system_message(reasoning_effort, with_custom_tools)
     }
 
-    /// Create developer message with tool descriptions
+    /// Build developer message with common logic
     ///
-    /// - Filters out built-in tools (web_search_preview, code_interpreter, container)
-    /// - Extracts function tools and MCP tools, converts to ToolDescription
-    /// - Adds function tools to DeveloperContent
+    /// Filters out built-in tools and converts custom tools to ToolDescription
     ///
     /// # Arguments
-    ///
-    /// * `tools` - Optional list of tools from the request
-    ///
-    /// # Returns
-    ///
-    /// Harmony Message with Role::Developer containing tool descriptions
-    fn build_developer_message_from_chat(&self, tools: Option<&Vec<Tool>>) -> HarmonyMessage {
-        let mut dev_content = DeveloperContent::new();
-
-        // Early return if no tools
-        let Some(tools) = tools else {
-            return HarmonyMessage::from_role_and_content(Role::Developer, dev_content);
-        };
-
-        let mut function_tools = Vec::new();
-
-        for tool in tools {
-            match tool.tool_type.as_str() {
-                "web_search_preview" | "code_interpreter" | "container" => {
-                    // These are built-in tools that are added to the system message.
-                    // Skip them in the developer message.
-                    continue;
-                }
-                "mcp" => {
-                    // We support MCP tools.
-                    // Add them as function tools.
-                    function_tools.push(tool);
-                }
-                "function" => {
-                    function_tools.push(tool);
-                }
-                _ => {
-                    // Unknown tool type - skip it
-                    continue;
-                }
-            }
-        }
-
-        // Convert function tools to ToolDescription and add to developer content
-        if !function_tools.is_empty() {
-            let tool_descriptions: Vec<ToolDescription> = function_tools
-                .iter()
-                .map(|tool| {
-                    ToolDescription::new(
-                        tool.function.name.clone(),
-                        tool.function.description.clone().unwrap_or_default(),
-                        Some(tool.function.parameters.clone()),
-                    )
-                })
-                .collect();
-
-            dev_content = dev_content.with_function_tools(tool_descriptions);
-        }
-
-        HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
-    }
-
-    /// Build developer message from Responses request
-    ///
-    /// # Arguments
-    /// * `instructions` - Optional instructions (Responses API specific, handled in system message)
     /// * `tools` - Optional list of tools
-    fn build_developer_message_from_responses(
+    /// * `instructions` - Optional instructions (Responses API only)
+    fn build_developer_message<T: ToolLike>(
         &self,
+        tools: Option<&Vec<T>>,
         instructions: Option<&str>,
-        tools: Option<&Vec<ResponseTool>>,
     ) -> HarmonyMessage {
         let mut dev_content = DeveloperContent::new();
 
-        // Add instructions if provided
+        // Add instructions if provided (Responses API only)
         if let Some(instructions) = instructions {
             dev_content = dev_content.with_instructions(instructions.to_string());
         }
@@ -334,47 +331,36 @@ impl HarmonyBuilder {
             return HarmonyMessage::from_role_and_content(Role::Developer, dev_content);
         };
 
-        let mut function_tools = Vec::new();
+        // Filter to custom tools and convert to ToolDescription
+        let tool_descriptions: Vec<ToolDescription> = tools
+            .iter()
+            .filter(|t| t.is_custom())
+            .filter_map(|t| t.to_tool_description())
+            .collect();
 
-        for tool in tools {
-            match tool.r#type {
-                ResponseToolType::WebSearchPreview | ResponseToolType::CodeInterpreter => {
-                    // These are built-in tools that are added to the system message.
-                    // Skip them in the developer message.
-                    continue;
-                }
-                ResponseToolType::Mcp => {
-                    // We support MCP tools.
-                    // Add them as function tools if they have a function definition.
-                    if tool.function.is_some() {
-                        function_tools.push(tool);
-                    }
-                }
-                ResponseToolType::Function => {
-                    function_tools.push(tool);
-                }
-            }
-        }
-
-        // Convert function tools to ToolDescription and add to developer content
-        if !function_tools.is_empty() {
-            let tool_descriptions: Vec<ToolDescription> = function_tools
-                .iter()
-                .filter_map(|tool| {
-                    tool.function.as_ref().map(|func| {
-                        ToolDescription::new(
-                            func.name.clone(),
-                            func.description.clone().unwrap_or_default(),
-                            Some(func.parameters.clone()),
-                        )
-                    })
-                })
-                .collect();
-
+        // Add function tools to developer content
+        if !tool_descriptions.is_empty() {
             dev_content = dev_content.with_function_tools(tool_descriptions);
         }
 
         HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
+    }
+
+    fn build_developer_message_from_chat(&self, tools: Option<&Vec<Tool>>) -> HarmonyMessage {
+        self.build_developer_message(tools, None)
+    }
+
+    /// Build developer message from Responses request
+    ///
+    /// # Arguments
+    /// * `instructions` - Optional instructions (Responses API specific)
+    /// * `tools` - Optional list of tools
+    fn build_developer_message_from_responses(
+        &self,
+        instructions: Option<&str>,
+        tools: Option<&Vec<ResponseTool>>,
+    ) -> HarmonyMessage {
+        self.build_developer_message(tools, instructions)
     }
 
     /// Construct input messages for Responses API with Harmony

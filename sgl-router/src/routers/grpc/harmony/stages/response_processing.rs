@@ -7,7 +7,7 @@ use axum::response::Response;
 
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
 use crate::routers::grpc::{
-    context::{FinalResponse, RequestContext},
+    context::{FinalResponse, RequestContext, RequestType},
     stages::PipelineStage,
     utils,
 };
@@ -40,8 +40,6 @@ impl Default for HarmonyResponseProcessingStage {
 #[async_trait]
 impl PipelineStage for HarmonyResponseProcessingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        use crate::routers::grpc::context::RequestType;
-
         // Get execution result (output tokens from model)
         let execution_result = ctx
             .state
