@@ -205,6 +205,14 @@ class ModelConfig:
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
 
+        # matryoshka embeddings
+        self.matryoshka_dimensions = getattr(
+            self.hf_config, "matryoshka_dimensions", None
+        )
+        self.is_matryoshka = self.matryoshka_dimensions or getattr(
+            self.hf_config, "is_matryoshka", False
+        )
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
@@ -635,6 +643,7 @@ class ModelConfig:
             "petit_nvfp4",
         ]
         compatible_quantization_methods = {
+            "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
