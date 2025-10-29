@@ -38,6 +38,7 @@ futures-util = "0.3"
 futures = "0.3"
 pyo3 = { version = "0.27.1", features = ["extension-module", "abi3-py38"] }
 dashmap = "6.1.0"
+lru = "0.16.2"
 blake3 = "1.5"
 http = "1.1.0"
 tokio = { version = "1.42.0", features = ["full"] }
