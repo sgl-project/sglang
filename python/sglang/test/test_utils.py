@@ -1084,13 +1084,16 @@ def run_embeddings_benchmark(
     if device == "auto":
         device = auto_config_device()
 
+    # Add --is-embedding flag for embedding models
+    server_args = ["--is-embedding"] + other_server_args
+
     # Launch the server (consistent with run_bench_serving)
     base_url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
         model,
         base_url,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_server_args,
+        other_args=server_args,
     )
 
     async def _run_benchmark():
@@ -1100,17 +1103,17 @@ def run_embeddings_benchmark(
 
         tokenizer = get_tokenizer(model)
 
-        special_token = "<|im_start|>"
-
         def generate_text_with_token_count(num_tokens):
-            """Generate text with precise token count using replicated token."""
+            """Generate text with precise token count using special tokens."""
+            # Use a token that reliably produces 1 token
+            special_token = "<|im_start|>"
+            # Verify it's a single token
+            test_tokens = tokenizer.encode(special_token, add_special_tokens=False)
+            if len(test_tokens) != 1:
+                # Fallback to a simple word if special token doesn't work
+                special_token = "hello"
+            
             text = special_token * num_tokens
-            actual_tokens = len(tokenizer.encode(text, add_special_tokens=False))
-            if actual_tokens != num_tokens:
-                text = special_token * (
-                    num_tokens
-                    // len(tokenizer.encode(special_token, add_special_tokens=False))
-                )
             return text
 
         # Generate input text

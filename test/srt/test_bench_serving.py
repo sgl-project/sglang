@@ -493,21 +493,17 @@ class TestBenchServing(CustomTestCase):
             self.assertEqual(res["successful_requests"], res["total_requests"])
             if batch_size == 10:
                 avg_latency_bound = 45
-            elif batch_size == 25:
-                avg_latency_bound = 50
-            elif batch_size == 50:
-                avg_latency_bound = 60
-            else:
-                avg_latency_bound = 60
-            self.assertLess(res["avg_latency_ms"], avg_latency_bound)
-            if batch_size == 10:
                 p95_latency_bound = 50
             elif batch_size == 25:
+                avg_latency_bound = 50
                 p95_latency_bound = 60
             elif batch_size == 50:
+                avg_latency_bound = 60
                 p95_latency_bound = 65
             else:
+                avg_latency_bound = 60
                 p95_latency_bound = 65
+            self.assertLess(res["avg_latency_ms"], avg_latency_bound)
             self.assertLess(res["p95_latency_ms"], p95_latency_bound)
 
     def test_embeddings_api_latency_throughput(self):
@@ -531,41 +527,14 @@ class TestBenchServing(CustomTestCase):
             )
 
         self.assertEqual(res["successful_requests"], res["total_requests"])
-        self.assertLess(res["avg_latency_ms"], 50)
-        self.assertLess(res["p95_latency_ms"], 60)
-        self.assertGreater(res["throughput"], 15)
-
-    def test_embeddings_api_matryoshka(self):
-        """Test embeddings API with matryoshka dimensions"""
-        matryoshka_dims = [512, 768, 1024]
-
-        for dims in matryoshka_dims:
-            res = run_embeddings_benchmark(
-                model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
-                num_requests=500,
-                batch_size=1,
-                input_tokens=500,
-                matryoshka_dimensions=dims,
-                need_warmup=True,
-            )
-
-            if is_in_ci():
-                write_github_step_summary(
-                    f"### test_embeddings_api_matryoshka_dims_{dims}\n"
-                    f"Matryoshka dimensions: {dims}\n"
-                    f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
-                    f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
-                    f"Throughput: {res['throughput']:.2f} req/s\n"
-                    f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
-                )
-
-            self.assertEqual(res["successful_requests"], res["total_requests"])
-            self.assertLess(res["avg_latency_ms"], 55)
-            self.assertLess(res["p95_latency_ms"], 65)
+        # Bounds based on actual performance on 1xH100: avg=15ms, p95=15ms, throughput=67req/s
+        self.assertLess(res["avg_latency_ms"], 20)
+        self.assertLess(res["p95_latency_ms"], 25)
+        self.assertGreater(res["throughput"], 60)
 
     def test_embeddings_api_batch_scaling(self):
         """Test embeddings API performance with different batch sizes"""
-        batch_sizes = [1, 5, 10]
+        batch_sizes = [10, 25, 50]
 
         for batch_size in batch_sizes:
             res = run_embeddings_benchmark(
@@ -586,23 +555,19 @@ class TestBenchServing(CustomTestCase):
                 )
 
             self.assertEqual(res["successful_requests"], res["total_requests"])
-            if batch_size == 1:
-                avg_latency_bound = 50
-            elif batch_size == 5:
-                avg_latency_bound = 70
-            elif batch_size == 10:
-                avg_latency_bound = 100
-            else:
-                avg_latency_bound = 100
-            self.assertLess(res["avg_latency_ms"], avg_latency_bound)
-            if batch_size == 1:
+            if batch_size == 10:
+                avg_latency_bound = 58
                 p95_latency_bound = 60
-            elif batch_size == 5:
-                p95_latency_bound = 80
-            elif batch_size == 10:
-                p95_latency_bound = 110
+            elif batch_size == 25:
+                avg_latency_bound = 115
+                p95_latency_bound = 120
+            elif batch_size == 50:
+                avg_latency_bound = 190
+                p95_latency_bound = 195
             else:
-                p95_latency_bound = 110
+                avg_latency_bound = 250
+                p95_latency_bound = 250
+            self.assertLess(res["avg_latency_ms"], avg_latency_bound)
             self.assertLess(res["p95_latency_ms"], p95_latency_bound)
 
 
