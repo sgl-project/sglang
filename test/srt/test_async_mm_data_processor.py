@@ -84,7 +84,7 @@ class TestAsyncMMDataProcessor:
     @pytest.mark.asyncio
     async def test_async_path_basic(self, async_processor):
         """Async processor should be awaited directly."""
-        proc = AsyncMMDataProcessor(async_processor)
+        proc = AsyncMMDataProcessor(async_processor, None)
         out = await proc.process(
             image_data=["img1.png"],
             audio_data=["a.wav"],
@@ -102,7 +102,7 @@ class TestAsyncMMDataProcessor:
     @pytest.mark.asyncio
     async def test_sync_fallback_basic(self, sync_processor):
         """Sync processor should run in fallback executor."""
-        proc = AsyncMMDataProcessor(sync_processor)
+        proc = AsyncMMDataProcessor(sync_processor, None)
         out = await proc.process(
             image_data=[b"\x00\x01"],
             audio_data=None,
@@ -120,7 +120,7 @@ class TestAsyncMMDataProcessor:
     @pytest.mark.asyncio
     async def test_timeout_async(self, async_processor):
         """Timeout should raise asyncio.TimeoutError for async path."""
-        proc = AsyncMMDataProcessor(async_processor, timeout_s=0.01)
+        proc = AsyncMMDataProcessor(async_processor, None, timeout_s=0.01)
         with pytest.raises(asyncio.TimeoutError):
             await proc.process(
                 input_text_or_ids="slow",
@@ -130,27 +130,33 @@ class TestAsyncMMDataProcessor:
 
     @pytest.mark.asyncio
     async def test_timeout_sync(self, sync_processor):
-        """Timeout should raise asyncio.TimeoutError for sync fallback path."""
-        proc = AsyncMMDataProcessor(sync_processor, timeout_s=0.01)
-        with pytest.raises(asyncio.TimeoutError):
-            await proc.process(
-                input_text_or_ids="slow",
-                request_obj=None,
-                delay_s=0.05,  # longer than timeout
-            )
+        """
+        Sync fallback path should NOT raise TimeoutError:
+        design: timeout applies only to async path.
+        """
+        proc = AsyncMMDataProcessor(sync_processor, None, timeout_s=0.01)
+        out = await proc.process(
+            input_text_or_ids="slow",
+            request_obj=None,
+            delay_s=0.05,  # longer than timeout, but should still complete
+        )
+        assert out["path"] == "sync"
+        assert out["text"] == "slow"
 
     @pytest.mark.asyncio
-    async def test_semaphore_release_after_timeout(self, sync_processor):
+    async def test_semaphore_release_after_timeout_async(self, sync_processor):
         """
-        If a call times out, the semaphore should be released so a subsequent call can proceed.
-        Use >=2 fallback workers so the timed-out thread doesn't block the next call.
+        If an async call times out, the semaphore should be released so a subsequent call can proceed.
         """
-        proc = AsyncMMDataProcessor(
-            sync_processor,
-            max_concurrent_calls=1,
-            timeout_s=0.01,
-            fallback_executor_workers=4,
-        )
+        sem = asyncio.Semaphore(1)
+
+        class SlowAsync:
+            async def process_mm_data_async(self, **kwargs):
+                delay = kwargs.get("delay_s", 0.0)
+                await asyncio.sleep(delay)
+                return {"ok": True}
+
+        proc = AsyncMMDataProcessor(SlowAsync(), sem, timeout_s=0.01)
 
         # First call will time out
         with pytest.raises(asyncio.TimeoutError):
@@ -160,11 +166,11 @@ class TestAsyncMMDataProcessor:
 
         # Second call should be able to acquire the semaphore and complete
         out = await proc.process(input_text_or_ids="ok", request_obj=None, delay_s=0.0)
-        assert out["text"] == "ok"
+        assert out["ok"] is True
 
     @pytest.mark.asyncio
     async def test_concurrency_limit_async(self):
-        """Ensure max_concurrent_calls caps concurrency for async path."""
+        """Ensure shared semaphore caps concurrency for async path."""
         current = 0
         max_seen = 0
 
@@ -179,7 +185,8 @@ class TestAsyncMMDataProcessor:
                 finally:
                     current -= 1
 
-        proc = AsyncMMDataProcessor(AsyncProc(), max_concurrent_calls=2)
+        sem = asyncio.Semaphore(2)
+        proc = AsyncMMDataProcessor(AsyncProc(), sem)
 
         tasks = [
             proc.process(input_text_or_ids=f"t{i}", request_obj=None) for i in range(6)
@@ -190,7 +197,7 @@ class TestAsyncMMDataProcessor:
 
     @pytest.mark.asyncio
     async def test_concurrency_limit_sync(self):
-        """Ensure max_concurrent_calls caps concurrency for sync fallback path."""
+        """Ensure shared semaphore caps concurrency for sync fallback path."""
         current = 0
         max_seen = 0
         lock = threading.Lock()
@@ -208,9 +215,8 @@ class TestAsyncMMDataProcessor:
                     with lock:
                         current -= 1
 
-        proc = AsyncMMDataProcessor(
-            SyncProc(), max_concurrent_calls=3, fallback_executor_workers=16
-        )
+        sem = asyncio.Semaphore(3)
+        proc = AsyncMMDataProcessor(SyncProc(), sem)
 
         tasks = [
             proc.process(input_text_or_ids=f"s{i}", request_obj=None) for i in range(9)
@@ -228,7 +234,7 @@ class TestAsyncMMDataProcessor:
                 await asyncio.sleep(0)
                 raise ValueError("async boom")
 
-        proc = AsyncMMDataProcessor(BadAsync())
+        proc = AsyncMMDataProcessor(BadAsync(), None)
         with pytest.raises(ValueError, match="async boom"):
             await proc.process(input_text_or_ids="x", request_obj=None)
 
@@ -240,7 +246,7 @@ class TestAsyncMMDataProcessor:
             def process_mm_data(self, **_):
                 raise RuntimeError("sync boom")
 
-        proc = AsyncMMDataProcessor(BadSync())
+        proc = AsyncMMDataProcessor(BadSync(), None)
         with pytest.raises(RuntimeError, match="sync boom"):
             await proc.process(input_text_or_ids="x", request_obj=None)
 
@@ -251,7 +257,7 @@ class TestAsyncMMDataProcessor:
         class Empty:
             pass
 
-        proc = AsyncMMDataProcessor(Empty())
+        proc = AsyncMMDataProcessor(Empty(), None)
         with pytest.raises(
             RuntimeError, match="neither 'process_mm_data_async' nor 'process_mm_data'"
         ):
@@ -272,14 +278,14 @@ class TestAsyncMMDataProcessor:
             def process_mm_data(self, **_):
                 return {"path": "sync"}
 
-        proc = AsyncMMDataProcessor(WeirdProc())
+        proc = AsyncMMDataProcessor(WeirdProc(), None)
         out = await proc.process(input_text_or_ids="x", request_obj=None)
         assert out["path"] == "sync"
 
     @pytest.mark.asyncio
     async def test_kwargs_and_request_passthrough_async(self, async_processor):
         """Extra kwargs and request_obj should be forwarded on async path."""
-        proc = AsyncMMDataProcessor(async_processor)
+        proc = AsyncMMDataProcessor(async_processor, None)
         out = await proc.process(
             image_data=["i1", "i2"],
             audio_data=["a1"],
@@ -297,7 +303,7 @@ class TestAsyncMMDataProcessor:
     @pytest.mark.asyncio
     async def test_kwargs_and_request_passthrough_sync(self, sync_processor):
         """Extra kwargs and request_obj should be forwarded on sync path."""
-        proc = AsyncMMDataProcessor(sync_processor)
+        proc = AsyncMMDataProcessor(sync_processor, None)
         out = await proc.process(
             image_data=None,
             audio_data=[],
@@ -311,27 +317,11 @@ class TestAsyncMMDataProcessor:
         assert out["request"] == ("r", 7)
         assert out["kwargs"]["lang"] == "en"
 
-    def test_shutdown_on_sync_executor(self, sync_processor):
-        """Explicit shutdown should close fallback executor for sync path."""
-        proc = AsyncMMDataProcessor(sync_processor)
-        # Swap real executor for a mock to assert shutdown behavior
-        proc.fallback_exec = Mock()
-        proc.shutdown()
-        proc.fallback_exec.shutdown.assert_called_once_with(wait=False)
-
-    def test_del_calls_shutdown(self, sync_processor, caplog):
-        """__del__ should best-effort shutdown without raising."""
-        caplog.set_level(logging.DEBUG)
-        proc = AsyncMMDataProcessor(sync_processor)
-        proc.fallback_exec = Mock()
-        # Simulate object destruction
-        proc.__del__()
-        proc.fallback_exec.shutdown.assert_called_once_with(wait=False)
-
     @pytest.mark.asyncio
     async def test_concurrent_mixed_requests(self, async_processor):
         """Mix different payloads and ensure all complete with valid outputs."""
-        proc = AsyncMMDataProcessor(async_processor, max_concurrent_calls=4)
+        sem = asyncio.Semaphore(4)
+        proc = AsyncMMDataProcessor(async_processor, sem)
 
         tasks = [
             proc.process(input_text_or_ids="t1", request_obj=1),
@@ -352,9 +342,8 @@ class TestAsyncMMDataProcessor:
     @pytest.mark.asyncio
     async def test_many_requests_values_match_inputs(self, sync_processor):
         """For sync path, ensure each response corresponds to its specific input."""
-        proc = AsyncMMDataProcessor(
-            sync_processor, max_concurrent_calls=8, fallback_executor_workers=16
-        )
+        sem = asyncio.Semaphore(8)
+        proc = AsyncMMDataProcessor(sync_processor, sem)
         texts = [f"msg-{i}" for i in range(10)]
         tasks = [
             proc.process(input_text_or_ids=t, request_obj=i)
