@@ -49,7 +49,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
-
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 
 class DeepseekMLP(nn.Module):
 
@@ -91,7 +91,6 @@ class DeepseekMLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
-
 class DeepseekMoE(nn.Module):
 
     def __init__(
@@ -99,9 +98,11 @@ class DeepseekMoE(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        layer_id = None
     ):
         super().__init__()
         self.config = config
+        self.layer_id = layer_id
         self.rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.n_routed_experts = config.n_routed_experts
@@ -148,7 +149,7 @@ class DeepseekMoE(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
             )
-
+        self.packed_amx=False
     def pack_params(self):
         w1 = []
         w2 = []
@@ -168,7 +169,11 @@ class DeepseekMoE(nn.Module):
 
         self.w2 = self.w2.view(len(w2), *w2s[0].shape)
 
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self.packed_amx:
+             _amx_process_weight_after_loading(self, ["w1", "w2"])
+             self.packed_amx=True
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.config.n_shared_experts is not None:
@@ -176,14 +181,31 @@ class DeepseekMoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe.fused_moe(
+        # final_hidden_states = fused_moe.fused_moe(
+        #     hidden_states,
+        #     w1=self.w1,
+        #     w2=self.w2,
+        #     topk_output=topk_output,
+        #     moe_runner_config=MoeRunnerConfig(inplace=True),
+        # )
+        # final_hidden_states = self.experts(hidden_states, topk_output)
+        topk_weights, topk_ids, _ = topk_output
+        final_hidden_states = torch.ops.sgl_kernel.fused_experts_cpu(
             hidden_states,
-            w1=self.w1,
-            w2=self.w2,
-            topk_output=topk_output,
-            moe_runner_config=MoeRunnerConfig(inplace=True),
+            self.w1,
+            self.w2,
+            topk_weights,
+            topk_ids,
+            False,  # inplace # See [Note] inplace should be False in fused_experts.
+            False,  # use_int8_w8a8
+            False,  # use_fp8_w8a16
+            None,  # w1_scale
+            None,  # w2_scale
+            None,  # block_size
+            None,  # a1_scale
+            None,  # a2_scale
+            True,  # is_vnni
         )
-
         if self.config.n_shared_experts is not None:
             final_hidden_states = final_hidden_states + shared_output
         final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -311,6 +333,7 @@ class DeepseekDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                layer_id=layer_id,
             )
         else:
             self.mlp = DeepseekMLP(
