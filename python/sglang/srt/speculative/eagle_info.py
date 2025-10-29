@@ -24,6 +24,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
 )
+from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -37,7 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
 
 _is_npu = is_npu()
 
@@ -46,10 +47,7 @@ if is_cuda():
         top_k_renorm_prob,
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
-        verify_tree_greedy,
     )
-elif is_hip():
-    from sgl_kernel import verify_tree_greedy
 
 logger = logging.getLogger(__name__)
 
@@ -285,33 +283,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE or _is_npu:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
-
-            if not _is_npu:
-                verify_tree_greedy(
-                    predicts=predict,  # mutable
-                    accept_index=accept_index,  # mutable
-                    accept_token_num=accept_length,  # mutable
-                    candidates=candidates,
-                    retrive_index=self.retrive_index,
-                    retrive_next_token=self.retrive_next_token,
-                    retrive_next_sibling=self.retrive_next_sibling,
-                    target_predict=target_predict,
-                )
-            else:
-                from sglang.srt.speculative.eagle_utils import verify_tree_greedy_native
-
-                predict, accept_index, accept_length = verify_tree_greedy_native(
-                    candidates,
-                    self.retrive_index,
-                    self.retrive_next_token,
-                    self.retrive_next_sibling,
-                    target_predict,
-                    accept_index,
-                    accept_length,
-                    predict,
-                    self.draft_token_num,
-                    self.topk,
-                )
+            predict, accept_index, accept_length = verify_tree_greedy_func(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=accept_length,  # mutable
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
+                target_predict=target_predict,
+                topk=self.topk,
+            )
 
         else:
             # apply temperature and get target probs

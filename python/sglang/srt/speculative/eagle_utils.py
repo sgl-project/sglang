@@ -6,7 +6,11 @@ import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
-if is_cuda() or is_hip():
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_npu = is_npu()
+
+if _is_cuda or _is_hip:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
@@ -270,16 +274,15 @@ def build_tree_kernel_efficient(
 
 
 def verify_tree_greedy_native(
-    candidates,
-    retrive_index,
-    retrive_next_token,
-    retrive_next_sibling,
-    target_predict,
-    accept_index,
-    accept_token_num,
-    predicts,
-    num_speculative_tokens,
-    topk,
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+    topk: int = -1,
 ):
     batch_size, num_draft_tokens = candidates.shape
 
@@ -312,7 +315,7 @@ def verify_tree_greedy_native(
         num_accepted = 0
         cur_node = 0
 
-        for _ in range(1, num_speculative_tokens):
+        for _ in range(1, num_draft_tokens):
             cur_node = cur_next_token[cur_node]
             found = False
             while cur_node != -1:
@@ -336,4 +339,45 @@ def verify_tree_greedy_native(
         predicts[last_accepted_idx] = cur_target[
             last_accepted_idx - num_draft_tokens * bx
         ]
+    return predicts, accept_index, accept_token_num
+
+
+def verify_tree_greedy_func(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+    topk: int = -1,
+):
+    if _is_cuda or _is_hip:
+        from sgl_kernel import verify_tree_greedy
+
+        verify_tree_greedy(
+            predicts=predicts,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=accept_token_num,  # mutable
+            candidates=candidates,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            target_predict=target_predict,
+        )
+
+    elif _is_npu:
+        predicts, accept_index, accept_token_num = verify_tree_greedy_native(
+            predicts=predicts,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=accept_token_num,  # mutable
+            candidates=candidates,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            target_predict=target_predict,
+            topk=topk,
+        )
+
     return predicts, accept_index, accept_token_num

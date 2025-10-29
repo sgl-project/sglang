@@ -128,6 +128,8 @@ def assign_req_to_token_pool_func(
             next_power_of_2(batch_size),
         )
     elif _is_npu:
+        import sgl_kernel_npu  # noqa: F401
+
         torch.ops.npu.cache_loc_assign(
             req_pool_indices,
             req_to_token,
