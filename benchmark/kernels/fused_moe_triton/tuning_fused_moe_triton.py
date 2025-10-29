@@ -440,11 +440,12 @@ def main(args: argparse.Namespace):
             2 * intermediate_size // (args.tp_size // args.ep_size)
         )
     elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
-        E = (
-            config.n_routed_experts + (0 if args.disable_shared_experts_fusion else 1)
-            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
-            else config.n_routed_experts
-        ) // args.ep_size
+        E = (config.n_routed_experts // args.ep_size) + (
+            0
+            if args.disable_shared_experts_fusion
+            or config.architectures[0] not in ["DeepseekV3ForCausalLM"]
+            else 1
+        )
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = (
