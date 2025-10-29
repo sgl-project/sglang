@@ -456,7 +456,7 @@ class KVCache(abc.ABC):
             # Handle boolean True as NVLINK
             if custom_mem_pool_type.lower() == "true":
                 custom_mem_pool_type = "NVLINK"
-            self.enable_custom_mem_pool = custom_mem_pool_type in ["NVLINK", "BAREX"]
+            self.enable_custom_mem_pool = custom_mem_pool_type in SUPPORTED_CUSTOM_MEM_POOL_TYPES
         else:
             self.enable_custom_mem_pool = False
 
@@ -982,7 +982,7 @@ class SWAKVPool(KVCache):
             # Handle boolean True as NVLINK
             if custom_mem_pool_type.lower() == "true":
                 custom_mem_pool_type = "NVLINK"
-            self.enable_custom_mem_pool = custom_mem_pool_type in ["NVLINK", "BAREX"]
+            self.enable_custom_mem_pool = custom_mem_pool_type in SUPPORTED_CUSTOM_MEM_POOL_TYPES
         else:
             self.enable_custom_mem_pool = False
 
