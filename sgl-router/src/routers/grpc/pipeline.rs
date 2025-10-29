@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use super::{context::*, processing, responses::BackgroundTaskInfo, streaming, utils};
+use super::{context::*, error, processing, responses::BackgroundTaskInfo, streaming, utils};
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     grpc_client::proto,
@@ -97,7 +97,7 @@ impl PreparationStage {
             match utils::process_chat_messages(&body_ref, &*ctx.components.tokenizer) {
                 Ok(msgs) => msgs,
                 Err(e) => {
-                    return Err(utils::bad_request_error(e));
+                    return Err(error::bad_request(e));
                 }
             };
 
@@ -105,10 +105,7 @@ impl PreparationStage {
         let encoding = match ctx.components.tokenizer.encode(&processed_messages.text) {
             Ok(encoding) => encoding,
             Err(e) => {
-                return Err(utils::internal_error_message(format!(
-                    "Tokenization failed: {}",
-                    e
-                )));
+                return Err(error::internal_error(format!("Tokenization failed: {}", e)));
             }
         };
 
@@ -116,9 +113,8 @@ impl PreparationStage {
 
         // Step 4: Build tool constraints if needed
         let tool_call_constraint = if let Some(tools) = body_ref.tools.as_ref() {
-            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model).map_err(
-                |e| utils::bad_request_error(format!("Invalid tool configuration: {}", e)),
-            )?
+            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
+                .map_err(|e| error::bad_request(format!("Invalid tool configuration: {}", e)))?
         } else {
             None
         };
@@ -160,7 +156,7 @@ impl PreparationStage {
         let (original_text, token_ids) = match self.resolve_generate_input(ctx, request) {
             Ok(res) => res,
             Err(msg) => {
-                return Err(utils::bad_request_error(msg));
+                return Err(error::bad_request(msg));
             }
         };
 
@@ -268,7 +264,7 @@ impl PipelineStage for WorkerSelectionStage {
             .state
             .preparation
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Preparation stage not completed"))?;
+            .ok_or_else(|| error::internal_error("Preparation stage not completed"))?;
 
         let text = prep.original_text.as_deref();
 
@@ -277,7 +273,7 @@ impl PipelineStage for WorkerSelectionStage {
                 match self.select_single_worker(ctx.input.model_id.as_deref(), text) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
-                        return Err(utils::service_unavailable_error(format!(
+                        return Err(error::service_unavailable(format!(
                             "No available workers for model: {:?}",
                             ctx.input.model_id
                         )));
@@ -288,7 +284,7 @@ impl PipelineStage for WorkerSelectionStage {
                 match self.select_pd_pair(ctx.input.model_id.as_deref(), text) {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
-                        return Err(utils::service_unavailable_error(format!(
+                        return Err(error::service_unavailable(format!(
                             "No available PD worker pairs for model: {:?}",
                             ctx.input.model_id
                         )));
@@ -408,7 +404,7 @@ impl PipelineStage for ClientAcquisitionStage {
             .state
             .workers
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Worker selection not completed"))?;
+            .ok_or_else(|| error::internal_error("Worker selection not completed"))?;
 
         let clients = match workers {
             WorkerSelection::Single { worker } => {
@@ -456,13 +452,13 @@ impl PipelineStage for RequestBuildingStage {
             .state
             .preparation
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Preparation not completed"))?;
+            .ok_or_else(|| error::internal_error("Preparation not completed"))?;
 
         let clients = ctx
             .state
             .clients
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Client acquisition not completed"))?;
+            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
 
         // Get client for building request (use prefill client if PD mode)
         let builder_client = match clients {
@@ -488,9 +484,7 @@ impl PipelineStage for RequestBuildingStage {
                             .clone(),
                         prep.tool_constraints.clone(),
                     )
-                    .map_err(|e| {
-                        utils::bad_request_error(format!("Invalid request parameters: {}", e))
-                    })?
+                    .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?
             }
             RequestType::Generate(request) => {
                 let request_id = request
@@ -505,7 +499,7 @@ impl PipelineStage for RequestBuildingStage {
                         prep.original_text.clone(),
                         prep.token_ids.clone(),
                     )
-                    .map_err(utils::bad_request_error)?
+                    .map_err(error::bad_request)?
             }
         };
 
@@ -568,7 +562,7 @@ impl PipelineStage for DispatchMetadataStage {
             .state
             .proto_request
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Proto request not built"))?;
+            .ok_or_else(|| error::internal_error("Proto request not built"))?;
 
         let request_id = proto_request.request_id.clone();
         let model = match &ctx.input.request_type {
@@ -644,13 +638,13 @@ impl PipelineStage for RequestExecutionStage {
             .state
             .proto_request
             .take()
-            .ok_or_else(|| utils::internal_error_static("Proto request not built"))?;
+            .ok_or_else(|| error::internal_error("Proto request not built"))?;
 
         let clients = ctx
             .state
             .clients
             .as_mut()
-            .ok_or_else(|| utils::internal_error_static("Client acquisition not completed"))?;
+            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
 
         let result = match self.mode {
             ExecutionMode::Single => self.execute_single(proto_request, clients).await?,
@@ -677,11 +671,12 @@ impl RequestExecutionStage {
     ) -> Result<ExecutionResult, Response> {
         let client = clients
             .single_mut()
-            .ok_or_else(|| utils::internal_error_static("Expected single client but got dual"))?;
+            .ok_or_else(|| error::internal_error("Expected single client but got dual"))?;
 
-        let stream = client.generate(proto_request).await.map_err(|e| {
-            utils::internal_error_message(format!("Failed to start generation: {}", e))
-        })?;
+        let stream = client
+            .generate(proto_request)
+            .await
+            .map_err(|e| error::internal_error(format!("Failed to start generation: {}", e)))?;
 
         Ok(ExecutionResult::Single { stream })
     }
@@ -693,7 +688,7 @@ impl RequestExecutionStage {
     ) -> Result<ExecutionResult, Response> {
         let (prefill_client, decode_client) = clients
             .dual_mut()
-            .ok_or_else(|| utils::internal_error_static("Expected dual clients but got single"))?;
+            .ok_or_else(|| error::internal_error("Expected dual clients but got single"))?;
 
         let prefill_request = proto_request.clone();
         let decode_request = proto_request;
@@ -707,7 +702,7 @@ impl RequestExecutionStage {
         let prefill_stream = match prefill_result {
             Ok(s) => s,
             Err(e) => {
-                return Err(utils::internal_error_message(format!(
+                return Err(error::internal_error(format!(
                     "Prefill worker failed to start: {}",
                     e
                 )));
@@ -718,7 +713,7 @@ impl RequestExecutionStage {
         let decode_stream = match decode_result {
             Ok(s) => s,
             Err(e) => {
-                return Err(utils::internal_error_message(format!(
+                return Err(error::internal_error(format!(
                     "Decode worker failed to start: {}",
                     e
                 )));
@@ -785,14 +780,14 @@ impl ResponseProcessingStage {
             .response
             .execution_result
             .take()
-            .ok_or_else(|| utils::internal_error_static("No execution result"))?;
+            .ok_or_else(|| error::internal_error("No execution result"))?;
 
         // Get dispatch metadata (needed by both streaming and non-streaming)
         let dispatch = ctx
             .state
             .dispatch
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?
+            .ok_or_else(|| error::internal_error("Dispatch metadata not set"))?
             .clone();
 
         if is_streaming {
@@ -819,7 +814,7 @@ impl ResponseProcessingStage {
             .response
             .stop_decoder
             .as_mut()
-            .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
+            .ok_or_else(|| error::internal_error("Stop decoder not initialized"))?;
 
         let response = self
             .processor
@@ -851,14 +846,14 @@ impl ResponseProcessingStage {
             .response
             .execution_result
             .take()
-            .ok_or_else(|| utils::internal_error_static("No execution result"))?;
+            .ok_or_else(|| error::internal_error("No execution result"))?;
 
         // Get dispatch metadata (needed by both streaming and non-streaming)
         let dispatch = ctx
             .state
             .dispatch
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?
+            .ok_or_else(|| error::internal_error("Dispatch metadata not set"))?
             .clone();
 
         if is_streaming {
@@ -881,7 +876,7 @@ impl ResponseProcessingStage {
             .response
             .stop_decoder
             .as_mut()
-            .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
+            .ok_or_else(|| error::internal_error("Stop decoder not initialized"))?;
 
         let result_array = self
             .processor
@@ -1048,9 +1043,9 @@ impl RequestPipeline {
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => axum::Json(response).into_response(),
             Some(FinalResponse::Generate(_)) => {
-                utils::internal_error_static("Internal error: wrong response type")
+                error::internal_error("Internal error: wrong response type")
             }
-            None => utils::internal_error_static("No response produced"),
+            None => error::internal_error("No response produced"),
         }
     }
 
@@ -1092,9 +1087,9 @@ impl RequestPipeline {
         match ctx.state.response.final_response {
             Some(FinalResponse::Generate(response)) => axum::Json(response).into_response(),
             Some(FinalResponse::Chat(_)) => {
-                utils::internal_error_static("Internal error: wrong response type")
+                error::internal_error("Internal error: wrong response type")
             }
-            None => utils::internal_error_static("No response produced"),
+            None => error::internal_error("No response produced"),
         }
     }
 
@@ -1123,7 +1118,7 @@ impl RequestPipeline {
             match stage.execute(&mut ctx).await {
                 Ok(Some(_response)) => {
                     // Streaming not supported for responses sync mode
-                    return Err(utils::bad_request_error(
+                    return Err(error::bad_request(
                         "Streaming is not supported in this context".to_string(),
                     ));
                 }
@@ -1180,10 +1175,10 @@ impl RequestPipeline {
         // Extract final response
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => Ok(response),
-            Some(FinalResponse::Generate(_)) => Err(utils::internal_error_static(
-                "Internal error: wrong response type",
-            )),
-            None => Err(utils::internal_error_static("No response produced")),
+            Some(FinalResponse::Generate(_)) => {
+                Err(error::internal_error("Internal error: wrong response type"))
+            }
+            None => Err(error::internal_error("No response produced")),
         }
     }
 }
