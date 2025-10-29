@@ -1817,20 +1817,13 @@ class Scheduler(
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_ratio = self.new_token_ratio
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
-            )
+            retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
             self.num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
-            for req in reqs_to_abort:
-                self.send_to_tokenizer.send_output(
-                    AbortReq(abort_reason=req.to_abort_message, rid=req.rid), req
-                )
 
             logger.info(
                 "KV cache pool is full. Retract requests. "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
-                f"#aborted_retracted_reqs: {len(reqs_to_abort)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
             )
 
@@ -2534,11 +2527,11 @@ class Scheduler(
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
-                # Abort method 3: set `to_abort=True`
+                # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_abort = True
+                req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

@@ -510,16 +510,15 @@ class Req:
 
         # Check finish
         self.tokenizer = None
-        self.finished_reason = None
+        self.finished_reason: Optional[BaseFinishReason] = None
         # finished position (in output_ids), used when checking stop conditions with speculative decoding
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
-        # If we want to abort the request in the middle of the event loop, set this to true
+        # If we want to abort the request in the middle of the event loop,
+        # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
-        self.to_abort = False
-        # This carries the error message for `.to_abort` and will be attached to the finished_reason at the end of the event loop
-        self.to_abort_message: str = None
+        self.to_finish: Optional[BaseFinishReason] = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
@@ -888,10 +887,9 @@ class Req:
         if self.finished():
             return
 
-        if self.to_abort:
-            self.finished_reason = FINISH_ABORT(
-                message=self.to_abort_message,
-            )
+        if self.to_finish:
+            self.finished_reason = self.to_finish
+            self.to_finish = None
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
@@ -970,7 +968,7 @@ class Req:
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
         self.return_logprob = False
-        self.finished_reason = FINISH_ABORT(
+        self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
 
@@ -1538,7 +1536,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio, []
+        return retracted_reqs, new_estimate_ratio
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]

@@ -782,7 +782,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
-            if self.model_config.is_multimodal_gen and req.to_abort:
+            if self.model_config.is_multimodal_gen and req.to_finish:
                 continue
 
             if req.finished():
