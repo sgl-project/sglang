@@ -38,6 +38,15 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q
+    try:
+        # Try standalone build first
+        from mla_fusion_kernel import mla_rope_quantize_fp8_fused
+    except ImportError:
+        # Fallback to sgl_kernel
+        try:
+            from sgl_kernel import mla_rope_quantize_fp8_fused
+        except ImportError:
+            mla_rope_quantize_fp8_fused = None  # Will use non-fused path
 
 # Constants
 DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
@@ -642,12 +651,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         cos_sin_cache: torch.Tensor,
         is_neox: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        *,
+        layer: Optional["RadixAttention"] = None,
+        save_kv_cache: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Quantize and apply RoPE for FP8 attention path.
 
         This function handles the FP8 quantization and RoPE application for MLA attention.
         It takes separate query/key nope and rope components, applies RoPE to the rope parts,
         quantizes all components to FP8, and merges the query components into a single tensor.
+        
+        When layer and save_kv_cache are provided, it uses the fused kernel to directly write
+        K into the KV cache, eliminating intermediate global memory operations.
 
         Args:
             q_nope: Query no-position-encoding component [seq_len, num_heads, kv_lora_rank]
@@ -662,12 +677,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             cos_sin_cache: Precomputed cosine/sine cache for RoPE
                 - expected dtype: matches q_/k_ input dtype (torch.bfloat16)
             is_neox: Whether to use NeoX-style RoPE (interleaved) or GPT-style (half rotation)
+            layer: Optional RadixAttention layer for fused KV cache write
+            save_kv_cache: If True and layer is provided, use fused kernel to directly write KV cache
 
         Returns:
             tuple: (merged_q_out, k_nope_out, k_rope_out) quantized to FP8
                 - merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=torch.float8_e4m3fn
-                - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn
-                - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn
+                - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn or None (if fused)
+                - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn or None (if fused)
         """
         attn_dtype = torch.float8_e4m3fn
         q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
@@ -681,35 +698,98 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             dtype=attn_dtype,
         )
 
-        # Key outputs maintain original shapes but with FP8 dtype
-        k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
-        k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
-
-        # Apply RoPE and quantize all components in a single fused kernel call
-        # This kernel handles:
-        # 1. RoPE application to q_rope and k_rope using cos_sin_cache and positions
-        # 2. Quantization of all components to FP8 format
-        # 3. Output placement into pre-allocated tensors
-        flashinfer.rope.mla_rope_quantize_fp8(
-            q_rope=q_rope,
-            k_rope=k_rope,
-            q_nope=q_nope,
-            k_nope=k_nope,
-            cos_sin_cache=cos_sin_cache,
-            pos_ids=forward_batch.positions,
-            is_neox=is_neox,
-            quantize_dtype=attn_dtype,
-            # Output tensor slicing: q_out contains [nope_part, rope_part]
-            q_rope_out=q_out[..., self.kv_lora_rank :],  # RoPE part goes to end
-            k_rope_out=k_rope_out,
-            q_nope_out=q_out[..., : self.kv_lora_rank],  # Nope part goes to beginning
-            k_nope_out=k_nope_out,
-            # Quantization scales (set to 1.0 for no additional scaling)
-            quant_scale_q=1.0,
-            quant_scale_kv=1.0,
+        # Determine if we can use the fused kernel (RoPE + quantization + direct KV write)
+        # Conditions: save_kv_cache, layer provided, not NSA packed format, kernel available
+        kernel_available = mla_rope_quantize_fp8_fused is not None
+        has_layer = layer is not None
+        nsa_flag = getattr(forward_batch.token_to_kv_pool, "nsa_kv_cache_store_fp8", False)
+        
+        # Enable fused KV write for performance optimization
+        use_fused_kv_write = (
+            kernel_available
+            and save_kv_cache
+            and has_layer
+            and not nsa_flag
         )
+        
+        # DEBUG: Basic branch tracking
+        import sys
+        if use_fused_kv_write:
+            sys.stderr.write(f"[MLA FUSION] ✅ Using fused kernel (layer={layer.layer_id}, tokens={q_len})\n")
+        elif not kernel_available:
+            sys.stderr.write(f"[MLA FUSION] ❌ Kernel not available, using standard path\n")
+        sys.stderr.flush()
 
-        return q_out, k_nope_out, k_rope_out
+        if use_fused_kv_write:
+            # Fused path: RoPE + quantization + direct KV cache write
+            # This eliminates the intermediate write/read of k_nope_out/k_rope_out
+            
+            # CRITICAL: Reshape KV buffer to [num_blocks, page_size, kv_dim] layout
+            # get_key_buffer() returns flattened [num_blocks*page_size, 1, kv_dim]
+            # We need to reshape it to proper 3D layout for correct page-internal indexing
+            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_buffer = k_cache.view(-1, self.page_size, self.kv_cache_dim)
+            
+            # Note: Keep as FP8 tensor, C++ will do reinterpret_cast to uint8*
+            # Don't use .view(torch.uint8) which is wrong API usage
+            
+            # Dtype assertion for safety
+            assert q_nope.dtype in (torch.float16, torch.bfloat16), f"Unsupported dtype: {q_nope.dtype}"
+            assert k_nope.dtype == q_nope.dtype, "Q and K dtype mismatch"
+            
+            # Call fused kernel
+            # Note: Kernel now natively supports both FP16 and BF16 via C++ templates
+            # Note: kernel accepts 2D or 3D Q inputs (handles stride properly)
+            # Note: Pass FP8 tensors as-is, C++ will reinterpret_cast to uint8*
+            # K inputs must be 2D
+            mla_rope_quantize_fp8_fused(
+                q_nope,  # [nnz, num_heads, Dn] or [nnz, Dn] - kernel handles both, FP16/BF16
+                q_rope,  # [nnz, num_heads, Dr] or [nnz, Dr] - kernel handles both, FP16/BF16
+                k_nope,  # [nnz, Dn] - already 2D from squeeze(1), FP16/BF16
+                k_rope,  # [nnz, Dr] - already 2D from squeeze(1), FP16/BF16
+                cos_sin_cache,
+                forward_batch.positions,
+                is_neox,
+                q_out,   # FP8 tensor, C++ will reinterpret as uint8*
+                None,  # k_nope_out - skip intermediate output
+                None,  # k_rope_out - skip intermediate output
+                kv_buffer,  # FP8 tensor, direct write to KV cache
+                forward_batch.out_cache_loc,
+            )
+            
+            # Return Q output and None for K outputs (already written to cache)
+            return q_out, None, None
+        else:
+            # Standard path: RoPE + quantization only (backward compatible)
+            # Key outputs maintain original shapes but with FP8 dtype
+            k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
+            k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
+
+            # Apply RoPE and quantize all components in a single kernel call
+            # This kernel handles:
+            # 1. RoPE application to q_rope and k_rope using cos_sin_cache and positions
+            # 2. Quantization of all components to FP8 format
+            # 3. Output placement into pre-allocated tensors
+            flashinfer.rope.mla_rope_quantize_fp8(
+                q_rope=q_rope,
+                k_rope=k_rope,
+                q_nope=q_nope,
+                k_nope=k_nope,
+                cos_sin_cache=cos_sin_cache,
+                pos_ids=forward_batch.positions,
+                is_neox=is_neox,
+                quantize_dtype=attn_dtype,
+                # Output tensor slicing: q_out contains [nope_part, rope_part]
+                q_rope_out=q_out[..., self.kv_lora_rank :],  # RoPE part goes to end
+                k_rope_out=k_rope_out,
+                q_nope_out=q_out[..., : self.kv_lora_rank],  # Nope part goes to beginning
+                k_nope_out=k_nope_out,
+                # Quantization scales (set to 1.0 for no additional scaling)
+                quant_scale_q=1.0,
+                quant_scale_kv=1.0,
+            )
+
+            return q_out, k_nope_out, k_rope_out
 
     def pad_draft_extend_query(
         self,
@@ -806,12 +886,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
         merge_query = q_rope is not None
+        fused_kv = False  # Track if using fused KV write path
         if self.data_type == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert all(
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
+            
+            # Call quantize_and_rope_for_fp8 with layer and save_kv_cache parameters
+            # This enables the fused kernel path when conditions are met
             q, k, k_rope = self.quantize_and_rope_for_fp8(
                 q,
                 q_rope,
@@ -820,14 +904,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch,
                 cos_sin_cache,
                 is_neox,
+                layer=layer,
+                save_kv_cache=save_kv_cache,
             )
             merge_query = False
+            # Check if fused path was used (K outputs are None when directly written to KV cache)
+            fused_kv = (k is None and k_rope is None)
+            if fused_kv:
+                import sys
+                sys.stderr.write(f"[DECODE] ✅ Fused path used\n")
+                sys.stderr.flush()
 
-        # Save KV cache if requested
-        if save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+        # Save KV cache if requested (only if not using fused path)
+        # When k or k_rope is None, it means the fused kernel already wrote to KV cache
+        if save_kv_cache and not fused_kv and k is not None and k_rope is not None:
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
@@ -916,30 +1006,54 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
-        if (
+        fused_kv = False  # Track if we used fused KV write path
+        
+        # For FP8 path, check if we should use quantize_and_rope_for_fp8
+        # Conditions:
+        # 1. Using FP8 data type
+        # 2. In target_verify or draft_extend mode
+        # 3. All rope-related parameters are available (not None)
+        use_fp8_quantize = (
             self.data_type == torch.float8_e4m3fn
-        ) and forward_batch.forward_mode.is_target_verify():
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            )
+            and all(x is not None for x in [q_rope, k_rope, cos_sin_cache])
+        )
+        
+        if use_fp8_quantize:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
-            assert all(
-                x is not None for x in [q_rope, k_rope, cos_sin_cache]
-            ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-            q, k, k_rope = self.quantize_and_rope_for_fp8(
-                q,
-                q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
+            
+            # Call quantize_and_rope_for_fp8 with layer and save_kv_cache parameters
+            # This enables the fused kernel path when conditions are met
+            # NOTE: Do NOT squeeze Q - fused kernel supports 3D Q: [nnz, num_heads, dim]
+            q, k_fp8_nope, k_fp8_rope = self.quantize_and_rope_for_fp8(
+                q,  # ✅ Keep Q as is (supports both 2D and 3D)
+                q_rope,  # ✅ Keep Q_rope as is
+                k.squeeze(1) if k.dim() == 3 else k,  # K must be 2D
+                k_rope.squeeze(1) if k_rope.dim() == 3 else k_rope,  # K_rope must be 2D
                 forward_batch,
                 cos_sin_cache,
                 is_neox,
+                layer=layer,
+                save_kv_cache=save_kv_cache,
             )
             merge_query = False
+            # Fused path: K already written to KV cache, function returns None for K outputs
+            fused_kv = (k_fp8_nope is None and k_fp8_rope is None)
+            if fused_kv:
+                import sys
+                sys.stderr.write(f"[EXTEND] ✅ Fused path used\n")
+                sys.stderr.flush()
+            # Update local variables for subsequent logic
+            k = k_fp8_nope
+            k_rope = k_fp8_rope
 
-        # Save KV cache if requested
-        if save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+        # Save KV cache if requested (only if not using fused path)
+        # When k or k_rope is None, it means the fused kernel already wrote to KV cache
+        if save_kv_cache and not fused_kv and k is not None and k_rope is not None:
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
@@ -1035,10 +1149,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             return output
 
-        if k_rope is not None:
-            k = torch.cat([k, k_rope], dim=-1)
-        k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-        v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+        # Only prepare k/v tensors if NOT using fused path (for MHA prefill)
+        # In fused path, K is already in KV cache and we use decode kernel
+        if not fused_kv:
+            if k_rope is not None:
+                k = torch.cat([k, k_rope], dim=-1)
+            k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+            v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
         # When chunked prefix cache is enabled, dispatch to different path for ragged attention.
         if forward_batch.attn_attend_prefix_cache:
             # MHA for chunked prefix kv cache when running model with MLA
