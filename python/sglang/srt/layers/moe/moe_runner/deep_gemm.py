@@ -234,7 +234,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 assert (
                     s_mn % 4 == 0 and s_k % 4 == 0
                 ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
-                hidden_states_scale = _cast_to_e8m0_with_rounding_up(hidden_states_scale)
+                hidden_states_scale = _cast_to_e8m0_with_rounding_up(
+                    hidden_states_scale
+                )
         else:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
