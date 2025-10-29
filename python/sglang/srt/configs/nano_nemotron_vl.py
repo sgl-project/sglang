@@ -32,7 +32,7 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         force_image_size=None,
         downsample_ratio=0.5,
         template=None,
-        ps_version="v1",
+        ps_version="v2",
         image_tag_type="internvl",
         projector_hidden_size=4096,
         vit_hidden_size=1280,
