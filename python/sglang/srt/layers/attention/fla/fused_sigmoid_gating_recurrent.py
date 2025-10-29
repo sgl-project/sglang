@@ -17,6 +17,8 @@ from sglang.srt.layers.attention.fla.utils import input_guard
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
     a,
+    a_stride_m,
+    a_stride_k,
     dt_bias,
     softplus_beta,
     softplus_threshold,
@@ -70,7 +72,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     # Gating computation pointers
     p_A_log = A_log + i_hv
-    p_a = a + bos * HV + i_hv
+    p_a = a + bos * a_stride_m + i_hv * a_stride_k
     p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
@@ -146,7 +148,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_o += HV * V
         p_v += HV * V
         p_b += HV
-        p_a += HV
+        p_a += a_stride_m
 
     # Store final state back to h0_source with bounds checking
     if USE_INITIAL_STATE:
@@ -204,6 +206,8 @@ def fused_sigmoid_gating_delta_rule_update(
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
+        a_stride_m=a.stride(0),
+        a_stride_k=a.stride(1),
         dt_bias=dt_bias,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
