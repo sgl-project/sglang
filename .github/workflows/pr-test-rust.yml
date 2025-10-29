@@ -67,7 +67,9 @@ jobs:
       - name: Test wheel install
         run: |
           pip install dist/*.whl
-          python -c "import sglang_router; print('Wheel installs successfully')"
+          python -c "import sglang_router; print('Python package: OK')"
+          python -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
+          python -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
   unit-test-rust:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
