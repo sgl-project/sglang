@@ -164,7 +164,7 @@ jobs:
           export RUSTC_WRAPPER=sccache
           cd sgl-router
           pip install maturin
-          maturin build --release
+          maturin build --release --out dist
           pip install --force-reinstall dist/*.whl
 
 
@@ -261,7 +261,7 @@ jobs:
           export RUSTC_WRAPPER=sccache
           cd sgl-router
           pip install maturin
-          maturin build --release
+          maturin build --release --out dist
           pip install --force-reinstall dist/*.whl
 
       - name: Run Python E2E response API tests
