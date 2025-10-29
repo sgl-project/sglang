@@ -107,9 +107,9 @@ class SchedulerOutputProcessorMixin:
 
                     # Update Mamba
                     seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-                    page_size = get_global_server_args().page_size
-                    paged_aligned_seq_len = seq_len // page_size * page_size
                     if req.mamba_pool_copy_ping_pong_idx is not None:
+                        page_size = get_global_server_args().page_size
+                        paged_aligned_seq_len = seq_len // page_size * page_size
                         req.mamba_pool_copy_next_idx = 1 - req.mamba_pool_copy_next_idx
                         req.mamba_pool_copy_last_seqlen = paged_aligned_seq_len
 
