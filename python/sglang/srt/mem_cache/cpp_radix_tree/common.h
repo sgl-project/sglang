@@ -15,15 +15,15 @@ using token_slice = std::span<const token_t>;
 using NodeHandle = std::size_t;
 using IOTicket = std::uint32_t;
 
-inline void
-_assert(bool condition, const char *message = "Assertion failed",
-        std::source_location loc = std::source_location::current()) {
+inline void _assert(
+    bool condition,
+    const char* message = "Assertion failed",
+    std::source_location loc = std::source_location::current()) {
   if (!condition) [[unlikely]] {
     std::string msg = message;
-    msg = msg + " at " + loc.file_name() + ":" + std::to_string(loc.line()) +
-          " in " + loc.function_name();
+    msg = msg + " at " + loc.file_name() + ":" + std::to_string(loc.line()) + " in " + loc.function_name();
     throw std::runtime_error(msg);
   }
 }
 
-} // namespace radix_tree_v2
+}  // namespace radix_tree_v2

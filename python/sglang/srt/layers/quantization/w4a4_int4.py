@@ -1,38 +1,60 @@
 from __future__ import annotations
 
+import importlib
+import sys
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     Mapping,
     Optional,
+    Tuple,
+    Union,
     cast,
 )
 
 import torch
+from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import (
+    ChannelQuantScaleParameter,
+    ModelWeightParameter,
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.w8a8_int8 import NPU_W8A8DynamicLinearMethod
 from sglang.srt.utils import (
+    apply_module_patch,
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
     is_npu,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 
 if TYPE_CHECKING:
-    pass
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -98,6 +120,7 @@ class W4A4Int4Config(QuantizationConfig):
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if _is_npu:
             if isinstance(layer, LinearBase):

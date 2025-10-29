@@ -20,7 +20,8 @@ from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.layers.quantization.w8a8_int8 import (
     NPU_W8A8DynamicLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
@@ -87,9 +88,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
                     range_max = (input_scale * (int8_traits.max - azps)).max()
                     range_min = (input_scale * (int8_traits.min - azps)).min()
 
-                    scale = (range_max - range_min) / (
-                        int8_traits.max - int8_traits.min
-                    )
+                    scale = (range_max - range_min) / (int8_traits.max - int8_traits.min)
 
                     # AZP loaded as int8 but used as int32
                     azp = (int8_traits.min - range_min / scale).to(dtype=torch.int32)
@@ -160,7 +159,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
             # TODO make NPU kernel work with compressed-tensors static input data
             if _is_npu:
                 raise NotImplementedError(
-                    "Static scheme for activations is not implemented on NPU."
+                "Static scheme for activations is not implemented on NPU."
                 )
             input_scale = PerTensorScaleParameter(
                 data=torch.empty(1, dtype=torch.float32), weight_loader=weight_loader
@@ -188,10 +187,5 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
             x_q, x_scale = per_token_quant_int8(x)
 
             return int8_scaled_mm(
-                x_q,
-                layer.weight,
-                x_scale,
-                layer.weight_scale,
-                out_dtype=x.dtype,
-                bias=bias,
+                x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
             )

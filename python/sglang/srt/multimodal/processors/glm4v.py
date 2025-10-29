@@ -8,9 +8,7 @@ from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import (
-    MultimodalSpecialTokens,
-)
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
