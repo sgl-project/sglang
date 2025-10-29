@@ -194,6 +194,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 from sglang.srt.layers.moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     set_global_experts_capturer,
+    get_global_experts_capturer,
 )
 
 logger = logging.getLogger(__name__)
@@ -1646,11 +1647,15 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+            print(f"[get_next_batch_to_run] Prefill {ret}")
         else:
             # Run decode
             if not self.running_batch.is_empty():
+                print(f"[get_next_batch_to_run] Before update {self.running_batch}")
                 self.running_batch = self.update_running_batch(self.running_batch)
+                print(f"[get_next_batch_to_run] After update {self.running_batch}")
                 ret = self.running_batch if not self.running_batch.is_empty() else None
+                print(f"[get_next_batch_to_run] Decode {ret}")
             else:
                 ret = None
 
@@ -1977,6 +1982,14 @@ class Scheduler(
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
+            print(f"[run_batch] Scheduler.run_batch {batch}")
+            print(f"[run_batch] ModelWorkerBatch {batch_or_worker_batch=}")
+            print(f"[run_batch] batch {batch.reqs}")
+            
+            # Copy cached routing experts' buffers back to CPU cache
+            get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
+                batch.out_cache_loc
+            )
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
             #       we shall still keep the original outputs, e.g. next_token_ids

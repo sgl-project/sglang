@@ -123,6 +123,13 @@ class RoutedExpertsCapturer(ABC):
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         raise NotImplementedError
+
+    def sync_fwd_experts_buffer_DtoH(
+        self,
+        batch: int,
+        loc: torch.Tensor
+    ):
+        raise NotImplementedError
     
     def get_host_cache(self):
         raise NotImplementedError
@@ -157,6 +164,13 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             topk_ids
         )
 
+    def sync_fwd_experts_buffer_DtoH(
+        self,
+        loc: torch.Tensor
+    ):
+        batch = loc.shape[0]
+        self.host_cache.buffer[loc] = self.device_cache.buffer[:batch].cpu()
+    
     def get_host_cache(self):
         return self.host_cache
 
@@ -170,7 +184,10 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         pass
 
-    def clear_buffer(self):
+    def sync_fwd_experts_buffer_DtoH(
+        self,
+        loc: torch.Tensor
+    ):
         pass
     
     def get_captured_experts(self):

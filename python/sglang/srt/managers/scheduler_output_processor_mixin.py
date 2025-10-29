@@ -148,12 +148,13 @@ class SchedulerOutputProcessorMixin:
                             .tolist()
                         )
                     
-                    if req.return_routed_experts:
-                        req.routed_experts.append(
-                            self.routed_experts_capturer.get_captured_experts()[i]
-                            .clone()
-                            .tolist()
-                        )
+                    # if req.return_routed_experts:
+                    #     print(f"When capture experts, next ids {next_token_ids=} {req=}")
+                    #     req.routed_experts.append(
+                    #         self.routed_experts_capturer.get_captured_experts()[i]
+                    #         .clone()
+                    #         .tolist()
+                    #     )
 
                     if req.grammar is not None:
                         # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -194,8 +195,8 @@ class SchedulerOutputProcessorMixin:
                                     last_prefill_chunk=False,
                                 )
                             logprob_pt += num_input_logprobs
-            if batch.return_routed_experts:
-                self.routed_experts_capturer.clear_buffer()
+            # if batch.return_routed_experts:
+            #     self.routed_experts_capturer.clear_buffer()
         else:  # embedding or reward model
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
@@ -382,12 +383,12 @@ class SchedulerOutputProcessorMixin:
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
             
-            if req.return_routed_experts:
-                req.routed_experts.append(
-                    self.routed_experts_capturer.get_captured_experts()[i]
-                    .clone()
-                    .tolist()
-                )
+            # if req.return_routed_experts:
+            #     req.routed_experts.append(
+            #         self.routed_experts_capturer.get_captured_experts()[i]
+            #         .clone()
+            #         .tolist()
+            #     )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -401,8 +402,8 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
-        if batch.return_routed_experts:
-            self.routed_experts_capturer.clear_buffer()
+        # if batch.return_routed_experts:
+        #     self.routed_experts_capturer.clear_buffer()
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
