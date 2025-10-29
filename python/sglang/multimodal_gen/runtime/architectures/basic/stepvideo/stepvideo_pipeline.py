@@ -90,14 +90,13 @@ class StepVideoPipeline(LoRAPipeline, ComposedPipelineBase):
     def build_llm(self, model_dir, device) -> torch.nn.Module:
         text_encoder = (
             STEP1TextEncoder(model_dir, max_length=320)
-            .to(device)
             .to(torch.bfloat16)
             .eval()
         )
         return text_encoder
 
     def build_clip(self, model_dir, device) -> HunyuanClip:
-        clip = HunyuanClip(model_dir, max_length=77).to(device).eval()
+        clip = HunyuanClip(model_dir, max_length=77).eval()
         return clip
 
     def initialize_pipeline(self, server_args: ServerArgs):
@@ -124,11 +123,15 @@ class StepVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         )
         torch.ops.load_library(lib_path)
 
-    def load_modules(self, server_args: ServerArgs) -> dict[str, Any]:
+    def load_modules(
+        self,
+        server_args: ServerArgs,
+        loaded_modules: dict[str, torch.nn.Module] | None = None,
+    ) -> dict[str, Any]:
         """
         Load the modules from the config.
         """
-        model_index = self._load_config(self.model_path)
+        model_index = self._load_config()
         logger.info("Loading pipeline modules from config: %s", model_index)
 
         # remove keys that are not pipeline modules
