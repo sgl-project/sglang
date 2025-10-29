@@ -19,7 +19,7 @@ ARG NVSHMEM_VERSION=3.4.5
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    NVSHMEM_DIR=/sgl-workspace/nvshmem/install \    
+    NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
     CCACHE_DIR=/tmp/.ccache \
     CCACHE_MAXSIZE=10G
 # Add GKE default lib and bin locations.
