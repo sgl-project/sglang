@@ -217,17 +217,8 @@ impl HarmonyPreparationStage {
         // New xgrammar format with "format" field
         let structural_tag = json!({
             "format": {
-                "type": "sequence",
-                "elements": [
-                    {
-                        "type": "const_string",
-                        "value": "<|start|>assistant"
-                    },
-                    {
-                        "type": "or",
-                        "elements": tool_options
-                    }
-                ]
+                "type": "or",
+                "elements": tool_options
             }
         });
 
@@ -249,10 +240,6 @@ impl HarmonyPreparationStage {
             "format": {
                 "type": "sequence",
                 "elements": [
-                    {
-                        "type": "const_string",
-                        "value": "<|start|>assistant"
-                    },
                     {
                         "type": "const_string",
                         "value": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", function_name)
