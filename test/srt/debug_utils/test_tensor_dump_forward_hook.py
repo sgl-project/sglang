@@ -1,3 +1,5 @@
+import unittest
+
 import torch
 from torch import nn
 
@@ -85,3 +87,7 @@ def test_model_forward_dump(tmp_path):
     assert torch.allclose(
         data["model.mlp.down_proj"], result.cpu(), rtol=1e-5, atol=1e-5
     )
+
+
+if __name__ == "__main__":
+    unittest.main()
