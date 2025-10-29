@@ -132,7 +132,7 @@ impl McpManager {
             .await?;
 
         self.inventory.clear_server_tools(&server_key);
-        Self::load_server_inventory(&self.inventory, &server_name, &client).await;
+        Self::load_server_inventory(&self.inventory, &server_key, &client).await;
         Ok(client)
     }
 
@@ -473,40 +473,40 @@ impl McpManager {
     /// It discovers all tools, prompts, and resources from the client and caches them in the inventory.
     pub async fn load_server_inventory(
         inventory: &Arc<ToolInventory>,
-        server_name: &str,
+        server_key: &str,
         client: &Arc<McpClient>,
     ) {
         // Tools
         match client.peer().list_all_tools().await {
             Ok(ts) => {
-                info!("Discovered {} tools from '{}'", ts.len(), server_name);
+                info!("Discovered {} tools from '{}'", ts.len(), server_key);
                 for t in ts {
-                    inventory.insert_tool(t.name.to_string(), server_name.to_string(), t);
+                    inventory.insert_tool(t.name.to_string(), server_key.to_string(), t);
                 }
             }
-            Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
+            Err(e) => warn!("Failed to list tools from '{}': {}", server_key, e),
         }
 
         // Prompts
         match client.peer().list_all_prompts().await {
             Ok(ps) => {
-                info!("Discovered {} prompts from '{}'", ps.len(), server_name);
+                info!("Discovered {} prompts from '{}'", ps.len(), server_key);
                 for p in ps {
-                    inventory.insert_prompt(p.name.clone(), server_name.to_string(), p);
+                    inventory.insert_prompt(p.name.clone(), server_key.to_string(), p);
                 }
             }
-            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
+            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_key, e),
         }
 
         // Resources
         match client.peer().list_all_resources().await {
             Ok(rs) => {
-                info!("Discovered {} resources from '{}'", rs.len(), server_name);
+                info!("Discovered {} resources from '{}'", rs.len(), server_key);
                 for r in rs {
-                    inventory.insert_resource(r.uri.clone(), server_name.to_string(), r.raw);
+                    inventory.insert_resource(r.uri.clone(), server_key.to_string(), r.raw);
                 }
             }
-            Err(e) => debug!("No resources or failed to list on '{}': {}", server_name, e),
+            Err(e) => debug!("No resources or failed to list on '{}': {}", server_key, e),
         }
     }
 
