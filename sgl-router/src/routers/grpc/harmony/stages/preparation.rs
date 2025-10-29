@@ -88,7 +88,7 @@ impl HarmonyPreparationStage {
 
         // Step 2: Build tool constraints
         let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
-            Self::generate_harmony_structural_tag(tools, &body_ref.tool_choice)?
+            Self::generate_harmony_structural_tag(tools, &body_ref.tool_choice).map_err(|e| *e)?
         } else {
             None
         };
@@ -157,7 +157,7 @@ impl HarmonyPreparationStage {
     fn generate_harmony_structural_tag(
         tools: &[Tool],
         tool_choice: &Option<ToolChoice>,
-    ) -> Result<Option<(String, String)>, Response> {
+    ) -> Result<Option<(String, String)>, Box<Response>> {
         let Some(choice) = tool_choice.as_ref() else {
             return Ok(None);
         };
@@ -187,7 +187,7 @@ impl HarmonyPreparationStage {
     fn build_harmony_structural_tag(
         tools: &[Tool],
         specific_function: Option<&str>,
-    ) -> Result<String, Response> {
+    ) -> Result<String, Box<Response>> {
         let mut tags = Vec::new();
 
         // Filter tools if specific function requested
@@ -202,10 +202,10 @@ impl HarmonyPreparationStage {
 
         // Validate specific function exists
         if specific_function.is_some() && tools_to_use.is_empty() {
-            return Err(utils::bad_request_error(format!(
+            return Err(Box::new(utils::bad_request_error(format!(
                 "Tool '{}' not found in tools list",
                 specific_function.unwrap()
-            )));
+            ))));
         }
 
         // Build tags for each tool
@@ -236,7 +236,7 @@ impl HarmonyPreparationStage {
         });
 
         serde_json::to_string(&structural_tag).map_err(|e| {
-            utils::internal_error_message(format!("Failed to serialize structural tag: {}", e))
+            Box::new(utils::internal_error_message(format!("Failed to serialize structural tag: {}", e)))
         })
     }
 }
