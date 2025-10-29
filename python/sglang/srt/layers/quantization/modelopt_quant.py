@@ -1432,7 +1432,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         layer.dispatcher.set_quant_config(
-            {"input_global_scale": layer.w13_input_scale_quant}
+            {
+                "input_global_scale": (
+                    layer.w13_input_scale_quant if CUTEDSL_MOE_NVFP4_DISPATCH else None
+                )
+            }
         )
 
         # Validate weight scales
@@ -1654,7 +1658,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def apply_without_routing_weights(
         self,
         layer: FusedMoE,
-        x: torch.Tensor,
+        x: tuple[torch.Tensor, Optional[torch.Tensor]],
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
         down_gemm_overlap_args: Optional["DownGemmOverlapArgs"],
