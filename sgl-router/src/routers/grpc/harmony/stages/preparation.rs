@@ -205,10 +205,6 @@ impl HarmonyPreparationStage {
                     {
                         "type": "json_schema",
                         "json_schema": params_schema
-                    },
-                    {
-                        "type": "const_string",
-                        "value": "<|call|>"
                     }
                 ]
             }));
@@ -247,10 +243,6 @@ impl HarmonyPreparationStage {
                     {
                         "type": "json_schema",
                         "json_schema": params_schema
-                    },
-                    {
-                        "type": "const_string",
-                        "value": "<|call|>"
                     }
                 ]
             }
