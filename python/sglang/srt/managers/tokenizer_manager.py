@@ -25,7 +25,6 @@ import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
@@ -215,16 +214,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.mm_processor = get_mm_processor(
                 self.model_config.hf_config, server_args, _processor, transport_mode
             )
-            max_concurrent_calls = getattr(
-                self.server_args, "mm_max_concurrent_calls", 32
-            )
-            self.mm_semaphore = asyncio.Semaphore(max_concurrent_calls)
-            self.mm_executor = ThreadPoolExecutor(max_workers=max_concurrent_calls)
             self.mm_data_processor = AsyncMMDataProcessor(
                 self.mm_processor,
-                self.mm_semaphore,
-                timeout_s=getattr(self.server_args, "mm_per_request_timeout", None),
-                executor=self.mm_executor,
+                max_concurrent_calls=self.server_args.mm_max_concurrent_calls,
+                timeout_s=self.server_args.mm_per_request_timeout,
             )
 
             if server_args.skip_tokenizer_init:
