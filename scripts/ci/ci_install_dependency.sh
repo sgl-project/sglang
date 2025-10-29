@@ -24,6 +24,29 @@ rm -rf /root/.cache/flashinfer
 # Install apt packages
 apt install -y git libnuma-dev
 
+# Install protoc for router build (gRPC protobuf compilation)
+if ! command -v protoc &> /dev/null; then
+    echo "Installing protoc..."
+    if command -v apt-get &> /dev/null; then
+        # Ubuntu/Debian
+        apt-get update
+        apt-get install -y wget unzip gcc g++ perl make
+    elif command -v yum &> /dev/null; then
+        # RHEL/CentOS
+        yum update -y
+        yum install -y wget unzip gcc gcc-c++ perl-core make
+    fi
+
+    cd /tmp
+    wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip
+    unzip protoc-32.0-linux-x86_64.zip -d /usr/local
+    rm protoc-32.0-linux-x86_64.zip
+    protoc --version
+    cd -
+else
+    echo "protoc already installed: $(protoc --version)"
+fi
+
 # Install uv
 if [ "$IS_BLACKWELL" = "1" ]; then
     # The blackwell CI runner has some issues with pip and uv,
