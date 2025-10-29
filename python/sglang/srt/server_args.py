@@ -144,6 +144,7 @@ NSA_CHOICES = [
     "flashmla_kv",
     "flashmla_auto",
     "fa3",
+    "fa4",
     "tilelang",
     "aiter",
 ]

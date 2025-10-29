@@ -420,12 +420,13 @@ def handle_attention_nsa(attn, forward_batch):
         else:
             max_kv_len = 0
 
-        # Only enable MHA on SM90 for now
-        is_h_card = _device_sm == 90
+        # Enable MHA on SM90 (H100/H200) and SM100 (B200)
+        # SM90 uses FA3, SM100 uses FA4
+        is_supported_gpu = _device_sm == 90 or _device_sm == 100
 
         return (
             AttnForwardMethod.MHA_CHUNKED_KV
-            if (max_kv_len <= NSA_THRESHOLD and is_h_card)
+            if (max_kv_len <= NSA_THRESHOLD and is_supported_gpu)
             else AttnForwardMethod.MLA
         )
 
