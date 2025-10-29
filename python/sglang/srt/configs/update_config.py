@@ -71,6 +71,20 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     return model_config
 
 
+def update_linear_dim(cfg, attr_name, tp_size):
+    if not hasattr(cfg, attr_name):
+        return
+
+    origin_dim = getattr(cfg, attr_name)
+    if origin_dim % tp_size == 0:
+        return
+    from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+    updated_dim = pad_vocab_size(origin_dim, tp_size)
+    print(f"{attr_name} updated to {updated_dim}!")
+    setattr(cfg, attr_name, updated_dim)
+    return
+
+
 def adjust_config_with_unaligned_cpu_tp(
     model_config: ModelConfig, load_config: LoadConfig, tp_size: int
 ) -> ModelConfig:
@@ -130,35 +144,36 @@ def adjust_config_with_unaligned_cpu_tp(
         model_config, "intermediate_size_mlp", intermediate_padding_size
     )
     if hasattr(model_config.hf_config, "vision_config"):
-        model_config.hf_config.vision_config.original_num_attention_heads = (
+        vision_cfg_obj = model_config.hf_config.vision_config
+        vision_cfg_obj.original_num_attention_heads = (
             model_config.num_attention_heads
         )
         att_heads = -1
-        if hasattr(model_config.hf_config.vision_config, "num_attention_heads"):
-            att_heads = model_config.hf_config.vision_config.num_attention_heads
-        if hasattr(model_config.hf_config.vision_config, "attention_heads"):
-            att_heads = model_config.hf_config.vision_config.attention_heads
+        if hasattr(vision_cfg_obj, "num_attention_heads"):
+            att_heads = vision_cfg_obj.num_attention_heads
+        if hasattr(vision_cfg_obj, "attention_heads"):
+            att_heads = vision_cfg_obj.attention_heads
         if att_heads > -1:
             if att_heads % tp_size != 0:
-                model_config.hf_config.vision_config.head_dim = (
-                    model_config.hf_config.vision_config.hidden_size
-                    // att_heads
-                )
+                vision_cfg_obj.head_dim = vision_cfg_obj.hidden_size // att_heads
                 from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
                 pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
                 att_heads = pad_vocab_size(
                     att_heads, pad_size
                 )
-                model_config.hf_config.vision_config.hidden_size = model_config.hf_config.vision_config.head_dim * att_heads
-                if hasattr(model_config.hf_config.vision_config, "num_attention_heads"):
-                    model_config.hf_config.vision_config.num_attention_heads = att_heads
-                if hasattr(model_config.hf_config.vision_config, "attention_heads"):
-                    model_config.hf_config.vision_config.attention_heads = att_heads
-        model_config.hf_config.vision_config = update_intermediate_size(
-            model_config.hf_config.vision_config,
+                vision_cfg_obj.hidden_size = vision_cfg_obj.head_dim * att_heads
+                if hasattr(vision_cfg_obj, "num_attention_heads"):
+                    vision_cfg_obj.num_attention_heads = att_heads
+                if hasattr(vision_cfg_obj, "attention_heads"):
+                    vision_cfg_obj.attention_heads = att_heads
+        vision_cfg_obj = update_intermediate_size(
+            vision_cfg_obj,
             "intermediate_size",
             intermediate_padding_size,
         )
+        update_fields = ["projector_input_dim", "projector_output_dim"]
+        for field in update_fields:
+            update_linear_dim(vision_cfg_obj, field, tp_size)
 
     return model_config

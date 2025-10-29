@@ -377,7 +377,7 @@ class ColumnParallelLinear(LinearBase):
                 from sglang.srt.model_loader.weight_utils import (
                     narrow_padded_param_and_loaded_weight,
                 )
-
+                print(f"Pad func called in {type(self).__name__}")
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -404,6 +404,7 @@ class ColumnParallelLinear(LinearBase):
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
+        print(f"weight_loader_v2 called in {type(self).__name__}")
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
@@ -618,7 +619,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 from sglang.srt.model_loader.weight_utils import (
                     narrow_padded_param_and_loaded_weight,
                 )
-
+                print(f"Pad func called in {type(self).__name__}")
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -710,6 +711,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[int] = None,
     ):
+        print(f"weight_loader_v2 called in {type(self).__name__}")
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
                 param.load_merged_column_weight(
@@ -943,6 +945,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[str] = None,
     ):
+        print(f"weight_loader_v2 called in {type(self).__name__}")
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
                 param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
@@ -1149,7 +1152,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 from sglang.srt.model_loader.weight_utils import (
                     narrow_padded_param_and_loaded_weight,
                 )
-
+                print(f"Pad func called in {type(self).__name__}")
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -1308,7 +1311,7 @@ class RowParallelLinear(LinearBase):
                 from sglang.srt.model_loader.weight_utils import (
                     narrow_padded_param_and_loaded_weight,
                 )
-
+                print(f"Pad func called in {type(self).__name__}")
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -1338,7 +1341,7 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
-
+        print(f"weight_loader_v2 called in {type(self).__name__}")
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
