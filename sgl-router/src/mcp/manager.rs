@@ -30,10 +30,7 @@ use serde_json::Map;
 use tracing::{debug, error, info, warn};
 
 use crate::mcp::{
-    config::{
-        McpConfig, McpProxyConfig, McpServerConfig, McpTransport, PromptInfo, ResourceInfo,
-        ToolInfo,
-    },
+    config::{McpConfig, McpProxyConfig, McpServerConfig, McpTransport, Prompt, RawResource, Tool},
     connection_pool::McpConnectionPool,
     error::{McpError, McpResult},
     inventory::ToolInventory,
@@ -215,7 +212,7 @@ impl McpManager {
     // ========================================================================
 
     /// List all available tools from all servers
-    pub fn list_tools(&self) -> Vec<ToolInfo> {
+    pub fn list_tools(&self) -> Vec<Tool> {
         self.inventory
             .list_tools()
             .into_iter()
@@ -239,10 +236,10 @@ impl McpManager {
             .ok_or_else(|| McpError::ToolNotFound(tool_name.to_string()))?;
 
         // Convert args with type coercion based on schema
-        let tool_schema = tool_info.parameters.as_ref();
+        let tool_schema = Some(serde_json::Value::Object((*tool_info.input_schema).clone()));
         let args_map = args
             .into()
-            .into_map(tool_schema)
+            .into_map(tool_schema.as_ref())
             .map_err(McpError::InvalidArguments)?;
 
         // Get client for that server
@@ -264,7 +261,7 @@ impl McpManager {
     }
 
     /// Get a tool by name
-    pub fn get_tool(&self, tool_name: &str) -> Option<ToolInfo> {
+    pub fn get_tool(&self, tool_name: &str) -> Option<Tool> {
         self.inventory
             .get_tool(tool_name)
             .map(|(_server_name, tool_info)| tool_info)
@@ -305,7 +302,7 @@ impl McpManager {
     }
 
     /// List all available prompts
-    pub fn list_prompts(&self) -> Vec<PromptInfo> {
+    pub fn list_prompts(&self) -> Vec<Prompt> {
         self.inventory
             .list_prompts()
             .into_iter()
@@ -343,7 +340,7 @@ impl McpManager {
     }
 
     /// List all available resources
-    pub fn list_resources(&self) -> Vec<ResourceInfo> {
+    pub fn list_resources(&self) -> Vec<RawResource> {
         self.inventory
             .list_resources()
             .into_iter()
@@ -410,12 +407,12 @@ impl McpManager {
     }
 
     /// Get prompt info by name
-    pub fn get_prompt_info(&self, name: &str) -> Option<PromptInfo> {
+    pub fn get_prompt_info(&self, name: &str) -> Option<Prompt> {
         self.inventory.get_prompt(name).map(|(_server, info)| info)
     }
 
     /// Get resource info by URI
-    pub fn get_resource_info(&self, uri: &str) -> Option<ResourceInfo> {
+    pub fn get_resource_info(&self, uri: &str) -> Option<RawResource> {
         self.inventory.get_resource(uri).map(|(_server, info)| info)
     }
 
@@ -536,13 +533,7 @@ impl McpManager {
             Ok(ts) => {
                 info!("Discovered {} tools from '{}'", ts.len(), server_name);
                 for t in ts {
-                    let tool_info = ToolInfo {
-                        name: t.name.to_string(),
-                        description: t.description.as_deref().unwrap_or_default().to_string(),
-                        server: server_name.to_string(),
-                        parameters: Some(serde_json::Value::Object((*t.input_schema).clone())),
-                    };
-                    inventory.insert_tool(t.name.to_string(), server_name.to_string(), tool_info);
+                    inventory.insert_tool(t.name.to_string(), server_name.to_string(), t);
                 }
             }
             Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
@@ -553,15 +544,7 @@ impl McpManager {
             Ok(ps) => {
                 info!("Discovered {} prompts from '{}'", ps.len(), server_name);
                 for p in ps {
-                    let prompt_info = PromptInfo {
-                        name: p.name.clone(),
-                        description: p.description.clone(),
-                        server: server_name.to_string(),
-                        arguments: p.arguments.clone().map(|args| {
-                            args.into_iter().map(|arg| serde_json::json!(arg)).collect()
-                        }),
-                    };
-                    inventory.insert_prompt(p.name.clone(), server_name.to_string(), prompt_info);
+                    inventory.insert_prompt(p.name.clone(), server_name.to_string(), p);
                 }
             }
             Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
@@ -572,18 +555,7 @@ impl McpManager {
             Ok(rs) => {
                 info!("Discovered {} resources from '{}'", rs.len(), server_name);
                 for r in rs {
-                    let resource_info = ResourceInfo {
-                        uri: r.uri.clone(),
-                        name: r.name.clone(),
-                        description: r.description.clone(),
-                        mime_type: r.mime_type.clone(),
-                        server: server_name.to_string(),
-                    };
-                    inventory.insert_resource(
-                        r.uri.clone(),
-                        server_name.to_string(),
-                        resource_info,
-                    );
+                    inventory.insert_resource(r.uri.clone(), server_name.to_string(), r.raw);
                 }
             }
             Err(e) => debug!("No resources or failed to list on '{}': {}", server_name, e),
@@ -600,17 +572,8 @@ impl McpManager {
             Ok(ts) => {
                 info!("Discovered {} tools from '{}'", ts.len(), server_name);
                 for t in ts {
-                    let tool_info = ToolInfo {
-                        name: t.name.to_string(),
-                        description: t.description.as_deref().unwrap_or_default().to_string(),
-                        server: server_name.to_string(),
-                        parameters: Some(serde_json::Value::Object((*t.input_schema).clone())),
-                    };
-                    self.inventory.insert_tool(
-                        t.name.to_string(),
-                        server_name.to_string(),
-                        tool_info,
-                    );
+                    self.inventory
+                        .insert_tool(t.name.to_string(), server_name.to_string(), t);
                 }
             }
             Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
@@ -621,19 +584,8 @@ impl McpManager {
             Ok(ps) => {
                 info!("Discovered {} prompts from '{}'", ps.len(), server_name);
                 for p in ps {
-                    let prompt_info = PromptInfo {
-                        name: p.name.clone(),
-                        description: p.description.clone(),
-                        server: server_name.to_string(),
-                        arguments: p.arguments.clone().map(|args| {
-                            args.into_iter().map(|arg| serde_json::json!(arg)).collect()
-                        }),
-                    };
-                    self.inventory.insert_prompt(
-                        p.name.clone(),
-                        server_name.to_string(),
-                        prompt_info,
-                    );
+                    self.inventory
+                        .insert_prompt(p.name.clone(), server_name.to_string(), p);
                 }
             }
             Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
@@ -644,18 +596,8 @@ impl McpManager {
             Ok(rs) => {
                 info!("Discovered {} resources from '{}'", rs.len(), server_name);
                 for r in rs {
-                    let resource_info = ResourceInfo {
-                        uri: r.uri.clone(),
-                        name: r.name.clone(),
-                        description: r.description.clone(),
-                        mime_type: r.mime_type.clone(),
-                        server: server_name.to_string(),
-                    };
-                    self.inventory.insert_resource(
-                        r.uri.clone(),
-                        server_name.to_string(),
-                        resource_info,
-                    );
+                    self.inventory
+                        .insert_resource(r.uri.clone(), server_name.to_string(), r.raw);
                 }
             }
             Err(e) => debug!("No resources or failed to list on '{}': {}", server_name, e),
