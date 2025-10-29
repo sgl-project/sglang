@@ -26,8 +26,6 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 
-# from torch.nn import RMSNorm
-# TODO: RMSNorm ....
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -336,7 +334,6 @@ class WanTransformerBlock(nn.Module):
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
         orig_dtype = hidden_states.dtype
-        # assert orig_dtype != torch.float32
 
         if temb.dim() == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -610,7 +607,6 @@ class WanTransformer3DModel(CachableDiT):
             if (attn_backend and attn_backend.lower() == "video_sparse_attn")
             else WanTransformerBlock
         )
-        print(f"{transformer_block=}")
         self.blocks = nn.ModuleList(
             [
                 transformer_block(
