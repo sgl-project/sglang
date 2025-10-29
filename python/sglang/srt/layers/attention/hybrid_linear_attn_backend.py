@@ -581,7 +581,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             q=query,
             k=key,
             v=value,
-            a=a,
+            a=a.contiguous(),
             b=b,
             initial_state_source=ssm_states,
             initial_state_indices=cache_indices,
