@@ -74,7 +74,9 @@ def flashinfer_cutedsl_moe_masked(
     assert (
         w2_alpha.dtype == torch.float32
     ), f"w2_alpha must be float32, got {w2_alpha.dtype}"
-    assert len(hidden_states) == 2, f"hidden_states must be a tuple of length 2, got {len(hidden_states)}"
+    assert (
+        len(hidden_states) == 2
+    ), f"hidden_states must be a tuple of length 2, got {len(hidden_states)}"
 
     # === Assertions on shapes ===
     n = w2.shape[-1] * 2  # intermediate dimension
