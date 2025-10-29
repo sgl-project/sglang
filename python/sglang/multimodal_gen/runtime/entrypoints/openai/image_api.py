@@ -8,13 +8,22 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
 
 from sglang.multimodal_gen.api.configs.sample.base import (
     SamplingParams,
     generate_request_id,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import _parse_size
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    ImageGenerationsRequest,
+    ImageResponse,
+    ImageResponseData,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    _parse_size,
+    _save_upload_to_path,
+    post_process_sample,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
 from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
@@ -23,35 +32,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
-
-# In-memory store for produced images (non-persistent)
-IMAGE_ITEMS: Dict[str, Dict[str, Any]] = {}
-IMAGE_LOCK = asyncio.Lock()
-
-
-# TODO: move this to `types.py`
-class ImageResponseData(BaseModel):
-    b64_json: Optional[str] = None
-    url: Optional[str] = None
-    revised_prompt: Optional[str] = None
-
-
-class ImageResponse(BaseModel):
-    created: int = Field(default_factory=lambda: int(time.time()))
-    data: List[ImageResponseData]
-
-
-class ImageGenerationsRequest(BaseModel):
-    prompt: str
-    model: Optional[str] = None
-    n: Optional[int] = 1
-    quality: Optional[str] = "auto"
-    response_format: Optional[str] = "url"  # url | b64_json
-    size: Optional[str] = "1024x1024"  # e.g., 1024x1024
-    style: Optional[str] = "vivid"
-    background: Optional[str] = "auto"  # transparent | opaque | auto
-    output_format: Optional[str] = None  # png | jpeg | webp
-    user: Optional[str] = None
 
 
 def _choose_ext(output_format: Optional[str], background: Optional[str]) -> str:
@@ -124,17 +104,6 @@ def _build_req_from_sampling(s: SamplingParams) -> Req:
     )
 
 
-async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    content = await upload.read()
-    with open(target_path, "wb") as f:
-        f.write(content)
-    return target_path
-
-
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import post_process_sample
-
-
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
     request: ImageGenerationsRequest,
@@ -165,15 +134,17 @@ async def generations(
         save_file_path,
     )
 
-    async with IMAGE_LOCK:
-        IMAGE_ITEMS[request_id] = {
+    await IMAGE_STORE.upsert(
+        request_id,
+        {
             "id": request_id,
             "created_at": int(time.time()),
             "file_path": save_file_path,
-        }
+        },
+    )
 
-    # TODO: verify this first.
-    if (request.response_format or "b64_json").lower() == "b64_json":
+    resp_format = (request.response_format or "b64_json").lower()
+    if resp_format == "b64_json":
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         return ImageResponse(
@@ -193,12 +164,13 @@ async def generations(
 
 @router.post("/edits", response_model=ImageResponse)
 async def edits(
-    image: List[UploadFile] = File(...),
+    image: Optional[List[UploadFile]] = File(None),
+    image_array: Optional[List[UploadFile]] = File(None, alias="image[]"),
     prompt: str = Form(...),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
-    response_format: Optional[str] = Form("url"),
+    response_format: Optional[str] = Form(None),
     size: Optional[str] = Form("1024x1024"),
     output_format: Optional[str] = Form(None),
     background: Optional[str] = Form("auto"),
@@ -206,10 +178,15 @@ async def edits(
 ):
 
     request_id = generate_request_id()
+    # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
+    images = image or image_array
+    if not images or len(images) == 0:
+        raise HTTPException(status_code=422, detail="Field 'image' is required")
+
     # Save first input image; additional images or mask are not yet used by the pipeline
     uploads_dir = os.path.join("outputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
-    first_image = image[0]
+    first_image = images[0]
     input_path = os.path.join(uploads_dir, f"{request_id}_{first_image.filename}")
     await _save_upload_to_path(first_image, input_path)
 
@@ -234,14 +211,17 @@ async def edits(
         save_file_path,
     )
 
-    async with IMAGE_LOCK:
-        IMAGE_ITEMS[request_id] = {
+    await IMAGE_STORE.upsert(
+        request_id,
+        {
             "id": request_id,
             "created_at": int(time.time()),
             "file_path": save_file_path,
-        }
+        },
+    )
 
-    if (response_format or "url").lower() == "b64_json":
+    # Default to b64_json to align with gpt-image-1 behavior in OpenAI examples
+    if (response_format or "b64_json").lower() == "b64_json":
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         return ImageResponse(
@@ -252,67 +232,11 @@ async def edits(
         return ImageResponse(data=[ImageResponseData(url=url, revised_prompt=prompt)])
 
 
-@router.post("/variations", response_model=ImageResponse)
-async def variations(
-    image: UploadFile = File(...),
-    model: Optional[str] = Form(None),
-    n: Optional[int] = Form(1),
-    response_format: Optional[str] = Form("url"),
-    size: Optional[str] = Form("1024x1024"),
-    output_format: Optional[str] = Form(None),
-    background: Optional[str] = Form("auto"),
-    user: Optional[str] = Form(None),
-):
-
-    request_id = generate_request_id()
-    uploads_dir = os.path.join("outputs", "uploads")
-    os.makedirs(uploads_dir, exist_ok=True)
-    input_path = os.path.join(uploads_dir, f"{request_id}_{image.filename}")
-    await _save_upload_to_path(image, input_path)
-
-    sampling = _build_sampling_params_from_request(
-        request_id=request_id,
-        prompt="",  # variations do not require a prompt
-        n=n or 1,
-        size=size,
-        output_format=output_format,
-        background=background,
-        image_path=input_path,
-    )
-    batch = _build_req_from_sampling(sampling)
-
-    result = await scheduler_client.forward([batch])
-    save_file_path = os.path.join(batch.output_path, batch.output_file_name)
-    post_process_sample(
-        result.output[0],
-        batch.data_type,
-        1,
-        batch.save_output,
-        save_file_path,
-    )
-
-    async with IMAGE_LOCK:
-        IMAGE_ITEMS[request_id] = {
-            "id": request_id,
-            "created_at": int(time.time()),
-            "file_path": save_file_path,
-        }
-
-    if (response_format or "url").lower() == "b64_json":
-        with open(save_file_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-        return ImageResponse(data=[ImageResponseData(b64_json=b64)])
-    else:
-        url = f"/v1/images/{request_id}/content"
-        return ImageResponse(data=[ImageResponseData(url=url)])
-
-
 @router.get("/{image_id}/content")
 async def download_image_content(
     image_id: str = Path(...), variant: Optional[str] = Query(None)
 ):
-    async with IMAGE_LOCK:
-        item = IMAGE_ITEMS.get(image_id)
+    item = await IMAGE_STORE.get(image_id)
     if not item:
         raise HTTPException(status_code=404, detail="Image not found")
 

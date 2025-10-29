@@ -6,11 +6,6 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-import imageio
-import numpy as np
-import torch
-import torchvision
-from einops import rearrange
 from fastapi import (
     APIRouter,
     File,
@@ -22,13 +17,18 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
 
 from sglang.multimodal_gen.api.configs.sample.base import (
-    DataType,
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    VideoGenerationsRequest,
+    VideoListResponse,
+    VideoRemixRequest,
+    VideoResponse,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     _save_upload_to_path,
@@ -41,44 +41,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
-
-
-# TODO: move this to `types.py`
-class VideoResponse(BaseModel):
-    id: str
-    object: str = "video"
-    model: str = "sora-2"
-    status: str = "queued"
-    progress: int = 0
-    created_at: int = Field(default_factory=lambda: int(time.time()))
-    size: str = "720x1280"
-    seconds: str = "4"
-    quality: str = "standard"
-    remixed_from_video_id: Optional[str] = None
-    completed_at: Optional[int] = None
-    expires_at: Optional[int] = None
-    error: Optional[Dict[str, Any]] = None
-
-
-class VideoGenerationsRequest(BaseModel):
-    prompt: str
-    input_reference: Optional[str] = None
-    model: Optional[str] = None
-    seconds: Optional[int] = 4
-    size: Optional[str] = "720x1280"
-    fps: Optional[int] = None
-    num_frames: Optional[int] = None
-
-
-class VideoListResponse(BaseModel):
-    data: List[VideoResponse]
-    object: str = "list"
-
-
-# In-memory job store (simple, non-persistent)
-# TODO: Encapsulate instead of direct call
-VIDEO_JOBS: Dict[str, Dict[str, Any]] = {}
-VIDEO_LOCK = asyncio.Lock()
 
 
 def _build_sampling_params_from_request(
@@ -145,19 +107,15 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
             batch.save_output,
             os.path.join(batch.output_path, batch.output_file_name),
         )
-        async with VIDEO_LOCK:
-            job = VIDEO_JOBS.get(job_id)
-            if job is not None:
-                job["status"] = "completed"
-                job["progress"] = 100
-                job["completed_at"] = int(time.time())
+        await VIDEO_STORE.update_fields(
+            job_id,
+            {"status": "completed", "progress": 100, "completed_at": int(time.time())},
+        )
     except Exception as e:
         logger.error(f"{e}")
-        async with VIDEO_LOCK:
-            job = VIDEO_JOBS.get(job_id)
-            if job is not None:
-                job["status"] = "failed"
-                job["error"] = {"message": str(e)}
+        await VIDEO_STORE.update_fields(
+            job_id, {"status": "failed", "error": {"message": str(e)}}
+        )
 
 
 # TODO: support image to video generation
@@ -234,8 +192,7 @@ async def create_video(
 
     sampling_params = _build_sampling_params_from_request(request_id, req)
     job = _video_job_from_sampling(request_id, req, sampling_params)
-    async with VIDEO_LOCK:
-        VIDEO_JOBS[request_id] = job
+    await VIDEO_STORE.upsert(request_id, job)
 
     # Build Req for scheduler
     batch = prepare_request(
@@ -248,8 +205,7 @@ async def create_video(
     return VideoResponse(**job)
 
 
-class VideoRemixRequest(BaseModel):
-    prompt: str
+## 请求/响应模型已迁移至 protocol.py
 
 
 @router.get("", response_model=VideoListResponse)
@@ -262,8 +218,7 @@ async def list_videos(
     order = (order or "desc").lower()
     if order not in ("asc", "desc"):
         order = "desc"
-    async with VIDEO_LOCK:
-        jobs = list(VIDEO_JOBS.values())
+    jobs = await VIDEO_STORE.list_values()
 
     reverse = order != "asc"
     jobs.sort(key=lambda j: j.get("created_at", 0), reverse=reverse)
@@ -283,8 +238,7 @@ async def list_videos(
 
 @router.get("/{video_id}", response_model=VideoResponse)
 async def retrieve_video(video_id: str = Path(...)):
-    async with VIDEO_LOCK:
-        job = VIDEO_JOBS.get(video_id)
+    job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
     return VideoResponse(**job)
@@ -293,8 +247,7 @@ async def retrieve_video(video_id: str = Path(...)):
 # TODO: support aborting a job.
 @router.delete("/{video_id}", response_model=VideoResponse)
 async def delete_video(video_id: str = Path(...)):
-    async with VIDEO_LOCK:
-        job = VIDEO_JOBS.pop(video_id, None)
+    job = await VIDEO_STORE.pop(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
     # Mark as deleted in response semantics
@@ -306,8 +259,7 @@ async def delete_video(video_id: str = Path(...)):
 async def download_video_content(
     video_id: str = Path(...), variant: Optional[str] = Query(None)
 ):
-    async with VIDEO_LOCK:
-        job = VIDEO_JOBS.get(video_id)
+    job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
 
