@@ -1,0 +1,11 @@
+python -m sglang.bench_one_batch \
+        --model-path /home/ckpt/Qwen3-8B \
+        --model-impl mindspore \
+        --device npu \
+        --attention-backend ascend \
+        --tp-size 1 \
+        --dp-size 1 \
+        --batch 8 \
+        --input-len 256 \
+        --output-len 32 \
+        --max-total-tokens 80000

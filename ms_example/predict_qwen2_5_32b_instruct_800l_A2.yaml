@@ -1,0 +1,125 @@
+seed: 0
+output_dir: './output' # path to save checkpoint/strategy
+load_checkpoint: ""
+src_strategy_path_or_dir: ''
+auto_trans_ckpt: True  # If true, auto transform load_checkpoint to load in distributed model
+only_save_strategy: False
+resume_training: False
+use_parallel: True
+run_mode: 'predict'
+
+# trainer config
+trainer:
+  type: CausalLanguageModelingTrainer
+  model_name: 'qwen2_5_32b'
+
+# runner config
+runner_config:
+  epochs: 5
+  batch_size: 1
+  sink_mode: True
+  sink_size: 2
+runner_wrapper:
+  type: MFTrainOneStepCell
+  scale_sense:
+    type: DynamicLossScaleUpdateCell
+    loss_scale_value: 65536
+    scale_factor: 2
+    scale_window: 1000
+  use_clip_grad: True
+
+# default parallel of device num = 8 for Atlas 800T A2
+parallel_config:
+  data_parallel: 1
+  model_parallel: 4
+  pipeline_stage: 1
+  micro_batch_num: 1
+  vocab_emb_dp: False
+  gradient_aggregation_group: 4
+# when model parallel is greater than 1, we can set micro_batch_interleave_num=2, that may accelerate the train process.
+micro_batch_interleave_num: 1
+
+model:
+  model_config:
+    type: LlamaConfig
+    batch_size: 1
+    seq_length: 32768
+    hidden_size: 5120
+    num_layers: 64
+    num_heads: 40
+    n_kv_heads: 8
+    vocab_size: 152064
+    intermediate_size: 27648
+    max_position_embeddings: 32768
+    qkv_has_bias: True
+    rms_norm_eps: 1.0e-6
+    theta: 1000000.0
+    emb_dropout_prob: 0.0
+    eos_token_id: [151645,151643]
+    pad_token_id: 151643
+    bos_token_id: 151643
+    compute_dtype: "bfloat16"
+    layernorm_compute_type: "bfloat16"
+    softmax_compute_type: "float32"
+    rotary_dtype: "bfloat16"
+    param_init_type: "bfloat16"
+    use_past: True
+    use_flash_attention: True
+    block_size: 32
+    num_blocks: 1024
+    use_past_shard: False
+    offset: 0
+    checkpoint_name_or_path: ""
+    repetition_penalty: 1.05
+    temperature: 0.7
+    max_decode_length: 512
+    top_k: 20
+    top_p: 0.8
+    do_sample: True
+    is_dynamic: True
+    qkv_concat: True
+    auto_map:
+      AutoTokenizer: [qwen2_5_tokenizer.Qwen2Tokenizer, null]
+  arch:
+    type: LlamaForCausalLM
+
+processor:
+  return_tensors: ms
+  tokenizer:
+    model_max_length: 131072
+    vocab_file: "/path/to/vocab.json"
+    merges_file: "/path/to/merges.txt"
+    unk_token: null
+    pad_token: "<|endoftext|>"
+    eos_token: "<|im_end|>"
+    bos_token: null
+    chat_template: "{%- if tools %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- messages[0]['content'] }}\n    {%- else %}\n        {{- 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' }}\n    {%- endif %}\n    {{- \"\\n\\n# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}}\\n</tool_call><|im_end|>\\n\" }}\n{%- else %}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}\n    {%- else %}\n        {{- '<|im_start|>system\\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- for message in messages %}\n    {%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) or (message.role == \"assistant\" and not message.tool_calls) %}\n        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {{- '<|im_start|>' + message.role }}\n        {%- if message.content %}\n            {{- '\\n' + message.content }}\n        {%- endif %}\n        {%- for tool_call in message.tool_calls %}\n            {%- if tool_call.function is defined %}\n                {%- set tool_call = tool_call.function %}\n            {%- endif %}\n            {{- '\\n<tool_call>\\n{\"name\": \"' }}\n            {{- tool_call.name }}\n            {{- '\", \"arguments\": ' }}\n            {{- tool_call.arguments | tojson }}\n            {{- '}\\n</tool_call>' }}\n        {%- endfor %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != \"tool\") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- message.content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n{%- endif %}\n"
+    type: Qwen2Tokenizer
+  type: Qwen2Processor
+
+# mindspore context init config
+context:
+  mode: 0 #0--Graph Mode; 1--Pynative Mode
+  device_target: "Ascend"
+  ascend_config:
+    precision_mode: "must_keep_origin_dtype"
+  max_call_depth: 10000
+  max_device_memory: "27GB"
+  save_graphs: False
+  save_graphs_path: "./graph"
+  device_id: 0
+
+# parallel context config
+parallel:
+  parallel_mode: 0 # 0-data parallel, 1-semi-auto parallel, 2-auto parallel, 3-hybrid parallel
+  gradients_mean: False
+  enable_alltoall: False
+  full_batch: True
+  search_mode: "sharding_propagation"
+  enable_parallel_optimizer: False
+  strategy_ckpt_config:
+    save_file: "./ckpt_strategy.ckpt"
+    only_trainable_params: False
+  parallel_optimizer_config:
+    gradient_accumulation_shard: False
+    parallel_optimizer_threshold: 64
