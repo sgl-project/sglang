@@ -248,6 +248,8 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     bool use_qk_l2norm_in_kernel,
     double softplus_beta = 1.0,
     double softplus_threshold = 20.0);
+// fused_gdn_gating
+at::Tensor fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& dt_bias);
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
@@ -386,6 +388,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "a, Tensor b, Tensor(a!) initial_state_source, Tensor initial_state_indices, Tensor cu_seqlens, bool "
       "use_qk_l2norm_in_kernel, float softplus_beta=1.0, float softplus_threshold=20.0) -> Tensor");
   m.impl("fused_sigmoid_gating_delta_rule_update_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_cpu);
+  // fused_gdn_gating
+  m.def("fused_gdn_gating_cpu(Tensor A_log, Tensor a, Tensor dt_bias) -> Tensor");
+  m.impl("fused_gdn_gating_cpu", torch::kCPU, &fused_gdn_gating_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
