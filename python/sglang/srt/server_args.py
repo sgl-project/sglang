@@ -1227,7 +1227,7 @@ class ServerArgs:
         # AMD platforms backends
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.90
+                self.mem_fraction_static *= 0.85
 
         # NPU platforms backends
         if is_npu() and self.attention_backend in ["ascend"]:
