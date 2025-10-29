@@ -764,9 +764,6 @@ class SchedulerOutputProcessorMixin:
         inference_start_times = []
         prefill_delays = []
         prefill_latencies = []
-        placeholder_tokens_idx = None
-        placeholder_tokens_val = None
-        token_steps = None
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -781,7 +778,6 @@ class SchedulerOutputProcessorMixin:
             input_token_ids_logprobs_idx = []
             output_token_ids_logprobs_val = []
             output_token_ids_logprobs_idx = []
-            output_token_entropy_val = []
         else:
             input_token_logprobs_val = input_token_logprobs_idx = (
                 output_token_logprobs_val
@@ -791,7 +787,7 @@ class SchedulerOutputProcessorMixin:
                 input_token_ids_logprobs_val
             ) = input_token_ids_logprobs_idx = output_token_ids_logprobs_val = (
                 output_token_ids_logprobs_idx
-            ) = output_token_entropy_val = None
+            ) = None
 
         for req in reqs:
             if req is skip_req:
@@ -953,11 +949,6 @@ class SchedulerOutputProcessorMixin:
                                 send_output_token_logprobs_offset:
                             ]
                         )
-                        output_token_entropy_val.append(
-                            req.output_token_entropy_val[
-                                send_output_token_logprobs_offset:
-                            ]
-                        )
                         req.send_output_token_logprobs_offset = len(
                             req.output_token_logprobs_val
                         )
@@ -968,7 +959,6 @@ class SchedulerOutputProcessorMixin:
                         output_top_logprobs_idx.append([])
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
-                        output_token_entropy_val.append([])
 
                 if req.return_hidden_states:
                     if output_hidden_states is None:
@@ -989,36 +979,36 @@ class SchedulerOutputProcessorMixin:
 
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
-                    spec_verify_ct=spec_verify_ct,
-                    spec_accepted_tokens=spec_accepted_tokens,
-                    queue_time=queue_times,
-                    inference_start_time=inference_start_times,
-                    prefill_delay=prefill_delays,
-                    prefill_latency=prefill_latencies,
-                    finished_reasons=finished_reasons,
-                    decoded_texts=decoded_texts,
-                    decode_ids=decode_ids_list,
-                    read_offsets=read_offsets,
-                    output_ids=output_ids,
-                    skip_special_tokens=skip_special_tokens,
-                    spaces_between_special_tokens=spaces_between_special_tokens,
-                    no_stop_trim=no_stop_trim,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    cached_tokens=cached_tokens,
-                    input_token_logprobs_val=input_token_logprobs_val,
-                    input_token_logprobs_idx=input_token_logprobs_idx,
-                    output_token_logprobs_val=output_token_logprobs_val,
-                    output_token_logprobs_idx=output_token_logprobs_idx,
-                    input_top_logprobs_val=input_top_logprobs_val,
-                    input_top_logprobs_idx=input_top_logprobs_idx,
-                    output_top_logprobs_val=output_top_logprobs_val,
-                    output_top_logprobs_idx=output_top_logprobs_idx,
-                    input_token_ids_logprobs_val=input_token_ids_logprobs_val,
-                    input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
-                    output_token_ids_logprobs_val=output_token_ids_logprobs_val,
-                    output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
-                    output_token_entropy_val=output_token_entropy_val,
+                    spec_verify_ct,
+                    spec_accepted_tokens,
+                    queue_times,
+                    inference_start_times,
+                    prefill_delays,
+                    prefill_latencies,
+                    finished_reasons,
+                    decoded_texts,
+                    decode_ids_list,
+                    read_offsets,
+                    output_ids,
+                    skip_special_tokens,
+                    spaces_between_special_tokens,
+                    no_stop_trim,
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                    input_token_logprobs_val,
+                    input_token_logprobs_idx,
+                    output_token_logprobs_val,
+                    output_token_logprobs_idx,
+                    input_top_logprobs_val,
+                    input_top_logprobs_idx,
+                    output_top_logprobs_val,
+                    output_top_logprobs_idx,
+                    input_token_ids_logprobs_val,
+                    input_token_ids_logprobs_idx,
+                    output_token_ids_logprobs_val,
+                    output_token_ids_logprobs_idx,
+                    output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
