@@ -25,8 +25,10 @@ from torch.nn.parameter import Parameter
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -79,6 +81,11 @@ if _is_hip:
             e8m0_shuffle
         ) = err
 
+if is_cuda():
+    from sgl_kernel import scaled_fp4_quant
+
+from flashinfer import mm_fp4 as fp4_gemm
+enable_flashinfer_fp4_gemm = True
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
@@ -176,15 +183,19 @@ class Mxfp4Config(QuantizationConfig):
         self,
         ignored_layers: Optional[list[str]] = None,
         is_checkpoint_mxfp4_serialized: bool = False,
+        group_size: int = None,
     ):
         super().__init__()
+        self.group_size = group_size
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers
 
     @classmethod
     def from_config(cls, config):
 
+        group_size = None
         quant_method = cls.get_from_keys(config, ["quant_method"])
+        ignored_layers = cls.get_from_keys(config, ["modules_to_not_convert"])
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
 
         if _is_hip:
@@ -198,8 +209,13 @@ class Mxfp4Config(QuantizationConfig):
                 raise ValueError(
                     f"Current platform {platform} not support mxfp4 computation"
                 )
-
-        return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
+        group_size = Mxfp4Config.common_group_size(config)
+        if not group_size:
+            logger.warning(f"group_size: {group_size}")
+            raise ValueError(
+                "Mxfp4 quantization requires group size"
+            )
+        return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,ignored_layers=ignored_layers, group_size=group_size)
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -220,6 +236,39 @@ class Mxfp4Config(QuantizationConfig):
     def is_static_cfg(self):
         return self.is_checkpoint_mxfp4_serialized
 
+    @staticmethod
+    def common_group_size(cfg: dict) -> int:
+        """Return the unique group_size across the config; raise if missing/mismatched."""
+        sizes = set()
+
+        # Top-level and 'quantization' block
+        v = cfg.get("group_size")
+        if isinstance(v, int):
+            sizes.add(v)
+        q = cfg.get("quantization_config")
+        if isinstance(q, dict):
+            v = q.get("group_size")
+            if isinstance(v, int):
+                sizes.add(v)
+
+        # config_groups: accept group-level or nested dicts (e.g., weights/input_activations)
+        for g in (cfg.get("config_groups") or {}).values():
+            if isinstance(g, dict):
+                v = g.get("group_size")
+                if isinstance(v, int):
+                    sizes.add(v)
+                for sub in g.values():
+                    if isinstance(sub, dict):
+                        v = sub.get("group_size")
+                        if isinstance(v, int):
+                            sizes.add(v)
+
+        if not sizes:
+            raise ValueError("No group_size found in config.")
+        if len(sizes) > 1:
+            raise ValueError(f"Inconsistent group_size values: {sorted(sizes)}")
+        return next(iter(sizes))
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
@@ -227,6 +276,7 @@ class Mxfp4Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
             if self.ignored_layers and is_layer_skipped(
@@ -237,11 +287,23 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             elif _is_hip:
                 return UnquantizedLinearMethod()
+            elif "mlp.gate_up_proj"in prefix or "mlp.shared_experts.gate_up_proj"in prefix:
+                return Mxfp4LinearMethod(self)
+            elif "mlp.down_proj" in prefix or "mlp.shared_experts.down_proj" in prefix:
+                return Mxfp4LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
                 return Mxfp4MoEMethod(prefix=prefix)
             else:
                 return Mxfp4DynamicQuantMoEMethod()
+        elif isinstance(layer, RadixAttention):
+            return None
+        elif self.ignored_layers and is_layer_skipped(
+                prefix=prefix,
+                ignored_layers=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return None
         else:
             if self.is_checkpoint_mxfp4_serialized:
                 raise NotImplementedError("Mxfp4 attention layer is not implemented")
@@ -283,6 +345,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
         self.with_bias = with_bias
         mxfp4_block = 32
+        weight_loader = extra_weight_attrs.get("weight_loader")
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
@@ -375,6 +438,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_bias", w2_weight_bias)
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+
+        w13_input_scale = PerTensorScaleParameter(
+                data=torch.full((num_experts,), 1.0, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+        w2_input_scale = PerTensorScaleParameter(
+            data=torch.full((num_experts,), 1.0, dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("w13_input_scale", w13_input_scale)
+        layer.register_parameter("w2_input_scale", w2_input_scale)
+
+        w13_weight_scale_2 = PerTensorScaleParameter(
+            data=torch.empty(layer.num_local_experts, 2, dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
+
+        w2_weight_scale_2 = PerTensorScaleParameter(
+            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
 
     def process_weights_after_loading(self, layer):
         if self.use_flashinfer:
@@ -534,6 +620,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 torch.stack(gemm2_bias_shuffled).reshape(self.num_experts, -1),
                 requires_grad=False,
             )
+
+            w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
+            w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
+            w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
+
+            layer.g1_alphas = Parameter(
+                (w13_input_scale * w13_weight_scale_2).to(torch.float32),
+                requires_grad=False,
+            )
+            layer.g2_alphas = Parameter(
+                (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
+                requires_grad=False,
+            )
+            # layer.w13_input_scale_quant = Parameter(
+            #     (1 / w13_input_scale).to(torch.float32), requires_grad=False
+            # )
+            layer.w2_input_scale_quant = Parameter(
+                (1 / w2_input_scale).to(torch.float32), requires_grad=False
+            )
+            layer.g1_scale_c = Parameter(
+                    (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
+                    requires_grad=False,
+                )
+
             return
 
         if self.use_triton_kernels:
@@ -582,6 +692,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
+
+    def get_tile_tokens_dim(self, num_tokens, top_k, num_experts):
+        # Guess tokens per expert assuming perfect expert distribution first.
+        num_tokens_per_expert = (num_tokens * top_k) // num_experts
+        # And pad the number to the next power of 2.
+        tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
+        # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+        tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+        return tile_tokens_dim
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -639,32 +758,32 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             router_logits = topk_output.router_logits
 
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
-                router_logits.to(torch.bfloat16),
-                None,  # routing_bias
+                router_logits.to(torch.float32),
+                topk_output.topk_config.correction_bias.to(x.dtype),  # routing_bias
                 x_quant,
                 x_scale,
                 layer.w13_weight,  # uint8 (e2m1 x 2)
                 layer.w13_weight_scale,  # uint8 (e4m3 x 2)
-                layer.w13_weight_bias,  # fp32 per expert per channel
-                layer.gemm1_alpha,  # fp32 per expert
-                layer.gemm1_beta,  # fp32 per expert
-                layer.gemm1_clamp_limit,  # fp32 per expert
+                None,  # fp32 per expert per channel
+                None,  # fp32 per expert
+                None,  # fp32 per expert
+                None,  # fp32 per expert
                 layer.w2_weight,  # uint8 (e2m1 x 2)
                 layer.w2_weight_scale,  # ue8m0
-                layer.w2_weight_bias,  # fp32 per expert per channel
-                None,  # output1_scale_scalar
-                None,  # output1_scale_gate_scalar
-                None,  # output2_scale_scalar
+                None,  # fp32 per expert per channel
+                layer.g1_scale_c.data,  # output1_scale_scalar
+                layer.g1_alphas.data,  # output1_scale_gate_scalar
+                layer.g2_alphas.data,  # output2_scale_scalar
                 layer.num_experts,
                 top_k,
-                None,  # n_group      # TODO: support n_group
-                None,  # topk_group   # TODO: support topk_group
+                topk_output.topk_config.num_expert_group,  # n_group      # TODO: support n_group
+                topk_output.topk_config.topk_group,  # topk_group   # TODO: support topk_group
                 self.intermediate_size_per_partition,  # padded to multiple of 256
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
-                None,
-                None,  # tile_tokens_dim
-                1,  # routing_method_type, renormalize
+                self.moe_runner_config.routed_scaling_factor,
+                self.get_tile_tokens_dim(x.shape[0], top_k, layer.num_local_experts),  # tile_tokens_dim
+                2,  # routing_method_type, renormalize
                 True,  # do finalize
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
@@ -835,3 +954,161 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
             doweight_stage1=False,
         )
         return StandardCombineInput(hidden_states=output)
+
+class Mxfp4LinearMethod(LinearMethodBase):
+    """Linear method for Mxfp4.
+    Args:
+        quant_config: The quantization config.
+    """
+
+    def __init__(self, quant_config: Mxfp4Config):
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        del input_size, output_size
+        if not self.quant_config.is_checkpoint_mxfp4_serialized:
+            raise ValueError(
+                "Mxfp4 quantization was selected, "
+                " dynamic quantization is not supported."
+            )
+
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        if input_size_per_partition % 16 != 0:
+            raise ValueError(
+                "Unsupported model when in features size is " "not multiple of 16"
+            )
+
+        weight_dtype = (
+            torch.float8_e4m3fn
+            if self.quant_config.is_checkpoint_mxfp4_serialized
+            else params_dtype
+        )
+
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                # 2 fp4 data is packed in one uint8 in the input dimension
+                output_size_per_partition,
+                input_size_per_partition // 2,
+                dtype=torch.uint8,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        input_scale = PerTensorScaleParameter(
+            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+
+        layer.register_parameter("input_scale", input_scale)
+
+        weight_scale_2 = PerTensorScaleParameter(
+            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale_2", weight_scale_2)
+
+        weight_scale = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // self.quant_config.group_size // 2,
+                dtype=weight_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+
+        layer.register_parameter("weight_scale", weight_scale)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        input_scale_2 = layer.input_scale.max().to(torch.float32)
+        weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+        layer.input_scale = Parameter(input_scale_2, requires_grad=False)
+        layer.weight_scale_2 = Parameter(weight_scale_2, requires_grad=False)
+        layer.alpha = Parameter(
+            layer.input_scale * layer.weight_scale_2, requires_grad=False
+        )
+        layer.input_scale_inv = Parameter(
+            (1 / input_scale_2).to(torch.float32), requires_grad=False
+        )
+
+        # Pad and blockwise interleave weight_scale
+        scales = layer.weight_scale
+        scale_ndim = scales.ndim
+        if scale_ndim == 2:
+            scales = scales.unsqueeze(0)
+        assert scales.ndim == 3
+        B, M, K = scales.shape
+        round_up_multiple = lambda x, m: (x + m - 1) // m * m
+        M_padded = round_up_multiple(M, 128)
+        K_padded = round_up_multiple(K, 4)
+        padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
+        padded_scales[:B, :M, :K] = scales
+        batches, rows, cols = padded_scales.shape
+        assert rows % 128 == 0
+        assert cols % 4 == 0
+        padded_scales = padded_scales.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
+        padded_scales = padded_scales.permute((0, 1, 4, 3, 2, 5))
+        padded_scales = padded_scales.contiguous().cuda()
+        padded_scales = (
+            padded_scales.reshape(M_padded, K_padded)
+            if scale_ndim == 2
+            else padded_scales.reshape(B, M_padded, K_padded)
+        )
+        layer.weight_scale_interleaved = Parameter(padded_scales, requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        output_dtype = x.dtype
+        x_m, _ = x.shape
+        w_n, _ = layer.weight.shape
+        output_shape = [x_m, w_n]
+
+        # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
+        x_fp4, x_scale_interleaved = scaled_fp4_quant(x, layer.input_scale_inv)
+
+        assert x_fp4.dtype == torch.uint8
+        assert x_scale_interleaved.dtype == torch.float8_e4m3fn
+        assert layer.weight.dtype == torch.uint8
+        assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
+        assert layer.alpha.dtype == torch.float32
+
+        w = layer.weight
+        w_scale_interleaved = layer.weight_scale_interleaved
+        if enable_flashinfer_fp4_gemm:
+            w = layer.weight.T
+            w_scale_interleaved = layer.weight_scale_interleaved.T
+        out = fp4_gemm(
+            x_fp4,
+            w,
+            x_scale_interleaved,
+            w_scale_interleaved,
+            layer.alpha,
+            output_dtype,
+            backend="trtllm",
+        )
+        if bias is not None:
+            out = out + bias
+        return out.view(*output_shape)
