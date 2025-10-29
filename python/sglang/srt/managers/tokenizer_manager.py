@@ -24,6 +24,7 @@ import signal
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -214,6 +215,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.mm_processor = get_mm_processor(
                 self.model_config.hf_config, server_args, _processor, transport_mode
             )
+            max_concurrent_calls=getattr(
+                self.server_args, "mm_max_concurrent_calls", 32
+            )
+            self.mm_semaphore = asyncio.Semaphore(max_concurrent_calls)
+            self.mm_executor = ThreadPoolExecutor(max_workers=max_concurrent_calls)
 
             if server_args.skip_tokenizer_init:
                 self.tokenizer = self.processor = None
@@ -590,10 +596,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         self.mm_data_processor = AsyncMMDataProcessor(
             self.mm_processor,
-            max_concurrent_calls=getattr(
-                self.server_args, "mm_max_concurrent_calls", 32
-            ),
+            self.mm_semaphore,
             timeout_s=getattr(self.server_args, "mm_per_request_timeout", None),
+            executor=self.mm_executor,
         )
 
         if self.mm_processor and obj.contains_mm_input():

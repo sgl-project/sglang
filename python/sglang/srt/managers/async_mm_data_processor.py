@@ -21,10 +21,10 @@ class AsyncMMDataProcessor:
     def __init__(
         self,
         mm_processor: Any,
+        semaphore: Optional[asyncio.Semaphore],
         *,
-        max_concurrent_calls: Optional[int] = None,
         timeout_s: Optional[float] = None,
-        fallback_executor_workers: int = 32,
+        executor: Optional[ThreadPoolExecutor] = None,
     ) -> None:
         """
         Args:
@@ -32,26 +32,18 @@ class AsyncMMDataProcessor:
                 - async def process_mm_data_async(...): -> Dict[str, Any]
               or
                 - def process_mm_data(...): -> Dict[str, Any]
-            max_concurrent_calls: Optional concurrency cap for per-call execution.
+            semaphore: Optional semaphore cap for per-call execution.
             timeout_s: Optional timeout (seconds) for each `process()` call.
-            fallback_executor_workers: Threads for the sync fall-back.
+            executor: Threads for the sync fall-back.
         """
         self.mm_processor = mm_processor
         self.timeout_s = timeout_s
-
-        # Concurrency guard (None -> unlimited)
-        self.semaphore = (
-            asyncio.Semaphore(max_concurrent_calls) if max_concurrent_calls else None
-        )
+        self.semaphore = semaphore
 
         # Detect async path; if missing, prepare a fallback executor for sync path
         self._proc_async = getattr(mm_processor, "process_mm_data_async", None)
         self.is_async = asyncio.iscoroutinefunction(self._proc_async)
-        self.fallback_exec: Optional[ThreadPoolExecutor] = (
-            ThreadPoolExecutor(max_workers=fallback_executor_workers)
-            if not self.is_async
-            else None
-        )
+        self._executor = executor if not self.is_async else None
 
     async def process(
         self,
@@ -92,33 +84,16 @@ class AsyncMMDataProcessor:
                 request_obj=request_obj,
                 **kwargs,
             )
-            return await loop.run_in_executor(self.fallback_exec, fn)
+            return await loop.run_in_executor(self._executor, fn)
 
         # Apply optional concurrency guard
         if self.semaphore is not None:
             async with self.semaphore:
-                if self.timeout_s is not None:
+                if self.timeout_s is not None and self.is_async:
                     return await asyncio.wait_for(_invoke(), timeout=self.timeout_s)
                 return await _invoke()
 
         # No concurrency guard
-        if self.timeout_s is not None:
+        if self.timeout_s is not None and self.is_async:
             return await asyncio.wait_for(_invoke(), timeout=self.timeout_s)
         return await _invoke()
-
-    def shutdown(self) -> None:
-        """Gracefully shutdown resources owned by this wrapper."""
-        try:
-            if self.fallback_exec:
-                self.fallback_exec.shutdown(wait=False)
-        except Exception:
-            logger.exception(
-                "Error while shutting down fallback executor in AsyncMMDataProcessor"
-            )
-
-    def __del__(self):
-        # Best-effort shutdown
-        try:
-            self.shutdown()
-        except Exception:
-            pass
