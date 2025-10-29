@@ -67,14 +67,15 @@ class CommonKVManager(BaseKVManager):
         )
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
-        self.rank_port = -1  # lazy assign when bound to random port
         self.local_ip = get_local_ip_auto()
         self.server_socket = zmq.Context().socket(zmq.PULL)
         if is_valid_ipv6_address(self.local_ip):
             self.server_socket.setsockopt(zmq.IPV6, 1)
+        self.rank_port = self._bind_server_socket()
         self.request_status: Dict[int, KVPoll] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._register_to_bootstrap()
             self.transfer_infos = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
