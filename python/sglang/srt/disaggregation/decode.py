@@ -621,11 +621,11 @@ class DecodePreallocQueue:
         req.req_pool_idx = req_pool_indices[0]
 
         if self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(
-                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-            )
-            req.kv_allocated_len = len(kv_loc)
-            req.kv_committed_len = len(kv_loc)
+            # Previously retracted request has decode tokens
+            fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
+            req.kv_allocated_len = fill_len
+            req.kv_committed_len = fill_len
         else:
             num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
             kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
