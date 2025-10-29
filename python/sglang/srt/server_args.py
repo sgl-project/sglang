@@ -823,7 +823,7 @@ class ServerArgs:
             capture_bs = (
                 list(range(1, 9, 1))
                 + list(range(10, 33, 2))
-                + list(range(40, 64, 4))
+                + list(range(40, 65, 4))
                 + list(range(72, 257, 8))
                 + list(range(272, self.cuda_graph_max_bs + 1, 16))
             )
@@ -886,7 +886,7 @@ class ServerArgs:
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
                     )
-                if self.moe_runner_backend == "auto":
+                if self.moe_a2a_backend == "none" and self.moe_runner_backend == "auto":
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
@@ -972,6 +972,12 @@ class ServerArgs:
                 logger.warning(
                     "Use trtllm_mha as attention backend on sm100 for Llama4 model"
                 )
+            if is_sm100_supported() and self.moe_runner_backend == "auto":
+                if self.quantization in {"fp8", "modelopt_fp8"}:
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as MoE runner backend on SM100 for Llama4"
+                    )
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
@@ -1222,7 +1228,7 @@ class ServerArgs:
         # AMD platforms backends
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.90
+                self.mem_fraction_static *= 0.85
 
         # NPU platforms backends
         if is_npu() and self.attention_backend in ["ascend"]:
@@ -1337,8 +1343,10 @@ class ServerArgs:
 
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert (
-                self.quantization == "modelopt_fp4" or self.quantization == "fp8"
-            ), "modelopt_fp4 or fp8 quantization is required for Flashinfer TRTLLM MoE"
+                self.quantization == "modelopt_fp4"
+                or self.quantization == "modelopt_fp8"
+                or self.quantization == "fp8"
+            ), "modelopt_fp4, modelopt_fp8 or fp8 quantization is required for Flashinfer TRTLLM MoE"
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
