@@ -81,8 +81,11 @@ else
     $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --upgrade
 fi
 
+# Install OpenSSL development libraries for router build
+apt install -y libssl-dev pkg-config
+
 # Install router for pd-disagg test
-SGLANG_ROUTER_BUILD_NO_RUST=1 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
+$PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
 
 # Install sgl-kernel
 SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
