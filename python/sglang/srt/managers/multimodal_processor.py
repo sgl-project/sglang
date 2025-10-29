@@ -46,3 +46,10 @@ def get_mm_processor(
         f"No processor registered for architecture: {hf_config.architectures}.\n"
         f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
     )
+
+
+def get_mm_processor_cls(hf_config):
+    for model_cls, processor_cls in PROCESSOR_MAPPING.items():
+        if model_cls.__name__ in hf_config.architectures:
+            return processor_cls
+    return None

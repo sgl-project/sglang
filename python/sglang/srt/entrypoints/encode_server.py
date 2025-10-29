@@ -18,9 +18,13 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.model_loader import get_model
-from sglang.srt.multimodal.processors.qwen_vl import resize_image_async
+from sglang.srt.multimodal.processors.qwen_vl import (
+    QwenVLImageProcessor,
+    resize_image_async,
+)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -96,27 +100,32 @@ class ImageEncoder:
         self.context = zmq.asyncio.Context(2)
         self.send_to_prefill_sockets = dict()
 
+        self.processor_cls = get_mm_processor_cls(self.model_config.hf_config)
+
     async def encode(self, mm_items):
         images = load_images(mm_items)
 
         # Qwen-specific: resize images
-        resize_tasks = [resize_image_async(image) for image in images]
-        images = await asyncio.gather(*resize_tasks)
+        if self.processor_cls and self.processor_cls == QwenVLImageProcessor:
+            resize_tasks = [resize_image_async(image) for image in images]
+            images = await asyncio.gather(*resize_tasks)
 
         images_input = self.image_processor(images=images)
         feature = images_input["pixel_values"]
-        image_grid_thw = images_input["image_grid_thw"]
         if type(feature) is not torch.Tensor:
             feature = torch.tensor(feature)
-        if type(image_grid_thw) is not torch.Tensor:
-            image_grid_thw = torch.tensor(image_grid_thw)
         mm_item = MultimodalDataItem.from_dict(
             {
                 "modality": Modality.IMAGE,
                 "feature": feature,
             }
         )
-        mm_item.set("image_grid_thw", image_grid_thw)
+        for k, v in images_input.items():
+            if k == "pixel_values":
+                continue
+            if type(v) is not torch.Tensor:
+                v = torch.tensor(v)
+            mm_item.set(k, v)
         mm_embedding = self.model.get_image_feature([mm_item])
         return mm_embedding
 
