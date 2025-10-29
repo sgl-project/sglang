@@ -972,10 +972,11 @@ class ServerArgs:
                     "Use trtllm_mha as attention backend on sm100 for Llama4 model"
                 )
             if is_sm100_supported() and self.moe_runner_backend == "auto":
-                self.moe_runner_backend = "flashinfer_trtllm"
-                logger.info(
-                    "Use flashinfer_trtllm as MoE runner backend on SM100 for Llama4"
-                )
+                if self.quantization in {"fp8", "modelopt_fp8"}:
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as MoE runner backend on SM100 for Llama4"
+                    )
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
