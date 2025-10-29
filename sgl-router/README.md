@@ -6,7 +6,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Unified control plane for registering, monitoring, and orchestrating prefill, decode, and regular workers across heterogeneous model fleets.
 - Data plane that routes requests across HTTP, PD (prefill/decode), gRPC, and OpenAI-compatible backends with shared reliability features.
 - Industry-first gRPC pipeline with native Rust tokenization, reasoning, and tool-call execution for high-throughput OpenAI-compatible serving.
-- Multi model inference gateway mode (`--enable-igw`) that runs several routers at once and applies per-model policies.
+- Multi-model inference gateway mode (`--enable-igw`) that runs several routers at once and applies per-model policies.
 - Conversation, response, and chat-history connectors that centralize state at the router, enabling compliant sharing across models/MCP loops with in-memory, no-op, or Oracle ATP storage options.
 - Built-in reliability primitives: retries with exponential backoff, circuit breakers, token-bucket rate limiting, and queuing.
 - First-class observability with structured logging and Prometheus metrics.
@@ -67,14 +67,16 @@ cargo build --release
 
 ### Python Package
 ```bash
-pip install setuptools-rust wheel build
-python -m build
-pip install dist/*.whl
+pip install maturin
 
-# Rebuild & reinstall in one step during development
-python -m build && pip install --force-reinstall dist/*.whl
+# Fast development mode (debug build, no wheel, instant)
+maturin develop
+
+# Production build (optimized, creates wheel)
+maturin build --release
+pip install --force-reinstall dist/*.whl
 ```
-> **Note:** Editable installs (`pip install -e .`) are currently not supported; prefer wheel builds for development.
+> **Note:** Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release` for production wheels with full optimizations (opt-level="z", lto="fat"). The package uses abi3 support for Python 3.8+ compatibility.
 
 ## Quick Start
 
@@ -562,20 +564,19 @@ curl -X POST "http://localhost:8080/add_worker?url=http://worker3:8000&api_key=w
 
 ## Development & Testing
 ```bash
-# Build Rust components
+# Build Rust components (debug mode, fast)
 cargo build
 
 # Run Rust tests
 cargo test
 
-# Build & install Python bindings
-python -m build
-pip install --force-reinstall dist/*.whl
+# Fast Python development (rebuilds and installs in debug mode)
+maturin develop
 
 # Run Python tests
 pytest
 ```
-When modifying runtime behavior, rebuild the wheel or run the binary directly. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
+For production builds, use `maturin build --release` to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
 
 ---
 
