@@ -87,14 +87,6 @@ pub enum ContentPart {
     // more types here...
 }
 
-/// Text-only content part
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub enum TextContentPart {
-    #[serde(rename = "text")]
-    Text { text: String },
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ImageUrl {
     pub url: String,

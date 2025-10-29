@@ -1,6 +1,6 @@
 use serde_json::json;
 use sglang_router_rs::protocols::{
-    chat::{ChatMessage, TextMessageContent, UserMessageContent},
+    chat::{ChatMessage, UserMessageContent},
     common::ContentPart,
 };
 
@@ -14,7 +14,7 @@ fn test_chat_message_tagged_by_role_system() {
     let msg: ChatMessage = serde_json::from_value(json).unwrap();
     match msg {
         ChatMessage::System { content, .. } => match content {
-            TextMessageContent::Text(text) => assert_eq!(text, "You are a helpful assistant"),
+            UserMessageContent::Text(text) => assert_eq!(text, "You are a helpful assistant"),
             _ => panic!("Expected Text variant"),
         },
         _ => panic!("Expected System variant"),

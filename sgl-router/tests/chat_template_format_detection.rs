@@ -1,5 +1,5 @@
 use sglang_router_rs::{
-    protocols::chat::{ChatMessage, TextMessageContent, UserMessageContent},
+    protocols::chat::{ChatMessage, UserMessageContent},
     tokenizer::chat_template::{
         detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateProcessor,
@@ -176,7 +176,7 @@ assistant:
 
     let messages = [
         ChatMessage::System {
-            content: TextMessageContent::Text("You are helpful".to_string()),
+            content: UserMessageContent::Text("You are helpful".to_string()),
             name: None,
         },
         ChatMessage::User {

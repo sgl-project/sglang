@@ -1,6 +1,6 @@
 use sglang_router_rs::{
     protocols::{
-        chat::{ChatMessage, TextMessageContent, UserMessageContent},
+        chat::{ChatMessage, UserMessageContent},
         common::{ContentPart, ImageUrl},
     },
     tokenizer::chat_template::{
@@ -118,7 +118,7 @@ fn test_llama_style_template() {
 
     let messages = [
         ChatMessage::System {
-            content: TextMessageContent::Text("You are a helpful assistant".to_string()),
+            content: UserMessageContent::Text("You are a helpful assistant".to_string()),
             name: None,
         },
         ChatMessage::User {
