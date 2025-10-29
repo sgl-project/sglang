@@ -38,7 +38,7 @@ pub(super) fn build_stored_response(
         .map(|s| s.to_string())
         .or_else(|| Some(original_body.model.clone()));
 
-    if let Some(safety_identifier) = original_body.safety_identifier.clone() {
+    if let Some(safety_identifier) = original_body.user.clone() {
         stored_response.safety_identifier = Some(safety_identifier);
     }
 
@@ -149,7 +149,7 @@ pub(super) fn patch_streaming_response_json(
             .map(|v| v.is_null())
             .unwrap_or(false)
         {
-            if let Some(safety_identifier) = &original_body.safety_identifier {
+            if let Some(safety_identifier) = &original_body.user {
                 obj.insert(
                     "safety_identifier".to_string(),
                     Value::String(safety_identifier.clone()),
