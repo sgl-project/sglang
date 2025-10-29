@@ -1,4 +1,4 @@
-name: PR Test (PD Router)
+name: PR Benchmark (SMG PD Router)
 
 on:
   push:
@@ -257,7 +257,7 @@ jobs:
                 {"role": "user", "content": "Write a Python function to calculate fibonacci numbers recursively"}
               ],
               "stream": false,
-              "max_tokens": 100
+              "max_completion_tokens": 100
             }')
 
           if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
@@ -279,7 +279,7 @@ jobs:
                 {"role": "user", "content": "Count from 1 to 5"}
               ],
               "stream": true,
-              "max_tokens": 50
+              "max_completion_tokens": 50
             }')
 
           if echo "$stream_response" | grep -q "data:"; then

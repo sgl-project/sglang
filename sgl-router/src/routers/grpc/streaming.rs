@@ -3,31 +3,40 @@
 //! This module contains shared streaming logic for both Regular and PD routers,
 //! eliminating ~600 lines of duplication.
 
-use axum::response::Response;
-use axum::{body::Body, http::StatusCode};
+use std::{collections::HashMap, io, sync::Arc, time::Instant};
+
+use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
+use proto::{
+    generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
+    generate_response::Response::{Chunk, Complete, Error},
+};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::io;
-use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_stream::StreamExt;
+use tokio::sync::{mpsc, mpsc::UnboundedSender};
+use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tracing::{debug, error, warn};
 
-use super::context;
-use super::utils;
-use crate::grpc_client::proto;
-use crate::protocols::spec::*;
-use crate::reasoning_parser::ReasoningParser;
-use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ToolParser;
-use proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId};
-use proto::generate_response::Response::{Chunk, Complete, Error};
-use std::time::Instant;
-use tokio::sync::mpsc;
+use super::{context, utils};
+use crate::{
+    grpc_client::proto,
+    protocols::{
+        chat::{
+            ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
+        },
+        common::{
+            ChatLogProbs, FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice,
+            ToolChoiceValue, Usage,
+        },
+        generate::GenerateRequest,
+    },
+    reasoning_parser::ReasoningParser,
+    tokenizer::{
+        stop::{SequenceDecoderOutput, StopSequenceDecoder},
+        traits::Tokenizer,
+    },
+    tool_parser::ToolParser,
+};
 
 /// Shared streaming processor for both single and dual dispatch modes
 #[derive(Clone)]

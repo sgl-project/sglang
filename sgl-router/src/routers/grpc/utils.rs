@@ -1,17 +1,7 @@
 //! Shared utilities for gRPC routers
 
-use super::ProcessedMessages;
-use crate::core::Worker;
-use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
-use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatLogProbs, ChatLogProbsContent, ChatMessage, FunctionCallResponse,
-    GenerateFinishReason, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
-};
-use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
-use crate::tokenizer::traits::Tokenizer;
-use crate::tokenizer::HuggingFaceTokenizer;
-pub use crate::tokenizer::StopSequenceDecoder;
+use std::{collections::HashMap, sync::Arc};
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -19,10 +9,29 @@ use axum::{
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
+
+use super::ProcessedMessages;
+pub use crate::tokenizer::StopSequenceDecoder;
+use crate::{
+    core::Worker,
+    grpc_client::{proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage},
+        common::{
+            ChatLogProbs, ChatLogProbsContent, FunctionCallResponse, StringOrArray, Tool, ToolCall,
+            ToolChoice, ToolChoiceValue, TopLogProb,
+        },
+        generate::GenerateFinishReason,
+    },
+    tokenizer::{
+        cache::CachedTokenizer,
+        chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+        traits::Tokenizer,
+        HuggingFaceTokenizer,
+    },
+};
 
 /// Get gRPC client from worker, returning appropriate error response on failure
 pub async fn get_grpc_client_from_worker(
@@ -34,8 +43,7 @@ pub async fn get_grpc_client_from_worker(
         .map_err(|e| internal_error_message(format!("Failed to get gRPC client: {}", e)))?
         .ok_or_else(|| internal_error_static("Selected worker is not configured for gRPC"))?;
 
-    let client = client_arc.lock().await.clone();
-    Ok(client)
+    Ok((*client_arc).clone())
 }
 
 /// Process tool call arguments in messages
@@ -310,9 +318,24 @@ pub fn process_chat_messages(
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
     // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
-    let formatted_text = if let Some(hf_tokenizer) =
-        tokenizer.as_any().downcast_ref::<HuggingFaceTokenizer>()
-    {
+    // First try direct downcast, then try via CachedTokenizer wrapper
+    let hf_tokenizer = tokenizer
+        .as_any()
+        .downcast_ref::<HuggingFaceTokenizer>()
+        .or_else(|| {
+            // If direct downcast fails, try to get inner tokenizer from CachedTokenizer
+            tokenizer
+                .as_any()
+                .downcast_ref::<CachedTokenizer>()
+                .and_then(|cached| {
+                    cached
+                        .inner()
+                        .as_any()
+                        .downcast_ref::<HuggingFaceTokenizer>()
+                })
+        });
+
+    let formatted_text = if let Some(hf_tokenizer) = hf_tokenizer {
         // Get content format and transform messages accordingly
         let content_format = hf_tokenizer.chat_template_content_format();
         let mut transformed_messages = process_content_format(&request.messages, content_format)?;
@@ -359,7 +382,6 @@ pub fn process_chat_messages(
 
         let params = ChatTemplateParams {
             add_generation_prompt: true,
-            continue_final_message: request.continue_final_message,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             ..Default::default()
@@ -520,6 +542,8 @@ pub fn create_stop_decoder(
 pub fn parse_json_schema_response(
     processed_text: &str,
     tool_choice: &Option<ToolChoice>,
+    model: &str,
+    history_tool_calls_count: usize,
 ) -> (Option<Vec<ToolCall>>, String) {
     match tool_choice {
         Some(ToolChoice::Function { function, .. }) => {
@@ -527,7 +551,12 @@ pub fn parse_json_schema_response(
             match serde_json::from_str::<Value>(processed_text) {
                 Ok(params) => {
                     let tool_call = ToolCall {
-                        id: format!("call_{}", Uuid::new_v4()),
+                        id: generate_tool_call_id(
+                            model,
+                            &function.name,
+                            0,
+                            history_tool_calls_count,
+                        ),
                         tool_type: "function".to_string(),
                         function: FunctionCallResponse {
                             name: function.name.clone(),
@@ -558,7 +587,12 @@ pub fn parse_json_schema_response(
                             let parameters = obj.get("parameters")?;
 
                             Some(ToolCall {
-                                id: format!("call_{}_{}", i, Uuid::new_v4()),
+                                id: generate_tool_call_id(
+                                    model,
+                                    &name,
+                                    i,
+                                    history_tool_calls_count,
+                                ),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
                                     name,
@@ -951,10 +985,16 @@ pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> Generate
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::protocols::spec::{ChatMessage, ContentPart, ImageUrl, UserMessageContent};
-    use crate::tokenizer::chat_template::ChatTemplateContentFormat;
     use serde_json::json;
+
+    use super::*;
+    use crate::{
+        protocols::{
+            chat::{ChatMessage, UserMessageContent},
+            common::{ContentPart, ImageUrl},
+        },
+        tokenizer::chat_template::ChatTemplateContentFormat,
+    };
 
     #[test]
     fn test_transform_messages_string_format() {

@@ -246,7 +246,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         # Apply penalty
-        if sampling_info.penalizer_orchestrator.is_required:
+        if (
+            sampling_info.penalizer_orchestrator.is_required
+            or sampling_info.logit_bias is not None
+        ):
             # This is a relaxed version of penalties for speculative decoding.
             linear_penalty = torch.zeros(
                 (bs, logits_output.next_token_logits.shape[1]),
@@ -574,6 +577,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 @dataclass
 class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+    # Constant: alloc length per decode step
+    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
+
     # The inputs for decode
     # shape: (b, topk)
     topk_p: torch.Tensor = None
@@ -608,9 +614,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     allocate_lens: Optional[torch.Tensor] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
-
-    # FIXME(lsyin): remove this hack
-    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)

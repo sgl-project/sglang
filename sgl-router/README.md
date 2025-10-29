@@ -147,7 +147,7 @@ curl -X POST http://localhost:30000/workers \
       }'
 
 # Inspect registered workers
-curl http://localhost:30000/workers | jq
+curl http://localhost:30000/workers
 ```
 Sample response (http workers):
 ```json
@@ -194,19 +194,132 @@ Route requests to OpenAI or OpenAI-compatible endpoints:
 python3 -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
-  --api-key "$OPENAI_API_KEY"
 
 # Route to custom OpenAI-compatible endpoint (Gemini, xAI, etc.)
 python3 -m sglang_router.launch_router \
   --backend openai \
   --worker-urls http://my-openai-compatible-service:8000 \
-  --api-key "tenant-api-key"
 ```
 
 **Notes**
 - OpenAI backend mode acts as a proxy to a single remote endpoint; load balancing is not applied.
 - Provide exactly one `--worker-urls` entry per router instance.
 - The Rust binary supports the same flags (`./target/release/sglang-router --backend openai ...`).
+
+### MCP Integration
+The SGL Model Gateway provides native Model Context Protocol (MCP) client integration, enabling tool calling across STDIO, SSE, and Streamable transports. MCP servers are configured via a YAML configuration file and registered at startup through the workflow engine.
+
+#### Basic Usage
+```bash
+# Rust binary
+./target/release/sglang-router \
+  --mcp-config-path /path/to/mcp-config.yaml \
+  --worker-urls http://worker1:8000
+
+# Python launcher
+python3 -m sglang_router.launch_router \
+  --mcp-config-path /path/to/mcp-config.yaml \
+  --worker-urls http://worker1:8000
+```
+
+#### MCP Configuration File
+Create an MCP configuration file to define servers, transports, and connection settings:
+
+```yaml
+servers:
+  - name: "filesystem"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    required: false
+
+  - name: "github"
+    url: "https://api.github.com/mcp"
+    token: "ghp_xxxxx"
+    transport: "sse"
+    required: false
+
+  - name: "custom-tools"
+    url: "https://tools.example.com/mcp"
+    transport: "streamable"
+    required: true
+
+pool:
+  max_connections: 100
+  idle_timeout: 300  # seconds
+
+proxy:
+  http: "http://proxy.internal:8080"
+  https: "https://proxy.internal:8443"
+  no_proxy: "localhost,127.0.0.1,*.internal"
+
+inventory:
+  enable_refresh: true
+  tool_ttl: 300  # seconds - how long tools are considered fresh
+  refresh_interval: 300  # seconds - background refresh interval
+```
+
+#### Configuration Options
+
+**Server Configuration** (`servers` array):
+- `name`: Unique identifier for the MCP server
+- `command` + `args`: For STDIO transport (local process execution)
+- `url`: For SSE or Streamable transports (HTTP/HTTPS endpoints)
+- `token`: Optional authentication token for HTTP-based transports
+- `transport`: Protocol type (`"sse"` or `"streamable"`; STDIO is inferred from `command`)
+- `required`: If `true`, router fails to start if server is unreachable (default: `false`)
+- `envs`: Environment variables for STDIO processes (optional)
+- `proxy`: Per-server proxy override (set to `null` to bypass global proxy)
+
+**Connection Pool** (`pool`):
+- `max_connections`: Maximum pooled connections for dynamic servers (default: 100)
+- `idle_timeout`: Idle connection timeout in seconds before cleanup (default: 300)
+
+**Proxy Configuration** (`proxy`):
+- `http`/`https`: Proxy URLs for MCP server connections (not LLM traffic)
+- `no_proxy`: Comma-separated hosts to exclude from proxying (supports wildcards)
+- **Note**: Proxy settings are currently ignored for `streamable` transport. Use STDIO or SSE transports if proxy support is required.
+
+**Inventory Settings** (`inventory`):
+- `enable_refresh`: Enable automatic background refresh of tool inventory (default: true)
+- `tool_ttl`: Tool cache TTL in seconds - how long tools are considered fresh (default: 300)
+- `refresh_interval`: Background refresh interval in seconds - proactive inventory refresh (default: 300)
+
+#### Transport Types
+
+**STDIO** (Local Process):
+```yaml
+name: "local-tools"
+command: "python"
+args: ["-m", "my_mcp_server"]
+envs:
+  API_KEY: "secret"
+  DEBUG: "true"
+```
+
+**SSE** (Server-Sent Events):
+```yaml
+name: "remote-sse"
+url: "https://mcp.example.com/events"
+token: "bearer-token"
+transport: "sse"
+```
+
+**Streamable** (Bidirectional Streaming):
+```yaml
+name: "streaming-tools"
+url: "https://mcp.example.com/stream"
+transport: "streamable"
+required: true
+```
+
+#### Server Lifecycle
+- MCP servers are registered via the workflow engine with retry logic (100 attempts, 2-hour timeout for STDIO servers)
+- Discovery phase identifies tools, prompts, and resources
+- Tool inventory is cached with configurable TTL and periodic refresh
+- Failed optional servers log warnings; required servers halt startup
+- Static servers (from config) are permanent; dynamic servers (per-request) use connection pooling
+
+Check Prometheus metrics for MCP activity (`mcp_*` metrics) and workflow job status via the admin API.
 
 ### Python Launcher (Router + Workers)
 Launch router and SGLang worker processes together; `launch_server` spins up workers (HTTP or gRPC) and the router in one shot.
@@ -218,7 +331,7 @@ Add flags as needed for production deployments:
 python3 -m sglang_router.launch_server \
   --host 0.0.0.0 \
   --port 8080 \
-  --model /raid/models/meta-llama/Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.1-8B-Instruct \
   --tp-size 1 \
   --dp-size 8 \
   --grpc-mode
@@ -240,7 +353,7 @@ Use upstream SGLang binaries to start dedicated worker processes.
 - **Prefill worker server (gRPC mode)**:
   ```bash
   python3 -m sglang.launch_server \
-    --model /raid/models/meta-llama/Llama-3.1-8B-Instruct \
+    --model meta-llama/Llama-3.1-8B-Instruct \
     --port 20000 \
     --tp-size 1 \
     --grpc-mode
@@ -312,7 +425,7 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 ### OpenAI Router
 - Proxies OpenAI-compatible chat completions and responses APIs, preserving headers and SSE streams end-to-end.
 - Supports `/v1/responses` background jobs with cancellation, deletion, and listing input items—enabling agentic, multi-turn orchestration without persisting data at remote vendor endpoints.
-- Conversation APIs (`/v1/conversations` and `/items`) interact with the configured conversation storage backend for compliant chat-history management. Conversation state lives at the router tier, so the same history can drive different models or MCP loops without leaking data to upstream vendors.
+- Conversation APIs (`/v1/conversations` and `/v1/conversations/{id}/items`) interact with the configured conversation storage backend for compliant chat-history management. Conversation state lives at the router tier, so the same history can drive different models or MCP loops without leaking data to upstream vendors.
 - Chat history, agentic multi-turn `/v1/responses`, and the native MCP client (STDIO/HTTP/SSE/Streamable transports) are designed to satisfy enterprise data-privacy requirements by keeping sensitive state within the router.
 
 ### Request Endpoints
@@ -323,10 +436,7 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 | `POST /v1/completions`                                                           | OpenAI-compatible text completions.                        |
 | `POST /v1/responses`                                                             | Create background responses, returns response IDs.         |
 | `GET /v1/responses/{id}`                                                         | Retrieve stored responses.                                 |
-| `POST /v1/responses/{id}/cancel`                                                 | Cancel in-flight background jobs.                          |
-| `DELETE /v1/responses/{id}`                                                      | Delete stored response.                                    |
-| `GET /v1/responses/{id}/input`                                                   | List captured input items.                                 |
-| Conversation endpoints (`/v1/conversations`, `/v1/conversations/{id}`, `/items`) | Manage chat history.                                       |
+| Conversation endpoints (`/v1/conversations`, `/v1/conversations/{id}`, `/v1/conversations/{id}/items`) | Manage chat history.                                       |
 | `POST /v1/embeddings`                                                            | Forward embedding requests.                                |
 | `POST /v1/rerank`, `POST /rerank`                                                | Ranking APIs.                                              |
 

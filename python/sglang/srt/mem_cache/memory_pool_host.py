@@ -1,7 +1,6 @@
 import abc
 import logging
 import threading
-from enum import IntEnum
 from functools import wraps
 from typing import Optional
 
