@@ -13,7 +13,12 @@ from __future__ import annotations
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Mixin class and utils for multi-http-worker mode"""
+
+"""
+Mixin classes and utils for multi-http-worker mode
+This file uses multiple processes to handle requests and tokenization, reducing the overhead of python and http server.
+"""
+
 import asyncio
 import logging
 import multiprocessing as multiprocessing
@@ -329,6 +334,11 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=(
+                [output.retraction_counts[i]]
+                if len(output.retraction_counts) > i
+                else None
+            ),
             token_steps=([output.token_steps[i]] if output.token_steps else None),
         )
     elif isinstance(output, BatchMultimodalOutput):
@@ -566,3 +576,14 @@ def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
         logger.warning(
             "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
         )
+
+
+class SenderWrapper:
+    def __init__(self, port_args: PortArgs, send_to_scheduler: zmq.Socket):
+        self.port_args = port_args
+        self.send_to_scheduler = send_to_scheduler
+
+    def send_pyobj(self, obj):
+        if isinstance(obj, BaseReq):
+            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
+        self.send_to_scheduler.send_pyobj(obj)
