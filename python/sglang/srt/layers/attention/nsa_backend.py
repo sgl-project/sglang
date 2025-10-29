@@ -1209,6 +1209,10 @@ class NativeSparseAttnBackend(AttentionBackend):
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
+        # Determine FA version: FA3 for SM90, FA4 for SM100 (B200)
+        device_sm = torch.cuda.get_device_capability()[0] * 10 + torch.cuda.get_device_capability()[1]
+        fa_version = 4 if device_sm == 100 else 3
+
         return_lse = getattr(forward_batch, "mha_return_lse", False)
 
         if return_lse:
@@ -1223,6 +1227,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 softmax_scale=layer.scaling,
                 causal=causal,
                 return_softmax_lse=True,
+                ver=fa_version,  # Use FA4 on B200, FA3 on H100/H200
             )
             # flash_attn returns (nheads, total_tokens) but merge_state_v2 expects (total_tokens, nheads)
             lse = lse.T.contiguous()
@@ -1238,6 +1243,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=layer.scaling,
                 causal=causal,
+                ver=fa_version,  # Use FA4 on B200, FA3 on H100/H200
             )
 
     def _forward_tilelang(
