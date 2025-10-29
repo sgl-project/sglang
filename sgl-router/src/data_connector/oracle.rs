@@ -6,7 +6,7 @@
 //! 3. OracleConversationItemStorage
 //! 4. OracleResponseStorage
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

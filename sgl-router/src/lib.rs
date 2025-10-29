@@ -144,14 +144,17 @@ impl PyOracleConfig {
 pub struct PyPostgresConfig {
     #[pyo3(get, set)]
     pub db_url: Option<String>,
+
+    #[pyo3(get, set)]
+    pub pool_max: usize,
 }
 
 #[pymethods]
 impl PyPostgresConfig {
     #[new]
-    #[pyo3(signature = (db_url = None))]
-    fn new(db_url: Option<String>) -> PyResult<Self> {
-        Ok(PyPostgresConfig { db_url })
+    #[pyo3(signature = (db_url = None,pool_max = 16,))]
+    fn new(db_url: Option<String>, pool_max: usize) -> PyResult<Self> {
+        Ok(PyPostgresConfig { db_url, pool_max })
     }
 }
 
@@ -159,6 +162,7 @@ impl PyPostgresConfig {
     fn to_config_postgres(&self) -> config::PostgresConfig {
         config::PostgresConfig {
             db_url: self.db_url.clone().unwrap_or_default(),
+            pool_max: self.pool_max,
         }
     }
 }

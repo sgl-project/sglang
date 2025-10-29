@@ -18,6 +18,7 @@ use crate::{
     config::{HistoryBackend, OracleConfig, RouterConfig},
     data_connector::postgres::{
         PostgresConversationItemStorage, PostgresConversationStorage, PostgresResponseStorage,
+        PostgresStore,
     },
 };
 
@@ -79,17 +80,17 @@ pub fn create_storage(config: &RouterConfig) -> Result<StorageTuple, String> {
                 .clone()
                 .ok_or("Postgres configuration is required when history_backend=postgres")?;
             info!(
-                "Initializing data connector: Postgres (db_url: {})",
-                postgres_cfg.db_url
+                "Initializing data connector: Postgres (db_url: {}, pool_max: {})",
+                postgres_cfg.db_url, postgres_cfg.pool_max
             );
-            let postgres_resp = PostgresResponseStorage::new(postgres_cfg.clone())
+            let store = PostgresStore::new(postgres_cfg)?;
+            let postgres_resp = PostgresResponseStorage::new(store.clone())
                 .map_err(|err| format!("failed to initialize Postgres response storage: {err}"))?;
-            let postgres_conv =
-                PostgresConversationStorage::new(postgres_cfg.clone()).map_err(|err| {
-                    format!("failed to initialize Postgres conversation storage: {err}")
-                })?;
-            let postgres_item = PostgresConversationItemStorage::new(postgres_cfg.clone())
-                .map_err(|err| {
+            let postgres_conv = PostgresConversationStorage::new(store.clone()).map_err(|err| {
+                format!("failed to initialize Postgres conversation storage: {err}")
+            })?;
+            let postgres_item =
+                PostgresConversationItemStorage::new(store.clone()).map_err(|err| {
                     format!("failed to initialize Postgres conversation item storage: {err}")
                 })?;
             info!("Data connector initialized successfully: Postgres");

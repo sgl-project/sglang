@@ -191,6 +191,23 @@ pub struct PostgresConfig {
     // Database connection URL,
     // postgres://[user[:password]@][netloc][:port][/dbname][?param1=value1&...]
     pub db_url: String,
+    // Database pool max size
+    pub pool_max: usize,
+}
+
+impl PostgresConfig {
+    pub fn default_pool_max() -> usize {
+        16
+    }
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            db_url: "postgresql://localhost:5432/sglang".to_string(),
+            pool_max: 16,
+        }
+    }
 }
 
 /// Routing mode configuration
