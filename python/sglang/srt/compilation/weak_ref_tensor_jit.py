@@ -15,7 +15,7 @@ if is_npu():
         sources=[f"{_abs_path}/weak_ref_tensor_npu.cpp"],
         extra_cflags=["-O3"],
         extra_ldflags=[
-            f"-L/{os.path.join(site_packs_dir, 'torch_npu/lib/')}",
+            f"-L{os.path.join(site_packs_dir, 'torch_npu/lib/')}",
             "-ltorch_npu",
         ],
         extra_include_paths=[os.path.join(site_packs_dir, "torch_npu/include/")],
