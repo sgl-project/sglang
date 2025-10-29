@@ -493,6 +493,7 @@ def latency_test_run_once(
     log_decode_step,
     profile,
     profile_record_shapes,
+    profiler_activities,
     profile_filename_prefix,
     profile_stage,
     tp_rank,
@@ -520,7 +521,7 @@ def latency_test_run_once(
     enable_profile_prefill = profile and profile_stage in ["all", "prefill"]
     if enable_profile_prefill:
         profiler = start_profile(
-            bench_args.profiler_activities,
+            profiler_activities,
             profile_record_shapes=profile_record_shapes,
             rank_print=rank_print,
         )
@@ -537,7 +538,7 @@ def latency_test_run_once(
         )
         stop_profile(
             profiler,
-            bench_args.profiler_activities,
+            profiler_activities,
             rank_print=rank_print,
             save_trace=True,
             trace_filename=trace_filename,
@@ -560,7 +561,7 @@ def latency_test_run_once(
         profiler = None
         if enable_profile_decode and i == step_of_interest:
             profiler = start_profile(
-                bench_args.profiler_activities,
+                profiler_activities,
                 profile_record_shapes=profile_record_shapes,
                 rank_print=rank_print,
             )
@@ -576,7 +577,7 @@ def latency_test_run_once(
             )
             stop_profile(
                 profiler,
-                bench_args.profiler_activities,
+                profiler_activities,
                 rank_print=rank_print,
                 save_trace=True,
                 trace_filename=trace_filename,
@@ -650,8 +651,9 @@ def latency_test(
         log_decode_step=0,
         profile=False,
         profile_record_shapes=False,
-        profile_filename_prefix="",  # not used
-        profile_stage="all",  # not used during warmup
+        profiler_activities=("CPU", "GPU"),
+        profile_filename_prefix="",
+        profile_stage="all",
         tp_rank=tp_rank,
     )
 
@@ -699,6 +701,7 @@ def latency_test(
             bench_args.log_decode_step,
             bench_args.profile if tp_rank == 0 else None,
             bench_args.profile_record_shapes if tp_rank == 0 else None,
+            bench_args.profiler_activities,
             bench_args.profile_filename_prefix,
             bench_args.profile_stage,
             tp_rank,
