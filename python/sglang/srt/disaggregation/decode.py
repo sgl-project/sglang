@@ -620,39 +620,21 @@ class DecodePreallocQueue:
 
         req.req_pool_idx = req_pool_indices[0]
 
+        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         if self.token_to_kv_pool_allocator.page_size == 1:
             # Previously retracted request has decode tokens
-            fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
             req.kv_allocated_len = fill_len
             req.kv_committed_len = fill_len
         else:
-            num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            device = self.token_to_kv_pool_allocator.device
             kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                prefix_lens=torch.tensor(
-                    [0],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                prefix_lens_cpu=torch.tensor(
-                    [0],
-                    dtype=torch.int64,
-                ),
-                seq_lens=torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                seq_lens_cpu=torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int64,
-                ),
-                last_loc=torch.tensor(
-                    [-1],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                extend_num_tokens=num_tokens,
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                extend_num_tokens=fill_len,
             )
 
         assert (
