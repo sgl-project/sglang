@@ -235,7 +235,8 @@ impl HarmonyPreparationStage {
             }
         });
 
-        serde_json::to_string(&structural_tag)
-            .map_err(|e| utils::internal_error_message(format!("Failed to serialize structural tag: {}", e)))
+        serde_json::to_string(&structural_tag).map_err(|e| {
+            utils::internal_error_message(format!("Failed to serialize structural tag: {}", e))
+        })
     }
 }
