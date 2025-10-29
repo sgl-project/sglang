@@ -67,6 +67,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.utils import SupportsPP
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
@@ -634,7 +635,7 @@ class Qwen2MoeModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class Qwen2MoeForCausalLM(nn.Module):
+class Qwen2MoeForCausalLM(nn.Module, SupportsPP):
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -760,17 +761,8 @@ class Qwen2MoeForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
+        filtered_weights = self.filter_weights_by_layers(weights)
+        for name, loaded_weight in filtered_weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:

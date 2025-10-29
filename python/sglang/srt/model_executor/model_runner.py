@@ -108,7 +108,13 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
 from sglang.srt.model_loader import get_model
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    device_loading_context,
+    get_model_loader,
+    initialize_model,
+)
+from sglang.srt.model_loader.utils import SupportsPP, set_default_torch_dtype
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_init_weights_send_group_for_remote_instance_request,
 )
@@ -734,14 +740,32 @@ class ModelRunner:
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
 
+        device_config = DeviceConfig(self.device)
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(self.model_config.dtype):
+            with target_device:
+                model_class = initialize_model(self.model_config, self.load_config)
+
+        # check model support pipeline parallelism
+        if isinstance(model_class, SupportsPP):
+            self.support_pp = True
+        else:
+            self.support_pp = False
+            if self.pp_size > 1:
+                raise RuntimeError(
+                    "model %s does not support pipeline parallelism now.",
+                    model_class,
+                )
+
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=self.server_args.enable_weights_cpu_backup,
-        ):
+        ):  
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
-                device_config=DeviceConfig(self.device, self.gpu_id),
+                device_config=device_config,
+                model_class=model_class,
             )
         monkey_patch_vllm_parallel_state(reverse=True)
 

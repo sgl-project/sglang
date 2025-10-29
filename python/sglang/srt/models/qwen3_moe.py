@@ -51,6 +51,23 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from sglang.srt.managers.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
+from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
+from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
+from sglang.srt.model_loader.utils import SupportsPP
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -660,7 +677,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
         )
 
 
-class Qwen3MoeForCausalLM(nn.Module):
+class Qwen3MoeForCausalLM(nn.Module, SupportsPP):
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -805,22 +822,9 @@ class Qwen3MoeForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
 
-        # Cache params_dict to avoid repeated expensive traversal of model parameters
-        if not hasattr(self, "_cached_params_dict"):
-            self._cached_params_dict = dict(self.named_parameters())
-        params_dict = self._cached_params_dict
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
-
+        params_dict = dict(self.named_parameters())
+        filtered_weights = self.filter_weights_by_layers(weights)
+        for name, loaded_weight in filtered_weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:

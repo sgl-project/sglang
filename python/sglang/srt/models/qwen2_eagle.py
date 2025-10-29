@@ -37,7 +37,7 @@ from sglang.srt.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
 Qwen2Config = None
 
 
-class Qwen2DecoderLayer(Qwen2DecoderLayer):
+class Qwen2DecoderLayerEagle(Qwen2DecoderLayer):
     def __init__(
         self,
         config: Qwen2Config,
@@ -71,7 +71,7 @@ class Qwen2Model(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                Qwen2DecoderLayer(
+                Qwen2DecoderLayerEagle(
                     config,
                     i,
                     quant_config=quant_config,

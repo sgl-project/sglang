@@ -23,6 +23,7 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.utils import SupportsPP
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -306,7 +307,7 @@ class Qwen3Model(Qwen2Model):
         )
 
 
-class Qwen3ForCausalLM(nn.Module):
+class Qwen3ForCausalLM(nn.Module, SupportsPP):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -474,20 +475,10 @@ class Qwen3ForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
+        filtered_weights = self.filter_weights_by_layers(weights)
+        for name, loaded_weight in filtered_weights:
             if "Embedding" in self.config.name_or_path:
                 name = add_prefix(name, "model")
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
-
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

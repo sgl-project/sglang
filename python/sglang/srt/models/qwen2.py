@@ -45,6 +45,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.utils import SupportsPP
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
@@ -407,7 +408,7 @@ class Qwen2Model(nn.Module):
                 )
 
 
-class Qwen2ForCausalLM(nn.Module):
+class Qwen2ForCausalLM(nn.Module, SupportsPP):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -576,17 +577,8 @@ class Qwen2ForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
+        filtered_weights = self.filter_weights_by_layers(weights)
+        for name, loaded_weight in filtered_weights:
 
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue

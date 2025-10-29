@@ -63,6 +63,12 @@ class LlamaForSequenceClassification(nn.Module):
 
         return EmbeddingPoolerOutput(scores)
 
+    def filter_weights_by_layers(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> Iterable[Tuple[str, torch.Tensor]]:
+        """Dummy implementation since there is no PP now, but we invoke the LlamaForCausalLM.load_weights directly."""
+        return weights
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         return LlamaForCausalLM.load_weights(self, weights)
 

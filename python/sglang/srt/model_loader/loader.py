@@ -214,7 +214,7 @@ def _get_quantization_config(
     return None
 
 
-def _initialize_model(
+def initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
 ) -> nn.Module:
@@ -279,6 +279,7 @@ class BaseModelLoader(ABC):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        model_class: nn.Module = None,
     ) -> nn.Module:
         """Load a model with the given configurations."""
         raise NotImplementedError
@@ -575,6 +576,7 @@ class DefaultModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        model_class: nn.Module = None,
     ) -> nn.Module:
 
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
@@ -587,10 +589,13 @@ class DefaultModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                )
+                if model_class is None:
+                    model = initialize_model(
+                        model_config,
+                        self.load_config,
+                    )
+                else:
+                    model = model_class
 
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
@@ -630,6 +635,7 @@ class LayeredModelLoader(DefaultModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        model_class: nn.Module = None,
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
         from sglang.srt.server_args import get_global_server_args
@@ -640,10 +646,13 @@ class LayeredModelLoader(DefaultModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             # Create model on meta device
             with torch.device("meta"):
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                )
+                if model_class is None:
+                    model = initialize_model(
+                        model_config,
+                        self.load_config,
+                    )
+                else:
+                    model = model_class
 
             # Check model's layered load support
             if not hasattr(model, "load_weights_to_module"):
@@ -707,6 +716,7 @@ class DummyModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        model_class: nn.Module = None,
     ) -> nn.Module:
 
         if get_bool_env_var("SGL_CPU_QUANTIZATION"):
@@ -716,10 +726,13 @@ class DummyModelLoader(BaseModelLoader):
 
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                )
+                if model_class is None:
+                    model = initialize_model(
+                        model_config,
+                        self.load_config,
+                    )
+                else:
+                    model = model_class
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -817,6 +830,7 @@ class ShardedStateLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        model_class: nn.Module = None,
     ) -> nn.Module:
         from safetensors.torch import safe_open
 
@@ -828,7 +842,14 @@ class ShardedStateLoader(BaseModelLoader):
 
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config)
+                if model_class is None:
+                    model = initialize_model(
+                        model_config,
+                        self.load_config,
+                    )
+                else:
+                    model = model_class
+
                 for _, module in model.named_modules():
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
@@ -1377,13 +1398,17 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        model_class: nn.Module = None,
     ) -> nn.Module:
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                )
+                if model_class is None:
+                    model = initialize_model(
+                        model_config,
+                        self.load_config,
+                    )
+                else:
+                    model = model_class
 
                 self._load_weights(model_config, model)
 
@@ -1469,6 +1494,7 @@ class GGUFModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        model_class: nn.Module = None,
     ) -> nn.Module:
 
         local_model_path = self._prepare_weights(model_config.model_path)
@@ -1482,7 +1508,13 @@ class GGUFModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = _initialize_model(model_config, self.load_config)
+                if model_class is None:
+                    model = initialize_model(
+                        model_config,
+                        self.load_config,
+                    )
+                else:
+                    model = model_class
             model.load_weights(
                 self._get_weights_iterator(local_model_path, gguf_weights_map)
             )
@@ -1705,6 +1737,7 @@ class RemoteModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        model_class: nn.Module = None,
     ) -> nn.Module:
         logger.info("Loading weights from remote storage ...")
         start = time.perf_counter()
@@ -1721,7 +1754,17 @@ class RemoteModelLoader(BaseModelLoader):
 
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config)
+                if model_class is None:
+                    model = initialize_model(
+                        model_config,
+                        self.load_config,
+                    )
+                else:
+                    model = model_class
+                for _, module in model.named_modules():
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        quant_method.process_weights_after_loading(module)
 
             with create_remote_connector(
                 model_weights, device=device_config.device
