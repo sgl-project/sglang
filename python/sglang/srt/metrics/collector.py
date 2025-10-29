@@ -1008,3 +1008,16 @@ class StorageMetricsCollector:
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+
+
+class ExpertDispatchCollector:
+    def __init__(self, ep_size: int) -> None:
+        from prometheus_client import Histogram
+
+        ep_size_buckets = [i for i in range(ep_size)]
+        self.eplb_gpu_physical_count = Histogram(
+            name="sglang:eplb_gpu_physical_count",
+            documentation="The selected count of physical experts on each layer and GPU rank.",
+            labelnames={"layer"},
+            buckets=ep_size_buckets,
+        )
