@@ -15,6 +15,9 @@ use crate::mcp::{
 /// Type alias for MCP client
 type McpClient = RunningService<RoleClient, ()>;
 
+/// Type alias for eviction callback
+type EvictionCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Cached MCP connection with metadata
 #[derive(Clone)]
 pub struct CachedConnection {
@@ -48,7 +51,7 @@ pub struct McpConnectionPool {
 
     /// Optional eviction callback (called when LRU evicts a connection)
     /// Used to clean up tools from inventory
-    eviction_callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    eviction_callback: Option<EvictionCallback>,
 }
 
 impl McpConnectionPool {

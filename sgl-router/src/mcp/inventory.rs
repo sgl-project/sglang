@@ -51,7 +51,15 @@ impl ToolInventory {
             resources: DashMap::new(),
         }
     }
+}
 
+impl Default for ToolInventory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolInventory {
     // ============================================================================
     // Tool Methods
     // ============================================================================
