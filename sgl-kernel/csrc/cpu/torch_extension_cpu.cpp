@@ -233,6 +233,9 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
+// fused_gdn_gating
+at::Tensor fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& dt_bias);
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
@@ -363,6 +366,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+  // fused_gdn_gating
+  m.def("fused_gdn_gating_cpu(Tensor A_log, Tensor a, Tensor dt_bias) -> Tensor");
+  m.impl("fused_gdn_gating_cpu", torch::kCPU, &fused_gdn_gating_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
