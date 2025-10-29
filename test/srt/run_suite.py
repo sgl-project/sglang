@@ -60,6 +60,8 @@ suites = {
         TestFile("test_gguf.py", 96),
     ],
     "__not_in_ci__": [
+        TestFile("entrypoints/grpc_server/test_get_tokenizer.py"),
+        TestFile("entrypoints/grpc_server/test_tokenizer_stream.py"),
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("test_bench_one_batch.py"),
