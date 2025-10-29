@@ -2366,13 +2366,19 @@ class Scheduler(
                 len(req.req.origin_input_ids)
                 for req in self.disagg_decode_prealloc_queue.queue
             )
-            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.queue)
+            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.queue) + len(
+                self.disagg_decode_transfer_queue.queue
+            )
+
+        # Extract finished requests for accurate load report
+        running_cnt = sum(1 for req in self.running_batch.reqs if not req.finished())
 
         return GetLoadReqOutput(
             dp_rank=self.dp_rank,
-            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
+            num_reqs=running_cnt + num_waiting_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
+            num_finished_reqs=0,
         )
 
     def get_internal_state(self, recv_req: GetInternalStateReq):

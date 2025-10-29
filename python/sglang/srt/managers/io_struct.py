@@ -16,6 +16,8 @@ The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
+from __future__ import annotations
+
 import copy
 import uuid
 from abc import ABC
@@ -866,6 +868,9 @@ class BatchTokenIDOutput(BaseBatchReq):
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
+    # Load for DP balance
+    load: GetLoadReqOutput = None
+
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
@@ -944,6 +949,9 @@ class BatchStrOutput(BaseBatchReq):
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # Load for DP balance
+    load: GetLoadReqOutput = None
 
 
 @dataclass
@@ -1466,6 +1474,7 @@ class GetLoadReqOutput(BaseReq):
     num_reqs: int
     num_waiting_reqs: int
     num_tokens: int
+    num_finished_reqs: int
 
 
 @dataclass
