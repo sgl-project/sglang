@@ -163,8 +163,8 @@ jobs:
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
           cd sgl-router
-          pip install setuptools-rust wheel build
-          python3 -m build
+          pip install maturin
+          maturin build --release
           pip install --force-reinstall dist/*.whl
 
 
@@ -260,8 +260,8 @@ jobs:
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
           cd sgl-router
-          pip install setuptools-rust wheel build
-          python3 -m build
+          pip install maturin
+          maturin build --release
           pip install --force-reinstall dist/*.whl
 
       - name: Run Python E2E response API tests
@@ -284,7 +284,7 @@ jobs:
 
 
   finish:
-    needs: [unit-test-rust, pytest-rust, pytest-rust-2]
+    needs: [maturin-build-test, unit-test-rust, pytest-rust, pytest-rust-2]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
