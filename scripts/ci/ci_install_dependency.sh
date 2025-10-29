@@ -55,7 +55,7 @@ else
     $PIP_CMD install flashinfer-python==0.4.1 --prerelease=allow $PIP_INSTALL_SUFFIX
 
     # Install the main package
-    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --upgrade
+    $PIP_CMD install -e "python" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --upgrade
 fi
 
 # Install router for pd-disagg test
