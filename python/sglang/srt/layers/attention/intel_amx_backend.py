@@ -24,7 +24,11 @@ class IntelAMXAttnBackend(AttentionBackend):
             model_runner.model_config.num_attention_heads // model_runner.tp_size
         )
 
-        layer_id = [*model_runner.token_to_kv_pool.full_attention_layer_id_mapping][0]
+        layer_id = 0
+        if hasattr(model_runner.token_to_kv_pool, "full_attention_layer_id_mapping"):
+            layer_id = [*model_runner.token_to_kv_pool.full_attention_layer_id_mapping][
+                0
+            ]
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(
             layer_id
         ).shape[-1]
