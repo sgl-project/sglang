@@ -193,6 +193,8 @@ class TestFusedMOE(CustomTestCase):
         dtypes = [torch.float16, torch.bfloat16]
         fp8_modes = [False, True]
 
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
         # Calculate total number of tests
         total_tests = (
             len(m_values)

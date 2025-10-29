@@ -71,7 +71,7 @@ suites = {
         TestFile("rl/test_fp32_lm_head.py", 30),
         TestFile("rl/test_update_weights_from_disk.py", 114),
         TestFile("rl/test_update_weights_from_tensor.py", 48),
-        TestFile("test_abort.py", 51),
+        TestFile("test_abort.py", 121),
         TestFile("test_build_eagle_tree.py", 8),
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_create_kvindices.py", 2),
@@ -158,6 +158,7 @@ suites = {
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 257),
+        TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 291),
