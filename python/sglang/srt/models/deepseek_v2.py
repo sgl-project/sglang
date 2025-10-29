@@ -131,13 +131,11 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cpu,
     is_cuda,
-    is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
     is_nvidia_cublas_cu12_version_ge_12_9,
-    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -197,8 +195,6 @@ elif _is_npu:
 else:
     pass
 
-_is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and is_sm100_supported()
 _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
 logger = logging.getLogger(__name__)
@@ -1260,7 +1256,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
             and _is_cuda
-            and _device_sm >= 90
+            and 90 <= _device_sm < 120
         )
 
         self.qkv_proj_with_rope_is_int8 = (
@@ -3002,7 +2998,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
-        elif self.quant_config.get_name() == "w4afp8":
+        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
@@ -3293,8 +3289,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 experts = layer.mlp.experts
                 if isinstance(experts, DeepEPMoE):
                     for w in [
-                        experts.w13_weight_fp8,
-                        experts.w2_weight_fp8,
+                        (experts.w13_weight, experts.w13_weight_scale_inv),
+                        (experts.w2_weight, experts.w2_weight_scale_inv),
                     ]:
                         requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
             else:
@@ -3342,10 +3338,26 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
 
         experts = layer.mlp.experts
+        w13_weight_fp8 = (
+            experts.w13_weight,
+            (
+                experts.w13_weight_scale_inv
+                if hasattr(experts, "w13_weight_scale_inv")
+                else experts.w13_weight_scale
+            ),
+        )
+        w2_weight_fp8 = (
+            experts.w2_weight,
+            (
+                experts.w2_weight_scale_inv
+                if hasattr(experts, "w2_weight_scale_inv")
+                else experts.w2_weight_scale
+            ),
+        )
         if isinstance(experts, DeepEPMoE):
             for w in [
-                experts.w13_weight_fp8,
-                experts.w2_weight_fp8,
+                w13_weight_fp8,
+                w2_weight_fp8,
             ]:
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 

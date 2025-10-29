@@ -1,6 +1,6 @@
 # If the device is Battlemage, we need to set UBUNTU_VERSION to 24.10
 
-# Usage: docker build --build-arg UBUNTU_VERSION=24.04 --build-arg PYTHON_VERSION=3.10 -t sglang:xpu_kernel -f  Dockerfile.xpu --no-cache .
+# Usage: docker build --build-arg UBUNTU_VERSION=24.04 --build-arg PYTHON_VERSION=3.10 -t sglang:xpu_kernel -f  xpu.Dockerfile --no-cache .
 
 # Use Intel deep learning essentials base image with Ubuntu 24.04
 FROM intel/deep-learning-essentials:2025.1.3-0-devel-ubuntu24.04

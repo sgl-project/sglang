@@ -44,7 +44,7 @@ You can install SGLang using one of the methods below.
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.4 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.4.post1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Compile sgl-kernel
@@ -60,7 +60,7 @@ pip install -e "python[all_hip]"
 
 ### Install Using Docker (Recommended)
 
-The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile.rocm](https://github.com/sgl-project/sglang/tree/main/docker).
+The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [rocm.Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 
 The steps below show how to build and use an image.
 
@@ -68,7 +68,7 @@ The steps below show how to build and use an image.
    If you use pre-built images, you can skip this step and replace `sglang_image` with the pre-built image names in the steps below.
 
    ```bash
-   docker build -t sglang_image -f Dockerfile.rocm .
+   docker build -t sglang_image -f rocm.Dockerfile .
    ```
 
 2. Create a convenient alias.
