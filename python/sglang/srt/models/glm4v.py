@@ -553,29 +553,32 @@ class Glm4vForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
-        self.visual = Glm4vVisionModel(
-            config.vision_config,
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
-        )
 
-        vision_utils.update_vit_attn_dummy_heads_config(self.config)
-
-        self.model = Glm4Model(
-            config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
+        if not config.language_only:
+            self.visual = Glm4vVisionModel(
+                config.vision_config,
                 quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
+                prefix=add_prefix("visual", prefix),
             )
+
+            vision_utils.update_vit_attn_dummy_heads_config(self.config)
+
+        if not config.mm_only:
+            self.model = Glm4Model(
+                config,
+                quant_config=quant_config,
+                prefix=add_prefix("model", prefix),
+            )
+
+            if config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
@@ -741,6 +744,11 @@ class Glm4vForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                # Skip loading visual/language model weights
+                if (
+                    self.config.mm_only or self.config.language_only
+                ) and name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -753,6 +761,11 @@ class Glm4vForConditionalGeneration(nn.Module):
                 try:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip loading visual/language model weights
+                    if (
+                        self.config.mm_only or self.config.language_only
+                    ) and name not in params_dict:
                         continue
                     param = params_dict[name]
                 except KeyError:

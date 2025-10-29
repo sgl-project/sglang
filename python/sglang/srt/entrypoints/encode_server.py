@@ -104,13 +104,19 @@ class ImageEncoder:
         images = await asyncio.gather(*resize_tasks)
 
         images_input = self.image_processor(images=images)
+        feature = images_input["pixel_values"]
+        image_grid_thw = images_input["image_grid_thw"]
+        if type(feature) is not torch.Tensor:
+            feature = torch.tensor(feature)
+        if type(image_grid_thw) is not torch.Tensor:
+            image_grid_thw = torch.tensor(image_grid_thw)
         mm_item = MultimodalDataItem.from_dict(
             {
                 "modality": Modality.IMAGE,
-                "feature": images_input["pixel_values"],
+                "feature": feature,
             }
         )
-        mm_item.set("image_grid_thw", images_input["image_grid_thw"])
+        mm_item.set("image_grid_thw", image_grid_thw)
         mm_embedding = self.model.get_image_feature([mm_item])
         return mm_embedding
 
