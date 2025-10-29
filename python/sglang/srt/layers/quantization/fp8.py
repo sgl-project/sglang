@@ -1281,7 +1281,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         if activation == "silu"
                         else ActivationType.Gelu
                     ),
-                    expert_mask=None,
+                    expert_mask=layer.expert_mask_gpu,
                 )
             else:
                 return fused_moe(
@@ -1298,6 +1298,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         if activation == "silu"
                         else ActivationType.Gelu
                     ),
+                    expert_mask=layer.expert_mask_gpu,
                 )
         return None
 
