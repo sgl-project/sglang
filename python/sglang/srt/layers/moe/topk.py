@@ -29,7 +29,6 @@ from typing import (
 )
 
 import torch
-import torch._inductor.config as inductor_config
 import torch.nn.functional as F
 
 from sglang.srt.custom_op import CustomOp
@@ -43,7 +42,6 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -485,10 +483,6 @@ def grouped_topk_gpu(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    if get_global_server_args().enable_deterministic_inference:
-        inductor_config.triton.persistent_reductions = False
-        inductor_config.triton.max_tiles = 1
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = torch.softmax(gating_output, dim=-1)
