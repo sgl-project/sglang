@@ -19,7 +19,9 @@ ARG NVSHMEM_VERSION=3.4.5
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+    NVSHMEM_DIR=/sgl-workspace/nvshmem/install \    
+    CCACHE_DIR=/tmp/.ccache \
+    CCACHE_MAXSIZE=10G
 # Add GKE default lib and bin locations.
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
@@ -157,7 +159,12 @@ RUN cd /sgl-workspace/nvshmem && \
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} && \
+    cmake -S . -B build/ \
+        -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} \
+        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && \
     cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
 
 # Install DeepEP
@@ -177,7 +184,12 @@ RUN cd /sgl-workspace/DeepEP && \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
       sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
     fi && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
+    CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    CMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+    NVSHMEM_DIR=${NVSHMEM_DIR} \
+    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" \
+    pip install --no-build-isolation .
 
 # Install flashmla
 RUN if [ "$CUDA_VERSION" != "13.0.1" ]; then \
@@ -188,6 +200,9 @@ RUN if [ "$CUDA_VERSION" != "13.0.1" ]; then \
       if [ "$CUDA_VERSION" = "12.6.1" ]; then \
         export FLASH_MLA_DISABLE_SM100=1; \
       fi && \
+      CMAKE_C_COMPILER_LAUNCHER=ccache \
+      CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      CMAKE_CUDA_COMPILER_LAUNCHER=ccache \
       pip install --no-build-isolation -v . ; \
     fi
 
