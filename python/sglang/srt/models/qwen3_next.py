@@ -480,9 +480,10 @@ class Qwen3GatedDeltaNet(nn.Module):
         z = z.reshape(-1, z.shape[-1])
 
         # Add padding for DP-Attn
-        core_attn_out_pad = torch.zeros_like(z)
-        core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
-        core_attn_out = core_attn_out_pad
+        if is_dp_attention_enabled():
+            core_attn_out_pad = torch.zeros_like(z)
+            core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+            core_attn_out = core_attn_out_pad
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
