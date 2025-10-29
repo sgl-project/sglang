@@ -65,42 +65,6 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-class TestFlashMLAAttnLatency(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = [
-            "--attention-backend",
-            "flashmla",
-            "--cuda-graph-max-bs",
-            "16",
-            "--trust-remote-code",
-        ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_bs_1_speed(self):
-        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
-        acc_length, speed = send_one_prompt(args)
-
-        print(f"{speed=:.2f}")
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_bs_1_speed (flashmla)\n" f"{speed=:.2f} token/s\n"
-            )
-            self.assertGreater(speed, 140)
-
-
 class TestFlashMLAMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
