@@ -558,8 +558,8 @@ class ChatCompletionRequest(BaseModel):
             raise ValueError("Either 'messages' or 'input_ids' must be provided")
 
         if messages is not None and input_ids is not None:
-            raise ValueError(
-                "Cannot provide both 'messages' and 'input_ids'. Please use only one."
+            logger.warning(
+                "Both 'messages' and 'input_ids' provided. 'input_ids' will take precedence and 'messages' will be ignored."
             )
 
         return values

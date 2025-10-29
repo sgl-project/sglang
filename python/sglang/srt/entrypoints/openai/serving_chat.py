@@ -111,6 +111,50 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return stop
 
+    def _validate_request_max_tokens(
+        self, request: ChatCompletionRequest
+    ) -> Optional[str]:
+        """Validate that max_tokens is within server context length."""
+        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        server_context_length = self.tokenizer_manager.server_args.context_length
+        if (
+            max_output_tokens
+            and server_context_length
+            and max_output_tokens > server_context_length
+        ):
+            return (
+                f"max_completion_tokens is too large: {max_output_tokens}."
+                f"This model supports at most {server_context_length} completion tokens."
+            )
+        return None
+
+    def _process_tool_call_constraint(
+        self, request: ChatCompletionRequest
+    ) -> Optional[tuple]:
+        """Process tool call constraint from request.
+
+        Returns tool_call_constraint tuple or None if no tools/tool_choice.
+        This logic works on OUTPUT, so it's compatible with both input_ids and messages.
+        """
+        if not request.tools or request.tool_choice == "none":
+            return None
+
+        tool_call_constraint = None
+
+        # Try to get constraint from parser first
+        if self.tool_call_parser:
+            parser = FunctionCallParser(request.tools, self.tool_call_parser)
+            tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
+
+        # Handle JSON schema constraint for required or named tool choice
+        if request.tool_choice == "required" or isinstance(
+            request.tool_choice, ToolChoice
+        ):
+            json_schema = get_json_schema_constraint(request.tools, request.tool_choice)
+            tool_call_constraint = ("json_schema", json_schema)
+
+        return tool_call_constraint
+
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
 
@@ -121,17 +165,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 return "input_ids must be a non-empty list of integers."
 
             # Validate max_tokens
-            max_output_tokens = request.max_completion_tokens or request.max_tokens
-            server_context_length = self.tokenizer_manager.server_args.context_length
-            if (
-                max_output_tokens
-                and server_context_length
-                and max_output_tokens > server_context_length
-            ):
-                return (
-                    f"max_completion_tokens is too large: {max_output_tokens}."
-                    f"This model supports at most {server_context_length} completion tokens."
-                )
+            error = self._validate_request_max_tokens(request)
+            if error:
+                return error
 
             # Note: Tool calling and reasoning parsing work on OUTPUT, so they are supported with input_ids
             return None
@@ -164,17 +200,10 @@ class OpenAIServingChat(OpenAIServingBase):
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
 
-        max_output_tokens = request.max_completion_tokens or request.max_tokens
-        server_context_length = self.tokenizer_manager.server_args.context_length
-        if (
-            max_output_tokens
-            and server_context_length
-            and max_output_tokens > server_context_length
-        ):
-            return (
-                f"max_completion_tokens is too large: {max_output_tokens}."
-                f"This model supports at most {server_context_length} completion tokens."
-            )
+        # Validate max_tokens
+        error = self._validate_request_max_tokens(request)
+        if error:
+            return error
 
         if request.response_format and request.response_format.type == "json_schema":
             schema = getattr(request.response_format.json_schema, "schema_", None)
@@ -214,20 +243,7 @@ class OpenAIServingChat(OpenAIServingBase):
             modalities = []
 
             # Process tool call constraint (works on OUTPUT, compatible with input_ids)
-            tool_call_constraint = None
-            if request.tools and request.tool_choice != "none":
-                if self.tool_call_parser:
-                    parser = FunctionCallParser(request.tools, self.tool_call_parser)
-                    tool_call_constraint = parser.get_structure_constraint(
-                        request.tool_choice
-                    )
-                if request.tool_choice == "required" or isinstance(
-                    request.tool_choice, ToolChoice
-                ):
-                    json_schema = get_json_schema_constraint(
-                        request.tools, request.tool_choice
-                    )
-                    tool_call_constraint = ("json_schema", json_schema)
+            tool_call_constraint = self._process_tool_call_constraint(request)
         else:
             # Message-based processing: apply chat template
             processed_messages = self._process_messages(request, is_multimodal)
@@ -306,8 +322,6 @@ class OpenAIServingChat(OpenAIServingBase):
         if is_gpt_oss:
             request.skip_special_tokens = False
 
-        tool_call_constraint = None
-
         # Apply chat template and its stop strings
         tools = None
         if request.tools and request.tool_choice != "none":
@@ -320,19 +334,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             else:
                 tools = [item.function.model_dump() for item in request.tools]
-            if self.tool_call_parser:
-                parser = FunctionCallParser(request.tools, self.tool_call_parser)
-                tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice
-                )
-            # Handle JSON schema constraint directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(
-                request.tool_choice, ToolChoice
-            ):
-                json_schema = get_json_schema_constraint(
-                    request.tools, request.tool_choice
-                )
-                tool_call_constraint = ("json_schema", json_schema)
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -340,7 +341,8 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
-        result.tool_call_constraint = tool_call_constraint
+        # Process tool call constraint
+        result.tool_call_constraint = self._process_tool_call_constraint(request)
         return result
 
     def _apply_jinja_template(
