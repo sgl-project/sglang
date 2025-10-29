@@ -9,14 +9,7 @@ Refer to the [3fs-operator documentation](https://github.com/aliyun/kvc-3fs-oper
 ## Step 2: Launch SGLang Pod
 Start your SGLang Pod while specifying 3FS-related labels in the YAML configuration. Follow the [fuse-client-creation guide](https://github.com/aliyun/kvc-3fs-operator/blob/main/README_en.md#fuse-client-creation).
 
-## Step 3: Configure Usrbio Client in SGLang Pod
-The Usrbio client is required for accessing 3FS. Install it in your SGLang Pod using either method below:
-
-**Alternative 1 (Recommend):** Build from source (refer to [setup_usrbio_client.md](setup_usrbio_client.md))
-
-**Alternative 2:** Run `pip3 install hf3fs-py-usrbio` (Follow https://pypi.org/project/hf3fs-py-usrbio/#files)
-
-## Step 4: Deploy Model Serving
+## Step 3: Deploy Model Serving
 
 ### Single Node Deployment
 ```bash

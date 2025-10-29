@@ -35,6 +35,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     software-properties-common netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
     build-essential cmake \
+    clang-format-14 clang-14 clang-tidy-14 lld-14 meson google-perftools \
     libopenmpi-dev libnuma1 libnuma-dev numactl \
     libibverbs-dev libibverbs1 libibumad3 \
     librdmacm1 libnl-3-200 libnl-route-3-200 libnl-route-3-dev libnl-3-dev \
@@ -49,6 +50,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     patchelf \
     nvidia-dkms-550 \
     devscripts debhelper fakeroot dkms check libsubunit0 libsubunit-dev \
+    libaio-dev libdouble-conversion-dev libdwarf-dev libgflags-dev libgmock-dev libgoogle-perftools-dev liblz4-dev liblzma-dev libuv1-dev \
  && ln -sf /usr/bin/python3.12 /usr/bin/python \
  && rm -rf /var/lib/apt/lists/* \
  && apt-get clean
@@ -255,6 +257,13 @@ RUN python3 -m pip install --no-cache-dir setuptools-rust \
     && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache
 
+# Install hf3fs_py_usrbio
+RUN git clone https://github.com/deepseek-ai/3fs 3fs \
+    && cd 3fs \
+    && git submodule update --init --recursive \
+    && ./patches/apply.sh \
+    && CMAKE_BUILD_PARALLEL_LEVEL=32 python3 setup.py bdist_wheel -d dist \
+    && pip install dist/*.whl
 
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
