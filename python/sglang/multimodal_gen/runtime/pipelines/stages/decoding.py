@@ -130,7 +130,7 @@ class DecodingStage(PipelineStage):
             device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
         ):
             try:
-                #TODO: make it more specific
+                # TODO: make it more specific
                 if server_args.pipeline_config.vae_tiling:
                     self.vae.enable_tiling()
                 if server_args.pipeline_config.vae_sp:

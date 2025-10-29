@@ -16,12 +16,11 @@ from sglang.multimodal_gen.runtime.layers.attention import (
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
+    RMSNorm,
     ScaleResidual,
     ScaleResidualLayerNormScaleShift,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
-
-# TODO(will-PY-refactor): RMSNorm ....
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
@@ -37,63 +36,6 @@ from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_c
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.utils import modulate
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-
-
-class HunyuanRMSNorm(nn.Module):
-
-    def __init__(
-        self,
-        dim: int,
-        elementwise_affine=True,
-        eps: float = 1e-6,
-        device=None,
-        dtype=None,
-    ):
-        """
-        Initialize the RMSNorm normalization layer.
-
-        Args:
-            dim (int): The dimension of the input tensor.
-            eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
-
-        Attributes:
-            eps (float): A small value added to the denominator for numerical stability.
-
-        """
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        self.eps = eps
-        if elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(dim, **factory_kwargs))
-
-    def _norm(self, x) -> torch.Tensor:
-        """
-        Apply the RMSNorm normalization to the input tensor.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The normalized tensor.
-
-        """
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        """
-        Forward pass through the RMSNorm layer.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The output tensor after applying RMSNorm.
-
-        """
-        output = self._norm(x.float()).type_as(x)
-        if hasattr(self, "weight"):
-            output = output * self.weight
-        return output
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -145,8 +87,8 @@ class MMDoubleStreamBlock(nn.Module):
             prefix=f"{prefix}.img_attn_qkv",
         )
 
-        self.img_attn_q_norm = HunyuanRMSNorm(head_dim, eps=1e-6, dtype=dtype)
-        self.img_attn_k_norm = HunyuanRMSNorm(head_dim, eps=1e-6, dtype=dtype)
+        self.img_attn_q_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
+        self.img_attn_k_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
 
         self.img_attn_proj = ReplicatedLinear(
             hidden_size,
@@ -188,8 +130,8 @@ class MMDoubleStreamBlock(nn.Module):
         )
 
         # QK norm layers for text
-        self.txt_attn_q_norm = HunyuanRMSNorm(head_dim, eps=1e-6, dtype=dtype)
-        self.txt_attn_k_norm = HunyuanRMSNorm(head_dim, eps=1e-6, dtype=dtype)
+        self.txt_attn_q_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
+        self.txt_attn_k_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
 
         self.txt_attn_proj = ReplicatedLinear(
             hidden_size, hidden_size, bias=True, params_dtype=dtype
@@ -197,7 +139,7 @@ class MMDoubleStreamBlock(nn.Module):
 
         self.txt_mlp = MLP(hidden_size, mlp_hidden_dim, bias=True, dtype=dtype)
 
-        # USPAttention
+        # Use UlyssesAttention to replace Distributed attention
         self.attn = UlyssesAttention(
             num_heads=num_attention_heads,
             head_size=head_dim,
@@ -248,8 +190,8 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Apply QK-Norm if needed
 
-        img_q = self.img_attn_q_norm(img_q).to(img_v)
-        img_k = self.img_attn_k_norm(img_k).to(img_v)
+        img_q = self.img_attn_q_norm(img_q.contiguous()).to(img_v)
+        img_k = self.img_attn_k_norm(img_k.contiguous()).to(img_v)
         # Apply rotary embeddings
         cos, sin = freqs_cis
         img_q, img_k = _apply_rotary_emb(
@@ -269,8 +211,8 @@ class MMDoubleStreamBlock(nn.Module):
         txt_q, txt_k, txt_v = txt_qkv[:, :, 0], txt_qkv[:, :, 1], txt_qkv[:, :, 2]
 
         # Apply QK-Norm if needed
-        txt_q = self.txt_attn_q_norm(txt_q).to(txt_q.dtype)
-        txt_k = self.txt_attn_k_norm(txt_k).to(txt_k.dtype)
+        txt_q = self.txt_attn_q_norm(txt_q.contiguous()).to(txt_q.dtype)
+        txt_k = self.txt_attn_k_norm(txt_k.contiguous()).to(txt_k.dtype)
 
         # Run distributed attention
         img_attn, txt_attn = self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v)
@@ -346,8 +288,8 @@ class MMSingleStreamBlock(nn.Module):
         )
 
         # QK norm layers
-        self.q_norm = HunyuanRMSNorm(head_dim, eps=1e-6, dtype=dtype)
-        self.k_norm = HunyuanRMSNorm(head_dim, eps=1e-6, dtype=dtype)
+        self.q_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
+        self.k_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
 
         # Fused operations with better naming
         self.input_norm_scale_shift = LayerNormScaleShift(
@@ -371,7 +313,7 @@ class MMSingleStreamBlock(nn.Module):
             prefix=f"{prefix}.modulation",
         )
 
-        # USPAttention
+        # Use UlyssesAttention to replace Distributed attention
         self.attn = UlyssesAttention(
             num_heads=num_attention_heads,
             head_size=head_dim,
@@ -407,8 +349,8 @@ class MMSingleStreamBlock(nn.Module):
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
 
         # Apply QK-Norm
-        q = self.q_norm(q).to(v.dtype)
-        k = self.k_norm(k).to(v.dtype)
+        q = self.q_norm(q.contiguous()).to(v.dtype)
+        k = self.k_norm(k.contiguous()).to(v.dtype)
 
         # Split into image and text parts
         img_q, txt_q = q[:, :-txt_len], q[:, -txt_len:]
