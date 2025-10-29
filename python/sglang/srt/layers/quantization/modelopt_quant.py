@@ -1652,7 +1652,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def apply_without_routing_weights(
         self,
         layer: FusedMoE,
-        x: tuple[torch.Tensor, torch.Tensor],
+        x: tuple[torch.Tensor, Optional[torch.Tensor]],
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
         down_gemm_overlap_args: Optional["DownGemmOverlapArgs"],
