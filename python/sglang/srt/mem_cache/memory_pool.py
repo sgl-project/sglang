@@ -34,6 +34,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import logging
 from contextlib import nullcontext
+from itertools import groupby
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -43,7 +44,13 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_cuda,
+    is_npu,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -57,6 +64,14 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 if _is_npu:
     import torch_npu
+
+elastic_pool = get_bool_env_var("SGLANG_ELASTIC_MEM_POOL", "true")
+cu_page_size = get_int_env_var("SGLANG_CU_PAGE_SIZE", 2 << 20)
+if elastic_pool:
+    import signal
+
+    import kvcached.vmm_ops as vmm_ops
+    from kvcached.etensor import ETensor
 
 
 def get_tensor_size_bytes(t: torch.Tensor):
@@ -510,6 +525,7 @@ class MHATokenToKVPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_kv_cache_copy: bool = False,
+        pool_name: Optional[str] = None,
     ):
         super().__init__(
             size,
@@ -521,10 +537,19 @@ class MHATokenToKVPool(KVCache):
             start_layer,
             end_layer,
         )
+
+        if elastic_pool:
+            assert pool_name is not None
+            self.pool_name = pool_name
+
         self.head_num = head_num
         self.head_dim = head_dim
 
-        self._create_buffers()
+        if elastic_pool:
+            self._create_elastic_buffers()
+        else:
+            self._create_buffers()
+        self._create_data_ptrs()
 
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
@@ -605,6 +630,47 @@ class MHATokenToKVPool(KVCache):
                     for _ in range(self.layer_num)
                 ]
 
+    def _create_elastic_buffers(self):
+        signal.signal(signal.SIGINT, lambda sig, frame: vmm_ops.shutdown_emem())
+        signal.signal(signal.SIGTERM, lambda sig, frame: vmm_ops.shutdown_emem())
+        signal.signal(signal.SIGQUIT, lambda sig, frame: vmm_ops.shutdown_emem())
+
+        current_device_id = f"cuda:{torch.cuda.current_device()}"
+        vmm_ops.init_emem(current_device_id, cu_page_size)
+
+        assert self.size % self.page_size == 0
+        page_num = int(self.size / self.page_size) + 1
+        page_size = self.page_size
+        state_shape = (self.head_num, self.head_dim)
+        dtype = self.store_dtype
+        vsize_ratio = 8
+        self.ek_buffer = [
+            ETensor(
+                f"{self.pool_name}-k-{i}",
+                page_num,
+                page_size,
+                state_shape,
+                dtype,
+                vsize_ratio,
+            )
+            for i in range(self.layer_num)
+        ]
+        self.ev_buffer = [
+            ETensor(
+                f"{self.pool_name}-v-{i}",
+                page_num,
+                page_size,
+                state_shape,
+                dtype,
+                vsize_ratio,
+            )
+            for i in range(self.layer_num)
+        ]
+        self.k_buffer = [etensor.etensor for etensor in self.ek_buffer]
+        self.v_buffer = [etensor.etensor for etensor in self.ev_buffer]
+        logger.info(f"{state_shape=}, {self.ek_buffer[0].page_memsize=}")
+
+    def _create_data_ptrs(self):
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
@@ -794,6 +860,42 @@ class MHATokenToKVPool(KVCache):
             num_stages=2,
         )
 
+    def disable(self, page_indices: List[int]) -> int:
+        for _, g in groupby(
+            enumerate(sorted(set(page_indices))), lambda x: x[1] - x[0]
+        ):
+            group = list(g)
+            group_start = group[0][1]
+            group_len = len(group)
+            logger.debug(f"{group_start}, {group_len}")
+        unmap_num = 0
+        for ek, ev in zip(self.ek_buffer, self.ev_buffer):
+            unmap_num += ek.disable(page_indices)
+            unmap_num += ev.disable(page_indices)
+        self.size -= len(page_indices) * self.page_size
+        return unmap_num
+
+    def enable(self, page_indices: List[int]) -> int:
+        map_num = 0
+        for ek, ev in zip(self.ek_buffer, self.ev_buffer):
+            map_num += ek.enable(page_indices)
+            map_num += ev.enable(page_indices)
+        self.size += len(page_indices) * self.page_size
+        return map_num
+
+    def expand(self, page_num: int) -> int:
+        logger.debug(f"{page_num=}")
+        expand_num = 0
+        for ek, ev in zip(self.ek_buffer, self.ev_buffer):
+            expand_num += ek.expand(page_num)
+            expand_num += ev.expand(page_num)
+        logger.debug(f"{self.k_buffer[0].shape=}")
+        self.k_buffer = [etensor.etensor for etensor in self.ek_buffer]
+        self.v_buffer = [etensor.etensor for etensor in self.ev_buffer]
+        logger.debug(f"{self.k_buffer[0].shape=}")
+        self.size += page_num * self.page_size
+        return expand_num
+
 
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
@@ -949,12 +1051,16 @@ class SWAKVPool(KVCache):
         else:
             self.custom_mem_pool = None
 
+        if elastic_pool:
+            kwargs["pool_name"] = "swa"
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
             dtype=dtype,
             layer_num=self.swa_layer_nums,
             **kwargs,
         )
+        if elastic_pool:
+            kwargs["pool_name"] = "full"
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
             dtype=dtype,

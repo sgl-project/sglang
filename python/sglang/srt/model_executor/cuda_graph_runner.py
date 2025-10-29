@@ -823,6 +823,7 @@ class CudaGraphRunner:
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
+        # Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
         self.graphs[self.bs].replay()
 
         output = self.output_buffers[self.bs]

@@ -100,6 +100,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
+    elastic_pool,
 )
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -1757,6 +1758,7 @@ class ModelRunner:
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
+        need_sort = need_sort or elastic_pool
         if self.token_to_kv_pool_allocator is None:
             if _is_npu and (
                 self.server_args.attention_backend == "ascend"

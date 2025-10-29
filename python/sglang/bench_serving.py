@@ -1223,7 +1223,7 @@ def sample_random_requests(
         # Filter out the conversations with less than 2 turns.
         dataset = [
             data
-            for data in dataset
+            for data in tqdm(dataset)
             if len(data.get("conversations", data.get("conversation", []))) >= 2
         ]
         # Only keep the first two turns of each conversation.
@@ -1232,14 +1232,14 @@ def sample_random_requests(
                 data.get("conversations", data.get("conversation", []))[0]["value"],
                 data.get("conversations", data.get("conversation", []))[1]["value"],
             )
-            for data in dataset
+            for data in tqdm(dataset)
         ]
         # Shuffle the dataset.
         random.shuffle(dataset)
 
         # Filter out sequences that are too long or too short
         input_requests: List[DatasetRow] = []
-        for data in dataset:
+        for data in tqdm(dataset):
             i = len(input_requests)
             if i == num_prompts:
                 break

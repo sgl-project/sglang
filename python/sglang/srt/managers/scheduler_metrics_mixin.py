@@ -76,6 +76,64 @@ class SchedulerMetricsMixin:
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
 
+    def swa_resize(self, full_token_usage: float, swa_token_usage: float):
+        if full_token_usage > swa_token_usage:
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+            swa_evictable_size = self.tree_cache.swa_evictable_size()
+            logger.debug(f"before evict: {swa_available_size=}, {swa_evictable_size=}")
+            self.tree_cache.evict(0, swa_evictable_size)
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+            swa_evictable_size = self.tree_cache.swa_evictable_size()
+            logger.debug(f"after evict:  {swa_available_size=}, {swa_evictable_size=}")
+
+            transfer_token_num = swa_available_size // 2
+            logger.debug(f"{transfer_token_num=}")
+
+            unmap_num = self.token_to_kv_pool_allocator.disable(transfer_token_num)
+            self.swa_tokens_per_layer -= transfer_token_num
+            logger.debug(f"{unmap_num=}")
+
+            if self.token_to_kv_pool_allocator.has_invalid(is_swa=False):
+                map_num = self.token_to_kv_pool_allocator.enable(
+                    transfer_token_num, is_swa=False
+                )
+                logger.debug(f"{map_num=}")
+            else:
+                expand_num = self.token_to_kv_pool_allocator.expand(
+                    swa_available_size // 2, is_swa=False
+                )
+                logger.debug(f"{expand_num=}")
+            self.full_tokens_per_layer += transfer_token_num
+
+        else:
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            full_evictable_size = self.tree_cache.full_evictable_size()
+            logger.debug(
+                f"before evict: {full_available_size=}, {full_evictable_size=}"
+            )
+            self.tree_cache.evict(full_evictable_size, 0)
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            full_evictable_size = self.tree_cache.full_evictable_size()
+            logger.debug(
+                f"before evict: {full_available_size=}, {full_evictable_size=}"
+            )
+
+            transfer_token_num = full_available_size // 2
+
+            unmap_num = self.token_to_kv_pool_allocator.disable(
+                transfer_token_num, is_swa=False
+            )
+            self.full_tokens_per_layer -= transfer_token_num
+            logger.debug(f"{unmap_num=}")
+
+            if self.token_to_kv_pool_allocator.has_invalid():
+                map_num = self.token_to_kv_pool_allocator.enable(transfer_token_num)
+                logger.debug(f"{map_num=}")
+            else:
+                expand_num = self.token_to_kv_pool_allocator.expand(transfer_token_num)
+                logger.debug(f"{expand_num=}")
+            self.swa_tokens_per_layer += transfer_token_num
+
     def log_prefill_stats(
         self: Scheduler,
         adder: PrefillAdder,
@@ -106,6 +164,57 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_token_usage:.2f}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
+
+            need_resize = (full_token_usage > 0.95 or swa_token_usage > 0.95) and abs(
+                full_token_usage - swa_token_usage
+            ) > 0.1
+
+            if need_resize:
+                logger.debug(f"{need_resize=}")
+                self.swa_resize(full_token_usage, swa_token_usage)
+                (
+                    full_num_used_new,
+                    swa_num_used_new,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = self._get_swa_token_info()
+                assert (full_num_used_new == full_num_used) and (
+                    swa_num_used_new == swa_num_used
+                ), f"({full_num_used_new=} == {full_num_used=}) and ({swa_num_used_new=} == {swa_num_used=})"
+                full_shape, full_invalid, full_page_size = (
+                    self.token_to_kv_pool_allocator.full_attn_allocator._kvcache.k_buffer[
+                        0
+                    ].shape,
+                    len(
+                        self.token_to_kv_pool_allocator.full_attn_allocator.invalid_pages
+                    ),
+                    (
+                        self.token_to_kv_pool_allocator.full_attn_allocator._kvcache.page_size
+                    ),
+                )
+                swa_shape, swa_invalid, swa_page_size = (
+                    self.token_to_kv_pool_allocator.swa_attn_allocator._kvcache.k_buffer[
+                        0
+                    ].shape,
+                    len(
+                        self.token_to_kv_pool_allocator.swa_attn_allocator.invalid_pages
+                    ),
+                    (
+                        self.token_to_kv_pool_allocator.swa_attn_allocator._kvcache.page_size
+                    ),
+                )
+                assert (
+                    self.full_tokens_per_layer
+                    == (full_shape[0] - full_invalid - full_page_size)
+                ) and (
+                    self.swa_tokens_per_layer
+                    == (swa_shape[0] - swa_invalid - swa_page_size)
+                ), f"({self.full_tokens_per_layer=} == ({full_shape[0]=} - {full_invalid=} - {full_page_size=})) and ({self.swa_tokens_per_layer=} == ({swa_shape[0]=} - {swa_invalid=} - {swa_page_size=}))"
+
         elif self.is_hybrid_gdn:
             (
                 full_num_used,
