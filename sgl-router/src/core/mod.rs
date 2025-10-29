@@ -4,6 +4,7 @@
 //! - Worker trait and implementations
 //! - Error types
 //! - Circuit breaker for reliability
+//! - Token buckets for rate limiting
 //! - Workflow engine for multi-step operations
 //! - Common utilities
 
