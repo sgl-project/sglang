@@ -3287,10 +3287,26 @@ class DeepseekV2ForCausalLM(nn.Module):
                         )
 
                 experts = layer.mlp.experts
+                w13_weight_fp8 = (
+                    experts.w13_weight,
+                    (
+                        experts.w13_weight_scale_inv
+                        if hasattr(experts, "w13_weight_scale_inv")
+                        else experts.w13_weight_scale
+                    ),
+                )
+                w2_weight_fp8 = (
+                    experts.w2_weight,
+                    (
+                        experts.w2_weight_scale_inv
+                        if hasattr(experts, "w2_weight_scale_inv")
+                        else experts.w2_weight_scale
+                    ),
+                )
                 if isinstance(experts, DeepEPMoE):
                     for w in [
-                        experts.w13_weight_fp8,
-                        experts.w2_weight_fp8,
+                        w13_weight_fp8,
+                        w2_weight_fp8,
                     ]:
                         requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
             else:
@@ -3340,8 +3356,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         experts = layer.mlp.experts
         if isinstance(experts, DeepEPMoE):
             for w in [
-                experts.w13_weight_fp8,
-                experts.w2_weight_fp8,
+                (experts.w13_weight, experts.w13_weight_scale_inv),
+                (experts.w2_weight, experts.w2_weight_scale_inv),
             ]:
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 
