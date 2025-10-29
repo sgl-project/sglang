@@ -787,7 +787,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
-
             return
 
         # If checkpoint is fp8, we need to handle that the
@@ -871,7 +870,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
-
             return
 
     def process_weights_hip_int4(self, layer: Module):
