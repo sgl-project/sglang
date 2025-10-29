@@ -70,13 +70,21 @@ cargo build --release
 pip install maturin
 
 # Fast development mode (debug build, no wheel, instant)
+# Uses system OpenSSL (requires libssl-dev/openssl-devel)
 maturin develop
 
 # Production build (optimized, creates wheel)
+# Uses vendored OpenSSL (cross-platform compatibility)
+maturin build --release --features vendored-openssl
+pip install --force-reinstall dist/*.whl
+
+# Development build with system OpenSSL (faster)
+# Requires: apt install libssl-dev pkg-config (Ubuntu/Debian)
+#       or: yum install openssl-devel (RHEL/CentOS)
 maturin build --release
 pip install --force-reinstall dist/*.whl
 ```
-> **Note:** Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release` for production wheels with full optimizations (opt-level="z", lto="fat"). The package uses abi3 support for Python 3.8+ compatibility.
+> **Note:** Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
 
 ## Quick Start
 
