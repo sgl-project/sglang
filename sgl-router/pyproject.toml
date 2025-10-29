@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools-rust>=1.5.2"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "sglang-router"
@@ -41,10 +41,6 @@ dev = [
 ]
 
 
-# https://github.com/PyO3/setuptools-rust?tab=readme-ov-file
-[tool.setuptools.packages]
-find = { where = ["py_src"] }
-
-# workaround for https://github.com/pypa/twine/issues/1216
-[tool.setuptools]
-license-files = []
+[tool.maturin]
+python-source = "py_src"
+module-name = "sglang_router.sglang_router_rs"
