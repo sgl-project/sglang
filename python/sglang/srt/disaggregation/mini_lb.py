@@ -536,24 +536,25 @@ async def get_server_info():
                 all_internal_states.extend(info_json["internal_states"])
 
     # Return format expected by bench_one_batch_server.py
+    result = {}
+
     if all_internal_states:
-        return {
-            "internal_states": all_internal_states,
-            "prefill": prefill_infos,
-            "decode": decode_infos,
-        }
+        result["internal_states"] = all_internal_states
     else:
         # Fallback with dummy data if no internal states found
-        return {
-            "internal_states": [
-                {
-                    "last_gen_throughput": 0.0,
-                    "avg_spec_accept_length": None,
-                }
-            ],
-            "prefill": prefill_infos,
-            "decode": decode_infos,
-        }
+        result["internal_states"] = [
+            {
+                "last_gen_throughput": 0.0,
+                "avg_spec_accept_length": None,
+            }
+        ]
+
+    if prefill_infos:
+        result["prefill"] = prefill_infos
+    if decode_infos:
+        result["decode"] = decode_infos
+
+    return result
 
 
 @app.get("/get_model_info")
