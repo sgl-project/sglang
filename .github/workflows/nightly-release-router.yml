@@ -25,10 +25,10 @@ jobs:
             ls: dir
             target: x86_64
             python-architecture: x64
-            interpreter: 3.8 3.9 3.10 3.11 3.12 3.13
+            interpreter: 3.9 3.10 3.11 3.12 3.13
           - os: macos
             target: aarch64
-            interpreter: 3.8 3.9 3.10 3.11 3.12 3.13
+            interpreter: 3.9 3.10 3.11 3.12 3.13
           - os: ubuntu
             platform: linux
             target: aarch64
@@ -94,7 +94,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: --release --out dist --interpreter ${{ matrix.interpreter || '3.8 3.9 3.10 3.11 3.12 3.13' }}
+          args: --release --out dist --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
           rust-toolchain: stable
           docker-options: -e CI -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           before-script-linux: |

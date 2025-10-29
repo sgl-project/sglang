@@ -21,6 +21,47 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
+  maturin-build-test:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sglang-repo
+
+      - name: Move sgl-router folder to root
+        run: |
+          mv sglang-repo/sgl-router/* .
+          rm -rf sglang-repo
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install protoc and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget unzip gcc g++ perl make
+          cd /tmp
+          wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip
+          sudo unzip protoc-32.0-linux-x86_64.zip -d /usr/local
+          rm protoc-32.0-linux-x86_64.zip
+          protoc --version
+
+      - name: Test maturin build
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist
+          rust-toolchain: stable
+
+      - name: List built wheel
+        run: ls -lh dist/
+
+      - name: Test wheel install
+        run: |
+          pip install dist/*.whl
+          python -c "import sglang_router; print('Wheel installs successfully')"
   unit-test-rust:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest

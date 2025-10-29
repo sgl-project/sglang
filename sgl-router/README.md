@@ -6,7 +6,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Unified control plane for registering, monitoring, and orchestrating prefill, decode, and regular workers across heterogeneous model fleets.
 - Data plane that routes requests across HTTP, PD (prefill/decode), gRPC, and OpenAI-compatible backends with shared reliability features.
 - Industry-first gRPC pipeline with native Rust tokenization, reasoning, and tool-call execution for high-throughput OpenAI-compatible serving.
-- Multi-model inference gateway mode (`--enable-igw`) that runs several routers at once and applies per-model policies.
+- Multi model inference gateway mode (`--enable-igw`) that runs several routers at once and applies per-model policies.
 - Conversation, response, and chat-history connectors that centralize state at the router, enabling compliant sharing across models/MCP loops with in-memory, no-op, or Oracle ATP storage options.
 - Built-in reliability primitives: retries with exponential backoff, circuit breakers, token-bucket rate limiting, and queuing.
 - First-class observability with structured logging and Prometheus metrics.
