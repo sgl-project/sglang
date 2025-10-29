@@ -193,6 +193,8 @@ impl ResponseProcessor {
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,
                     &original_request.tool_choice,
+                    &original_request.model,
+                    history_tool_calls_count,
                 );
             } else if tool_parser_available {
                 (tool_calls, processed_text) = self
@@ -408,10 +410,7 @@ impl ResponseProcessor {
                             tool_type: "function".to_string(),
                             function: FunctionCallResponse {
                                 name: tc.function.name,
-                                arguments: Some(
-                                    serde_json::to_string(&tc.function.arguments)
-                                        .unwrap_or_else(|_| "{}".to_string()),
-                                ),
+                                arguments: Some(tc.function.arguments),
                             },
                         }
                     })

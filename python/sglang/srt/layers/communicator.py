@@ -15,7 +15,7 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -212,6 +212,32 @@ class LayerCommunicator:
             )
         )
 
+        self._speculative_algo = SpeculativeAlgorithm.from_string(
+            get_global_server_args().speculative_algorithm
+        )
+
+    def prepare_attn_and_capture_last_layer_outputs(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+    ):
+        hidden_states, residual = self.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        if captured_last_layer_outputs is not None:
+            gathered_last_layer_output = self._communicate_simple_fn(
+                hidden_states=residual,
+                forward_batch=forward_batch,
+                context=self._context,
+            )
+            if gathered_last_layer_output is residual:
+                # Clone to avoid modifying the original residual by Custom RMSNorm inplace operation
+                gathered_last_layer_output = residual.clone()
+            captured_last_layer_outputs.append(gathered_last_layer_output)
+        return hidden_states, residual
+
     def prepare_attn(
         self,
         hidden_states: torch.Tensor,
@@ -315,13 +341,10 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        speculative_algo = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
-        )
         if (
             is_dp_attention_enabled()
-            and speculative_algo is not None
-            and speculative_algo.is_eagle()
+            and self._speculative_algo is not None
+            and self._speculative_algo.is_eagle()
         ):
             return False
 
@@ -336,6 +359,7 @@ class LayerCommunicator:
         static_conditions_met = (
             (not self.is_last_layer)
             and (self._context.tp_size > 1)
+            and not is_dp_attention_enabled()
             and get_global_server_args().enable_flashinfer_allreduce_fusion
             and _is_flashinfer_available
         )

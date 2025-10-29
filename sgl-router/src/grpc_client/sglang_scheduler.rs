@@ -20,7 +20,9 @@ use crate::protocols::{
 };
 
 // Include the generated protobuf code
+#[allow(clippy::all)]
 pub mod proto {
+    #![allow(clippy::all, unused_qualifications)]
     tonic::include_proto!("sglang.grpc.scheduler");
 }
 
@@ -132,7 +134,6 @@ impl SglangSchedulerClient {
         };
 
         let channel = Channel::from_shared(http_endpoint)?
-            .timeout(Duration::from_secs(600)) // 10 minute timeout for connection
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)

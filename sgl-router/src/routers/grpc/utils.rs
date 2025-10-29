@@ -26,6 +26,7 @@ use crate::{
         generate::GenerateFinishReason,
     },
     tokenizer::{
+        cache::CachedTokenizer,
         chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
         traits::Tokenizer,
         HuggingFaceTokenizer,
@@ -42,8 +43,7 @@ pub async fn get_grpc_client_from_worker(
         .map_err(|e| internal_error_message(format!("Failed to get gRPC client: {}", e)))?
         .ok_or_else(|| internal_error_static("Selected worker is not configured for gRPC"))?;
 
-    let client = client_arc.lock().await.clone();
-    Ok(client)
+    Ok((*client_arc).clone())
 }
 
 /// Process tool call arguments in messages
@@ -318,9 +318,24 @@ pub fn process_chat_messages(
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
     // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
-    let formatted_text = if let Some(hf_tokenizer) =
-        tokenizer.as_any().downcast_ref::<HuggingFaceTokenizer>()
-    {
+    // First try direct downcast, then try via CachedTokenizer wrapper
+    let hf_tokenizer = tokenizer
+        .as_any()
+        .downcast_ref::<HuggingFaceTokenizer>()
+        .or_else(|| {
+            // If direct downcast fails, try to get inner tokenizer from CachedTokenizer
+            tokenizer
+                .as_any()
+                .downcast_ref::<CachedTokenizer>()
+                .and_then(|cached| {
+                    cached
+                        .inner()
+                        .as_any()
+                        .downcast_ref::<HuggingFaceTokenizer>()
+                })
+        });
+
+    let formatted_text = if let Some(hf_tokenizer) = hf_tokenizer {
         // Get content format and transform messages accordingly
         let content_format = hf_tokenizer.chat_template_content_format();
         let mut transformed_messages = process_content_format(&request.messages, content_format)?;
@@ -367,7 +382,6 @@ pub fn process_chat_messages(
 
         let params = ChatTemplateParams {
             add_generation_prompt: true,
-            continue_final_message: request.continue_final_message,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             ..Default::default()
@@ -528,6 +542,8 @@ pub fn create_stop_decoder(
 pub fn parse_json_schema_response(
     processed_text: &str,
     tool_choice: &Option<ToolChoice>,
+    model: &str,
+    history_tool_calls_count: usize,
 ) -> (Option<Vec<ToolCall>>, String) {
     match tool_choice {
         Some(ToolChoice::Function { function, .. }) => {
@@ -535,7 +551,12 @@ pub fn parse_json_schema_response(
             match serde_json::from_str::<Value>(processed_text) {
                 Ok(params) => {
                     let tool_call = ToolCall {
-                        id: format!("call_{}", Uuid::new_v4()),
+                        id: generate_tool_call_id(
+                            model,
+                            &function.name,
+                            0,
+                            history_tool_calls_count,
+                        ),
                         tool_type: "function".to_string(),
                         function: FunctionCallResponse {
                             name: function.name.clone(),
@@ -566,7 +587,12 @@ pub fn parse_json_schema_response(
                             let parameters = obj.get("parameters")?;
 
                             Some(ToolCall {
-                                id: format!("call_{}_{}", i, Uuid::new_v4()),
+                                id: generate_tool_call_id(
+                                    model,
+                                    &name,
+                                    i,
+                                    history_tool_calls_count,
+                                ),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
                                     name,

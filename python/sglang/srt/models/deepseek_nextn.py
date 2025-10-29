@@ -25,13 +25,18 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
+from sglang.srt.models.deepseek_v2 import (
+    DeepseekV2DecoderLayer,
+    DeepseekV3ForCausalLM,
+    enable_nextn_moe_bf16_cast_to_fp8,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda
 
@@ -49,6 +54,16 @@ class DeepseekModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+
+        if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
+            # refer to real DeepSeek V3 quant config
+            moe_quant_config = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[128, 128],
+            )
+        else:
+            moe_quant_config = None
+
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             logger.warning(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
@@ -74,6 +89,7 @@ class DeepseekModelNextN(nn.Module):
             config,
             0,
             quant_config=quant_config,
+            moe_quant_config=moe_quant_config,
             is_nextn=True,
             prefix=add_prefix("decoder", prefix),
             alt_stream=self.alt_stream,
