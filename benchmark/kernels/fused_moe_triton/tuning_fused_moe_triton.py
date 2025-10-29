@@ -84,7 +84,9 @@ def benchmark_config(
         w2 = torch.randn(
             local_experts, hidden_size, shard_intermediate_size // 2, dtype=init_dtype
         )
-    gating_output = torch.randn(num_iters, num_tokens, local_experts, dtype=torch.float32)
+    gating_output = torch.randn(
+        num_iters, num_tokens, local_experts, dtype=torch.float32
+    )
 
     w1_scale = None
     w2_scale = None
@@ -445,13 +447,21 @@ def main(args: argparse.Namespace):
         topk = config.ffn_config.moe_top_k
         intermediate_size = config.ffn_config.ffn_hidden_size
         # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = intermediate_size if args.ep_size > 1 else 2 * intermediate_size // args.tp_size
+        shard_intermediate_size = (
+            intermediate_size
+            if args.ep_size > 1
+            else 2 * intermediate_size // args.tp_size
+        )
     elif config.architectures[0] == "JambaForCausalLM":
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = intermediate_size if args.ep_size > 1 else 2 * intermediate_size // args.tp_size
+        shard_intermediate_size = (
+            intermediate_size
+            if args.ep_size > 1
+            else 2 * intermediate_size // args.tp_size
+        )
     elif config.architectures[0] in [
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -461,7 +471,11 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = intermediate_size if args.ep_size > 1 else 2 * intermediate_size // args.tp_size
+        shard_intermediate_size = (
+            intermediate_size
+            if args.ep_size > 1
+            else 2 * intermediate_size // args.tp_size
+        )
     elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
         E = (
             config.n_routed_experts + (0 if args.disable_shared_experts_fusion else 1)
@@ -471,7 +485,11 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = intermediate_size if args.ep_size > 1 else 2 * intermediate_size // args.tp_size
+        shard_intermediate_size = (
+            intermediate_size
+            if args.ep_size > 1
+            else 2 * intermediate_size // args.tp_size
+        )
     elif config.architectures[0] == "Llama4ForConditionalGeneration":
         E = config.text_config.num_local_experts + (
             0 if args.disable_shared_experts_fusion else 1
@@ -479,7 +497,11 @@ def main(args: argparse.Namespace):
         topk = config.text_config.num_experts_per_tok
         intermediate_size = config.text_config.intermediate_size
         # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = intermediate_size if args.ep_size > 1 else 2 * intermediate_size // args.tp_size
+        shard_intermediate_size = (
+            intermediate_size
+            if args.ep_size > 1
+            else 2 * intermediate_size // args.tp_size
+        )
     elif config.architectures[0] in [
         "Grok1ForCausalLM",
         "Grok1ImgGen",
@@ -489,7 +511,11 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = intermediate_size if args.ep_size > 1 else 2 * intermediate_size // args.tp_size
+        shard_intermediate_size = (
+            intermediate_size
+            if args.ep_size > 1
+            else 2 * intermediate_size // args.tp_size
+        )
     elif config.architectures[0] in [
         "BailingMoEForCausalLM",
         "BailingMoeForCausalLM",
@@ -499,20 +525,32 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = intermediate_size if args.ep_size > 1 else 2 * intermediate_size // args.tp_size
+        shard_intermediate_size = (
+            intermediate_size
+            if args.ep_size > 1
+            else 2 * intermediate_size // args.tp_size
+        )
     elif config.architectures[0] in ["Glm4MoeForCausalLM"]:
         E = config.n_routed_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = intermediate_size if args.ep_size > 1 else 2 * intermediate_size // args.tp_size
+        shard_intermediate_size = (
+            intermediate_size
+            if args.ep_size > 1
+            else 2 * intermediate_size // args.tp_size
+        )
     else:
         # Default: Mixtral
         E = config.num_local_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = intermediate_size if args.ep_size > 1 else 2 * intermediate_size // args.tp_size
+        shard_intermediate_size = (
+            intermediate_size
+            if args.ep_size > 1
+            else 2 * intermediate_size // args.tp_size
+        )
 
     hidden_size = getattr(config, "hidden_size", None) or config.text_config.hidden_size
     dtype = config.torch_dtype
@@ -672,7 +710,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
-    parser.add_argument("--ep-size", "--ep", type=int, default=1, help="Expert parallelism size")
+    parser.add_argument(
+        "--ep-size", "--ep", type=int, default=1, help="Expert parallelism size"
+    )
     args = parser.parse_args()
 
     main(args)
