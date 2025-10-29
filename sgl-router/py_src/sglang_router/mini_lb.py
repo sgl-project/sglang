@@ -20,9 +20,11 @@ from sglang_router.router_args import RouterArgs
 
 try:
     from sglang.srt.tracing.trace import (
+        process_tracing_init,
         trace_get_remote_propagate_context,
         trace_req_finish,
         trace_req_start,
+        trace_set_thread_info,
         trace_slice_end,
         trace_slice_start,
     )
@@ -59,7 +61,13 @@ class MiniLoadBalancer:
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
-        self.enable_trace = trace_package_imported and router_args.enable_trace
+        self.otlp_traces_endpoint = router_args.otlp_traces_endpoint
+        self.enable_trace = router_args.enable_trace
+        if self.enable_trace and not trace_package_imported:
+            logger.warning(
+                "Tracing is not supported in this environment. Please install sglang."
+            )
+            self.enable_trace = False
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -82,6 +90,9 @@ class MiniLoadBalancer:
     def start(self):
         global lb
         lb = self
+        if self.enable_trace:
+            process_tracing_init(self.otlp_traces_endpoint, "sglang")
+            trace_set_thread_info("Mini lb")
         uvicorn.run(app, host=self.host, port=self.port)
 
     def select_pair(self):

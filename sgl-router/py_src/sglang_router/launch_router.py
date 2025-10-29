@@ -38,20 +38,6 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             router_args = args
 
         if router_args.mini_lb:
-            if router_args.enable_trace:
-                try:
-                    from sglang.srt.tracing.trace import (
-                        process_tracing_init,
-                        trace_set_thread_info,
-                    )
-
-                    process_tracing_init(router_args.otlp_traces_endpoint, "sglang")
-                    trace_set_thread_info("Mini lb")
-                except ImportError:
-                    logger.warning(
-                        "Tracing is not supported in this environment. Please install sglang."
-                    )
-
             mini_lb = MiniLoadBalancer(router_args)
             mini_lb.start()
         else:
