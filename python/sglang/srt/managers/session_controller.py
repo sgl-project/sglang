@@ -15,11 +15,11 @@ import uuid
 from typing import Dict, Optional
 
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 
 
 class SessionReqNode:
-    def __init__(self, req, parent=None, childs=None):
+    def __init__(self, req: Req, parent=None, childs=None):
         self.req = req
         self.parent = parent
         if parent is not None:
@@ -36,12 +36,12 @@ class SessionReqNode:
             req_node.clear(req_dict)
 
         if self.req.finished_reason is None:
-            self.req.to_abort = True
+            self.req.to_finish = FINISH_ABORT()
         del req_dict[self.req.rid]
 
     def abort(self):
         if self.req.finished_reason is None:
-            self.req.to_abort = True
+            self.req.to_finish = FINISH_ABORT()
 
     def __str__(self):
         return self._str_helper(self.req.rid)
