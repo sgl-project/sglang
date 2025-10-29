@@ -89,9 +89,7 @@ class StepVideoPipeline(LoRAPipeline, ComposedPipelineBase):
 
     def build_llm(self, model_dir, device) -> torch.nn.Module:
         text_encoder = (
-            STEP1TextEncoder(model_dir, max_length=320)
-            .to(torch.bfloat16)
-            .eval()
+            STEP1TextEncoder(model_dir, max_length=320).to(torch.bfloat16).eval()
         )
         return text_encoder
 
