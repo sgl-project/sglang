@@ -517,7 +517,8 @@ def latency_test_run_once(
     tot_latency = 0
 
     profiler = None
-    if profile and profile_stage in ["all", "prefill"]:
+    enable_profile_prefill = profile and profile_stage in ["all", "prefill"]
+    if enable_profile_prefill:
         profiler = start_profile(
             bench_args.profiler_activities,
             profile_record_shapes=profile_record_shapes,
@@ -530,7 +531,7 @@ def latency_test_run_once(
     synchronize(device)
     prefill_latency = time.perf_counter() - tic
 
-    if profile and profile_stage in ["all", "prefill"]:
+    if enable_profile_prefill:
         trace_filename = _create_torch_profiler_filename(
             profile_filename_prefix, batch_size, input_len, output_len, "prefill"
         )
@@ -553,10 +554,11 @@ def latency_test_run_once(
 
     decode_latencies = []
     step_of_interest = output_len // 2
+    enable_profile_decode = profile and profile_stage in ["all", "decode"]
     for i in range(output_len - 1):
         synchronize(device)
         profiler = None
-        if profile and profile_stage in ["all", "decode"] and i == step_of_interest:
+        if enable_profile_decode and i == step_of_interest:
             profiler = start_profile(
                 bench_args.profiler_activities,
                 profile_record_shapes=profile_record_shapes,
@@ -568,7 +570,7 @@ def latency_test_run_once(
         synchronize(device)
         latency = time.perf_counter() - tic
 
-        if profile and profile_stage in ["all", "decode"] and i == step_of_interest:
+        if enable_profile_decode and i == step_of_interest:
             trace_filename = _create_torch_profiler_filename(
                 profile_filename_prefix, batch_size, input_len, output_len, "decode"
             )
