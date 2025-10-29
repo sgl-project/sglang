@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
