@@ -56,6 +56,8 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 
+_is_npu = is_npu()
+
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
@@ -201,7 +203,7 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph or is_npu():
+        if self.server_args.disable_cuda_graph or _is_npu:
             return
 
         # Capture draft
@@ -941,7 +943,7 @@ class EAGLEWorker(TpModelWorker):
         draft_input.hidden_states = logits_output.hidden_states
 
 
-@torch.compile(dynamic=True, disable=is_npu())
+@torch.compile(dynamic=True, disable=_is_npu)
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,

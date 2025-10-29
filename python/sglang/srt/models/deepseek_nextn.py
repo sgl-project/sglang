@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 class DeepseekModelNextN(nn.Module):
@@ -86,13 +87,12 @@ class DeepseekModelNextN(nn.Module):
 
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
 
-        if is_npu() and (
+        layer_name = "decoder"
+        if _is_npu and (
             get_global_server_args().speculative_draft_model_path
             == get_global_server_args().model_path
         ):
             layer_name = "layers." + str(config.num_hidden_layers)
-        else:
-            layer_name = "decoder"
 
         self.decoder = DeepseekV2DecoderLayer(
             config,

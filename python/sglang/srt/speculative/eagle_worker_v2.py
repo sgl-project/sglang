@@ -41,6 +41,8 @@ from sglang.srt.utils.common import (
     next_power_of_2,
 )
 
+_is_npu = is_npu()
+
 logger = logging.getLogger(__name__)
 
 
@@ -206,7 +208,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph or is_npu():
+        if self.server_args.disable_cuda_graph or _is_npu:
             return
 
         # Capture draft

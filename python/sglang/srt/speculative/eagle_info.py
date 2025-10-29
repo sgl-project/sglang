@@ -39,6 +39,8 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 
+_is_npu = is_npu()
+
 if is_cuda():
     from sgl_kernel import (
         top_k_renorm_prob,
@@ -77,10 +79,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
-        if is_npu():
-            device = "npu"
-        elif is_cuda():
+        if not _is_npu:
             device = "cuda"
+        else:
+            device = "npu"
         return cls(
             draft_token=torch.empty((0,), dtype=torch.long, device=device),
             custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
@@ -137,15 +139,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
             self.last_loc = last_loc
 
-        if is_npu():
-            torch.ops.npu.cache_loc_assign(
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                end_offset,
-                batch.out_cache_loc,
-            )
-        else:
+        if not _is_npu:
             bs = batch.batch_size()
             assign_req_to_token_pool[(bs,)](
                 batch.req_pool_indices,
@@ -155,6 +149,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.out_cache_loc,
                 batch.req_to_token_pool.req_to_token.shape[1],
                 next_power_of_2(bs),
+            )
+        else:
+            torch.ops.npu.cache_loc_assign(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                end_offset,
+                batch.out_cache_loc,
             )
 
     def generate_attn_arg_prefill(
@@ -290,11 +292,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 "Falling back to greedy verification."
             )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE or is_npu():
+        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE or _is_npu:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
 
-            if is_npu():
+            if not _is_npu:
+                verify_tree_greedy(
+                    predicts=predict,  # mutable
+                    accept_index=accept_index,  # mutable
+                    accept_token_num=accept_length,  # mutable
+                    candidates=candidates,
+                    retrive_index=self.retrive_index,
+                    retrive_next_token=self.retrive_next_token,
+                    retrive_next_sibling=self.retrive_next_sibling,
+                    target_predict=target_predict,
+                )
+            else:
                 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_native
 
                 predict, accept_index, accept_length = verify_tree_greedy_native(
@@ -310,17 +323,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     self.topk,
                 )
 
-            else:
-                verify_tree_greedy(
-                    predicts=predict,  # mutable
-                    accept_index=accept_index,  # mutable
-                    accept_token_num=accept_length,  # mutable
-                    candidates=candidates,
-                    retrive_index=self.retrive_index,
-                    retrive_next_token=self.retrive_next_token,
-                    retrive_next_sibling=self.retrive_next_sibling,
-                    target_predict=target_predict,
-                )
         else:
             # apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
@@ -501,15 +503,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if not has_finished:
             if page_size == 1 or self.topk == 1:
                 batch.out_cache_loc = batch.out_cache_loc[accept_index]
-                if is_npu():
-                    torch.ops.npu.cache_loc_assign(
-                        batch.req_pool_indices,
-                        batch.req_to_token_pool.req_to_token,
-                        batch.seq_lens,
-                        batch.seq_lens + accept_length + 1,
-                        batch.out_cache_loc,
-                    )
-                else:
+                if not _is_npu:
                     assign_req_to_token_pool[(bs,)](
                         batch.req_pool_indices,
                         batch.req_to_token_pool.req_to_token,
@@ -518,6 +512,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         batch.out_cache_loc,
                         batch.req_to_token_pool.req_to_token.shape[1],
                         next_power_of_2(bs),
+                    )
+                else:
+                    torch.ops.npu.cache_loc_assign(
+                        batch.req_pool_indices,
+                        batch.req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.seq_lens + accept_length + 1,
+                        batch.out_cache_loc,
                     )
             else:
                 batch.out_cache_loc = tgt_cache_loc
@@ -543,15 +545,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
         else:
             if page_size == 1 or self.topk == 1:
-                if is_npu():
-                    torch.ops.npu.cache_loc_assign(
-                        batch.req_pool_indices,
-                        batch.req_to_token_pool.req_to_token,
-                        batch.seq_lens,
-                        batch.seq_lens + accept_length + 1,
-                        batch.out_cache_loc[accept_index],
-                    )
-                else:
+                if not _is_npu:
                     assign_req_to_token_pool[(bs,)](
                         batch.req_pool_indices,
                         batch.req_to_token_pool.req_to_token,
@@ -560,6 +554,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         batch.out_cache_loc[accept_index],
                         batch.req_to_token_pool.req_to_token.shape[1],
                         next_power_of_2(bs),
+                    )
+                else:
+                    torch.ops.npu.cache_loc_assign(
+                        batch.req_pool_indices,
+                        batch.req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.seq_lens + accept_length + 1,
+                        batch.out_cache_loc[accept_index],
                     )
                 batch.seq_lens.add_(accept_length + 1)
                 batch.seq_lens_cpu.add_(accept_length_cpu + 1)

@@ -21,6 +21,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
+_is_npu = is_npu()
+
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -333,7 +335,7 @@ def get_target_cache_loc(
     )
 
 
-@torch.compile(dynamic=True, disable=is_npu())
+@torch.compile(dynamic=True, disable=_is_npu)
 def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -383,7 +385,7 @@ def filter_finished_cache_loc_kernel(
     )
 
 
-@torch.compile(dynamic=True, disable=is_npu())
+@torch.compile(dynamic=True, disable=_is_npu)
 def create_accept_length_filter(
     accept_length: torch.Tensor,
     unfinished_index_device: torch.Tensor,
@@ -397,7 +399,7 @@ def create_accept_length_filter(
     return accept_length_filter
 
 
-@torch.compile(dynamic=True, disable=is_npu())
+@torch.compile(dynamic=True, disable=_is_npu)
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
