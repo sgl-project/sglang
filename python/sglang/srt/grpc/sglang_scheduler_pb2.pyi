@@ -488,3 +488,51 @@ class GetServerInfoResponse(_message.Message):
     server_type: str
     start_time: _timestamp_pb2.Timestamp
     def __init__(self, server_args: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., scheduler_info: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., active_requests: _Optional[int] = ..., is_paused: bool = ..., last_receive_timestamp: _Optional[float] = ..., uptime_seconds: _Optional[float] = ..., sglang_version: _Optional[str] = ..., server_type: _Optional[str] = ..., start_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class GetTokenizerRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class GetTokenizerChunk(_message.Message):
+    __slots__ = ("metadata", "file_chunk")
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    FILE_CHUNK_FIELD_NUMBER: _ClassVar[int]
+    metadata: TokenizerMetadata
+    file_chunk: TokenizerFileChunk
+    def __init__(self, metadata: _Optional[_Union[TokenizerMetadata, _Mapping]] = ..., file_chunk: _Optional[_Union[TokenizerFileChunk, _Mapping]] = ...) -> None: ...
+
+class TokenizerMetadata(_message.Message):
+    __slots__ = ("model_identifier", "fingerprint", "files", "bundle_format")
+    MODEL_IDENTIFIER_FIELD_NUMBER: _ClassVar[int]
+    FINGERPRINT_FIELD_NUMBER: _ClassVar[int]
+    FILES_FIELD_NUMBER: _ClassVar[int]
+    BUNDLE_FORMAT_FIELD_NUMBER: _ClassVar[int]
+    model_identifier: str
+    fingerprint: str
+    files: _containers.RepeatedCompositeFieldContainer[TokenizerFileDescriptor]
+    bundle_format: str
+    def __init__(self, model_identifier: _Optional[str] = ..., fingerprint: _Optional[str] = ..., files: _Optional[_Iterable[_Union[TokenizerFileDescriptor, _Mapping]]] = ..., bundle_format: _Optional[str] = ...) -> None: ...
+
+class TokenizerFileDescriptor(_message.Message):
+    __slots__ = ("file_name", "mime_type", "optional")
+    FILE_NAME_FIELD_NUMBER: _ClassVar[int]
+    MIME_TYPE_FIELD_NUMBER: _ClassVar[int]
+    OPTIONAL_FIELD_NUMBER: _ClassVar[int]
+    file_name: str
+    mime_type: str
+    optional: bool
+    def __init__(self, file_name: _Optional[str] = ..., mime_type: _Optional[str] = ..., optional: bool = ...) -> None: ...
+
+class TokenizerFileChunk(_message.Message):
+    __slots__ = ("file_name", "data", "chunk_index", "is_last_chunk", "compression")
+    FILE_NAME_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    CHUNK_INDEX_FIELD_NUMBER: _ClassVar[int]
+    IS_LAST_CHUNK_FIELD_NUMBER: _ClassVar[int]
+    COMPRESSION_FIELD_NUMBER: _ClassVar[int]
+    file_name: str
+    data: bytes
+    chunk_index: int
+    is_last_chunk: bool
+    compression: str
+    def __init__(self, file_name: _Optional[str] = ..., data: _Optional[bytes] = ..., chunk_index: _Optional[int] = ..., is_last_chunk: bool = ..., compression: _Optional[str] = ...) -> None: ...
