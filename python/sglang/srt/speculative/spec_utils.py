@@ -19,17 +19,19 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 
+_is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
-if is_cuda():
+if _is_cuda:
     from sgl_kernel import fast_topk
-elif is_hip():
+elif _is_hip:
     from sgl_kernel import fast_topk
 else:
     from sglang.srt.utils.common import fast_topk
@@ -43,7 +45,7 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = is_cuda()  # This kernel is only available for CUDA now
+TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
 
 
 @triton.jit
@@ -105,6 +107,34 @@ def assign_req_to_token_pool(
         tl.store(token_pool + save_offset, data, mask=mask)
         save_offset += BLOCK_SIZE
         load_offset += BLOCK_SIZE
+
+
+def assign_req_to_token_pool_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+):
+    if _is_cuda or _is_hip:
+        assign_req_to_token_pool[(batch_size,)](
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+            next_power_of_2(batch_size),
+        )
+    elif _is_npu:
+        torch.ops.npu.cache_loc_assign(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+        )
 
 
 @triton.jit

@@ -29,7 +29,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     TREE_SPEC_KERNEL_AVAILABLE,
     align_evict_mask_to_page_size,
-    assign_req_to_token_pool,
+    assign_req_to_token_pool_func,
     create_accept_length_filter,
     create_extend_after_decode_spec_info,
     filter_finished_cache_loc_kernel,
@@ -139,25 +139,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
             self.last_loc = last_loc
 
-        if not _is_npu:
-            bs = batch.batch_size()
-            assign_req_to_token_pool[(bs,)](
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                end_offset,
-                batch.out_cache_loc,
-                batch.req_to_token_pool.req_to_token.shape[1],
-                next_power_of_2(bs),
-            )
-        else:
-            torch.ops.npu.cache_loc_assign(
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                end_offset,
-                batch.out_cache_loc,
-            )
+        bs = batch.batch_size()
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
+            batch.out_cache_loc,
+            bs,
+        )
 
     def generate_attn_arg_prefill(
         self,
@@ -503,24 +493,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if not has_finished:
             if page_size == 1 or self.topk == 1:
                 batch.out_cache_loc = batch.out_cache_loc[accept_index]
-                if not _is_npu:
-                    assign_req_to_token_pool[(bs,)](
-                        batch.req_pool_indices,
-                        batch.req_to_token_pool.req_to_token,
-                        batch.seq_lens,
-                        batch.seq_lens + accept_length + 1,
-                        batch.out_cache_loc,
-                        batch.req_to_token_pool.req_to_token.shape[1],
-                        next_power_of_2(bs),
-                    )
-                else:
-                    torch.ops.npu.cache_loc_assign(
-                        batch.req_pool_indices,
-                        batch.req_to_token_pool.req_to_token,
-                        batch.seq_lens,
-                        batch.seq_lens + accept_length + 1,
-                        batch.out_cache_loc,
-                    )
+                assign_req_to_token_pool_func(
+                    batch.req_pool_indices,
+                    batch.req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.seq_lens + accept_length + 1,
+                    batch.out_cache_loc,
+                    bs,
+                )
             else:
                 batch.out_cache_loc = tgt_cache_loc
             batch.seq_lens.add_(accept_length + 1)
@@ -545,24 +525,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
         else:
             if page_size == 1 or self.topk == 1:
-                if not _is_npu:
-                    assign_req_to_token_pool[(bs,)](
-                        batch.req_pool_indices,
-                        batch.req_to_token_pool.req_to_token,
-                        batch.seq_lens,
-                        batch.seq_lens + accept_length + 1,
-                        batch.out_cache_loc[accept_index],
-                        batch.req_to_token_pool.req_to_token.shape[1],
-                        next_power_of_2(bs),
-                    )
-                else:
-                    torch.ops.npu.cache_loc_assign(
-                        batch.req_pool_indices,
-                        batch.req_to_token_pool.req_to_token,
-                        batch.seq_lens,
-                        batch.seq_lens + accept_length + 1,
-                        batch.out_cache_loc[accept_index],
-                    )
+                assign_req_to_token_pool_func(
+                    batch.req_pool_indices,
+                    batch.req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.seq_lens + accept_length + 1,
+                    batch.out_cache_loc[accept_index],
+                    bs,
+                )
                 batch.seq_lens.add_(accept_length + 1)
                 batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 

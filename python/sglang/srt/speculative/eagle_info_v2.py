@@ -80,7 +80,7 @@ def assign_draft_cache_locs_page_size_1(
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
-        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool
+        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size()
 
@@ -114,26 +114,14 @@ class EagleDraftInputV2Mixin:
                 extend_num_tokens,
             )
 
-        if not _is_npu:
-            assign_req_to_token_pool[(bs,)](
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                self.allocate_lens,
-                new_allocate_lens,
-                out_cache_loc,
-                batch.req_to_token_pool.req_to_token.shape[1],
-                next_power_of_2(bs),
-            )
-        else:
-            import sgl_kernel_npu  # noqa: F401
-
-            torch.ops.npu.cache_loc_assign(
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                self.allocate_lens,
-                new_allocate_lens,
-                out_cache_loc.to(dtype=torch.int32),
-            )
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            self.allocate_lens,
+            new_allocate_lens,
+            out_cache_loc,
+            bs,
+        )
 
         self.allocate_lens = new_allocate_lens
 
