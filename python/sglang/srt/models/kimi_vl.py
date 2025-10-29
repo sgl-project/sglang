@@ -124,17 +124,20 @@ class KimiVLForConditionalGeneration(nn.Module):
         self.config = config
         assert isinstance(config.vision_config, MoonViTConfig)
 
-        self.vision_tower = MoonVitPretrainedModel(config.vision_config)
+        if not self.config.language_only:
+            self.vision_tower = MoonVitPretrainedModel(config.vision_config)
+            self.multi_modal_projector = KimiVLMultiModalProjector(config=config)
 
-        self.multi_modal_projector = KimiVLMultiModalProjector(config=config)
         self.quant_config = quant_config
         text_config = copy.deepcopy(config.text_config)
         text_config.architectures = ["DeepseekV2ForCausalLM"]
-        self.language_model = DeepseekV2ForCausalLM(
-            config=text_config,
-            quant_config=quant_config,
-            prefix=add_prefix("language_model", prefix),
-        )
+
+        if not self.config.mm_only:
+            self.language_model = DeepseekV2ForCausalLM(
+                config=text_config,
+                quant_config=quant_config,
+                prefix=add_prefix("language_model", prefix),
+            )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = (
@@ -224,7 +227,7 @@ class KimiVLForConditionalGeneration(nn.Module):
                     name = name.replace(key_to_modify, new_key)
             use_default_weight_loading = False
             if "vision" in name:
-                if self.vision_tower is not None:
+                if not self.config.language_only and self.vision_tower is not None:
                     # We only do sharding for language model and
                     # not vision model for now.
                     use_default_weight_loading = True
@@ -244,6 +247,11 @@ class KimiVLForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    # Skip loading visual/language model weights
+                    if (
+                        self.config.mm_only or self.config.language_only
+                    ) and name not in params_dict:
+                        continue
 
                     param = params_dict[name]
                     weight_loader = param.weight_loader
@@ -259,6 +267,12 @@ class KimiVLForConditionalGeneration(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
+
+                        # Skip loading visual/language model weights
+                        if (
+                            self.config.mm_only or self.config.language_only
+                        ) and name not in params_dict:
+                            continue
 
                         param = params_dict[name]
                         weight_loader = param.weight_loader
@@ -277,6 +291,11 @@ class KimiVLForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                # Skip loading visual/language model weights
+                if (
+                    self.config.mm_only or self.config.language_only
+                ) and name not in params_dict:
+                    continue
                 # Remapping the name of FP8 kv-scale.
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
@@ -288,7 +307,8 @@ class KimiVLForConditionalGeneration(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, **kwargs)
-        self.language_model.post_load_weights()
+        if not self.config.mm_only:
+            self.language_model.post_load_weights()
 
 
 def get_spec_layer_idx_from_weight_name(
