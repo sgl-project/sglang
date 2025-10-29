@@ -118,7 +118,7 @@ def _handle_output_by_index(output, i):
             decoded_texts=(
                 [output.decoded_texts[i]] if len(output.decoded_texts) > i else None
             ),
-            decode_ids=[output.decode_ids[i]] if len(output.decode_ids) > i else None,
+            decode_ids=([output.decode_ids[i]] if len(output.decode_ids) > i else None),
             read_offsets=(
                 [output.read_offsets[i]] if len(output.read_offsets) > i else None
             ),
@@ -223,7 +223,7 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            token_steps=[output.token_steps[i]] if output.token_steps else None,
+            token_steps=([output.token_steps[i]] if output.token_steps else None),
             rids=[output.rids[i]],
         )
     elif isinstance(output, BatchEmbeddingOutput):
