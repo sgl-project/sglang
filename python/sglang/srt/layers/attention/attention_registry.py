@@ -217,3 +217,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     return full_attn_backend
+
+
+@register_attention_backend("intel_xpu")
+def create_intel_xpu_backend(runner):
+    from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+    return XPUAttentionBackend(runner)

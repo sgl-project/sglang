@@ -4,6 +4,8 @@
 //! that transform a RequestContext through its lifecycle.
 
 use std::{
+    borrow::Cow,
+    collections::HashMap,
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -12,15 +14,20 @@ use async_trait::async_trait;
 use axum::response::{IntoResponse, Response};
 use proto::DisaggregatedParams;
 use rand::Rng;
+use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use super::{context::*, processing, streaming, utils};
+use super::{context::*, processing, responses::BackgroundTaskInfo, streaming, utils};
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     grpc_client::proto,
     policies::PolicyRegistry,
-    protocols::{chat::ChatCompletionRequest, common::InputIds, generate::GenerateRequest},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatCompletionResponse},
+        common::InputIds,
+        generate::GenerateRequest,
+    },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
@@ -131,7 +138,7 @@ impl PreparationStage {
             token_ids,
             processed_messages: Some(processed_messages),
             tool_constraints: tool_call_constraint,
-            filtered_request: if matches!(body_ref, std::borrow::Cow::Owned(_)) {
+            filtered_request: if matches!(body_ref, Cow::Owned(_)) {
                 Some(body_ref.into_owned())
             } else {
                 None
@@ -1088,6 +1095,95 @@ impl RequestPipeline {
                 utils::internal_error_static("Internal error: wrong response type")
             }
             None => utils::internal_error_static("No response produced"),
+        }
+    }
+
+    /// Execute chat pipeline for responses endpoint
+    ///
+    /// TODO: The support for background tasks is not scalable. Consider replacing this with
+    /// a better design in the future.
+    /// Used by ALL non-streaming /v1/responses requests (both sync and background modes).
+    /// Uses the same 7 pipeline stages as execute_chat(), with three differences:
+    /// 1. Returns Result<ChatCompletionResponse, Response> for tool_loop composition
+    /// 2. Disallows streaming (responses endpoint uses different SSE format)
+    /// 3. Injects hooks for background task cancellation (only active when response_id provided)
+    pub async fn execute_chat_for_responses(
+        &self,
+        request: Arc<ChatCompletionRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+        response_id: Option<String>,
+        background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
+    ) -> Result<ChatCompletionResponse, Response> {
+        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+
+        // Execute each stage in sequence
+        for (idx, stage) in self.stages.iter().enumerate() {
+            match stage.execute(&mut ctx).await {
+                Ok(Some(_response)) => {
+                    // Streaming not supported for responses sync mode
+                    return Err(utils::bad_request_error(
+                        "Streaming is not supported in this context".to_string(),
+                    ));
+                }
+                Ok(None) => {
+                    let stage_name = stage.name();
+
+                    // After ClientAcquisitionStage, store client for background task cancellation
+                    if stage_name == "ClientAcquisition" {
+                        if let (Some(ref clients), Some(ref resp_id), Some(ref tasks)) =
+                            (&ctx.state.clients, &response_id, &background_tasks)
+                        {
+                            let client_to_store = match clients {
+                                ClientSelection::Single { client } => client.clone(),
+                                ClientSelection::Dual { decode, .. } => decode.clone(),
+                            };
+
+                            if let Some(task_info) = tasks.write().await.get_mut(resp_id.as_str()) {
+                                *task_info.client.write().await = Some(client_to_store);
+                                debug!("Stored client for response_id: {}", resp_id);
+                            }
+                        }
+                    }
+
+                    // After DispatchMetadataStage, store grpc_request_id for background task cancellation
+                    if stage_name == "DispatchMetadata" {
+                        if let (Some(ref dispatch), Some(ref resp_id), Some(ref tasks)) =
+                            (&ctx.state.dispatch, &response_id, &background_tasks)
+                        {
+                            let grpc_request_id = dispatch.request_id.clone();
+
+                            if let Some(task_info) = tasks.write().await.get_mut(resp_id.as_str()) {
+                                task_info.grpc_request_id = grpc_request_id.clone();
+                                debug!("Stored grpc_request_id for response_id: {}", resp_id);
+                            }
+                        }
+                    }
+
+                    // Continue to next stage
+                    continue;
+                }
+                Err(response) => {
+                    // Error occurred - return the response as-is to preserve HTTP status codes
+                    error!(
+                        "Stage {} ({}) failed with status {}",
+                        idx + 1,
+                        stage.name(),
+                        response.status()
+                    );
+                    return Err(response);
+                }
+            }
+        }
+
+        // Extract final response
+        match ctx.state.response.final_response {
+            Some(FinalResponse::Chat(response)) => Ok(response),
+            Some(FinalResponse::Generate(_)) => Err(utils::internal_error_static(
+                "Internal error: wrong response type",
+            )),
+            None => Err(utils::internal_error_static("No response produced")),
         }
     }
 }

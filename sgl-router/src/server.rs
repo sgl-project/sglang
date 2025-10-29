@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, OnceLock,
+        Arc,
     },
     time::Duration,
 };
@@ -13,28 +13,25 @@ use axum::{
     routing::{delete, get, post},
     serve, Json, Router,
 };
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, signal, spawn};
 use tracing::{error, info, warn, Level};
 
 use crate::{
-    config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
+    app_context::AppContext,
+    config::{RouterConfig, RoutingMode},
     core::{
-        worker_to_info, Job, JobQueue, JobQueueConfig, LoadMonitor, WorkerManager, WorkerRegistry,
-        WorkerType,
-    },
-    data_connector::{
-        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-        NoOpConversationStorage, NoOpResponseStorage, OracleConversationItemStorage,
-        OracleConversationStorage, OracleResponseStorage, SharedConversationItemStorage,
-        SharedConversationStorage, SharedResponseStorage,
+        worker_to_info,
+        workflow::{
+            create_mcp_registration_workflow, create_worker_registration_workflow,
+            create_worker_removal_workflow, LoggingSubscriber, WorkflowEngine,
+        },
+        Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
-    middleware::{self, AuthConfig, QueuedRequest, TokenBucket},
-    policies::PolicyRegistry,
+    middleware::{self, AuthConfig, QueuedRequest},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -46,79 +43,9 @@ use crate::{
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo},
     },
-    reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
-    tokenizer::{
-        cache::{CacheConfig, CachedTokenizer},
-        factory as tokenizer_factory,
-        traits::Tokenizer,
-    },
-    tool_parser::ParserFactory as ToolParserFactory,
 };
-
-//
-
-#[derive(Clone)]
-pub struct AppContext {
-    pub client: Client,
-    pub router_config: RouterConfig,
-    pub rate_limiter: Option<Arc<TokenBucket>>,
-    pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    pub reasoning_parser_factory: Option<ReasoningParserFactory>,
-    pub tool_parser_factory: Option<ToolParserFactory>,
-    pub worker_registry: Arc<WorkerRegistry>,
-    pub policy_registry: Arc<PolicyRegistry>,
-    pub router_manager: Option<Arc<RouterManager>>,
-    pub response_storage: SharedResponseStorage,
-    pub conversation_storage: SharedConversationStorage,
-    pub conversation_item_storage: SharedConversationItemStorage,
-    pub load_monitor: Option<Arc<LoadMonitor>>,
-    pub configured_reasoning_parser: Option<String>,
-    pub configured_tool_parser: Option<String>,
-    pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
-}
-
-impl AppContext {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        router_config: RouterConfig,
-        client: Client,
-        rate_limiter: Option<Arc<TokenBucket>>,
-        tokenizer: Option<Arc<dyn Tokenizer>>,
-        reasoning_parser_factory: Option<ReasoningParserFactory>,
-        tool_parser_factory: Option<ToolParserFactory>,
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
-        response_storage: SharedResponseStorage,
-        conversation_storage: SharedConversationStorage,
-        conversation_item_storage: SharedConversationItemStorage,
-        load_monitor: Option<Arc<LoadMonitor>>,
-        worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
-    ) -> Self {
-        let configured_reasoning_parser = router_config.reasoning_parser.clone();
-        let configured_tool_parser = router_config.tool_call_parser.clone();
-
-        Self {
-            client,
-            router_config,
-            rate_limiter,
-            tokenizer,
-            reasoning_parser_factory,
-            tool_parser_factory,
-            worker_registry,
-            policy_registry,
-            router_manager: None,
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
-            load_monitor,
-            configured_reasoning_parser,
-            configured_tool_parser,
-            worker_job_queue,
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -436,51 +363,6 @@ async fn v1_conversations_delete_item(
         .await
 }
 
-#[derive(Deserialize)]
-struct AddWorkerQuery {
-    url: String,
-    api_key: Option<String>,
-}
-
-async fn add_worker(
-    State(state): State<Arc<AppState>>,
-    Query(AddWorkerQuery { url, api_key }): Query<AddWorkerQuery>,
-) -> Response {
-    // Warn if router has API key but worker is being added without one
-    if state.context.router_config.api_key.is_some() && api_key.is_none() {
-        warn!(
-            "Adding worker {} without API key while router has API key configured. \
-            Worker will be accessible without authentication. \
-            If the worker requires the same API key as the router, please specify it explicitly.",
-            url
-        );
-    }
-
-    let result = WorkerManager::add_worker(&url, &api_key, &state.context).await;
-
-    match result {
-        Ok(message) => (StatusCode::OK, message).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
-    }
-}
-
-async fn list_workers(State(state): State<Arc<AppState>>) -> Response {
-    let worker_list = WorkerManager::get_worker_urls(&state.context.worker_registry);
-    Json(json!({ "urls": worker_list })).into_response()
-}
-
-async fn remove_worker(
-    State(state): State<Arc<AppState>>,
-    Query(AddWorkerQuery { url, .. }): Query<AddWorkerQuery>,
-) -> Response {
-    let result = WorkerManager::remove_worker(&url, &state.context);
-
-    match result {
-        Ok(message) => (StatusCode::OK, message).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
-    }
-}
-
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
     match WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
         .await
@@ -562,6 +444,12 @@ async fn create_worker(
             config.url
         );
     }
+
+    // Populate dp_aware from router's configuration
+    let config = WorkerConfigRequest {
+        dp_aware: state.context.router_config.dp_aware,
+        ..config
+    };
 
     // Submit job for async processing
     let worker_url = config.url.clone();
@@ -721,7 +609,7 @@ pub fn build_app(
         )
         .route("/v1/responses/{response_id}", delete(v1_responses_delete))
         .route(
-            "/v1/responses/{response_id}/input",
+            "/v1/responses/{response_id}/input_items",
             get(v1_responses_list_input_items),
         )
         .route("/v1/conversations", post(v1_conversations_create))
@@ -758,9 +646,6 @@ pub fn build_app(
         .route("/get_server_info", get(get_server_info));
 
     let admin_routes = Router::new()
-        .route("/add_worker", post(add_worker))
-        .route("/remove_worker", post(remove_worker))
-        .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -833,173 +718,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
-    let client = Client::builder()
-        .pool_idle_timeout(Some(Duration::from_secs(50)))
-        .pool_max_idle_per_host(500)
-        .timeout(Duration::from_secs(config.request_timeout_secs))
-        .connect_timeout(Duration::from_secs(10))
-        .tcp_nodelay(true)
-        .tcp_keepalive(Some(Duration::from_secs(30)))
-        .build()
-        .expect("Failed to create HTTP client");
-
-    // Initialize rate limiter
-    let rate_limiter = match config.router_config.max_concurrent_requests {
-        n if n <= 0 => None,
-        n => {
-            let rate_limit_tokens = config
-                .router_config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
-            Some(Arc::new(TokenBucket::new(
-                n as usize,
-                rate_limit_tokens as usize,
-            )))
-        }
-    };
-
-    // Initialize tokenizer and parser factories for gRPC mode
-    let (tokenizer, reasoning_parser_factory, tool_parser_factory) = if config
-        .router_config
-        .connection_mode
-        == ConnectionMode::Grpc
-    {
-        let tokenizer_path = config
-            .router_config
-            .tokenizer_path
-            .clone()
-            .or_else(|| config.router_config.model_path.clone())
-            .ok_or_else(|| {
-                "gRPC mode requires either --tokenizer-path or --model-path to be specified"
-                    .to_string()
-            })?;
-
-        let base_tokenizer =
-                tokenizer_factory::create_tokenizer_with_chat_template_blocking(
-                    &tokenizer_path,
-                    config.router_config.chat_template.as_deref(),
-                )
-                .map_err(|e| {
-                    format!(
-                        "Failed to create tokenizer from '{}': {}. \
-                        Ensure the path is valid and points to a tokenizer file (tokenizer.json) \
-                        or a HuggingFace model ID. For directories, ensure they contain tokenizer files.",
-                        tokenizer_path, e
-                    )
-                })?;
-
-        // Conditionally wrap with caching layer if at least one cache is enabled
-        let tokenizer = if config.router_config.tokenizer_cache.enable_l0
-            || config.router_config.tokenizer_cache.enable_l1
-        {
-            let cache_config = CacheConfig {
-                enable_l0: config.router_config.tokenizer_cache.enable_l0,
-                l0_max_entries: config.router_config.tokenizer_cache.l0_max_entries,
-                enable_l1: config.router_config.tokenizer_cache.enable_l1,
-                l1_max_memory: config.router_config.tokenizer_cache.l1_max_memory,
-            };
-            Some(Arc::new(CachedTokenizer::new(base_tokenizer, cache_config)) as Arc<dyn Tokenizer>)
-        } else {
-            // Use base tokenizer directly without caching
-            Some(base_tokenizer)
-        };
-        let reasoning_parser_factory = Some(ReasoningParserFactory::new());
-        let tool_parser_factory = Some(ToolParserFactory::new());
-
-        (tokenizer, reasoning_parser_factory, tool_parser_factory)
-    } else {
-        (None, None, None)
-    };
-
-    // Initialize worker registry and policy registry
-    let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(config.router_config.policy.clone()));
-
-    // Initialize storage backends
-    let (response_storage, conversation_storage): (
-        SharedResponseStorage,
-        SharedConversationStorage,
-    ) = match config.router_config.history_backend {
-        HistoryBackend::Memory => {
-            info!("Initializing data connector: Memory");
-            (
-                Arc::new(MemoryResponseStorage::new()),
-                Arc::new(MemoryConversationStorage::new()),
-            )
-        }
-        HistoryBackend::None => {
-            info!("Initializing data connector: None (no persistence)");
-            (
-                Arc::new(NoOpResponseStorage::new()),
-                Arc::new(NoOpConversationStorage::new()),
-            )
-        }
-        HistoryBackend::Oracle => {
-            let oracle_cfg = config.router_config.oracle.clone().ok_or_else(|| {
-                "oracle configuration is required when history_backend=oracle".to_string()
-            })?;
-            info!(
-                "Initializing data connector: Oracle ATP (pool: {}-{})",
-                oracle_cfg.pool_min, oracle_cfg.pool_max
-            );
-
-            let response_storage = OracleResponseStorage::new(oracle_cfg.clone())
-                .map_err(|err| format!("failed to initialize Oracle response storage: {err}"))?;
-
-            let conversation_storage =
-                OracleConversationStorage::new(oracle_cfg.clone()).map_err(|err| {
-                    format!("failed to initialize Oracle conversation storage: {err}")
-                })?;
-            info!("Data connector initialized successfully: Oracle ATP");
-
-            (Arc::new(response_storage), Arc::new(conversation_storage))
-        }
-    };
-
-    // Initialize conversation items storage
-    let conversation_item_storage: SharedConversationItemStorage =
-        match config.router_config.history_backend {
-            HistoryBackend::Oracle => {
-                let oracle_cfg = config.router_config.oracle.clone().ok_or_else(|| {
-                    "oracle configuration is required when history_backend=oracle".to_string()
-                })?;
-                Arc::new(OracleConversationItemStorage::new(oracle_cfg).map_err(|e| {
-                    format!("failed to initialize Oracle conversation item storage: {e}")
-                })?)
-            }
-            _ => Arc::new(MemoryConversationItemStorage::new()),
-        };
-
-    // Initialize load monitor
-    let load_monitor = Some(Arc::new(LoadMonitor::new(
-        worker_registry.clone(),
-        policy_registry.clone(),
-        client.clone(),
-        config.router_config.worker_startup_check_interval_secs,
-    )));
-
-    // Create empty OnceLock for worker job queue (will be initialized below)
-    let worker_job_queue = Arc::new(OnceLock::new());
-
-    // Create AppContext with all initialized components
-    let app_context = AppContext::new(
-        config.router_config.clone(),
-        client.clone(),
-        rate_limiter,
-        tokenizer,
-        reasoning_parser_factory,
-        tool_parser_factory,
-        worker_registry,
-        policy_registry,
-        response_storage,
-        conversation_storage,
-        conversation_item_storage,
-        load_monitor,
-        worker_job_queue,
+    let app_context = Arc::new(
+        AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
     );
-
-    let app_context = Arc::new(app_context);
 
     let weak_context = Arc::downgrade(&app_context);
     let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
@@ -1008,17 +729,66 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
 
+    // Initialize workflow engine and register workflows
+    let engine = Arc::new(WorkflowEngine::new());
+
+    engine
+        .event_bus()
+        .subscribe(Arc::new(LoggingSubscriber))
+        .await;
+
+    engine.register_workflow(create_worker_registration_workflow(&config.router_config));
+    engine.register_workflow(create_worker_removal_workflow());
+    engine.register_workflow(create_mcp_registration_workflow());
+    app_context
+        .workflow_engine
+        .set(engine)
+        .expect("WorkflowEngine should only be initialized once");
+    info!(
+        "Workflow engine initialized with worker and MCP registration workflows (health check timeout: {}s)",
+        config.router_config.health_check.timeout_secs
+    );
+
     info!(
         "Initializing workers for routing mode: {:?}",
         config.router_config.mode
     );
-    WorkerManager::initialize_workers(
-        &config.router_config,
-        &app_context.worker_registry,
-        Some(&app_context.policy_registry),
-    )
-    .await
-    .map_err(|e| format!("Failed to initialize workers: {}", e))?;
+
+    // Submit worker initialization job to queue
+    let job_queue = app_context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue should be initialized");
+    let job = Job::InitializeWorkersFromConfig {
+        router_config: Box::new(config.router_config.clone()),
+    };
+    job_queue
+        .submit(job)
+        .await
+        .map_err(|e| format!("Failed to submit worker initialization job: {}", e))?;
+
+    info!("Worker initialization job submitted (will complete in background)");
+
+    if let Some(mcp_config) = &config.router_config.mcp_config {
+        info!("Found {} MCP server(s) in config", mcp_config.servers.len());
+        let mcp_job = Job::InitializeMcpServers {
+            mcp_config: Box::new(mcp_config.clone()),
+        };
+        job_queue
+            .submit(mcp_job)
+            .await
+            .map_err(|e| format!("Failed to submit MCP initialization job: {}", e))?;
+    } else {
+        info!("No MCP config provided, skipping MCP server initialization");
+    }
+
+    // Start background refresh for all registered static MCP servers
+    if let Some(mcp_manager) = app_context.mcp_manager.get() {
+        let refresh_interval = Duration::from_secs(300); // 5 minutes, matches default TTL
+        let _refresh_handle =
+            Arc::clone(mcp_manager).spawn_background_refresh_all(refresh_interval);
+        info!("Started background refresh for all static MCP servers");
+    }
 
     let worker_stats = app_context.worker_registry.stats();
     info!(

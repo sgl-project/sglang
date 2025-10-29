@@ -1,5 +1,4 @@
 import logging
-import os
 import socket
 import subprocess
 import time
@@ -198,6 +197,8 @@ def pd_cluster(e2e_model: str):
             "--policy",
             "round_robin",
             "--pd-disaggregation",
+            "--log-level",
+            "warn",
         ]
         for url, bport in prefill:
             cmd += ["--prefill", url, str(bport)]

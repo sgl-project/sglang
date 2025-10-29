@@ -14,6 +14,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     get_global_graph_memory_pool,
     model_capture_mode,
     set_global_graph_memory_pool,
+    set_is_extend_in_batch,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -81,6 +82,7 @@ class EAGLEDraftCudaGraphRunner:
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
+        self.extend_seq_lens_cpu = [self.seq_len_fill_value] * self.max_bs
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -92,6 +94,7 @@ class EAGLEDraftCudaGraphRunner:
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
+            self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.zeros(
                 (self.max_num_token * self.speculative_num_steps,), dtype=torch.int64
             )
@@ -165,6 +168,9 @@ class EAGLEDraftCudaGraphRunner:
         # Graph inputs
         req_pool_indices = self.req_pool_indices[:num_seqs]
         seq_lens = self.seq_lens[:num_seqs]
+        seq_lens_cpu = self.seq_lens_cpu[:num_seqs]
+        extend_seq_lens = self.extend_seq_lens[:num_seqs]
+        extend_seq_lens_cpu = self.extend_seq_lens_cpu[:num_seqs]
         out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
         positions = self.positions[:num_tokens]
         mrope_positions = self.mrope_positions[:, :num_tokens]
@@ -227,6 +233,9 @@ class EAGLEDraftCudaGraphRunner:
             input_ids=None,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
@@ -255,6 +264,7 @@ class EAGLEDraftCudaGraphRunner:
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            set_is_extend_in_batch(False)
 
             # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
