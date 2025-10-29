@@ -77,7 +77,6 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -349,7 +348,11 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
-                compute_initial_expert_location_metadata(server_args, self.model_config)
+                compute_initial_expert_location_metadata(
+                    server_args=server_args,
+                    model_config=self.model_config,
+                    moe_ep_rank=self.moe_ep_rank,
+                )
             )
             if self.tp_rank == 0 and get_bool_env_var(
                 "SGLANG_LOG_EXPERT_LOCATION_METADATA"
@@ -730,7 +733,6 @@ class ModelRunner:
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
-        monkey_patch_isinstance_for_vllm_base_layer()
 
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
@@ -742,7 +744,6 @@ class ModelRunner:
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
         monkey_patch_vllm_parallel_state(reverse=True)
-        monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
         get_offloader().post_init()
 

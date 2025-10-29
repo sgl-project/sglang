@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
-use crate::mcp::config::{PromptInfo, ResourceInfo, ToolInfo};
+use crate::mcp::config::{Prompt, RawResource, Tool};
 
 /// Cached tool with metadata
 #[derive(Clone)]
 pub struct CachedTool {
     pub server_name: String,
-    pub tool: ToolInfo,
+    pub tool: Tool,
     pub cached_at: Instant,
 }
 
@@ -22,7 +22,7 @@ pub struct CachedTool {
 #[derive(Clone)]
 pub struct CachedPrompt {
     pub server_name: String,
-    pub prompt: PromptInfo,
+    pub prompt: Prompt,
     pub cached_at: Instant,
 }
 
@@ -30,7 +30,7 @@ pub struct CachedPrompt {
 #[derive(Clone)]
 pub struct CachedResource {
     pub server_name: String,
-    pub resource: ResourceInfo,
+    pub resource: RawResource,
     pub cached_at: Instant,
 }
 
@@ -74,7 +74,7 @@ impl ToolInventory {
     /// Get a tool if it exists and is fresh (within TTL)
     ///
     /// Returns None if the tool doesn't exist or has expired.
-    pub fn get_tool(&self, tool_name: &str) -> Option<(String, ToolInfo)> {
+    pub fn get_tool(&self, tool_name: &str) -> Option<(String, Tool)> {
         self.tools.get(tool_name).and_then(|entry| {
             let cached = entry.value();
 
@@ -94,7 +94,7 @@ impl ToolInventory {
     }
 
     /// Insert or update a tool
-    pub fn insert_tool(&self, tool_name: String, server_name: String, tool: ToolInfo) {
+    pub fn insert_tool(&self, tool_name: String, server_name: String, tool: Tool) {
         self.tools.insert(
             tool_name,
             CachedTool {
@@ -106,7 +106,7 @@ impl ToolInventory {
     }
 
     /// Get all tools (fresh only)
-    pub fn list_tools(&self) -> Vec<(String, String, ToolInfo)> {
+    pub fn list_tools(&self) -> Vec<(String, String, Tool)> {
         let now = Instant::now();
         self.tools
             .iter()
@@ -130,7 +130,7 @@ impl ToolInventory {
     // ============================================================================
 
     /// Get a prompt if it exists and is fresh (within TTL)
-    pub fn get_prompt(&self, prompt_name: &str) -> Option<(String, PromptInfo)> {
+    pub fn get_prompt(&self, prompt_name: &str) -> Option<(String, Prompt)> {
         self.prompts.get(prompt_name).and_then(|entry| {
             let cached = entry.value();
 
@@ -149,7 +149,7 @@ impl ToolInventory {
     }
 
     /// Insert or update a prompt
-    pub fn insert_prompt(&self, prompt_name: String, server_name: String, prompt: PromptInfo) {
+    pub fn insert_prompt(&self, prompt_name: String, server_name: String, prompt: Prompt) {
         self.prompts.insert(
             prompt_name,
             CachedPrompt {
@@ -161,7 +161,7 @@ impl ToolInventory {
     }
 
     /// Get all prompts (fresh only)
-    pub fn list_prompts(&self) -> Vec<(String, String, PromptInfo)> {
+    pub fn list_prompts(&self) -> Vec<(String, String, Prompt)> {
         let now = Instant::now();
         self.prompts
             .iter()
@@ -185,7 +185,7 @@ impl ToolInventory {
     // ============================================================================
 
     /// Get a resource if it exists and is fresh (within TTL)
-    pub fn get_resource(&self, resource_uri: &str) -> Option<(String, ResourceInfo)> {
+    pub fn get_resource(&self, resource_uri: &str) -> Option<(String, RawResource)> {
         self.resources.get(resource_uri).and_then(|entry| {
             let cached = entry.value();
 
@@ -208,7 +208,7 @@ impl ToolInventory {
         &self,
         resource_uri: String,
         server_name: String,
-        resource: ResourceInfo,
+        resource: RawResource,
     ) {
         self.resources.insert(
             resource_uri,
@@ -221,7 +221,7 @@ impl ToolInventory {
     }
 
     /// Get all resources (fresh only)
-    pub fn list_resources(&self) -> Vec<(String, String, ResourceInfo)> {
+    pub fn list_resources(&self) -> Vec<(String, String, RawResource)> {
         let now = Instant::now();
         self.resources
             .iter()
@@ -316,38 +316,55 @@ impl ToolInventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::config::{Prompt, RawResource, Tool};
 
     // Helper to create a test tool
-    fn create_test_tool(name: &str) -> ToolInfo {
-        ToolInfo {
-            name: name.to_string(),
-            description: format!("Test tool: {}", name),
-            server: "test_server".to_string(),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {}
-            })),
+    fn create_test_tool(name: &str) -> Tool {
+        use std::{borrow::Cow, sync::Arc};
+
+        let schema_obj = serde_json::json!({
+            "type": "object",
+            "properties": {}
+        });
+
+        let schema_map = if let serde_json::Value::Object(m) = schema_obj {
+            m
+        } else {
+            serde_json::Map::new()
+        };
+
+        Tool {
+            name: Cow::Owned(name.to_string()),
+            title: None,
+            description: Some(Cow::Owned(format!("Test tool: {}", name))),
+            input_schema: Arc::new(schema_map),
+            output_schema: None,
+            annotations: None,
+            icons: None,
         }
     }
 
     // Helper to create a test prompt
-    fn create_test_prompt(name: &str) -> PromptInfo {
-        PromptInfo {
+    fn create_test_prompt(name: &str) -> Prompt {
+        Prompt {
             name: name.to_string(),
+            title: None,
             description: Some(format!("Test prompt: {}", name)),
-            server: "test_server".to_string(),
             arguments: None,
+            icons: None,
         }
     }
 
     // Helper to create a test resource
-    fn create_test_resource(uri: &str) -> ResourceInfo {
-        ResourceInfo {
+    fn create_test_resource(uri: &str) -> RawResource {
+        RawResource {
             uri: uri.to_string(),
             name: uri.to_string(),
+            title: None,
             description: Some(format!("Test resource: {}", uri)),
             mime_type: Some("text/plain".to_string()),
-            server: "test_server".to_string(),
+            size: None,
+            icons: None,
         }
     }
 
