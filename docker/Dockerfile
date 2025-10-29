@@ -40,7 +40,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     tzdata \
     software-properties-common netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
-    build-essential cmake \
+    build-essential cmake perl \
     libopenmpi-dev libnuma1 libnuma-dev numactl \
     libibverbs-dev libibverbs1 libibumad3 \
     librdmacm1 libnl-3-200 libnl-route-3-200 libnl-route-3-dev libnl-3-dev \
@@ -305,11 +305,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version
 
 # Build and install sgl-router
-RUN python3 -m pip install --no-cache-dir setuptools-rust \
+RUN python3 -m pip install --no-cache-dir maturin \
     && cd /sgl-workspace/sglang/sgl-router \
-    && cargo build --release \
-    && python3 -m pip install --no-cache-dir . \
-    && rm -rf /root/.cache
+    && maturin build --release --features vendored-openssl --out dist \
+    && python3 -m pip install --no-cache-dir --force-reinstall dist/*.whl \
+    && rm -rf /root/.cache target dist
 
 
 # Add yank script
