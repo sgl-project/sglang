@@ -228,7 +228,7 @@ def build_tree_kernel_efficient(
             (bs * num_verify_tokens,), device=device, dtype=torch.long
         )
 
-    if is_npu():
+    if _is_npu:
         (
             positions,
             retrive_index,
