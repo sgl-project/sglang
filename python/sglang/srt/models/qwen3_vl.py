@@ -618,6 +618,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
             self.config = config.text_config  # for qwen3-omni
+            self.config.mm_only = config.mm_only
+            self.config.language_only = config.language_only
 
         if not config.mm_only:
             self.model = language_model_cls(
