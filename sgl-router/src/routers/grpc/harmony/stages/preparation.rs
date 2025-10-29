@@ -164,16 +164,16 @@ impl HarmonyPreparationStage {
 
         match choice {
             ToolChoice::Function { function, .. } => {
-                let tag = Self::build_harmony_specific_function_tag(&function.name, tools)?;
+                let tag = Self::build_harmony_structural_tag(tools, Some(&function.name))?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
             ToolChoice::Value(ToolChoiceValue::Required) => {
-                let tag = Self::build_harmony_required_tag(tools)?;
+                let tag = Self::build_harmony_structural_tag(tools, None)?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
             ToolChoice::AllowedTools { mode, .. } => {
                 if mode == "required" {
-                    let tag = Self::build_harmony_required_tag(tools)?;
+                    let tag = Self::build_harmony_structural_tag(tools, None)?;
                     Ok(Some(("structural_tag".to_string(), tag)))
                 } else {
                     Ok(None)
@@ -183,68 +183,55 @@ impl HarmonyPreparationStage {
         }
     }
 
-    /// Build structural tag for required tool call (at least one)
-    ///
-    /// Uses new xgrammar format with sequence + or to enforce from the start.
-    /// Forces <|start|>assistant then immediately one of the tool calls.
-    fn build_harmony_required_tag(tools: &[Tool]) -> Result<String, Response> {
-        let mut tool_options = Vec::new();
+    /// Build Harmony structural tag for tool calling constraints
+    fn build_harmony_structural_tag(
+        tools: &[Tool],
+        specific_function: Option<&str>,
+    ) -> Result<String, Response> {
+        let mut tags = Vec::new();
 
-        for tool in tools {
+        // Filter tools if specific function requested
+        let tools_to_use: Vec<&Tool> = if let Some(func_name) = specific_function {
+            tools
+                .iter()
+                .filter(|t| t.function.name == func_name)
+                .collect()
+        } else {
+            tools.iter().collect()
+        };
+
+        // Validate specific function exists
+        if specific_function.is_some() && tools_to_use.is_empty() {
+            return Err(utils::bad_request_error(format!(
+                "Tool '{}' not found in tools list",
+                specific_function.unwrap()
+            )));
+        }
+
+        // Build tags for each tool
+        for tool in tools_to_use {
             let tool_name = &tool.function.name;
             let params_schema = &tool.function.parameters;
 
-            // Each tool becomes a sequence: commentary header + json_schema + call marker
-            tool_options.push(json!({
-                "type": "sequence",
-                "elements": [
-                    {
-                        "type": "const_string",
-                        "value": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name)
-                    },
-                    {
-                        "type": "json_schema",
-                        "json_schema": params_schema
-                    }
-                ]
+            tags.push(json!({
+                "begin": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
+                "content": {
+                    "type": "json_schema",
+                    "json_schema": params_schema
+                },
+                "end": "" // `end` is empty because <|call|> comes naturally from Harmony stop tokens
             }));
         }
 
-        // New xgrammar format with "format" field
+        let stop_after_first = specific_function.is_some();
+
         let structural_tag = json!({
             "format": {
-                "type": "or",
-                "elements": tool_options
-            }
-        });
-
-        serde_json::to_string(&structural_tag)
-            .map_err(|e| utils::internal_error_message(format!("Failed to serialize structural tag: {}", e)))
-    }
-
-    /// Build structural tag for specific function
-    fn build_harmony_specific_function_tag(function_name: &str, tools: &[Tool]) -> Result<String, Response> {
-        let tool = tools
-            .iter()
-            .find(|t| t.function.name == function_name)
-            .ok_or_else(|| utils::bad_request_error(format!("Tool '{}' not found in tools list", function_name)))?;
-
-        let params_schema = &tool.function.parameters;
-
-        // New xgrammar format with "format" field
-        let structural_tag = json!({
-            "format": {
-                "type": "sequence",
-                "elements": [
-                    {
-                        "type": "const_string",
-                        "value": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", function_name)
-                    },
-                    {
-                        "type": "json_schema",
-                        "json_schema": params_schema
-                    }
-                ]
+                "type": "triggered_tags",
+                "triggers": ["<|channel|>commentary"],
+                "tags": tags,
+                "at_least_one": true,
+                "stop_after_first": stop_after_first
             }
         });
 
