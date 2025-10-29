@@ -10,7 +10,7 @@ use crate::{
     grpc_client::proto,
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-        common::{ToolCall, ToolChoice, ToolChoiceValue, Usage},
+        common::{ToolCall, Usage},
         responses::{
             ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
             ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
@@ -69,16 +69,7 @@ impl HarmonyResponseProcessor {
             return Err(utils::internal_error_static("No responses from server"));
         }
 
-        // Check if JSON schema constraint was used (specific function or required mode)
-        // When JSON schema is used, backend outputs pure JSON array, not Harmony format
-        let used_json_schema = match &chat_request.tool_choice {
-            Some(ToolChoice::Function { .. }) => true,
-            Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-            Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-            _ => false,
-        };
-
-        // Build choices by parsing output
+        // Build choices by parsing output with HarmonyParserAdapter
         let mut choices: Vec<ChatChoice> = Vec::new();
         for (index, complete) in all_responses.iter().enumerate() {
             // Convert matched_stop from proto to JSON
@@ -91,67 +82,31 @@ impl HarmonyResponseProcessor {
                 }
             });
 
-            let (message, finish_reason) = if used_json_schema {
-                // JSON schema mode: Parse pure JSON array
-                // Decode output_ids to text using Harmony tokenizer
-                let encoding = super::builder::get_harmony_encoding();
-                let output_text = encoding
-                    .tokenizer()
-                    .decode_utf8(&complete.output_ids)
-                    .map_err(|e| {
-                        utils::internal_error_message(format!("Failed to decode output tokens: {}", e))
-                    })?;
+            // Parse Harmony channels with HarmonyParserAdapter
+            let mut parser = HarmonyParserAdapter::new().map_err(|e| {
+                utils::internal_error_message(format!("Failed to create Harmony parser: {}", e))
+            })?;
 
-                // Parse JSON schema response
-                let (tool_calls, remaining_text) = utils::parse_json_schema_response(
-                    &output_text,
-                    &chat_request.tool_choice,
-                    &chat_request.model,
-                    0, // Harmony models don't need history tool call count
-                );
-
-                // Override finish reason if we have tool calls
-                let final_finish_reason = if tool_calls.is_some() {
-                    "tool_calls".to_string()
-                } else {
-                    complete.finish_reason.clone()
-                };
-
-                let message = ChatCompletionMessage {
-                    role: "assistant".to_string(),
-                    content: (!remaining_text.is_empty()).then_some(remaining_text),
-                    tool_calls,
-                    reasoning_content: None, // JSON schema mode doesn't support reasoning
-                };
-
-                (message, final_finish_reason)
-            } else {
-                // Harmony format mode: Parse channels with HarmonyParserAdapter
-                let mut parser = HarmonyParserAdapter::new().map_err(|e| {
-                    utils::internal_error_message(format!("Failed to create Harmony parser: {}", e))
+            // Parse Harmony channels with finish_reason and matched_stop
+            let parsed = parser
+                .parse_complete(
+                    &complete.output_ids,
+                    complete.finish_reason.clone(),
+                    matched_stop.clone(),
+                )
+                .map_err(|e| {
+                    utils::internal_error_message(format!("Harmony parsing failed: {}", e))
                 })?;
 
-                // Parse Harmony channels with finish_reason and matched_stop
-                let parsed = parser
-                    .parse_complete(
-                        &complete.output_ids,
-                        complete.finish_reason.clone(),
-                        matched_stop.clone(),
-                    )
-                    .map_err(|e| {
-                        utils::internal_error_message(format!("Harmony parsing failed: {}", e))
-                    })?;
-
-                // Build response message (assistant)
-                let message = ChatCompletionMessage {
-                    role: "assistant".to_string(),
-                    content: (!parsed.final_text.is_empty()).then_some(parsed.final_text),
-                    tool_calls: parsed.commentary,
-                    reasoning_content: parsed.analysis,
-                };
-
-                (message, parsed.finish_reason)
+            // Build response message (assistant)
+            let message = ChatCompletionMessage {
+                role: "assistant".to_string(),
+                content: (!parsed.final_text.is_empty()).then_some(parsed.final_text),
+                tool_calls: parsed.commentary,
+                reasoning_content: parsed.analysis,
             };
+
+            let finish_reason = parsed.finish_reason;
 
             choices.push(ChatChoice {
                 index: index as u32,

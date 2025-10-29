@@ -2,10 +2,15 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use serde_json::json;
 
 use super::super::HarmonyBuilder;
 use crate::{
-    protocols::{chat::ChatCompletionRequest, responses::ResponsesRequest},
+    protocols::{
+        chat::ChatCompletionRequest,
+        common::{Tool, ToolChoice, ToolChoiceValue},
+        responses::ResponsesRequest,
+    },
     routers::grpc::{
         context::{PreparationOutput, RequestContext, RequestType},
         stages::PipelineStage,
@@ -81,10 +86,9 @@ impl HarmonyPreparationStage {
         // Step 1: Filter tools if needed
         let body_ref = utils::filter_tools_for_request(request);
 
-        // Step 2: Build tool constraints if needed
+        // Step 2: Build tool constraints
         let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
-            utils::generate_tool_constraints(tools, &body_ref.tool_choice, &body_ref.model)
-                .map_err(|e| utils::bad_request_error(format!("Invalid tool configuration: {}", e)))?
+            Self::generate_harmony_structural_tag(tools, &body_ref.tool_choice)?
         } else {
             None
         };
@@ -144,5 +148,95 @@ impl HarmonyPreparationStage {
         });
 
         Ok(None)
+    }
+
+    /// Generate Harmony structural tag for tool constraints
+    ///
+    /// Uses structural tags with `triggered_tags` format to force Harmony format output.
+    /// This ensures the model outputs in Harmony format (with channels) even when constrained.
+    fn generate_harmony_structural_tag(
+        tools: &[Tool],
+        tool_choice: &Option<ToolChoice>,
+    ) -> Result<Option<(String, String)>, Response> {
+        let Some(choice) = tool_choice.as_ref() else {
+            return Ok(None);
+        };
+
+        match choice {
+            ToolChoice::Function { function, .. } => {
+                let tag = Self::build_harmony_specific_function_tag(&function.name, tools)?;
+                Ok(Some(("structural_tag".to_string(), tag)))
+            }
+            ToolChoice::Value(ToolChoiceValue::Required) => {
+                let tag = Self::build_harmony_required_tag(tools)?;
+                Ok(Some(("structural_tag".to_string(), tag)))
+            }
+            ToolChoice::AllowedTools { mode, .. } => {
+                if mode == "required" {
+                    let tag = Self::build_harmony_required_tag(tools)?;
+                    Ok(Some(("structural_tag".to_string(), tag)))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Build structural tag for required tool call (at least one)
+    fn build_harmony_required_tag(tools: &[Tool]) -> Result<String, Response> {
+        let mut tags = Vec::new();
+
+        for tool in tools {
+            let tool_name = &tool.function.name;
+            let params_schema = &tool.function.parameters;
+
+            // Each tool becomes a tag with begin/schema/end
+            tags.push(json!({
+                "begin": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
+                "schema": params_schema,
+                "end": "<|call|>"
+            }));
+        }
+
+        // Use triggered_tags with at_least_one: true
+        let structural_tag = json!({
+            "type": "triggered_tags",
+            "triggers": ["<|channel|>commentary"],
+            "tags": tags,
+            "at_least_one": true,
+            "stop_after_first": false
+        });
+
+        serde_json::to_string(&structural_tag)
+            .map_err(|e| utils::internal_error_message(format!("Failed to serialize structural tag: {}", e)))
+    }
+
+    /// Build structural tag for specific function
+    fn build_harmony_specific_function_tag(function_name: &str, tools: &[Tool]) -> Result<String, Response> {
+        let tool = tools
+            .iter()
+            .find(|t| t.function.name == function_name)
+            .ok_or_else(|| utils::bad_request_error(format!("Tool '{}' not found in tools list", function_name)))?;
+
+        let params_schema = &tool.function.parameters;
+
+        // Single tag for specific function
+        let tag = json!({
+            "begin": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", function_name),
+            "schema": params_schema,
+            "end": "<|call|>"
+        });
+
+        let structural_tag = json!({
+            "type": "triggered_tags",
+            "triggers": ["<|channel|>commentary"],
+            "tags": [tag],
+            "at_least_one": true,
+            "stop_after_first": true
+        });
+
+        serde_json::to_string(&structural_tag)
+            .map_err(|e| utils::internal_error_message(format!("Failed to serialize structural tag: {}", e)))
     }
 }
