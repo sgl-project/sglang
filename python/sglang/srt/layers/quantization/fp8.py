@@ -757,6 +757,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
                 _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
+            # TODO: required by ue8m0 requantization, should be removed after ue8m0 requantization is refactored
+            layer.w13_weight_fp8 = (layer.w13_weight, layer.w13_weight_scale_inv)
+            layer.w2_weight_fp8 = (layer.w2_weight, layer.w2_weight_scale_inv)
+
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
@@ -787,6 +791,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
+
+            layer.w13_weight_fp8 = (layer.w13_weight, layer.w13_weight_scale)
+            layer.w2_weight_fp8 = (layer.w2_weight, layer.w2_weight_scale)
+
             return
 
         # If checkpoint is fp8, we need to handle that the
@@ -870,6 +878,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
+
+            layer.w13_weight_fp8 = (layer.w13_weight, layer.w13_weight_scale)
+            layer.w2_weight_fp8 = (layer.w2_weight, layer.w2_weight_scale)
+
             return
 
     def process_weights_hip_int4(self, layer: Module):
