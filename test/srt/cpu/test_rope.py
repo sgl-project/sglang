@@ -6,6 +6,7 @@ from utils import precision
 
 from sglang.srt.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
+    MRotaryEmbedding,
     RotaryEmbedding,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -15,6 +16,77 @@ torch.manual_seed(1234)
 
 
 class TestROPE(CustomTestCase):
+    def test_mrope(self):
+        head_size = 128
+        seq_len = 1024
+        num_heads = 16
+        num_kv_heads = 1
+        rotary_dim = 128
+        max_pos = 262144
+        base = 5000000
+        is_neox_style = True
+        dtype = torch.bfloat16
+        mrope_section = [24, 20, 20]
+        mrope_interleaved = True
+        positions_mrope = torch.randint(0, max_pos, (3, seq_len))
+        positions_text = torch.randint(0, max_pos, (seq_len,))
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
+        test_config = [
+            # (dtype, is_neox_stype, mrope_interleaved, positions, mrope_section)
+            (torch.bfloat16, True, True, positions_mrope, mrope_section),
+            (torch.bfloat16, True, False, positions_mrope, mrope_section),
+            # (torch.bfloat16, False, True, positions_mrope, mrope_section),
+            # (torch.bfloat16, False, False, positions_mrope, mrope_section),
+            (torch.bfloat16, True, False, positions_text, None),
+            (torch.bfloat16, False, False, positions_text, None),
+        ]
+        for (
+            dtype,
+            is_neox_style,
+            mrope_interleaved,
+            positions,
+            mrope_section,
+        ) in test_config:
+            rope = MRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_pos,
+                base,
+                is_neox_style,
+                dtype,
+                mrope_section,
+                mrope_interleaved,
+            )
+            enable_autocast = True
+
+            with torch.no_grad(), torch.amp.autocast("cpu", enabled=enable_autocast):
+                q = torch.randn(seq_len, num_heads * head_size, dtype=dtype)
+                q_clone = q.clone()
+                k = torch.randn(seq_len, num_kv_heads * head_size, dtype=dtype)
+                k_clone = k.clone()
+
+                # ref kernel
+                q_ref, k_ref = rope._forward_cpu(
+                    query=q,
+                    key=k,
+                    positions=positions,
+                )
+                # fused rope kernel
+                q_sgl, k_sgl = torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+                    positions,
+                    q_clone,
+                    k_clone,
+                    rope.head_size,
+                    rope.cos_sin_cache,
+                    rope.mrope_section,
+                    rope.mrope_interleaved,
+                    is_neox_style,
+                )
+                atol = rtol = precision[q_ref.dtype]
+                torch.testing.assert_close(q_ref, q_sgl, atol=atol, rtol=rtol)
+                torch.testing.assert_close(k_ref, k_sgl, atol=atol, rtol=rtol)
+
     def test_deepseek_v2_rope(self):
         num_head = 16
         seq_len = 1024

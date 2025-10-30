@@ -163,6 +163,92 @@ void rotary_embedding_neox_2D_kernel_impl(
 }
 
 template <typename scalar_t>
+void multimodal_rotary_embedding_neox_2D_kernel_impl(
+    int64_t* __restrict__ positions,
+    scalar_t* __restrict__ query,
+    scalar_t* __restrict__ key,
+    scalar_t* __restrict__ cos_sin_cache,
+    int64_t rotary_dim,
+    int64_t query_stride_s,
+    int64_t key_stride_s,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_size,
+    int64_t num_tokens,
+    int64_t mrope_section_t,
+    int64_t mrope_section_h,
+    int64_t mrope_section_w,
+    int64_t positions_stride0,
+    bool mrope_interleaved) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t bVecSize = bVec::size();
+
+  int64_t embed_dim = rotary_dim / 2;
+
+#pragma omp parallel for
+  for (int64_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
+    int64_t pos_t = positions[token_idx];
+    int64_t pos_h = positions[positions_stride0 + token_idx];
+    int64_t pos_w = positions[positions_stride0 * 2 + token_idx];
+    scalar_t* cache_t_ptr = cos_sin_cache + pos_t * rotary_dim;
+    scalar_t* cache_h_ptr = cos_sin_cache + pos_h * rotary_dim;
+    scalar_t* cache_w_ptr = cos_sin_cache + pos_w * rotary_dim;
+
+    for (int64_t i = 0; i < num_heads; ++i) {
+      int64_t head_idx = i;
+      int64_t q_token_head = token_idx * query_stride_s + head_idx * head_size;
+      int64_t k_token_head = token_idx * key_stride_s + head_idx * head_size;
+      for (int64_t j = 0; j < embed_dim; ++j) {
+        int64_t x_index = j;
+        int64_t y_index = embed_dim + j;
+
+        float _cos = 0;
+        float _sin = 0;
+        if (mrope_interleaved) {
+          if (j % 3 == 1 && j <= mrope_section_h * 3) {
+            _cos = cache_h_ptr[x_index];
+            _sin = cache_h_ptr[y_index];
+          } else if (j % 3 == 2 && j <= mrope_section_w * 3) {
+            _cos = cache_w_ptr[x_index];
+            _sin = cache_w_ptr[y_index];
+          } else {
+            _cos = cache_t_ptr[x_index];
+            _sin = cache_t_ptr[y_index];
+          }
+        } else {
+          if (j < mrope_section_t) {
+            _cos = cache_t_ptr[x_index];
+            _sin = cache_t_ptr[y_index];
+          } else if (j < mrope_section_t + mrope_section_h) {
+            _cos = cache_h_ptr[x_index];
+            _sin = cache_h_ptr[y_index];
+          } else {
+            _cos = cache_w_ptr[x_index];
+            _sin = cache_w_ptr[y_index];
+          }
+        }
+
+        int64_t q_out_x = q_token_head + x_index;
+        int64_t q_out_y = q_token_head + y_index;
+        float _q_x = query[q_out_x];
+        float _q_y = query[q_out_y];
+        query[q_out_x] = _q_x * _cos - _q_y * _sin;
+        query[q_out_y] = _q_y * _cos + _q_x * _sin;
+        if (i < num_kv_heads) {
+          int64_t k_out_x = k_token_head + x_index;
+          int64_t k_out_y = k_token_head + y_index;
+          float _k_x = key[k_out_x];
+          float _k_y = key[k_out_y];
+          key[k_out_x] = _k_x * _cos - _k_y * _sin;
+          key[k_out_y] = _k_y * _cos + _k_x * _sin;
+        }
+      }
+    }
+  }
+}
+
+template <typename scalar_t>
 void rotary_embedding_2D_kernel_impl(
     int64_t* __restrict__ positions,
     scalar_t* __restrict__ query,
@@ -342,5 +428,111 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
           query_out_stride_h);
     }
   });
+  return std::make_tuple(query_out, key_out);
+}
+
+// positions: [num_tokens] (text only) or [3, num_tokens] (T/H/W positions with multimodal inputs)
+// query: [num_tokens, num_heads * head_size]
+// key: [num_tokens, num_kv_heads * head_size]
+// cos_sin_cache: [max_position_embeddings, rotary_dim]
+// mrope_section: [t, h, w]
+std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
+    at::Tensor& positions,
+    at::Tensor& query,
+    at::Tensor& key,
+    int64_t head_size,
+    at::Tensor& cos_sin_cache,
+    const std::optional<std::vector<int64_t>>& mrope_section,
+    bool mrope_interleaved,
+    bool is_neox) {
+  RECORD_FUNCTION("sgl-kernel::multimodal_rotary_embedding_cpu", std::vector<c10::IValue>({query, key}));
+  TORCH_CHECK(positions.dim() == 1 || positions.dim() == 2, "positions must be a 1D or 2D tensor");
+  CHECK_DIM(2, query);
+  CHECK_DIM(2, key);
+  CHECK_DIM(2, cos_sin_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
+  int64_t rotary_dim = cos_sin_cache.size(1);
+  int64_t num_tokens = positions.size(-1);
+  CHECK_EQ(key.size(0), num_tokens);
+  CHECK_EQ(query.size(0), num_tokens);
+  const auto input_dtype = query.scalar_type();
+  TORCH_CHECK(positions.scalar_type() == at::kLong, "expect positions to be int64, got ", positions.scalar_type());
+  TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
+  TORCH_CHECK(input_dtype == cos_sin_cache.scalar_type(), "query and cos_sin_cache must have the same data type");
+
+  int64_t num_heads = query.size(-1) / head_size;
+  int64_t num_kv_heads = key.size(-1) / head_size;
+  int64_t key_stride_s = key.stride(0);
+  int64_t query_stride_s = query.stride(0);
+  at::Tensor query_out = at::empty_like(query);
+  at::Tensor key_out = at::empty_like(key);
+
+  if (positions.dim() == 2) {
+    TORCH_CHECK(mrope_section.has_value(), "mrope_section must be provided when positions is 2D");
+    auto mrope_section_val = mrope_section.value();
+    CHECK_EQ(mrope_section_val.size(), 3);
+    CHECK_EQ(positions.size(0), 3);
+    int64_t mrope_section_t = mrope_section_val[0];
+    int64_t mrope_section_h = mrope_section_val[1];
+    int64_t mrope_section_w = mrope_section_val[2];
+    int64_t positions_stride0 = positions.stride(0);
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
+      if (is_neox) {
+        multimodal_rotary_embedding_neox_2D_kernel_impl<scalar_t>(
+            positions.data_ptr<int64_t>(),
+            query.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
+            cos_sin_cache.data_ptr<scalar_t>(),
+            rotary_dim,
+            query_stride_s,
+            key_stride_s,
+            num_heads,
+            num_kv_heads,
+            head_size,
+            num_tokens,
+            mrope_section_t,
+            mrope_section_h,
+            mrope_section_w,
+            positions_stride0,
+            mrope_interleaved);
+      }
+    });
+    query_out = query;
+    key_out = key;
+
+  } else {  // positions.dim() == 1
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
+      if (is_neox) {
+        rotary_embedding_neox_2D_kernel_impl<scalar_t>(
+            positions.data_ptr<int64_t>(),
+            query.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
+            cos_sin_cache.data_ptr<scalar_t>(),
+            rotary_dim,
+            query_stride_s,
+            key_stride_s,
+            num_heads,
+            num_kv_heads,
+            head_size,
+            num_tokens);
+      } else {
+        rotary_embedding_2D_kernel_impl<scalar_t>(
+            positions.data_ptr<int64_t>(),
+            query.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
+            cos_sin_cache.data_ptr<scalar_t>(),
+            rotary_dim,
+            query_stride_s,
+            key_stride_s,
+            num_heads,
+            num_kv_heads,
+            head_size,
+            num_tokens);
+      }
+      query_out = query;
+      key_out = key;
+    });
+  }
   return std::make_tuple(query_out, key_out);
 }
