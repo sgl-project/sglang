@@ -1,9 +1,12 @@
-from typing import Tuple
+from typing import Dict, Tuple
 
 import torchvision.transforms as T
 from PIL import Image
 from transformers import PretrainedConfig
 
+from sglang.srt.sampling.custom_logit_processor import (
+    DeepseekOCRNoRepeatNGramLogitProcessor,
+)
 BASE_SIZE = 1024
 IMAGE_SIZE = 640
 CROP_MODE = True
@@ -19,6 +22,18 @@ NGRAM_NO_REPEAT_SIZE = 30
 NGRAM_NO_REPEAT_WINDOW = 90
 # Whitelist `<td>` and `</td>` token ids to allow table structures.
 NGRAM_NO_REPEAT_WHITELIST = (128821, 128822)
+
+DEFAULT_CUSTOM_LOGIT_PROCESSOR = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
+
+
+def get_default_ngram_custom_params() -> Dict[str, object]:
+    """Return default custom params for the DeepSeek-OCR n-gram no repeat processor."""
+
+    return {
+        "ngram_size": NGRAM_NO_REPEAT_SIZE,
+        "window_size": NGRAM_NO_REPEAT_WINDOW,
+        "whitelist_token_ids": list(NGRAM_NO_REPEAT_WHITELIST),
+    }
 
 PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
 
