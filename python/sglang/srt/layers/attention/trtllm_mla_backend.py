@@ -207,6 +207,7 @@ class TRTLLMMLAPrefillMetadata:
     max_seq_len: int
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
+    fallback_to_flashinfer_mla: bool = False
 
 
 @dataclass
@@ -283,9 +284,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-
-        # Whether to fallback to flashinfer MLA kernel
-        self.fallback_to_flashinfer_mla = False
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -521,10 +519,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             # For extend batch with prefix length > 0, fallback to flashinfer MLA kernel when chunked prefix cache is disabled.
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-            self.fallback_to_flashinfer_mla = (
+            fallback_to_flashinfer_mla = (
                 self.disable_chunked_prefix_cache and not extend_no_prefix
             )
-            if self.fallback_to_flashinfer_mla:
+            if fallback_to_flashinfer_mla:
                 super().init_forward_metadata(forward_batch)
 
             seq_lens = forward_batch.seq_lens - forward_batch.extend_prefix_lens
@@ -539,13 +537,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq_len,
                 cum_seq_lens_q,
                 seq_lens,
+                fallback_to_flashinfer_mla,
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
-            self.fallback_to_flashinfer_mla = False
             bs = forward_batch.batch_size
 
             # Get maximum sequence length.
@@ -592,7 +590,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
-            self.fallback_to_flashinfer_mla = True
             return super().init_forward_metadata(forward_batch)
 
     def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
@@ -871,7 +868,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         is_neox: Optional[bool] = False,
     ) -> torch.Tensor:
 
-        if self.fallback_to_flashinfer_mla:
+        if self.forward_prefill_metadata.fallback_to_flashinfer_mla:
             return super().forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
