@@ -433,6 +433,14 @@ def get_filename(
 def main(args: argparse.Namespace):
     print(args)
 
+    def _calculate_shard_intermediate_size(intermediate_size: int) -> int:
+        # In EP mode, use original intermediate_size; otherwise apply TP sharding
+        return (
+            intermediate_size
+            if args.ep_size > 1
+            else 2 * intermediate_size // args.tp_size
+        )
+
     # Check EP mode constraint: tp_size must be 1 when ep_size > 1
     if args.ep_size > 1 and args.tp_size != 1:
         raise ValueError(
@@ -461,22 +469,12 @@ def main(args: argparse.Namespace):
         E = config.ffn_config.moe_num_experts
         topk = config.ffn_config.moe_top_k
         intermediate_size = config.ffn_config.ffn_hidden_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
     elif architecture == "JambaForCausalLM":
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
     elif architecture in [
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -486,12 +484,7 @@ def main(args: argparse.Namespace):
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
     elif architecture in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
         E = (
             config.n_routed_experts + (0 if args.disable_shared_experts_fusion else 1)
@@ -500,22 +493,12 @@ def main(args: argparse.Namespace):
         )
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
     elif architecture == "Llama4ForConditionalGeneration":
         E = config.num_local_experts + (0 if args.disable_shared_experts_fusion else 1)
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
     elif architecture in [
         "Grok1ForCausalLM",
         "Grok1ImgGen",
@@ -524,12 +507,7 @@ def main(args: argparse.Namespace):
         E = config.num_local_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
     elif architecture in [
         "BailingMoEForCausalLM",
         "BailingMoeForCausalLM",
@@ -538,33 +516,18 @@ def main(args: argparse.Namespace):
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
     elif architecture in ["Glm4MoeForCausalLM"]:
         E = config.n_routed_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
     else:
         # Default: Mixtral
         E = config.num_local_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
 
     hidden_size = config.hidden_size
     dtype = config.torch_dtype
