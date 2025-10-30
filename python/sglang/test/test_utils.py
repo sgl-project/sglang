@@ -1037,8 +1037,7 @@ def run_score_benchmark(
         if successful_requests > 0:
             throughput = successful_requests / total_time
             avg_latency = total_latency / successful_requests
-            latencies.sort()
-            p95_latency = latencies[int(len(latencies) * 0.95)] if latencies else 0
+            p95_latency = np.percentile(latencies, 95) if latencies else 0
 
             return {
                 "completed": successful_requests,
@@ -1072,7 +1071,6 @@ def run_embeddings_benchmark(
     num_requests=100,
     batch_size=1,
     input_tokens=500,
-    matryoshka_dimensions=None,
     other_server_args=None,
     need_warmup=False,
     device="auto",
@@ -1109,10 +1107,6 @@ def run_embeddings_benchmark(
             special_token = "<|im_start|>"
             # Verify it's a single token
             test_tokens = tokenizer.encode(special_token, add_special_tokens=False)
-            if len(test_tokens) != 1:
-                # Fallback to a simple word if special token doesn't work
-                special_token = "hello"
-            
             text = special_token * num_tokens
             return text
 
@@ -1124,8 +1118,6 @@ def run_embeddings_benchmark(
                 "input": input_text,
                 "model": model,
             }
-            if matryoshka_dimensions is not None:
-                warmup_data["dimensions"] = matryoshka_dimensions
 
             async with aiohttp.ClientSession() as session:
                 try:
@@ -1148,8 +1140,6 @@ def run_embeddings_benchmark(
                 "input": input_data,
                 "model": model,
             }
-            if matryoshka_dimensions is not None:
-                embeddings_data["dimensions"] = matryoshka_dimensions
 
             test_requests.append(embeddings_data)
 
@@ -1172,12 +1162,6 @@ def run_embeddings_benchmark(
                             request_end = time.monotonic()
 
                             if "data" in response_data:
-                                # Validate matryoshka dimensions if specified
-                                if matryoshka_dimensions is not None:
-                                    embedding = response_data["data"][0]["embedding"]
-                                    if len(embedding) != matryoshka_dimensions:
-                                        continue
-
                                 latency_ms = (request_end - request_start) * 1000
                                 latencies.append(latency_ms)
                                 total_latency += latency_ms
@@ -1191,8 +1175,7 @@ def run_embeddings_benchmark(
         if successful_requests > 0:
             throughput = successful_requests / total_time
             avg_latency = total_latency / successful_requests
-            latencies.sort()
-            p95_latency = latencies[int(len(latencies) * 0.95)] if latencies else 0
+            p95_latency = np.percentile(latencies, 95) if latencies else 0
 
             return {
                 "completed": successful_requests,
