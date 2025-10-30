@@ -31,7 +31,7 @@ important args:
     "batch_size_1": "<speculative_num_steps>_<topk>_<draft_tokens>",
     "batch_size_2": "<speculative_num_steps-1>_<topk-1>_<draft_tokens-1>",
     // ...
-    "batch_size_n": "<speculative_num_steps-n>_<topk-n>_<draft_tokens-n>",
+    "batch_size_n": "<speculative_num_steps-n>_<topk-n>_<draft_tokens-n>"
 }
 ```
 
