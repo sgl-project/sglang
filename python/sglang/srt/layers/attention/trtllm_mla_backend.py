@@ -284,6 +284,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
+        # Whether to fallback to flashinfer MLA kernel
+        self.fallback_to_flashinfer_mla = False
+
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
         Calculate padded block count that satisfies both TRT-LLM and Triton constraints.
@@ -516,7 +519,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
-            if self.disable_chunked_prefix_cache:
+            # For extend batch with prefix length > 0, fallback to flashinfer MLA kernel when chunked prefix cache is disabled.
+            extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+            self.fallback_to_flashinfer_mla = (
+                self.disable_chunked_prefix_cache and not extend_no_prefix
+            )
+            if self.fallback_to_flashinfer_mla:
                 super().init_forward_metadata(forward_batch)
 
             seq_lens = forward_batch.seq_lens - forward_batch.extend_prefix_lens
@@ -537,6 +545,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
+            self.fallback_to_flashinfer_mla = False
             bs = forward_batch.batch_size
 
             # Get maximum sequence length.
@@ -583,6 +592,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
+            self.fallback_to_flashinfer_mla = True
             return super().init_forward_metadata(forward_batch)
 
     def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
@@ -861,8 +871,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         is_neox: Optional[bool] = False,
     ) -> torch.Tensor:
 
-        # When chunked prefix cache is disabled, fallback to normal MLA path
-        if self.disable_chunked_prefix_cache:
+        if self.fallback_to_flashinfer_mla:
             return super().forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
@@ -1011,9 +1020,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             return output
 
         # When chunked prefix cache is enabled, dispatch to different path for ragged attention.
-        assert (
-            not self.disable_chunked_prefix_cache
-        ), "Chunked prefix cache should be enabled when using ragged attention."
         if forward_batch.attn_attend_prefix_cache:
             # MHA for chunked prefix kv cache when running model with MLA
             assert forward_batch.prefix_chunk_idx is not None
