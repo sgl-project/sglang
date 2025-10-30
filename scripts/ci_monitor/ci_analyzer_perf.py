@@ -622,11 +622,13 @@ class SGLangPerfAnalyzer:
                 "head_sha": (run.get("head_sha") or "")[:8],
                 "author": "Unknown",
                 "pr_number": None,
-                "url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}"
+                "url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}",
             }
             head_commit = run.get("head_commit", {})
             if isinstance(head_commit, dict):
-                run_info["author"] = head_commit.get("author", {}).get("name", "Unknown")
+                run_info["author"] = head_commit.get("author", {}).get(
+                    "name", "Unknown"
+                )
 
             # Extract PR number
             pull_requests = run.get("pull_requests", [])
