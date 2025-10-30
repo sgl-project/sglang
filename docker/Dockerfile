@@ -255,7 +255,7 @@ RUN python3 -m pip install --no-cache-dir setuptools-rust \
     && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache
 
-    
+
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
 #!/bin/bash
