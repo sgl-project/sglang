@@ -1478,6 +1478,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         assert self.q_lora_rank is not None
         if (
             (not isinstance(hidden_states, tuple))
+            and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16
             and self.use_min_latency_fused_a_gemm
         ):
@@ -2769,7 +2770,6 @@ class DeepseekV2Model(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
 
-        q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
