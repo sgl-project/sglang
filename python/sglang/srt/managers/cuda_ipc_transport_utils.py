@@ -1,19 +1,24 @@
+import fcntl
 import logging
 from multiprocessing import shared_memory
 from typing import Tuple
-import fcntl
 
 import numpy as np
 import torch
 
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
 
-MM_FEATURE_CACHE_SIZE = 2 * 1024 * 1024 * 1024
-
+MM_FEATURE_CACHE_SIZE = (
+    2 * 1024 * 1024 * 1024
+    if not get_int_env_var("SGLANG_MM_FEATURE_CACHE_MB")
+    else get_int_env_var("SGLANG_MM_FEATURE_CACHE_MB") * 1024 * 1024
+)
 
 SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
+
 
 class ShmSyncBuffer:
     def __init__(self, byte_size: int = 4):
@@ -75,11 +80,11 @@ class MmItemMemoryPool:
         init_chunk = MmItemMemoryChunk((0, memory_size), self.pop_sync_buffer())
         self.available_chunks = [init_chunk]
         self.occupied_chunks = []
-    
+
     def clear_sync_flag_list(self):
         # call each chunk's __del__
         self.sync_flag_list.clear()
-        
+
     def pop_sync_buffer(self):
         if len(self.sync_flag_list) == 0:
             try:
@@ -172,15 +177,15 @@ class MmItemMemoryPool:
                     merged_chunks.append(chunk)
 
         self.available_chunks = merged_chunks
-        
+
 
 class CudaIpcTensorTransportProxy:
     """
     A torch.tensor's proxy used to do inter-process data-sharing
     including:
-    
+
     torch.tensor(on gpu)'s cuda-ipc-hande infos
-    a shm sync buffer's meta data which is used to sync between different process 
+    a shm sync buffer's meta data which is used to sync between different process
     """
 
     def __init__(
