@@ -48,7 +48,26 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
+
+_is_npu = is_npu()
+
+if _is_npu:
+    from sglang.srt.distributed import (
+        get_moe_expert_parallel_world_size,
+        get_pp_group,
+    )
+    from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    from sglang.srt.layers.utils import get_layer_id
+    from sglang.srt.layers.dp_attention import (
+        get_attention_tp_rank,
+        get_attention_tp_size,
+        is_dp_attention_enabled,
+    )
+    from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+    from sglang.srt.utils import make_layers
 
 
 class DeepseekMLP(nn.Module):
@@ -99,6 +118,7 @@ class DeepseekMoE(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        layer_id: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
@@ -115,20 +135,33 @@ class DeepseekMoE(nn.Module):
             top_k=self.top_k,
             renormalize=config.norm_topk_prob,
         )
-        self.experts = nn.ModuleList(
-            [
-                DeepseekMLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.moe_intermediate_size,
-                    hidden_act=config.hidden_act,
-                    quant_config=quant_config,
-                    reduce_results=False,
-                    prefix=add_prefix(f"{idx}.experts", prefix),
-                )
-                for idx in range(self.n_routed_experts)
-            ]
-        )
-        self.pack_params()
+        if _is_npu:
+            self.layer_id = layer_id
+            self.experts = get_moe_impl_class(quant_config)(
+                layer_id=self.layer_id,
+                top_k=config.num_experts_per_tok,
+                num_experts=config.n_routed_experts
+                + get_global_server_args().ep_num_redundant_experts,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                quant_config=quant_config,
+                prefix=add_prefix("experts", prefix),
+            )
+        else:
+            self.experts = nn.ModuleList(
+                [
+                    DeepseekMLP(
+                        hidden_size=config.hidden_size,
+                        intermediate_size=config.moe_intermediate_size,
+                        hidden_act=config.hidden_act,
+                        quant_config=quant_config,
+                        reduce_results=False,
+                        prefix=add_prefix(f"{idx}.experts", prefix),
+                    )
+                    for idx in range(self.n_routed_experts)
+                ]
+            )
+            self.pack_params()
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -148,6 +181,13 @@ class DeepseekMoE(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
             )
+
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+        ]
 
     def pack_params(self):
         w1 = []
@@ -176,13 +216,16 @@ class DeepseekMoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe.fused_moe(
-            hidden_states,
-            w1=self.w1,
-            w2=self.w2,
-            topk_output=topk_output,
-            moe_runner_config=MoeRunnerConfig(inplace=True),
-        )
+        if _is_npu:
+            final_hidden_states = self.experts(hidden_states, topk_output)
+        else:
+            final_hidden_states = fused_moe.fused_moe(
+                hidden_states,
+                w1=self.w1,
+                w2=self.w2,
+                topk_output=topk_output,
+                moe_runner_config=MoeRunnerConfig(inplace=True),
+            )
 
         if self.config.n_shared_experts is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -311,6 +354,7 @@ class DeepseekDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                layer_id=layer_id,
             )
         else:
             self.mlp = DeepseekMLP(
@@ -364,21 +408,52 @@ class DeepseekModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
-        self.layers = nn.ModuleList(
-            [
-                DeepseekDecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
+        if _is_npu:
+            self.pp_group = get_pp_group()
+            if self.pp_group.is_first_rank:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    enable_tp=not is_dp_attention_enabled(),
+                    prefix=add_prefix("embed_tokens", prefix),
                 )
-                for layer_id in range(config.num_hidden_layers)
-            ]
-        )
+            else:
+                self.embed_tokens = PPMissingLayer()
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+
+        if _is_npu:
+            self.layers, self.start_layer, self.end_layer = make_layers(
+                config.num_hidden_layers,
+                lambda idx, prefix: DeepseekDecoderLayer(
+                    layer_id=idx,
+                    config=config,
+                    quant_config=quant_config,
+                    prefix=prefix,
+                    #alt_stream=alt_stream,
+                ),
+                pp_rank=self.pp_group.rank_in_group,
+                pp_size=self.pp_group.world_size,
+                prefix=add_prefix("layers", prefix),
+            )
+        else:
+            self.start_layer = 0
+            self.end_layer = 0
+            self.layers = nn.ModuleList(
+                [
+                    DeepseekDecoderLayer(
+                        config,
+                        layer_id,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+                    )
+                    for layer_id in range(config.num_hidden_layers)
+                ]
+            )
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -442,6 +517,14 @@ class DeepseekForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -451,14 +534,39 @@ class DeepseekForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-
+        if _is_npu:
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.n_routed_experts,
+            )
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
+                if _is_npu:
+                    # We have mlp.experts[0].gate_proj in the checkpoint.
+                    # Since we handle the experts below in expert_params_mapping,
+                    # we need to skip here BEFORE we update the name, otherwise
+                    # name will be updated to mlp.experts[0].gate_up_proj, which
+                    # will then be updated below in expert_params_mapping
+                    # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                    if "mlp.experts" in name:
+                        continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -473,17 +581,70 @@ class DeepseekForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip experts that are not assigned to this worker.
-                if (
-                    "mlp.experts." in name or "mlp.shared_experts." in name
-                ) and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if _is_npu:
+                    # Track if this is an expert weight to enable early skipping
+                    is_expert_weight = False
+
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        # Mark as expert weight regardless of whether we can process it
+                        is_expert_weight = True
+                        name = name.replace(weight_name, param_name)
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                        break
+                    else:
+                        if is_expert_weight:
+                            # This is an expert weight but not mapped to this rank, skip all remaining processing
+                            continue
+                        # Skip loading extra bias for GPTQ models.
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        # Skip experts that are not assigned to this worker.
+                        if (
+                            "mlp.experts." in name or "mlp.shared_experts." in name
+                        ) and name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, loaded_weight)
+                else:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip experts that are not assigned to this worker.
+                    if (
+                        "mlp.experts." in name or "mlp.shared_experts." in name
+                    ) and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+        if _is_npu:
+            # Lazy initialization of expert weights cache to avoid slowing down load_weights
+            if not hasattr(self, "routed_experts_weights_of_layer"):
+                self.routed_experts_weights_of_layer = {
+                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                    for layer_id in range(self.start_layer, self.end_layer)
+                    if isinstance(self.model.layers[layer_id].mlp, DeepseekMoE)
+                }
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.n_routed_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = DeepseekForCausalLM
