@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.kit_matched_stop import MatchedStopMixin
+from sglang.test.kits.matched_stop_mixin import MatchedStopMixin
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
