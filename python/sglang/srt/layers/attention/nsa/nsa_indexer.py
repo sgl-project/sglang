@@ -484,6 +484,7 @@ class Indexer(CustomOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
+        skip_topk_computation: bool = False,
     ) -> Optional[torch.Tensor]:
         if is_hip():
             from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
@@ -538,6 +539,10 @@ class Indexer(CustomOp):
             index_k_scale=k_scale,
         )
 
+        # Optimization: skip topk calculation if caller (e.g., MHA short path) doesn't need it
+        if skip_topk_computation:
+            return None
+
         if not self.fuse_wk_and_weights_proj:
             weights, _ = self.weights_proj(x)
         weights = self._get_logits_head_gate(weights, q_scale)
@@ -582,6 +587,7 @@ class Indexer(CustomOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
+        skip_topk_computation: bool = False,  # Keep signature consistent; Can be supported in the future
     ) -> torch.Tensor:
         import custom_ops  # noqa: F401
         import torch_npu

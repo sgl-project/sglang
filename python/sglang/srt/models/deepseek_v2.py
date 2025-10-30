@@ -422,10 +422,9 @@ def handle_attention_nsa(attn, forward_batch):
         else:
             max_kv_len = 0
 
-        # B200 with FP8 KV cache must use MLA; B200/H200 with BF16 KV cache can use MHA
-        kv_cache_dtype = get_global_server_args().kv_cache_dtype
-        is_b200_fp8 = _device_sm == 100 and kv_cache_dtype.startswith("fp8")
-        is_supported_gpu = (_device_sm == 90 or _device_sm == 100) and not is_b200_fp8
+        # B200 (SM100) is temporarily disabled for MHA due to FA4 accuracy issues
+        # Currently only H200 (SM90) with FA3 is allowed to use MHA path
+        is_supported_gpu = _device_sm == 90
 
         return (
             AttnForwardMethod.MHA_CHUNKED_KV
@@ -1171,6 +1170,8 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         self.use_nsa = is_deepseek_nsa(config)
         if self.use_nsa:
+            # MHA/MLA selection threshold: MHA for short (<2048), MLA+NSA for long sequences
+            self.nsa_seq_len_threshold = getattr(config, "nsa_seq_len_threshold", 2048)
             self.indexer = Indexer(
                 hidden_size=hidden_size,
                 index_n_heads=get_nsa_index_n_heads(config),
@@ -1191,8 +1192,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                     config, quant_config
                 ),
             )
-            # Threshold for MHA/MLA selection: MHA for short (<2048), MLA+NSA for long sequences
-            self.nsa_seq_len_threshold = getattr(config, "nsa_seq_len_threshold", 2048)
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1518,7 +1517,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 -1, self.num_local_heads, self.qk_head_dim
             )
 
-            # NSA Indexer Call for MHA Path
+            # NSA Indexer Call for MHA Path: only cache quantized keys, skip topk
             if self.use_nsa and _is_extend_without_speculative(forward_batch):
                 _ = self.indexer(
                     x=hidden_states,
@@ -1526,6 +1525,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     positions=positions,
                     forward_batch=forward_batch,
                     layer_id=self.layer_id,
+                    skip_topk_computation=True,  # MHA path doesn't need topk results
                 )
         else:
             q = self.q_proj(hidden_states)[0].view(
