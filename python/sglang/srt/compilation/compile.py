@@ -10,7 +10,7 @@ from typing import Any, Callable, Optional, Union
 
 import torch
 
-from sglang.srt.compilation.compilation_config import CompilationConfig
+from sglang.srt.configs.sglang_config import SGLangConfig
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +122,7 @@ def install_torch_compiled(
     *,
     dynamic_arg_dims: dict[str, Union[int, list[int]]] | None = None,
     backend_factory: Optional[Callable[[torch.fx.GraphModule, list], Callable]] = None,
-    compile_config: CompilationConfig = None,
+    sglang_config: SGLangConfig = None,
     fullgraph: bool = True,
     graph_pool: Any = None,
 ):
@@ -136,7 +136,7 @@ def install_torch_compiled(
     if backend_factory is None:
         from sglang.srt.compilation.backend import SGLangBackend
 
-        backend_factory = lambda gm, ex: SGLangBackend(compile_config, graph_pool)(
+        backend_factory = lambda gm, ex: SGLangBackend(sglang_config, graph_pool)(
             gm, ex
         )
 
