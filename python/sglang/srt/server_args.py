@@ -826,7 +826,7 @@ class ServerArgs:
             capture_bs = (
                 list(range(1, 9, 1))
                 + list(range(10, 33, 2))
-                + list(range(40, 64, 4))
+                + list(range(40, 65, 4))
                 + list(range(72, 257, 8))
                 + list(range(272, self.cuda_graph_max_bs + 1, 16))
             )
@@ -974,6 +974,13 @@ class ServerArgs:
                 self.attention_backend = "trtllm_mha"
                 logger.warning(
                     "Use trtllm_mha as attention backend on sm100 for Llama4 model"
+                )
+            if is_sm100_supported() and self.attention_backend == "trtllm_mha":
+                # TODO(brayden): remove this once TRTLLM MHA kernel for FP8 w/ tileSizeKv=128 is available.
+                # This is a Llama 4 specific issue only.
+                self.kv_cache_dtype = "bfloat16"
+                logger.warning(
+                    "Setting kv_cache_dtype to bfloat16 for Llama4 with trtllm_mha backend, due to a missing FlashInfer TRTLLM MHA kernel for FP8 KV Cache"
                 )
             if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
