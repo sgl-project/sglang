@@ -57,7 +57,7 @@ class MmItemMemoryChunk:
                 "get_global_server_args has not been inited , skip this turn 's recycle"
             )
             tp_num = -1
-        if self.sync_flag.buffer_wrapper.item() == tp_num:
+        if self.sync_flag.buffer_wrapper.item() == float(tp_num):
             self.sync_flag.buffer_wrapper *= 0
             return True
 
