@@ -1,9 +1,8 @@
-import os
-import random
 import unittest
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.test.kits.radix_cache_server_kit import gen_radix_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -14,18 +13,6 @@ from sglang.test.test_utils import (
     kill_process_tree,
     popen_launch_server,
 )
-
-
-def run_test(base_url, nodes):
-    data = {
-        "input_ids": [node["input_ids"] for node in nodes],
-        "sampling_params": [
-            {"max_new_tokens": node["decode_len"], "temperature": 0} for node in nodes
-        ],
-    }
-
-    res = requests.post(base_url + "/generate", json=data)
-    assert res.status_code == 200
 
 
 class TestRadixCacheFCFS(CustomTestCase):
@@ -53,7 +40,16 @@ class TestRadixCacheFCFS(CustomTestCase):
 
     def test_radix_attention(self):
         nodes = gen_radix_tree()
-        run_test(self.base_url, nodes)
+        data = {
+            "input_ids": [node["input_ids"] for node in nodes],
+            "sampling_params": [
+                {"max_new_tokens": node["decode_len"], "temperature": 0}
+                for node in nodes
+            ],
+        }
+
+        res = requests.post(self.base_url + "/generate", json=data)
+        assert res.status_code == 200
 
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
@@ -99,5 +95,5 @@ class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
 
 
 if __name__ == "__main__":
-    os.environ["SGLANG_TEST_RETRACT"] = "true"
+    envs.SGLANG_TEST_RETRACT.set(True)
     unittest.main()
