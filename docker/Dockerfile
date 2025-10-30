@@ -189,11 +189,11 @@ RUN cd /sgl-workspace/DeepEP && \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
       sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
     fi && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
+    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
 # In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
 # latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
-RUN python3 -m pip install --no-cache-dir --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0"
+RUN python3 -m pip install --no-cache-dir --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0" --extra-index-url https://pypi.org/simple/
 
 # For cuda 13, we install triton from source to fix some sm103 issues
 # This can be reverted after >3.4.5 is released
