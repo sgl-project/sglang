@@ -20,6 +20,7 @@ pub mod service_discovery;
 pub mod tokenizer;
 pub mod tool_parser;
 pub mod tree;
+pub mod ha;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
@@ -663,6 +664,7 @@ impl Router {
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
+                ha_server_config: None,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
