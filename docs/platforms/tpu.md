@@ -1,3 +1,3 @@
 # TPU
 
-The support for TPU is under active development. Please stay tuned.
+See https://github.com/sgl-project/sglang-jax

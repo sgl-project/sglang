@@ -3,7 +3,6 @@
 # Adapted from vLLM: https://github.com/vllm-project/vllm/blob/1b9902806915040ac9b3029f2ab7522ec505afc3/vllm/entrypoints/harmony_utils.py
 # Slight differences in processing chat messages
 import datetime
-import json
 from collections.abc import Iterable
 from typing import Literal, Optional, Union
 

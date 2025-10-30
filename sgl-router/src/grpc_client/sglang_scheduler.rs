@@ -1,19 +1,29 @@
-use std::convert::TryFrom;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    convert::TryFrom,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
+
 use tonic::{transport::Channel, Request, Streaming};
 use tracing::{debug, warn};
 
-use crate::protocols::spec::{
-    ChatCompletionRequest, GenerateRequest, ResponseFormat,
-    SamplingParams as GenerateSamplingParams, StringOrArray,
+use crate::protocols::{
+    chat::ChatCompletionRequest,
+    common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
+    generate::GenerateRequest,
+    responses::ResponsesRequest,
+    sampling_params::SamplingParams as GenerateSamplingParams,
 };
 
 // Include the generated protobuf code
+#[allow(clippy::all)]
 pub mod proto {
+    #![allow(clippy::all, unused_qualifications)]
     tonic::include_proto!("sglang.grpc.scheduler");
 }
 
@@ -125,7 +135,6 @@ impl SglangSchedulerClient {
         };
 
         let channel = Channel::from_shared(http_endpoint)?
-            .timeout(Duration::from_secs(600)) // 10 minute timeout for connection
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)
@@ -280,13 +289,49 @@ impl SglangSchedulerClient {
                 input_ids: token_ids,
             }),
             sampling_params: Some(sampling_params),
-            return_logprob: body.return_logprob,
-            logprob_start_len: -1,
-            top_logprobs_num: 0,
-            token_ids_logprob: vec![],
+            return_logprob: body.return_logprob.unwrap_or(false),
+            logprob_start_len: body.logprob_start_len.unwrap_or(-1),
+            top_logprobs_num: body.top_logprobs_num.unwrap_or(0),
+            token_ids_logprob: body.token_ids_logprob.clone().unwrap_or_default(),
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
-            log_metrics: true,
+            log_metrics: body.log_metrics,
+            ..Default::default()
+        };
+
+        Ok(grpc_request)
+    }
+
+    /// Build a GenerateRequest from ResponsesRequest (OpenAI Responses API)
+    pub fn build_generate_request_from_responses(
+        &self,
+        request_id: String,
+        body: &ResponsesRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        harmony_stop_ids: Option<Vec<u32>>,
+    ) -> Result<proto::GenerateRequest, String> {
+        // Build sampling params from ResponsesRequest
+        let mut sampling_params = self.build_grpc_sampling_params_from_responses(body)?;
+
+        // Inject Harmony stop token IDs if provided
+        if let Some(stop_ids) = harmony_stop_ids {
+            sampling_params.stop_token_ids = stop_ids;
+        }
+
+        let grpc_request = proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: processed_text,
+                input_ids: token_ids,
+            }),
+            mm_inputs: None, // Responses API doesn't support multimodal yet
+            sampling_params: Some(sampling_params),
+            return_logprob: false, // Responses API uses top_logprobs field instead
+            logprob_start_len: -1,
+            top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
+            return_hidden_states: false,
+            stream: body.stream.unwrap_or(false),
             ..Default::default()
         };
 
@@ -301,20 +346,12 @@ impl SglangSchedulerClient {
     ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = self.extract_stop_strings(request);
 
-        // Handle max tokens: prefer max_completion_tokens (new) over max_tokens (deprecated)
-        // If neither is specified, use None to let the backend decide the default
-        #[allow(deprecated)]
-        let max_new_tokens = request
-            .max_completion_tokens
-            .or(request.max_tokens)
-            .map(|v| v as i32);
+        let max_new_tokens = request.max_completion_tokens.map(|v| v as i32);
 
         // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
         let skip_special_tokens = if request.tools.is_some() {
             match &request.tool_choice {
-                Some(crate::protocols::spec::ToolChoice::Value(
-                    crate::protocols::spec::ToolChoiceValue::None,
-                )) => request.skip_special_tokens,
+                Some(ToolChoice::Value(ToolChoiceValue::None)) => request.skip_special_tokens,
                 Some(_) => false, // tool_choice is not "none"
                 None => false, // TODO: this assumes tool_choice defaults to "auto" when tools present
             }
@@ -322,7 +359,6 @@ impl SglangSchedulerClient {
             request.skip_special_tokens
         };
 
-        #[allow(deprecated)]
         Ok(proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
@@ -399,6 +435,37 @@ impl SglangSchedulerClient {
             1 => Ok(constraints.pop()),
             _ => Err("Multiple constraints are not allowed.".to_string()),
         }
+    }
+
+    /// Build gRPC SamplingParams from ResponsesRequest
+    fn build_grpc_sampling_params_from_responses(
+        &self,
+        request: &ResponsesRequest,
+    ) -> Result<proto::SamplingParams, String> {
+        // ResponsesRequest doesn't have stop sequences in the same way
+        // Tools are handled externally by MCP loop, not via constraints
+
+        let max_new_tokens = request.max_output_tokens.map(|v| v as i32);
+
+        Ok(proto::SamplingParams {
+            temperature: request.temperature.unwrap_or(1.0),
+            top_p: request.top_p.unwrap_or(1.0),
+            top_k: -1,               // ResponsesRequest doesn't expose top_k
+            min_p: 0.0,              // ResponsesRequest doesn't expose min_p
+            frequency_penalty: 0.0,  // ResponsesRequest doesn't expose frequency_penalty
+            presence_penalty: 0.0,   // ResponsesRequest doesn't expose presence_penalty
+            repetition_penalty: 1.0, // ResponsesRequest doesn't expose repetition_penalty
+            max_new_tokens,
+            stop: vec![],               // No stop sequences in Responses API
+            stop_token_ids: vec![],     // Handled by Harmony stop tokens
+            skip_special_tokens: false, // Keep special tokens for Harmony
+            spaces_between_special_tokens: true,
+            ignore_eos: false,
+            no_stop_trim: false,
+            n: 1,             // Responses API doesn't support n>1
+            constraint: None, // No constraints - tools handled by MCP
+            ..Default::default()
+        })
     }
 
     fn build_single_constraint_from_plain(
@@ -485,10 +552,10 @@ impl SglangSchedulerClient {
                 })?);
         }
 
-        // Handle min_tokens with conversion
-        if let Some(min_tokens) = p.min_tokens {
-            sampling.min_new_tokens = i32::try_from(min_tokens)
-                .map_err(|_| "min_tokens must fit into a 32-bit signed integer".to_string())?;
+        // Handle min_new_tokens with conversion
+        if let Some(min_new_tokens) = p.min_new_tokens {
+            sampling.min_new_tokens = i32::try_from(min_new_tokens)
+                .map_err(|_| "min_new_tokens must fit into a 32-bit signed integer".to_string())?;
         }
 
         // Handle n with conversion

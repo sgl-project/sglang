@@ -14,11 +14,10 @@ limitations under the License.
 """
 
 import logging
-import math
 import threading
 import time
-from queue import Empty, Full, PriorityQueue, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Set, Tuple
+from queue import Empty, Full, Queue
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
@@ -41,7 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
 logger = logging.getLogger(__name__)
 
