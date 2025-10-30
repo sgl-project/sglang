@@ -1,9 +1,7 @@
 import unittest
 
-import requests
-
 from sglang.srt.environ import envs
-from sglang.test.kits.radix_cache_server_kit import gen_radix_tree
+from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -39,17 +37,7 @@ class TestRadixCacheFCFS(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_radix_attention(self):
-        nodes = gen_radix_tree()
-        data = {
-            "input_ids": [node["input_ids"] for node in nodes],
-            "sampling_params": [
-                {"max_new_tokens": node["decode_len"], "temperature": 0}
-                for node in nodes
-            ],
-        }
-
-        res = requests.post(self.base_url + "/generate", json=data)
-        assert res.status_code == 200
+        run_radix_attention_test(self.base_url)
 
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")

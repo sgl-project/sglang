@@ -1,5 +1,7 @@
 import random
 
+import requests
+
 
 def gen_radix_tree(num_nodes=400, chunk_len=256):
     num0 = num_nodes // 2
@@ -33,3 +35,16 @@ def gen_radix_tree(num_nodes=400, chunk_len=256):
 
     random.shuffle(nodes)
     return nodes
+
+
+def run_radix_attention_test(base_url: str):
+    nodes = gen_radix_tree()
+    data = {
+        "input_ids": [node["input_ids"] for node in nodes],
+        "sampling_params": [
+            {"max_new_tokens": node["decode_len"], "temperature": 0} for node in nodes
+        ],
+    }
+
+    res = requests.post(base_url + "/generate", json=data)
+    assert res.status_code == 200
