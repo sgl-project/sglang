@@ -342,18 +342,16 @@ class MooncakeEPDispatcher(BaseDispatcher):
         del self._dispatch_intermediate_state
         return self._get_impl().dispatch_b(*inner_state)
 
-    def combine(self, *args, **kwargs) -> Tuple:
-        self.combine_a(*args, **kwargs)
+    def combine(self, combine_input: CombineInput) -> Tuple:
+        self.combine_a(combine_input)
         ret = self.combine_b()
         return ret
 
     def combine_a(
         self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        overlap_args: Optional = None,
+        combine_input: CombineInput,
     ):
+        hidden_states, topk_ids, topk_weights, overlap_args = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,
