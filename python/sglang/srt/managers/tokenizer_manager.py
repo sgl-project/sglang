@@ -740,6 +740,41 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        default_custom_params: Optional[Dict[str, Any]] = None
+        if isinstance(obj, GenerateReqInput):
+            model_type = getattr(self.model_config.hf_config, "model_type", "")
+            if model_type == "deepseek-ocr":
+                from sglang.srt.configs.deepseek_ocr import (
+                    NGRAM_NO_REPEAT_SIZE,
+                    NGRAM_NO_REPEAT_WHITELIST,
+                    NGRAM_NO_REPEAT_WINDOW,
+                    SKIP_REPEAT,
+                )
+
+                if SKIP_REPEAT:
+                    from sglang.srt.sampling.custom_logit_processor import (
+                        DeepseekOCRNoRepeatNGramLogitProcessor,
+                    )
+
+                    processor_str = (
+                        DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
+                    )
+                    apply_defaults = False
+                    if obj.custom_logit_processor is None:
+                        obj.custom_logit_processor = processor_str
+                        apply_defaults = True
+                    elif obj.custom_logit_processor == processor_str:
+                        apply_defaults = True
+
+                    if apply_defaults:
+                        default_custom_params = {
+                            "ngram_size": NGRAM_NO_REPEAT_SIZE,
+                            "window_size": NGRAM_NO_REPEAT_WINDOW,
+                            "whitelist_token_ids": list(
+                                NGRAM_NO_REPEAT_WHITELIST
+                            ),
+                        }
+
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -747,6 +782,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
+        if default_custom_params is not None:
+            existing_custom_params = sampling_kwargs.get("custom_params") or {}
+            if not isinstance(existing_custom_params, dict):
+                existing_custom_params = dict(existing_custom_params)
+            for key, value in default_custom_params.items():
+                existing_custom_params.setdefault(key, value)
+            sampling_kwargs["custom_params"] = existing_custom_params
         sampling_params = SamplingParams(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)

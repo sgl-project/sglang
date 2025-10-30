@@ -15,6 +15,11 @@ PRINT_NUM_VIS_TOKENS = False
 SKIP_REPEAT = True
 MODEL_PATH = "deepseek-ai/DeepSeek-OCR"  # change to your model path
 
+NGRAM_NO_REPEAT_SIZE = 30
+NGRAM_NO_REPEAT_WINDOW = 90
+# Whitelist `<td>` and `</td>` token ids to allow table structures.
+NGRAM_NO_REPEAT_WHITELIST = (128821, 128822)
+
 PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
 
 
