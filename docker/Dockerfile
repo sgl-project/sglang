@@ -255,7 +255,6 @@ RUN python3 -m pip install --no-cache-dir setuptools-rust \
     && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache
 
-
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
 #!/bin/bash
@@ -278,17 +277,6 @@ RUN chmod +x /usr/local/bin/yank
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
     && git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
     && git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
-
-# Install hf3fs_py_usrbio
-RUN git clone https://github.com/deepseek-ai/3fs 3fs \
-      && cd 3fs \
-      && git checkout 6f029c439d0d22995900ca357d51b37975c6ffb5 \
-      && git submodule update --init --recursive \
-      && ./patches/apply.sh \
-      && CMAKE_BUILD_PARALLEL_LEVEL=32 python3 setup.py bdist_wheel -d dist \
-      && pip install dist/*.whl \
-      && cd .. \
-      && rm -rf 3fs
 
 # Configure Vim
 COPY --chown=root:root <<-"EOF" /root/.vimrc
