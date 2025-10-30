@@ -53,6 +53,7 @@ if _is_cuda or _is_xpu:
     if _is_flashinfer_available:
         try:
             from flashinfer.norm import layernorm
+
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
             _flashinfer_layernorm_available = False
@@ -310,30 +311,22 @@ class LayerNorm(CustomOp):
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
         self.elementwise_affine = elementwise_affine
+        self.use_bias = bias
         self.dtype = dtype
-        
-        if self.elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(hidden_size, dtype=self.dtype))
-            if bias:
-                self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=self.dtype))
-            else:
-                self.register_parameter("bias", None)
-        else:
-            self.register_parameter("weight", None)
-            self.register_parameter("bias", None)
+
+        self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=self.dtype))
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=self.dtype))
 
     def forward_cuda(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.elementwise_affine:
-            return self.forward_native(x)
-        
-        if _flashinfer_layernorm_available and x.dtype == torch.bfloat16 and self.dtype == torch.float32:
-            beta = self.bias if self.bias is not None else torch.zeros_like(self.weight)
-            return layernorm(
-                x, self.weight, beta, self.variance_epsilon
-            )
+        if (
+            _flashinfer_layernorm_available
+            and x.dtype == torch.bfloat16
+            and self.dtype == torch.float32
+        ):
+            return layernorm(x, self.weight, self.bias, self.variance_epsilon)
         else:
             return self.forward_native(x)
 
@@ -341,15 +334,17 @@ class LayerNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.elementwise_affine:
-            return F.layer_norm(x, (self.hidden_size,), eps=self.variance_epsilon)
-        
+        weight = self.weight if self.elementwise_affine else None
+        bias = self.bias if self.use_bias else None
         orig_dtype = x.dtype
         x = x.to(self.dtype)
-        if self.bias is not None:
-            return F.layer_norm(x, (self.hidden_size,), weight=self.weight, bias=self.bias, eps=self.variance_epsilon).to(orig_dtype)
-        
-        return F.layer_norm(x, (self.hidden_size,), weight=self.weight, eps=self.variance_epsilon).to(orig_dtype)
+        return F.layer_norm(
+            x,
+            (self.hidden_size,),
+            weight=self.weight,
+            bias=bias,
+            eps=self.variance_epsilon,
+        ).to(orig_dtype)
 
     def forward_hip(
         self,
@@ -363,16 +358,16 @@ class LayerNorm(CustomOp):
     ) -> torch.Tensor:
         orig_dtype = x.dtype
         x = x.to(self.dtype)
-        
+
         mean = x.mean(dim=-1, keepdim=True)
         variance = (x - mean).pow(2).mean(dim=-1, keepdim=True)
         x = (x - mean) * torch.rsqrt(variance + self.variance_epsilon)
-        
+
         if self.elementwise_affine:
             x = x * self.weight.to(self.dtype)
-            if self.bias is not None:
+            if self.use_bias:
                 x = x + self.bias.to(self.dtype)
-        
+
         return x.to(orig_dtype)
 
     def forward_cpu(

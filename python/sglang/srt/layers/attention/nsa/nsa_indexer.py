@@ -4,9 +4,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
-import torch.nn.functional as F
 from einops import rearrange
-from torch import nn
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
@@ -147,7 +145,7 @@ class Indexer(CustomOp):
                 bias=False,
                 prefix=add_prefix("weights_proj", prefix),
             )
-        self.k_norm = LayerNorm(self.head_dim)
+        self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,
