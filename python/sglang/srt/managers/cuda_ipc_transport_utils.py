@@ -193,7 +193,7 @@ class CudaIpcTensorTransportProxy:
                 f"Input 'data' must be a torch.Tensor, but got {type(data)}"
             )
 
-        self.proxy_state = self.get_proxy(data, info_data)
+        self.proxy_state = self.get_proxy_state(data, info_data)
         self.reconstruct_tensor = None
         self.sync_data_meta = sync_buffer_meta
         self.sync_buffer = None
@@ -212,7 +212,7 @@ class CudaIpcTensorTransportProxy:
         self.sync_buffer.close()
         self.sync_buffer = None
 
-    def get_proxy(self, data, info_data):
+    def get_proxy_state(self, data, info_data):
         # acquire all serialize metadata from _metadata
         state = {}
 
