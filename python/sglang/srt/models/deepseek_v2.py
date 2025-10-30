@@ -516,6 +516,9 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
+        if get_global_server_args().enable_deterministic_inference:
+            return F.linear(hidden_states, self.weight, None)
+
         # NOTE: For some unknown reason, router_gemm seems degrade accept length.
         if (
             _is_cuda
