@@ -3669,11 +3669,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 if use_async_loading:
                                     futures.append(
                                         executor.submit(
-                                            weight_loader, param, loaded_weight
+                                            weight_loader, param, fused_weight
                                         )
                                     )
                                 else:
-                                    weight_loader(param, loaded_weight)
+                                    weight_loader(param, fused_weight)
                                 cached_wk_and_weights_proj.pop(wk_name)
                                 cached_wk_and_weights_proj.pop(weights_proj_name)
                         else:
