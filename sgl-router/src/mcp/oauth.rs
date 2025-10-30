@@ -1,4 +1,6 @@
-// OAuth authentication support for MCP servers
+//! OAuth authentication for MCP servers.
+//!
+//! Handles OAuth flow including callback server and token exchange.
 
 use std::{net::SocketAddr, sync::Arc};
 
