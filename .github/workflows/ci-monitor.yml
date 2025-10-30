@@ -3,8 +3,6 @@ name: CI Monitor
 on:
   schedule:
     - cron: '0 */12 * * *' # Every 12 hours for main analysis
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
     inputs:
       limit:
