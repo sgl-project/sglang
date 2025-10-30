@@ -559,7 +559,7 @@ def latency_test_run_once(
     for i in range(output_len - 1):
         synchronize(device)
         profiler = None
-        if enable_profile_decode and i == step_of_interest:
+        if enable_profile_decode and i == profile_step_of_interest:
             profiler = start_profile(
                 profiler_activities,
                 profile_record_shapes=profile_record_shapes,
@@ -571,7 +571,7 @@ def latency_test_run_once(
         synchronize(device)
         latency = time.perf_counter() - tic
 
-        if enable_profile_decode and i == step_of_interest:
+        if enable_profile_decode and i == profile_step_of_interest:
             trace_filename = _create_torch_profiler_filename(
                 profile_filename_prefix, batch_size, input_len, output_len, "decode"
             )
