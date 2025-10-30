@@ -857,6 +857,10 @@ pub struct ResponsesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
+    /// Safety identifier for content moderation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+
     /// Additional metadata
     #[serde(default)]
     pub metadata: HashMap<String, Value>,
