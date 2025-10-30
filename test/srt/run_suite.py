@@ -54,7 +54,7 @@ suites = {
         TestFile("openai_server/features/test_openai_server_ebnf.py", 20),
         TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
         TestFile("openai_server/features/test_reasoning_content.py", 89),
-        TestFile("openai_server/features/test_lora_openai_compatible.py", 120),
+        TestFile("openai_server/features/test_lora_openai_compatible.py", 150),
         TestFile("openai_server/function_call/test_openai_function_calling.py", 60),
         TestFile("openai_server/function_call/test_tool_choice.py", 120),
         TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
@@ -137,7 +137,7 @@ suites = {
         TestFile("test_triton_sliding_window.py", 100),
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 170),
-        TestFile("test_vision_openai_server_a.py", 800),
+        TestFile("test_vision_openai_server_a.py", 900),
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_modelopt_loader.py", 30),
         TestFile("test_modelopt_export.py", 30),
@@ -276,7 +276,7 @@ suite_amd = {
         TestFile("test_torch_compile.py", 169),
         TestFile("test_torch_compile_moe.py", 210),
         TestFile("test_torch_native_attention_backend.py", 123),
-        TestFile("test_triton_attention_backend.py", 150),
+        TestFile("test_triton_attention_backend.py", 250),
         TestFile("test_wave_attention_kernels.py", 2),
         # Disabled temporarily
         # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
