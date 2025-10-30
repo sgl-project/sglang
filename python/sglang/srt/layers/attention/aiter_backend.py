@@ -843,7 +843,6 @@ class AiterAttnBackend(AttentionBackend):
                 device="cuda",
             ).fill_(-1)
 
-
             reduce_indptr = torch.empty(
                 [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
             )
@@ -856,14 +855,6 @@ class AiterAttnBackend(AttentionBackend):
 
             page_size = 1
             nhead_kv = 1
-            mtp = 1
-
-            split_params = {
-                "kv_granularity": max(page_size, 16),
-                "max_seqlen_qo": self.forward_metadata.max_q_len,
-                "uni_seqlen_qo": mtp,
-                "fast_mode": 1,
-            }
 
             meta = get_mla_metadata_v1(
                 self.forward_metadata.qo_indptr,
@@ -891,6 +882,8 @@ class AiterAttnBackend(AttentionBackend):
                 kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
             else:
                 q_input = q
+                q_scale = None
+                kv_scale = None
 
             mla_decode_fwd(
                 q_input.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -903,12 +896,12 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata.max_q_len,
                 layer.scaling,
                 layer.logit_cap,
-                work_meta_data=work_meta_data,
-                work_indptr=work_indptr,
-                work_info_set=work_info_set,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
+                #work_meta_data=work_meta_data,
+                #work_indptr=work_indptr,
+                #work_info_set=work_info_set,
+                #reduce_indptr=reduce_indptr,
+                #reduce_final_map=reduce_final_map,
+                #reduce_partial_map=reduce_partial_map,
                 q_scale=q_scale,
                 kv_scale=kv_scale,
             )
