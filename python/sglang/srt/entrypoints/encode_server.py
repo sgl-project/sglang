@@ -1,6 +1,7 @@
 import asyncio
 from typing import Optional
 
+import numpy as np
 import torch
 import uvicorn
 import zmq
@@ -18,7 +19,10 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.dp_attention import initialize_dp_attention
-from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
+from sglang.srt.managers.multimodal_processor import (
+    get_mm_processor_cls,
+    import_processors,
+)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.processors.qwen_vl import (
@@ -57,13 +61,28 @@ class EmbeddingData:
         return len(self.embedding_dict) == self.num_parts
 
 
+def _convert(data):
+    if type(data) == torch.Tensor:
+        return data
+    elif type(data) == np.ndarray:
+        return torch.tensor(data)
+    elif type(data) == list and type(data[0]) == np.ndarray:
+        return torch.tensor(np.array(data))
+    elif type(data) == list and type(data[0]) in [int, float]:
+        return torch.tensor(data)
+    else:
+        return data
+
+
 class ImageEncoder:
     def __init__(self, server_args: ServerArgs):
         self.server_args = server_args
         set_global_server_args_for_scheduler(server_args)
 
         self.image_processor = AutoImageProcessor.from_pretrained(
-            server_args.model_path, trust_remote_code=server_args.trust_remote_code
+            server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            use_fast=True,
         )
 
         self.model_config = ModelConfig.from_server_args(
@@ -100,6 +119,7 @@ class ImageEncoder:
         self.context = zmq.asyncio.Context(2)
         self.send_to_prefill_sockets = dict()
 
+        import_processors("sglang.srt.multimodal.processors")
         self.processor_cls = get_mm_processor_cls(self.model_config.hf_config)
 
     async def encode(self, mm_items):
@@ -112,21 +132,19 @@ class ImageEncoder:
 
         images_input = self.image_processor(images=images)
         feature = images_input["pixel_values"]
-        if type(feature) is not torch.Tensor:
-            feature = torch.tensor(feature)
         mm_item = MultimodalDataItem.from_dict(
             {
                 "modality": Modality.IMAGE,
-                "feature": feature,
+                "feature": _convert(feature),
             }
         )
         for k, v in images_input.items():
             if k == "pixel_values":
                 continue
-            if type(v) is not torch.Tensor:
-                v = torch.tensor(v)
-            mm_item.set(k, v)
+            mm_item.set(k, _convert(v))
         mm_embedding = self.model.get_image_feature([mm_item])
+        if len(mm_embedding.shape) == 3:
+            mm_embedding = mm_embedding.squeeze(0)
         return mm_embedding
 
     def send(self, send_data, prefill_ip):
