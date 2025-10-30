@@ -50,21 +50,21 @@ jobs:
 
       - name: Run Performance Analysis
         env:
-          GITHUB_TOKEN: ${{ secrets.CI_MONITOR }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           PYTHONUNBUFFERED: 1
           PYTHONIOENCODING: utf-8
         run: |
           cd scripts/ci_monitor
-          python ci_analyzer_perf.py --token $GITHUB_TOKEN --limit ${{ inputs.limit || '1000' }} --output-dir performance_tables_$(date +%Y%m%d_%H%M%S)
+          python ci_analyzer_perf.py --token $GITHUB_TOKEN --limit ${{ inputs.limit || '1000' }} --output-dir performance_tables_$(date +%Y%m%d_%H%M%S) --upload-to-github
 
-      # - name: Upload Analysis Results
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: ci-analysis-results-${{ github.run_number }}
-      #     path: |
-      #       scripts/ci_monitor/ci_analysis_*.json
-      #       scripts/ci_monitor/performance_tables_*
-      #     retention-days: 30
+      - name: Upload Analysis Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-analysis-results-${{ github.run_number }}
+          path: |
+            scripts/ci_monitor/ci_analysis_*.json
+            scripts/ci_monitor/performance_tables_*
+          retention-days: 30
 
   ci-monitor-balance:
     needs: ci-monitor
@@ -93,11 +93,11 @@ jobs:
           cd scripts/ci_monitor
           python ci_analyzer_balance.py --token $GITHUB_TOKEN --limit ${{ inputs.limit || '1000' }} --output test_balance_report_$(date +%Y%m%d_%H%M%S).json
 
-      # - name: Upload Balance Analysis Results
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: test-balance-results-${{ github.run_number }}
-      #     path: |
-      #       scripts/ci_monitor/test_balance_report_*.json
-      #       scripts/ci_monitor/test_balance_report_*.csv
-      #     retention-days: 30
+      - name: Upload Balance Analysis Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-balance-results-${{ github.run_number }}
+          path: |
+            scripts/ci_monitor/test_balance_report_*.json
+            scripts/ci_monitor/test_balance_report_*.csv
+          retention-days: 30
