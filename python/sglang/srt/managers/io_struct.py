@@ -227,8 +227,8 @@ class GenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
-    # OpenTelemetry trace headers
-    trace_headers: Optional[Dict[str, str]] = None
+    # tracing context
+    trace_context: Optional[Dict] = None
 
     def contains_mm_input(self) -> bool:
         return (

@@ -35,12 +35,12 @@ from typing import Any, Dict, List, Mapping, Optional
 logger = logging.getLogger(__name__)
 opentelemetry_imported = False
 tracing_enabled = False
+_trace_context_propagator = None
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
 
 try:
     from opentelemetry import context, propagate, trace
-    from opentelemetry.context.context import Context
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.sdk.trace import TracerProvider, id_generator
@@ -48,6 +48,8 @@ try:
     from opentelemetry.trace.propagation.tracecontext import (
         TraceContextTextMapPropagator,
     )
+
+    _trace_context_propagator = TraceContextTextMapPropagator()
 
     opentelemetry_imported = True
 except ImportError:
@@ -63,7 +65,7 @@ def is_tracing_enabled() -> bool:
     return tracing_enabled
 
 
-def extract_trace_headers(headers: Mapping[str, str]) -> Mapping[str, str]:
+def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
     return {h: headers[h] for h in TRACE_HEADERS if h in headers}
 
 
@@ -409,7 +411,7 @@ def trace_req_start(
     bootstrap_room: Optional[int] = None,
     ts: Optional[int] = None,
     role: Optional[str] = "null",
-    trace_headers: Optional[Dict[str, str]] = None,
+    trace_context: Optional[Dict[str, str]] = None,
 ):
     if not tracing_enabled:
         return
@@ -432,12 +434,11 @@ def trace_req_start(
         is_copy=False,
     )
 
-    trace_context = extract_trace_context(trace_headers)
-
     # create bootstrap room span
     tracer = threads_info[pid].tracer
     if str(bootstrap_room) not in remote_trace_contexts:
         attrs = {"bootstrap_room": str(hex(bootstrap_room))}
+        trace_context = _trace_context_propagator.extract(trace_context)
         bootstrap_room_span = tracer.start_span(
             name=f"Bootstrap Room {hex(bootstrap_room)}",
             start_time=ts,
@@ -704,11 +705,3 @@ def trace_event_batch(
 
     for req in reqs:
         trace_event(name, req.rid, ts=ts, attrs=attrs)
-
-
-def extract_trace_context(headers: Optional[Mapping[str, str]]) -> Optional[Context]:
-    if tracing_enabled:
-        headers = headers or {}
-        return TraceContextTextMapPropagator().extract(headers)
-    else:
-        return None
