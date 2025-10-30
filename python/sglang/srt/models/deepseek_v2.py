@@ -3450,6 +3450,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             params_dict = dict(self.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
+                # Use async multi-threading only for host memory (CPU) tensors to overlap data transfer.
+                # For device memory (GPU) tensors, multi-threading adds overhead without benefit.
+                use_async_loading = loaded_weight.device.type == "cpu"
                 layer_id = get_layer_id(name)
                 if (
                     layer_id is not None
@@ -3517,9 +3520,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    futures.append(
-                        executor.submit(weight_loader, param, loaded_weight, shard_id)
-                    )
+                    if use_async_loading:
+                        futures.append(
+                            executor.submit(
+                                weight_loader, param, loaded_weight, shard_id
+                            )
+                        )
+                    else:
+                        weight_loader(param, loaded_weight, shard_id)
                     break
                 else:
                     for mapping in expert_params_mapping:
@@ -3529,16 +3537,25 @@ class DeepseekV2ForCausalLM(nn.Module):
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
                         weight_loader = param.weight_loader
-                        futures.append(
-                            executor.submit(
-                                weight_loader,
+                        if use_async_loading:
+                            futures.append(
+                                executor.submit(
+                                    weight_loader,
+                                    param,
+                                    loaded_weight,
+                                    name,
+                                    shard_id=shard_id,
+                                    expert_id=expert_id,
+                                )
+                            )
+                        else:
+                            weight_loader(
                                 param,
                                 loaded_weight,
                                 name,
                                 shard_id=shard_id,
                                 expert_id=expert_id,
                             )
-                        )
                         break
                     else:
                         # Skip loading extra bias for GPTQ models.
@@ -3597,9 +3614,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
-                                futures.append(
-                                    executor.submit(weight_loader, param, fused_weight)
-                                )
+                                if use_async_loading:
+                                    futures.append(
+                                        executor.submit(
+                                            weight_loader, param, fused_weight
+                                        )
+                                    )
+                                else:
+                                    weight_loader(param, fused_weight)
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
                         elif fuse_wk_and_weights_proj and (
@@ -3644,9 +3666,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
-                                futures.append(
-                                    executor.submit(weight_loader, param, fused_weight)
-                                )
+                                if use_async_loading:
+                                    futures.append(
+                                        executor.submit(
+                                            weight_loader, param, loaded_weight
+                                        )
+                                    )
+                                else:
+                                    weight_loader(param, loaded_weight)
                                 cached_wk_and_weights_proj.pop(wk_name)
                                 cached_wk_and_weights_proj.pop(weights_proj_name)
                         else:
@@ -3670,9 +3697,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            futures.append(
-                                executor.submit(weight_loader, param, loaded_weight)
-                            )
+                            if use_async_loading:
+                                futures.append(
+                                    executor.submit(weight_loader, param, loaded_weight)
+                                )
+                            else:
+                                weight_loader(param, loaded_weight)
 
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
