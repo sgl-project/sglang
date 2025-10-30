@@ -2033,7 +2033,7 @@ async def benchmark(
     ):
         result = {
             # Arguments
-            "tag": args.tag,
+            "tag": getattr(args, "tag", None),
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,

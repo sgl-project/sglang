@@ -27,13 +27,7 @@ docker pull lmsysorg/sglang:dsv32-a3
 git clone https://github.com/sgl-project/sglang
 cd sglang
 pip3 install pip --upgrade
-pip3 install -e "python[all]"
-
-# Install flash_mla
-git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla
-cd flash-mla
-git submodule update --init --recursive
-pip install -v .
+pip3 install -e "python"
 ```
 ## Launch DeepSeek V3.2 with SGLang
 
