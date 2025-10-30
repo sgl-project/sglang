@@ -709,7 +709,7 @@ class Req:
             return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
 
     def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
-        """Return the range of unreleased KV cache and mark them as freed."""
+        """Return the range of over-allocated KV cache and mark them as freed."""
 
         # NOTE: This function is called when there is over-allocation of KV cache.
         # Over-allocation: we allocate more KV cache then the committed length.
