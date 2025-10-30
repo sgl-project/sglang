@@ -7,6 +7,7 @@ edition = "2021"
 default = ["grpc-client"]
 grpc-client = []
 grpc-server = []
+vendored-openssl = ["openssl/vendored"]
 
 [lints.rust]
 unused_qualifications = "warn"
@@ -36,8 +37,9 @@ rand = "0.9.2"
 reqwest = { version = "0.12.8", features = ["stream", "blocking", "json", "rustls-tls"], default-features = false }
 futures-util = "0.3"
 futures = "0.3"
-pyo3 = { version = "0.27.1", features = ["extension-module"] }
+pyo3 = { version = "0.27.1", features = ["extension-module", "abi3-py38"] }
 dashmap = "6.1.0"
+lru = "0.16.2"
 blake3 = "1.5"
 http = "1.1.0"
 tokio = { version = "1.42.0", features = ["full"] }
@@ -66,6 +68,7 @@ tiktoken-rs = { version = "0.7.0" }
 minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins"] }
 minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+openssl = "0.10.73"
 hf-hub = { version = "0.4.3", features = ["tokio"] }
 rmcp = { version = "0.8.3", features = ["client", "server",
     "transport-child-process",
@@ -80,6 +83,7 @@ oracle = { version = "0.6.3", features = ["chrono"] }
 subtle = "2.6"
 rustpython-parser = "0.4.0"
 num-traits = "0.2"
+openai-harmony = { git = "https://github.com/openai/harmony", tag = "v0.0.4" }
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.14.2", features = ["gzip", "transport"] }
@@ -119,14 +123,21 @@ harness = false
 path = "benches/tool_parser_benchmark.rs"
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
+opt-level = "z"     # Optimize for size
+lto = "fat"         # Full LTO for smaller binaries
+codegen-units = 1   # Better optimization, slower compile
+strip = true        # Strip debug symbols
 
 [profile.dev]
 opt-level = 0
-debug = true
+debug = 1
 split-debuginfo = "unpacked"
 incremental = true
+codegen-units = 256
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
 
 
 [profile.dev.build-override]
