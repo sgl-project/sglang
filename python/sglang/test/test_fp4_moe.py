@@ -3,9 +3,12 @@ from typing import Callable
 
 import pytest
 import torch
-from flashinfer import fp4_quantize
+from flashinfer import (
+    fp4_quantize,
+    scaled_fp4_grouped_quantize,
+)
 from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-from sgl_kernel import scaled_fp4_grouped_quant, scaled_fp4_quant
+from sgl_kernel import scaled_fp4_quant
 from torch.nn import functional as F
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -191,16 +194,16 @@ def flashinfer_cutedsl_grouped_gemm_nt_masked(
 
     # hidden_states: [l, m, k]
     # weights: [l, n, k]
-    aq, aq_sf = scaled_fp4_grouped_quant(
+    aq, aq_sf = scaled_fp4_grouped_quantize(
         hidden_states,
-        input_global_scale,
         masked_m.to(hidden_states.device),
+        input_global_scale,
     )
     num_experts, n, k = weights.shape
-    bq, bq_sf = scaled_fp4_grouped_quant(
+    bq, bq_sf = scaled_fp4_grouped_quantize(
         weights,
-        w_global_scale,
         torch.ones(num_experts, device=weights.device, dtype=torch.int32) * n,
+        w_global_scale,
     )
 
     out = torch.zeros(
@@ -499,15 +502,15 @@ def test_flashinfer_cutedsl_moe_masked(
         (num_experts,), dtype=torch.float32, device=hidden_states.device
     )  # assume intermediate scale is 1.0
 
-    w1_fp4, w1_blockscale = scaled_fp4_grouped_quant(
+    w1_fp4, w1_blockscale = scaled_fp4_grouped_quantize(
         w1,
-        w1_global_scale,
         torch.ones(num_experts, dtype=torch.int32, device=w1.device) * 2 * inter_dim,
+        w1_global_scale,
     )
-    w2_fp4, w2_blockscale = scaled_fp4_grouped_quant(
+    w2_fp4, w2_blockscale = scaled_fp4_grouped_quantize(
         w2,
-        w2_global_scale,
         torch.ones(num_experts, dtype=torch.int32, device=w2.device) * hidden_dim,
+        w2_global_scale,
     )
 
     w1_alpha = 1.0 / (input_global_scale * w1_global_scale)
