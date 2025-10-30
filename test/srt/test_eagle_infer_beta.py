@@ -88,5 +88,9 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         assert self.process.poll() is None
 
 
+class TestEagleServerPage(TestEagleServerBase):
+    other_launch_args = ["--page-size", "64"]
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -714,13 +714,8 @@ class Req:
         # Over-allocation: we allocate more KV cache then the committed length.
         # e.g., speculative decoding may allocate more KV cache than actually used.
         assert self.kv_freed_len == self.kv_committed_len
-        page_size = get_global_server_args().page_size
-
-        if page_size == 1:
-            self.kv_freed_len = self.kv_allocated_len
-            return self.kv_committed_len, self.kv_allocated_len
-        else:
-            raise NotImplementedError()
+        self.kv_freed_len = self.kv_allocated_len
+        return self.kv_committed_len, self.kv_allocated_len
 
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:

@@ -296,9 +296,8 @@ class SchedulerOutputProcessorMixin:
             req: Req
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
-                indices_to_free = None
+                start_p, end_p = req.pop_all_kv_cache()
                 if batch.spec_algorithm.is_eagle():
-                    start_p, end_p = req.pop_all_kv_cache()
                     if self.page_size > 1:
                         start_p = ceil_align(start_p, self.page_size)
 
@@ -308,7 +307,6 @@ class SchedulerOutputProcessorMixin:
 
                     self.token_to_kv_pool_allocator.free(indices_to_free)
                 else:
-                    start_p, end_p = req.pop_all_kv_cache()
                     assert start_p == end_p, f"{start_p=}, {end_p=}"
 
                 continue
