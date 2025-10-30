@@ -177,24 +177,27 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         if not hasattr(config, "hidden_size"):
             config.hidden_size = config.text_config.hidden_size
 
-        self.vision_tower = SiglipVisionModel(
-            config=config.vision_config,
-            quant_config=quant_config,
-            prefix=add_prefix("vision_tower", prefix),
-        )
+        if not self.config.language_only:
+            self.vision_tower = SiglipVisionModel(
+                config=config.vision_config,
+                quant_config=quant_config,
+                prefix=add_prefix("vision_tower", prefix),
+            )
 
-        self.multi_modal_projector = Gemma3MultiModalProjector(config)
+            self.multi_modal_projector = Gemma3MultiModalProjector(config)
+
         self.vocab_size = config.text_config.vocab_size
 
-        # Text model
-        self.language_model = Gemma3ForCausalLM(
-            config.text_config,
-            quant_config,
-            prefix=add_prefix("language_model", prefix),
-        )
-        if self.language_model.logits_processor.logit_scale:
-            logit_scale = getattr(config, "logit_scale", 1.0)
-            self.language_model.logits_processor.logit_scale *= logit_scale
+        if not self.config.mm_only:
+            # Text model
+            self.language_model = Gemma3ForCausalLM(
+                config.text_config,
+                quant_config,
+                prefix=add_prefix("language_model", prefix),
+            )
+            if self.language_model.logits_processor.logit_scale:
+                logit_scale = getattr(config, "logit_scale", 1.0)
+                self.language_model.logits_processor.logit_scale *= logit_scale
         self.post_init()
 
     def pad_input_ids(
@@ -287,6 +290,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         """
         return self.language_model.get_attention_sliding_window_size()
 
+    def dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
+
     def get_image_feature(self, items: List[MultimodalDataItem]):
         """
         Projects the last hidden state from the vision model into language model space.
@@ -314,7 +320,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             for i in range(batch_size):
                 pixel_value = pixel_values_batch[i : i + 1]  # Keep batch dimension as 1
                 pixel_value = pixel_value.to(
-                    device=self.vision_tower.device, dtype=self.language_model.dtype()
+                    device=self.vision_tower.device, dtype=self.dtype()
                 )
                 vision_output = self.vision_tower(pixel_values=pixel_value)
                 vision_outputs_list.append(vision_output)
@@ -397,7 +403,8 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         return bool(self.lora_pattern.match(module_name))
 
     def tie_weights(self):
-        return self.language_model.tie_weights()
+        if not self.config.mm_only:
+            return self.language_model.tie_weights()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -428,6 +435,11 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    # Skip loading visual/language model weights
+                    if (
+                        self.config.mm_only or self.config.language_only
+                    ) and name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
@@ -438,6 +450,11 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                         name = name.replace(".self_attn.out_proj", ".self_attn.proj")
                     # Skip loading extra bias for GPTQ models
                     if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip loading visual/language model weights
+                    if (
+                        self.config.mm_only or self.config.language_only
+                    ) and name not in params_dict:
                         continue
                     # Remapping the name of FP8 kv-scale
                     name = maybe_remap_kv_scale_name(name, params_dict)
