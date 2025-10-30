@@ -408,8 +408,8 @@ def handle_attention_nsa(attn, forward_batch):
     - Decode: MLA (avoids per-token decompression)
     - Prefill <= 2048: MHA (topk ineffective, MHA has lower FLOPs)
     - Prefill > 2048: MLA (topk filtering reduces computation significantly)
-    
-    Note: B200 (SM100) with FP8 KV cache always uses MLA due to compatibility constraints.
+
+    TODO: B200 (SM100) MHA path is temporarily disabled due to FA4 gpqa accuracy issues.
     """
     if forward_batch.forward_mode.is_decode_or_idle():
         return AttnForwardMethod.MLA
