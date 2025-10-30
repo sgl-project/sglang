@@ -129,7 +129,6 @@ def _selective_scan_update_kernel(
     if HAS_Z:
         z_ptr += pid_b * stride_z_batch + pid_h * stride_z_head
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
-
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
     state_ptrs = state_ptr + (
