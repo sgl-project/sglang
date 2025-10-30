@@ -1137,10 +1137,10 @@ class AscendTokenToKVPool(MHATokenToKVPool):
         torch_npu._npu_reshape_and_cache(
             key=cache_k,
             value=cache_v,
-            key_cache=self.k_buffer[layer_id].view(
+            key_cache=self.k_buffer[layer_id - self.start_layer].view(
                 -1, self.page_size, self.head_num, self.head_dim
             ),
-            value_cache=self.v_buffer[layer_id].view(
+            value_cache=self.v_buffer[layer_id - self.start_layer].view(
                 -1, self.page_size, self.head_num, self.head_dim
             ),
             slot_indices=loc,

@@ -2033,6 +2033,7 @@ async def benchmark(
     ):
         result = {
             # Arguments
+            "tag": getattr(args, "tag", None),
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,
@@ -2626,6 +2627,9 @@ if __name__ == "__main__":
             "toolagent",
         ],
         help="Underlying workload for the mooncake dataset.",
+    )
+    parser.add_argument(
+        "--tag", type=str, default=None, help="The tag to be dumped to output."
     )
     args = parser.parse_args()
     run_benchmark(args)

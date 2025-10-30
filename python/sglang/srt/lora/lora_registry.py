@@ -205,3 +205,12 @@ class LoRARegistry:
         Returns the total number of LoRA adapters currently registered.
         """
         return len(self._registry)
+
+    def get_all_adapters(self) -> Dict[str, LoRARef]:
+        """
+        Returns a dictionary of all registered LoRA adapters.
+
+        Returns:
+            Dict[str, LoRARef]: A dictionary mapping LoRA names to LoRARef objects.
+        """
+        return dict(self._registry)

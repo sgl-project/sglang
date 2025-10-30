@@ -80,6 +80,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         tool_choice: Some(ToolChoice::default()),
         tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
+            function: None,
             server_url: Some(mcp.url()),
             authorization: None,
             server_label: Some("mock".to_string()),

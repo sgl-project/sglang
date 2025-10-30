@@ -1,43 +1,36 @@
-// MCP Tool Inventory with TTL-based Caching
-//
-// This module provides TTL-based caching for MCP tools, prompts, and resources.
-// Tools are cached with timestamps and automatically expire after the configured TTL.
-// Background refresh tasks can proactively update the inventory.
-
-use std::time::{Duration, Instant};
+//! MCP tool, prompt, and resource inventory.
+//!
+//! Thread-safe cache for MCP capabilities across all connected servers.
 
 use dashmap::DashMap;
 
-use crate::mcp::config::{PromptInfo, ResourceInfo, ToolInfo};
+use crate::mcp::config::{Prompt, RawResource, Tool};
 
 /// Cached tool with metadata
 #[derive(Clone)]
 pub struct CachedTool {
     pub server_name: String,
-    pub tool: ToolInfo,
-    pub cached_at: Instant,
+    pub tool: Tool,
 }
 
 /// Cached prompt with metadata
 #[derive(Clone)]
 pub struct CachedPrompt {
     pub server_name: String,
-    pub prompt: PromptInfo,
-    pub cached_at: Instant,
+    pub prompt: Prompt,
 }
 
 /// Cached resource with metadata
 #[derive(Clone)]
 pub struct CachedResource {
     pub server_name: String,
-    pub resource: ResourceInfo,
-    pub cached_at: Instant,
+    pub resource: RawResource,
 }
 
-/// Tool inventory with TTL-based caching
+/// Tool inventory with periodic refresh
 ///
-/// Provides thread-safe caching of MCP tools, prompts, and resources with automatic expiration.
-/// Entries are timestamped and can be queried with TTL validation.
+/// Provides thread-safe caching of MCP tools, prompts, and resources.
+/// Entries are refreshed periodically by background tasks.
 pub struct ToolInventory {
     /// Map of tool_name -> cached tool
     tools: DashMap<String, CachedTool>,
@@ -47,80 +40,59 @@ pub struct ToolInventory {
 
     /// Map of resource_uri -> cached resource
     resources: DashMap<String, CachedResource>,
-
-    /// Tool cache TTL
-    tool_ttl: Duration,
-
-    /// Last refresh time per server
-    server_refresh_times: DashMap<String, Instant>,
 }
 
 impl ToolInventory {
-    /// Create a new tool inventory with the specified TTL
-    pub fn new(tool_ttl: Duration) -> Self {
+    /// Create a new tool inventory
+    pub fn new() -> Self {
         Self {
             tools: DashMap::new(),
             prompts: DashMap::new(),
             resources: DashMap::new(),
-            tool_ttl,
-            server_refresh_times: DashMap::new(),
         }
     }
+}
 
+impl Default for ToolInventory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolInventory {
     // ============================================================================
     // Tool Methods
     // ============================================================================
 
-    /// Get a tool if it exists and is fresh (within TTL)
-    ///
-    /// Returns None if the tool doesn't exist or has expired.
-    pub fn get_tool(&self, tool_name: &str) -> Option<(String, ToolInfo)> {
-        self.tools.get(tool_name).and_then(|entry| {
-            let cached = entry.value();
-
-            // Check if still fresh
-            if cached.cached_at.elapsed() < self.tool_ttl {
-                Some((cached.server_name.clone(), cached.tool.clone()))
-            } else {
-                // Expired - will be removed by cleanup
-                None
-            }
-        })
+    /// Get a tool if it exists
+    pub fn get_tool(&self, tool_name: &str) -> Option<(String, Tool)> {
+        self.tools
+            .get(tool_name)
+            .map(|entry| (entry.server_name.clone(), entry.tool.clone()))
     }
 
-    /// Check if tool exists (regardless of TTL)
+    /// Check if tool exists
     pub fn has_tool(&self, tool_name: &str) -> bool {
         self.tools.contains_key(tool_name)
     }
 
     /// Insert or update a tool
-    pub fn insert_tool(&self, tool_name: String, server_name: String, tool: ToolInfo) {
-        self.tools.insert(
-            tool_name,
-            CachedTool {
-                server_name,
-                tool,
-                cached_at: Instant::now(),
-            },
-        );
+    pub fn insert_tool(&self, tool_name: String, server_name: String, tool: Tool) {
+        self.tools
+            .insert(tool_name, CachedTool { server_name, tool });
     }
 
-    /// Get all tools (fresh only)
-    pub fn list_tools(&self) -> Vec<(String, String, ToolInfo)> {
-        let now = Instant::now();
+    /// Get all tools
+    pub fn list_tools(&self) -> Vec<(String, String, Tool)> {
         self.tools
             .iter()
-            .filter_map(|entry| {
+            .map(|entry| {
                 let (name, cached) = entry.pair();
-                if now.duration_since(cached.cached_at) < self.tool_ttl {
-                    Some((
-                        name.clone(),
-                        cached.server_name.clone(),
-                        cached.tool.clone(),
-                    ))
-                } else {
-                    None
-                }
+                (
+                    name.clone(),
+                    cached.server_name.clone(),
+                    cached.tool.clone(),
+                )
             })
             .collect()
     }
@@ -129,53 +101,40 @@ impl ToolInventory {
     // Prompt Methods
     // ============================================================================
 
-    /// Get a prompt if it exists and is fresh (within TTL)
-    pub fn get_prompt(&self, prompt_name: &str) -> Option<(String, PromptInfo)> {
-        self.prompts.get(prompt_name).and_then(|entry| {
-            let cached = entry.value();
-
-            // Check if still fresh
-            if cached.cached_at.elapsed() < self.tool_ttl {
-                Some((cached.server_name.clone(), cached.prompt.clone()))
-            } else {
-                None
-            }
-        })
+    /// Get a prompt if it exists
+    pub fn get_prompt(&self, prompt_name: &str) -> Option<(String, Prompt)> {
+        self.prompts
+            .get(prompt_name)
+            .map(|entry| (entry.server_name.clone(), entry.prompt.clone()))
     }
 
-    /// Check if prompt exists (regardless of TTL)
+    /// Check if prompt exists
     pub fn has_prompt(&self, prompt_name: &str) -> bool {
         self.prompts.contains_key(prompt_name)
     }
 
     /// Insert or update a prompt
-    pub fn insert_prompt(&self, prompt_name: String, server_name: String, prompt: PromptInfo) {
+    pub fn insert_prompt(&self, prompt_name: String, server_name: String, prompt: Prompt) {
         self.prompts.insert(
             prompt_name,
             CachedPrompt {
                 server_name,
                 prompt,
-                cached_at: Instant::now(),
             },
         );
     }
 
-    /// Get all prompts (fresh only)
-    pub fn list_prompts(&self) -> Vec<(String, String, PromptInfo)> {
-        let now = Instant::now();
+    /// Get all prompts
+    pub fn list_prompts(&self) -> Vec<(String, String, Prompt)> {
         self.prompts
             .iter()
-            .filter_map(|entry| {
+            .map(|entry| {
                 let (name, cached) = entry.pair();
-                if now.duration_since(cached.cached_at) < self.tool_ttl {
-                    Some((
-                        name.clone(),
-                        cached.server_name.clone(),
-                        cached.prompt.clone(),
-                    ))
-                } else {
-                    None
-                }
+                (
+                    name.clone(),
+                    cached.server_name.clone(),
+                    cached.prompt.clone(),
+                )
             })
             .collect()
     }
@@ -184,21 +143,14 @@ impl ToolInventory {
     // Resource Methods
     // ============================================================================
 
-    /// Get a resource if it exists and is fresh (within TTL)
-    pub fn get_resource(&self, resource_uri: &str) -> Option<(String, ResourceInfo)> {
-        self.resources.get(resource_uri).and_then(|entry| {
-            let cached = entry.value();
-
-            // Check if still fresh
-            if cached.cached_at.elapsed() < self.tool_ttl {
-                Some((cached.server_name.clone(), cached.resource.clone()))
-            } else {
-                None
-            }
-        })
+    /// Get a resource if it exists
+    pub fn get_resource(&self, resource_uri: &str) -> Option<(String, RawResource)> {
+        self.resources
+            .get(resource_uri)
+            .map(|entry| (entry.server_name.clone(), entry.resource.clone()))
     }
 
-    /// Check if resource exists (regardless of TTL)
+    /// Check if resource exists
     pub fn has_resource(&self, resource_uri: &str) -> bool {
         self.resources.contains_key(resource_uri)
     }
@@ -208,34 +160,28 @@ impl ToolInventory {
         &self,
         resource_uri: String,
         server_name: String,
-        resource: ResourceInfo,
+        resource: RawResource,
     ) {
         self.resources.insert(
             resource_uri,
             CachedResource {
                 server_name,
                 resource,
-                cached_at: Instant::now(),
             },
         );
     }
 
-    /// Get all resources (fresh only)
-    pub fn list_resources(&self) -> Vec<(String, String, ResourceInfo)> {
-        let now = Instant::now();
+    /// Get all resources
+    pub fn list_resources(&self) -> Vec<(String, String, RawResource)> {
         self.resources
             .iter()
-            .filter_map(|entry| {
+            .map(|entry| {
                 let (uri, cached) = entry.pair();
-                if now.duration_since(cached.cached_at) < self.tool_ttl {
-                    Some((
-                        uri.clone(),
-                        cached.server_name.clone(),
-                        cached.resource.clone(),
-                    ))
-                } else {
-                    None
-                }
+                (
+                    uri.clone(),
+                    cached.server_name.clone(),
+                    cached.resource.clone(),
+                )
             })
             .collect()
     }
@@ -244,7 +190,7 @@ impl ToolInventory {
     // Server Management Methods
     // ============================================================================
 
-    /// Clear all cached items for a specific server (before refresh)
+    /// Clear all cached items for a specific server (called when LRU evicts client)
     pub fn clear_server_tools(&self, server_name: &str) {
         self.tools
             .retain(|_, cached| cached.server_name != server_name);
@@ -252,51 +198,6 @@ impl ToolInventory {
             .retain(|_, cached| cached.server_name != server_name);
         self.resources
             .retain(|_, cached| cached.server_name != server_name);
-    }
-
-    /// Mark server as refreshed
-    pub fn mark_refreshed(&self, server_name: &str) {
-        self.server_refresh_times
-            .insert(server_name.to_string(), Instant::now());
-    }
-
-    /// Check if server needs refresh based on refresh interval
-    pub fn needs_refresh(&self, server_name: &str, refresh_interval: Duration) -> bool {
-        self.server_refresh_times
-            .get(server_name)
-            .map(|t| t.elapsed() > refresh_interval)
-            .unwrap_or(true) // Never refreshed = needs refresh
-    }
-
-    /// Get last refresh time for a server
-    pub fn last_refresh(&self, server_name: &str) -> Option<Instant> {
-        self.server_refresh_times
-            .get(server_name)
-            .map(|t| *t.value())
-    }
-
-    // ============================================================================
-    // Cleanup Methods
-    // ============================================================================
-
-    /// Cleanup expired entries
-    ///
-    /// Removes all tools, prompts, and resources that have exceeded their TTL.
-    /// Should be called periodically by a background task.
-    pub fn cleanup_expired(&self) {
-        let now = Instant::now();
-
-        // Remove expired tools
-        self.tools
-            .retain(|_, cached| now.duration_since(cached.cached_at) < self.tool_ttl);
-
-        // Remove expired prompts
-        self.prompts
-            .retain(|_, cached| now.duration_since(cached.cached_at) < self.tool_ttl);
-
-        // Remove expired resources
-        self.resources
-            .retain(|_, cached| now.duration_since(cached.cached_at) < self.tool_ttl);
     }
 
     /// Get count of cached items
@@ -309,51 +210,67 @@ impl ToolInventory {
         self.tools.clear();
         self.prompts.clear();
         self.resources.clear();
-        self.server_refresh_times.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::config::{Prompt, RawResource, Tool};
 
     // Helper to create a test tool
-    fn create_test_tool(name: &str) -> ToolInfo {
-        ToolInfo {
-            name: name.to_string(),
-            description: format!("Test tool: {}", name),
-            server: "test_server".to_string(),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {}
-            })),
+    fn create_test_tool(name: &str) -> Tool {
+        use std::{borrow::Cow, sync::Arc};
+
+        let schema_obj = serde_json::json!({
+            "type": "object",
+            "properties": {}
+        });
+
+        let schema_map = if let serde_json::Value::Object(m) = schema_obj {
+            m
+        } else {
+            serde_json::Map::new()
+        };
+
+        Tool {
+            name: Cow::Owned(name.to_string()),
+            title: None,
+            description: Some(Cow::Owned(format!("Test tool: {}", name))),
+            input_schema: Arc::new(schema_map),
+            output_schema: None,
+            annotations: None,
+            icons: None,
         }
     }
 
     // Helper to create a test prompt
-    fn create_test_prompt(name: &str) -> PromptInfo {
-        PromptInfo {
+    fn create_test_prompt(name: &str) -> Prompt {
+        Prompt {
             name: name.to_string(),
+            title: None,
             description: Some(format!("Test prompt: {}", name)),
-            server: "test_server".to_string(),
             arguments: None,
+            icons: None,
         }
     }
 
     // Helper to create a test resource
-    fn create_test_resource(uri: &str) -> ResourceInfo {
-        ResourceInfo {
+    fn create_test_resource(uri: &str) -> RawResource {
+        RawResource {
             uri: uri.to_string(),
             name: uri.to_string(),
+            title: None,
             description: Some(format!("Test resource: {}", uri)),
             mime_type: Some("text/plain".to_string()),
-            server: "test_server".to_string(),
+            size: None,
+            icons: None,
         }
     }
 
     #[test]
     fn test_tool_insert_and_get() {
-        let inventory = ToolInventory::new(Duration::from_secs(60));
+        let inventory = ToolInventory::new();
         let tool = create_test_tool("test_tool");
 
         inventory.insert_tool("test_tool".to_string(), "server1".to_string(), tool.clone());
@@ -367,29 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_expiration() {
-        let inventory = ToolInventory::new(Duration::from_millis(100));
-        let tool = create_test_tool("expiring_tool");
-
-        inventory.insert_tool(
-            "expiring_tool".to_string(),
-            "server1".to_string(),
-            tool.clone(),
-        );
-
-        // Should be available immediately
-        assert!(inventory.get_tool("expiring_tool").is_some());
-
-        // Wait for expiration
-        std::thread::sleep(Duration::from_millis(150));
-
-        // Should be expired now
-        assert!(inventory.get_tool("expiring_tool").is_none());
-    }
-
-    #[test]
     fn test_has_tool() {
-        let inventory = ToolInventory::new(Duration::from_secs(60));
+        let inventory = ToolInventory::new();
         let tool = create_test_tool("check_tool");
 
         assert!(!inventory.has_tool("check_tool"));
@@ -401,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_list_tools() {
-        let inventory = ToolInventory::new(Duration::from_secs(60));
+        let inventory = ToolInventory::new();
 
         inventory.insert_tool(
             "tool1".to_string(),
@@ -424,28 +320,8 @@ mod tests {
     }
 
     #[test]
-    fn test_list_tools_filters_expired() {
-        let inventory = ToolInventory::new(Duration::from_millis(100));
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
-
-        // Should have 1 tool
-        assert_eq!(inventory.list_tools().len(), 1);
-
-        // Wait for expiration
-        std::thread::sleep(Duration::from_millis(150));
-
-        // Should have 0 tools (filtered out)
-        assert_eq!(inventory.list_tools().len(), 0);
-    }
-
-    #[test]
     fn test_clear_server_tools() {
-        let inventory = ToolInventory::new(Duration::from_secs(60));
+        let inventory = ToolInventory::new();
 
         inventory.insert_tool(
             "tool1".to_string(),
@@ -468,54 +344,8 @@ mod tests {
     }
 
     #[test]
-    fn test_server_refresh_tracking() {
-        let inventory = ToolInventory::new(Duration::from_secs(60));
-
-        // Never refreshed
-        assert!(inventory.needs_refresh("server1", Duration::from_secs(10)));
-
-        // Mark as refreshed
-        inventory.mark_refreshed("server1");
-
-        // Should not need refresh immediately
-        assert!(!inventory.needs_refresh("server1", Duration::from_secs(10)));
-
-        // Wait and check again
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(inventory.needs_refresh("server1", Duration::from_millis(50)));
-    }
-
-    #[test]
-    fn test_cleanup_expired() {
-        let inventory = ToolInventory::new(Duration::from_millis(100));
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
-        inventory.insert_tool(
-            "tool2".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool2"),
-        );
-
-        let (tools, _, _) = inventory.counts();
-        assert_eq!(tools, 2);
-
-        // Wait for expiration
-        std::thread::sleep(Duration::from_millis(150));
-
-        // Cleanup expired entries
-        inventory.cleanup_expired();
-
-        let (tools, _, _) = inventory.counts();
-        assert_eq!(tools, 0);
-    }
-
-    #[test]
     fn test_prompt_operations() {
-        let inventory = ToolInventory::new(Duration::from_secs(60));
+        let inventory = ToolInventory::new();
         let prompt = create_test_prompt("test_prompt");
 
         inventory.insert_prompt(
@@ -536,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_resource_operations() {
-        let inventory = ToolInventory::new(Duration::from_secs(60));
+        let inventory = ToolInventory::new();
         let resource = create_test_resource("file:///test.txt");
 
         inventory.insert_resource(
@@ -559,7 +389,7 @@ mod tests {
     async fn test_concurrent_access() {
         use std::sync::Arc;
 
-        let inventory = Arc::new(ToolInventory::new(Duration::from_secs(60)));
+        let inventory = Arc::new(ToolInventory::new());
 
         // Spawn multiple tasks that insert tools concurrently
         let mut handles = vec![];
@@ -584,7 +414,7 @@ mod tests {
 
     #[test]
     fn test_clear_all() {
-        let inventory = ToolInventory::new(Duration::from_secs(60));
+        let inventory = ToolInventory::new();
 
         inventory.insert_tool(
             "tool1".to_string(),
@@ -602,8 +432,6 @@ mod tests {
             create_test_resource("res1"),
         );
 
-        inventory.mark_refreshed("server1");
-
         let (tools, prompts, resources) = inventory.counts();
         assert_eq!(tools, 1);
         assert_eq!(prompts, 1);
@@ -615,6 +443,5 @@ mod tests {
         assert_eq!(tools, 0);
         assert_eq!(prompts, 0);
         assert_eq!(resources, 0);
-        assert!(inventory.last_refresh("server1").is_none());
     }
 }

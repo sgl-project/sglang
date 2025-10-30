@@ -361,7 +361,7 @@ class Qwen3ForCausalLM(nn.Module):
                 self.pp_group.send(
                     self.model.embed_tokens.weight, dst=self.pp_group.last_rank
                 )
-            else:
+            elif self.pp_group.is_last_rank:
                 emb_token_weight = self.pp_group.recv(
                     size=(config.vocab_size, config.hidden_size),
                     dtype=next(self.model.parameters()).dtype,

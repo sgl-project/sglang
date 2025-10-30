@@ -188,7 +188,16 @@ is_hopper_with_cuda_12_3 = lambda: _check(9)
 def is_blackwell():
     if not is_cuda():
         return False
-    return torch.cuda.get_device_capability()[0] == 10
+    return torch.cuda.get_device_capability()[0] in [10, 12]
+
+
+@lru_cache(maxsize=1)
+def is_blackwell_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
+    return (torch.cuda.get_device_capability(device)[0] in [10, 12]) and (
+        torch.version.cuda >= "12.8"
+    )
 
 
 @lru_cache(maxsize=1)
@@ -1230,42 +1239,34 @@ def point_to_point_pyobj(
     dst: int = 1,
 ):
     """Send data from src to dst in group using DeviceToDevice communication."""
-
+    device = torch.get_device_module().current_device()
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor(
-                [0], dtype=torch.long, device=torch.cuda.current_device()
-            )
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.send(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            ).cuda(
-                device=torch.cuda.current_device()
+            ).to(
+                device=device
             )  # Move to GPU
-            tensor_size = torch.tensor(
-                [size], dtype=torch.long, device=torch.cuda.current_device()
-            )
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             dist.send(tensor_size, dst=dst, group=group)
             dist.send(tensor_data, dst=dst, group=group)
         return data
 
     elif rank == dst:
-        tensor_size = torch.tensor(
-            [0], dtype=torch.long, device=torch.cuda.current_device()
-        )
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
         dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(
-            size, dtype=torch.uint8, device=torch.cuda.current_device()
-        )
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.recv(tensor_data, src=src, group=group)
 
         serialized_data = bytes(
@@ -3562,7 +3563,17 @@ def cached_triton_kernel(key_fn=None):
     """
 
     def decorator(fn):
-        return CachedKernel(fn, key_fn)
+        if envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.get():
+            logger.debug(
+                f"{envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.name} = True. Using custom triton kernel cache."
+            )
+            return CachedKernel(fn, key_fn)
+        else:
+            # Fallback to the native triton cache.
+            logger.debug(
+                f"{envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.name} = False. Using native triton kernel cache."
+            )
+            return fn
 
     return decorator
 

@@ -16,10 +16,12 @@ use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::utils::{event_types, generate_id};
+use super::utils::event_types;
 use crate::{
     mcp,
-    protocols::responses::{ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
+    protocols::responses::{
+        generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
+    },
     routers::header_utils::apply_request_headers,
 };
 
@@ -293,11 +295,7 @@ pub(super) fn prepare_mcp_payload_for_streaming(
         let mut tools_json = Vec::new();
         let tools = active_mcp.list_tools();
         for t in tools {
-            let parameters = t.parameters.clone().unwrap_or(serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }));
+            let parameters = Value::Object((*t.input_schema).clone());
             let tool = serde_json::json!({
                 "type": event_types::ITEM_TYPE_FUNCTION,
                 "name": t.name,
@@ -862,11 +860,7 @@ pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label
             json!({
                 "name": t.name,
                 "description": t.description,
-                "input_schema": t.parameters.clone().unwrap_or_else(|| json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                })),
+                "input_schema": Value::Object((*t.input_schema).clone()),
                 "annotations": {
                     "read_only": false
                 }
