@@ -552,10 +552,16 @@ impl ResponseStreamEventEmitter {
         let event_json = serde_json::to_string(event)
             .map_err(|e| format!("Failed to serialize event: {}", e))?;
 
-        if tx
-            .send(Ok(Bytes::from(format!("data: {}\n\n", event_json))))
-            .is_err()
-        {
+        // Extract event type from the JSON for SSE event field
+        let event_type = event
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("message");
+
+        // Format as SSE with event: field
+        let sse_message = format!("event: {}\ndata: {}\n\n", event_type, event_json);
+
+        if tx.send(Ok(Bytes::from(sse_message))).is_err() {
             return Err("Client disconnected".to_string());
         }
 
