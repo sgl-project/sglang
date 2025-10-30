@@ -722,7 +722,7 @@ class BaseMultimodalProcessor(ABC):
                     )
                     if isinstance(available_slice, torch.Tensor):
                         available_slice.copy_(
-                            item.precomputed_embeddings.view(torch.int8),
+                            item.precomputed_embeddings.view(torch.int8).view(-1),
                             non_blocking=True,
                         )
                         item.precomputed_embeddings = CudaIpcTensorTransportProxy(
