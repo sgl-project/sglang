@@ -16,6 +16,8 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
+    AscendMHATokenToKVPoolHost,
+    AscendMLATokenToKVPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
@@ -23,6 +25,10 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.metrics.collector import StorageMetricsCollector
 
 logger = logging.getLogger(__name__)
+
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
 class HiRadixCache(RadixCache):
@@ -56,23 +62,23 @@ class HiRadixCache(RadixCache):
 
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
-                self.kv_cache,
-                hicache_ratio,
-                hicache_size,
-                page_size,
-                hicache_mem_layout,
+            host_pool_class = (
+                AscendMHATokenToKVPoolHost if _is_npu else MHATokenToKVPoolHost
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache,
-                hicache_ratio,
-                hicache_size,
-                page_size,
-                hicache_mem_layout,
+            host_pool_class = (
+                AscendMLATokenToKVPoolHost if _is_npu else MLATokenToKVPoolHost
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+
+        self.token_to_kv_pool_host = host_pool_class(
+            self.kv_cache,
+            hicache_ratio,
+            hicache_size,
+            page_size,
+            hicache_mem_layout,
+        )
 
         self.tp_group = tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)

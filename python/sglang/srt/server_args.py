@@ -1399,7 +1399,9 @@ class ServerArgs:
         if self.enable_hierarchical_cache and self.hicache_io_backend == "kernel":
             # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
             if self.decode_attention_backend is None:
-                if not self.use_mla_backend():
+                if is_npu():
+                    self.decode_attention_backend = "ascend"
+                elif not self.use_mla_backend():
                     self.decode_attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
                     )

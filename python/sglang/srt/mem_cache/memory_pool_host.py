@@ -7,7 +7,13 @@ from typing import Optional
 import psutil
 import torch
 
-from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    AscendMLAPagedTokenToKVPool,
+    AscendTokenToKVPool,
+    KVCache,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
 from sglang.srt.utils import is_npu, is_xpu
 
 _is_npu = is_npu()
@@ -753,3 +759,176 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+
+class AscendMHATokenToKVPoolHost(MHATokenToKVPoolHost):
+    device_pool: AscendTokenToKVPool
+
+    def init_kv_buffer(self):
+        dims = (
+            2,
+            self.size // self.page_size + 1,
+            self.layer_num,
+            self.page_size,
+            self.head_num,
+            self.head_dim,
+        )
+
+        return torch.empty(
+            dims,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+
+    @property
+    def k_buffer(self):
+        return self.kv_buffer[0]
+
+    @property
+    def v_buffer(self):
+        return self.kv_buffer[1]
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if layer_id == 0:
+            torch.ops.npu.transfer_kv_dim_exchange(
+                device_pool.k_buffer,
+                self.k_buffer,
+                device_pool.v_buffer,
+                self.v_buffer,
+                device_indices,
+                host_indices,
+                self.page_size,
+                1,
+                2,
+            )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        torch.ops.npu.transfer_kv_dim_exchange(
+            device_pool.k_buffer,
+            self.k_buffer,
+            device_pool.v_buffer,
+            self.v_buffer,
+            device_indices,
+            host_indices,
+            self.page_size,
+            2,
+            2,
+        )
+
+
+class AscendMLATokenToKVPoolHost(HostKVCache):
+    device_pool: AscendMLAPagedTokenToKVPool
+
+    def __init__(
+        self,
+        device_pool: MLATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+    ):
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+        )
+
+    def get_size_per_token(self):
+        self.kv_lora_rank = self.device_pool.kv_lora_rank
+        self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
+        self.layer_num = self.device_pool.layer_num
+
+        return (
+            (self.kv_lora_rank + self.qk_rope_head_dim)
+            * 1
+            * self.dtype.itemsize
+            * self.layer_num
+        )
+
+    def init_kv_buffer(self):
+        self.k_buffer = torch.empty(
+            (
+                self.size // self.page_size + 1,
+                self.layer_num,
+                self.page_size,
+                1,
+                self.kv_lora_rank,
+            ),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.v_buffer = torch.empty(
+            (
+                self.size // self.page_size + 1,
+                self.layer_num,
+                self.page_size,
+                1,
+                self.qk_rope_head_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        return (self.k_buffer, self.v_buffer)
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if layer_id == 0:
+            torch.ops.npu.transfer_kv_dim_exchange(
+                device_pool.k_buffer,
+                self.k_buffer,
+                device_pool.v_buffer,
+                self.v_buffer,
+                device_indices,
+                host_indices,
+                self.page_size,
+                1,
+                2,
+            )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        torch.ops.npu.transfer_kv_dim_exchange(
+            device_pool.k_buffer,
+            self.k_buffer,
+            device_pool.v_buffer,
+            self.v_buffer,
+            device_indices,
+            host_indices,
+            self.page_size,
+            2,
+            2,
+        )
+
+    def get_flat_data_page(self, index) -> torch.Tensor:
+        raise NotImplementedError(
+            "Storage backend is not supported for Ascend MLA yet."
+        )
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        raise NotImplementedError(
+            "Storage backend is not supported for Ascend MLA yet."
+        )
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "Storage backend is not supported for Ascend MLA yet."
+        )
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        raise NotImplementedError(
+            "Storage backend is not supported for Ascend MLA yet."
+        )
