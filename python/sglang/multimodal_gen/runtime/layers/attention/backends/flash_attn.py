@@ -104,8 +104,8 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        return_softmax_lse: bool = False,
         attn_metadata: AttentionMetadata = None,
+        return_softmax_lse: bool = False,
     ):
         attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
         if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
