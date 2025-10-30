@@ -252,10 +252,10 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 10
+        timeout-minutes: 45
         run: |
-          cd test/lang
-          python3 run_suite.py --suite per-commit
+          cd test/srt
+          python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
 
   unit-test-frontend:
     needs: [check-changes, sgl-kernel-build-wheels]

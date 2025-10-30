@@ -41,7 +41,7 @@ else
 fi
 
 # Install protoc for router build (gRPC protobuf compilation)
-if [ "${INSTALL_PROTOC:-0}" = 1 ]; then
+if [ "${INSTALL_PROTOC:-0}" = "1" ]; then
     echo "Installing protoc..."
     if command -v apt-get &> /dev/null; then
         # Ubuntu/Debian
