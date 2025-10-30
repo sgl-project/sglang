@@ -348,7 +348,11 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
-                compute_initial_expert_location_metadata(server_args, self.model_config)
+                compute_initial_expert_location_metadata(
+                    server_args=server_args,
+                    model_config=self.model_config,
+                    moe_ep_rank=self.moe_ep_rank,
+                )
             )
             if self.tp_rank == 0 and get_bool_env_var(
                 "SGLANG_LOG_EXPERT_LOCATION_METADATA"
@@ -1655,9 +1659,11 @@ class ModelRunner:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
-                    layer_num=self.model_config.num_hidden_layers,
+                    layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
             self.token_to_kv_pool = NSATokenToKVPool(
