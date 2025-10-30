@@ -37,7 +37,7 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 # env_info = envs.PACKAGES_CHECKER.get_packages_info()
 # HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
-HAS_LONG_CTX_ATTN = False
+HAS_LONG_CTX_ATTN = True
 
 _group_name_counter: dict[str, int] = {}
 

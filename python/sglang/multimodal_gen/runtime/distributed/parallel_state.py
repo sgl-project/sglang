@@ -63,7 +63,8 @@ except ModuleNotFoundError:
     pass
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
-HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
+# HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
+HAS_LONG_CTX_ATTN = True
 HAS_FLASH_ATTN = env_info["has_flash_attn"]
 
 logger = init_logger(__name__)

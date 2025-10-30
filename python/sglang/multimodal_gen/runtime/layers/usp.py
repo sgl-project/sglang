@@ -122,7 +122,8 @@ def ring_attn(
     from torch.distributed.tensor.experimental._attention import (
         _templated_ring_attention,
     )
-
+    from torch.distributed.tensor.experimental._attention import _cp_options
+    _cp_options.enable_load_balance = False
     ring_pg = get_sp_group().ring_group
     assert ring_pg is not None, "Ring process group is not initialized."
 
