@@ -6,6 +6,7 @@
 """Minimal implementation of CLIPVisionModel intended to be only used
 within a vision language model."""
 from collections.abc import Iterable
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -17,8 +18,6 @@ from sglang.multimodal_gen.configs.models.encoders import (
 )
 from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-
-# from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask, _prepare_4d_attention_mask
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -183,6 +182,7 @@ class CLIPAttention(nn.Module):
             self.num_heads_per_partition,
             softmax_scale=self.scale,
             causal=False,
+            # causal=False,
             supported_attention_backends=config._supported_attention_backends,
         )
 
@@ -340,7 +340,7 @@ class CLIPEncoder(nn.Module):
         hidden_states_pool = [inputs_embeds]
         hidden_states = inputs_embeds
 
-        for encoder_layer in self.layers:
+        for idx, encoder_layer in enumerate(self.layers):
             hidden_states = encoder_layer(hidden_states)
             if return_all_hidden_states:
                 hidden_states_pool.append(hidden_states)
@@ -580,13 +580,16 @@ class CLIPVisionTransformer(nn.Module):
     def forward(
         self,
         pixel_values: torch.Tensor,
+        output_hidden_states: Optional[bool] = None,
         feature_sample_layers: list[int] | None = None,
-    ) -> torch.Tensor:
+    ) -> BaseEncoderOutput:
 
         hidden_states = self.embeddings(pixel_values)
         hidden_states = self.pre_layrnorm(hidden_states)
 
-        return_all_hidden_states = feature_sample_layers is not None
+        return_all_hidden_states = output_hidden_states or (
+            feature_sample_layers is not None
+        )
 
         # Produces either the last layer output or all of the hidden states,
         # depending on if we have feature_sample_layers or not
@@ -598,15 +601,18 @@ class CLIPVisionTransformer(nn.Module):
         if not return_all_hidden_states:
             encoder_outputs = encoder_outputs[0]
 
-        # Handle post-norm (if applicable) and stacks feature layers if needed
-        encoder_outputs = resolve_visual_encoder_outputs(
-            encoder_outputs,
-            feature_sample_layers,
-            self.post_layernorm,
-            self.config.num_hidden_layers,
-        )
+            # Handle post-norm (if applicable) and stacks feature layers if needed
+            encoder_outputs = resolve_visual_encoder_outputs(
+                encoder_outputs,
+                feature_sample_layers,
+                self.post_layernorm,
+                self.config.num_hidden_layers,
+            )
 
-        return encoder_outputs
+        if return_all_hidden_states:
+            return BaseEncoderOutput(hidden_states=encoder_outputs)
+
+        return BaseEncoderOutput(last_hidden_state=encoder_outputs)
 
 
 class CLIPVisionModel(ImageEncoder):
@@ -628,10 +634,16 @@ class CLIPVisionModel(ImageEncoder):
         self,
         pixel_values: torch.Tensor,
         feature_sample_layers: list[int] | None = None,
+        output_hidden_states: Optional[bool] = None,
         **kwargs,
     ) -> BaseEncoderOutput:
-        last_hidden_state = self.vision_model(pixel_values, feature_sample_layers)
-        return BaseEncoderOutput(last_hidden_state=last_hidden_state)
+        base_encoder_output = self.vision_model(
+            pixel_values,
+            output_hidden_states=output_hidden_states,
+            feature_sample_layers=feature_sample_layers,
+        )
+
+        return base_encoder_output
 
     @property
     def device(self):

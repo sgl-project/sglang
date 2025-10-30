@@ -385,9 +385,7 @@ class ImageProcessorLoader(ComponentLoader):
         """Load the image processor based on the model path, and inference args."""
         logger.info("Loading image processor from %s", model_path)
 
-        image_processor = AutoImageProcessor.from_pretrained(
-            model_path,
-        )
+        image_processor = AutoImageProcessor.from_pretrained(model_path, use_fast=True)
         logger.info("Loaded image processor: %s", image_processor.__class__.__name__)
         return image_processor
 

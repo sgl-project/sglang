@@ -84,7 +84,8 @@ class WanT2V_14B_SamplingParams(SamplingParams):
 class WanI2V_14B_480P_SamplingParam(WanT2V_1_3B_SamplingParams):
     # Denoising stage
     guidance_scale: float = 5.0
-    num_inference_steps: int = 40
+    num_inference_steps: int = 50
+    # num_inference_steps: int = 40
 
     teacache_params: WanTeaCacheParams = field(
         default_factory=lambda: WanTeaCacheParams(
@@ -111,7 +112,8 @@ class WanI2V_14B_480P_SamplingParam(WanT2V_1_3B_SamplingParams):
 class WanI2V_14B_720P_SamplingParam(WanT2V_14B_SamplingParams):
     # Denoising stage
     guidance_scale: float = 5.0
-    num_inference_steps: int = 40
+    num_inference_steps: int = 50
+    # num_inference_steps: int = 40
 
     teacache_params: WanTeaCacheParams = field(
         default_factory=lambda: WanTeaCacheParams(

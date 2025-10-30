@@ -32,10 +32,15 @@ COMPONENT_DIRS = [
     and not d.startswith(".")
 ]
 
+_IMAGE_ENCODER_MODELS: dict[str, tuple] = {
+    # "HunyuanVideoTransformer3DModel": ("image_encoder", "hunyuanvideo", "HunyuanVideoImageEncoder"),
+    "CLIPVisionModelWithProjection": ("encoders", "clip", "CLIPVisionModel"),
+}
+
 
 @lru_cache(maxsize=None)
 def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
-    discovered_models = {}
+    discovered_models = _IMAGE_ENCODER_MODELS
     for component in COMPONENT_DIRS:
         component_path = os.path.join(MODELS_PATH, component)
         for filename in os.listdir(component_path):
@@ -84,11 +89,7 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
                                 logger.warning(
                                     f"Duplicate architecture found: {model_cls_str}. It will be overwritten."
                                 )
-                            model_arch = (
-                                model_cls_str
-                                if model_cls_str != "CLIPVisionModel"
-                                else "CLIPVisionModelWithProjection"
-                            )
+                            model_arch = model_cls_str
                             discovered_models[model_arch] = (
                                 component,
                                 mod_relname,

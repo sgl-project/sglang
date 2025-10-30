@@ -89,6 +89,15 @@ class WanI2V480PConfig(WanT2V480PConfig):
     image_encoder_config: EncoderConfig = field(default_factory=CLIPVisionConfig)
     image_encoder_precision: str = "fp32"
 
+    image_encoder_extra_args: dict = field(
+        default_factory=lambda: dict(
+            output_hidden_states=True,
+        )
+    )
+
+    def postprocess_image(self, image):
+        return image.hidden_states[-2]
+
     def __post_init__(self) -> None:
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True

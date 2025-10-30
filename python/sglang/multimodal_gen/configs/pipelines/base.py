@@ -86,6 +86,12 @@ class PipelineConfig:
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
 
+    # image encoding
+    image_encoder_extra_args: dict = field(default_factory=lambda: {})
+
+    def postprocess_image(self, image):
+        return image.last_hidden_state
+
     preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (preprocess_text,)
     )
@@ -108,6 +114,7 @@ class PipelineConfig:
 
     # Wan2.2 TI2V parameters
     ti2v_task: bool = False
+    i2v_task: bool = False
     ti2i_task: bool = False
     boundary_ratio: float | None = None
 

@@ -104,6 +104,9 @@ class SamplingParams:
     profile: bool = False
     num_profiled_timesteps: int = 2
 
+    # Debugging
+    debug: bool = False
+
     # Misc
     save_output: bool = True
     return_frames: bool = False
@@ -216,6 +219,12 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.profile,
             help="Enable torch profiler for denoising stage",
+        )
+        parser.add_argument(
+            "--debug",
+            action="store_true",
+            default=SamplingParams.debug,
+            help="",
         )
         parser.add_argument(
             "--num-profiled-timesteps",

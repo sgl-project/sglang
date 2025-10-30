@@ -86,6 +86,7 @@ class Req:
 
     # Image inputs
     image_path: str | None = None
+    # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
     pil_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
@@ -195,6 +196,9 @@ class Req:
     # profile
     profile: bool = False
     num_profiled_timesteps: int = 8
+
+    # debugging
+    debug: bool = False
 
     # results
     output: torch.Tensor | None = None

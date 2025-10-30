@@ -51,6 +51,7 @@ class InputValidationStage(PipelineStage):
         seeds = [seed + i for i in range(num_videos_per_prompt)]
         batch.seeds = seeds
         # Peiyuan: using GPU seed will cause A100 and H100 to generate different results...
+        # FIXME: the generator's in latent preparation stage seems to be different from seeds
         batch.generator = [torch.Generator("cpu").manual_seed(seed) for seed in seeds]
 
     def forward(
