@@ -125,6 +125,9 @@ def smart_nframes(
     ele: dict,
     total_frames: int,
     video_fps: int | float,
+    fps: int | float = FPS,
+    fps_min_frames: int = FPS_MIN_FRAMES,
+    fps_max_frames: int = FPS_MAX_FRAMES,
 ) -> int:
     """calculate the number of frames for video used for model inputs.
 
@@ -137,6 +140,9 @@ def smart_nframes(
                     - max_frames: the maximum number of frames of the video, only used when fps is provided.
         total_frames (int): the original total number of frames of the video.
         video_fps (int | float): the original fps of the video.
+        fps (int | float, optional): target frames to sample per second. Defaults to FPS.
+        fps_min_frames (int, optional): the minimum number of frames of the video. Defaults to FPS_MIN_FRAMES.
+        fps_max_frames (int, optional): the maximum number of frames of the video. Defaults to FPS_MAX_FRAMES.
 
     Raises:
         ValueError: nframes should in interval [FRAME_FACTOR, total_frames].
@@ -150,10 +156,10 @@ def smart_nframes(
     if "nframes" in ele:
         nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
     else:
-        fps = ele.get("fps", FPS)
-        min_frames = ceil_by_factor(ele.get("min_frames", FPS_MIN_FRAMES), FRAME_FACTOR)
+        fps = ele.get("fps", fps)
+        min_frames = ceil_by_factor(ele.get("min_frames", fps_min_frames), FRAME_FACTOR)
         max_frames = floor_by_factor(
-            ele.get("max_frames", min(FPS_MAX_FRAMES, total_frames)), FRAME_FACTOR
+            ele.get("max_frames", min(fps_max_frames, total_frames)), FRAME_FACTOR
         )
         nframes = total_frames / video_fps * fps
         if nframes > total_frames:
@@ -173,19 +179,31 @@ def smart_nframes(
 async def preprocess_video(
     vr,
     image_factor: int = IMAGE_FACTOR,
+    video_min_pixels: int = VIDEO_MIN_PIXELS,
+    video_max_pixels: int = VIDEO_MAX_PIXELS,
+    fps: int | float = FPS,
+    fps_min_frames: int = FPS_MIN_FRAMES,
+    fps_max_frames: int = FPS_MAX_FRAMES,
     # vr: VideoReader, image_factor: int = IMAGE_FACTOR
 ) -> torch.Tensor:
     ele = {}
     total_frames, video_fps = len(vr), vr.get_avg_fps()
-    nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
+    nframes = smart_nframes(
+        ele,
+        total_frames=total_frames,
+        video_fps=video_fps,
+        fps=fps,
+        fps_min_frames=fps_min_frames,
+        fps_max_frames=fps_max_frames,
+    )
     idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
     video = vr.get_batch(idx).asnumpy()
     video = torch.tensor(video).permute(0, 3, 1, 2)  # Convert to TCHW format
     nframes, _, height, width = video.shape
-    min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
+    min_pixels = ele.get("min_pixels", video_min_pixels)
     total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
     max_pixels = max(
-        min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
+        min(video_max_pixels, total_pixels / nframes * FRAME_FACTOR),
         int(min_pixels * 1.05),
     )
     max_pixels_supposed = ele.get("max_pixels", max_pixels)
@@ -199,6 +217,8 @@ async def preprocess_video(
             ele["resized_height"],
             ele["resized_width"],
             factor=image_factor,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
         )
     else:
         resized_height, resized_width = smart_resize(
@@ -250,10 +270,40 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         self.audio_token_id = getattr(hf_config, "audio_token_id", None)
 
         self.NUM_TOKEN_PER_FRAME = 770
+        # Use global defaults for other model types
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
         self.MAX_PIXELS = 16384 * 28 * 28
         self.MAX_RATIO = 200
+        self.VIDEO_MIN_PIXELS = VIDEO_MIN_PIXELS
+        self.VIDEO_MAX_PIXELS = VIDEO_MAX_PIXELS
+        self.FPS = FPS
+        self.FPS_MIN_FRAMES = FPS_MIN_FRAMES
+        self.FPS_MAX_FRAMES = FPS_MAX_FRAMES
+
+        # Dynamically extract preprocessing parameters from processor for qwen3_vl models
+        image_processor = getattr(_processor, "image_processor", None)
+        video_processor = getattr(_processor, "video_processor", None)
+
+        if hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
+            # Extract image processing parameters from processor if available
+            if not image_processor:
+                size = getattr(image_processor, "size", {})
+                if size:
+                    self.MIN_PIXELS = size.get("shortest_edge", 64 * 32 * 32)
+                    self.MAX_PIXELS = size.get("longest_edge", 32 * 32 * 16384)
+                patch_size = getattr(image_processor, "patch_size", 16)
+                merge_size = getattr(image_processor, "merge_size", 2)
+                self.IMAGE_FACTOR = patch_size * merge_size
+
+            # Extract video processing parameters from video processor if available
+            if video_processor:
+                video_size = getattr(video_processor, "size", {})
+                self.VIDEO_MIN_PIXELS = video_size.get("shortest_edge", 128 * 32 * 32)
+                self.VIDEO_MAX_PIXELS = video_size.get("longest_edge", 32 * 32 * 768)
+                self.FPS = getattr(video_processor, "fps", 2)
+                self.FPS_MIN_FRAMES = getattr(video_processor, "min_frames", 4)
+                self.FPS_MAX_FRAMES = getattr(video_processor, "max_frames", 768)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
@@ -283,13 +333,32 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
+            resize_tasks = [
+                resize_image_async(
+                    image,
+                    min_pixels=self.MIN_PIXELS,
+                    max_pixels=self.MAX_PIXELS,
+                    size_factor=self.IMAGE_FACTOR,
+                )
+                for image in base_output.images
+            ]
             base_output.images = await asyncio.gather(*resize_tasks)
 
         video_metadata = None
         if base_output.videos:
             video_results = await asyncio.gather(
-                *[preprocess_video(video) for video in base_output.videos]
+                *[
+                    preprocess_video(
+                        video,
+                        image_factor=self.IMAGE_FACTOR,
+                        video_min_pixels=self.VIDEO_MIN_PIXELS,
+                        video_max_pixels=self.VIDEO_MAX_PIXELS,
+                        fps=self.FPS,
+                        fps_min_frames=self.FPS_MIN_FRAMES,
+                        fps_max_frames=self.FPS_MAX_FRAMES,
+                    )
+                    for video in base_output.videos
+                ]
             )
             base_output.videos, video_metadata = map(list, zip(*video_results))
 
