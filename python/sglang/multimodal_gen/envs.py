@@ -70,8 +70,6 @@ class PackagesEnvChecker:
     def initialize(self):
         self.packages_info = {
             "has_aiter": self.check_aiter(),
-            "has_flash_attn": self.check_flash_attn(),
-            "has_long_ctx_attn": self.check_long_ctx_attn(),
             "diffusers_version": self.check_diffusers_version(),
         }
 

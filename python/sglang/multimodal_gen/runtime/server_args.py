@@ -22,7 +22,6 @@ from sglang.multimodal_gen.configs.pipelines.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import HAS_LONG_CTX_ATTN
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -807,12 +806,6 @@ class ServerArgs:
         if self.sp_degree != self.ring_degree * self.ulysses_degree:
             raise ValueError(
                 f"sequence_parallel_degree is not equal to ring_degree * ulysses_degree, {self.sp_degree} != {self.ring_degree} * {self.ulysses_degree}"
-            )
-        if not HAS_LONG_CTX_ATTN and self.sp_degree > 1:
-            raise ImportError(
-                f"Sequence Parallel kit 'yunchang' not found but "
-                f"sp_degree is {self.sp_degree}, please set it "
-                f"to 1 or install 'yunchang' to use it"
             )
 
     def check_server_dp_args(self):

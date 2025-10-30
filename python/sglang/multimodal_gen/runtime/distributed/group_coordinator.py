@@ -35,9 +35,6 @@ logger = init_logger(__name__)
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
-# env_info = envs.PACKAGES_CHECKER.get_packages_info()
-# HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
-HAS_LONG_CTX_ATTN = True
 
 _group_name_counter: dict[str, int] = {}
 
@@ -1210,26 +1207,20 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             torch_distributed_backend=torch_distributed_backend,
             group_name=group_name,
         )
-        if HAS_LONG_CTX_ATTN:
-            ulysses_group = kwargs.get("ulysses_group", None)
-            ring_group = kwargs.get("ring_group", None)
-            if ulysses_group is None:
-                raise RuntimeError(
-                    f"Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
-                )
-            if ring_group is None:
-                raise RuntimeError(
-                    f"Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
-                )
-            self.ulysses_group = ulysses_group
-            self.ring_group = ring_group
-
-            self.ulysses_world_size = torch.distributed.get_world_size(
-                self.ulysses_group
+        ulysses_group = kwargs.get("ulysses_group", None)
+        ring_group = kwargs.get("ring_group", None)
+        if ulysses_group is None:
+            raise RuntimeError(
+                f"Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
             )
-            self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
-            self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
-            self.ring_rank = torch.distributed.get_rank(self.ring_group)
-        else:
-            self.ulysses_world_size = self.ring_world_size = 1
-            self.ulysses_rank = self.ring_rank = 0
+        if ring_group is None:
+            raise RuntimeError(
+                f"Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
+            )
+        self.ulysses_group = ulysses_group
+        self.ring_group = ring_group
+
+        self.ulysses_world_size = torch.distributed.get_world_size(self.ulysses_group)
+        self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
+        self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
+        self.ring_rank = torch.distributed.get_rank(self.ring_group)

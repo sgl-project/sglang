@@ -62,10 +62,6 @@ try:
 except ModuleNotFoundError:
     pass
 
-env_info = envs.PACKAGES_CHECKER.get_packages_info()
-# HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
-HAS_LONG_CTX_ATTN = True
-HAS_FLASH_ATTN = env_info["has_flash_attn"]
 
 logger = init_logger(__name__)
 
@@ -474,33 +470,24 @@ def initialize_model_parallel(
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
 
-    # if HAS_LONG_CTX_ATTN and sequence_parallel_degree > 1:
-    if HAS_LONG_CTX_ATTN:
-        from yunchang import set_seq_parallel_pg
-        from yunchang.globals import PROCESS_GROUP
+    from yunchang import set_seq_parallel_pg
+    from yunchang.globals import PROCESS_GROUP
 
-        set_seq_parallel_pg(
-            sp_ulysses_degree=ulysses_degree,
-            sp_ring_degree=ring_degree,
-            rank=get_world_group().rank_in_group,
-            world_size=dit_parallel_size,
-        )
+    set_seq_parallel_pg(
+        sp_ulysses_degree=ulysses_degree,
+        sp_ring_degree=ring_degree,
+        rank=get_world_group().rank_in_group,
+        world_size=dit_parallel_size,
+    )
 
-        _SP = init_parallel_group_coordinator(
-            group_ranks=rank_generator.get_ranks("sp"),
-            local_rank=get_world_group().local_rank,
-            backend=backend,
-            parallel_mode="sequence",
-            ulysses_group=PROCESS_GROUP.ULYSSES_PG,
-            ring_group=PROCESS_GROUP.RING_PG,
-        )
-    else:
-        _SP = init_parallel_group_coordinator(
-            group_ranks=rank_generator.get_ranks("sp"),
-            local_rank=get_world_group().local_rank,
-            backend=backend,
-            parallel_mode="sequence",
-        )
+    _SP = init_parallel_group_coordinator(
+        group_ranks=rank_generator.get_ranks("sp"),
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        parallel_mode="sequence",
+        ulysses_group=PROCESS_GROUP.ULYSSES_PG,
+        ring_group=PROCESS_GROUP.RING_PG,
+    )
 
     global _TP
     assert _TP is None, "Tensor parallel group is already initialized"
