@@ -148,13 +148,13 @@ impl PodInfo {
         // Read worker load limit annotations
         let annotations = pod.metadata.annotations.as_ref();
         let max_req_limit = annotations
-            .and_then(|a| a.get("sglang.ai/worker_load_limit/max_req"))
+            .and_then(|a| a.get("sglang.ai/worker-load-limit/max-req"))
             .and_then(|s| s.parse::<u32>().ok());
         let max_waiting_req_limit = annotations
-            .and_then(|a| a.get("sglang.ai/worker_load_limit/max_waiting_reqs"))
+            .and_then(|a| a.get("sglang.ai/worker-load-limit/max-waiting-reqs"))
             .and_then(|s| s.parse::<u32>().ok());
         let max_token_limit = annotations
-            .and_then(|a| a.get("sglang.ai/worker_load_limit/max_token"))
+            .and_then(|a| a.get("sglang.ai/worker-load-limit/max-token"))
             .and_then(|s| s.parse::<u32>().ok());
 
         Some(PodInfo {
@@ -788,15 +788,15 @@ mod tests {
     fn test_pod_info_from_pod_with_worker_load_limit_annotations() {
         let mut pod = create_pd_k8s_pod("worker-pod", "10.0.0.1", "worker", None);
         pod.metadata.annotations.as_mut().unwrap().insert(
-            "sglang.ai/worker_load_limit/max_req".to_string(),
+            "sglang.ai/worker-load-limit/max-req".to_string(),
             "100".to_string(),
         );
         pod.metadata.annotations.as_mut().unwrap().insert(
-            "sglang.ai/worker_load_limit/max_waiting_reqs".to_string(),
+            "sglang.ai/worker-load-limit/max-waiting-reqs".to_string(),
             "50".to_string(),
         );
         pod.metadata.annotations.as_mut().unwrap().insert(
-            "sglang.ai/worker_load_limit/max_token".to_string(),
+            "sglang.ai/worker-load-limit/max-token".to_string(),
             "8192".to_string(),
         );
         let config = create_pd_config();
@@ -811,7 +811,7 @@ mod tests {
     fn test_pod_info_from_pod_with_invalid_worker_load_limit_annotations() {
         let mut pod = create_pd_k8s_pod("worker-pod", "10.0.0.1", "worker", None);
         pod.metadata.annotations.as_mut().unwrap().insert(
-            "sglang.ai/worker_load_limit/max_req".to_string(),
+            "sglang.ai/worker-load-limit/max-req".to_string(),
             "invalid".to_string(),
         );
         let config = create_pd_config();
