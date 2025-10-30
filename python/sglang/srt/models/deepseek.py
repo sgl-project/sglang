@@ -53,20 +53,13 @@ from sglang.srt.utils import add_prefix, is_npu
 _is_npu = is_npu()
 
 if _is_npu:
-    from sglang.srt.distributed import (
-        get_moe_expert_parallel_world_size,
-        get_pp_group,
-    )
-    from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-    from sglang.srt.server_args import get_global_server_args
-    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-    from sglang.srt.layers.utils import get_layer_id
-    from sglang.srt.layers.dp_attention import (
-        get_attention_tp_rank,
-        get_attention_tp_size,
-        is_dp_attention_enabled,
-    )
+    from sglang.srt.distributed import get_pp_group
     from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+    from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+    from sglang.srt.server_args import get_global_server_args
     from sglang.srt.utils import make_layers
 
 
@@ -433,7 +426,6 @@ class DeepseekModel(nn.Module):
                     config=config,
                     quant_config=quant_config,
                     prefix=prefix,
-                    #alt_stream=alt_stream,
                 ),
                 pp_rank=self.pp_group.rank_in_group,
                 pp_size=self.pp_group.world_size,
@@ -615,7 +607,9 @@ class DeepseekForCausalLM(nn.Module):
                         ) and name not in params_dict:
                             continue
                         param = params_dict[name]
-                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
                         weight_loader(param, loaded_weight)
                 else:
                     # Skip loading extra bias for GPTQ models.
@@ -627,7 +621,9 @@ class DeepseekForCausalLM(nn.Module):
                     ) and name not in params_dict:
                         continue
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
         if _is_npu:
             # Lazy initialization of expert weights cache to avoid slowing down load_weights

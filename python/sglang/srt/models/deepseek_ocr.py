@@ -1521,7 +1521,6 @@ class DeepseekOCRForCausalLM(nn.Module):
                         # Track if this is an expert weight to enable early skipping
                         is_expert_weight = False
                         param_name, weight_name, expert_id, shard_id = mapping
-                        #print("DSOCR: " + param_name + " " + weight_name)
                         if weight_name not in name:
                             continue
                         # Mark as expert weight regardless of whether we can process it
@@ -1550,7 +1549,9 @@ class DeepseekOCRForCausalLM(nn.Module):
                         ) and name not in params_dict:
                             continue
                         param = params_dict[name]
-                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
                         weight_loader(param, loaded_weight)
                 else:
                     # Skip loading extra bias for GPTQ models.
@@ -1562,7 +1563,9 @@ class DeepseekOCRForCausalLM(nn.Module):
                     ) and name not in params_dict:
                         continue
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
