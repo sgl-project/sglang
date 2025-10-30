@@ -7,7 +7,7 @@ import sys
 import time
 import unittest
 
-from sglang.multimodal_gen.api.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.base import DataType
 
 
 def run_command(command):

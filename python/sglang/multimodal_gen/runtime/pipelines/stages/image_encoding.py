@@ -14,7 +14,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import (
     retrieve_latents,
 )
 
-from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
+from sglang.multimodal_gen.configs.pipelines.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
     _pack_latents,

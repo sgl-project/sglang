@@ -7,7 +7,7 @@ from dataclasses import field
 import torch
 from torch import nn
 
-from sglang.multimodal_gen.api.configs.models.encoders import (
+from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     ImageEncoderConfig,
     TextEncoderConfig,

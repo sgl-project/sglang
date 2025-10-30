@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse
 
-from sglang.multimodal_gen.api.configs.sample.base import (
+from sglang.multimodal_gen.configs.sample.base import (
     SamplingParams,
     generate_request_id,
 )

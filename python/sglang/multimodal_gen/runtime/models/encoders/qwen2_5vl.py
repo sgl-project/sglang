@@ -17,7 +17,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 
-from sglang.multimodal_gen.api.configs.models.encoders.qwen_image import Qwen2_5VLConfig
+from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,

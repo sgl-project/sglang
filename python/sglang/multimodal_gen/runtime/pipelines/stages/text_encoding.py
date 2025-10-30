@@ -9,8 +9,8 @@ This module contains implementations of prompt encoding stages for diffusion pip
 
 import torch
 
-from sglang.multimodal_gen.api.configs.models.encoders import BaseEncoderOutput
-from sglang.multimodal_gen.api.configs.pipelines import FluxPipelineConfig
+from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.pipelines import FluxPipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req

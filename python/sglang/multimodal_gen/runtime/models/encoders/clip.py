@@ -10,7 +10,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.api.configs.models.encoders import (
+from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPTextConfig,
     CLIPVisionConfig,

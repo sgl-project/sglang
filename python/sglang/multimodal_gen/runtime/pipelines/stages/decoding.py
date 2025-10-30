@@ -9,8 +9,8 @@ import weakref
 
 import torch
 
-from sglang.multimodal_gen.api.configs.models.vaes.base import VAEArchConfig
-from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
+from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig
+from sglang.multimodal_gen.configs.pipelines.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )

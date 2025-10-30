@@ -18,7 +18,7 @@ import torch
 from einops import rearrange, repeat
 from torch import nn
 
-from sglang.multimodal_gen.api.configs.models.dits import StepVideoConfig
+from sglang.multimodal_gen.configs.models.dits import StepVideoConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift

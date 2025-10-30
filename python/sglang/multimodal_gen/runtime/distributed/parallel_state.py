@@ -46,7 +46,6 @@ from torch.distributed import ProcessGroup
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from ..utils.distributed import RankGenerator
@@ -637,6 +636,8 @@ def maybe_init_distributed_environment_and_model_parallel(
     dp_size: int = 1,
     distributed_init_method: str = "env://",
 ):
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
     if _WORLD is not None and model_parallel_is_initialized():
         # make sure the tp and sp sizes are correct
         assert (

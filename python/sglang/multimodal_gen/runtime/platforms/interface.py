@@ -2,19 +2,22 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/interface.py
+from __future__ import annotations
 
 import enum
 import random
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
 
-from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
-    AttentionImpl,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import resolve_obj_by_qualname
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+        AttentionImpl,
+    )
 
 logger = init_logger(__name__)
 

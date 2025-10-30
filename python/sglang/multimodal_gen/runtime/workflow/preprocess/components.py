@@ -12,12 +12,12 @@ import pyarrow as pa
 import torch
 from datasets import Dataset, Video, load_dataset
 
-from sglang.multimodal_gen.api.configs.configs import (
+from sglang.multimodal_gen.configs.configs import (
     DatasetType,
     PreprocessConfig,
     VideoLoaderType,
 )
-from sglang.multimodal_gen.api.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.base import DataType
 from sglang.multimodal_gen.dataset.dataloader.parquet_io import (
     ParquetDatasetWriter,
     records_to_table,

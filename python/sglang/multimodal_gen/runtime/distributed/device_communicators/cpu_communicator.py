@@ -8,9 +8,6 @@ import os
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.platforms.interface import CpuArchEnum
-
 from .base_device_communicator import DeviceCommunicatorBase
 
 
@@ -23,6 +20,9 @@ class CpuCommunicator(DeviceCommunicatorBase):
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
     ):
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+        from sglang.multimodal_gen.runtime.platforms.interface import CpuArchEnum
+
         super().__init__(cpu_group, device, device_group, unique_name)
         self.dist_module = torch.distributed
 

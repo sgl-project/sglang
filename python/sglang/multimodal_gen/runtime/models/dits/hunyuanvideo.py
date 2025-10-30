@@ -8,8 +8,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.api.configs.models.dits import HunyuanVideoConfig
-from sglang.multimodal_gen.api.configs.sample.teacache import TeaCacheParams
+from sglang.multimodal_gen.configs.models.dits import HunyuanVideoConfig
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,

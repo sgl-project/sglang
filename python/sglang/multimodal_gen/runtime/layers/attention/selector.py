@@ -14,10 +14,7 @@ import torch
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
 )
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import STR_BACKEND_ENV_VAR, resolve_obj_by_qualname
@@ -108,6 +105,8 @@ def _cached_get_attn_backend(
     #
     # THIS SELECTION OVERRIDES THE SGL_DIFFUSION_ATTENTION_BACKEND
     # ENVIRONMENT VARIABLE.
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
     if not supported_attention_backends:
         raise ValueError("supported_attention_backends is empty")
     selected_backend = None

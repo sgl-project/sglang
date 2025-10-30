@@ -32,10 +32,7 @@ import torch
 from torch import nn
 
 # from ..utils import (extract_layer_index)
-from sglang.multimodal_gen.api.configs.models.encoders import (
-    BaseEncoderOutput,
-    LlamaConfig,
-)
+from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput, LlamaConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 

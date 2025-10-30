@@ -20,7 +20,7 @@ from einops import rearrange
 from torch import nn
 from torch.nn import functional as F
 
-from sglang.multimodal_gen.api.configs.models.vaes import StepVideoVAEConfig
+from sglang.multimodal_gen.configs.models.vaes import StepVideoVAEConfig
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
 

@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from sglang.multimodal_gen.api.configs.sample import SamplingParams
+from sglang.multimodal_gen.configs.sample import SamplingParams
 from sglang.multimodal_gen.dataset import gettextdataset
 from sglang.multimodal_gen.dataset.dataloader.parquet_io import (
     ParquetDatasetWriter,

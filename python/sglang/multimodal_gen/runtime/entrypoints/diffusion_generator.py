@@ -28,7 +28,7 @@ logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
 logging.getLogger("PIL").setLevel(logging.WARNING)
 logging.getLogger("PIL.Image").setLevel(logging.WARNING)
 
-from sglang.multimodal_gen.api.configs.sample.base import DataType, SamplingParams
+from sglang.multimodal_gen.configs.sample.base import DataType, SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.managers.schedulerbase import SchedulerBase

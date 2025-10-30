@@ -18,7 +18,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
-from sglang.multimodal_gen.api.configs.sample.base import (
+from sglang.multimodal_gen.configs.sample.base import (
     SamplingParams,
     generate_request_id,
 )

@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 from diffusers.utils.torch_utils import randn_tensor
 
-from sglang.multimodal_gen.api.configs.models import VAEConfig
+from sglang.multimodal_gen.configs.models import VAEConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,

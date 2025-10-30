@@ -5,7 +5,7 @@ from typing import cast
 
 from torch.utils.data import DataLoader
 
-from sglang.multimodal_gen.api.configs.configs import PreprocessConfig
+from sglang.multimodal_gen.configs.configs import PreprocessConfig
 from sglang.multimodal_gen.dataset.dataloader.record_schema import (
     basic_t2v_record_creator,
     i2v_record_creator,

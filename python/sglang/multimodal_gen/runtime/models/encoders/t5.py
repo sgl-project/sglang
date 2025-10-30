@@ -29,10 +29,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.multimodal_gen.api.configs.models.encoders import (
-    BaseEncoderOutput,
-    T5Config,
-)
+from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput, T5Config
 from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm

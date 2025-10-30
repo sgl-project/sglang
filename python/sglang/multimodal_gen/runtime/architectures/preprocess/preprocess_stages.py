@@ -10,7 +10,7 @@ import torchvision
 from einops import rearrange
 from torchvision import transforms
 
-from sglang.multimodal_gen.api.configs.configs import VideoLoaderType
+from sglang.multimodal_gen.configs.configs import VideoLoaderType
 from sglang.multimodal_gen.dataset.transform import (
     CenterCropResizeVideo,
     TemporalRandomCrop,

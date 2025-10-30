@@ -9,7 +9,7 @@ import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
 
-from sglang.multimodal_gen.api.configs.pipelines.qwen_image import (
+from sglang.multimodal_gen.configs.pipelines.qwen_image import (
     QwenImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video

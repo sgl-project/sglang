@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from sglang.multimodal_gen.api.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.base import DataType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.test_utils import TestCLIBase, check_image_size
 

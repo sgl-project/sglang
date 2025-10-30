@@ -19,7 +19,7 @@ import torch.profiler
 from einops import rearrange
 from tqdm.auto import tqdm
 
-from sglang.multimodal_gen.api.configs.pipelines.base import STA_Mode
+from sglang.multimodal_gen.configs.pipelines.base import STA_Mode
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,

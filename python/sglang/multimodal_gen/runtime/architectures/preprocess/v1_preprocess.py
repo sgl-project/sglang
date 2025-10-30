@@ -5,7 +5,7 @@ import os
 from typing import Any
 
 from sglang.multimodal_gen import PipelineConfig
-from sglang.multimodal_gen.api.configs.models.vaes import WanVAEConfig
+from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.runtime.architectures.preprocess.preprocess_pipeline_i2v import (
     PreprocessPipeline_I2V,
 )

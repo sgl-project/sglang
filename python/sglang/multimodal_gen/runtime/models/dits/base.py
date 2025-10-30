@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.multimodal_gen.api.configs.models import DiTConfig
+from sglang.multimodal_gen.configs.models import DiTConfig
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
