@@ -182,7 +182,7 @@ class CLIPAttention(nn.Module):
             self.head_dim,
             self.num_heads_per_partition,
             softmax_scale=self.scale,
-            causal=True,
+            causal=False,
             supported_attention_backends=config._supported_attention_backends,
         )
 
@@ -221,6 +221,7 @@ class CLIPAttention(nn.Module):
             self.head_dim,
         )
         attn_output = self.attn(query_states, key_states, value_states)
+
         attn_output = attn_output.reshape(
             attn_output.shape[0],
             attn_output.shape[1],

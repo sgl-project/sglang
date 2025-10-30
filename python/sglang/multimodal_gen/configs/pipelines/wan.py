@@ -84,7 +84,7 @@ class WanI2V480PConfig(WanT2V480PConfig):
     """Base configuration for Wan I2V 14B 480P pipeline architecture."""
 
     # WanConfig-specific parameters with defaults
-
+    i2v_task: bool = True
     # Precision for each component
     image_encoder_config: EncoderConfig = field(default_factory=CLIPVisionConfig)
     image_encoder_precision: str = "fp32"

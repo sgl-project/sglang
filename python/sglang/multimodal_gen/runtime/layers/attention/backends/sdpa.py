@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
@@ -74,4 +75,11 @@ class SDPAImpl(AttentionImpl):
             query, key, value, **attn_kwargs
         )
         output = output.transpose(1, 2)
+
+        # attn_weights = torch.matmul(query, key.transpose(-1, -2)) * self.softmax_scale
+        # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        # attn_weights = nn.functional.dropout(attn_weights, p=0.0, training=False)
+        #
+        # output = torch.matmul(attn_weights, value)
+        # output = output.transpose(1, 2).contiguous()
         return output
