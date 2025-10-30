@@ -25,8 +25,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
-    is_blackwell_supported,
     is_flashinfer_available,
+    is_sm100_supported,
     next_power_of_2,
 )
 
@@ -242,9 +242,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        self.fmha_backend = "auto"
-        if is_blackwell_supported():
+        if is_sm100_supported():
             self.fmha_backend = "cutlass"
+        else:
+            self.fmha_backend = "auto"
+
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=self.fmha_backend
         )
