@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package sglang.ha.gossip;
+
+service Gossip {
+  rpc PingServer(GossipMessage) returns (NodeUpdate);
+}
+
+enum NodeStatus {
+  INIT = 0;
+  ALIVE = 1;
+  SUSPECTED = 2;
+  DOWN = 3;
+  LEAVING = 4;
+}
+
+message NodeState {
+  string name = 1;
+  string address = 2;
+  NodeStatus status = 3;
+  uint64 version = 4;
+  map<string, bytes> metadata = 5;
+}
+
+
+message StateSync {
+  repeated NodeState nodes = 1;
+}
+
+message Ping {
+  StateSync state_sync = 1;
+}
+
+message PingReq {
+  NodeState node = 1;
+}
+
+message Ack {
+  uint64 timestamp = 1;
+}
+
+message NodeUpdate {
+  string name = 1;
+  string address = 2;
+  NodeStatus status = 3;
+}
+
+message GossipMessage {
+  oneof payload {
+    Ping ping = 1;
+    PingReq ping_req = 2;
+  }
+}
