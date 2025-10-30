@@ -9,16 +9,13 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
 )
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.layers.moe.routed_experts_capturer import (
-    get_global_experts_capturer
-)
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
@@ -109,6 +106,16 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
+                        req.routed_experts = (
+                            get_global_experts_capturer()
+                            .get_host_cache()
+                            .buffer[
+                                self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                                    : len(req.fill_ids)
+                                ].cpu()
+                            ]
+                            .tolist()
+                        )
                         self.tree_cache.cache_finished_req(req)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -151,7 +158,6 @@ class SchedulerOutputProcessorMixin:
                             .clone()
                             .tolist()
                         )
-                    
 
                     if req.grammar is not None:
                         # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -192,8 +198,7 @@ class SchedulerOutputProcessorMixin:
                                     last_prefill_chunk=False,
                                 )
                             logprob_pt += num_input_logprobs
-            # if batch.return_routed_experts:
-            #     self.routed_experts_capturer.clear_buffer()
+
         else:  # embedding or reward model
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
@@ -332,6 +337,16 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
+                req.routed_experts = (
+                    get_global_experts_capturer()
+                    .get_host_cache()
+                    .buffer[
+                        self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                            : len(req.output_ids) + len(req.fill_ids)
+                        ].cpu()
+                    ]
+                    .tolist()
+                )
                 if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
                     # FIXME(lsyin): fix the messy logic here
                     # 1) when not overlap (v2 impl), we free the extra tokens in the req
@@ -354,20 +369,6 @@ class SchedulerOutputProcessorMixin:
                 else:
                     self.tree_cache.cache_finished_req(req)
 
-                if self.tree_cache is not None:
-                    for req in batch.reqs:
-                        (
-                            cached_token_indices,
-                            _,
-                            _,
-                            _,
-                        ) = self.tree_cache.match_prefix(
-                            key=RadixKey(token_ids=req.origin_input_ids)
-                        )
-                        req.routed_experts = get_global_experts_capturer().get_host_cache().buffer[i]
-                        # print(f"In process batch result{batch.forward_mode}: {req=}")
-        
-                
                 req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
@@ -928,7 +929,7 @@ class SchedulerOutputProcessorMixin:
                 if req.return_routed_experts:
                     if output_routed_experts is None:
                         output_routed_experts = []
-                    output_routed_experts.append(req.routed_experts.tolist())
+                    output_routed_experts.append(req.routed_experts)
 
             if (
                 req.finished()
