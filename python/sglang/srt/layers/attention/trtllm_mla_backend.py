@@ -860,6 +860,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
     ) -> torch.Tensor:
+
+        # When chunked prefix cache is disabled, fallback to normal MLA path
+        if self.disable_chunked_prefix_cache:
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
+
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
         if (
@@ -1003,6 +1010,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             return output
 
+        # When chunked prefix cache is enabled, dispatch to different path for ragged attention.
+        assert (
+            not self.disable_chunked_prefix_cache
+        ), "Chunked prefix cache should be enabled when using ragged attention."
         if forward_batch.attn_attend_prefix_cache:
             # MHA for chunked prefix kv cache when running model with MLA
             assert forward_batch.prefix_chunk_idx is not None
