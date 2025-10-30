@@ -23,7 +23,6 @@ from sglang.multimodal_gen.configs.pipelines.base import STA_Mode
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
-    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
     get_world_group,
@@ -219,20 +218,7 @@ class DenoisingStage(PipelineStage):
         ) and not server_args.disable_autocast
 
         # Handle sequence parallelism if enabled
-        sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
-        sp_group = sp_world_size > 1
-        if sp_group:
-            latents = rearrange(
-                batch.latents, "b c (n t) h w -> b c n t h w", n=sp_world_size
-            ).contiguous()
-            latents = latents[:, :, rank_in_sp_group, :, :, :]
-            batch.latents = latents
-            if batch.image_latent is not None:
-                image_latent = rearrange(
-                    batch.image_latent, "b c (n t) h w -> b c n t h w", n=sp_world_size
-                ).contiguous()
-                image_latent = image_latent[:, :, rank_in_sp_group, :, :, :]
-                batch.image_latent = image_latent
+        self._preprocess_sp_latents(batch)
 
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
@@ -316,7 +302,9 @@ class DenoisingStage(PipelineStage):
                 * (batch.width // spatial_scale)
                 // (patch_size[1] * patch_size[2])
             )
-            seq_len = int(math.ceil(seq_len / sp_world_size)) * sp_world_size
+            seq_len = (
+                int(math.ceil(seq_len / get_sp_world_size())) * get_sp_world_size()
+            )
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -402,14 +390,9 @@ class DenoisingStage(PipelineStage):
             trajectory_timesteps_tensor = None
 
         # Gather results if using sequence parallelism
-        sp_group = get_sp_group()
-        if sp_group:
-            latents = sequence_model_parallel_all_gather(latents, dim=2)
-            if batch.return_trajectory_latents:
-                trajectory_tensor = trajectory_tensor.to(get_local_torch_device())
-                trajectory_tensor = sequence_model_parallel_all_gather(
-                    trajectory_tensor, dim=3
-                )
+        latents, trajectory_tensor = self._postprocess_sp_latents(
+            batch, latents, trajectory_tensor
+        )
 
         if trajectory_tensor is not None and trajectory_timesteps_tensor is not None:
             batch.trajectory_timesteps = trajectory_timesteps_tensor.cpu()
@@ -443,6 +426,56 @@ class DenoisingStage(PipelineStage):
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
+
+    def _preprocess_sp_latents(self, batch: Req):
+        """Shard latents for Sequence Parallelism if applicable."""
+        sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        if get_sp_world_size() <= 1:
+            batch.did_sp_shard_latents = False
+            return
+
+        def _shard_tensor(
+            tensor: torch.Tensor | None,
+        ) -> tuple[torch.Tensor | None, bool]:
+            if tensor is None:
+                return None, False
+
+            if tensor.dim() == 5:
+                time_dim = tensor.shape[2]
+                if time_dim > 0 and time_dim % sp_world_size == 0:
+                    sharded_tensor = rearrange(
+                        tensor, "b c (n t) h w -> b c n t h w", n=sp_world_size
+                    ).contiguous()
+                    sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
+                    return sharded_tensor, True
+
+            # For 4D image tensors or unsharded 5D tensors, return as is.
+            return tensor, False
+
+        batch.latents, did_shard = _shard_tensor(batch.latents)
+        batch.did_sp_shard_latents = did_shard
+
+        # image_latent is sharded independently, but the decision to all-gather later
+        # is based on whether the main `latents` was sharded.
+        if batch.image_latent is not None:
+            batch.image_latent, _ = _shard_tensor(batch.image_latent)
+
+    def _postprocess_sp_latents(
+        self,
+        batch: Req,
+        latents: torch.Tensor,
+        trajectory_tensor: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Gather latents after Sequence Parallelism if they were sharded."""
+        if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
+            latents = sequence_model_parallel_all_gather(latents, dim=2)
+            if trajectory_tensor is not None:
+                # trajectory_tensor shape: [b, num_steps, c, t_local, h, w] -> gather on dim 3
+                trajectory_tensor = trajectory_tensor.to(get_local_torch_device())
+                trajectory_tensor = sequence_model_parallel_all_gather(
+                    trajectory_tensor, dim=3
+                )
+        return latents, trajectory_tensor
 
     def start_profile(self, batch: Req):
         if not batch.profile:
