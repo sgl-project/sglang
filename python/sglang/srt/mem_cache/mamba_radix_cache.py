@@ -389,8 +389,6 @@ class MambaRadixCache(BasePrefixCache):
 
         # copy mamba state to req local space if cow is true
         if cow_mamba and last_node.mamba_value is not None:
-            assert req.req_pool_idx is None  # req_pool_idx is uninitialed
-
             # for reqs without mamba cache
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
@@ -428,7 +426,7 @@ class MambaRadixCache(BasePrefixCache):
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
         return self._insert_helper(self.root_node, key, value, mamba_value)
 
-    def cache_finished_req(self, req: Req) -> None:
+    def cache_finished_req(self, req: Req, is_insert=True) -> None:
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -456,15 +454,20 @@ class MambaRadixCache(BasePrefixCache):
             .clone()
         )
 
-        new_prefix_len, mamba_exist = self.insert(
-            RadixKey(token_ids[:page_aligned_len], req.extra_key),
-            page_aligned_kv_indices,
-            mamba_value,
-        )
-
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
-        )
+        if is_insert:
+            new_prefix_len, mamba_exist = self.insert(
+                RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                page_aligned_kv_indices,
+                mamba_value,
+            )
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[len(req.prefix_indices) : new_prefix_len]
+            )
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[len(req.prefix_indices) : page_aligned_len]
+            )
+            mamba_exist = True
 
         self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=mamba_exist)
         self.dec_lock_ref(req.last_node)
