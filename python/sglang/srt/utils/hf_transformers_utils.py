@@ -246,11 +246,7 @@ def get_config(
     if config.model_type in _CONFIG_REGISTRY:
         model_type = config.model_type
         if model_type == "deepseek_vl_v2":
-            if (
-                getattr(config, "auto_map", None) is not None
-                and config.auto_map.get("AutoModel")
-                == "modeling_deepseekocr.DeepseekOCRForCausalLM"
-            ):
+            if _is_deepseek_ocr_model(config):
                 model_type = "deepseek-ocr"
         config_class = _CONFIG_REGISTRY[model_type]
         config = config_class.from_pretrained(model, revision=revision)
