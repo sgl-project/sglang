@@ -178,6 +178,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
     numa_bind_to_node,
+    patch_torch,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
     require_mlp_sync,
@@ -286,6 +287,9 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
+
+        if get_bool_env_var("SGLANG_SANITY_CHECK_TORCH_EMPTY"):
+            patch_torch.handle_sanity_check_torch_empty()
 
         # Init tokenizer
         self.init_tokenizer()
