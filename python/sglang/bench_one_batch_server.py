@@ -16,6 +16,7 @@ import argparse
 import dataclasses
 import itertools
 import json
+import logging
 import multiprocessing
 import os
 import random
@@ -38,6 +39,8 @@ from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
+
+logger = logging.getLogger(__name__)
 
 
 class ProfileLinks(BaseModel):
