@@ -1,37 +1,60 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
 import logging
-from abc import abstractmethod
 from typing import Any, Iterable, Optional, Tuple
 
 import mindspore as ms
 import numpy as np
 import torch
+import torch_npu
 from mindspore import Tensor, mint, mutable
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.mindspore_models.deepseekv3 import DeepseekV3ForCausalLM
-from sglang.srt.models.mindspore_models.qwen3 import Qwen3ForCausalLM
-from sglang.srt.models.mindspore_models.qwen3_moe import Qwen3MoeForCausalLM
-from sglang.srt.models.mindspore_models.utils import tensor_ms2torch, tensor_torch2ms
-
-# from torch import nn
-
-
-type_model_map = {
-    "qwen3": Qwen3ForCausalLM,
-    "qwen3_moe": Qwen3MoeForCausalLM,
-    "deepseek_v3": DeepseekV3ForCausalLM,
-}
+from sglang.srt.models.registry import import_model_classes
 
 logger = logging.getLogger(__name__)
+
+
+def tensor_torch2ms(x: torch.Tensor):
+    if x is None or not isinstance(x, torch.Tensor):
+        return x
+
+    if x.device.type == "cpu":
+        # TODO: dlpack support CPU, for now will slow down the weight loading
+        if x.dtype == torch.bfloat16:
+            return ms.Tensor(
+                x.contiguous().to(torch.float32).numpy(), dtype=ms.bfloat16
+            )
+        return ms.Tensor(x.contiguous().numpy())
+
+    # torch tensor -> dlpack -> mindspore tensor
+    pt_dlpack = torch.utils.dlpack.to_dlpack(x)
+    ms_tensor = ms.utils.dlpack.from_dlpack(pt_dlpack)
+    return ms_tensor
+
+
+def tensor_ms2torch(x: ms.Tensor):
+    if x is None or not isinstance(x, ms.Tensor):
+        return x
+
+    if x.device == "CPU":  # TODO: dlpack support CPU
+        if x.dtype == ms.bfloat16:
+            return torch.tensor(
+                x.contiguous().to(ms.float32).asnumpy(), dtype=torch.bfloat16
+            )
+        return torch.tensor(x.contiguous().asnumpy())
+
+    # ms tensor -> dlpack -> torch tensor
+    ms_dlpack = ms.utils.dlpack.to_dlpack(x)
+    torch_tensor = torch.utils.dlpack.from_dlpack(ms_dlpack)
+    torch_npu.npu.synchronize()
+    return torch_tensor
 
 
 # Adapt from: https://gitee.com/mindspore/vllm-mindspore/blob/master/vllm_mindspore/model_executor/models/attention_mask.py
@@ -160,10 +183,7 @@ class MindSporeForCausalLM(torch.nn.Module):
             # MatMulAllReduce only support tp size in (1, 2, 4, 8)
             ms.set_context(graph_kernel_flags="--disable_pass=MatMulAllReduce")
 
-        model_type = self.config.model_type
-        if model_type not in type_model_map:
-            raise ValueError(f"Unsupported arch {model_type}")
-        arch = type_model_map[model_type]
+        arch = self.get_arch(self.config)
         self.model = arch(config=config, quant_config=quant_config)
 
         self.casual_mask = LowerTriangularMask(
@@ -171,6 +191,23 @@ class MindSporeForCausalLM(torch.nn.Module):
         )
         self.key_cache = []
         self.value_cache = []
+
+    def get_arch(self, config):
+        # Get all implemented models
+        mindspore_models = import_model_classes("sgl_mindspore.models")
+
+        # Get arch from config
+        architectures = config.architectures
+        if isinstance(architectures, str):
+            architectures = [architectures]
+        if not architectures:
+            logger.warning("No model architectures are specified")
+
+        for arch in architectures:
+            if arch in mindspore_models:
+                return mindspore_models[arch]
+        if arch is None:
+            raise ValueError(f"Unsupported arch {architectures}")
 
     @property
     def use_mla(self):

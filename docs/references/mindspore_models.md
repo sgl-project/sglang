@@ -18,6 +18,14 @@ Currently, the following models are supported:
 
 ## Installation
 
+> **Note**: Currently, MindSpore models are provided by an independent package `sgl-mindspore`, which needs to be installed separately.
+
+```shell
+git clone https://github.com/chz34/sgl-mindspore.git
+cd sgl-mindspore
+pip install -e .
+```
+
 You will need to install the following packages, due to the support of tensor conversion through `dlpack` on 3rd devices, the minimum version of  `PyTorch` is 2.7.1
 
 ```shell
