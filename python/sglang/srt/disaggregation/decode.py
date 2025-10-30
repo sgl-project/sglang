@@ -58,6 +58,11 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sglang.srt.tracing.trace import (
+    trace_event_batch,
+    trace_slice_batch,
+    trace_slice_end,
+)
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -313,6 +318,7 @@ class DecodePreallocQueue:
             )
 
             req.add_latency(RequestStage.DECODE_PREPARE)
+            trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -527,6 +533,9 @@ class DecodePreallocQueue:
                 time.perf_counter()
             )
             decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
+            trace_slice_end(
+                RequestStage.DECODE_BOOTSTRAP, decode_req.req.rid, auto_next_anon=True
+            )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -764,8 +773,12 @@ class DecodeTransferQueue:
                 indices_to_remove.add(i)
                 decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
 
-                # special handling for sampling_params.max_new_tokens == 1
-                if decode_req.req.sampling_params.max_new_tokens == 1:
+                # special handling for corner cases
+                should_finish = (
+                    decode_req.req.sampling_params.max_new_tokens == 1
+                    or output_id in decode_req.req.eos_token_ids
+                )
+                if should_finish:
                     # finish immediately
                     decode_req.req.time_stats.forward_entry_time = (
                         decode_req.req.time_stats.completion_time
@@ -775,8 +788,19 @@ class DecodeTransferQueue:
                         [decode_req.req], decode_req.req.return_logprob
                     )
                     self.tree_cache.cache_finished_req(decode_req.req)
+                    trace_slice_end(
+                        RequestStage.DECODE_QUICK_FINISH,
+                        decode_req.req.rid,
+                        thread_finish_flag=True,
+                    )
                 else:
                     transferred_reqs.append(decode_req.req)
+                    trace_slice_end(
+                        RequestStage.DECODE_TRANSFERRED,
+                        decode_req.req.rid,
+                        auto_next_anon=True,
+                    )
+
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -822,6 +846,7 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
+                    trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
                     if prepare_mlp_sync_flag:
                         self._prepare_idle_batch_and_run(None)
                 else:
@@ -871,6 +896,7 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
+                    trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
                     if prepare_mlp_sync_flag:
                         batch_, batch_result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
@@ -953,6 +979,9 @@ class SchedulerDisaggregationDecodeMixin:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
 
+        if ret:
+            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
+            trace_event_batch("schedule", ret.reqs, attrs=attrs)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:

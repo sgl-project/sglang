@@ -323,11 +323,11 @@ class CudaGraphRunner:
                 self.pp_proxy_tensors = {
                     "hidden_states": torch.zeros(
                         (self.max_bs, self.model_runner.model_config.hidden_size),
-                        dtype=torch.bfloat16,
+                        dtype=self.model_runner.model_config.dtype,
                     ),
                     "residual": torch.zeros(
                         (self.max_bs, self.model_runner.model_config.hidden_size),
-                        dtype=torch.bfloat16,
+                        dtype=self.model_runner.model_config.dtype,
                     ),
                 }
 

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use validator::Validate;
 
 // Import shared types from common module
 use super::common::{
@@ -20,6 +21,9 @@ use super::common::{
 pub struct ResponseTool {
     #[serde(rename = "type")]
     pub r#type: ResponseToolType,
+    // Function tool fields (used when type == "function")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<crate::protocols::common::Function>,
     // MCP-specific fields (used when type == "mcp")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
@@ -39,6 +43,7 @@ impl Default for ResponseTool {
     fn default() -> Self {
         Self {
             r#type: ResponseToolType::WebSearchPreview,
+            function: None,
             server_url: None,
             authorization: None,
             server_label: None,
@@ -52,6 +57,7 @@ impl Default for ResponseTool {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseToolType {
+    Function,
     WebSearchPreview,
     CodeInterpreter,
     Mcp,
@@ -130,6 +136,13 @@ pub enum ResponseInputOutputItem {
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -439,7 +452,7 @@ fn default_top_p() -> Option<f32> {
 // Request/Response Types
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct ResponsesRequest {
     /// Run the request in the background
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -474,6 +487,7 @@ pub struct ResponsesRequest {
 
     /// Optional conversation id to persist input/output as items
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_conversation_id"))]
     pub conversation: Option<String>,
 
     /// Whether to enable parallel tool calls
@@ -497,7 +511,7 @@ pub struct ResponsesRequest {
     pub store: Option<bool>,
 
     /// Whether to stream the response
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub stream: Option<bool>,
 
     /// Temperature for sampling
@@ -676,11 +690,41 @@ impl GenerationRequest for ResponsesRequest {
                     ResponseInputOutputItem::FunctionToolCall { arguments, .. } => {
                         Some(arguments.clone())
                     }
+                    ResponseInputOutputItem::FunctionCallOutput { output, .. } => {
+                        Some(output.clone())
+                    }
                 })
                 .collect::<Vec<String>>()
                 .join(" "),
         }
     }
+}
+
+/// Validate conversation ID format
+pub fn validate_conversation_id(conv_id: &str) -> Result<(), validator::ValidationError> {
+    if !conv_id.starts_with("conv_") {
+        let mut error = validator::ValidationError::new("invalid_conversation_id");
+        error.message = Some(std::borrow::Cow::Owned(format!(
+            "Invalid 'conversation': '{}'. Expected an ID that begins with 'conv_'.",
+            conv_id
+        )));
+        return Err(error);
+    }
+
+    // Check if the conversation ID contains only valid characters
+    let is_valid = conv_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+
+    if !is_valid {
+        let mut error = validator::ValidationError::new("invalid_conversation_id");
+        error.message = Some(std::borrow::Cow::Owned(format!(
+            "Invalid 'conversation': '{}'. Expected an ID that contains letters, numbers, underscores, or dashes, but this value contained additional characters.",
+            conv_id
+        )));
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Normalize a SimpleInputMessage to a proper Message item
