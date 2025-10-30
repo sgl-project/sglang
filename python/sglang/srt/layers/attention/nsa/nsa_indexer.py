@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -17,10 +17,10 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
-from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM, NSA_USE_REAL_INDEXER
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -74,7 +74,7 @@ class BaseIndexerMetadata(ABC):
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
-    from fast_hadamard_transform import hadamard_transform
+    from sgl_kernel import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -119,6 +119,7 @@ class Indexer(CustomOp):
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        fuse_wk_and_weights_proj: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -129,6 +130,7 @@ class Indexer(CustomOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.fuse_wk_and_weights_proj = fuse_wk_and_weights_proj
         if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = align(self.sm_count // 2, 8)
@@ -140,21 +142,29 @@ class Indexer(CustomOp):
             quant_config=quant_config,
             prefix=add_prefix("wq_b", prefix),
         )
-        self.wk = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wk", prefix),
-        )
+        if self.fuse_wk_and_weights_proj:
+            self.fused_wk_and_weights_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim + self.n_heads,
+                bias=False,
+                prefix=add_prefix("fused_wk_and_weights_proj", prefix),
+            )
+        else:
+            self.wk = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wk", prefix),
+            )
+            # NOTE: weight_proj is not quantized
+            self.weights_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.n_heads,
+                bias=False,
+                prefix=add_prefix("weights_proj", prefix),
+            )
         self.k_norm = V32LayerNorm(self.head_dim)
-        # NOTE: weight_proj is not quantized
-        self.weights_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.n_heads,
-            bias=False,
-            prefix=add_prefix("weights_proj", prefix),
-        )
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,
@@ -168,45 +178,8 @@ class Indexer(CustomOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-    def _forward_fake(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-    ):
-        bs = x.shape[0]
-        assert self.index_topk == 2048
-        ans = torch.arange(0, self.index_topk, dtype=torch.int32, device=x.device)[
-            None, ...
-        ].repeat(bs, 1)
-        if forward_batch.forward_mode.is_extend():
-            assert (
-                forward_batch.extend_seq_lens_cpu is not None
-                and forward_batch.seq_lens_cpu is not None
-            )
-            which = 0
-            for i, (kv_len, qo_len) in enumerate(
-                zip(
-                    forward_batch.seq_lens_cpu.tolist(),
-                    forward_batch.extend_seq_lens_cpu,
-                    strict=True,
-                )
-            ):
-                for j in range(kv_len - qo_len, kv_len):
-                    ans[which, j + 1 :] = -1
-                    which += 1
-            assert which == ans.shape[0]
-        else:
-            assert forward_batch.seq_lens_cpu is not None
-            for i, seq_len in enumerate(forward_batch.seq_lens_cpu.tolist()):
-                ans[i, seq_len:] = -1
-
-        return ans
-
-    def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        weights, _ = self.weights_proj(x)
+    @torch.compile(dynamic=True)
+    def _get_logits_head_gate(self, weights: torch.Tensor, q_scale: torch.Tensor):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
@@ -218,7 +191,7 @@ class Indexer(CustomOp):
         positions: torch.Tensor,
         enable_dual_stream: bool,
     ):
-
+        weights = None
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -235,7 +208,12 @@ class Indexer(CustomOp):
                 )
             with torch.cuda.stream(self.alt_stream):
                 # TODO we should also put DeepGEMM half SM here?
-                key, _ = self.wk(x)
+                if self.fuse_wk_and_weights_proj:
+                    key, weights = self.fused_wk_and_weights_proj(x)[0].split(
+                        [self.head_dim, self.n_heads], dim=-1
+                    )
+                else:
+                    key, _ = self.wk(x)
                 key = self.k_norm(key)
 
                 k_rope, _ = torch.split(
@@ -253,7 +231,12 @@ class Indexer(CustomOp):
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-            key, _ = self.wk(x)
+            if self.fuse_wk_and_weights_proj:
+                key, weights = self.fused_wk_and_weights_proj(x)[0].split(
+                    [self.head_dim, self.n_heads], dim=-1
+                )
+            else:
+                key, _ = self.wk(x)
             key = self.k_norm(key)
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -276,7 +259,7 @@ class Indexer(CustomOp):
             query = rotate_activation(query)
             key = rotate_activation(key)
 
-        return query, key
+        return query, key, weights
 
     def _get_topk_paged(
         self,
@@ -302,7 +285,10 @@ class Indexer(CustomOp):
         )
 
         blocksize = page_size
-        seqlens_32 = metadata.get_seqlens_int32()
+        if forward_batch.forward_mode.is_target_verify():
+            seqlens_32 = metadata.get_seqlens_expanded()
+        else:
+            seqlens_32 = metadata.get_seqlens_int32()
         # NOTE(dark): 132 is SM count on H200/B200, not magic number
         schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32, blocksize, self.sm_count
@@ -353,8 +339,9 @@ class Indexer(CustomOp):
         k_fp8_list = []
         k_scale_list = []
         ks_list = []
+        ke_list = []
         offset = 0
-
+        seq_lens_expanded = metadata.get_seqlens_expanded()
         block_tables = metadata.get_page_table_64()
 
         assert (
@@ -377,33 +364,37 @@ class Indexer(CustomOp):
             )
             extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
             ks = torch.full((extend_seq_len,), offset, dtype=torch.int32, device="cuda")
+            ke = ks + seq_lens_expanded[offset : offset + extend_seq_len]
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
             ks_list.append(ks)
+            ke_list.append(ke)
             offset += extend_seq_len
 
         k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
         ks = torch.cat(ks_list, dim=0)
-        seq_lens_expanded = metadata.get_seqlens_expanded()
-        ke = ks + seq_lens_expanded
+        ke = torch.cat(ke_list, dim=0)
 
         logits = deep_gemm.fp8_mqa_logits(
-            q_fp8,
+            q_fp8[:offset],
             kv_fp8,
-            weights,
+            weights[:offset],
             ks,
             ke,
             clean_logits=False,
         )
-
+        token_nums, _, _ = q_fp8.shape
         assert logits.shape[0] == len(seq_lens_expanded)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
-
+        raw_topk_result = metadata.topk_transform(logits, self.index_topk)
+        topk_result = torch.full(
+            (token_nums, self.index_topk), -1, device=q_fp8.device, dtype=torch.int32
+        )
+        topk_result[:offset] = raw_topk_result
         return topk_result
 
-    def forward_indexer_bs_1(
+    def forward_indexer(
         self,
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
@@ -484,20 +475,9 @@ class Indexer(CustomOp):
             q_len_start = q_len_end
 
         topk_indices = torch.cat(topk_indices_list, dim=0)
-
         return topk_indices
 
-    def forward_indexer(
-        self,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        forward_batch: ForwardBatch,
-        topk: int,
-        layer_id: int,
-    ) -> Optional[torch.Tensor]:
-        return self.forward_indexer_bs_1(q_fp8, weights, forward_batch, topk, layer_id)
-
-    def _forward(
+    def forward_cuda(
         self,
         x: torch.Tensor,
         q_lora: torch.Tensor,
@@ -529,10 +509,9 @@ class Indexer(CustomOp):
         if metadata is None:
             return None
 
-        if not NSA_USE_REAL_INDEXER:  # temporary
-            return self._forward_fake(x, q_lora, positions, forward_batch, layer_id)
-
-        query, key = self._get_q_k_bf16(q_lora, x, positions, enable_dual_stream)
+        query, key, weights = self._get_q_k_bf16(
+            q_lora, x, positions, enable_dual_stream
+        )
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -550,6 +529,8 @@ class Indexer(CustomOp):
         # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
         # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
+        if not forward_batch.out_cache_loc.is_contiguous():
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
         forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
@@ -557,7 +538,9 @@ class Indexer(CustomOp):
             index_k_scale=k_scale,
         )
 
-        weights = self._get_logits_head_gate(x, q_scale)
+        if not self.fuse_wk_and_weights_proj:
+            weights, _ = self.weights_proj(x)
+        weights = self._get_logits_head_gate(weights, q_scale)
 
         if is_cuda():
             assert forward_batch.seq_lens_cpu is not None
@@ -571,7 +554,10 @@ class Indexer(CustomOp):
                     (x.shape[0], self.index_topk), -1, dtype=torch.int, device="cuda"
                 )
 
-            if forward_batch.forward_mode.is_decode_or_idle():
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            ):
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
@@ -587,18 +573,7 @@ class Indexer(CustomOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
-
         return topk_result
-
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-    ) -> Optional[torch.Tensor]:
-        return self._forward(x, q_lora, positions, forward_batch, layer_id)
 
     def forward_npu(
         self,
@@ -608,7 +583,7 @@ class Indexer(CustomOp):
         forward_batch: ForwardBatch,
         layer_id: int,
     ) -> torch.Tensor:
-        import custom_ops
+        import custom_ops  # noqa: F401
         import torch_npu
 
         from sglang.srt.layers.dp_attention import (

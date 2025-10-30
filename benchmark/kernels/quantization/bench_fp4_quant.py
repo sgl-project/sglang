@@ -6,8 +6,8 @@ import triton
 from sgl_kernel import scaled_fp4_grouped_quant, silu_and_mul_scaled_fp4_grouped_quant
 from sgl_kernel.elementwise import silu_and_mul
 
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 
 
 def _test_accuracy_once(E, M, K, input_dtype, device):

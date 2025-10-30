@@ -4,7 +4,6 @@ python3 -m unittest test_bnb.TestVisionModel.test_vlm
 python3 -m unittest test_bnb.TestLanguageModel.test_mmlu
 """
 
-import base64
 import io
 import json
 import multiprocessing as mp
@@ -15,6 +14,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import openai
+import pybase64
 import requests
 from PIL import Image
 

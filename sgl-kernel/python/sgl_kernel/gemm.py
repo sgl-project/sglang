@@ -137,6 +137,11 @@ def sgl_per_token_group_quant_8bit(
     )
 
 
+# For legacy usage
+sgl_per_token_group_quant_fp8 = sgl_per_token_group_quant_8bit
+sgl_per_token_group_quant_int8 = sgl_per_token_group_quant_8bit
+
+
 def sgl_per_tensor_quant_fp8(
     input: torch.Tensor,
     output_q: torch.Tensor,
@@ -460,7 +465,7 @@ def scaled_fp4_experts_quant(
     # larger models.
     import os
 
-    MAX_TOKENS_PER_EXPERT = os.environ.get("MODELOPT_MAX_TOKENS_PER_EXPERT", 65536)
+    MAX_TOKENS_PER_EXPERT = int(os.environ.get("MODELOPT_MAX_TOKENS_PER_EXPERT", 65536))
     assert m_numtopk <= MAX_TOKENS_PER_EXPERT * topk, (
         f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT("
         f"{MAX_TOKENS_PER_EXPERT})"

@@ -1,17 +1,7 @@
 // PD (Prefill-Decode) gRPC Router Implementation
 
-use crate::config::types::RetryConfig;
-use crate::core::{ConnectionMode, WorkerRegistry, WorkerType};
-use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest,
-};
-use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
-use crate::routers::RouterTrait;
-use crate::server::AppContext;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserFactory as ToolParserFactory;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -19,27 +9,28 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use std::sync::Arc;
-
 use tracing::debug;
 
-use super::context::SharedComponents;
-use super::pipeline::RequestPipeline;
+use super::{context::SharedComponents, pipeline::RequestPipeline};
+use crate::{
+    app_context::AppContext,
+    core::{ConnectionMode, WorkerRegistry, WorkerType},
+    protocols::{
+        chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    routers::RouterTrait,
+};
 
 /// gRPC PD (Prefill-Decode) router implementation for SGLang
 #[derive(Clone)]
-#[allow(dead_code)] // Fields will be used once implementation is complete
 pub struct GrpcPDRouter {
     worker_registry: Arc<WorkerRegistry>,
-    policy_registry: Arc<PolicyRegistry>,
-    tokenizer: Arc<dyn Tokenizer>,
-    reasoning_parser_factory: ReasoningParserFactory,
-    tool_parser_factory: ToolParserFactory,
-    dp_aware: bool,
-    api_key: Option<String>,
-    retry_config: RetryConfig,
-    configured_reasoning_parser: Option<String>,
-    configured_tool_parser: Option<String>,
     pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
 }
@@ -88,15 +79,6 @@ impl GrpcPDRouter {
 
         Ok(GrpcPDRouter {
             worker_registry,
-            policy_registry,
-            tokenizer,
-            reasoning_parser_factory,
-            tool_parser_factory,
-            dp_aware: ctx.router_config.dp_aware,
-            api_key: ctx.router_config.api_key.clone(),
-            retry_config: ctx.router_config.effective_retry_config(),
-            configured_reasoning_parser: ctx.configured_reasoning_parser.clone(),
-            configured_tool_parser: ctx.configured_tool_parser.clone(),
             pipeline,
             shared_components,
         })
@@ -168,7 +150,6 @@ impl std::fmt::Debug for GrpcPDRouter {
         f.debug_struct("GrpcPDRouter")
             .field("prefill_workers_count", &prefill_workers.len())
             .field("decode_workers_count", &decode_workers.len())
-            .field("dp_aware", &self.dp_aware)
             .finish()
     }
 }
@@ -253,6 +234,15 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &EmbeddingRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
