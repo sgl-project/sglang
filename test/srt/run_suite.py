@@ -71,18 +71,18 @@ suites = {
         TestFile("rl/test_fp32_lm_head.py", 30),
         TestFile("rl/test_update_weights_from_disk.py", 114),
         TestFile("rl/test_update_weights_from_tensor.py", 48),
-        TestFile("test_abort.py", 51),
+        TestFile("test_abort.py", 121),
         TestFile("test_build_eagle_tree.py", 8),
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_deterministic.py", 320),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
-        TestFile("test_eagle_infer_beta.py", 300),
+        TestFile("test_eagle_infer_beta.py", 90),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
-        # TestFile("test_flashmla.py", 352),
+        TestFile("test_flashmla.py", 352),
         TestFile("rotary_embedding/test_mrope.py", 300),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
@@ -158,6 +158,7 @@ suites = {
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 257),
+        TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 291),
@@ -179,9 +180,10 @@ suites = {
         TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_llama31_fp4.py", 300),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -357,6 +359,7 @@ suite_ascend = {
     ],
     "per-commit-16-ascend-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
+        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
 }
 
