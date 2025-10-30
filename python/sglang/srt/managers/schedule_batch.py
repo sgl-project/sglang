@@ -252,19 +252,6 @@ class MmItemMemoryPool:
 
         self.available_chunks = merged_chunks
 
-    def print_available_chunk(self, des: str = ""):
-        logger.info("check available chunks @ {}:----->".format(des))
-        for chunk in self.available_chunks:
-            logger.info("[{}, {}]".format(chunk.start, chunk.end))
-
-        logger.info("-----------check finish------------")
-
-    def print_occupied_chunk(self, des: str = ""):
-        logger.info("check occupied chunks @ {}:----->".format(des))
-        for chunk in self.occupied_chunks:
-            logger.info("[{}, {}]".format(chunk.start, chunk.end))
-        logger.info("-----------check finish------------")
-
 
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
