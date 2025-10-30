@@ -554,7 +554,7 @@ def latency_test_run_once(
     measurement_results["prefill_throughput"] = throughput
 
     decode_latencies = []
-    step_of_interest = output_len // 2
+    profile_step_of_interest = output_len // 2
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
     for i in range(output_len - 1):
         synchronize(device)
