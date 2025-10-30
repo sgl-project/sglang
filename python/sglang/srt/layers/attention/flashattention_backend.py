@@ -693,18 +693,16 @@ class FlashAttentionBackend(AttentionBackend):
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
-        # 4) fa_impl_ver != 4 since fa4 does not support descale parameters (but FA4 can work with FP8 if all tensors have matching dtypes).
+        # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
+            and self.fa_impl_ver != 4
         ):
-            if self.fa_impl_ver != 4:
-                # For FA3, use descale parameters for on-the-fly dequantization
-                if layer.k_scale is not None:
-                    descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                    k_descale = layer.k_scale.expand(descale_shape)
-                    v_descale = layer.v_scale.expand(descale_shape)
-            # Convert query to FP8 to match KV cache dtype (required for FA4, optional for FA3)
+            if layer.k_scale is not None:
+                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None

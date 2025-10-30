@@ -816,8 +816,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
-        query_dtype = query.dtype
-        key_dtype = key.dtype
+        dtype = query.dtype
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
         if self.rotary_dim < self.head_size:
@@ -848,7 +847,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         else:
             query = query_rot
             key = key_rot
-        return query.to(query_dtype), key.to(key_dtype)
+        return query.to(dtype), key.to(dtype)
 
     def forward_npu(
         self,
