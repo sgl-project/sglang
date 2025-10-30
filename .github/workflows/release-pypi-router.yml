@@ -1,6 +1,4 @@
-# Reference: https://github.com/openai/tiktoken/blob/63527649963def8c759b0f91f2eb69a40934e468/.github/workflows/build_wheels.yml#L1
-
-name: Release SGLang Router to PyPI
+name: Release SGLang Model Gateway to PyPI
 
 on:
   push:
@@ -12,15 +10,113 @@ on:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }} (${{ matrix.target }})
+    name: build on ${{ matrix.platform || matrix.os }} (${{ matrix.target }} - ${{ matrix.manylinux || 'auto' }})
     runs-on: ${{ matrix.os }}-latest
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu, macos, windows]
+        target: [x86_64, aarch64]
+        manylinux: [auto]
         include:
           - os: ubuntu
+            platform: linux
+          - os: windows
+            ls: dir
             target: x86_64
+            python-architecture: x64
+            interpreter: 3.9 3.10 3.11 3.12 3.13
+          - os: macos
+            target: aarch64
+            interpreter: 3.9 3.10 3.11 3.12 3.13
+          - os: ubuntu
+            platform: linux
+            target: aarch64
+          # musllinux
+          - os: ubuntu
+            platform: linux
+            target: x86_64
+            manylinux: musllinux_1_1
+          - os: ubuntu
+            platform: linux
+            target: aarch64
+            manylinux: musllinux_1_1
+        exclude:
+          - os: windows
+            target: aarch64
 
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sglang-repo
+
+      - name: Move sgl-router folder to root and delete sglang-repo
+        run: |
+          mv sglang-repo/sgl-router/* .
+          rm -rf sglang-repo
+          ls -alt
+        shell: bash
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: ${{ matrix.python-architecture || 'x64' }}
+
+      - name: Install twine
+        run: pip install -U twine
+
+      - name: Install protoc (macOS)
+        if: matrix.os == 'macos'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: matrix.os == 'windows'
+        run: choco install protoc -y
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist --features vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
+          rust-toolchain: stable
+          docker-options: -e CI -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+          before-script-linux: |
+            # Install build dependencies (perl/make for vendored OpenSSL, protoc for gRPC)
+            if command -v yum &> /dev/null; then
+              yum update -y && yum install -y wget unzip gcc gcc-c++ perl-core make
+              # Install cross-compilation toolchain for aarch64 if needed
+              if [ "${{ matrix.target }}" = "aarch64" ]; then
+                yum install -y gcc-aarch64-linux-gnu gcc-c++-aarch64-linux-gnu || true
+              fi
+            elif command -v apt-get &> /dev/null; then
+              apt-get update && apt-get install -y wget unzip gcc g++ perl make
+              # Install cross-compilation toolchain for aarch64 if needed
+              if [ "${{ matrix.target }}" = "aarch64" ]; then
+                apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu || true
+              fi
+            fi
+            (cd /tmp && \
+             wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip && \
+             unzip protoc-32.0-linux-x86_64.zip -d /usr/local && \
+             rm protoc-32.0-linux-x86_64.zip)
+            protoc --version
+
+      - name: List built packages
+        run: ${{ matrix.ls || 'ls -lh' }} dist/
+
+      - name: Check packages
+        run: twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'auto' }}
+          path: dist/
+
+  build-sdist:
+    name: Build SDist
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,64 +131,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Install build dependencies
-        run: |
-          python -m pip install -U pip
-          python -m pip install build twine auditwheel
-
-      - name: Build package
-        uses: pypa/cibuildwheel@v2.21.3
-        env:
-          CIBW_BUILD: "cp38-manylinux_x86_64 cp39-manylinux_x86_64 cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64"
-          CIBW_BEFORE_ALL: |
-            yum update -y && yum install -y openssl-devel wget unzip && \
-            # Install latest protoc (v32.0) that supports proto3
-            cd /tmp && \
-            wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip && \
-            unzip protoc-32.0-linux-x86_64.zip -d /usr/local && \
-            rm protoc-32.0-linux-x86_64.zip && \
-            # Install Rust
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          CIBW_ENVIRONMENT: "PATH=$HOME/.cargo/bin:$PATH"
-
-      - name: List built packages
-        run: ls -lh wheelhouse/
-
-      - name: Check packages
-        run: twine check --strict wheelhouse/*
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: packages-${{ matrix.os }}-${{ matrix.target }}
-          path: wheelhouse/
-
-  build-sdist:
-    name: Build SDist
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: sglang-repo
-
-      - name: Move sgl-router folder to root, copy the license file, and delete sglang-repo
-        run: |
-          mv sglang-repo/sgl-router/* .
-          mv sglang-repo/LICENSE .
-          rm -rf sglang-repo
-          ls -alt
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+          python-version: "3.13"
 
       - name: Build SDist
-        run: |
-          pip install build
-          python -m pip install -U packaging
-          python -m build --sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          rust-toolchain: stable
 
       - uses: actions/upload-artifact@v4
         with:
