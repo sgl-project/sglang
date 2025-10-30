@@ -64,6 +64,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     # so we can only use pip with `--break-system-packages`
     PIP_CMD="pip"
     PIP_INSTALL_SUFFIX="--break-system-packages"
+    $PIP_CMD install --upgrade pip
 
     # Clean up existing installations
     $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
