@@ -1,11 +1,11 @@
 from typing import Optional
 
 import torch
-from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 from flashinfer import (
     scaled_fp4_grouped_quantize,
     silu_and_mul_scaled_nvfp4_experts_quantize,
 )
+from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
 
 def get_cute_dtype(input: torch.Tensor) -> str:
@@ -74,6 +74,9 @@ def flashinfer_cutedsl_moe_masked(
     assert (
         w2_alpha.dtype == torch.float32
     ), f"w2_alpha must be float32, got {w2_alpha.dtype}"
+    assert isinstance(
+        hidden_states, tuple
+    ), f"Expected a tuple, got {type(hidden_states)}"
     assert (
         len(hidden_states) == 2
     ), f"hidden_states must be a tuple of length 2, got {len(hidden_states)}"

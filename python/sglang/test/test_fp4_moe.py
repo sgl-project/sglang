@@ -3,10 +3,7 @@ from typing import Callable
 
 import pytest
 import torch
-from flashinfer import (
-    fp4_quantize,
-    scaled_fp4_grouped_quantize,
-)
+from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
 from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 from sgl_kernel import scaled_fp4_quant
 from torch.nn import functional as F
@@ -517,7 +514,7 @@ def test_flashinfer_cutedsl_moe_masked(
     w2_alpha = 1.0 / (a2_global_scale * w2_global_scale)
 
     out = flashinfer_cutedsl_moe_masked(
-        hidden_states_3d.to(hidden_states.device),
+        (hidden_states_3d.to(hidden_states.device), None),
         input_global_scale,
         w1_fp4.permute(2, 0, 1),
         w1_blockscale,
