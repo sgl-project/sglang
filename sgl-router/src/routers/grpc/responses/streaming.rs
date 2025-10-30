@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::protocols::chat::ChatCompletionStreamResponse;
 
-pub(super) enum OutputItemType {
+pub enum OutputItemType {
     Message,
     McpListTools,
     McpCall,
@@ -53,9 +53,9 @@ struct OutputItemState {
 /// - response.mcp_call_arguments.done
 /// - response.mcp_call.completed
 /// - response.mcp_call.failed
-pub(super) struct ResponseStreamEventEmitter {
+pub struct ResponseStreamEventEmitter {
     sequence_number: u64,
-    response_id: String,
+    pub response_id: String,
     model: String,
     created_at: u64,
     message_id: String,
@@ -74,7 +74,7 @@ pub(super) struct ResponseStreamEventEmitter {
 }
 
 impl ResponseStreamEventEmitter {
-    pub(super) fn new(response_id: String, model: String, created_at: u64) -> Self {
+    pub fn new(response_id: String, model: String, created_at: u64) -> Self {
         let message_id = format!("msg_{}", Uuid::new_v4());
 
         Self {
@@ -102,7 +102,7 @@ impl ResponseStreamEventEmitter {
         seq
     }
 
-    pub(super) fn emit_created(&mut self) -> serde_json::Value {
+    pub fn emit_created(&mut self) -> serde_json::Value {
         self.has_emitted_created = true;
         json!({
             "type": "response.created",
@@ -118,7 +118,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_in_progress(&mut self) -> serde_json::Value {
+    pub fn emit_in_progress(&mut self) -> serde_json::Value {
         self.has_emitted_in_progress = true;
         json!({
             "type": "response.in_progress",
@@ -131,7 +131,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_content_part_added(
+    pub fn emit_content_part_added(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -151,7 +151,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_text_delta(
+    pub fn emit_text_delta(
         &mut self,
         delta: &str,
         output_index: usize,
@@ -169,7 +169,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_text_done(
+    pub fn emit_text_done(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -185,7 +185,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_content_part_done(
+    pub fn emit_content_part_done(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -204,10 +204,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_completed(
-        &mut self,
-        usage: Option<&serde_json::Value>,
-    ) -> serde_json::Value {
+    pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
         let mut response = json!({
             "type": "response.completed",
             "sequence_number": self.next_sequence(),
@@ -240,10 +237,7 @@ impl ResponseStreamEventEmitter {
     // MCP Event Emission Methods
     // ========================================================================
 
-    pub(super) fn emit_mcp_list_tools_in_progress(
-        &mut self,
-        output_index: usize,
-    ) -> serde_json::Value {
+    pub fn emit_mcp_list_tools_in_progress(&mut self, output_index: usize) -> serde_json::Value {
         json!({
             "type": "response.mcp_list_tools.in_progress",
             "sequence_number": self.next_sequence(),
@@ -251,7 +245,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_list_tools_completed(
+    pub fn emit_mcp_list_tools_completed(
         &mut self,
         output_index: usize,
         tools: &[crate::mcp::Tool],
@@ -275,7 +269,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_in_progress(
+    pub fn emit_mcp_call_in_progress(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -288,7 +282,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_arguments_delta(
+    pub fn emit_mcp_call_arguments_delta(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -309,7 +303,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_arguments_done(
+    pub fn emit_mcp_call_arguments_done(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -324,7 +318,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_completed(
+    pub fn emit_mcp_call_completed(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -357,7 +351,7 @@ impl ResponseStreamEventEmitter {
     // ========================================================================
 
     /// Emit response.output_item.added event
-    pub(super) fn emit_output_item_added(
+    pub fn emit_output_item_added(
         &mut self,
         output_index: usize,
         item: &serde_json::Value,
@@ -371,7 +365,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Emit response.output_item.done event
-    pub(super) fn emit_output_item_done(
+    pub fn emit_output_item_done(
         &mut self,
         output_index: usize,
         item: &serde_json::Value,
@@ -390,7 +384,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Allocate next output index and track item
-    pub(super) fn allocate_output_index(&mut self, item_type: OutputItemType) -> (usize, String) {
+    pub fn allocate_output_index(&mut self, item_type: OutputItemType) -> (usize, String) {
         let index = self.next_output_index;
         self.next_output_index += 1;
 
@@ -412,7 +406,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Mark output item as completed
-    pub(super) fn complete_output_item(&mut self, output_index: usize) {
+    pub fn complete_output_item(&mut self, output_index: usize) {
         if let Some(item) = self
             .output_items
             .iter_mut()
@@ -426,7 +420,7 @@ impl ResponseStreamEventEmitter {
     ///
     /// Reasoning items in OpenAI format are simple placeholders emitted between tool iterations.
     /// They don't have streaming content - just wrapper events with empty/null content.
-    pub(super) fn emit_reasoning_item(
+    pub fn emit_reasoning_item(
         &mut self,
         tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
         reasoning_content: Option<String>,
@@ -550,7 +544,7 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
-    pub(super) fn send_event(
+    pub fn send_event(
         &self,
         event: &serde_json::Value,
         tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
@@ -558,13 +552,38 @@ impl ResponseStreamEventEmitter {
         let event_json = serde_json::to_string(event)
             .map_err(|e| format!("Failed to serialize event: {}", e))?;
 
-        if tx
-            .send(Ok(Bytes::from(format!("data: {}\n\n", event_json))))
-            .is_err()
-        {
+        // Extract event type from the JSON for SSE event field
+        let event_type = event
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("message");
+
+        // Format as SSE with event: field
+        let sse_message = format!("event: {}\ndata: {}\n\n", event_type, event_json);
+
+        if tx.send(Ok(Bytes::from(sse_message))).is_err() {
             return Err("Client disconnected".to_string());
         }
 
         Ok(())
+    }
+
+    /// Send event and log any errors (typically client disconnect)
+    ///
+    /// This is a convenience method for streaming scenarios where client
+    /// disconnection is expected and should be logged but not fail the operation.
+    /// Returns true if sent successfully, false if client disconnected.
+    pub fn send_event_best_effort(
+        &self,
+        event: &serde_json::Value,
+        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    ) -> bool {
+        match self.send_event(event, tx) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!("Failed to send event (likely client disconnect): {}", e);
+                false
+            }
+        }
     }
 }
