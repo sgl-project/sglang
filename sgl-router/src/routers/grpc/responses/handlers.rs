@@ -721,6 +721,7 @@ impl StreamingResponseAccumulator {
                     while self.tool_calls.len() <= index {
                         self.tool_calls.push(ResponseOutputItem::FunctionToolCall {
                             id: String::new(),
+                            call_id: String::new(),
                             name: String::new(),
                             arguments: String::new(),
                             output: None,
