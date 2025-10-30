@@ -42,11 +42,13 @@ use axum::response::Response;
 use serde_json::Value as JsonValue;
 
 use crate::{
+    data_connector::{ResponseId, ResponseStorage},
     mcp::McpManager,
     protocols::{
         common::{Function, ToolCall},
         responses::{
-            ResponseInput, ResponseTool, ResponsesRequest, ResponsesResponse, StringOrContentParts,
+            ResponseInput, ResponseInputOutputItem, ResponseTool, ResponsesRequest,
+            ResponsesResponse, StringOrContentParts,
         },
     },
     routers::grpc::{
@@ -137,6 +139,9 @@ pub struct HarmonyResponsesContext {
     /// MCP manager for tool execution
     pub mcp_manager: Arc<McpManager>,
 
+    /// Response storage for loading conversation history
+    pub response_storage: Arc<dyn ResponseStorage>,
+
     /// Optional streaming sender (for future streaming support)
     pub stream_tx: Option<tokio::sync::mpsc::UnboundedSender<Result<String, String>>>,
 }
@@ -147,11 +152,13 @@ impl HarmonyResponsesContext {
         pipeline: Arc<RequestPipeline>,
         components: Arc<SharedComponents>,
         mcp_manager: Arc<McpManager>,
+        response_storage: Arc<dyn ResponseStorage>,
     ) -> Self {
         Self {
             pipeline,
             components,
             mcp_manager,
+            response_storage,
             stream_tx: None,
         }
     }
@@ -161,12 +168,14 @@ impl HarmonyResponsesContext {
         pipeline: Arc<RequestPipeline>,
         components: Arc<SharedComponents>,
         mcp_manager: Arc<McpManager>,
+        response_storage: Arc<dyn ResponseStorage>,
         stream_tx: tokio::sync::mpsc::UnboundedSender<Result<String, String>>,
     ) -> Self {
         Self {
             pipeline,
             components,
             mcp_manager,
+            response_storage,
             stream_tx: Some(stream_tx),
         }
     }
@@ -213,7 +222,8 @@ pub async fn serve_harmony_responses(
     ctx: &HarmonyResponsesContext,
     request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
-    let mut current_request = request;
+    // Load previous conversation history if previous_response_id is set
+    let mut current_request = load_previous_messages(ctx, request).await?;
     let mut iteration_count = 0;
 
     // Check if request has MCP tools - if so, ensure dynamic client is registered
@@ -740,6 +750,106 @@ fn inject_mcp_metadata(
 
     // 2. Append all mcp_call items at the end
     response.output.extend(mcp_call_items);
+}
+
+/// Load previous conversation messages from storage
+///
+/// If the request has `previous_response_id`, loads the response chain from storage
+/// and prepends the conversation history to the request input items.
+///
+/// # Arguments
+///
+/// * `ctx` - Harmony Responses context with response_storage
+/// * `request` - Current request (may have previous_response_id set)
+///
+/// # Returns
+///
+/// Modified request with conversation history prepended to input items
+async fn load_previous_messages(
+    ctx: &HarmonyResponsesContext,
+    request: ResponsesRequest,
+) -> Result<ResponsesRequest, Response> {
+    let Some(ref prev_id_str) = request.previous_response_id else {
+        // No previous_response_id, return request as-is
+        return Ok(request);
+    };
+
+    let prev_id = ResponseId::from(prev_id_str.as_str());
+
+    // Load response chain from storage
+    let chain = ctx
+        .response_storage
+        .get_response_chain(&prev_id, None)
+        .await
+        .map_err(|e| {
+            utils::internal_error_message(format!(
+                "Failed to load previous response chain for {}: {}",
+                prev_id_str, e
+            ))
+        })?;
+
+    // Build conversation history from stored responses
+    let mut history_items = Vec::new();
+
+    // Helper to deserialize and collect items from a JSON array
+    let deserialize_items =
+        |arr: &serde_json::Value, item_type: &str| -> Vec<ResponseInputOutputItem> {
+            arr.as_array()
+                .into_iter()
+                .flat_map(|items| items.iter())
+                .filter_map(|item| {
+                    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
+                        .map_err(|e| {
+                            tracing::warn!(
+                                "Failed to deserialize stored {} item: {}. Item: {}",
+                                item_type,
+                                e,
+                                item
+                            );
+                        })
+                        .ok()
+                })
+                .collect()
+        };
+
+    for stored in chain.responses.iter() {
+        history_items.extend(deserialize_items(&stored.input, "input"));
+        history_items.extend(deserialize_items(&stored.output, "output"));
+    }
+
+    tracing::debug!(
+        previous_response_id = %prev_id_str,
+        history_items_count = history_items.len(),
+        "Loaded conversation history from previous response"
+    );
+
+    // Build modified request with history prepended
+    let mut modified_request = request;
+
+    // Convert current input to items format
+    let all_items = match modified_request.input {
+        ResponseInput::Items(items) => {
+            // Prepend history to existing items
+            let mut combined = history_items;
+            combined.extend(items);
+            combined
+        }
+        ResponseInput::Text(text) => {
+            // Convert text to item and prepend history
+            history_items.push(ResponseInputOutputItem::SimpleInputMessage {
+                content: StringOrContentParts::String(text),
+                role: "user".to_string(),
+                r#type: None,
+            });
+            history_items
+        }
+    };
+
+    // Update request with combined items and clear previous_response_id
+    modified_request.input = ResponseInput::Items(all_items);
+    modified_request.previous_response_id = None;
+
+    Ok(modified_request)
 }
 
 // TODO: Implement streaming support

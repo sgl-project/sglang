@@ -201,6 +201,7 @@ impl GrpcRouter {
             Arc::new(self.harmony_pipeline.clone()),
             self.shared_components.clone(),
             self.harmony_responses_context.mcp_manager.clone(),
+            self.harmony_responses_context.response_storage.clone(),
         );
 
         // Use serve_harmony_responses for multi-turn MCP tool orchestration

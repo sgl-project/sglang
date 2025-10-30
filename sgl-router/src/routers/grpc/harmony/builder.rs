@@ -418,17 +418,10 @@ impl HarmonyBuilder {
             }
         } else {
             // Continue the previous conversation
-            // NOTE: Currently, request params like reasoning and instructions are ignored
-            // TODO: Load previous messages from storage (msg_store) when available
-
-            // For now, this is a placeholder - full implementation requires:
-            // 1. Access to msg_store from previous response
-            // 2. Chain-of-thoughts cleanup logic
-            // 3. Proper state management across turns
-            debug!(
-                "Continuing conversation from previous response: {:?}",
-                request.previous_response_id
-            );
+            // NOTE: Previous messages are loaded by serve_harmony_responses() before calling this method.
+            // The request.input will already contain the conversation history when previous_response_id was set.
+            // We just proceed with parsing the input items as normal.
+            debug!("Continuing conversation (history already loaded in request.input)");
         }
 
         // Append the new input

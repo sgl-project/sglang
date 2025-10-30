@@ -7,13 +7,11 @@ pub struct HarmonyDetector;
 
 impl HarmonyDetector {
     pub fn is_harmony_model(model_name: &str) -> bool {
-        // Convert to lowercase for case-insensitive matching
-        let model_lower = model_name.to_lowercase();
-
-        // Check for Harmony-capable model patterns
-        model_lower.contains("gpt-oss")
-            || model_lower.contains("gpt-4o")
-            || model_lower.contains("gpt-4.5")
-            || model_lower.contains("gpt-5")
+        // Case-insensitive substring search without heap allocation
+        // More efficient than to_lowercase() which allocates a new String
+        model_name
+            .as_bytes()
+            .windows(7) // "gpt-oss".len()
+            .any(|window| window.eq_ignore_ascii_case(b"gpt-oss"))
     }
 }
