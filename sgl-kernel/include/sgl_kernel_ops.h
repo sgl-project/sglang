@@ -192,7 +192,7 @@ void gelu_quick(at::Tensor& out, const at::Tensor& input);
 #endif
 
 /*
- * From gguf quantization
+ * From csrc/quantization/gguf
  */
 torch::Tensor
 ggml_dequantize(torch::Tensor W, int64_t type, int64_t m, int64_t n, std::optional<at::ScalarType> const& dtype);
@@ -888,7 +888,7 @@ torch::Tensor fast_hadamard_transform_28N(torch::Tensor& x, double scale);
 torch::Tensor fast_hadamard_transform_40N(torch::Tensor& x, double scale);
 
 /*
- * From csrc/fastertransformer
+ * From flashmla
  */
 std::vector<at::Tensor> get_mla_decoding_metadata(
     at::Tensor& seqlens_k,
