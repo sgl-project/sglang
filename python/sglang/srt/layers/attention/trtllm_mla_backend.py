@@ -518,9 +518,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             # For extend batch with prefix length > 0, fallback to flashinfer MLA kernel when chunked prefix cache is disabled.
-            extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+            has_prefix = any(forward_batch.extend_prefix_lens_cpu)
             fallback_to_flashinfer_mla = (
-                self.disable_chunked_prefix_cache and not extend_no_prefix
+                self.disable_chunked_prefix_cache and has_prefix
             )
             if fallback_to_flashinfer_mla:
                 super().init_forward_metadata(forward_batch)
