@@ -881,6 +881,7 @@ class Req:
 
     def reset_for_retract(self):
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.routed_experts = []
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
@@ -934,7 +935,8 @@ class Req:
             f"Req(rid={self.rid}, "
             f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}, "
             f"{self.grammar=}, "
-            f"{self.sampling_params=})"
+            f"{self.sampling_params=}), "
+            f"{self.prefix_indices=}), "
         )
 
 

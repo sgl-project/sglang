@@ -504,9 +504,6 @@ class Scheduler(
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
-        
-        # Init routed experts capturer
-        self.init_routed_experts_capturer()
 
         # Init overlap
         self.init_overlap()
@@ -866,7 +863,10 @@ class Scheduler(
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
         init_embedding_cache(embedding_cache_size * 1024 * 1024)
-
+        
+        # Init routed experts capturer
+        self.init_routed_experts_capturer()
+        
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
@@ -1647,15 +1647,11 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
-            print(f"[get_next_batch_to_run] Prefill {ret}")
         else:
             # Run decode
             if not self.running_batch.is_empty():
-                print(f"[get_next_batch_to_run] Before update {self.running_batch}")
                 self.running_batch = self.update_running_batch(self.running_batch)
-                print(f"[get_next_batch_to_run] After update {self.running_batch}")
                 ret = self.running_batch if not self.running_batch.is_empty() else None
-                print(f"[get_next_batch_to_run] Decode {ret}")
             else:
                 ret = None
 
@@ -1982,9 +1978,6 @@ class Scheduler(
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
-            print(f"[run_batch] Scheduler.run_batch {batch}")
-            print(f"[run_batch] ModelWorkerBatch {batch_or_worker_batch=}")
-            print(f"[run_batch] batch {batch.reqs}")
             
             # Copy cached routing experts' buffers back to CPU cache
             get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(

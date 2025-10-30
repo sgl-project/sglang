@@ -15,6 +15,10 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
 )
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    get_global_experts_capturer
+)
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
@@ -148,13 +152,6 @@ class SchedulerOutputProcessorMixin:
                             .tolist()
                         )
                     
-                    # if req.return_routed_experts:
-                    #     print(f"When capture experts, next ids {next_token_ids=} {req=}")
-                    #     req.routed_experts.append(
-                    #         self.routed_experts_capturer.get_captured_experts()[i]
-                    #         .clone()
-                    #         .tolist()
-                    #     )
 
                     if req.grammar is not None:
                         # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -357,6 +354,20 @@ class SchedulerOutputProcessorMixin:
                 else:
                     self.tree_cache.cache_finished_req(req)
 
+                if self.tree_cache is not None:
+                    for req in batch.reqs:
+                        (
+                            cached_token_indices,
+                            _,
+                            _,
+                            _,
+                        ) = self.tree_cache.match_prefix(
+                            key=RadixKey(token_ids=req.origin_input_ids)
+                        )
+                        req.routed_experts = get_global_experts_capturer().get_host_cache().buffer[i]
+                        # print(f"In process batch result{batch.forward_mode}: {req=}")
+        
+                
                 req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
@@ -382,13 +393,6 @@ class SchedulerOutputProcessorMixin:
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
-            
-            # if req.return_routed_experts:
-            #     req.routed_experts.append(
-            #         self.routed_experts_capturer.get_captured_experts()[i]
-            #         .clone()
-            #         .tolist()
-            #     )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -402,8 +406,7 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
-        # if batch.return_routed_experts:
-        #     self.routed_experts_capturer.clear_buffer()
+
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -925,7 +928,7 @@ class SchedulerOutputProcessorMixin:
                 if req.return_routed_experts:
                     if output_routed_experts is None:
                         output_routed_experts = []
-                    output_routed_experts.append(req.routed_experts)
+                    output_routed_experts.append(req.routed_experts.tolist())
 
             if (
                 req.finished()
