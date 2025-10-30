@@ -45,8 +45,8 @@ def _filter_compiled_extensions(file_list):
 
 def _load_architecture_specific_ops():
     """Load the appropriate common_ops library based on GPU architecture."""
+    import glob
     import importlib.util
-    import sys
     from pathlib import Path
 
     compute_capability = _get_compute_capability()
@@ -70,7 +70,6 @@ def _load_architecture_specific_ops():
         variant_name = "CPU/No GPU detected (using precise math)"
 
     # Look for the compiled module with any valid extension
-    import glob
 
     ops_pattern = str(sgl_kernel_dir / ops_subdir / "common_ops.*")
     raw_matching_files = glob.glob(ops_pattern)
