@@ -182,7 +182,6 @@ class CLIPAttention(nn.Module):
             self.num_heads_per_partition,
             softmax_scale=self.scale,
             causal=False,
-            # causal=False,
             supported_attention_backends=config._supported_attention_backends,
         )
 
