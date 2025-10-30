@@ -610,6 +610,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     req_pool_indices_for_draft_extend: torch.Tensor = None
 
     # Inputs for V2 overlap worker
+    _pending_out_cache_loc: Optional[torch.Tensor] = None
+    _pending_extend_lens: Optional[torch.Tensor] = None
     future_indices: Optional[FutureIndices] = None
     allocate_lens: Optional[torch.Tensor] = None
     new_seq_lens: Optional[torch.Tensor] = None
