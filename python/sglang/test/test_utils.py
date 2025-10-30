@@ -921,6 +921,79 @@ def run_bench_serving(
     return res
 
 
+async def _run_api_benchmark_requests(
+    base_url: str,
+    endpoint: str,
+    test_requests: List[dict],
+    num_requests: int,
+    response_validator: Callable[[dict], bool],
+):
+    """
+    Helper function to run API benchmark requests and collect metrics.
+    
+    Args:
+        base_url: The base URL of the server
+        endpoint: The API endpoint to test (e.g., "/v1/score", "/v1/embeddings")
+        test_requests: List of request payloads to send
+        num_requests: Total number of requests expected
+        response_validator: Function to validate if response contains expected data
+    
+    Returns:
+        Dictionary with benchmark metrics
+    """
+    start_time = time.monotonic()
+    successful_requests = 0
+    total_latency = 0
+    latencies = []
+
+    async with aiohttp.ClientSession() as session:
+        for request_data in test_requests:
+            try:
+                request_start = time.monotonic()
+                async with session.post(
+                    f"{base_url}{endpoint}",
+                    json=request_data,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    if response.status == 200:
+                        response_data = await response.json()
+                        request_end = time.monotonic()
+
+                        if response_validator(response_data):
+                            latency_ms = (request_end - request_start) * 1000
+                            latencies.append(latency_ms)
+                            total_latency += latency_ms
+                            successful_requests += 1
+            except Exception:
+                continue
+
+    end_time = time.monotonic()
+    total_time = end_time - start_time
+
+    if successful_requests > 0:
+        throughput = successful_requests / total_time
+        avg_latency = total_latency / successful_requests
+        p95_latency = np.percentile(latencies, 95) if latencies else 0
+
+        return {
+            "completed": successful_requests,
+            "total_requests": num_requests,
+            "throughput": throughput,
+            "avg_latency_ms": avg_latency,
+            "p95_latency_ms": p95_latency,
+            "successful_requests": successful_requests,
+        }
+    else:
+        return {
+            "completed": 0,
+            "total_requests": num_requests,
+            "throughput": 0,
+            "avg_latency_ms": 0,
+            "p95_latency_ms": 0,
+            "successful_requests": 0,
+        }
+
+
 def run_score_benchmark(
     model,
     num_requests=100,
@@ -1007,57 +1080,14 @@ def run_score_benchmark(
             }
             test_requests.append(score_data)
 
-        start_time = time.monotonic()
-        successful_requests = 0
-        total_latency = 0
-        latencies = []
-
-        async with aiohttp.ClientSession() as session:
-            for request_data in test_requests:
-                try:
-                    request_start = time.monotonic()
-                    async with session.post(
-                        f"{base_url}/v1/score",
-                        json=request_data,
-                        timeout=aiohttp.ClientTimeout(total=30),
-                    ) as response:
-                        if response.status == 200:
-                            response_data = await response.json()
-                            request_end = time.monotonic()
-
-                            if "scores" in response_data or "logprobs" in response_data:
-                                latency_ms = (request_end - request_start) * 1000
-                                latencies.append(latency_ms)
-                                total_latency += latency_ms
-                                successful_requests += 1
-                except Exception:
-                    continue
-
-        end_time = time.monotonic()
-        total_time = end_time - start_time
-
-        if successful_requests > 0:
-            throughput = successful_requests / total_time
-            avg_latency = total_latency / successful_requests
-            p95_latency = np.percentile(latencies, 95) if latencies else 0
-
-            return {
-                "completed": successful_requests,
-                "total_requests": num_requests,
-                "throughput": throughput,
-                "avg_latency_ms": avg_latency,
-                "p95_latency_ms": p95_latency,
-                "successful_requests": successful_requests,
-            }
-        else:
-            return {
-                "completed": 0,
-                "total_requests": num_requests,
-                "throughput": 0,
-                "avg_latency_ms": 0,
-                "p95_latency_ms": 0,
-                "successful_requests": 0,
-            }
+        # Run benchmark requests using shared helper
+        return await _run_api_benchmark_requests(
+            base_url=base_url,
+            endpoint="/v1/score",
+            test_requests=test_requests,
+            num_requests=num_requests,
+            response_validator=lambda resp: "scores" in resp or "logprobs" in resp,
+        )
 
     try:
         res = asyncio.run(_run_benchmark())
@@ -1145,57 +1175,14 @@ def run_embeddings_benchmark(
 
             test_requests.append(embeddings_data)
 
-        start_time = time.monotonic()
-        successful_requests = 0
-        total_latency = 0
-        latencies = []
-
-        async with aiohttp.ClientSession() as session:
-            for request_data in test_requests:
-                try:
-                    request_start = time.monotonic()
-                    async with session.post(
-                        f"{base_url}/v1/embeddings",
-                        json=request_data,
-                        timeout=aiohttp.ClientTimeout(total=30),
-                    ) as response:
-                        if response.status == 200:
-                            response_data = await response.json()
-                            request_end = time.monotonic()
-
-                            if "data" in response_data:
-                                latency_ms = (request_end - request_start) * 1000
-                                latencies.append(latency_ms)
-                                total_latency += latency_ms
-                                successful_requests += 1
-                except Exception:
-                    continue
-
-        end_time = time.monotonic()
-        total_time = end_time - start_time
-
-        if successful_requests > 0:
-            throughput = successful_requests / total_time
-            avg_latency = total_latency / successful_requests
-            p95_latency = np.percentile(latencies, 95) if latencies else 0
-
-            return {
-                "completed": successful_requests,
-                "total_requests": num_requests,
-                "throughput": throughput,
-                "avg_latency_ms": avg_latency,
-                "p95_latency_ms": p95_latency,
-                "successful_requests": successful_requests,
-            }
-        else:
-            return {
-                "completed": 0,
-                "total_requests": num_requests,
-                "throughput": 0,
-                "avg_latency_ms": 0,
-                "p95_latency_ms": 0,
-                "successful_requests": 0,
-            }
+        # Run benchmark requests using shared helper
+        return await _run_api_benchmark_requests(
+            base_url=base_url,
+            endpoint="/v1/embeddings",
+            test_requests=test_requests,
+            num_requests=num_requests,
+            response_validator=lambda resp: "data" in resp,
+        )
 
     try:
         res = asyncio.run(_run_benchmark())
