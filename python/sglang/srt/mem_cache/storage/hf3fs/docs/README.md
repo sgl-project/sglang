@@ -47,6 +47,7 @@ python3 -m sglang.launch_server \
     --hicache-ratio 2 --hicache-size 0 \
     --hicache-write-policy write_through \
     --hicache-storage-backend hf3fs
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.12/dist-packages
 ```
 
 ### Multi-Node Deployment (Shared KV Cache)
