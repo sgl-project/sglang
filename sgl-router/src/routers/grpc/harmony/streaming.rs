@@ -18,16 +18,21 @@ use tokio::sync::mpsc;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tracing::error;
 
-use super::{types::HarmonyChannelDelta, HarmonyParserAdapter};
+use super::{
+    processor::ResponsesIterationResult, types::HarmonyChannelDelta, HarmonyParserAdapter,
+};
 use crate::{
     grpc_client::{proto, sglang_scheduler::AbortOnDropStream},
     protocols::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
         },
-        common::{FunctionCallDelta, ToolCallDelta, Usage},
+        common::{FunctionCallDelta, ToolCall, ToolCallDelta, Usage},
     },
-    routers::grpc::context,
+    routers::grpc::{
+        context,
+        responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
+    },
 };
 
 /// Processor for streaming Harmony responses
@@ -524,6 +529,634 @@ impl HarmonyStreamingProcessor {
             .map_err(|_| "Failed to send usage chunk".to_string())?;
 
         Ok(())
+    }
+
+    /// Process streaming chunks for Responses API iteration
+    ///
+    /// Returns ResponsesIterationResult indicating whether tool calls were found
+    /// (requiring MCP loop continuation) or if the iteration is complete.
+    pub async fn process_responses_iteration_stream(
+        execution_result: context::ExecutionResult,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<ResponsesIterationResult, String> {
+        match execution_result {
+            context::ExecutionResult::Single { stream } => {
+                Self::process_responses_single_stream(stream, emitter, tx).await
+            }
+            context::ExecutionResult::Dual { prefill, decode } => {
+                Self::process_responses_dual_stream(prefill, *decode, emitter, tx).await
+            }
+        }
+    }
+
+    /// Process streaming chunks from a single stream (Responses API)
+    async fn process_responses_single_stream(
+        mut grpc_stream: AbortOnDropStream,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<ResponsesIterationResult, String> {
+        // Initialize Harmony parser for this iteration
+        let mut parser =
+            HarmonyParserAdapter::new().map_err(|e| format!("Failed to create parser: {}", e))?;
+
+        // State tracking for channels
+        let mut has_analysis = false;
+        let mut accumulated_final_text = String::new();
+        let mut accumulated_tool_calls: Option<Vec<ToolCall>> = None;
+
+        // Track which items we've started
+        let mut reasoning_output_index: Option<usize> = None;
+        let mut message_output_index: Option<usize> = None;
+        let mut message_item_id: Option<String> = None;
+        let mut has_emitted_content_part_added = false;
+
+        // MCP tool call tracking (index -> (output_index, item_id))
+        let mut mcp_call_tracking: HashMap<usize, (usize, String)> = HashMap::new();
+
+        // Metadata from Complete message
+        let mut finish_reason = String::from("stop");
+        let mut matched_stop: Option<serde_json::Value> = None;
+
+        // Process stream
+        while let Some(result) = grpc_stream.next().await {
+            let response = result.map_err(|e| format!("Stream error: {}", e))?;
+
+            match response.response {
+                Some(Chunk(chunk)) => {
+                    // Parse chunk via Harmony parser
+                    let delta_result = parser
+                        .parse_chunk(&chunk.token_ids)
+                        .map_err(|e| format!("Parse error: {}", e))?;
+
+                    // Emit SSE events if there's a delta
+                    if let Some(delta) = delta_result {
+                        // Analysis channel → Reasoning item (wrapper events only, emitted once)
+                        if let Some(_analysis_text) = &delta.analysis_delta {
+                            if reasoning_output_index.is_none() {
+                                // Allocate reasoning item and emit wrapper events
+                                let (output_index, _item_id) =
+                                    emitter.allocate_output_index(OutputItemType::Reasoning);
+                                reasoning_output_index = Some(output_index);
+
+                                // Emit reasoning item (added + done in one call)
+                                // Note: reasoning_content will be provided at finalize
+                                emitter
+                                    .emit_reasoning_item(tx, None)
+                                    .map_err(|e| format!("Failed to emit reasoning item: {}", e))?;
+
+                                has_analysis = true;
+                            }
+                        }
+
+                        // Final channel → Message item (WITH text streaming)
+                        if let Some(final_delta) = &delta.final_delta {
+                            if !final_delta.is_empty() {
+                                // Allocate message item if needed
+                                if message_output_index.is_none() {
+                                    let (output_index, item_id) =
+                                        emitter.allocate_output_index(OutputItemType::Message);
+                                    message_output_index = Some(output_index);
+                                    message_item_id = Some(item_id.clone());
+
+                                    // Build message item structure
+                                    let item = json!({
+                                        "id": item_id,
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": []
+                                    });
+
+                                    // Emit output_item.added
+                                    let event = emitter.emit_output_item_added(output_index, &item);
+                                    let _ = emitter.send_event(&event, tx);
+                                }
+
+                                let output_index = message_output_index.unwrap();
+                                let item_id = message_item_id.as_ref().unwrap();
+                                let content_index = 0; // Single content part
+
+                                // Emit content_part.added before first delta
+                                if !has_emitted_content_part_added {
+                                    let event = emitter.emit_content_part_added(
+                                        output_index,
+                                        item_id,
+                                        content_index,
+                                    );
+                                    let _ = emitter.send_event(&event, tx);
+                                    has_emitted_content_part_added = true;
+                                }
+
+                                // Emit text delta
+                                let event = emitter.emit_text_delta(
+                                    final_delta,
+                                    output_index,
+                                    item_id,
+                                    content_index,
+                                );
+                                let _ = emitter.send_event(&event, tx);
+
+                                accumulated_final_text.push_str(final_delta);
+                            }
+                        }
+
+                        // Commentary channel → MCP tool call streaming
+                        if let Some(tc_delta) = &delta.commentary_delta {
+                            let call_index = tc_delta.index;
+
+                            // Check if this is a new tool call (has id and name)
+                            if tc_delta.id.is_some() {
+                                // NEW MCP CALL: Allocate output item and emit in_progress
+                                let (output_index, item_id) =
+                                    emitter.allocate_output_index(OutputItemType::McpCall);
+
+                                // Store tracking info
+                                mcp_call_tracking
+                                    .insert(call_index, (output_index, item_id.clone()));
+
+                                // Emit mcp_call.in_progress
+                                let event =
+                                    emitter.emit_mcp_call_in_progress(output_index, &item_id);
+                                let _ = emitter.send_event(&event, tx);
+
+                                // If we have function name, emit initial mcp_call_arguments.delta
+                                if tc_delta.function.as_ref().is_some_and(|f| f.name.is_some()) {
+                                    // For MCP, the function name is the tool name
+                                    // Emit initial empty arguments delta to establish the call
+                                    let event = emitter.emit_mcp_call_arguments_delta(
+                                        output_index,
+                                        &item_id,
+                                        "",
+                                    );
+                                    let _ = emitter.send_event(&event, tx);
+                                }
+                            } else {
+                                // CONTINUING MCP CALL: Emit arguments delta
+                                if let Some((output_index, item_id)) =
+                                    mcp_call_tracking.get(&call_index)
+                                {
+                                    if let Some(args) = tc_delta
+                                        .function
+                                        .as_ref()
+                                        .and_then(|f| f.arguments.as_ref())
+                                        .filter(|a| !a.is_empty())
+                                    {
+                                        let event = emitter.emit_mcp_call_arguments_delta(
+                                            *output_index,
+                                            item_id,
+                                            args,
+                                        );
+                                        let _ = emitter.send_event(&event, tx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(Complete(complete)) => {
+                    // Store final metadata
+                    finish_reason = complete.finish_reason.clone();
+                    matched_stop = complete.matched_stop.as_ref().map(|m| match m {
+                        MatchedTokenId(id) => {
+                            serde_json::json!(id)
+                        }
+                        MatchedStopStr(s) => {
+                            serde_json::json!(s)
+                        }
+                    });
+
+                    // Finalize parser and get complete output
+                    let final_output = parser
+                        .finalize(finish_reason.clone(), matched_stop.clone())
+                        .map_err(|e| format!("Finalize error: {}", e))?;
+
+                    // Store finalized tool calls
+                    accumulated_tool_calls = final_output.commentary.clone();
+
+                    // Complete all MCP tool calls if we have commentary
+                    if let Some(ref tool_calls) = accumulated_tool_calls {
+                        for (call_idx, tool_call) in tool_calls.iter().enumerate() {
+                            if let Some((output_index, item_id)) = mcp_call_tracking.get(&call_idx)
+                            {
+                                // Emit mcp_call_arguments.done with final arguments
+                                let args_str =
+                                    tool_call.function.arguments.as_deref().unwrap_or("");
+                                let event = emitter.emit_mcp_call_arguments_done(
+                                    *output_index,
+                                    item_id,
+                                    args_str,
+                                );
+                                let _ = emitter.send_event(&event, tx);
+
+                                // Emit mcp_call.completed
+                                let event = emitter.emit_mcp_call_completed(*output_index, item_id);
+                                let _ = emitter.send_event(&event, tx);
+
+                                // Mark output item as completed
+                                emitter.complete_output_item(*output_index);
+                            }
+                        }
+                    }
+
+                    // Close message item if we opened one
+                    if let Some(output_index) = message_output_index {
+                        let item_id = message_item_id.as_ref().unwrap();
+                        let content_index = 0;
+
+                        // Emit text_done
+                        let event = emitter.emit_text_done(output_index, item_id, content_index);
+                        let _ = emitter.send_event(&event, tx);
+
+                        // Emit content_part.done
+                        let event =
+                            emitter.emit_content_part_done(output_index, item_id, content_index);
+                        let _ = emitter.send_event(&event, tx);
+
+                        // Emit output_item.done
+                        let item = json!({
+                            "id": item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "text",
+                                "text": accumulated_final_text.clone()
+                            }]
+                        });
+                        let event = emitter.emit_output_item_done(output_index, &item);
+                        let _ = emitter.send_event(&event, tx);
+
+                        emitter.complete_output_item(output_index);
+                    }
+                }
+                Some(proto::generate_response::Response::Error(err)) => {
+                    return Err(format!("Server error: {}", err.message));
+                }
+                None => {}
+            }
+        }
+
+        // Mark stream as completed successfully to prevent abort on drop
+        grpc_stream.mark_completed();
+
+        // Return result based on whether tool calls were found
+        if let Some(tool_calls) = accumulated_tool_calls {
+            if !tool_calls.is_empty() {
+                let analysis_content = if has_analysis {
+                    // Get analysis from finalized parser output by calling finalize again
+                    // This is safe because finalize can be called multiple times
+                    let output = parser.finalize(finish_reason.clone(), matched_stop.clone())?;
+                    output.analysis
+                } else {
+                    None
+                };
+
+                return Ok(ResponsesIterationResult::ToolCallsFound {
+                    tool_calls,
+                    analysis: analysis_content,
+                    partial_text: accumulated_final_text,
+                });
+            }
+        }
+
+        // For streaming, we don't build the full ResponsesResponse here
+        // The caller will build it from the SSE events
+        // Return a placeholder Completed result (caller ignores these fields in streaming mode)
+        use crate::protocols::responses::{
+            ResponseStatus, ResponseUsage, ResponsesResponse, ResponsesUsage,
+        };
+        Ok(ResponsesIterationResult::Completed {
+            response: Box::new(ResponsesResponse {
+                id: String::new(),
+                object: "response".to_string(),
+                created_at: 0,
+                status: ResponseStatus::Completed,
+                error: None,
+                incomplete_details: None,
+                instructions: None,
+                max_output_tokens: None,
+                model: String::new(),
+                output: vec![],
+                parallel_tool_calls: true,
+                previous_response_id: None,
+                reasoning: None,
+                store: true,
+                temperature: None,
+                text: None,
+                tool_choice: "auto".to_string(),
+                tools: vec![],
+                top_p: None,
+                truncation: None,
+                user: None,
+                metadata: HashMap::new(),
+                usage: Some(ResponsesUsage::Modern(ResponseUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    input_tokens_details: None,
+                    output_tokens_details: None,
+                })),
+            }),
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                completion_tokens_details: None,
+            },
+        })
+    }
+
+    /// Process streaming chunks from dual streams (Responses API)
+    async fn process_responses_dual_stream(
+        mut prefill_stream: AbortOnDropStream,
+        mut decode_stream: AbortOnDropStream,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<ResponsesIterationResult, String> {
+        // Phase 1: Process prefill stream (collect metadata, no output)
+        while let Some(result) = prefill_stream.next().await {
+            let _response = result.map_err(|e| format!("Prefill stream error: {}", e))?;
+            // No-op for prefill in Responses API (just metadata collection)
+        }
+
+        // Phase 2: Process decode stream (same logic as single stream)
+        let mut parser =
+            HarmonyParserAdapter::new().map_err(|e| format!("Failed to create parser: {}", e))?;
+
+        let mut has_analysis = false;
+        let mut accumulated_final_text = String::new();
+        let mut accumulated_tool_calls: Option<Vec<ToolCall>> = None;
+
+        let mut reasoning_output_index: Option<usize> = None;
+        let mut message_output_index: Option<usize> = None;
+        let mut message_item_id: Option<String> = None;
+        let mut has_emitted_content_part_added = false;
+
+        // MCP tool call tracking (call_index -> (output_index, item_id))
+        let mut mcp_call_tracking: HashMap<usize, (usize, String)> = HashMap::new();
+
+        let mut finish_reason = String::from("stop");
+        let mut matched_stop: Option<serde_json::Value> = None;
+
+        while let Some(result) = decode_stream.next().await {
+            let response = result.map_err(|e| format!("Decode stream error: {}", e))?;
+
+            match response.response {
+                Some(Chunk(chunk)) => {
+                    let delta_result = parser
+                        .parse_chunk(&chunk.token_ids)
+                        .map_err(|e| format!("Parse error: {}", e))?;
+
+                    if let Some(delta) = delta_result {
+                        if let Some(_analysis_text) = &delta.analysis_delta {
+                            if reasoning_output_index.is_none() {
+                                let (output_index, _item_id) =
+                                    emitter.allocate_output_index(OutputItemType::Reasoning);
+                                reasoning_output_index = Some(output_index);
+
+                                emitter
+                                    .emit_reasoning_item(tx, None)
+                                    .map_err(|e| format!("Failed to emit reasoning item: {}", e))?;
+
+                                has_analysis = true;
+                            }
+                        }
+
+                        if let Some(final_delta) = &delta.final_delta {
+                            if !final_delta.is_empty() {
+                                if message_output_index.is_none() {
+                                    let (output_index, item_id) =
+                                        emitter.allocate_output_index(OutputItemType::Message);
+                                    message_output_index = Some(output_index);
+                                    message_item_id = Some(item_id.clone());
+
+                                    let item = json!({
+                                        "id": item_id,
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": []
+                                    });
+
+                                    let event = emitter.emit_output_item_added(output_index, &item);
+                                    let _ = emitter.send_event(&event, tx);
+                                }
+
+                                let output_index = message_output_index.unwrap();
+                                let item_id = message_item_id.as_ref().unwrap();
+                                let content_index = 0;
+
+                                if !has_emitted_content_part_added {
+                                    let event = emitter.emit_content_part_added(
+                                        output_index,
+                                        item_id,
+                                        content_index,
+                                    );
+                                    let _ = emitter.send_event(&event, tx);
+                                    has_emitted_content_part_added = true;
+                                }
+
+                                let event = emitter.emit_text_delta(
+                                    final_delta,
+                                    output_index,
+                                    item_id,
+                                    content_index,
+                                );
+                                let _ = emitter.send_event(&event, tx);
+
+                                accumulated_final_text.push_str(final_delta);
+                            }
+                        }
+
+                        // Commentary channel → MCP tool call streaming
+                        if let Some(tc_delta) = &delta.commentary_delta {
+                            let call_index = tc_delta.index;
+
+                            // Check if this is a new tool call (has id and name)
+                            if tc_delta.id.is_some() {
+                                // NEW MCP CALL: Allocate output item and emit in_progress
+                                let (output_index, item_id) =
+                                    emitter.allocate_output_index(OutputItemType::McpCall);
+
+                                // Store tracking info
+                                mcp_call_tracking
+                                    .insert(call_index, (output_index, item_id.clone()));
+
+                                // Emit mcp_call.in_progress
+                                let event =
+                                    emitter.emit_mcp_call_in_progress(output_index, &item_id);
+                                let _ = emitter.send_event(&event, tx);
+
+                                // If we have function name, emit initial mcp_call_arguments.delta
+                                if let Some(func) = &tc_delta.function {
+                                    if func.name.is_some() {
+                                        let event = emitter.emit_mcp_call_arguments_delta(
+                                            output_index,
+                                            &item_id,
+                                            "",
+                                        );
+                                        let _ = emitter.send_event(&event, tx);
+                                    }
+                                }
+                            } else {
+                                // CONTINUING MCP CALL: Emit arguments delta
+                                if let Some((output_index, item_id)) =
+                                    mcp_call_tracking.get(&call_index)
+                                {
+                                    if let Some(args) = tc_delta
+                                        .function
+                                        .as_ref()
+                                        .and_then(|f| f.arguments.as_ref())
+                                        .filter(|a| !a.is_empty())
+                                    {
+                                        let event = emitter.emit_mcp_call_arguments_delta(
+                                            *output_index,
+                                            item_id,
+                                            args,
+                                        );
+                                        let _ = emitter.send_event(&event, tx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(Complete(complete)) => {
+                    finish_reason = complete.finish_reason.clone();
+                    matched_stop = complete.matched_stop.as_ref().map(|m| match m {
+                        MatchedTokenId(id) => {
+                            json!(id)
+                        }
+                        MatchedStopStr(s) => {
+                            json!(s)
+                        }
+                    });
+
+                    let final_output = parser
+                        .finalize(finish_reason.clone(), matched_stop.clone())
+                        .map_err(|e| format!("Finalize error: {}", e))?;
+
+                    accumulated_tool_calls = final_output.commentary.clone();
+
+                    if let Some(output_index) = message_output_index {
+                        let item_id = message_item_id.as_ref().unwrap();
+                        let content_index = 0;
+
+                        let event = emitter.emit_text_done(output_index, item_id, content_index);
+                        let _ = emitter.send_event(&event, tx);
+
+                        let event =
+                            emitter.emit_content_part_done(output_index, item_id, content_index);
+                        let _ = emitter.send_event(&event, tx);
+
+                        let item = json!({
+                            "id": item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "text",
+                                "text": accumulated_final_text.clone()
+                            }]
+                        });
+                        let event = emitter.emit_output_item_done(output_index, &item);
+                        let _ = emitter.send_event(&event, tx);
+
+                        emitter.complete_output_item(output_index);
+                    }
+
+                    // Complete all MCP tool calls if we have commentary
+                    if let Some(ref tool_calls) = accumulated_tool_calls {
+                        for (call_idx, tool_call) in tool_calls.iter().enumerate() {
+                            if let Some((output_index, item_id)) = mcp_call_tracking.get(&call_idx)
+                            {
+                                // Emit mcp_call_arguments.done with final arguments
+                                let args_str =
+                                    tool_call.function.arguments.as_deref().unwrap_or("");
+                                let event = emitter.emit_mcp_call_arguments_done(
+                                    *output_index,
+                                    item_id,
+                                    args_str,
+                                );
+                                let _ = emitter.send_event(&event, tx);
+
+                                // Emit mcp_call.completed
+                                let event = emitter.emit_mcp_call_completed(*output_index, item_id);
+                                let _ = emitter.send_event(&event, tx);
+
+                                // Mark output item as completed
+                                emitter.complete_output_item(*output_index);
+                            }
+                        }
+                    }
+                }
+                Some(proto::generate_response::Response::Error(err)) => {
+                    return Err(format!("Server error: {}", err.message));
+                }
+                None => {}
+            }
+        }
+
+        decode_stream.mark_completed();
+        prefill_stream.mark_completed();
+
+        if let Some(tool_calls) = accumulated_tool_calls {
+            if !tool_calls.is_empty() {
+                let analysis_content = if has_analysis {
+                    let output = parser.finalize(finish_reason.clone(), matched_stop.clone())?;
+                    output.analysis
+                } else {
+                    None
+                };
+
+                return Ok(ResponsesIterationResult::ToolCallsFound {
+                    tool_calls,
+                    analysis: analysis_content,
+                    partial_text: accumulated_final_text,
+                });
+            }
+        }
+
+        // Return placeholder Completed result for streaming
+        use crate::protocols::responses::{
+            ResponseStatus, ResponseUsage, ResponsesResponse, ResponsesUsage,
+        };
+        Ok(ResponsesIterationResult::Completed {
+            response: Box::new(ResponsesResponse {
+                id: String::new(),
+                object: "response".to_string(),
+                created_at: 0,
+                status: ResponseStatus::Completed,
+                error: None,
+                incomplete_details: None,
+                instructions: None,
+                max_output_tokens: None,
+                model: String::new(),
+                output: vec![],
+                parallel_tool_calls: true,
+                previous_response_id: None,
+                reasoning: None,
+                store: true,
+                temperature: None,
+                text: None,
+                tool_choice: "auto".to_string(),
+                tools: vec![],
+                top_p: None,
+                truncation: None,
+                user: None,
+                metadata: HashMap::new(),
+                usage: Some(ResponsesUsage::Modern(ResponseUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    input_tokens_details: None,
+                    output_tokens_details: None,
+                })),
+            }),
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                completion_tokens_details: None,
+            },
+        })
     }
 
     /// Build SSE response from receiver

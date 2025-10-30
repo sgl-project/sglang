@@ -43,7 +43,9 @@ pub use builder::HarmonyBuilder;
 pub use detector::HarmonyDetector;
 pub use parser::HarmonyParserAdapter;
 pub use processor::{HarmonyResponseProcessor, ResponsesIterationResult};
-pub use responses::{serve_harmony_responses, HarmonyResponsesContext};
+pub use responses::{
+    serve_harmony_responses, serve_harmony_responses_stream, HarmonyResponsesContext,
+};
 pub use stages::{
     HarmonyPreparationStage, HarmonyRequestBuildingStage, HarmonyResponseProcessingStage,
 };
