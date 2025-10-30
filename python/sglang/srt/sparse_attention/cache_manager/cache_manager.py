@@ -289,7 +289,7 @@ class CacheManager:
             for layer_id in range(self.config.num_layers):
                 if self.retrived_query[layer_id].updated:
                     if self.config.is_cuda_graph:
-                        self.graph_runner.graphs[layer_id].replay()
+                        self.graph_runner.replay(layer_id)
                     else:
                         self._retrive_one_layer(
                             self.retrived_query[layer_id],

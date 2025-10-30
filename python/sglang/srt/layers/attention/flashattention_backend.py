@@ -345,7 +345,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q_dtype=model_runner.dtype,
                 max_bs=model_runner.server_args.max_running_requests,
                 page_size=self.page_size,
-                retrive_budget_per_seq=4096,
+                retrive_budget_per_seq=2048,
                 device=model_runner.device,
                 async_retrive=True,
                 req_to_token=model_runner.req_to_token_pool.req_to_token,
