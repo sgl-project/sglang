@@ -83,6 +83,7 @@ oracle = { version = "0.6.3", features = ["chrono"] }
 subtle = "2.6"
 rustpython-parser = "0.4.0"
 num-traits = "0.2"
+openai-harmony = { git = "https://github.com/openai/harmony", tag = "v0.0.4" }
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.14.2", features = ["gzip", "transport"] }
