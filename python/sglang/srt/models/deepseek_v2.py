@@ -408,6 +408,8 @@ def handle_attention_nsa(attn, forward_batch):
     - Decode: MLA (avoids per-token decompression)
     - Prefill <= 2048: MHA (topk ineffective, MHA has lower FLOPs)
     - Prefill > 2048: MLA (topk filtering reduces computation significantly)
+    
+    Note: B200 (SM100) with FP8 KV cache always uses MLA due to compatibility constraints.
     """
     if forward_batch.forward_mode.is_decode_or_idle():
         return AttnForwardMethod.MLA
@@ -420,9 +422,10 @@ def handle_attention_nsa(attn, forward_batch):
         else:
             max_kv_len = 0
 
-        # Enable MHA on SM90 (H100/H200) and SM100 (B200)
-        # SM90 uses FA3, SM100 uses FA4
-        is_supported_gpu = _device_sm == 90 or _device_sm == 100
+        # B200 with FP8 KV cache must use MLA; B200/H200 with BF16 KV cache can use MHA
+        kv_cache_dtype = get_global_server_args().kv_cache_dtype
+        is_b200_fp8 = _device_sm == 100 and kv_cache_dtype.startswith("fp8")
+        is_supported_gpu = (_device_sm == 90 or _device_sm == 100) and not is_b200_fp8
 
         return (
             AttnForwardMethod.MHA_CHUNKED_KV
