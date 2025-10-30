@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -53,6 +54,8 @@ from sglang.srt.utils import (
     is_sm100_supported,
     prepare_weight_cache,
 )
+
+logger = logging.getLogger(__name__)
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = is_cuda() and is_sm90_supported()
@@ -438,6 +441,8 @@ class CommunicateSimpleFn:
         forward_batch: ForwardBatch,
         context: CommunicateContext,
     ) -> torch.Tensor:
+        if get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA"):
+            return hidden_states
         hidden_states, local_hidden_states = (
             get_local_dp_buffer(),
             hidden_states,
@@ -533,6 +538,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
+            if get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA"):
+                hidden_states += residual
+                if hidden_states.shape[0] != 0:
+                    hidden_states = layernorm(hidden_states)
+                return hidden_states, residual
             if context.attn_tp_rank == 0:
                 hidden_states += residual
 
@@ -581,6 +591,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
+        if get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA"):
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = layernorm(hidden_states, residual)
+            return hidden_states, residual
+
         input_hidden_states = hidden_states
         hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
             context.attn_tp_rank
@@ -667,6 +682,8 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
+        if get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA"):
+            return hidden_states, residual
         hidden_states, global_hidden_states = (
             get_local_dp_buffer(),
             hidden_states,
@@ -688,15 +705,18 @@ class CommunicateSummableTensorPairFn:
     ):
         hidden_states += residual
         residual = None
-        hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
-            hidden_states,
-        )
-        attn_tp_all_gather_into_tensor(
-            hidden_states,
-            local_hidden_states,
-        )
-        return hidden_states, residual
+        if get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA"):
+            return hidden_states, residual
+        else:
+            hidden_states, local_hidden_states = (
+                get_local_dp_buffer(),
+                hidden_states,
+            )
+            attn_tp_all_gather_into_tensor(
+                hidden_states,
+                local_hidden_states,
+            )
+            return hidden_states, residual
 
     @staticmethod
     def _scatter(
@@ -705,6 +725,8 @@ class CommunicateSummableTensorPairFn:
         forward_batch: ForwardBatch,
         context: CommunicateContext,
     ):
+        if get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA"):
+            return hidden_states, residual
         assert residual is None, "not yet handled residual!=None"
         tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
         hidden_states = tensor_list[context.attn_tp_rank]

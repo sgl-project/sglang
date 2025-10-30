@@ -698,6 +698,18 @@ class GroupCoordinator:
                 output, input, group_name=self.unique_name
             )
 
+    def all_gather_into_tensor_async(
+        self, output: torch.Tensor, input: torch.Tensor, stream=None
+    ):
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None:
+            pynccl_comm.all_gather_into_tensor(output, input, stream=stream)
+        else:
+            logger.warning("not all_gather_into_tensor_async")
+            torch.ops.sglang.reg_all_gather_into_tensor(
+                output, input, group_name=self.unique_name
+            )
+
     def all_gather(
         self,
         input_: torch.Tensor,

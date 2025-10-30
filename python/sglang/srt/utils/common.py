@@ -52,6 +52,7 @@ from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
+from itertools import accumulate
 from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
@@ -3584,3 +3585,128 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+def calculate_cp_seq_idx(cp_chunks_len, seqs_len):
+    """Used to obtain the index of the seq corresponding
+    to each cp block in the forwardbatch, and the starting
+    and ending positions of the corresponding seq in the cp block"""
+    j = 0
+    tuple_len = []  # Only keep this result list
+    cumulative = {}  # Used to track cumulative values for each index
+
+    for i in range(len(cp_chunks_len)):
+        current_dict = {}
+        current_tuples = []
+        c_val = cp_chunks_len[i]
+
+        while j < len(seqs_len):
+            s_val = seqs_len[j]
+            if s_val == c_val:
+                idx = j
+                current_dict[idx] = s_val
+                # Update cumulative value for this index
+                cumulative[idx] = cumulative.get(idx, 0) + s_val
+                j += 1
+                break
+            elif s_val > c_val:
+                idx = j
+                current_dict[idx] = c_val
+                # Update cumulative value for this index
+                cumulative[idx] = cumulative.get(idx, 0) + c_val
+                seqs_len[j] = s_val - c_val
+                break
+            else:  # s_val < c_val
+                idx = j
+                current_dict[idx] = s_val
+                # Update cumulative value for this index
+                cumulative[idx] = cumulative.get(idx, 0) + s_val
+                c_val -= s_val
+                j += 1
+
+        # Build tuple: (index, historical cumulative, historical+current)
+        for idx, val in current_dict.items():
+            # Subtract current value to get historical cumulative
+            prev_cum = cumulative.get(idx, 0) - val
+            current_cum = prev_cum + val
+            current_tuples.append((idx, prev_cum, current_cum))
+
+        tuple_len.append(current_tuples)
+    return tuple_len
+
+
+def prepare_input_dp_with_cp_dsa(
+    kv_len,
+    cp_rank,
+    cp_size,
+    seqs_len,
+):
+    """prepare_input_dp_with_cp_dsa"""
+    # just support batch = 1
+    bs_per_cp_group = 1
+    cp_input_dict = {}
+    kv_len_origin = kv_len
+    # get zigzag index
+    cp_segment_num = cp_size * 2
+    seq_per_batch = kv_len // cp_segment_num  # seq_len for each batch and segment
+    split_list = seq_per_batch.repeat_interleave(cp_segment_num).int().tolist()
+    remainder = kv_len % (cp_segment_num)
+    if remainder > 0:
+        split_list[:remainder] = [x + 1 for x in split_list[:remainder]]
+
+    cp_input_dict.update({"split_list": split_list})
+    # get cp_seq_index
+    # TODO Multi-batch-cp support has accuracy issues
+    # cp_seq_index = calculate_cp_seq_idx(split_list[:], seqs_len[:])
+
+    seq_max_rank_len = (kv_len + cp_size - 1) // cp_size
+    max_rank_len = seq_max_rank_len.repeat_interleave(cp_size).int().tolist()
+    cp_input_dict.update({"max_rank_len": max_rank_len})
+    zigzag_index = list(
+        range(cp_rank, cp_rank + bs_per_cp_group * cp_segment_num, cp_segment_num)
+    ) + list(
+        range(
+            cp_segment_num - cp_rank - 1,
+            bs_per_cp_group * cp_segment_num,
+            cp_segment_num,
+        )
+    )
+    cp_input_dict.update({"zigzag_index": zigzag_index})
+
+    per_rank_actual_token = list(
+        split_list[i] + split_list[cp_size * 2 - i - 1] for i in range(cp_size)
+    )
+    cp_input_dict.update({"per_rank_actual_token": per_rank_actual_token})
+    reverse_split_len = [
+        element
+        for i in range(cp_size)
+        for element in (split_list[i], split_list[cp_size * 2 - i - 1])
+    ]
+    cp_input_dict.update({"reverse_split_len": reverse_split_len})
+    # get zigzag reverse index
+    cp_reverse_index = []
+    for batch_id in range(bs_per_cp_group):
+        cp_reverse_index.extend(
+            list(range(batch_id, cp_segment_num * bs_per_cp_group, 2 * bs_per_cp_group))
+            + list(
+                range(
+                    (cp_segment_num - 1) * bs_per_cp_group + batch_id,
+                    0,
+                    -2 * bs_per_cp_group,
+                )
+            )
+        )
+    cp_input_dict.update({"cp_reverse_index": cp_reverse_index})
+    prefix_sum_list = list(accumulate(split_list))
+
+    cp_input_dict.update({"kv_len_prev": prefix_sum_list[cp_rank]})
+    cp_input_dict.update({"kv_len_next": prefix_sum_list[cp_size * 2 - cp_rank - 1]})
+    cp_input_dict.update({"actual_seq_q_prev": split_list[cp_rank]})
+    cp_input_dict.update({"actual_seq_q_next": split_list[cp_size * 2 - cp_rank - 1]})
+
+    # cp_input_dict.update({"cp_batch_seq_index_prev": cp_seq_index[cp_rank]})
+    # cp_input_dict.update({"cp_batch_seq_index_next": cp_seq_index[cp_size * 2 - cp_rank - 1]})
+
+    cp_input_dict.update({"total_seq_lens": kv_len_origin})
+
+    return cp_input_dict
