@@ -100,7 +100,7 @@ class BaseTpWorker(ABC):
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
-            recv_req.model_path, recv_req.load_format
+            recv_req.model_path, recv_req.load_format, recv_req.recapture_cuda_graph
         )
         return success, message
 
