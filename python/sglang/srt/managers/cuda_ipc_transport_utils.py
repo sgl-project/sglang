@@ -75,7 +75,11 @@ class MmItemMemoryPool:
         init_chunk = MmItemMemoryChunk((0, memory_size), self.pop_sync_buffer())
         self.available_chunks = [init_chunk]
         self.occupied_chunks = []
-
+    
+    def clear_sync_flag_list(self):
+        # call each chunk's __del__
+        self.sync_flag_list.clear()
+        
     def pop_sync_buffer(self):
         if len(self.sync_flag_list) == 0:
             try:
