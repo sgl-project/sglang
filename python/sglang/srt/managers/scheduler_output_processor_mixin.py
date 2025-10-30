@@ -352,17 +352,18 @@ class SchedulerOutputProcessorMixin:
                     # FIXME(lsyin): fix the messy logic here
                     # 1) when not overlap (v2 impl), we free the extra tokens in the req
                     # 2) overlap eagle and the current batch is prefill. This seq will not run extra iteration.
-                    start_p = batch.seq_lens_cpu[i] + accept_lens_list[i]
-                    end_p = allocate_lens_list[i]
-
                     if self.page_size > 1:
+                        start_p = batch.seq_lens_cpu[i] + accept_lens_list[i]
+                        end_p = allocate_lens_list[i]
                         start_p = ceil_div(start_p, self.page_size) * self.page_size
-                        indices_to_free = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx
-                        ][start_p:end_p]
-                        self.token_to_kv_pool_allocator.free(indices_to_free)
                     else:
-                        pass
+                        start_p = req.kv_committed_len
+                        end_p = req.kv_allocated_len
+
+                    indices_to_free = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx
+                    ][start_p:end_p]
+                    self.token_to_kv_pool_allocator.free(indices_to_free)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; cache_finished_req will be called after Device->Host transfer completes
