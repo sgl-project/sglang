@@ -111,7 +111,7 @@ test = [
 ]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 all = []
-dev = ["sglang[test]", "sglang[diffusion]"]
+dev = ["sglang[test]"]
 
 # Temporary tags
 cu130 = [
