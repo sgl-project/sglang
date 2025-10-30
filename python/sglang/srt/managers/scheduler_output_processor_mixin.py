@@ -99,7 +99,12 @@ class SchedulerOutputProcessorMixin:
                 ):
                     # Free the one delayed token for the mixed decode batch
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
+                    # Only free when the extra token is in a new page.
+                    # If page_size is 1, every token is in a new page.
+                    if self.page_size == 1 or (req.seqlen - 1) % self.page_size == 0:
+                        self.token_to_kv_pool_allocator.free(
+                            batch.out_cache_loc[j : j + 1]
+                        )
                     continue
 
                 if req.is_retracted:
