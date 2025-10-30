@@ -13,12 +13,11 @@ from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import (
-    MM_FEATURE_CACHE_SIZE,
     Modality,
     MultimodalDataItem,
 )
 
-from sglang.srt.managers.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy, MmItemMemoryPool
+from sglang.srt.managers.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy, MmItemMemoryPool, MM_FEATURE_CACHE_SIZE
 
 from sglang.srt.utils import (
     get_bool_env_var,
