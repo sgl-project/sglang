@@ -41,7 +41,7 @@ jobs:
 
       - name: Run CI Analysis
         env:
-          GITHUB_TOKEN: ${{ secrets.CI_MONITOR }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_CI_MONITOR }}
           PYTHONUNBUFFERED: 1
           PYTHONIOENCODING: utf-8
         run: |
@@ -50,7 +50,7 @@ jobs:
 
       - name: Run Performance Analysis
         env:
-          GITHUB_TOKEN: ${{ secrets.CI_MONITOR }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_CI_MONITOR }}
           PYTHONUNBUFFERED: 1
           PYTHONIOENCODING: utf-8
         run: |
@@ -86,7 +86,7 @@ jobs:
 
       - name: Run Test Balance Analysis
         env:
-          GITHUB_TOKEN: ${{ secrets.CI_MONITOR }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_CI_MONITOR }}
           PYTHONUNBUFFERED: 1
           PYTHONIOENCODING: utf-8
         run: |
