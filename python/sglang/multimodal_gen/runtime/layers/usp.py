@@ -186,7 +186,6 @@ def ring_attn(
         dropout_p: Dropout probability.
     """
     # torch.distributed.tensor.experimental._attention is not a public API,
-    # but it's what's used in official examples and xDiT.
     from torch.distributed.tensor.experimental._attention import (
         _cp_options,
         _templated_ring_attention,
