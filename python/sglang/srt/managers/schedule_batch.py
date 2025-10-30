@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
+from sglang.srt.managers.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -67,8 +68,6 @@ from sglang.srt.mem_cache.common import (
     alloc_for_extend,
     evict_from_tree_cache,
 )
-
-from sglang.srt.managers.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -89,6 +88,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
 logger = logging.getLogger(__name__)
+
 
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
@@ -1354,7 +1354,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 continue
             for mm_item in mm_input.mm_items:
                 pixel_values = getattr(mm_item, "feature", None)
-                # logger.info("pixel_value.device :{} vs self.device {}".format(pixel_values.device, torch.cuda.current_device()))
                 if isinstance(pixel_values, torch.Tensor):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
                 elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
