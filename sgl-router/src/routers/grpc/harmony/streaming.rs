@@ -16,7 +16,7 @@ use proto::{
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
-use tracing::error;
+use tracing::{debug, error};
 
 use super::{
     processor::ResponsesIterationResult, types::HarmonyChannelDelta, HarmonyParserAdapter,
@@ -563,7 +563,9 @@ impl HarmonyStreamingProcessor {
         let mut matched_stop: Option<serde_json::Value> = None;
 
         // Process stream
+        let mut chunk_count = 0;
         while let Some(result) = decode_stream.next().await {
+            chunk_count += 1;
             let response = result.map_err(|e| format!("Decode stream error: {}", e))?;
 
             match response.response {
@@ -779,6 +781,54 @@ impl HarmonyStreamingProcessor {
             }
         }
 
+        debug!(
+            "Stream loop ended. Total chunks received: {}, has_analysis: {}, tool_calls: {}, final_text_len: {}",
+            chunk_count,
+            has_analysis,
+            accumulated_tool_calls.as_ref().map(|tc| tc.len()).unwrap_or(0),
+            accumulated_final_text.len()
+        );
+
+        // Extract tool calls from completed messages or incomplete commentary
+        if chunk_count > 0 && accumulated_tool_calls.is_none() {
+            let messages = parser.get_messages();
+
+            // Try extracting from completed messages first
+            let (analysis_opt, commentary_opt, final_text_extracted) =
+                HarmonyParserAdapter::parse_messages(&messages);
+            accumulated_tool_calls = commentary_opt.clone();
+
+            // If no tool calls found, check for incomplete commentary in parser state
+            if accumulated_tool_calls.is_none() {
+                accumulated_tool_calls = parser.extract_incomplete_commentary();
+            }
+
+            debug!(
+                "Tool call extraction: completed_msgs={}, tool_calls={}, has_analysis={}, final_text_len={}",
+                messages.len(),
+                accumulated_tool_calls.as_ref().map(|tc| tc.len()).unwrap_or(0),
+                analysis_opt.is_some(),
+                final_text_extracted.len()
+            );
+
+            // Complete any pending MCP tool calls with data from completed messages
+            if let Some(ref tool_calls) = accumulated_tool_calls {
+                for (call_idx, tool_call) in tool_calls.iter().enumerate() {
+                    if let Some((output_index, item_id)) = mcp_call_tracking.get(&call_idx) {
+                        // Emit mcp_call_arguments.done with final arguments
+                        let args_str = tool_call.function.arguments.as_deref().unwrap_or("");
+                        let event =
+                            emitter.emit_mcp_call_arguments_done(*output_index, item_id, args_str);
+                        emitter.send_event_best_effort(&event, tx);
+
+                        // Emit mcp_call.completed
+                        let event = emitter.emit_mcp_call_completed(*output_index, item_id);
+                        emitter.send_event_best_effort(&event, tx);
+                    }
+                }
+            }
+        }
+
         // Mark stream as completed successfully to prevent abort on drop
         decode_stream.mark_completed();
 
@@ -857,9 +907,11 @@ impl HarmonyStreamingProcessor {
     ) -> Result<ResponsesIterationResult, String> {
         match execution_result {
             context::ExecutionResult::Single { stream } => {
+                debug!("Processing Responses API single stream mode");
                 Self::process_responses_single_stream(stream, emitter, tx).await
             }
             context::ExecutionResult::Dual { prefill, decode } => {
+                debug!("Processing Responses API dual stream mode");
                 Self::process_responses_dual_stream(prefill, *decode, emitter, tx).await
             }
         }
