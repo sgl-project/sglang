@@ -373,7 +373,7 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All for sequence/head sharding
         if get_ulysses_parallel_world_size() > 1:
-            # -> [B, S_local, H, D]
+            # -> [B, S, H_local, D]
             q = _usp_input_all_to_all(q, head_dim=2)
             k = _usp_input_all_to_all(k, head_dim=2)
             v = _usp_input_all_to_all(v, head_dim=2)
@@ -389,7 +389,7 @@ class USPAttention(nn.Module):
                 dropout_p=self.dropout_p,
             )
         else:
-            # -> [B, S_local, H, D]
+            # -> [B, S, H_local, D]
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
         # Ulysses-style All-to-All to restore original sharding
