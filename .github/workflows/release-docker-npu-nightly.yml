@@ -5,7 +5,7 @@ on:
       - main
     paths:
       - ".github/workflows/release-docker-npu-nightly.yml"
-      - "docker/Dockerfile.npu"
+      - "docker/npu.Dockerfile"
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
@@ -65,7 +65,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: docker
-          file: docker/Dockerfile.npu
+          file: docker/npu.Dockerfile
           # TODO: need add x86 platforms support when memfabric is ready
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
