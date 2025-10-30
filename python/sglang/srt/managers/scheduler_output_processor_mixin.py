@@ -21,7 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.tracing.trace import trace_slice
-from sglang.srt.utils.common import ceil_div
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -298,40 +298,19 @@ class SchedulerOutputProcessorMixin:
             if self.enable_overlap and (req.finished() or req.is_retracted):
                 indices_to_free = None
                 if batch.spec_algorithm.is_eagle():
-                    from sglang.srt.speculative.eagle_info import EagleDraftInput
-
-                    end_p = allocate_lens_list[i]
-                    start_p = end_p - EagleDraftInput.ALLOC_LEN_PER_DECODE
+                    start_p, end_p = req.pop_all_kv_cache()
                     if self.page_size > 1:
-                        start_p = ceil_div(start_p, self.page_size) * self.page_size
-                        indices_to_free = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx
-                        ][start_p:end_p]
-                    else:
-                        assert (
-                            req.kv_committed_len == req.kv_freed_len
-                        ), f"{req.kv_committed_len=}, {req.kv_freed_len=}"
-                        start_p = req.kv_freed_len
-                        end_p = req.kv_allocated_len
-                        indices_to_free = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx
-                        ][start_p:end_p]
-                else:
-                    if self.page_size == 1:
-                        # Free the one extra delayed token
-                        assert (
-                            req.kv_allocated_len == req.kv_freed_len
-                            and req.kv_committed_len == req.kv_freed_len
-                        ), f"{req.kv_allocated_len=}, {req.kv_committed_len=}, {req.kv_freed_len=},"
-                    else:
-                        if (
-                            len(req.origin_input_ids) + len(req.output_ids) - 1
-                        ) % self.page_size == 0:
-                            # Only free when the extra token is in a new page
-                            indices_to_free = batch.out_cache_loc[i : i + 1]
+                        start_p = ceil_align(start_p, self.page_size)
 
-                if indices_to_free is not None:
+                    indices_to_free = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx
+                    ][start_p:end_p]
+
                     self.token_to_kv_pool_allocator.free(indices_to_free)
+                else:
+                    start_p, end_p = req.pop_all_kv_cache()
+                    assert start_p == end_p, f"{start_p=}, {end_p=}"
+
                 continue
 
             if req.is_retracted:
@@ -349,13 +328,11 @@ class SchedulerOutputProcessorMixin:
 
             if req.finished():
                 if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
-                    # FIXME(lsyin): fix the messy logic here
-                    # 1) when not overlap (v2 impl), we free the extra tokens in the req
-                    # 2) overlap eagle and the current batch is prefill. This seq will not run extra iteration.
+                    # FIXME: remove this if branch
                     if self.page_size > 1:
                         start_p = batch.seq_lens_cpu[i] + accept_lens_list[i]
                         end_p = allocate_lens_list[i]
-                        start_p = ceil_div(start_p, self.page_size) * self.page_size
+                        start_p = ceil_align(start_p, self.page_size)
                     else:
                         start_p = req.kv_committed_len
                         end_p = req.kv_allocated_len

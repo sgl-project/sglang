@@ -424,6 +424,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     next_power_of_2(self.draft_token_num),
                 )
                 token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+                for i, req in enumerate(batch.reqs):
+                    req.kv_committed_len += accept_length_list[i] + 1
+                    req.kv_allocated_len = req.kv_committed_len
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part

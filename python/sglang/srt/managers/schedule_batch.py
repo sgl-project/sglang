@@ -694,8 +694,11 @@ class Req:
         """Return the length of committed KV cache and mark them as freed."""
 
         # NOTE: This function is called exactly once after the request is finished.
-        page_size = get_global_server_args().page_size
-        if page_size == 1:
+        global_server_args = get_global_server_args()
+        topk = global_server_args.speculative_eagle_topk
+
+        enable_kv_committed_len = topk is None or topk == 1
+        if enable_kv_committed_len:
             assert (
                 self.kv_freed_len == 0
             ), f"Committed KV cache already freed ({self.kv_freed_len=}, {self.kv_committed_len=})"
