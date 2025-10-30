@@ -5,11 +5,14 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed._functional_collectives as ft_c
 from packaging.version import parse
+from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_ulysses_parallel_world_size,
 )
+
+_cp_options.enable_load_balance = False
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -40,57 +43,119 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def _usp_input_all_to_all(x: torch.Tensor) -> torch.Tensor:
+def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
-    [b, h, s // world_size, d] -> [b, h // world_size, s, d]
+    Perform Ulysses-style input all-to-all over the head dimension.
+
+    Default layout expects heads at dim=1 and sequence at dim=2:
+        [b, h, s_local, d] -> [b, h // world_size, s_global, d]
+
+    If heads are at dim=2 (input is [b, s_local, h, d]), set head_dim=2, and the
+    function returns [b, s_global, h // world_size, d], preserving the original
+    head/sequence dim ordering.
+
+    Args:
+        x: A 4D tensor with layout [b, *, *, d] where '*' are sequence and heads
+        head_dim: Which dimension index corresponds to heads (1 or 2)
+
+    Returns:
+        Tensor with the same dim order as input, with heads sharded and sequence gathered.
     """
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
-    b, h, s, d = x.shape
+    assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+    seq_dim = 1 if head_dim == 2 else 2
+
+    # Bring to canonical [b, h, s, d]
+    if head_dim == 1 and seq_dim == 2:
+        x_c = x
+    else:
+        x_c = x.permute(0, head_dim, seq_dim, 3).contiguous()
+
+    b, h, s, d = x_c.shape
     assert (
         h % world_size == 0
     ), f"h ({h}) must be divisible by world_size ({world_size})"
 
     # [b, h, s, d] -> [h, b, s, d]
-    x = x.permute(1, 0, 2, 3).contiguous()
-
-    # [h, b, s, d]
-    x = _usp_all_to_all_single(x)
-
-    # -> [b, h, s, d]
-    x = (
-        x.reshape(world_size, h // world_size, b, -1, d)
+    x_c = x_c.permute(1, 0, 2, 3).contiguous()
+    # all-to-all along h
+    x_c = _usp_all_to_all_single(x_c)
+    # -> [b, h // world, s * world, d]
+    x_c = (
+        x_c.reshape(world_size, h // world_size, b, -1, d)
         .permute(2, 1, 0, 3, 4)
         .reshape(b, h // world_size, -1, d)
     )
-    return x
+
+    if head_dim == 1 and seq_dim == 2:
+        return x_c
+
+    # Map back to original ordering, preserving head/seq positions
+    new_order = [0, None, None, 3]
+    new_order[head_dim] = 1
+    new_order[seq_dim] = 2
+    return x_c.permute(tuple(new_order)).contiguous()
 
 
-def _usp_output_all_to_all(x: torch.Tensor) -> torch.Tensor:
+def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
-    [b, h // world_size, s, d] -> [b, h, s // world_size, d]
+    Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
+
+    Default layout expects heads at dim=1 and sequence at dim=2:
+        [b, h // world_size, s_global, d] -> [b, h, s_local, d]
+
+    If heads are at dim=2 (input is [b, s_global, h // world_size, d]), set head_dim=2,
+    and the function returns [b, s_local, h, d], preserving the original head/sequence
+    dim ordering.
+
+    Args:
+        x: A 4D tensor with layout [b, *, *, d] where '*' are sequence and heads
+        head_dim: Which dimension index corresponds to heads (1 or 2)
+
+    Returns:
+        Tensor with the same dim order as input, with heads gathered and sequence sharded.
     """
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
-    b, h, s, d = x.shape
+    assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+    seq_dim = 1 if head_dim == 2 else 2
+
+    # Bring to canonical [b, h, s, d]
+    if head_dim == 1 and seq_dim == 2:
+        x_c = x
+    else:
+        x_c = x.permute(0, head_dim, seq_dim, 3).contiguous()
+
+    b, h, s, d = x_c.shape
     assert (
         s % world_size == 0
     ), f"s ({s}) must be divisible by world_size ({world_size})"
 
-    x = x.permute(2, 0, 1, 3).contiguous()
-    x = _usp_all_to_all_single(x)
-    x = (
-        x.reshape(world_size, s // world_size, b, -1, d)
+    # [b, h, s, d] -> [s, b, h, d]
+    x_c = x_c.permute(2, 0, 1, 3).contiguous()
+    x_c = _usp_all_to_all_single(x_c)
+    # -> [b, h * world, s // world, d]
+    x_c = (
+        x_c.reshape(world_size, s // world_size, b, -1, d)
         .permute(2, 0, 3, 1, 4)
         .reshape(b, -1, s // world_size, d)
     )
-    return x
+
+    if head_dim == 1 and seq_dim == 2:
+        return x_c
+
+    # Map back to original ordering, preserving head/seq positions
+    new_order = [0, None, None, 3]
+    new_order[head_dim] = 1
+    new_order[seq_dim] = 2
+    return x_c.permute(tuple(new_order)).contiguous()
 
 
 def ring_attn(
@@ -122,8 +187,7 @@ def ring_attn(
     from torch.distributed.tensor.experimental._attention import (
         _templated_ring_attention,
     )
-    from torch.distributed.tensor.experimental._attention import _cp_options
-    _cp_options.enable_load_balance = False
+
     ring_pg = get_sp_group().ring_group
     assert ring_pg is not None, "Ring process group is not initialized."
 

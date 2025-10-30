@@ -373,14 +373,10 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All for sequence/head sharding
         if get_ulysses_parallel_world_size() > 1:
-            # -> [B, H, S_local, D]
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            # -> [B, H_local, S, D]
-            q = _usp_input_all_to_all(q)
-            k = _usp_input_all_to_all(k)
-            v = _usp_input_all_to_all(v)
+            # -> [B, S_local, H, D]
+            q = _usp_input_all_to_all(q, head_dim=2)
+            k = _usp_input_all_to_all(k, head_dim=2)
+            v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -393,19 +389,12 @@ class USPAttention(nn.Module):
                 dropout_p=self.dropout_p,
             )
         else:
-            # -> [B, S, H_local, D]
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
+            # -> [B, S_local, H, D]
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:
-            # -> [B, H_local, S, D]
-            out = out.transpose(1, 2)
-            # -> [B, H, S_local, D]
-            out = _usp_output_all_to_all(out)
             # -> [B, S_local, H, D]
-            out = out.transpose(1, 2)
+            out = _usp_output_all_to_all(out, head_dim=2)
 
         return out, None
