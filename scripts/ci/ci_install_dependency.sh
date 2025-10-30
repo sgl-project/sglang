@@ -21,7 +21,7 @@ python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TO
 rm -rf /root/.cache/flashinfer
 
 # Install apt packages
-apt install -y git libnuma-dev
+apt install -y git libnuma-dev libssl-dev pkg-config
 
 # Install protoc for router build (gRPC protobuf compilation)
 if ! command -v protoc &> /dev/null; then
@@ -54,10 +54,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     PIP_INSTALL_SUFFIX="--break-system-packages"
 
     # Clean up existing installations
-    $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
-
-    # Install the main package
-    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
+    $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
@@ -68,20 +65,11 @@ else
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
     # Clean up existing installations
-    $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
-
-    # Install the main package without deps
-    $PIP_CMD install -e "python[dev]" --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
-
-    # Install flashinfer-python 0.4.1 dependency that requires prerelease (This should be removed when flashinfer fixes this issue)
-    $PIP_CMD install flashinfer-python==0.4.1 --prerelease=allow $PIP_INSTALL_SUFFIX
-
-    # Install the main package
-    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --upgrade
+    $PIP_CMD uninstall sgl-kernel sglang || true
 fi
 
-# Install OpenSSL development libraries for router build
-apt install -y libssl-dev pkg-config
+# Install the main package
+$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 # Install router for pd-disagg test
 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
