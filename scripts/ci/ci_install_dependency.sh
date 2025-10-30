@@ -72,7 +72,7 @@ fi
 apt install -y libssl-dev pkg-config
 
 # Install the main package
-$PIP_CMD install -e "python" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
+$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
 
 # Install router for pd-disagg test
 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
