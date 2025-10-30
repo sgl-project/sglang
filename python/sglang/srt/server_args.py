@@ -2211,7 +2211,7 @@ class ServerArgs:
         parser.add_argument(
             "--mm-process-config",
             type=json.loads,
-            default=ServerArgs.mm_process_config,
+            default={},
             help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
         )
 
