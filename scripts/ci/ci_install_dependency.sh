@@ -28,8 +28,20 @@ rm -rf /root/.cache/flashinfer
 # Install apt packages
 apt install -y git libnuma-dev
 
+# Check if protoc of correct architecture is already installed
+if command -v protoc >/dev/null 2>&1; then
+    if protoc --version >/dev/null 2>&1; then
+        echo "protoc already installed: $(protoc --version)"
+    else
+        echo "protoc found but not runnable, reinstalling..."
+        INSTALL_PROTOC=1
+    fi
+else
+    INSTALL_PROTOC=1
+fi
+
 # Install protoc for router build (gRPC protobuf compilation)
-if ! command -v protoc &> /dev/null; then
+if [ "${INSTALL_PROTOC:-0}" = 1 ]; then
     echo "Installing protoc..."
     if command -v apt-get &> /dev/null; then
         # Ubuntu/Debian
