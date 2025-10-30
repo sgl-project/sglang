@@ -474,7 +474,8 @@ class Req:
         # For req-level memory management
         self.kv_committed_len = 0
         self.kv_allocated_len = 0
-        self.kv_freed_len = 0  # for debug / corner cases
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -700,21 +701,23 @@ class Req:
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
             assert (
-                self.kv_freed_len == 0
-            ), f"Committed KV cache already freed ({self.kv_freed_len=}, {self.kv_committed_len=})"
-            self.kv_freed_len = self.kv_committed_len
+                not self.kv_committed_freed
+            ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+            self.kv_committed_freed = True
             return self.kv_committed_len
         else:
             return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
 
-    def pop_all_kv_cache(self) -> Tuple[int, int]:
+    def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
         """Return the range of unreleased KV cache and mark them as freed."""
 
         # NOTE: This function is called when there is over-allocation of KV cache.
         # Over-allocation: we allocate more KV cache then the committed length.
         # e.g., speculative decoding may allocate more KV cache than actually used.
-        assert self.kv_freed_len == self.kv_committed_len
-        self.kv_freed_len = self.kv_allocated_len
+        assert (
+            not self.kv_overallocated_freed
+        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 
     def add_latency(self, stage: RequestStage):
@@ -944,7 +947,8 @@ class Req:
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
-        self.kv_freed_len = 0
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[

@@ -296,7 +296,7 @@ class SchedulerOutputProcessorMixin:
             req: Req
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
-                start_p, end_p = req.pop_all_kv_cache()
+                start_p, end_p = req.pop_overallocated_kv_cache()
                 if batch.spec_algorithm.is_eagle():
                     if self.page_size > 1:
                         start_p = ceil_align(start_p, self.page_size)
@@ -327,13 +327,9 @@ class SchedulerOutputProcessorMixin:
             if req.finished():
                 if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
                     # FIXME: remove this if branch
+                    start_p, end_p = req.pop_overallocated_kv_cache()
                     if self.page_size > 1:
-                        start_p = batch.seq_lens_cpu[i] + accept_lens_list[i]
-                        end_p = allocate_lens_list[i]
                         start_p = ceil_align(start_p, self.page_size)
-                    else:
-                        start_p = req.kv_committed_len
-                        end_p = req.kv_allocated_len
 
                     indices_to_free = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx
