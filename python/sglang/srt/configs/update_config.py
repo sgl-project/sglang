@@ -80,7 +80,6 @@ def update_linear_dim(cfg, attr_name, tp_size):
         return
     from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
     updated_dim = pad_vocab_size(origin_dim, tp_size)
-    print(f"{attr_name} updated to {updated_dim}!")
     setattr(cfg, attr_name, updated_dim)
     return
 
@@ -148,31 +147,31 @@ def adjust_config_with_unaligned_cpu_tp(
         vision_cfg_obj.original_num_attention_heads = (
             model_config.num_attention_heads
         )
-        att_heads = -1
+        att_heads = 0  # Initiate with an invalid value
         if hasattr(vision_cfg_obj, "num_attention_heads"):
             att_heads = vision_cfg_obj.num_attention_heads
         if hasattr(vision_cfg_obj, "attention_heads"):
             att_heads = vision_cfg_obj.attention_heads
-        if att_heads > -1:
-            if att_heads % tp_size != 0:
-                vision_cfg_obj.head_dim = vision_cfg_obj.hidden_size // att_heads
-                from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+        if att_heads > 0 and att_heads % tp_size != 0:
+            vision_cfg_obj.head_dim = vision_cfg_obj.hidden_size // att_heads
+            from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-                pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
-                att_heads = pad_vocab_size(
-                    att_heads, pad_size
-                )
+            pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
+            att_heads = pad_vocab_size(
+                att_heads, pad_size
+            )
+            if vision_cfg_obj.model_type != "siglip_vision_model":
                 vision_cfg_obj.hidden_size = vision_cfg_obj.head_dim * att_heads
-                if hasattr(vision_cfg_obj, "num_attention_heads"):
-                    vision_cfg_obj.num_attention_heads = att_heads
-                if hasattr(vision_cfg_obj, "attention_heads"):
-                    vision_cfg_obj.attention_heads = att_heads
+            if hasattr(vision_cfg_obj, "num_attention_heads"):
+                vision_cfg_obj.num_attention_heads = att_heads
+            if hasattr(vision_cfg_obj, "attention_heads"):
+                vision_cfg_obj.attention_heads = att_heads
         vision_cfg_obj = update_intermediate_size(
             vision_cfg_obj,
             "intermediate_size",
             intermediate_padding_size,
         )
-        update_fields = ["projector_input_dim", "projector_output_dim"]
+        update_fields = ["projector_input_dim"]
         for field in update_fields:
             update_linear_dim(vision_cfg_obj, field, tp_size)
 
