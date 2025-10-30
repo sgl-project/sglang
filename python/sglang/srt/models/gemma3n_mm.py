@@ -203,38 +203,41 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
 
         # Vision components
         # TODO: Use sglang's vision model
-        self.vision_tower = AutoModel.from_config(config=config.vision_config)
 
-        self.embed_vision = Gemma3nMultimodalEmbedder(
-            config.vision_config,
-            config.text_config,
-            quant_config=quant_config,
-            prefix=add_prefix("embed_vision", prefix),
-        )
+        if not self.config.language_only:
+            self.vision_tower = AutoModel.from_config(config=config.vision_config)
 
-        # Audio components
-        self.embed_audio = Gemma3nMultimodalEmbedder(
-            config.audio_config,
-            config.text_config,
-            quant_config=quant_config,
-            prefix=add_prefix("embed_audio", prefix),
-        )
+            self.embed_vision = Gemma3nMultimodalEmbedder(
+                config.vision_config,
+                config.text_config,
+                quant_config=quant_config,
+                prefix=add_prefix("embed_vision", prefix),
+            )
 
-        self.audio_tower = Gemma3nAudioEncoder(
-            config.audio_config,
-            quant_config=quant_config,
-            prefix=add_prefix("audio_tower", prefix),
-        )
+            # Audio components
+            self.embed_audio = Gemma3nMultimodalEmbedder(
+                config.audio_config,
+                config.text_config,
+                quant_config=quant_config,
+                prefix=add_prefix("embed_audio", prefix),
+            )
+
+            self.audio_tower = Gemma3nAudioEncoder(
+                config.audio_config,
+                quant_config=quant_config,
+                prefix=add_prefix("audio_tower", prefix),
+            )
 
         self.vocab_size = config.text_config.vocab_size
         self.vocab_size_per_layer_input = config.text_config.vocab_size_per_layer_input
 
         # Text model
-        self.language_model = Gemma3nTextModel(
-            config.text_config,
-            quant_config,
-            prefix=add_prefix("language_model", prefix),
-        )
+        if not self.config.mm_only:
+            self.language_model = Gemma3nTextModel(
+                config.text_config,
+                quant_config,
+                prefix=add_prefix("language_model", prefix),
+            )
 
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
@@ -252,6 +255,9 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
+
+    def dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
 
     def get_attention_sliding_window_size(self):
         return self.config.text_config.sliding_window - 1
@@ -283,7 +289,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             for i in range(batch_size):
                 pixel_value = pixel_values_batch[i : i + 1]  # Keep batch dimension as 1
                 pixel_value = pixel_value.to(
-                    device=self.vision_tower.device, dtype=self.language_model.dtype()
+                    device=self.vision_tower.device, dtype=self.dtype()
                 )
                 vision_outputs = self.vision_tower(
                     pixel_values=pixel_value, do_pooling=False, return_dict=True
@@ -446,7 +452,8 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         )
 
     def tie_weights(self):
-        return self.language_model.tie_weights()
+        if not self.config.mm_only:
+            return self.language_model.tie_weights()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -470,6 +477,11 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                 # Skip loading extra bias for GPTQ models
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                # Skip loading visual/language model weights
+                if (
+                    self.config.mm_only or self.config.language_only
+                ) and name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -480,6 +492,11 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                     name = name.replace(".self_attn.out_proj", ".self_attn.proj")
                 # Skip loading extra bias for GPTQ models
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip loading visual/language model weights
+                if (
+                    self.config.mm_only or self.config.language_only
+                ) and name not in params_dict:
                     continue
                 # Remapping the name of FP8 kv-scale
                 name = maybe_remap_kv_scale_name(name, params_dict)
