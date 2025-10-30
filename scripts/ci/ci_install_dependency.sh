@@ -3,7 +3,6 @@
 set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
-RUN_DEEPSEEK_V32=${RUN_DEEPSEEK_V32:-0}
 CU_VERSION="cu129"
 
 if [ "$CU_VERSION" = "cu130" ]; then
@@ -22,7 +21,7 @@ python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TO
 rm -rf /root/.cache/flashinfer
 
 # Install apt packages
-apt install -y git libnuma-dev
+apt install -y git libnuma-dev libssl-dev pkg-config
 
 # Install protoc for router build (gRPC protobuf compilation)
 if ! command -v protoc &> /dev/null; then
@@ -55,10 +54,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     PIP_INSTALL_SUFFIX="--break-system-packages"
 
     # Clean up existing installations
-    $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
-
-    # Install the main package
-    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
+    $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
@@ -69,20 +65,11 @@ else
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
     # Clean up existing installations
-    $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
-
-    # Install the main package without deps
-    $PIP_CMD install -e "python[dev]" --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
-
-    # Install flashinfer-python 0.4.1 dependency that requires prerelease (This should be removed when flashinfer fixes this issue)
-    $PIP_CMD install flashinfer-python==0.4.1 --prerelease=allow $PIP_INSTALL_SUFFIX
-
-    # Install the main package
-    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --upgrade
+    $PIP_CMD uninstall sgl-kernel sglang || true
 fi
 
-# Install OpenSSL development libraries for router build
-apt install -y libssl-dev pkg-config
+# Install the main package
+$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 # Install router for pd-disagg test
 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
@@ -111,22 +98,6 @@ if [ "$IS_BLACKWELL" != "1" ]; then
 
     # Install xformers
     $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
-fi
-
-# Install dependencies for deepseek-v3.2
-if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
-    # Install flashmla
-    FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
-    FLASH_MLA_DISABLE_SM100="0"
-    if [ "$IS_BLACKWELL" != "1" ]; then
-        FLASH_MLA_DISABLE_SM100="1"
-    fi
-    git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla
-    cd flash-mla
-    git checkout ${FLASHMLA_COMMIT}
-    git submodule update --init --recursive
-    FLASH_MLA_DISABLE_SM100=${FLASH_MLA_DISABLE_SM100} $PIP_CMD install -v . $PIP_INSTALL_SUFFIX --no-build-isolation
-    cd ..
 fi
 
 # Show current packages

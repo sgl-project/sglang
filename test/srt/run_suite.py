@@ -78,11 +78,11 @@ suites = {
         TestFile("test_deterministic.py", 320),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
-        TestFile("test_eagle_infer_beta.py", 300),
+        TestFile("test_eagle_infer_beta.py", 90),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
-        # TestFile("test_flashmla.py", 352),
+        TestFile("test_flashmla.py", 352),
         TestFile("rotary_embedding/test_mrope.py", 300),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
@@ -359,6 +359,7 @@ suite_ascend = {
     ],
     "per-commit-16-ascend-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
+        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
 }
 
