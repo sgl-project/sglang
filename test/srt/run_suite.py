@@ -185,6 +185,9 @@ suites = {
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
     ],
+    "per-commit-4-gpu-gb200": [
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+    ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
         TestFile("ep/test_mooncake_ep_small.py", 450),
