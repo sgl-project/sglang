@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,6 +19,8 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
         AttentionImpl,
     )
+
+logger = logging.getLogger(__name__)
 
 
 def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
@@ -185,6 +188,7 @@ def ring_attn(
     # torch.distributed.tensor.experimental._attention is not a public API,
     # but it's what's used in official examples and xDiT.
     from torch.distributed.tensor.experimental._attention import (
+        _cp_options,
         _templated_ring_attention,
     )
 
@@ -192,7 +196,6 @@ def ring_attn(
     assert ring_pg is not None, "Ring process group is not initialized."
 
     # Ring attention primitives expect tensors in [B, H, S, D] layout.
-    # The `attn_impl` backends (like FlashAttention) also expect this layout.
     # We permute the inputs here.
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
@@ -201,16 +204,23 @@ def ring_attn(
     # Create an adapter function that matches the signature expected by
     # _templated_ring_attention. The `attn_impl` already has dropout and
     # causal settings configured during its initialization.
+
+    # Note: Please be aware that Attention Backend and Ring Attention may require different QKV tensor shapes.
+    # For example, FlashAttention expects the format to be BSHD.
     def attn_callable_adapter(q, k, v, *args, **kwargs):
         # We ignore the dropout_p and is_causal passed by _templated_ring_attention
         # and rely on the pre-configured attn_impl.
         # The `attn_metadata` is not available here, so we pass None.
         # This is a limitation we must accept when using this experimental API.
-        output = attn_impl.forward(q, k, v, attn_metadata=None)
-        # _templated_ring_attention requires logsumexp as a second return value.
-        # We return a dummy tensor as it's not used in the inference forward pass.
-        logsumexp = torch.empty(q.shape[:-1], dtype=torch.float32, device=q.device)
-        return output, logsumexp
+        q = torch.permute(q, [0, 2, 1, 3])
+        k = torch.permute(k, [0, 2, 1, 3])
+        v = torch.permute(v, [0, 2, 1, 3])
+        # logger.warning(f"Warning: return_s·oftmax_lse is only supported for FlashAttentionImpl")
+        output, softmax_lse, *rest = attn_impl.forward(
+            q, k, v, return_softmax_lse=True, attn_metadata=None
+        )
+        output = torch.permute(output, [0, 2, 1, 3])
+        return output, softmax_lse, *rest
 
     # Starting from torch 2.6.0, _templated_ring_attention expects an integer
     # segment_id for the attention function.
