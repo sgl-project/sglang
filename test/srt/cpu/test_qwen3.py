@@ -54,7 +54,7 @@ def fix_query_key_value_ordering_reshape_cat(
     return mixed_qkv, z, b, a
 
 
-class TestFusedQKVZBASplitReshapeCat(CustomTestCase):
+class TestQwen3(CustomTestCase):
     def test_fused_qkvzba_split_reshape_cat(self):
         mixed_qkvz = torch.rand(1024, 12288, dtype=torch.bfloat16)
         mixed_ba = torch.rand(1024, 64, dtype=torch.bfloat16)
