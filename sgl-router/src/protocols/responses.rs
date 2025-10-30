@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use validator::Validate;
 
 // Import shared types from common module
 use super::common::{
@@ -439,7 +440,7 @@ fn default_top_p() -> Option<f32> {
 // Request/Response Types
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct ResponsesRequest {
     /// Run the request in the background
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -474,6 +475,7 @@ pub struct ResponsesRequest {
 
     /// Optional conversation id to persist input/output as items
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_conversation_id"))]
     pub conversation: Option<String>,
 
     /// Whether to enable parallel tool calls
@@ -681,6 +683,33 @@ impl GenerationRequest for ResponsesRequest {
                 .join(" "),
         }
     }
+}
+
+/// Validate conversation ID format
+pub fn validate_conversation_id(conv_id: &str) -> Result<(), validator::ValidationError> {
+    if !conv_id.starts_with("conv_") {
+        let mut error = validator::ValidationError::new("invalid_conversation_id");
+        error.message = Some(std::borrow::Cow::Owned(format!(
+            "Invalid 'conversation': '{}'. Expected an ID that begins with 'conv_'.",
+            conv_id
+        )));
+        return Err(error);
+    }
+
+    // Check if the conversation ID contains only valid characters
+    let is_valid = conv_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+
+    if !is_valid {
+        let mut error = validator::ValidationError::new("invalid_conversation_id");
+        error.message = Some(std::borrow::Cow::Owned(format!(
+            "Invalid 'conversation': '{}'. Expected an ID that contains letters, numbers, underscores, or dashes, but this value contained additional characters.",
+            conv_id
+        )));
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Normalize a SimpleInputMessage to a proper Message item

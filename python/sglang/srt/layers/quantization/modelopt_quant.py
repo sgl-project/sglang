@@ -673,7 +673,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
                 use_routing_scales_on_input=use_routing_scales_on_input,
-                tile_tokens_dim=None,
+                tile_tokens_dim=8,  # TODO(brayden): use the FI tile calculation
                 routing_method_type=routing_method_type,
             )
 

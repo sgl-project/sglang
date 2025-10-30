@@ -515,6 +515,9 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
+        if get_global_server_args().enable_deterministic_inference:
+            return F.linear(hidden_states, self.weight, None)
+
         # NOTE: For some unknown reason, router_gemm seems degrade accept length.
         if (
             _is_cuda
@@ -2998,7 +3001,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
-        elif self.quant_config.get_name() == "w4afp8":
+        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
@@ -3289,8 +3292,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 experts = layer.mlp.experts
                 if isinstance(experts, DeepEPMoE):
                     for w in [
-                        experts.w13_weight_fp8,
-                        experts.w2_weight_fp8,
+                        (experts.w13_weight, experts.w13_weight_scale_inv),
+                        (experts.w2_weight, experts.w2_weight_scale_inv),
                     ]:
                         requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
             else:
@@ -3338,10 +3341,26 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
 
         experts = layer.mlp.experts
+        w13_weight_fp8 = (
+            experts.w13_weight,
+            (
+                experts.w13_weight_scale_inv
+                if hasattr(experts, "w13_weight_scale_inv")
+                else experts.w13_weight_scale
+            ),
+        )
+        w2_weight_fp8 = (
+            experts.w2_weight,
+            (
+                experts.w2_weight_scale_inv
+                if hasattr(experts, "w2_weight_scale_inv")
+                else experts.w2_weight_scale
+            ),
+        )
         if isinstance(experts, DeepEPMoE):
             for w in [
-                experts.w13_weight_fp8,
-                experts.w2_weight_fp8,
+                w13_weight_fp8,
+                w2_weight_fp8,
             ]:
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 

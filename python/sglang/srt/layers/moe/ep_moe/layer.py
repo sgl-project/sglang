@@ -131,23 +131,6 @@ class DeepEPMoE(FusedMoE):
             )
             # the last one is invalid rank_id
             self.expert_mask[:-1] = 1
-        elif not _is_npu:
-            self.w13_weight_fp8 = (
-                self.w13_weight,
-                (
-                    self.w13_weight_scale_inv
-                    if self.use_block_quant or self.use_w4afp8
-                    else self.w13_weight_scale
-                ),
-            )
-            self.w2_weight_fp8 = (
-                self.w2_weight,
-                (
-                    self.w2_weight_scale_inv
-                    if self.use_block_quant or self.use_w4afp8
-                    else self.w2_weight_scale
-                ),
-            )
 
     def forward(
         self,
