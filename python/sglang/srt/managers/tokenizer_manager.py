@@ -77,6 +77,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
+    extract_trace_headers,
     trace_get_proc_propagate_context,
     trace_req_finish,
     trace_req_start,
@@ -388,6 +389,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if request:
             if "trace_context" in request.headers:
                 trace_set_remote_propagate_context(request.headers["trace_context"])
+            elif not obj.trace_context:
+                obj.trace_context = extract_trace_headers(request.headers)
 
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
@@ -2172,7 +2175,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 bootstrap_room,
                 ts=int(created_time * 1e9),
                 role=self.server_args.disaggregation_mode,
-                trace_headers=obj.trace_headers,
+                trace_context=obj.trace_context,
             )
             trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
         else:
@@ -2187,7 +2190,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     bootstrap_room,
                     ts=int(created_time * 1e9),
                     role=self.server_args.disaggregation_mode,
-                    trace_headers=obj.trace_headers,
+                    trace_context=obj.trace_context,
                 )
                 trace_slice_start(
                     "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
