@@ -62,7 +62,7 @@ if [ "${INSTALL_PROTOC:-0}" = 1 ]; then
     fi
     PROTOC_ZIP="protoc-32.0-linux-${PROTOC_ARCH}.zip"
     wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/${PROTOC_ZIP}
-    unzip ${PROTOC_ZIP} -d /usr/local
+    unzip -o ${PROTOC_ZIP} -d /usr/local
     rm ${PROTOC_ZIP}
     protoc --version
     cd -
