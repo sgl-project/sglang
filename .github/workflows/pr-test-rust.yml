@@ -97,7 +97,7 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          cargo clippy --all-targets --all-features -- -D warnings
+          cargo +1.90.0 clippy --all-targets --all-features -- -D warnings
 
       - name: Run fmt
         run: |
