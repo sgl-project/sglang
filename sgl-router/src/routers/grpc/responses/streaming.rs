@@ -561,4 +561,23 @@ impl ResponseStreamEventEmitter {
 
         Ok(())
     }
+
+    /// Send event and log any errors (typically client disconnect)
+    ///
+    /// This is a convenience method for streaming scenarios where client
+    /// disconnection is expected and should be logged but not fail the operation.
+    /// Returns true if sent successfully, false if client disconnected.
+    pub fn send_event_best_effort(
+        &self,
+        event: &serde_json::Value,
+        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    ) -> bool {
+        match self.send_event(event, tx) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!("Failed to send event (likely client disconnect): {}", e);
+                false
+            }
+        }
+    }
 }

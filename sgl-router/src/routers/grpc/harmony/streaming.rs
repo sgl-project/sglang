@@ -629,7 +629,7 @@ impl HarmonyStreamingProcessor {
 
                                     // Emit output_item.added
                                     let event = emitter.emit_output_item_added(output_index, &item);
-                                    let _ = emitter.send_event(&event, tx);
+                                    emitter.send_event_best_effort(&event, tx);
                                 }
 
                                 let output_index = message_output_index.unwrap();
@@ -643,7 +643,7 @@ impl HarmonyStreamingProcessor {
                                         item_id,
                                         content_index,
                                     );
-                                    let _ = emitter.send_event(&event, tx);
+                                    emitter.send_event_best_effort(&event, tx);
                                     has_emitted_content_part_added = true;
                                 }
 
@@ -654,7 +654,7 @@ impl HarmonyStreamingProcessor {
                                     item_id,
                                     content_index,
                                 );
-                                let _ = emitter.send_event(&event, tx);
+                                emitter.send_event_best_effort(&event, tx);
 
                                 accumulated_final_text.push_str(final_delta);
                             }
@@ -677,7 +677,7 @@ impl HarmonyStreamingProcessor {
                                 // Emit mcp_call.in_progress
                                 let event =
                                     emitter.emit_mcp_call_in_progress(output_index, &item_id);
-                                let _ = emitter.send_event(&event, tx);
+                                emitter.send_event_best_effort(&event, tx);
 
                                 // If we have function name, emit initial mcp_call_arguments.delta
                                 if tc_delta.function.as_ref().is_some_and(|f| f.name.is_some()) {
@@ -688,7 +688,7 @@ impl HarmonyStreamingProcessor {
                                         &item_id,
                                         "",
                                     );
-                                    let _ = emitter.send_event(&event, tx);
+                                    emitter.send_event_best_effort(&event, tx);
                                 }
                             } else {
                                 // CONTINUING MCP CALL: Emit arguments delta
@@ -706,7 +706,7 @@ impl HarmonyStreamingProcessor {
                                             item_id,
                                             args,
                                         );
-                                        let _ = emitter.send_event(&event, tx);
+                                        emitter.send_event_best_effort(&event, tx);
                                     }
                                 }
                             }
@@ -746,11 +746,11 @@ impl HarmonyStreamingProcessor {
                                     item_id,
                                     args_str,
                                 );
-                                let _ = emitter.send_event(&event, tx);
+                                emitter.send_event_best_effort(&event, tx);
 
                                 // Emit mcp_call.completed
                                 let event = emitter.emit_mcp_call_completed(*output_index, item_id);
-                                let _ = emitter.send_event(&event, tx);
+                                emitter.send_event_best_effort(&event, tx);
 
                                 // Mark output item as completed
                                 emitter.complete_output_item(*output_index);
@@ -765,12 +765,12 @@ impl HarmonyStreamingProcessor {
 
                         // Emit text_done
                         let event = emitter.emit_text_done(output_index, item_id, content_index);
-                        let _ = emitter.send_event(&event, tx);
+                        emitter.send_event_best_effort(&event, tx);
 
                         // Emit content_part.done
                         let event =
                             emitter.emit_content_part_done(output_index, item_id, content_index);
-                        let _ = emitter.send_event(&event, tx);
+                        emitter.send_event_best_effort(&event, tx);
 
                         // Emit output_item.done
                         let item = json!({
@@ -783,7 +783,7 @@ impl HarmonyStreamingProcessor {
                             }]
                         });
                         let event = emitter.emit_output_item_done(output_index, &item);
-                        let _ = emitter.send_event(&event, tx);
+                        emitter.send_event_best_effort(&event, tx);
 
                         emitter.complete_output_item(output_index);
                     }
@@ -937,7 +937,7 @@ impl HarmonyStreamingProcessor {
                                     });
 
                                     let event = emitter.emit_output_item_added(output_index, &item);
-                                    let _ = emitter.send_event(&event, tx);
+                                    emitter.send_event_best_effort(&event, tx);
                                 }
 
                                 let output_index = message_output_index.unwrap();
@@ -950,7 +950,7 @@ impl HarmonyStreamingProcessor {
                                         item_id,
                                         content_index,
                                     );
-                                    let _ = emitter.send_event(&event, tx);
+                                    emitter.send_event_best_effort(&event, tx);
                                     has_emitted_content_part_added = true;
                                 }
 
@@ -960,7 +960,7 @@ impl HarmonyStreamingProcessor {
                                     item_id,
                                     content_index,
                                 );
-                                let _ = emitter.send_event(&event, tx);
+                                emitter.send_event_best_effort(&event, tx);
 
                                 accumulated_final_text.push_str(final_delta);
                             }
@@ -983,7 +983,7 @@ impl HarmonyStreamingProcessor {
                                 // Emit mcp_call.in_progress
                                 let event =
                                     emitter.emit_mcp_call_in_progress(output_index, &item_id);
-                                let _ = emitter.send_event(&event, tx);
+                                emitter.send_event_best_effort(&event, tx);
 
                                 // If we have function name, emit initial mcp_call_arguments.delta
                                 if let Some(func) = &tc_delta.function {
@@ -993,7 +993,7 @@ impl HarmonyStreamingProcessor {
                                             &item_id,
                                             "",
                                         );
-                                        let _ = emitter.send_event(&event, tx);
+                                        emitter.send_event_best_effort(&event, tx);
                                     }
                                 }
                             } else {
@@ -1012,7 +1012,7 @@ impl HarmonyStreamingProcessor {
                                             item_id,
                                             args,
                                         );
-                                        let _ = emitter.send_event(&event, tx);
+                                        emitter.send_event_best_effort(&event, tx);
                                     }
                                 }
                             }
@@ -1041,11 +1041,11 @@ impl HarmonyStreamingProcessor {
                         let content_index = 0;
 
                         let event = emitter.emit_text_done(output_index, item_id, content_index);
-                        let _ = emitter.send_event(&event, tx);
+                        emitter.send_event_best_effort(&event, tx);
 
                         let event =
                             emitter.emit_content_part_done(output_index, item_id, content_index);
-                        let _ = emitter.send_event(&event, tx);
+                        emitter.send_event_best_effort(&event, tx);
 
                         let item = json!({
                             "id": item_id,
@@ -1057,7 +1057,7 @@ impl HarmonyStreamingProcessor {
                             }]
                         });
                         let event = emitter.emit_output_item_done(output_index, &item);
-                        let _ = emitter.send_event(&event, tx);
+                        emitter.send_event_best_effort(&event, tx);
 
                         emitter.complete_output_item(output_index);
                     }
@@ -1075,11 +1075,11 @@ impl HarmonyStreamingProcessor {
                                     item_id,
                                     args_str,
                                 );
-                                let _ = emitter.send_event(&event, tx);
+                                emitter.send_event_best_effort(&event, tx);
 
                                 // Emit mcp_call.completed
                                 let event = emitter.emit_mcp_call_completed(*output_index, item_id);
-                                let _ = emitter.send_event(&event, tx);
+                                emitter.send_event_best_effort(&event, tx);
 
                                 // Mark output item as completed
                                 emitter.complete_output_item(*output_index);

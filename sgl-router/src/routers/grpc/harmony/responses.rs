@@ -683,7 +683,7 @@ pub async fn serve_harmony_responses_stream(
                         "total_tokens": usage.total_tokens,
                     });
                     let event = emitter.emit_completed(Some(&usage_json));
-                    let _ = emitter.send_event(&event, &tx);
+                    emitter.send_event_best_effort(&event, &tx);
 
                     // Close channel
                     drop(tx);
