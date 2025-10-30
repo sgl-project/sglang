@@ -84,6 +84,9 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
 USE_CUTLASS_BACKEND_FOR_FP4_GEMM = get_bool_env_var(
     "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM", "true"
 )
+USE_TRTLLM_BACKEND_FOR_FP4_GEMM = get_bool_env_var(
+    "SGLANG_USE_TRTLLM_BACKEND_FOR_FP4_GEMM", "false"
+)
 # TODO make it true by default when the DeepEP PR is merged
 CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "false"
@@ -983,7 +986,25 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.input_scale_inv = Parameter(
             (1 / input_scale_2).to(torch.float32), requires_grad=False
         )
+        if USE_TRTLLM_BACKEND_FOR_FP4_GEMM:
+            # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
+            # FlashInfer provides nvfp4_quantize to quantize + shuffle the
+            # layout but we use our own quantization so we have to call
+            # shuffles ourselves.
+            from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+            weight = layer.weight
+            scale = layer.weight_scale
+            epilogue_tile_m = 128
+            weight = shuffle_matrix_a(weight.view(torch.uint8), epilogue_tile_m)
+            scale = (
+                shuffle_matrix_sf_a(scale.view(torch.uint8), epilogue_tile_m)
+                .reshape(scale.shape)
+                .view(torch.float8_e4m3fn)
+            )
 
+            layer.weight_scale_interleaved = Parameter(scale, requires_grad=False)
+            layer.weight = Parameter(weight, requires_grad=False)
+            return
         # Pad and blockwise interleave weight_scale
         scales = layer.weight_scale
         scale_ndim = scales.ndim
@@ -1033,6 +1054,18 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
+
+        assert not (USE_CUTLASS_BACKEND_FOR_FP4_GEMM and USE_TRTLLM_BACKEND_FOR_FP4_GEMM), (
+            "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM and SGLANG_USE_TRTLLM_BACKEND_FOR_FP4_GEMM"
+            "cannot both be enabled at the same time."
+        )
+        possible_backend = "auto"
+        if USE_TRTLLM_BACKEND_FOR_FP4_GEMM or USE_CUTLASS_BACKEND_FOR_FP4_GEMM:
+            possible_backend = (
+                "trtllm"
+                if USE_TRTLLM_BACKEND_FOR_FP4_GEMM
+                else "cutlass"
+            )
         out = fp4_gemm(
             x_fp4,
             w,
@@ -1040,7 +1073,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             w_scale_interleaved,
             layer.alpha,
             output_dtype,
-            **(dict(backend="cutlass") if USE_CUTLASS_BACKEND_FOR_FP4_GEMM else dict()),
+            **(dict(backend=possible_backend)),
         )
         if bias is not None:
             out = out + bias
