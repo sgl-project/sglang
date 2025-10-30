@@ -140,10 +140,6 @@ class MmItemMemoryPool:
         return None, None
 
     def recycle_chunks(self):
-        """
-        Optimized version of recycle_chunks that uses tensor vectorization
-        to avoid a Python for-loop with repeated GPU operations.
-        """
 
         new_occupied_chunks = []
         for chunk in self.occupied_chunks:
@@ -176,8 +172,11 @@ class MmItemMemoryPool:
 
 class CudaIpcTensorTransportProxy:
     """
-    A convenient torch.Tensor subclass that carries extra metadata and supports
-    efficient inter-process communications
+    A torch.tensor's proxy used to do inter-process data-sharing
+    including:
+    
+    torch.tensor(on gpu)'s cuda-ipc-hande infos
+    a shm sync buffer's meta data which is used to sync between different process 
     """
 
     def __init__(
