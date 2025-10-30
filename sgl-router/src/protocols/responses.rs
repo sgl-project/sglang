@@ -21,6 +21,9 @@ use super::common::{
 pub struct ResponseTool {
     #[serde(rename = "type")]
     pub r#type: ResponseToolType,
+    // Function tool fields (used when type == "function")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<crate::protocols::common::Function>,
     // MCP-specific fields (used when type == "mcp")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
@@ -40,6 +43,7 @@ impl Default for ResponseTool {
     fn default() -> Self {
         Self {
             r#type: ResponseToolType::WebSearchPreview,
+            function: None,
             server_url: None,
             authorization: None,
             server_label: None,
@@ -53,6 +57,7 @@ impl Default for ResponseTool {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseToolType {
+    Function,
     WebSearchPreview,
     CodeInterpreter,
     Mcp,
@@ -131,6 +136,13 @@ pub enum ResponseInputOutputItem {
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -499,7 +511,7 @@ pub struct ResponsesRequest {
     pub store: Option<bool>,
 
     /// Whether to stream the response
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub stream: Option<bool>,
 
     /// Temperature for sampling
@@ -677,6 +689,9 @@ impl GenerationRequest for ResponsesRequest {
                     }
                     ResponseInputOutputItem::FunctionToolCall { arguments, .. } => {
                         Some(arguments.clone())
+                    }
+                    ResponseInputOutputItem::FunctionCallOutput { output, .. } => {
+                        Some(output.clone())
                     }
                 })
                 .collect::<Vec<String>>()
