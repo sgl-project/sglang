@@ -52,4 +52,3 @@ Select the largest configuration that does not exceed the current batch size. (i
 python3 -m sglang.test.send_one --batch-size bs
 ```
 adjust `bs` and observe the accept length
-

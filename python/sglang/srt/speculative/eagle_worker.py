@@ -63,6 +63,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.common import log_info_on_rank0
 
 _is_npu = is_npu()
 
@@ -320,7 +321,9 @@ class EAGLEWorker(TpModelWorker):
                 self.mab_last_pull["batch_size"] = batch_size
                 self.mab_last_pull["mab_strategy"] = strategy
                 if self.log_mab_interval % self.server_args.decode_log_interval == 0:
-                    logger.info(f"dynamic tree eagle select strategy = {strategy}")
+                    log_info_on_rank0(
+                        logger, f"dynamic tree eagle select strategy = {strategy}"
+                    )
                 self.log_mab_interval += 1
 
             batch.spec_info.topk_p = batch.spec_info.topk_p[:, : self.topk]

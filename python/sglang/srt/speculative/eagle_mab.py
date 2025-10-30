@@ -195,10 +195,11 @@ class UCB1MAB(BaseMAB):
             else np.mean(sorted_vals)
         )
 
+
 class DirectMap:
     def __init__(self, config_path: str):
-        with open(config_path, 'r') as f:
-            self.speculative_map : Dict[str, str] = json.load(f)
+        with open(config_path, "r") as f:
+            self.speculative_map: Dict[str, str] = json.load(f)
             self.speculative_map = {int(k): v for k, v in self.speculative_map.items()}
             self.speculative_map_batch_size = sorted(list(self.speculative_map.keys()))
 
@@ -208,8 +209,8 @@ class DirectMap:
             if bs <= batch_size:
                 return self.speculative_map[bs]
         return self.speculative_map[self.speculative_map_batch_size[0]]
-    
-    
+
+
 class MABGroupManager:
     """Manages groups and their associated MAB instances.
 
@@ -225,9 +226,7 @@ class MABGroupManager:
         "UCB1": lambda strategies, window_size: UCB1MAB(
             strategies=strategies, window_size=window_size
         ),
-        "DIRECT_MAP": lambda config_path: DirectMap(
-            config_path=config_path
-        ),
+        "DIRECT_MAP": lambda config_path: DirectMap(config_path=config_path),
     }
 
     def __init__(
@@ -235,7 +234,7 @@ class MABGroupManager:
         strategies: List[str],
         algorithm: str = "DIRECT_MAP",
         window_size: int = 1000,
-        config_path: str = None
+        config_path: str = None,
     ):
         # Define batch size groups for MAB
         # TODO: batch_size should be determined more refinely
