@@ -1,7 +1,7 @@
 """
 Usage:
 cd test/srt
-python3 -m unittest test_deterministic_v3_deterministic
+python3 -m unittest test_deepseek_v3_deterministic.TestFa3Deterministic
 """
 
 import unittest
@@ -11,13 +11,14 @@ from sglang.test.test_deterministic_utils import (
     TestDeterministicBase,
 )
 
-# DEEPSEEK_MODEL = "lmsys/sglang-ci-dsv3-test"
-DEEPSEEK_MODEL = "/shared/public/sharing/sglanglearning/sglang-dpskv3-test/"
+DEEPSEEK_MODEL = "lmsys/sglang-ci-dsv3-test"
+
+
 class TestFa3Deterministic(TestDeterministicBase):
     @classmethod
     def get_model(cls):
         return DEEPSEEK_MODEL
-    
+
     # Test with fa3 attention backend
     @classmethod
     def get_server_args(cls):
@@ -35,7 +36,7 @@ class TestTritonDeterministic(TestDeterministicBase):
     @classmethod
     def get_model(cls):
         return DEEPSEEK_MODEL
-    
+
     # Test with triton attention backend
     @classmethod
     def get_server_args(cls):
