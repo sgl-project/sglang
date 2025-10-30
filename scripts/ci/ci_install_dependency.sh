@@ -3,7 +3,6 @@
 set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
-RUN_DEEPSEEK_V32=${RUN_DEEPSEEK_V32:-0}
 CU_VERSION="cu129"
 
 if [ "$CU_VERSION" = "cu130" ]; then
@@ -23,6 +22,29 @@ rm -rf /root/.cache/flashinfer
 
 # Install apt packages
 apt install -y git libnuma-dev
+
+# Install protoc for router build (gRPC protobuf compilation)
+if ! command -v protoc &> /dev/null; then
+    echo "Installing protoc..."
+    if command -v apt-get &> /dev/null; then
+        # Ubuntu/Debian
+        apt-get update
+        apt-get install -y wget unzip gcc g++ perl make
+    elif command -v yum &> /dev/null; then
+        # RHEL/CentOS
+        yum update -y
+        yum install -y wget unzip gcc gcc-c++ perl-core make
+    fi
+
+    cd /tmp
+    wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip
+    unzip protoc-32.0-linux-x86_64.zip -d /usr/local
+    rm protoc-32.0-linux-x86_64.zip
+    protoc --version
+    cd -
+else
+    echo "protoc already installed: $(protoc --version)"
+fi
 
 # Install uv
 if [ "$IS_BLACKWELL" = "1" ]; then
@@ -46,11 +68,14 @@ else
     $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
 fi
 
+# Install OpenSSL development libraries for router build
+apt install -y libssl-dev pkg-config
+
 # Install the main package
 $PIP_CMD install -e "python" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
 
 # Install router for pd-disagg test
-SGLANG_ROUTER_BUILD_NO_RUST=1 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
+$PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
 
 # Install sgl-kernel
 SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
@@ -59,7 +84,7 @@ echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNE
 
 if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     ls -alh sgl-kernel/dist
-    $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
 else
     $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
 fi
@@ -76,22 +101,6 @@ if [ "$IS_BLACKWELL" != "1" ]; then
 
     # Install xformers
     $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
-fi
-
-# Install dependencies for deepseek-v3.2
-if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
-    # Install flashmla
-    FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
-    FLASH_MLA_DISABLE_SM100="0"
-    if [ "$IS_BLACKWELL" != "1" ]; then
-        FLASH_MLA_DISABLE_SM100="1"
-    fi
-    git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla
-    cd flash-mla
-    git checkout ${FLASHMLA_COMMIT}
-    git submodule update --init --recursive
-    FLASH_MLA_DISABLE_SM100=${FLASH_MLA_DISABLE_SM100} $PIP_CMD install -v . $PIP_INSTALL_SUFFIX --no-build-isolation
-    cd ..
 fi
 
 # Show current packages

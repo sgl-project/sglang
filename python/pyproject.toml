@@ -89,6 +89,7 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
+dev = ["sglang[test]"]
 tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
