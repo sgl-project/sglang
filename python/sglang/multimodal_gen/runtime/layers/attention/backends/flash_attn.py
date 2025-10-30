@@ -105,6 +105,7 @@ class FlashAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
+        *,
         return_softmax_lse: bool = False,
     ):
         attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
@@ -116,7 +117,6 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
-
         output = flash_attn_func(
             q=query,  # type: ignore[no-untyped-call]
             k=key,

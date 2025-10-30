@@ -216,7 +216,11 @@ def ring_attn(
         v = torch.permute(v, [0, 2, 1, 3])
         # logger.warning(f"Warning: return_s·oftmax_lse is only supported for FlashAttentionImpl")
         output, softmax_lse, *rest = attn_impl.forward(
-            q, k, v, return_softmax_lse=True, attn_metadata=None
+            q,
+            k,
+            v,
+            attn_metadata=None,
+            return_softmax_lse=True,
         )
         output = torch.permute(output, [0, 2, 1, 3])
         return output, softmax_lse, *rest
