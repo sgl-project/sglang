@@ -333,7 +333,12 @@ void moe_align_block_size(
     bool pad_sorted_token_ids);
 
 void topk_softmax(
-    torch::Tensor& topk_weights, torch::Tensor& topk_indices, torch::Tensor& gating_output, bool renormalize);
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& gating_output,
+    bool renormalize,
+    double moe_softcapping,
+    const c10::optional<torch::Tensor>& correction_bias);
 
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
 
