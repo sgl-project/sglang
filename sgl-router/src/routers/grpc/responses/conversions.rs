@@ -358,6 +358,7 @@ pub fn chat_to_responses(
         top_p: original_req.top_p,
         truncation: None,
         usage,
+        user: None,
         safety_identifier: original_req.user.clone(),
         metadata: original_req.metadata.clone().unwrap_or_default(),
     })
