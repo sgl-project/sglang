@@ -299,7 +299,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         if base_output.videos:
             video_results = await asyncio.gather(
                 *[
-                    preprocess_video(video, self.video_config)
+                    preprocess_video(video, video_config=self.video_config)
                     for video in base_output.videos
                 ]
             )
