@@ -58,6 +58,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.dp_size = model_runner.server_args.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk
+        self.max_topk = eagle_worker.max_topk
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -307,7 +308,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch,
             )
             probs = torch.softmax(ret.next_token_logits, dim=-1)
-            ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
+            ret.topk_p, ret.topk_index = fast_topk(probs, self.max_topk, dim=-1)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup

@@ -31,6 +31,7 @@ from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.speculative.eagle_mab import MABConfig, MABGroupManager
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -387,6 +388,11 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    # Dynamic verify
+    speculative_eagle_mab_algorithm: Optional[str] = "DIRECT_MAP"
+    speculative_eagle_mab_configs: Optional[List[str]] = None
+    speculative_mab_window_size: int = 300
+    speculative_eagle_mab_config_path: Optional[str] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -2789,6 +2795,37 @@ class ServerArgs:
             help="The cache capacity for ngram speculative decoding.",
         )
 
+        parser.add_argument(
+            "--speculative-eagle-mab-algorithm",
+            type=str,
+            default="DIRECT_MAP",
+            choices=list(MABGroupManager.ALGORITHM_FACTORIES.keys()),
+            help="The algorithm for multi-armed bandit in EAGLE speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-mab-configs",
+            type=lambda s: MABConfig.validate_configs(s) if s else None,
+            default=None,
+            help=(
+                "Comma-separated list of MAB configurations in format '<speculative_num_steps>_<topk>_<draft_tokens>'. "
+                "Example: '1_1_1,2_2_4,3_4_8' means three configurations with different "
+                "combinations of steps, topk, and draft tokens."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-eagle-mab-config-path",
+            type=str,
+            default=ServerArgs.speculative_eagle_mab_config_path,
+            help=(
+                "Path to store MAB configurations about batch_size: '<speculative_num_steps>_<topk>_<draft_tokens>'"
+            ),
+        )
+        parser.add_argument(
+            "--speculative-mab-window-size",
+            type=int,
+            default=300,
+            help="Window size for multi-armed bandit algorithm",
+        )
         # Expert parallelism
         parser.add_argument(
             "--expert-parallel-size",

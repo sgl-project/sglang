@@ -1,6 +1,7 @@
+import json
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -34,6 +35,11 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
+)
+from sglang.srt.speculative.eagle_mab import (
+    MABConfig,
+    MABGroupManager,
+    SpeculativeResources,
 )
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
@@ -81,7 +87,7 @@ class EAGLEWorker(TpModelWorker):
     ):
         # Parse arguments
         self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
+        self.max_topk = self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.enable_nan_detection = server_args.enable_nan_detection
@@ -175,12 +181,35 @@ class EAGLEWorker(TpModelWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+
+        # Get mab_strategies and max_topk first
+        self.mab_strategies = [self.get_current_mab_strategy()]
+        if self.server_args.speculative_eagle_mab_config_path is not None:
+            with open(self.server_args.speculative_eagle_mab_config_path, "r") as f:
+                speculative_map: Dict[str, str] = json.load(f)
+                self.mab_strategies.extend(list(speculative_map.values()))
+                self.mab_strategies = sorted(list(set(self.mab_strategies)))
+        elif self.server_args.speculative_eagle_mab_configs is not None:
+            self.mab_strategies.extend(self.server_args.speculative_eagle_mab_configs)
+            self.mab_strategies = sorted(list(set(self.mab_strategies)))
+
+        for mab_strategy in self.mab_strategies:
+            _, topk, _ = MABConfig.parse_config(mab_strategy)
+            self.max_topk = max(self.max_topk, topk)
+
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
 
+        self.use_mab = bool(
+            server_args.speculative_eagle_mab_configs
+            or server_args.speculative_eagle_mab_config_path
+        )
+        if self.use_mab:
+            self._init_mab_configurations()
+            self.log_mab_interval = 0
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
@@ -258,6 +287,16 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+        # Initialize events dictionary only if MAB is enabled
+        events = {}
+        if self.use_mab and self.mab_algorithm != "DIRECT_MAP":
+            events = {
+                "processing_start": torch.cuda.Event(enable_timing=True),
+                "processing_end": torch.cuda.Event(enable_timing=True),
+            }
+            # Record the start of processing
+            events["processing_start"].record()
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
@@ -275,6 +314,18 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
+            if self.use_mab:
+                batch_size = batch.batch_size()
+                strategy = self.select_mab_strategy(batch_size)
+                self.mab_last_pull["batch_size"] = batch_size
+                self.mab_last_pull["mab_strategy"] = strategy
+                if self.log_mab_interval % self.server_args.decode_log_interval == 0:
+                    logger.info(f"dynamic tree eagle select strategy = {strategy}")
+                self.log_mab_interval += 1
+
+            batch.spec_info.topk_p = batch.spec_info.topk_p[:, : self.topk]
+            batch.spec_info.topk_index = batch.spec_info.topk_index[:, : self.topk]
+            
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context():
@@ -294,6 +345,12 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
+
+            if self.use_mab and self.mab_algorithm != "DIRECT_MAP":
+                events["processing_end"].record()
+                self.record_mab_strategy_metrics(
+                    events, verify_output.accept_length_per_req_cpu
+                )
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -979,8 +1036,178 @@ class EAGLEWorker(TpModelWorker):
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+        # Always get max_topk candidates to match CUDA graph buffer size
+        draft_input.topk_p, draft_input.topk_index = fast_topk(
+            probs, self.max_topk, dim=-1
+        )
         draft_input.hidden_states = logits_output.hidden_states
+
+    def get_current_mab_strategy(self):
+        """Get MAB strategy string from current speculative decoding settings."""
+        return MABConfig.format_config(
+            self.speculative_num_steps,
+            self.topk,
+            self.server_args.speculative_num_draft_tokens,
+        )
+
+    def update_speculative_args(self, mab_strategy: str):
+        """Update speculative settings of workers."""
+        steps, topk, draft_tokens = MABConfig.parse_config(mab_strategy)
+        self.speculative_num_steps = steps
+        self.topk = topk
+        self.speculative_num_draft_tokens = draft_tokens
+        self.server_args.speculative_num_draft_tokens = draft_tokens
+        self.target_worker.model_runner.server_args.speculative_num_steps = steps
+        self.target_worker.model_runner.server_args.speculative_eagle_topk = topk
+        self.target_worker.model_runner.server_args.speculative_num_draft_tokens = (
+            draft_tokens
+        )
+
+        self.target_worker.model_runner.graph_runner.num_tokens_per_bs = draft_tokens
+        self.padded_static_len = self.speculative_num_steps + 1
+        self.last_mab_strategy = mab_strategy
+
+    def set_mab_strategy(self, mab_strategy: str):
+        """Apply MAB strategy by updating speculative decoding settings."""
+        if mab_strategy == self.last_mab_strategy:
+            return
+
+        # Get cuda graph and attn for the strategy
+        resources = self.strategy_resources.get(mab_strategy)
+        if resources is None:
+            raise ValueError(f"No resources found for strategy: {mab_strategy}")
+
+        # draft decode cuda graph
+        self.draft_attn_backend = resources.draft_attn_backend
+        self.cuda_graph_runner = resources.draft_cuda_graph_runner
+        self.draft_model_runner.draft_attn_backend = resources.draft_attn_backend
+        self.draft_model_runner.graph_runner = resources.draft_cuda_graph_runner
+
+        # draft extend cuda graph
+        self.draft_extend_attn_backend = resources.draft_extend_attn_backend
+        self.cuda_graph_runner_for_draft_extend = (
+            resources.draft_extend_cuda_graph_runner
+        )
+
+        # target verify cuda graph
+        self.target_worker.model_runner.attn_backend = resources.target_attn_backend
+        self.target_worker.model_runner.graph_runner = (
+            resources.target_cuda_graph_runner
+        )
+
+        # Update speculative decoding settings
+        self.update_speculative_args(mab_strategy)
+
+    def select_mab_strategy(self, batch_size: int) -> str:
+        """Select and apply MAB strategy for the given batch.
+
+        Args:
+            batch_size: The batch size of the current requests.
+
+        Returns:
+            Selected MAB strategy string.
+        """
+        if not self.use_mab or len(self.mab_strategies) == 1:
+            return self.default_mab_strategy
+
+        # Use the MAB manager to select the best strategy for this batch size
+        selected_strategy = self.mab_manager.select_strategy(batch_size)
+
+        # Apply the selected strategy
+        self.set_mab_strategy(selected_strategy)
+
+        return selected_strategy
+
+    def record_mab_strategy_metrics(self, events, accept_length_per_req_cpu):
+        """Record performance metrics for the current MAB strategy.
+
+        Args:
+            events: CUDA events dictionary.
+            accept_length_per_req_cpu: Accept length per request in CPU.
+        """
+        # Calculate total processing time in seconds
+        torch.cuda.synchronize()
+        total_time = (
+            events["processing_start"].elapsed_time(events["processing_end"]) / 1000.0
+        )
+
+        # Calculate metrics
+        batch_size = self.mab_last_pull["batch_size"]
+        mab_strategy = self.mab_last_pull["mab_strategy"]
+        accept_length_avg = sum(accept_length_per_req_cpu) / batch_size + 1
+        stable_accept_length = (
+            self.mab_manager.get_stable_accept_length(mab_strategy)
+            if len(self.mab_strategies) > 1
+            else accept_length_avg
+        )
+        reward = stable_accept_length * batch_size / total_time
+
+        # Update metrics in MAB manager
+        self.mab_manager.record_strategy_metrics(
+            batch_size, mab_strategy, reward, accept_length_avg
+        )
+
+    def _init_mab_configurations(self):
+        """Initialize MAB configuration settings from server arguments."""
+        self.default_mab_strategy = self.get_current_mab_strategy()
+        self.mab_algorithm = self.server_args.speculative_eagle_mab_algorithm
+        self.last_mab_strategy = None
+
+        # Initialize resources for the default strategy
+        self.strategy_resources: Dict[str, SpeculativeResources] = {}
+        self.strategy_resources[self.default_mab_strategy] = SpeculativeResources(
+            draft_attn_backend=self.draft_attn_backend,
+            draft_extend_attn_backend=self.draft_extend_attn_backend,
+            draft_cuda_graph_runner=self.cuda_graph_runner,
+            draft_extend_cuda_graph_runner=self.cuda_graph_runner_for_draft_extend,
+            target_attn_backend=self.target_worker.model_runner.attn_backend,
+            target_cuda_graph_runner=self.target_worker.model_runner.graph_runner,
+        )
+
+        # Set window size for MAB metrics
+        self.mab_window_size = self.server_args.speculative_mab_window_size
+
+        self.mab_manager = MABGroupManager(
+            strategies=self.mab_strategies,
+            algorithm=self.mab_algorithm,
+            window_size=self.mab_window_size,
+            config_path=self.server_args.speculative_eagle_mab_config_path,
+        )
+
+        # Initialize basic data structure to store MAB pull info
+        self.mab_last_pull = {
+            "mab_strategy": None,
+            "batch_size": None,
+        }
+
+        # Set up resources for all strategies
+        for mab_strategy in self.mab_strategies:
+            if mab_strategy == self.default_mab_strategy:
+                continue
+
+            logging.info(f"Initializing MAB strategy {mab_strategy} resources")
+            self.update_speculative_args(mab_strategy)
+
+            # Initialize draft worker resources
+            with self.draft_tp_context(self.draft_model_runner.tp_group):
+                self.init_attention_backend()
+                self.init_cuda_graphs()
+
+            # Initialize target worker resources
+            self.target_worker.model_runner.init_attention_backend()
+            self.target_worker.model_runner.init_device_graphs()
+
+            # Store resources for the strategy
+            self.strategy_resources[mab_strategy] = SpeculativeResources(
+                draft_attn_backend=self.draft_attn_backend,
+                draft_extend_attn_backend=self.draft_extend_attn_backend,
+                draft_cuda_graph_runner=self.cuda_graph_runner,
+                draft_extend_cuda_graph_runner=self.cuda_graph_runner_for_draft_extend,
+                target_attn_backend=self.target_worker.model_runner.attn_backend,
+                target_cuda_graph_runner=self.target_worker.model_runner.graph_runner,
+            )
+
+        self.set_mab_strategy(self.default_mab_strategy)
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
