@@ -2292,6 +2292,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 bootstrap_room,
                 ts=int(created_time * 1e9),
                 role=self.server_args.disaggregation_mode,
+                trace_headers=obj.trace_headers,
             )
             trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
         else:
@@ -2306,6 +2307,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     bootstrap_room,
                     ts=int(created_time * 1e9),
                     role=self.server_args.disaggregation_mode,
+                    trace_headers=obj.trace_headers,
                 )
                 trace_slice_start(
                     "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True

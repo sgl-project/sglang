@@ -227,6 +227,9 @@ class GenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # OpenTelemetry trace headers
+    trace_headers: Optional[Dict[str, str]] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
