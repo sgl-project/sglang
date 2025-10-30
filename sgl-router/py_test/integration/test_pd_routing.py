@@ -1,6 +1,5 @@
 import collections
 import concurrent.futures
-import subprocess
 import time
 
 import pytest

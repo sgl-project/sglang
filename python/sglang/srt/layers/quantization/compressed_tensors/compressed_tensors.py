@@ -19,36 +19,31 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
+    CompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
     is_activation_quantization_format,
     should_ignore_layer,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-
-try:
-    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
-        WNA16_SUPPORTED_BITS,
-        CompressedTensorsWNA16,
-    )
-
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +71,7 @@ class DeviceCapability(NamedTuple):
 
 
 class CompressedTensorsConfig(QuantizationConfig):
+    DeepSeekFP8Config = None
 
     def __init__(
         self,
@@ -129,6 +125,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         ):
             return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
+            if CompressedTensorsConfig.DeepSeekFP8Config is not None:
+                return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
+            if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
+                return UnquantizedLinearMethod()
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedLinearMethod()
@@ -137,7 +137,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            return CompressedTensorsMoEMethod.get_moe_method(self)
+            # Ktransformers use CompressedTensorsWNA16AMXMOEMethod if AMX weights are provided
+            return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
 
     @classmethod
@@ -364,19 +365,6 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
-            if not VLLM_AVAILABLE:
-                raise ImportError(
-                    "vllm is not installed, to use CompressedTensorsW4A16Sparse24 and CompressedTensorsWNA16, please install vllm"
-                )
-            if (
-                self.quant_format == CompressionFormat.marlin_24.value
-                and weight_quant.num_bits in W4A16SPARSE24_SUPPORTED_BITS
-            ):
-                return CompressedTensorsW4A16Sparse24(
-                    strategy=weight_quant.strategy,
-                    num_bits=weight_quant.num_bits,
-                    group_size=weight_quant.group_size,
-                )
             if (
                 self.quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
@@ -386,6 +374,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                     strategy=weight_quant.strategy,
                     group_size=weight_quant.group_size,
                     actorder=weight_quant.actorder,
+                )
+            else:
+                raise ImportError(
+                    "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
                 )
 
         if is_activation_quantization_format(self.quant_format):
@@ -410,10 +402,6 @@ class CompressedTensorsConfig(QuantizationConfig):
 
             # note: input_quant can be None
             if self._is_fp8_w8a16(weight_quant, input_quant):
-                if not VLLM_AVAILABLE:
-                    raise ImportError(
-                        "vllm is not installed, to use CompressedTensorsW8A16Fp8, please install vllm"
-                    )
                 is_static_input_scheme = input_quant and not input_quant.dynamic
                 return CompressedTensorsW8A16Fp8(
                     strategy=weight_quant.strategy,
@@ -454,7 +442,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Find the "target" in the compressed-tensors config
         # that our layer conforms to.
-        # TODO (@robertgshaw): add compressed-tensors as dep
+        # TODO : add compressed-tensors as dep
         # so we do not have to re-write these functions
         # need to make accelerate optional in ct to do this
 
@@ -492,24 +480,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             input_quant=input_quant,
             sparsity_scheme=sparsity_scheme,
         ):
-            if not VLLM_AVAILABLE:
-                raise ImportError(
-                    "vllm is not installed, to use CompressedTensors24, please install vllm"
-                )
-            # Have a valid sparsity scheme
-            # Validate layer is supported by Cutlass 2:4 Kernel
-            model_compression_config = (
-                None
-                if sparsity_scheme is None or sparsity_scheme.format == "dense"
-                else self.config
-            )
-
-            scheme = CompressedTensors24(
-                quantized=weight_quant is not None or input_quant is not None,
-                weight_quant=weight_quant,
-                input_quant=input_quant,
-                model_compression_config=model_compression_config,
-            )
+            raise ImportError("CompressedTensors24 is not supported now")
         elif weight_quant is None:
             logger.warning_once(
                 "Acceleration for non-quantized schemes is "

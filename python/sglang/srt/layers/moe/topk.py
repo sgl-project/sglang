@@ -111,10 +111,10 @@ class TopKOutputChecker:
         return topk_output.format.is_standard()
 
     @staticmethod
-    def format_is_triton_kernel(
+    def format_is_triton_kernels(
         topk_output: TopKOutput,
     ) -> TypeGuard[TritonKernelTopKOutput]:
-        return topk_output.format.is_triton_kernel()
+        return topk_output.format.is_triton_kernels()
 
     @staticmethod
     def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
@@ -129,7 +129,7 @@ class TopKOutputFormat(Enum):
     def is_standard(self) -> bool:
         return self == TopKOutputFormat.STANDARD
 
-    def is_triton_kernel(self) -> bool:
+    def is_triton_kernels(self) -> bool:
         return self == TopKOutputFormat.TRITON_KERNEL
 
     def is_bypassed(self) -> bool:
@@ -254,7 +254,7 @@ class TopK(CustomOp):
     ) -> TopKOutput:
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
-        elif get_moe_runner_backend().is_triton_kernel():
+        elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif (
             should_use_flashinfer_trtllm_moe()
@@ -365,9 +365,10 @@ class TopK(CustomOp):
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
-        topk_idx = torch.full((0, topk), -1, dtype=torch.int32, device=device)
+        topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
+        # FIXME: router_logits should be of size (0, num_experts)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
-        return StandardTopKOutput(topk_weights, topk_idx, router_logits)
+        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
 # ------------------------------- TopK implementation -------------------------------------

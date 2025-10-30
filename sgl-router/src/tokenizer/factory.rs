@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn test_mock_tokenizer_creation() {
         let tokenizer = create_tokenizer_from_file("mock").unwrap();
-        assert_eq!(tokenizer.vocab_size(), 8); // Mock tokenizer has 8 tokens
+        assert_eq!(tokenizer.vocab_size(), 14); // Mock tokenizer has 14 tokens
     }
 
     #[test]
