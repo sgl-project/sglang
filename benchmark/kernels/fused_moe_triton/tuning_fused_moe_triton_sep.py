@@ -5,7 +5,7 @@ import os
 import time
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, TypedDict
+from typing import Any, Dict, List, Tuple
 
 import ray
 import torch
@@ -13,7 +13,6 @@ import triton
 import triton.language as tl
 from ray.experimental.tqdm_ray import tqdm
 from sgl_kernel import silu_and_mul
-from transformers import AutoConfig
 
 from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
@@ -28,16 +27,19 @@ from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.utils import is_hip
 
+from common_utils import (
+    BenchmarkConfig,
+    get_configs_compute_bound,
+    get_model_config,
+    get_rocm_configs_compute_bound,
+    save_configs,
+    sort_config,
+    validate_ep_tp_mode,
+)
+
 _is_hip = is_hip()
 
 
-class BenchmarkConfig(TypedDict):
-    BLOCK_SIZE_M: int
-    BLOCK_SIZE_N: int
-    BLOCK_SIZE_K: int
-    GROUP_SIZE_M: int
-    num_warps: int
-    num_stages: int
 
 
 def benchmark_config(
@@ -294,54 +296,6 @@ def benchmark_config(
     return avg, avg_tma, avg1, avg1_tma
 
 
-def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
-    configs: List[BenchmarkConfig] = []
-    waves_per_eu_range = 0
-    for block_m in [32, 64, 128, 256]:
-        for block_k in [32, 64, 128, 256]:
-            for block_n in [16, 32, 64, 128, 256]:
-                for num_stages in [2]:
-                    for num_warps in [1, 2, 4, 8]:
-                        for group_size in [1, 4, 8, 16, 32]:
-                            configs.append(
-                                {
-                                    "BLOCK_SIZE_M": block_m,
-                                    "BLOCK_SIZE_N": block_n,
-                                    "BLOCK_SIZE_K": block_k,
-                                    "GROUP_SIZE_M": group_size,
-                                    "num_warps": num_warps,
-                                    "num_stages": num_stages,
-                                    "waves_per_eu": waves_per_eu_range,
-                                }
-                            )
-    return configs
-
-
-def get_configs_compute_bound() -> List[Dict[str, int]]:
-    # Reduced search space for faster tuning.
-    # TODO(woosuk): Increase the search space and use a performance model to
-    # prune the search space.
-    configs: List[BenchmarkConfig] = []
-    if _is_hip:
-        configs = get_rocm_configs_compute_bound()
-    else:
-        for block_m in [16, 32, 64, 128, 256]:
-            for block_k in [32, 64, 128, 256]:
-                for block_n in [32, 64, 128, 256]:
-                    for num_stages in [2, 3, 4, 5]:
-                        for num_warps in [4, 8]:
-                            for group_size in [1, 16, 32, 64]:
-                                configs.append(
-                                    {
-                                        "BLOCK_SIZE_M": block_m,
-                                        "BLOCK_SIZE_N": block_n,
-                                        "BLOCK_SIZE_K": block_k,
-                                        "GROUP_SIZE_M": group_size,
-                                        "num_warps": num_warps,
-                                        "num_stages": num_stages,
-                                    }
-                                )
-    return configs
 
 
 class BestConfigTrace:
@@ -509,22 +463,7 @@ class BenchmarkWorker:
         )
 
 
-def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
-    return {
-        "BLOCK_SIZE_M": config["BLOCK_SIZE_M"],
-        "BLOCK_SIZE_N": config["BLOCK_SIZE_N"],
-        "BLOCK_SIZE_K": config["BLOCK_SIZE_K"],
-        "GROUP_SIZE_M": config["GROUP_SIZE_M"],
-        "num_warps": config["num_warps"],
-        "num_stages": config["num_stages"],
-        **(
-            {"waves_per_eu": config["waves_per_eu"]} if "waves_per_eu" in config else {}
-        ),
-        **({"USE_TMA": config["USE_TMA"]} if "USE_TMA" in config else {}),
-    }
-
-
-def save_configs(
+def save_configs_sep(
     configs: Dict[int, BenchmarkConfig],
     num_experts: int,
     shard_intermediate_size: int,
@@ -563,76 +502,26 @@ def save_configs(
 def main(args: argparse.Namespace):
     print(args)
 
-    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    if config.architectures[0] == "DbrxForCausalLM":
-        E = config.ffn_config.moe_num_experts
-        topk = config.ffn_config.moe_top_k
-        intermediate_size = config.ffn_config.ffn_hidden_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] == "JambaForCausalLM":
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in ["Qwen2MoeForCausalLM", "Qwen3MoeForCausalLM"]:
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
-        E = (
-            config.n_routed_experts + (0 if args.disable_shared_experts_fusion else 1)
-            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
-            else config.n_routed_experts
-        )
-        topk = (
-            config.num_experts_per_tok
-            + (0 if args.disable_shared_experts_fusion else 1)
-            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
-            else config.num_experts_per_tok
-        )
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] == "Llama4ForConditionalGeneration":
-        E = config.text_config.num_local_experts + (
-            0 if args.disable_shared_experts_fusion else 1
-        )
-        topk = config.text_config.num_experts_per_tok
-        intermediate_size = config.text_config.intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in [
-        "Grok1ForCausalLM",
-        "Grok1ImgGen",
-        "Grok1AForCausalLM",
-    ]:
-        E = config.num_local_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in ["Glm4MoeForCausalLM"]:
-        E = config.n_routed_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    else:
-        # Default: Mixtral
-        E = config.num_local_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    # Check EP mode constraint: tp_size must be 1 when ep_size > 1
+    validate_ep_tp_mode(args.ep_size, args.tp_size)
 
-    hidden_size = getattr(config, "hidden_size", None) or config.text_config.hidden_size
-    dtype = config.torch_dtype
+    model_config = get_model_config(
+        args.model, 
+        args.tp_size, 
+        args.ep_size, 
+        args.disable_shared_experts_fusion
+    )
+    
+    E = model_config["num_experts"]
+    topk = model_config["topk"]
+    hidden_size = model_config["hidden_size"]
+    shard_intermediate_size = model_config["shard_intermediate_size"]
+    dtype = model_config["dtype"]
+    block_shape = model_config["block_shape"]
+    
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
-    block_shape = None
-    if (
-        hasattr(config, "quantization_config")
-        and "weight_block_size" in config.quantization_config
-    ):
-        block_shape = config.quantization_config["weight_block_size"]
-        assert len(block_shape) == 2
 
     topk_ids_dir = args.topk_ids_dir
     if args.batch_size is None:
@@ -764,7 +653,7 @@ def main(args: argparse.Namespace):
     configs0.reverse()
     configs1.reverse()
     best_configs0 = {M: sort_config(config) for M, config in zip(batch_sizes, configs0)}
-    save_configs(
+    save_configs_sep(
         best_configs0,
         E,
         shard_intermediate_size,
@@ -778,7 +667,7 @@ def main(args: argparse.Namespace):
     )
 
     best_configs1 = {M: sort_config(config) for M, config in zip(batch_sizes, configs1)}
-    save_configs(
+    save_configs_sep(
         best_configs1,
         E,
         shard_intermediate_size,
@@ -801,6 +690,7 @@ if __name__ == "__main__":
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
     )
     parser.add_argument("--tp-size", "--tp", type=int, default=2)
+    parser.add_argument("--ep-size", "--ep", type=int, default=1)
     parser.add_argument(
         "--dtype",
         type=str,
