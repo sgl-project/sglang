@@ -10,9 +10,21 @@ export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH"
 export PATH="${NVSHMEM_DIR}/bin:$PATH"
 export CUDA_HOME=/usr/local/cuda
 
-# Install Mooncake+EP
-curl -L https://cloud.tsinghua.edu.cn/f/c22ec766545e48bf99e8/?dl=1 -o mooncake_transfer_engine-0.3.6.post1+ep-cp310-cp310-manylinux_2_17_x86_64.manylinux_2_35_x86_64.whl
-UV_SYSTEM_PYTHON=true uv pip install mooncake_transfer_engine-0.3.6.post1+ep-cp310-cp310-manylinux_2_17_x86_64.manylinux_2_35_x86_64.whl
+# Detect architecture
+ARCH=$(uname -m)
+if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
+    echo "Unsupported architecture: $ARCH"
+    exit 1
+fi
+
+if [ "$ARCH" = "x86_64" ]; then
+    # Install Mooncake+EP
+    curl -L https://cloud.tsinghua.edu.cn/f/c22ec766545e48bf99e8/?dl=1 -o mooncake_transfer_engine-0.3.6.post1+ep-cp310-cp310-manylinux_2_17_${ARCH}.manylinux_2_35_${ARCH}.whl
+else
+    # Use GitHub releases for ARM; This uses a released version of Mooncake and might be different from the one from Tsinghua.
+    curl -L "https://github.com/kvcache-ai/Mooncake/releases/download/v0.3.6.post1/mooncake_transfer_engine-0.3.6.post1-cp310-cp310-manylinux_2_17_${ARCH}.manylinux_2_35_${ARCH}.whl" -O
+fi
+UV_SYSTEM_PYTHON=true uv pip install mooncake_transfer_engine-0.3.6.post1*-cp310-cp310-manylinux_2_17_${ARCH}.manylinux_2_35_${ARCH}.whl
 
 if python3 -c "import deep_ep" >/dev/null 2>&1; then
     echo "deep_ep is already installed or importable. Skipping installation."
@@ -39,8 +51,10 @@ dpkg -i libgdrapi_*.deb
 dpkg -i gdrcopy-tests_*.deb
 dpkg -i gdrcopy_*.deb
 
-if [ ! -e "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
-    ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+# Set up library paths based on architecture
+LIB_PATH="/usr/lib/$ARCH-linux-gnu"
+if [ ! -e "$LIB_PATH/libmlx5.so" ]; then
+    ln -s $LIB_PATH/libmlx5.so.1 $LIB_PATH/libmlx5.so
 fi
 apt-get update && apt-get install -y libfabric-dev
 
