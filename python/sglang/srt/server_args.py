@@ -874,15 +874,6 @@ class ServerArgs:
             return
 
         hf_config = self.get_hf_config()
-        if (
-            getattr(hf_config, "model_type", None) == "deepseek-ocr"
-            and not self.enable_custom_logit_processor
-        ):
-            self.enable_custom_logit_processor = True
-            logger.info(
-                "Enabling custom logit processor for DeepSeek-OCR to apply the built-in n-gram no-repeat filter."
-            )
-
         model_arch = hf_config.architectures[0]
         if model_arch in ["DeepseekV3ForCausalLM"] and not is_deepseek_nsa(hf_config):
             if is_cuda() and is_sm100_supported():
