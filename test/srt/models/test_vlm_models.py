@@ -25,6 +25,7 @@ MODELS = [
         mmmu_accuracy=0.4,
     ),
     SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
+    SimpleNamespace(model="Qwen/Qwen3-VL-8B-Thinking", mmmu_accuracy=0.65),
 ]
 
 # Set default mem_fraction_static to 0.8
@@ -118,6 +119,7 @@ class TestVLMModels(CustomTestCase):
         self,
         model,
         output_path,
+        pp_size: int = 1,
         test_name="",
         custom_env=None,
         log_level="info",
@@ -153,22 +155,27 @@ class TestVLMModels(CustomTestCase):
                 stdout_file = open("/tmp/server_stdout.log", "w")
                 stderr_file = open("/tmp/server_stderr.log", "w")
 
+            server_args = [
+                "--trust-remote-code",
+                "--cuda-graph-max-bs",
+                "32",
+                "--enable-multimodal",
+                "--mem-fraction-static",
+                str(self.parsed_args.mem_fraction_static),
+                "--log-level",
+                log_level,
+            ]
+
+            if pp_size > 1:
+                server_args.extend(["--pp-size", str(pp_size)])
+
             # Launch server for testing
             process = popen_launch_server(
                 model.model,
                 base_url=self.base_url,
                 timeout=self.time_out,
                 api_key=self.api_key,
-                other_args=[
-                    "--trust-remote-code",
-                    "--cuda-graph-max-bs",
-                    "32",
-                    "--enable-multimodal",
-                    "--mem-fraction-static",
-                    str(self.parsed_args.mem_fraction_static),  # Use class variable
-                    "--log-level",
-                    log_level,
-                ],
+                other_args=server_args,
                 env=process_env,
                 return_stdout_stderr=(
                     (stdout_file, stderr_file) if capture_output else None
@@ -265,6 +272,23 @@ class TestVLMModels(CustomTestCase):
 
         for model in models_to_test:
             self._run_vlm_mmmu_test(model, "./logs")
+
+    def test_vlm_pp2_mmmu_benchmark(self):
+        """Test Qwen3-VL with pp_size=2 against MMMU benchmark."""
+        models_to_test = [
+            m for m in MODELS if m.model.split("/")[-1].startswith("Qwen3-VL")
+        ]
+
+        for model in models_to_test:
+            self._run_vlm_mmmu_test(
+                model,
+                "./logs_pp2",
+                pp_size=2,
+                test_name=" (PP=2)",
+                custom_env=None,
+                log_level="info",
+                capture_output=True,
+            )
 
     def test_vlm_mmmu_benchmark_with_small_cache(self):
         """Test VLM models against MMMU benchmark with a small embedding cache to force eviction."""
