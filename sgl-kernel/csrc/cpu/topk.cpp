@@ -471,6 +471,9 @@ topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t t
       case 256:
         LAUNCH_TOPK_SIGMOID_KERNEL(256);
         break;
+      case 512:
+        LAUNCH_TOPK_SIGMOID_KERNEL(512);
+        break;
       default:
         TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
     }
@@ -524,6 +527,9 @@ topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t t
         break;
       case 256:
         LAUNCH_TOPK_SOFTMAX_KERNEL(256);
+        break;
+      case 512:
+        LAUNCH_TOPK_SOFTMAX_KERNEL(512);
         break;
       default:
         TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
@@ -601,6 +607,9 @@ std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
         break;
       case 256:
         LAUNCH_GROUPED_TOPK_KERNEL(256);
+        break;
+      case 512:
+        LAUNCH_GROUPED_TOPK_KERNEL(512);
         break;
       default:
         TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
