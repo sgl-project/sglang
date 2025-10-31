@@ -175,7 +175,7 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             for idx in range(search_start, search_end):
                 ngram = sequence[idx : idx + ngram_size]
                 if ngram_size == 1 or tuple(ngram[:-1]) == current_prefix:
-                    banned_tokens.add(int(ngram[-1]))
+                    banned_tokens.add(ngram[-1])
 
             whitelist_ids = params.get("whitelist_token_ids") or []
             try:
