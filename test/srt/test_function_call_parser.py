@@ -2191,6 +2191,77 @@ class TestGlm4MoeDetector(unittest.TestCase):
         )
         self.assertEqual(self.detector._buffer, "")
 
+    def test_array_argument_with_escaped_json(self):
+        """Test that array arguments with escaped JSON are properly handled without double-escaping."""
+        # Add a tool with array parameter
+        tools_with_array = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="todo_write",
+                    description="Write todos",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "todos": {
+                                "type": "array",
+                                "description": "The updated todo list",
+                            }
+                        },
+                        "required": ["todos"],
+                    },
+                ),
+            ),
+        ]
+
+        def check_params(result):
+            self.assertEqual(len(result.calls), 1)
+            self.assertEqual(result.calls[0].name, "todo_write")
+            params = json.loads(result.calls[0].parameters)
+            self.assertIsInstance(
+                params["todos"],
+                list,
+                f"todos should be a list, not a string, {type(params["todos"])}",
+            )
+            self.assertEqual(len(params["todos"]), 4)
+            self.assertEqual(params["todos"][0]["id"], "1")
+            self.assertEqual(
+                params["todos"][0]["task"],
+                "Check for hard-coded issues in the backend code",
+            )
+            self.assertEqual(params["todos"][0]["status"], "in_progress")
+            self.assertEqual(params["todos"][1]["id"], "2")
+            self.assertEqual(
+                params["todos"][1]["task"],
+                "Check for hard-coded issues in the frontend code",
+            )
+            self.assertEqual(params["todos"][1]["status"], "pending")
+            self.assertEqual(params["todos"][2]["id"], "3")
+            self.assertEqual(
+                params["todos"][2]["task"],
+                "Check for code violating the Single Responsibility Principle",
+            )
+            self.assertEqual(params["todos"][2]["status"], "pending")
+            self.assertEqual(params["todos"][3]["id"], "4")
+            self.assertEqual(
+                params["todos"][3]["task"], "Generate a rectification proposal report"
+            )
+            self.assertEqual(params["todos"][3]["status"], "pending")
+
+        # Simulate the raw response from GLM-4.6 model with normal and escaped JSON in XML
+        result = self.detector.detect_and_parse(
+            """<tool_call>todo_write\n<arg_key>todos</arg_key>\n<arg_value>[{\"id\": \"1\", \"task\": \"Check for hard-coded issues in the backend code\", \"status\": \"in_progress\"}, {\"id\": \"2\", \"task\": \"Check for hard-coded issues in the frontend code\", \"status\": \"pending\"}, {\"id\": \"3\", \"task\": \"Check for code violating the Single Responsibility Principle\", \"status\": \"pending\"}, {\"id\": \"4\", \"task\": \"Generate a rectification proposal report\", \"status\": \"pending\"}]</arg_value>
+</tool_call>""",
+            tools_with_array,
+        )
+        check_params(result)
+        result = self.detector.detect_and_parse(
+            r"""<tool_call>todo_write\n<arg_key>todos</arg_key>\n<arg_value>[{\"id\": \"1\", \"task\": \"Check for hard-coded issues in the backend code\", \"status\": \"in_progress\"}, {\"id\": \"2\", \"task\": \"Check for hard-coded issues in the frontend code\", \"status\": \"pending\"}, {\"id\": \"3\", \"task\": \"Check for code violating the Single Responsibility Principle\", \"status\": \"pending\"}, {\"id\": \"4\", \"task\": \"Generate a rectification proposal report\", \"status\": \"pending\"}]</arg_value>
+</tool_call>""",
+            tools_with_array,
+        )
+        check_params(result)
+
 
 class TestJsonArrayParser(unittest.TestCase):
     def setUp(self):
