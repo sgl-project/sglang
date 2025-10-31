@@ -1902,9 +1902,16 @@ class Scheduler(
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_ratio = self.new_token_ratio
-            retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                self.server_args
+            )
             self.num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
+            for req in reqs_to_abort:
+                abort_reason: FINISH_ABORT = req.to_finish
+                self.send_to_tokenizer.send_output(
+                    AbortReq(abort_message=abort_reason.message, rid=req.rid), req
+                )
 
             logger.info(
                 "KV cache pool is full. Retract requests. "

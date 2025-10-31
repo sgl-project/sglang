@@ -325,7 +325,8 @@ async fn route_responses_background(
         top_p: request.top_p,
         truncation: None,
         usage: None,
-        user: request.user.clone(),
+        user: None,
+        safety_identifier: request.user.clone(),
         metadata: request.metadata.clone().unwrap_or_default(),
     };
 
@@ -720,6 +721,7 @@ impl StreamingResponseAccumulator {
                     while self.tool_calls.len() <= index {
                         self.tool_calls.push(ResponseOutputItem::FunctionToolCall {
                             id: String::new(),
+                            call_id: String::new(),
                             name: String::new(),
                             arguments: String::new(),
                             output: None,
@@ -842,6 +844,7 @@ impl StreamingResponseAccumulator {
             truncation: None,
             usage,
             user: None,
+            safety_identifier: self.original_request.user.clone(),
             metadata: self.original_request.metadata.clone().unwrap_or_default(),
         }
     }
