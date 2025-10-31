@@ -50,34 +50,20 @@ RUN source $HOME/.local/bin/env && \
     source /opt/venv/bin/activate && \
     uv pip install nvitop && \
     uv pip install --no-cache-dir --upgrade pip && \
-    uv pip install --no-cache-dir --prerelease=allow ./python[diffusion]
+    uv pip install --no-cache-dir torch==2.8.0 setuptools && \
+    uv pip install --no-cache-dir --prerelease=allow --no-build-isolation ./python[diffusion]
 
 COPY . .
 
 # Install dependencies using uv and set up shell configuration
 RUN source $HOME/.local/bin/env && \
     source /opt/venv/bin/activate && \
-    uv pip install --no-cache-dir --prerelease=allow -e ./python[diffusion] && \
     git config --unset-all http.https://github.com/.extraheader || true && \
     echo 'source /opt/venv/bin/activate' >> /root/.zshrc && \
     echo 'if [ -n "$ZSH_VERSION" ] && [ -f ~/.zshrc ]; then . ~/.zshrc; elif [ -f ~/.bashrc ]; then . ~/.bashrc; fi' > /root/.profile
 
 # Set PATH to include venv bin
 ENV PATH=/opt/venv/bin:$PATH
-
-# Install STA (Sliding Tile Attention)
-RUN source $HOME/.local/bin/env && \
-    source /opt/venv/bin/activate && \
-    cd python/sglang/multimodal_gen/csrc/attn/sliding_tile_attn && \
-    git submodule update --init --recursive && \
-    python setup.py install
-
-# Install VSA
-RUN source $HOME/.local/bin/env && \
-    source /opt/venv/bin/activate && \
-    cd python/sglang/multimodal_gen/csrc/attn/video_sparse_attn && \
-    git submodule update --init --recursive && \
-    python setup.py install
 
 # Configure zsh
 COPY --chown=root:root <<-"EOF" /root/.zshrc
