@@ -175,6 +175,7 @@ export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 export HCCL_BUFFSIZE=200
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
 export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_NPU_USE_EINSUM_MM=1
 
 drun <image_name> \
     python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \
