@@ -331,7 +331,7 @@ class SchedulerMetricsMixin:
 
             # Others
             self.calculate_utilization()
-            self.metrics_collector.log_stats(self.stats)
+            self.metrics_collector.log_stats(self.stats, is_decode_stats=True)
             self._emit_kv_metrics()
         self._publish_kv_events()
 
