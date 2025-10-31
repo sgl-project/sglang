@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
@@ -23,6 +24,7 @@ _ENABLE_JIT_DEEPGEMM_PRECOMPILE = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get()
 _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = get_bool_env_var("SGL_IS_FIRST_RANK_ON_NODE", "true")
 _IN_PRECOMPILE_STAGE = get_bool_env_var("SGL_IN_DEEPGEMM_PRECOMPILE_STAGE", "false")
+_LOG_DEEPGEMM = get_bool_env_var("SGLANG_LOG_DEEPGEMM", "false")
 
 # Force redirect deep_gemm cache_dir
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
@@ -65,6 +67,7 @@ class DeepGemmKernelType(IntEnum):
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+_RUNTIME_SEEN_KEYS: Dict[Tuple[DeepGemmKernelType, int, int, int, int], bool] = dict()
 
 
 # TODO improve code
@@ -234,4 +237,47 @@ def deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
 ):
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
-    yield
+
+    # Best-effort visibility into cache vs (re)compile behavior.
+    # We treat a case as "precompiled" if we have already run compile-all for (kernel_type, n, k, num_groups).
+    # Otherwise, the first runtime use may trigger a JIT compile if the DG cache is missing.
+    if _LOG_DEEPGEMM:
+        precompiled = _INITIALIZATION_DICT.get((kernel_type, n, k, num_groups)) is True
+        runtime_key = (kernel_type, n, k, num_groups, int(m))
+        if runtime_key not in _RUNTIME_SEEN_KEYS:
+            _RUNTIME_SEEN_KEYS[runtime_key] = True
+            if precompiled:
+                logger.info(
+                    "DeepGEMM cache-hit (precompiled): kernel=%s N=%d K=%d G=%d M=%d",
+                    kernel_type.name,
+                    n,
+                    k,
+                    num_groups,
+                    m,
+                )
+            else:
+                logger.info(
+                    "DeepGEMM first use (may JIT if cache miss): kernel=%s N=%d K=%d G=%d M=%d",
+                    kernel_type.name,
+                    n,
+                    k,
+                    num_groups,
+                    m,
+                )
+
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            dt = (time.perf_counter() - t0) * 1000.0
+            logger.debug(
+                "DeepGEMM exec time: kernel=%s N=%d K=%d G=%d M=%d took %.2f ms",
+                kernel_type.name,
+                n,
+                k,
+                num_groups,
+                m,
+                dt,
+            )
+    else:
+        yield
