@@ -23,7 +23,7 @@ use crate::{
         traits::Tokenizer,
     },
     tool_parser::ParserFactory as ToolParserFactory,
-    wasm::{module_manager::WasmModuleManager, config::WasmRuntimeConfig},
+    wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
 };
 
 /// Error type for AppContext builder
@@ -520,13 +520,14 @@ impl AppContextBuilder {
     /// Create wasm manager if enabled in config
     fn with_wasm_manager(mut self, config: &RouterConfig) -> Self {
         self.wasm_manager = if config.enable_wasm {
-            Some(Arc::new(WasmModuleManager::new(WasmRuntimeConfig::default()).unwrap()))
+            Some(Arc::new(
+                WasmModuleManager::new(WasmRuntimeConfig::default()).unwrap(),
+            ))
         } else {
             None
         };
         self
     }
-
 }
 
 impl Default for AppContextBuilder {
