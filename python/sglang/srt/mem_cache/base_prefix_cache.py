@@ -25,6 +25,7 @@ class PrefixCacheTrait(Protocol):
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
+    disable: bool
 
 
 class MatchResult(NamedTuple):
