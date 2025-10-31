@@ -6,6 +6,7 @@ from transformers.configuration_utils import PretrainedConfig
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 
+
 class KimiLinearConfig(PretrainedConfig):
     model_type = "kimi_linear"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -143,23 +144,19 @@ class KimiLinearConfig(PretrainedConfig):
 
     @property
     def linear_layer_ids(self):
-        return [
-            i for i in range(self.num_hidden_layers) if self.is_kda_layer(i)
-        ]
+        return [i for i in range(self.num_hidden_layers) if self.is_kda_layer(i)]
 
     @property
     def full_attention_layer_ids(self):
-        return [
-            i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)
-        ]
-    
+        return [i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)]
+
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
         shape = KimiLinearStateShape.create(
             tp_world_size=get_attention_tp_size(),
-            num_heads = self.linear_attn_config["num_heads"],
-            head_dim = self.linear_attn_config["head_dim"],
-            conv_kernel_size = self.linear_attn_config["short_conv_kernel_size"]
+            num_heads=self.linear_attn_config["num_heads"],
+            head_dim=self.linear_attn_config["head_dim"],
+            conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],
         )
 
         return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)

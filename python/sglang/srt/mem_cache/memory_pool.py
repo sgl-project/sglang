@@ -171,7 +171,6 @@ class MambaPool:
             else nullcontext()
         ):
             if self.is_kda_cache:
-                print(f"{conv_state_shape=}")
                 conv_state = [
                     torch.zeros(
                         size=(num_mamba_layers, size + 1) + conv_shape,

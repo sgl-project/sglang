@@ -272,6 +272,10 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
+        q_conv_state = q_conv_state.transpose(-1, -2)
+        k_conv_state = k_conv_state.transpose(-1, -2)
+        v_conv_state = v_conv_state.transpose(-1, -2)
+
         q = causal_conv1d_update(
             q_proj_states,
             q_conv_state,

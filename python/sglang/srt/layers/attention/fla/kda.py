@@ -11,13 +11,14 @@
 
 import torch
 import torch.nn as nn
-
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
-from sglang.srt.layers.attention.fla.fused_recurrent import fused_recurrent_gated_delta_rule_fwd_kernel
+from sglang.srt.layers.attention.fla.fused_recurrent import (
+    fused_recurrent_gated_delta_rule_fwd_kernel,
+)
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.op import exp, log
@@ -26,6 +27,7 @@ from sglang.srt.layers.attention.fla.utils import is_amd
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
+
 
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
@@ -37,6 +39,7 @@ def next_power_of_2(n: int) -> int:
     if n < 1:
         return 1
     return 1 << (n - 1).bit_length()
+
 
 def fused_recurrent_kda_fwd(
     q: torch.Tensor,
