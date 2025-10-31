@@ -14,9 +14,11 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 @dataclass
 class EncoderArchConfig(ArchConfig):
     architectures: list[str] = field(default_factory=lambda: [])
-    _supported_attention_backends: tuple[AttentionBackendEnum, ...] = (
-        AttentionBackendEnum.FLASH_ATTN,
-        AttentionBackendEnum.TORCH_SDPA,
+    _supported_attention_backends: set[AttentionBackendEnum] = field(
+        default_factory=lambda: {
+            AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.TORCH_SDPA,
+        }
     )
     output_hidden_states: bool = False
     use_return_dict: bool = True

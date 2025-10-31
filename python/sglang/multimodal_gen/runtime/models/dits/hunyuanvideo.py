@@ -52,7 +52,7 @@ class MMDoubleStreamBlock(nn.Module):
         num_attention_heads: int,
         mlp_ratio: float,
         dtype: torch.dtype | None = None,
-        supported_attention_backends: tuple[AttentionBackendEnum, ...] | None = None,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -259,7 +259,7 @@ class MMSingleStreamBlock(nn.Module):
         num_attention_heads: int,
         mlp_ratio: float = 4.0,
         dtype: torch.dtype | None = None,
-        supported_attention_backends: tuple[AttentionBackendEnum, ...] | None = None,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
     ):
         super().__init__()

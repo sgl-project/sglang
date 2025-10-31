@@ -18,7 +18,7 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 class TextEncoder(nn.Module, ABC):
     _fsdp_shard_conditions: list = field(default_factory=lambda: [])
     _stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
-    _supported_attention_backends: tuple[AttentionBackendEnum, ...] = (
+    _supported_attention_backends: set[AttentionBackendEnum] = (
         TextEncoderConfig()._supported_attention_backends
     )
 
@@ -45,12 +45,12 @@ class TextEncoder(nn.Module, ABC):
         pass
 
     @property
-    def supported_attention_backends(self) -> tuple[AttentionBackendEnum, ...]:
+    def supported_attention_backends(self) -> set[AttentionBackendEnum]:
         return self._supported_attention_backends
 
 
 class ImageEncoder(nn.Module, ABC):
-    _supported_attention_backends: tuple[AttentionBackendEnum, ...] = (
+    _supported_attention_backends: set[AttentionBackendEnum] = (
         ImageEncoderConfig()._supported_attention_backends
     )
 
@@ -67,5 +67,5 @@ class ImageEncoder(nn.Module, ABC):
         pass
 
     @property
-    def supported_attention_backends(self) -> tuple[AttentionBackendEnum, ...]:
+    def supported_attention_backends(self) -> set[AttentionBackendEnum]:
         return self._supported_attention_backends

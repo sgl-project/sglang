@@ -47,7 +47,7 @@ class UlyssesAttention(nn.Module):
         num_kv_heads: int | None = None,
         softmax_scale: float | None = None,
         causal: bool = False,
-        supported_attention_backends: tuple[AttentionBackendEnum, ...] | None = None,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
@@ -234,7 +234,7 @@ class LocalAttention(nn.Module):
         num_kv_heads: int | None = None,
         softmax_scale: float | None = None,
         causal: bool = False,
-        supported_attention_backends: tuple[AttentionBackendEnum, ...] | None = None,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -307,7 +307,7 @@ class USPAttention(nn.Module):
         num_kv_heads: int | None = None,
         softmax_scale: float | None = None,
         causal: bool = False,
-        supported_attention_backends: tuple[AttentionBackendEnum, ...] | None = None,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         dropout_p: float = 0.0,
         **extra_impl_args,

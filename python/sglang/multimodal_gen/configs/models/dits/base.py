@@ -16,14 +16,16 @@ class DiTArchConfig(ArchConfig):
     param_names_mapping: dict = field(default_factory=dict)
     reverse_param_names_mapping: dict = field(default_factory=dict)
     lora_param_names_mapping: dict = field(default_factory=dict)
-    _supported_attention_backends: tuple[AttentionBackendEnum, ...] = (
-        AttentionBackendEnum.SLIDING_TILE_ATTN,
-        AttentionBackendEnum.SAGE_ATTN,
-        AttentionBackendEnum.FLASH_ATTN,
-        AttentionBackendEnum.TORCH_SDPA,
-        AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-        AttentionBackendEnum.VMOBA_ATTN,
-        AttentionBackendEnum.SAGE_ATTN_THREE,
+    _supported_attention_backends: set[AttentionBackendEnum] = field(
+        default_factory=lambda: {
+            AttentionBackendEnum.SLIDING_TILE_ATTN,
+            AttentionBackendEnum.SAGE_ATTN,
+            AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.VMOBA_ATTN,
+            AttentionBackendEnum.SAGE_ATTN_THREE,
+        }
     )
 
     hidden_size: int = 0

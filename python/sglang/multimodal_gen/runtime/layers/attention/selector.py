@@ -89,16 +89,23 @@ def get_global_forced_attn_backend() -> AttentionBackendEnum | None:
 def get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
-    supported_attention_backends: tuple[AttentionBackendEnum, ...] | None = None,
+    supported_attention_backends: set[AttentionBackendEnum] | None = None,
 ) -> type[AttentionBackend]:
-    return _cached_get_attn_backend(head_size, dtype, supported_attention_backends)
+    if supported_attention_backends is not None:
+        # Sort the backend names to ensure consistent cache key
+        be_tuple = tuple(
+            sorted(list(supported_attention_backends), key=lambda b: b.name)
+        )
+    else:
+        be_tuple = None
+    return _cached_get_attn_backend(head_size, dtype, be_tuple)
 
 
 @cache
 def _cached_get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
-    supported_attention_backends: tuple[AttentionBackendEnum, ...] | None = None,
+    supported_attention_backends: tuple[AttentionBackendEnum] | None = None,
 ) -> type[AttentionBackend]:
     # Check whether a particular choice of backend was
     # previously forced.
@@ -107,6 +114,7 @@ def _cached_get_attn_backend(
     # ENVIRONMENT VARIABLE.
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
+    supported_attention_backends = set(supported_attention_backends)
     if not supported_attention_backends:
         raise ValueError("supported_attention_backends is empty")
     selected_backend = None

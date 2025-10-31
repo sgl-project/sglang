@@ -21,7 +21,7 @@ class BaseDiT(nn.Module, ABC):
     num_attention_heads: int
     num_channels_latents: int
     # always supports torch_sdpa
-    _supported_attention_backends: tuple[AttentionBackendEnum, ...] = (
+    _supported_attention_backends: set[AttentionBackendEnum] = (
         DiTConfig()._supported_attention_backends
     )
 
@@ -68,7 +68,7 @@ class BaseDiT(nn.Module, ABC):
                 )
 
     @property
-    def supported_attention_backends(self) -> tuple[AttentionBackendEnum, ...]:
+    def supported_attention_backends(self) -> set[AttentionBackendEnum]:
         return self._supported_attention_backends
 
     @property
@@ -94,7 +94,7 @@ class CachableDiT(BaseDiT):
     num_attention_heads: int
     num_channels_latents: int
     # always supports torch_sdpa
-    _supported_attention_backends: tuple[AttentionBackendEnum, ...] = (
+    _supported_attention_backends: set[AttentionBackendEnum] = (
         DiTConfig()._supported_attention_backends
     )
 

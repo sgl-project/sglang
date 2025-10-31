@@ -257,7 +257,7 @@ class CausalWanTransformerBlock(nn.Module):
         cross_attn_norm: bool = False,
         eps: float = 1e-6,
         added_kv_proj_dim: int | None = None,
-        supported_attention_backends: tuple[AttentionBackendEnum, ...] | None = None,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
     ):
         super().__init__()
