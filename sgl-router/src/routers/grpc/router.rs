@@ -13,7 +13,10 @@ use tracing::debug;
 
 use super::{
     context::SharedComponents,
-    harmony::{serve_harmony_responses, HarmonyDetector, HarmonyResponsesContext},
+    harmony::{
+        serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector,
+        HarmonyResponsesContext,
+    },
     pipeline::RequestPipeline,
     responses,
 };
@@ -192,8 +195,8 @@ impl GrpcRouter {
         model_id: Option<&str>,
     ) -> Response {
         debug!(
-            "Processing Harmony responses request for model: {:?}",
-            model_id
+            "Processing Harmony responses request for model: {:?}, streaming: {:?}",
+            model_id, body.stream
         );
 
         // Create HarmonyResponsesContext from existing responses context
@@ -204,10 +207,15 @@ impl GrpcRouter {
             self.harmony_responses_context.response_storage.clone(),
         );
 
-        // Use serve_harmony_responses for multi-turn MCP tool orchestration
-        match serve_harmony_responses(&harmony_ctx, body.clone()).await {
-            Ok(response) => axum::Json(response).into_response(),
-            Err(error_response) => error_response,
+        // Check if streaming is requested
+        if body.stream.unwrap_or(false) {
+            serve_harmony_responses_stream(&harmony_ctx, body.clone()).await
+        } else {
+            // Use non-streaming version for standard JSON responses
+            match serve_harmony_responses(&harmony_ctx, body.clone()).await {
+                Ok(response) => axum::Json(response).into_response(),
+                Err(error_response) => error_response,
+            }
         }
     }
 }

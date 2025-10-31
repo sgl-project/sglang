@@ -1781,7 +1781,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         state = self.rid_to_state[recv_obj.rid]
         state.finished = True
 
-        abort_message = recv_obj.abort_reason or "Abort in waiting queue"
+        abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {
             "type": "abort",
             "message": abort_message,
