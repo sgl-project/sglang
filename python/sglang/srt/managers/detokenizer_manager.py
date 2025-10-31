@@ -250,6 +250,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return BatchStrOutput(
             rids=recv_obj.rids,
+            queue_time=recv_obj.queue_time,
+            inference_start_time=recv_obj.inference_start_time,
+            prefill_delay=recv_obj.prefill_delay,
+            prefill_latency=recv_obj.prefill_latency,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
@@ -291,6 +295,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             cached_tokens=recv_obj.cached_tokens,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            queue_time=recv_obj.queue_time,
+            inference_start_time=recv_obj.inference_start_time,
+            prefill_delay=recv_obj.prefill_delay,
+            prefill_latency=recv_obj.prefill_latency,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):

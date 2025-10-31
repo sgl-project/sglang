@@ -760,6 +760,11 @@ class SchedulerOutputProcessorMixin:
         retraction_counts = []
         output_hidden_states = None
 
+        queue_times = []
+        inference_start_times = []
+        prefill_delays = []
+        prefill_latencies = []
+
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -861,6 +866,28 @@ class SchedulerOutputProcessorMixin:
 
                 retraction_counts.append(req.retraction_count)
 
+                queue_times.append(req.time_stats.get_queueing_time())
+                inference_start_times.append(req.time_stats.forward_entry_time)
+
+                if req.time_stats.prefill_start_time > 0.0:
+                    prefill_delays.append(
+                        req.time_stats.prefill_start_time
+                        - req.time_stats.forward_entry_time
+                    )
+                else:
+                    prefill_delays.append(None)
+
+                if (
+                    req.time_stats.prefill_start_time > 0.0
+                    and req.time_stats.prefill_end_time > 0.0
+                ):
+                    prefill_latencies.append(
+                        req.time_stats.prefill_end_time
+                        - req.time_stats.prefill_start_time
+                    )
+                else:
+                    prefill_latencies.append(None)
+
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
@@ -952,6 +979,12 @@ class SchedulerOutputProcessorMixin:
 
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
+                    spec_verify_ct,
+                    spec_accepted_tokens,
+                    queue_times,
+                    inference_start_times,
+                    prefill_delays,
+                    prefill_latencies,
                     finished_reasons,
                     decoded_texts,
                     decode_ids_list,
@@ -963,8 +996,6 @@ class SchedulerOutputProcessorMixin:
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
-                    spec_verify_ct,
-                    spec_accepted_tokens,
                     input_token_logprobs_val,
                     input_token_logprobs_idx,
                     output_token_logprobs_val,
@@ -995,6 +1026,10 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
+        queue_times = []
+        inference_start_times = []
+        prefill_delays = []
+        prefill_latencies = []
         retraction_counts = []
         for req in reqs:
             if req.finished():
@@ -1004,17 +1039,43 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                queue_times.append(req.time_stats.get_queueing_time())
+                inference_start_times.append(req.time_stats.forward_entry_time)
+
+                if req.time_stats.prefill_start_time > 0.0:
+                    prefill_delays.append(
+                        req.time_stats.prefill_start_time
+                        - req.time_stats.forward_entry_time
+                    )
+                else:
+                    prefill_delays.append(None)
+
+                if (
+                    req.time_stats.prefill_start_time > 0.0
+                    and req.time_stats.prefill_end_time > 0.0
+                ):
+                    prefill_latencies.append(
+                        req.time_stats.prefill_end_time
+                        - req.time_stats.prefill_start_time
+                    )
+                else:
+                    prefill_latencies.append(None)
                 retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
-                finished_reasons,
-                embeddings,
-                prompt_tokens,
-                cached_tokens,
-                rids=rids,
+                queue_time=queue_times,
+                inference_start_time=inference_start_times,
+                prefill_delay=prefill_delays,
+                prefill_latency=prefill_latencies,
+                finished_reasons=finished_reasons,
+                embeddings=embeddings,
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
                 http_worker_ipcs=http_worker_ipcs,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,
+                rids=rids,
             )
         )
