@@ -159,9 +159,7 @@ class InputValidationStage(PipelineStage):
             # TODO: should we store in a new field: pixel values?
             batch.pil_image = img
 
-        if isinstance(server_args.pipeline_config, WanI2V480PConfig) or isinstance(
-            server_args.pipeline_config, WanI2V720PConfig
-        ):
+        if isinstance(server_args.pipeline_config, WanI2V480PConfig):
             # TODO: could we merge with above?
             # resize image only, Wan2.1 I2V
             max_area = 720 * 1280
