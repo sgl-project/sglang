@@ -30,6 +30,7 @@ git clone https://github.com/deepseek-ai/3fs 3fs \
       && pip install dist/*.whl \
       && cd .. \
       && rm -rf 3fs
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.12/dist-packages
 ```
 
 **Alternative 2:** Run `pip3 install hf3fs-py-usrbio` (Follow https://pypi.org/project/hf3fs-py-usrbio/#files)
@@ -47,7 +48,6 @@ python3 -m sglang.launch_server \
     --hicache-ratio 2 --hicache-size 0 \
     --hicache-write-policy write_through \
     --hicache-storage-backend hf3fs
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.12/dist-packages
 ```
 
 ### Multi-Node Deployment (Shared KV Cache)
