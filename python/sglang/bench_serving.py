@@ -2162,6 +2162,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
 
+    if not hasattr(args, "served_model_name"):
+        args.served_model_name = None
+
     print(f"benchmark_args={args}")
 
     # Set global environments
