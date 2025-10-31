@@ -8,9 +8,12 @@ import copy
 import gc
 import logging
 import math
+import os
 from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_LOG_FA4_COMPILE = os.getenv("SGLANG_LOG_FA4_COMPILE", "0") == "1"
 
 
 import cuda.bindings.driver as cuda
@@ -314,7 +317,24 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
     )
-    if compile_key not in _flash_attn_fwd.compile_cache:
+    cache_hit = compile_key in _flash_attn_fwd.compile_cache
+    if _LOG_FA4_COMPILE:
+        status = "cache-hit" if cache_hit else "compiling"
+        logger.info(
+            "FA4 %s: hdim=%d/%d qh/kvh=%d causal=%s local=%s packgqa=%s varlen=%s paged=%s lse=%s SM=%d",
+            status,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            causal,
+            local,
+            pack_gqa,
+            cu_seqlens_q is not None or seqused_q is not None,
+            page_table is not None,
+            lse is not None,
+            compute_capability,
+        )
+    if not cache_hit:
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
