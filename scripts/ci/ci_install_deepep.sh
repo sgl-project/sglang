@@ -25,9 +25,11 @@ else
     echo "Skipping Mooncake+EP installation for ARM architecture"
 fi
 
-if python3 -c "import deep_ep" >/dev/null 2>&1; then
-    echo "deep_ep is already installed or importable. Skipping installation."
-    exit 0
+if [ "$GRACE_BLACKWELL" != "1" ]; then
+    if python3 -c "import deep_ep" >/dev/null 2>&1; then
+        echo "deep_ep is already installed or importable. Skipping installation."
+        exit 0
+    fi
 fi
 
 # Install system dependencies
