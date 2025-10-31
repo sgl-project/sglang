@@ -268,7 +268,7 @@ pub fn make_item_id(item_type: &str) -> ConversationItemId {
         "reasoning" => "rs".to_string(),
         "mcp_call" => "mcp".to_string(),
         "mcp_list_tools" => "mcpl".to_string(),
-        "function_tool_call" => "ftc".to_string(),
+        "function_call" => "fc".to_string(),
         other => {
             // Fallback: first 3 letters of type or "itm"
             let mut p = other.chars().take(3).collect::<String>();
