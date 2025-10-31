@@ -3,11 +3,21 @@ import argparse
 import time
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, List, Tuple, Dict
+from typing import Any, Dict, List, Tuple
 
 import ray
 import torch
 import triton
+from common_utils import (
+    BenchmarkConfig,
+    get_config_filename,
+    get_configs_compute_bound,
+    get_default_batch_sizes,
+    get_model_config,
+    save_configs,
+    sort_config,
+    validate_ep_tp_mode,
+)
 from ray.experimental.tqdm_ray import tqdm
 
 from sglang.srt.layers.moe.fused_moe_triton import override_config
@@ -21,20 +31,7 @@ from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.utils import is_hip
 
-from common_utils import (
-    BenchmarkConfig,
-    get_config_filename,
-    get_configs_compute_bound,
-    get_default_batch_sizes,
-    get_model_config,
-    save_configs,
-    sort_config,
-    validate_ep_tp_mode,
-)
-
 _is_hip = is_hip()
-
-
 
 
 def benchmark_config(
@@ -192,8 +189,6 @@ def benchmark_config(
     return avg
 
 
-
-
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
 
@@ -313,8 +308,6 @@ class BenchmarkWorker:
         return best_config
 
 
-
-
 def main(args: argparse.Namespace):
     print(args)
 
@@ -322,19 +315,16 @@ def main(args: argparse.Namespace):
     validate_ep_tp_mode(args.ep_size, args.tp_size)
 
     model_config = get_model_config(
-        args.model, 
-        args.tp_size, 
-        args.ep_size, 
-        args.disable_shared_experts_fusion
+        args.model, args.tp_size, args.ep_size, args.disable_shared_experts_fusion
     )
-    
+
     E = model_config["num_experts"]
     topk = model_config["topk"]
     hidden_size = model_config["hidden_size"]
     shard_intermediate_size = model_config["shard_intermediate_size"]
     dtype = model_config["dtype"]
     block_shape = model_config["block_shape"]
-    
+
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"

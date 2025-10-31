@@ -23,11 +23,7 @@ class BenchmarkConfig(TypedDict):
 def calculate_shard_intermediate_size(
     intermediate_size: int, tp_size: int, ep_size: int = 1
 ) -> int:
-    return (
-        intermediate_size
-        if ep_size > 1
-        else 2 * intermediate_size // tp_size
-    )
+    return intermediate_size if ep_size > 1 else 2 * intermediate_size // tp_size
 
 
 def validate_ep_tp_mode(ep_size: int, tp_size: int) -> None:
@@ -40,13 +36,13 @@ def validate_ep_tp_mode(ep_size: int, tp_size: int) -> None:
 
 
 def get_model_config(
-    model_name: str, 
-    tp_size: int, 
-    ep_size: int = 1, 
-    disable_shared_experts_fusion: bool = False
+    model_name: str,
+    tp_size: int,
+    ep_size: int = 1,
+    disable_shared_experts_fusion: bool = False,
 ) -> Dict:
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    
+
     block_shape = None
     if (
         hasattr(config, "quantization_config")
@@ -56,7 +52,7 @@ def get_model_config(
         assert len(block_shape) == 2
 
     architecture = config.architectures[0]
-    
+
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
         config = config.get_text_config()
@@ -107,7 +103,7 @@ def get_model_config(
         )
     elif architecture in [
         "Grok1ForCausalLM",
-        "Grok1ImgGen", 
+        "Grok1ImgGen",
         "Grok1AForCausalLM",
     ]:
         E = config.num_local_experts // ep_size
@@ -118,7 +114,7 @@ def get_model_config(
         )
     elif architecture in [
         "BailingMoEForCausalLM",
-        "BailingMoeForCausalLM", 
+        "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
     ]:
         E = config.num_experts // ep_size

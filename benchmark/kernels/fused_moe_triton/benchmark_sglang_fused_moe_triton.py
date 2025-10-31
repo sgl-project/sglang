@@ -3,6 +3,7 @@ import argparse
 
 import torch
 import triton
+from common_utils import get_model_config, validate_ep_tp_mode
 
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -18,10 +19,6 @@ from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopK, TopKConfig, select_experts
-
-from common_utils import get_model_config, validate_ep_tp_mode
-
-
 
 
 def fused_moe_triton_api(
