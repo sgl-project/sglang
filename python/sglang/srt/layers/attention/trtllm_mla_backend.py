@@ -407,7 +407,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         metadata = TRTLLMMLADecodeMetadata()
 
-        num_tokens_per_bs = num_tokens // bs
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.num_draft_tokens
             metadata.seq_lens_k = torch.zeros(
@@ -415,7 +414,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
         elif forward_mode.is_draft_extend(include_v2=True):
-            metadata.max_seq_len_q = num_tokens_per_bs + 1
+            num_tokens_per_bs = num_tokens // bs
+            metadata.max_seq_len_q = num_tokens_per_bs
             metadata.sum_seq_lens_q = num_tokens_per_bs * bs
             metadata.cu_seqlens_q = torch.arange(
                 0,
@@ -493,8 +493,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         elif forward_mode.is_draft_extend(include_v2=True):
             accept_length = spec_info.accept_length[:bs]
             if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu[:bs])
-                metadata.sum_seq_lens_q = sum(spec_info.accept_length_cpu[:bs])
+                metadata.max_seq_len_q = max(spec_info.accept_length_cpu[:bs]) + 1
+                metadata.sum_seq_lens_q = sum(spec_info.accept_length_cpu[:bs]) + bs
             else:
                 metadata.max_seq_len_q = 1
                 metadata.sum_seq_lens_q = bs
