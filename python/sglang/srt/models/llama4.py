@@ -148,7 +148,7 @@ class Llama4MoE(nn.Module):
         return out_aD
 
     def _forward_core(self, hidden_states, forward_mode: ForwardMode):
-        if hidden_states.shape[0] < 4 and _is_cuda:
+        if _is_cuda:
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
