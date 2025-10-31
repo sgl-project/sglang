@@ -17,6 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -27,6 +28,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -51,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
     fast_topk,
@@ -510,16 +513,24 @@ class Llama4Model(nn.Module):
             hidden_states = input_embeds
         residual = None
         aux_hidden_states = []
-        for i in range(len(self.layers)):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
+        global_server_args = get_global_server_args()
+        for i, layer in enumerate(self.layers):
+            ctx = (
+                nullcontext()
+                if global_server_args.enable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(i)
             )
+            with ctx:
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states if residual is None else hidden_states + residual
+                    )
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                )
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
 

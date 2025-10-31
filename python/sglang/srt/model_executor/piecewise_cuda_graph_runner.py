@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
 
@@ -103,13 +104,14 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
 
 
 @contextmanager
-def patch_model(model: torch.nn.Module, compiler: str):
+def patch_model(model: torch.nn.Module, enable_compile: bool):
     try:
-        if compiler != "eager":
+        if enable_compile:
             _to_torch(model, reverse=False, num_tokens=16)
         yield model
     finally:
-        _to_torch(model, reverse=True, num_tokens=16)
+        if enable_compile:
+            _to_torch(model, reverse=True, num_tokens=16)
 
 
 # Reuse this memory pool across all cuda graph runners.
@@ -153,6 +155,9 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_tokens,
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
         )
+        self._compiled_enabled = (
+            self.model_runner.server_args.piecewise_cuda_graph_compiler != "eager"
+        )
 
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
@@ -186,23 +191,25 @@ class PiecewiseCudaGraphRunner:
         set_graph_pool_id(get_global_graph_memory_pool())
 
         with patch_model(
-            self.model_runner.model.model, self.compile_config.compiler
+            self.model_runner.model.model, self._compiled_enabled
         ) as patched_model:
-            install_torch_compiled(
-                patched_model,
-                fullgraph=True,
-                dynamic_arg_dims=None,
-                compile_config=self.compile_config,
-                graph_pool=get_global_graph_memory_pool(),
-            )
+            if self._compiled_enabled:
+                install_torch_compiled(
+                    patched_model,
+                    fullgraph=True,
+                    dynamic_arg_dims=None,
+                    compile_config=self.compile_config,
+                    graph_pool=get_global_graph_memory_pool(),
+                )
 
-            with set_compiled(True):
+            with set_compiled(self._compiled_enabled):
                 self.warmup_and_capture()
 
             # Capture
             try:
                 with model_capture_mode():
-                    self.capture()
+                    with set_compiled(self._compiled_enabled):
+                        self.capture()
             except RuntimeError as e:
                 raise Exception(
                     f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
@@ -306,7 +313,7 @@ class PiecewiseCudaGraphRunner:
                         f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                     )
 
-                with set_compiled(True):
+                with set_compiled(self._compiled_enabled):
                     self.capture_one_batch_size(num_tokens)
 
                 # Save gemlite cache after each capture
@@ -485,7 +492,7 @@ class PiecewiseCudaGraphRunner:
         static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
         # Replay
         with set_forward_context(static_forward_batch, self.attention_layers):
-            with set_compiled(True):
+            with set_compiled(self._compiled_enabled):
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
                     static_forward_batch.positions,
