@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_npu,
     is_sm90_supported,
     is_sm100_supported,
     prepare_weight_cache,
@@ -62,6 +63,7 @@ _is_gfx95_supported = is_gfx95_supported()
 
 if _use_aiter and _is_gfx95_supported:
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+_is_npu = is_npu()
 
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
@@ -135,8 +137,15 @@ class LayerScatterModes:
                 ScatterMode.SCATTERED
                 if (
                     # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
-                    not get_moe_a2a_backend().is_none()
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    (
+                        not get_moe_a2a_backend().is_none()
+                        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    )
+                    and (
+                        not (
+                            _is_npu and global_server_args_dict["enable_torch_compile"]
+                        )
+                    )
                 )
                 else ScatterMode.FULL
             )

@@ -375,6 +375,7 @@ class CudaGraphRunner:
                 device=self.device,
             )
 
+    def initialize(self):
         # Capture
         try:
             with model_capture_mode():
