@@ -57,7 +57,7 @@ jobs:
       - name: Test maturin build
         uses: PyO3/maturin-action@v1
         with:
-          args: --release --out dist
+          args: --release --out dist --features vendored-openssl
           rust-toolchain: stable
           sccache: true
 
@@ -97,6 +97,7 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
+          rustup component add clippy
           cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run fmt
@@ -166,7 +167,7 @@ jobs:
           export RUSTC_WRAPPER=sccache
           cd sgl-router
           pip install maturin
-          maturin build --release --out dist
+          maturin build --release --out dist --features vendored-openssl
           pip install --force-reinstall dist/*.whl
 
 
@@ -263,7 +264,7 @@ jobs:
           export RUSTC_WRAPPER=sccache
           cd sgl-router
           pip install maturin
-          maturin build --release --out dist
+          maturin build --release --out dist --features vendored-openssl
           pip install --force-reinstall dist/*.whl
 
       - name: Run Python E2E response API tests

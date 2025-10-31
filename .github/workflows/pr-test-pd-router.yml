@@ -149,7 +149,7 @@ jobs:
         echo "Building sgl-router..."
         cd sgl-router
         pip install maturin
-        maturin build --release --out dist
+        maturin build --release --out dist --features vendored-openssl
         pip install --force-reinstall dist/*.whl
 
     - name: Start disaggregation servers
