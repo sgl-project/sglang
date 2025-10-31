@@ -32,12 +32,59 @@ pub(crate) mod event_types {
     pub const MCP_LIST_TOOLS_IN_PROGRESS: &str = "response.mcp_list_tools.in_progress";
     pub const MCP_LIST_TOOLS_COMPLETED: &str = "response.mcp_list_tools.completed";
 
+    // Web Search Call events (for web_search_preview)
+    pub const WEB_SEARCH_CALL_IN_PROGRESS: &str = "response.web_search_call.in_progress";
+    pub const WEB_SEARCH_CALL_SEARCHING: &str = "response.web_search_call.searching";
+    pub const WEB_SEARCH_CALL_COMPLETED: &str = "response.web_search_call.completed";
+
     // Item types
     pub const ITEM_TYPE_FUNCTION_CALL: &str = "function_call";
     pub const ITEM_TYPE_FUNCTION_TOOL_CALL: &str = "function_tool_call";
     pub const ITEM_TYPE_MCP_CALL: &str = "mcp_call";
     pub const ITEM_TYPE_FUNCTION: &str = "function";
     pub const ITEM_TYPE_MCP_LIST_TOOLS: &str = "mcp_list_tools";
+    pub const ITEM_TYPE_WEB_SEARCH_CALL: &str = "web_search_call";
+}
+
+// ============================================================================
+// Web Search Constants
+// ============================================================================
+
+/// Constants for web search preview feature
+pub(crate) mod web_search_constants {
+    /// MCP server name for web search preview
+    pub const WEB_SEARCH_PREVIEW_SERVER_NAME: &str = "web_search_preview";
+
+    /// Status constants
+    pub const STATUS_COMPLETED: &str = "completed";
+    pub const STATUS_FAILED: &str = "failed";
+
+    /// Action type for web search
+    pub const ACTION_TYPE_SEARCH: &str = "search";
+}
+
+// ============================================================================
+// Tool Context Enum
+// ============================================================================
+
+/// Represents the context for tool handling strategy
+///
+/// This enum replaces boolean flags for better type safety and clarity.
+/// It makes the code more maintainable and easier to extend with new
+/// tool handling strategies in the future.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolContext {
+    /// Regular MCP tool handling with full mcp_call and mcp_list_tools items
+    Regular,
+    /// Web search preview handling with simplified web_search_call items
+    WebSearchPreview,
+}
+
+impl ToolContext {
+    /// Check if this is web search preview context
+    pub fn is_web_search(&self) -> bool {
+        matches!(self, ToolContext::WebSearchPreview)
+    }
 }
 
 // ============================================================================
