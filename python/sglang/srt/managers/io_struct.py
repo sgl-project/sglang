@@ -1519,6 +1519,16 @@ class WatchLoadUpdateReq(BaseReq):
 
 
 @dataclass
+class SetInjectDumpMetadataReqInput(BaseReq):
+    dump_metadata: Dict[str, Any]
+
+
+@dataclass
+class SetInjectDumpMetadataReqOutput(BaseReq):
+    success: bool
+
+
+@dataclass
 class LazyDumpTensorsReqInput(BaseReq):
     pass
 
@@ -1549,6 +1559,3 @@ def _check_all_req_types():
             raise ValueError(
                 f"{name} is a subclass of BaseReq but not follow the naming convention."
             )
-
-
-_check_all_req_types()
