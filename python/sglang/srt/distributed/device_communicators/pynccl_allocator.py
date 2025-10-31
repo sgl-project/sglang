@@ -87,12 +87,6 @@ class SymmetricMemoryContext:
         self.pre_2_8_0 = version.parse(torch.__version__) < version.parse("2.8.0")
 
     def __enter__(self):
-        assert (
-            self.group_coordinator.pynccl_comm is not None
-        ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.group_name}'"
-        assert (
-            self.group_coordinator.pynccl_comm.nccl_version >= 22703
-        ), "NCCL version 2.27.3 or higher is required for NCCL symmetric memory"
         if self.is_graph_capture:
             assert (
                 _graph_pool_id is not None

@@ -28,14 +28,11 @@ _is_hip = is_hip()
 
 
 try:
-    if ops.use_vllm_custom_allreduce and not _is_hip:
-        # Use vLLM custom allreduce
-        ops.meta_size()
-    else:
-        # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
-        import sgl_kernel  # noqa: F401
+    # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
+    import sgl_kernel  # noqa: F401
+
     custom_ar = True
-except Exception:
+except ImportError:
     # For CPUs
     custom_ar = False
 
