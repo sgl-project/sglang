@@ -10,6 +10,7 @@ export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH"
 export PATH="${NVSHMEM_DIR}/bin:$PATH"
 export CUDA_HOME=/usr/local/cuda
 
+GRACE_BLACKWELL=${GRACE_BLACKWELL:-0}
 # Detect architecture
 ARCH=$(uname -m)
 if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
@@ -64,7 +65,7 @@ cd /opt/nvshmem
 wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.4.5/source/nvshmem_src_cuda12-all-all-3.4.5.tar.gz
 tar -xf nvshmem_src_cuda12-all-all-3.4.5.tar.gz
 mv nvshmem_src nvshmem && cd nvshmem
-if [ "GRACE_BLACKWELL" = "1" ]; then
+if [ "$GRACE_BLACKWELL" = "1" ]; then
     CUDA_ARCH="90;100;103;120"
 else
     CUDA_ARCH="90"
@@ -86,7 +87,7 @@ DEEPEP_DIR=/root/.cache/deepep
 GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 CUDA_VERSION=12.9.1
 rm -rf ${DEEPEP_DIR}
-if [ "GRACE_BLACKWELL" = "1" ]; then
+if [ "$GRACE_BLACKWELL" = "1" ]; then
     git clone https://github.com/fzyzcjy/DeepEP.git ${DEEPEP_DIR} && \
     pushd ${DEEPEP_DIR} && \
     git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
@@ -113,7 +114,7 @@ if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
 fi
 cd ${DEEPEP_DIR}
-if [ "GRACE_BLACKWELL" = "1" ]; then
+if [ "$GRACE_BLACKWELL" = "1" ]; then
     NVSHMEM_DIR=/opt/nvshmem/install TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
 else
     python3 setup.py install
