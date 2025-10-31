@@ -38,7 +38,6 @@ from sglang.srt.layers.dp_attention import (
     get_dp_device,
     get_dp_dtype,
     get_dp_hidden_size,
-    get_local_attention_dp_size,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
@@ -47,7 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import dump_to_file, is_npu, use_intel_amx_backend
+from sglang.srt.utils import is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +134,10 @@ class LogitsMetadata:
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
-            forward_batch.forward_mode.is_extend()
+            (
+                forward_batch.forward_mode.is_extend()
+                or forward_batch.forward_mode.is_split_prefill()
+            )
             and forward_batch.return_logprob
             and not forward_batch.forward_mode.is_target_verify()
         ):
@@ -248,10 +250,6 @@ class LogitsProcessor(nn.Module):
             and self.final_logit_softcapping < 0
         ):
             self.final_logit_softcapping = None
-
-        self.debug_tensor_dump_output_folder = (
-            get_global_server_args().debug_tensor_dump_output_folder
-        )
 
     def compute_logprobs_for_multi_item_scoring(
         self,
@@ -386,8 +384,8 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices = None
         elif (
             logits_metadata.forward_mode.is_extend()
-            and not logits_metadata.extend_return_logprob
-        ):
+            or logits_metadata.forward_mode.is_split_prefill()
+        ) and not logits_metadata.extend_return_logprob:
             # Prefill without input logprobs.
             if logits_metadata.padded_static_len < 0:
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
@@ -459,14 +457,6 @@ class LogitsProcessor(nn.Module):
         sampled_logits = (
             logits[sample_indices] if sample_indices is not None else logits
         )
-
-        if self.debug_tensor_dump_output_folder:
-            assert (
-                not self.do_tensor_parallel_all_gather
-                or get_local_attention_dp_size() == 1
-            ), "dp attention + sharded lm_head doesn't support full logits"
-            full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
-            dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits)
 
         hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():

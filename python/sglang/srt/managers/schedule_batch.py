@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import enum
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -70,15 +72,14 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils.common import is_npu
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -396,13 +397,23 @@ class MultimodalInputs:
 
 
 class RequestStage(str, enum.Enum):
-    # prefill
+    # Tokenizer
+    TOKENIZE = "tokenize"
+    TOKENIZER_DISPATCH = "dispatch"
+
+    # DP controller
+    DC_DISPATCH = "dc_dispatch"
+
+    # common/non-disaggregation
     PREFILL_WAITING = "prefill_waiting"
+    REQUEST_PROCESS = "request_process"
+    DECODE_LOOP = "decode_loop"
+    PREFILL_FORWARD = "prefill_forward"
+    PREFILL_CHUNKED_FORWARD = "chunked_prefill"
 
     # disaggregation prefill
     PREFILL_PREPARE = "prefill_prepare"
     PREFILL_BOOTSTRAP = "prefill_bootstrap"
-    PREFILL_FORWARD = "prefill_forward"
     PREFILL_TRANSFER_KV_CACHE = "prefill_transfer_kv_cache"
 
     # disaggregation decode
@@ -410,6 +421,8 @@ class RequestStage(str, enum.Enum):
     DECODE_BOOTSTRAP = "decode_bootstrap"
     DECODE_WAITING = "decode_waiting"
     DECODE_TRANSFERRED = "decode_transferred"
+    DECODE_FAKE_OUTPUT = "fake_output"
+    DECODE_QUICK_FINISH = "quick_finish"
 
 
 class Req:
@@ -495,16 +508,15 @@ class Req:
 
         # Check finish
         self.tokenizer = None
-        self.finished_reason = None
+        self.finished_reason: Optional[BaseFinishReason] = None
         # finished position (in output_ids), used when checking stop conditions with speculative decoding
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
-        # If we want to abort the request in the middle of the event loop, set this to true
+        # If we want to abort the request in the middle of the event loop,
+        # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
-        self.to_abort = False
-        # This carries the error message for `.to_abort` and will be attached to the finished_reason at the end of the event loop
-        self.to_abort_message: str = None
+        self.to_finish: Optional[BaseFinishReason] = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
@@ -622,6 +634,9 @@ class Req:
         # The number of accepted tokens in speculative decoding for this request.
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
+
+        # The number of times this request has been retracted / preempted.
+        self.retraction_count = 0
 
         # For metrics
         self.metrics_collector = metrics_collector
@@ -853,10 +868,9 @@ class Req:
         if self.finished():
             return
 
-        if self.to_abort:
-            self.finished_reason = FINISH_ABORT(
-                message=self.to_abort_message,
-            )
+        if self.to_finish:
+            self.finished_reason = self.to_finish
+            self.to_finish = None
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
@@ -883,6 +897,10 @@ class Req:
             return
 
     def reset_for_retract(self):
+        # Increment retraction count before resetting other state. We should not reset this
+        # since we are tracking the total number of retractions for each request.
+        self.retraction_count += 1
+
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.last_node = None
         self.swa_uuid_for_lock = None
@@ -928,7 +946,7 @@ class Req:
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
         self.return_logprob = False
-        self.finished_reason = FINISH_ABORT(
+        self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
 
@@ -1035,7 +1053,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     has_grammar: bool = False
 
     # Device
-    device: str = "cuda"
+    if not _is_npu:
+        device: str = "cuda"
+    else:
+        device: str = "npu"
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
@@ -1394,6 +1415,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens += running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
+        self.is_prefill_only = False
 
     def new_page_count_next_decode(self, selected_indices: Optional[List[int]] = None):
         page_size = self.token_to_kv_pool_allocator.page_size
@@ -1424,7 +1446,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self._is_available_size_sufficient(num_tokens)
 
-    def retract_decode(self, server_args: ServerArgs):
+    def retract_decode(
+        self, server_args: ServerArgs
+    ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
 
