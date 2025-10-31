@@ -19,7 +19,7 @@ use crate::protocols::validated::Normalizable;
 pub enum ChatMessage {
     #[serde(rename = "system")]
     System {
-        content: String,
+        content: UserMessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -55,6 +55,22 @@ pub enum ChatMessage {
 pub enum UserMessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+impl UserMessageContent {
+    pub fn extract_text_from_content(&self) -> String {
+        match self {
+            UserMessageContent::Text(text) => text.clone(),
+            UserMessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<String>>()
+                .join(" "),
+        }
+    }
 }
 
 // ============================================================================
@@ -564,20 +580,8 @@ impl GenerationRequest for ChatCompletionRequest {
         self.messages
             .iter()
             .filter_map(|msg| match msg {
-                ChatMessage::System { content, .. } => Some(content.clone()),
-                ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) => Some(text.clone()),
-                    UserMessageContent::Parts(parts) => {
-                        let texts: Vec<String> = parts
-                            .iter()
-                            .filter_map(|part| match part {
-                                ContentPart::Text { text } => Some(text.clone()),
-                                _ => None,
-                            })
-                            .collect();
-                        Some(texts.join(" "))
-                    }
-                },
+                ChatMessage::System { content, .. } => Some(content.extract_text_from_content()),
+                ChatMessage::User { content, .. } => Some(content.extract_text_from_content()),
                 ChatMessage::Assistant {
                     content,
                     reasoning_content,

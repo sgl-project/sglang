@@ -84,6 +84,7 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    // more types here...
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
