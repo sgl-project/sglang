@@ -588,7 +588,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.tp_worker.get_tp_group().cpu_group,
+            self.tp_worker.get_attention_tp_cpu_group(),
         )
 
         transferred_rids: List[str] = []
@@ -722,8 +722,11 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             data = None
 
-        if self.tp_size != 1:
+        if self.attn_tp_size != 1:
             data = broadcast_pyobj(
-                data, self.tp_group.rank, self.tp_cpu_group, src=self.tp_group.ranks[0]
+                data,
+                self.attn_tp_group.rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_group.ranks[0],
             )
         return data
