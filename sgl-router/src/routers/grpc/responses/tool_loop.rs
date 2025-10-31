@@ -124,6 +124,7 @@ impl ToolLoopState {
         self.conversation_history
             .push(ResponseInputOutputItem::FunctionToolCall {
                 id: call_id.clone(),
+                call_id: call_id.clone(),
                 name: tool_name.clone(),
                 arguments: args_json_str.clone(),
                 output: Some(output_str.clone()),

@@ -40,6 +40,9 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.debug_utils.tensor_dump_forward_hook import (
+    register_forward_hook_for_model,
+)
 from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
@@ -362,7 +365,11 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
-                compute_initial_expert_location_metadata(server_args, self.model_config)
+                compute_initial_expert_location_metadata(
+                    server_args=server_args,
+                    model_config=self.model_config,
+                    moe_ep_rank=self.moe_ep_rank,
+                )
             )
             if self.tp_rank == 0 and get_bool_env_var(
                 "SGLANG_LOG_EXPERT_LOCATION_METADATA"
@@ -802,6 +809,15 @@ class ModelRunner:
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
+        if self.server_args.debug_tensor_dump_output_folder is not None:
+            register_forward_hook_for_model(
+                self.model,
+                self.server_args.debug_tensor_dump_output_folder,
+                self.server_args.debug_tensor_dump_layers,
+                self.tp_size,
+                self.tp_rank,
+                self.pp_rank,
+            )
 
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
@@ -1670,9 +1686,11 @@ class ModelRunner:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
-                    layer_num=self.model_config.num_hidden_layers,
+                    layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
             self.token_to_kv_pool = NSATokenToKVPool(

@@ -4,7 +4,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
+from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj, require_mlp_sync
 
 
 class SchedulerPPMixin:
@@ -236,7 +236,12 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
 
                 self.process_prefill_chunk()
-                mbs[mb_id] = self.get_new_batch_prefill()
+
+                batch = self.get_new_batch_prefill()
+                if require_mlp_sync(self.server_args):
+                    batch = self.prepare_mlp_sync_batch(batch)
+                mbs[mb_id] = batch
+
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch = mbs[mb_id]

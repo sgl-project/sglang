@@ -59,7 +59,7 @@ wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./
 
 
 ### Install sgl-kernel-npu
-SGL_KERNEL_NPU_TAG="20250926"
+SGL_KERNEL_NPU_TAG="20251030"
 git clone --depth 1 https://github.com/sgl-project/sgl-kernel-npu.git --branch ${SGL_KERNEL_NPU_TAG}
 # pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
 pip install wheel==0.45.1
