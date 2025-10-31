@@ -6,7 +6,7 @@ from typing import Callable, List, Optional, Tuple
 import torch
 
 from sglang.srt.model_executor.graph_runner import get_global_graph_memory_pool
-
+from sglang.srt.sparse_attention.kernels.moving_average import moving_average_update
 
 class ManagerConfig:
     def __init__(
@@ -108,6 +108,7 @@ class RetriveQuery:
         )
         self.updated = False
         self.layer_id = layer_id
+        self.bs = 0
 
 
 class RetriveResult:
@@ -235,10 +236,15 @@ class CacheManager:
     ):
 
         bs = req_pool_indices.shape[0]
-        self.retrived_query[layer_id].query[:bs] = query[:bs]
+        pre_bs = self.retrived_query[layer_id].bs
+        moving_average_factor = 0.9
+        moving_average_update(self.retrived_query[layer_id].query[:bs], query[:bs], 
+                              req_pool_indices[:bs], self.retrived_query[layer_id].req_pool_indices[:pre_bs], 
+                              moving_average_factor)
         self.retrived_query[layer_id].req_pool_indices[:bs] = req_pool_indices
         self.retrived_query[layer_id].seq_lens[:bs] = seq_lens
         self.retrived_query[layer_id].updated = True
+        self.retrived_query[layer_id].bs = bs
 
         self._call_after_update_query(
             key_cache=self.config.keys[layer_id],
@@ -254,6 +260,7 @@ class CacheManager:
     def call_after_init_cuda_graph(self):
         for layer_id in range(self.config.num_layers):
             self.retrived_query[layer_id].req_pool_indices.fill_(-1)
+            self.retrived_query[layer_id].query.fill_(0)
             self.retrived_result[layer_id].req_pool_indices.fill_(-1)
 
     def get_result(self, layer_id: int):
