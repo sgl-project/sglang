@@ -2272,7 +2272,7 @@ def run_benchmark(args_: argparse.Namespace):
 
     # Read dataset
     backend = args.backend
-    model_id = args.served_model_name if args.served_model_name is not None else args.model
+    model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
