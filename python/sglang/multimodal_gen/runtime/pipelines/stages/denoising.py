@@ -285,12 +285,13 @@ class DenoisingStage(PipelineStage):
                 z = z * self.vae.scaling_factor.to(z.device, z.dtype)
             else:
                 z = z * self.vae.scaling_factor
-            latent_model_input = latents.to(target_dtype).squeeze(0)
 
+            latent_model_input = latents.to(target_dtype).squeeze(0)
             _, mask2 = masks_like([latent_model_input], zero=True)
 
             latents = (1.0 - mask2[0]) * z + mask2[0] * latent_model_input
             latents = latents.to(get_local_torch_device())
+
             F = batch.num_frames
             temporal_scale = (
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
@@ -652,9 +653,9 @@ class DenoisingStage(PipelineStage):
                             batch=batch,
                         )
                     )
+
                     # Expand latents for I2V
                     latent_model_input = latents.to(target_dtype)
-
                     if batch.image_latent is not None:
                         assert (
                             not server_args.pipeline_config.ti2v_task
@@ -684,6 +685,7 @@ class DenoisingStage(PipelineStage):
                     latent_model_input = self.scheduler.scale_model_input(
                         latent_model_input, t_device
                     )
+
                     # Predict noise residual
                     attn_metadata = self._build_attn_metadata(i, batch, server_args)
                     noise_pred = self._predict_noise_with_cfg(

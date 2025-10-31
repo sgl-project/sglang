@@ -169,25 +169,11 @@ class ImageEncodingStage(PipelineStage):
         if self.image_encoder:
             # if an image encoder is provided
             with set_forward_context(current_timestep=0, attn_metadata=None):
-                print(f"{server_args.pipeline_config.image_encoder_extra_args=}")
                 outputs = self.image_encoder(
                     **image_inputs,
                     **server_args.pipeline_config.image_encoder_extra_args,
                 )
-                print(f"image after encoder: {outputs=}")
                 image_embeds = server_args.pipeline_config.postprocess_image(outputs)
-                print(f"{image_embeds=}")
-                # image_embeds = outputs.last_hidden_state
-                # image_embeds = outputs.last_hidden_states
-                # image_embeds = outputs.hidden_states[-2]
-                # print(f"{len(outputs.hidden_states)=}")
-                # print(f"{image_embeds.shape=}")
-                # print(f"{image_embeds=}")
-                #
-                # image_embeds = torch.load("/sgl-workspace/image_embeds").to(
-                #     get_local_torch_device()
-                # )
-                # print(f"loaded")
 
             batch.image_embeds.append(image_embeds)
         elif self.text_encoder:
@@ -503,9 +489,6 @@ class ImageVAEEncodingStage(PipelineStage):
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify encoding stage outputs."""
-        if batch.debug:
-            logger.debug(f"{batch.image_latent.shape=}")
-            logger.debug(f"{batch.image_latent=}")
         result = VerificationResult()
         result.add_check(
             "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
