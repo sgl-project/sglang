@@ -701,6 +701,7 @@ class Glm4MoeModel(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.vocab_size = config.vocab_size
+        self.first_k_dense_replace = config.first_k_dense_replace
         self.embed_dim = config.hidden_size
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
