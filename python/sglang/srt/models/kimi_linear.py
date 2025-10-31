@@ -125,9 +125,8 @@ class KimiMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = (
-            self.experts(hidden_states, topk_output) * self.routed_scaling_factor
-        )
+        final_hidden_states = self.experts(hidden_states, topk_output)
+
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
