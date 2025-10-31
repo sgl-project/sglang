@@ -182,7 +182,6 @@ class SGLangTestBalanceAnalyzer:
             "unit-test-backend-8-gpu-h20",
             "unit-test-backend-4-gpu-b200",
             "unit-test-backend-4-gpu-gb200",
-            "unit-test-backend-4-gpu-gb200-deepep",
             "unit-test-deepep-4-gpu",
             "unit-test-deepep-8-gpu",
             "unit-test-backend-8-gpu-deepseek-v32",
