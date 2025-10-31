@@ -497,7 +497,7 @@ class RadixCache(BasePrefixCache):
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
-            if len(x.parent.children) == 0:
+            if len(x.parent.children) == 0 and x.lock_ref == 0 and x != self.root_node:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
