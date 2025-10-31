@@ -26,6 +26,7 @@ import copy
 import gc
 import logging
 import math
+import os
 from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -518,6 +519,15 @@ def warmup_flash_attn(f):
     - Executes sequentially to minimize peak GPU mem
     - Does not modify user tensors (clones)
     """
+    disable_warmup = os.getenv("SGLANG_DISABLE_FA4_WARMUP", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if disable_warmup:
+        return f
+
     done = False
 
     def _clone_args(args, kwargs):
