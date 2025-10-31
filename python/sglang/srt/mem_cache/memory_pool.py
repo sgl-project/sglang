@@ -509,6 +509,7 @@ class MHATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
     ):
         super().__init__(
@@ -527,7 +528,9 @@ class MHATokenToKVPool(KVCache):
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
-        self.alt_stream = self.device_module.Stream() if _is_cuda else None
+        self.alt_stream = (
+            self.device_module.Stream() if _is_cuda and enable_alt_stream else None
+        )
 
         if enable_kv_cache_copy:
             self._init_kv_copy_and_warmup()
