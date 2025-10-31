@@ -39,6 +39,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
@@ -84,11 +85,16 @@ class ForwardMode(IntEnum):
     def is_prefill(self):
         return self.is_extend()
 
-    def is_extend(self):
+    def is_extend(self, include_draft_extend_v2: bool = False):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
+            or (
+                self == ForwardMode.DRAFT_EXTEND_V2
+                if include_draft_extend_v2
+                else False
+            )
             or self == ForwardMode.TARGET_VERIFY
         )
 
@@ -107,7 +113,11 @@ class ForwardMode(IntEnum):
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
-    def is_draft_extend(self):
+    def is_draft_extend(self, include_v2: bool = False):
+        if include_v2:
+            return (
+                self == ForwardMode.DRAFT_EXTEND_V2 or self == ForwardMode.DRAFT_EXTEND
+            )
         return self == ForwardMode.DRAFT_EXTEND
 
     def is_draft_extend_v2(self):
@@ -241,6 +251,8 @@ class ForwardBatch:
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether lse needs to be returned
     mha_return_lse: Optional[bool] = None
+    mha_one_shot_kv_indices: Optional[torch.Tensor] = None
+    mha_one_shot: Optional[bool] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -307,6 +319,9 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For matryoshka embeddings
+    dimensions: Optional[list[int]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -348,6 +363,7 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            dimensions=batch.dimensions,
         )
         device = model_runner.device
 
@@ -563,9 +579,15 @@ class ForwardBatch:
                         device=model_runner.device,
                     )
                 else:
-                    mrope_position_deltas = mm_input.mrope_position_delta.flatten().to(
-                        model_runner.device, non_blocking=True
-                    )
+                    if mm_input.mrope_position_delta.device.type != model_runner.device:
+                        # transfer mrope_position_delta to device when the first running,
+                        # avoiding successvie host-to-device data transfer
+                        mm_input.mrope_position_delta = (
+                            mm_input.mrope_position_delta.to(
+                                model_runner.device, non_blocking=True
+                            )
+                        )
+                    mrope_position_deltas = mm_input.mrope_position_delta.flatten()
                     mrope_positions_list[batch_idx] = (
                         (mrope_position_deltas + self.seq_lens[batch_idx] - 1)
                         .unsqueeze(0)
@@ -854,6 +876,10 @@ class ForwardBatch:
             self.token_to_kv_pool, MLATokenToKVPool
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
+        if not any(self.extend_prefix_lens_cpu):
+            self.num_prefix_chunks = 0
+            return
+
         if self.prefix_chunk_len is not None:
             # Chunked kv cache info already prepared by prior modules
             return
@@ -907,6 +933,34 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
+
+    def fetch_mha_one_shot_kv_indices(self):
+        if self.mha_one_shot_kv_indices is not None:
+            return self.mha_one_shot_kv_indices
+        batch_size = self.batch_size
+        paged_kernel_lens_sum = sum(self.seq_lens_cpu)
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum,
+            dtype=torch.int32,
+            device=self.req_pool_indices.device,
+        )
+        kv_indptr = torch.zeros(
+            batch_size + 1,
+            dtype=torch.int32,
+            device=self.req_pool_indices.device,
+        )
+        kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+        create_flashinfer_kv_indices_triton[(self.batch_size,)](
+            self.req_to_token_pool.req_to_token,
+            self.req_pool_indices,
+            self.seq_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token_pool.req_to_token.shape[1],
+        )
+        self.mha_one_shot_kv_indices = kv_indices
+        return kv_indices
 
 
 def enable_num_token_non_padded(server_args):

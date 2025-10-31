@@ -5,7 +5,6 @@ These tests focus on testing the validation logic in isolation,
 including parameter validation, URL validation, and configuration validation.
 """
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
