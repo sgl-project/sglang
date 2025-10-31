@@ -290,6 +290,7 @@ def handle_attention_ascend(attn, forward_batch):
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_target_verify()
         and not forward_batch.forward_mode.is_draft_extend()
+        and not forward_batch.forward_mode.is_draft_extend_v2()
     ):
         if hasattr(attn, "indexer"):
             return AttnForwardMethod.NPU_MLA_SPARSE
@@ -3753,8 +3754,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if not _is_npu:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        else:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

@@ -135,6 +135,8 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
+
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 NSA_CHOICES = [
@@ -188,6 +190,10 @@ def add_moe_runner_backend_choices(choices):
 
 def add_deterministic_attention_backend_choices(choices):
     DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
+def add_radix_supported_deterministic_attention_backend_choices(choices):
+    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend(choices)
 
 
 def add_radix_eviction_policy_choices(choices):
@@ -1753,13 +1759,17 @@ class ServerArgs:
                     f"but you explicitly specified '{self.attention_backend}'."
                 )
 
-            if self.attention_backend not in ["fa3", "triton"]:
-                if is_deepseek_model:
+            if is_deepseek_model:
+                if self.attention_backend not in ["fa3", "triton"]:
                     raise ValueError(
-                        f"Currently only fa3 and triton attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."
+                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."
                     )
 
-                # Currently, only FA3 and Triton supports radix cache. Support for other backends is in progress
+            if (
+                self.attention_backend
+                not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+            ):
+                # Currently, only certain backends support radix cache. Support for other backends is in progress
                 self.disable_radix_cache = True
                 logger.warning(
                     f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
