@@ -20,7 +20,7 @@ from enum import Enum, IntEnum, auto
 from typing import Any, List, Optional, Set, Union
 
 import torch
-from transformers import PretrainedConfig
+from transformers import GenerationConfig, PretrainedConfig
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
@@ -758,13 +758,12 @@ class ModelConfig:
         Returns:
             A dictionary containing the non-default sampling parameters.
         """
+
         if self.sampling_defaults != "model":
             return {}
 
         if self.hf_generation_config is None:
             return {}
-
-        config = self.hf_generation_config.to_dict()
 
         available_params = [
             "repetition_penalty",
@@ -773,10 +772,26 @@ class ModelConfig:
             "top_p",
             "min_p",
         ]
+        default_sampling_params: dict[str, Any] = {}
 
-        default_sampling_params = {
-            p: config.get(p) for p in available_params if config.get(p) is not None
-        }
+        base = GenerationConfig()
+
+        explicit_keys = getattr(self.hf_generation_config, "_explicit_keys", set())
+
+        for param in available_params:
+            value = getattr(self.hf_generation_config, param, None)
+            if value is None:
+                continue
+
+            # respect explicit keys from the JSON
+            if param in explicit_keys:
+                default_sampling_params[param] = value
+                continue
+
+            # otherwise, only include if it differs from HF base defaults
+            base_default = getattr(base, param, None)
+            if base_default is None or value != base_default:
+                default_sampling_params[param] = value
 
         return default_sampling_params
 
