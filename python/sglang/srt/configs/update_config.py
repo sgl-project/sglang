@@ -144,9 +144,6 @@ def adjust_config_with_unaligned_cpu_tp(
     )
     if hasattr(model_config.hf_config, "vision_config"):
         vision_cfg_obj = model_config.hf_config.vision_config
-        vision_cfg_obj.original_num_attention_heads = (
-            model_config.num_attention_heads
-        )
         att_heads = 0  # Initiate with an invalid value
         if hasattr(vision_cfg_obj, "num_attention_heads"):
             att_heads = vision_cfg_obj.num_attention_heads
@@ -160,7 +157,8 @@ def adjust_config_with_unaligned_cpu_tp(
             att_heads = pad_vocab_size(
                 att_heads, pad_size
             )
-            if vision_cfg_obj.model_type != "siglip_vision_model":
+            if vision_cfg_obj.model_type != "siglip_vision_model":  # Not applicable for Phi4MM
+                vision_cfg_obj.original_hidden_size = vision_cfg_obj.hidden_size
                 vision_cfg_obj.hidden_size = vision_cfg_obj.head_dim * att_heads
             if hasattr(vision_cfg_obj, "num_attention_heads"):
                 vision_cfg_obj.num_attention_heads = att_heads

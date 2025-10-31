@@ -352,9 +352,10 @@ class Llama4VisionModel(nn.Module):
             prefix=f"{prefix}.patch_embedding",
         )
 
-        self.class_embedding = nn.Parameter(self.scale * torch.randn(self.hidden_size))
+        orig_hidden_size = config.original_hidden_size if hasattr(config, "original_hidden_size") else self.hidden_size
+        self.class_embedding = nn.Parameter(self.scale * torch.randn(orig_hidden_size))
         self.positional_embedding_vlm = nn.Parameter(
-            self.scale * torch.randn(self.num_patches, self.hidden_size)
+            self.scale * torch.randn(self.num_patches, self.orig_hidden_size)
         )
 
         self.rotary_embedding = Llama4VisionRotaryEmbedding(config)
