@@ -2330,6 +2330,23 @@ class Scheduler(
                     f"{swa_available_size=}, "
                     f"{swa_evictable_size=}, "
                 )
+            elif self.is_hybrid_gdn:
+                (
+                    _,
+                    _,
+                    _,
+                    _,
+                    full_available_size,
+                    full_evictable_size,
+                    mamba_available_size,
+                    mamba_evictable_size,
+                ) = self._get_mamba_token_info()
+                info_msg = (
+                    f"{full_available_size=}, "
+                    f"{full_evictable_size=}, "
+                    f"{mamba_available_size=}, "
+                    f"{mamba_evictable_size=}, "
+                )
             else:
                 _, _, available_size, evictable_size = self._get_token_info()
                 info_msg = f"{available_size=}, " f"{evictable_size=}, "
@@ -2430,6 +2447,12 @@ class Scheduler(
                 - self.tree_cache.swa_evictable_size()
             )
             num_tokens = max(num_tokens_full, num_tokens_swa)
+        elif self.is_hybrid_gdn:
+            num_tokens = (
+                self.max_total_num_tokens
+                - self.token_to_kv_pool_allocator.available_size()
+                - self.tree_cache.full_evictable_size()
+            )
         else:
             num_tokens = (
                 self.max_total_num_tokens
