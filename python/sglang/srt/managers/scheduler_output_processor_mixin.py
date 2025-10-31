@@ -22,7 +22,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.tracing.trace import trace_slice
-from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -296,23 +295,9 @@ class SchedulerOutputProcessorMixin:
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
-            if self.enable_overlap and (req.finished() or req.is_retracted):
-                start_p, end_p = req.pop_overallocated_kv_cache()
-                if batch.spec_algorithm.is_eagle():
-                    if self.page_size > 1:
-                        start_p = ceil_align(start_p, self.page_size)
-
-                    indices_to_free = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx
-                    ][start_p:end_p]
-
-                    self.token_to_kv_pool_allocator.free(indices_to_free)
-                else:
-                    assert start_p == end_p, f"{start_p=}, {end_p=}"
-
-                continue
-
-            if req.is_retracted:
+            if req.finished() or req.is_retracted:
+                # NOTE: This can only happen when overlap scheduling is enabled.
+                # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
             new_accepted_len = 1
@@ -326,17 +311,6 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
-                if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
-                    # FIXME: remove this if branch
-                    start_p, end_p = req.pop_overallocated_kv_cache()
-                    if self.page_size > 1:
-                        start_p = ceil_align(start_p, self.page_size)
-
-                    indices_to_free = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx
-                    ][start_p:end_p]
-                    self.token_to_kv_pool_allocator.free(indices_to_free)
-
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
