@@ -33,11 +33,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
-    BasePrefixCache,
-    BasePrefixCacheMetricsMixin,
-    MatchResult,
-)
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
     FIFOStrategy,
@@ -47,7 +43,6 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -189,17 +184,17 @@ def _convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
     return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
 
 
-class RadixCache(BasePrefixCache, BasePrefixCacheMetricsMixin):
+class RadixCache(BasePrefixCache):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         disable: bool = False,
+        enable_metrics: bool = False,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
         is_eagle: bool = False,
-        server_args: Optional[ServerArgs] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -207,8 +202,10 @@ class RadixCache(BasePrefixCache, BasePrefixCacheMetricsMixin):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
-        self.init_metrics(server_args)
         self.is_eagle = is_eagle
+
+        if enable_metrics:
+            self.init_metrics_collector()
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device

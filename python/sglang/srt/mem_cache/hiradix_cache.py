@@ -21,7 +21,6 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.metrics.collector import StorageMetricsCollector
-from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,6 @@ class HiRadixCache(RadixCache):
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
         is_eagle: bool = False,
-        server_args: Optional[ServerArgs] = None,
     ):
 
         if hicache_io_backend == "direct":
@@ -141,7 +139,7 @@ class HiRadixCache(RadixCache):
             disable=False,
             eviction_policy=eviction_policy,
             is_eagle=is_eagle,
-            server_args=server_args,
+            enable_metrics=enable_metrics,
         )
 
     def _parse_storage_backend_extra_config(

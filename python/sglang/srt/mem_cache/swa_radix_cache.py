@@ -28,11 +28,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
-    BasePrefixCache,
-    BasePrefixCacheMetricsMixin,
-    MatchResult,
-)
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
@@ -41,7 +37,6 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_paged,
     get_child_key,
 )
-from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -325,7 +320,7 @@ class LRUList:
             raise Exception(msg)
 
 
-class SWARadixCache(BasePrefixCache, BasePrefixCacheMetricsMixin):
+class SWARadixCache(BasePrefixCache):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -334,7 +329,7 @@ class SWARadixCache(BasePrefixCache, BasePrefixCacheMetricsMixin):
         page_size: int,
         disable: bool = False,
         is_eagle: bool = False,
-        server_args: Optional[ServerArgs] = None,
+        enable_metrics: bool = False,
     ):
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
@@ -342,7 +337,6 @@ class SWARadixCache(BasePrefixCache, BasePrefixCacheMetricsMixin):
         self.page_size = page_size
         self.disable = disable
         self.is_eagle = is_eagle
-        self.init_metrics(server_args)
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -360,6 +354,9 @@ class SWARadixCache(BasePrefixCache, BasePrefixCacheMetricsMixin):
             self.key_convert_fn = _convert_to_bigram_key
         else:
             self.key_convert_fn = lambda key: key
+
+        if enable_metrics:
+            self.init_metrics_collector()
 
         self.sliding_window_size = sliding_window_size
         self.reset()
