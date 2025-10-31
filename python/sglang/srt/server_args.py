@@ -1022,6 +1022,11 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
+        elif model_arch in ["KimiLinearForCausalLM"]:
+            logger.warning(
+                f"Disabling Radix Cache for {model_arch} as it is not yet supported."
+            )
+            self.disable_radix_cache = True
 
         if is_deepseek_nsa(hf_config):
             if (
