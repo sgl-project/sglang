@@ -2221,7 +2221,7 @@ class TestGlm4MoeDetector(unittest.TestCase):
             self.assertIsInstance(
                 params["todos"],
                 list,
-                f"todos should be a list, not a string, {type(params["todos"])}",
+                f"todos should be a list, not a string",
             )
             self.assertEqual(len(params["todos"]), 4)
             self.assertEqual(params["todos"][0]["id"], "1")
