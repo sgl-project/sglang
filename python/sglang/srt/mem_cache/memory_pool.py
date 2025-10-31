@@ -509,7 +509,6 @@ class MHATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
     ):
         super().__init__(
@@ -528,9 +527,7 @@ class MHATokenToKVPool(KVCache):
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
-        self.alt_stream = (
-            self.device_module.Stream() if _is_cuda and enable_alt_stream else None
-        )
+        self.alt_stream = self.device_module.Stream() if _is_cuda else None
 
         if enable_kv_cache_copy:
             self._init_kv_copy_and_warmup()
@@ -1140,10 +1137,10 @@ class AscendTokenToKVPool(MHATokenToKVPool):
         torch_npu._npu_reshape_and_cache(
             key=cache_k,
             value=cache_v,
-            key_cache=self.k_buffer[layer_id].view(
+            key_cache=self.k_buffer[layer_id - self.start_layer].view(
                 -1, self.page_size, self.head_num, self.head_dim
             ),
-            value_cache=self.v_buffer[layer_id].view(
+            value_cache=self.v_buffer[layer_id - self.start_layer].view(
                 -1, self.page_size, self.head_num, self.head_dim
             ),
             slot_indices=loc,

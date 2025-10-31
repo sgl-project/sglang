@@ -29,6 +29,7 @@ from sglang.srt.utils import add_prefix
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
+import copy
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -201,6 +202,10 @@ class LlamaModel(nn.Module):
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
 
+        # idle batch
+        if hidden_states.shape[0] == 0:
+            return hidden_states, [hidden_states]
+
         residual = None
         hidden_states, residual = self.midlayer(
             positions,
@@ -257,7 +262,12 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
 
-        self.logits_processor = LogitsProcessor(config)
+        config_ = copy.deepcopy(config)
+        config_.vocab_size = (
+            config_.draft_vocab_size
+        )  # draft logits processor has it's own vocab size
+        self.logits_processor = LogitsProcessor(config_)
+
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
 

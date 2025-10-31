@@ -29,6 +29,7 @@ from typing import Deque, Dict, List, Optional, Tuple, Union
 import psutil
 import setproctitle
 import torch
+import torch.distributed
 import zmq
 from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
@@ -151,12 +152,12 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
+    trace_event_batch,
     trace_set_proc_propagate_context,
     trace_set_thread_info,
     trace_slice_batch,
@@ -198,6 +199,7 @@ logger = logging.getLogger(__name__)
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
+TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
@@ -213,7 +215,6 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
-    SchedulerMultiplexMixin,
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
 ):
@@ -253,7 +254,6 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
-        self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.enable_metrics_for_all_schedulers = (
@@ -286,10 +286,6 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
-
-        # Init pdmux context
-        if self.enable_pdmux:
-            self.init_pdmux()
 
         # Init tokenizer
         self.init_tokenizer()
@@ -383,6 +379,17 @@ class Scheduler(
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
+        # With DP attention enabled, the entry rank is attn_tp_rank==0;
+        # otherwise the entry rank is TP group local rank 0.
+        # For #11910, use the CPU communication group to broadcast VLM Python objects,
+        # avoiding any coupling with CUDA streams/devices.
+        if self.server_args.enable_dp_attention:
+            self.cpu_group = self.attn_tp_cpu_group
+            self.is_entry_rank = self.attn_tp_rank == 0
+        else:
+            self.cpu_group = self.tp_cpu_group
+            self.is_entry_rank = self.tp_group.rank == 0
+
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
@@ -419,8 +426,6 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
-        # The current split prefill batch
-        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
@@ -1140,6 +1145,70 @@ class Scheduler(
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
+    def _process_and_broadcast_mm_inputs(
+        self,
+        raw_mm_inputs: Optional[dict],
+    ):
+        """Materialize MultimodalInputs once on the entry rank and broadcast to others.
+
+        Entry rank:
+        - constructs MultimodalInputs.from_dict(raw_mm_inputs) once
+        - broadcasts to other ranks in self.cpu_group (if world_size > 1)
+
+        Non-entry ranks:
+        - receive the object via broadcast (if world_size > 1)
+        - otherwise (single-rank / no group) fall back to local from_dict
+
+        Returns:
+            MultimodalInputs | None
+        """
+        if raw_mm_inputs is None:
+            return None
+
+        group_world_size = 1
+        try:
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and self.cpu_group is not None
+            ):
+                group_world_size = torch.distributed.get_world_size(
+                    group=self.cpu_group
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to get world size in mm_inputs handling with {e}, fallback to 1."
+            )
+
+        # In case tp size > 1, all the Scheduler TP ranks runs the duplicated computing
+        # process in CPU which occupies the main thread CPU cycle. This computing logic
+        # merely needs to be run on TP0 and be broadcast to other TP ranks.
+        # Since the Scheduler is single-threaded, any large CPU cost will impact
+        # handling of other messages. For example, CPU hits 99.9% can significantly
+        # increase the CUDA kernel launch time.
+        if self.is_entry_rank:
+            # Only the entry rank materializes once from dict.
+            image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
+            # Broadcast to other TP ranks (use src=0 within the group).
+            if group_world_size > 1:
+                obj_list = [image_inputs]
+                torch.distributed.broadcast_object_list(
+                    obj_list, src=0, group=self.cpu_group
+                )
+                image_inputs = obj_list[0]
+        else:
+            # Non-entry ranks: receive if group size > 1; otherwise materialize locally.
+            if group_world_size > 1:
+                obj_list = [None]
+                torch.distributed.broadcast_object_list(
+                    obj_list, src=0, group=self.cpu_group
+                )
+                image_inputs = obj_list[0]
+            else:
+                image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
+
+        return image_inputs
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1221,7 +1290,9 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+            image_inputs = self._process_and_broadcast_mm_inputs(recv_req.mm_inputs)
+
+            # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -1354,7 +1425,7 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
-            trace_slice_end("process req", req.rid, auto_next_anon=True)
+            trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1451,7 +1522,7 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
-            image_inputs = MultimodalInputs.from_dict(recv_req.image_inputs)
+            image_inputs = self._process_and_broadcast_mm_inputs(recv_req.image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -1618,6 +1689,10 @@ class Scheduler(
         if need_dp_attn_preparation:
             ret = self.prepare_mlp_sync_batch(ret)
 
+        if ret:
+            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
+            trace_event_batch("schedule", ret.reqs, attrs=attrs)
+
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -1660,6 +1735,12 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
+
+        if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+            # If we are testing retraction and the running batch size exceeds
+            # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
+            # in the waiting queue.
+            return None
 
         # Prefill policy
         adder = PrefillAdder(
@@ -1827,14 +1908,14 @@ class Scheduler(
             self.num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
+                abort_reason: FINISH_ABORT = req.to_finish
                 self.send_to_tokenizer.send_output(
-                    AbortReq(abort_reason=req.to_abort_message, rid=req.rid), req
+                    AbortReq(abort_message=abort_reason.message, rid=req.rid), req
                 )
 
             logger.info(
                 "KV cache pool is full. Retract requests. "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
-                f"#aborted_retracted_reqs: {len(reqs_to_abort)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
             )
 
@@ -1873,6 +1954,7 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+
             batch_or_worker_batch = batch
 
             if self.enable_overlap or self.spec_algorithm.is_none():
@@ -1929,9 +2011,6 @@ class Scheduler(
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
-            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
@@ -1993,13 +2072,10 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
-            if self.enable_trace:
-                trace_slice_batch("decode loop", batch.reqs)
+            trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
 
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
-            if self.enable_trace:
-                trace_slice_batch("prefill", batch.reqs)
 
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
@@ -2543,11 +2619,11 @@ class Scheduler(
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
-                # Abort method 3: set `to_abort=True`
+                # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_abort = True
+                req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -2741,10 +2817,13 @@ def run_scheduler_process(
 
     # Set up tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-        if server_args.disaggregation_mode == "null":
-            thread_label = "Scheduler"
-            trace_set_thread_info(thread_label, tp_rank, dp_rank)
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        thread_label = "Scheduler"
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill Scheduler"
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode Scheduler"
+        trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
     # Create a scheduler and run the event loop
     try:
@@ -2767,9 +2846,7 @@ def run_scheduler_process(
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
-            if scheduler.enable_pdmux:
-                scheduler.event_loop_pdmux()
-            elif server_args.pp_size > 1:
+            if server_args.pp_size > 1:
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap()
