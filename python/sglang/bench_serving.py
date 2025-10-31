@@ -2272,7 +2272,7 @@ def run_benchmark(args_: argparse.Namespace):
 
     # Read dataset
     backend = args.backend
-    model_id = args.model
+    model_id = args.served_model_name if args.served_model_name is not None else args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
@@ -2370,6 +2370,11 @@ if __name__ == "__main__":
         "--model",
         type=str,
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        help="Name of the model served name in serving service. If not set, the default model served name will the same with args.model",
     )
     parser.add_argument(
         "--tokenizer",
