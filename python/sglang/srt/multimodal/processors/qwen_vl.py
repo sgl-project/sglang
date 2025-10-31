@@ -22,9 +22,6 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.utils import logger
 
-IMAGE_FACTOR = 28
-MIN_PIXELS = 4 * 28 * 28
-MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
 MAX_RATIO = 200
 RESIZE_RESAMPLE = getattr(Image, envs.SGLANG_RESIZE_RESAMPLE.get(), None)
 if envs.SGLANG_RESIZE_RESAMPLE.is_set() and RESIZE_RESAMPLE is None:
@@ -36,20 +33,15 @@ VIDEO_TOTAL_PIXELS = int(
     float(os.environ.get("VIDEO_MAX_PIXELS", 128000 * 28 * 28 * 0.9))
 )
 
-VIDEO_MIN_PIXELS = 128 * 28 * 28
-VIDEO_MAX_PIXELS = 768 * 28 * 28
 FRAME_FACTOR = 2
-FPS = 2.0
-FPS_MIN_FRAMES = 4
-FPS_MAX_FRAMES = 768
 
 
 def smart_resize(
     height: int,
     width: int,
-    factor: int = IMAGE_FACTOR,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
+    factor: int,
+    min_pixels: int,
+    max_pixels: int,
 ) -> tuple[int, int]:
     """
     Rescales the image so that the following conditions are met:
@@ -79,9 +71,9 @@ def smart_resize(
 
 def resize_image(
     image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
+    min_pixels: int,
+    max_pixels: int,
+    size_factor: int,
 ) -> Image.Image:
     width, height = image.size
     min_pixels = min_pixels
@@ -114,9 +106,9 @@ def floor_by_factor(number: int, factor: int) -> int:
 
 async def resize_image_async(
     image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
+    min_pixels: int,
+    max_pixels: int,
+    size_factor: int,
 ):
     return resize_image(image, min_pixels, max_pixels, size_factor)
 
@@ -125,9 +117,9 @@ def smart_nframes(
     ele: dict,
     total_frames: int,
     video_fps: int | float,
-    fps: int | float = FPS,
-    fps_min_frames: int = FPS_MIN_FRAMES,
-    fps_max_frames: int = FPS_MAX_FRAMES,
+    fps: int | float,
+    fps_min_frames: int,
+    fps_max_frames: int,
 ) -> int:
     """calculate the number of frames for video used for model inputs.
 
@@ -178,12 +170,12 @@ def smart_nframes(
 # process video, qwen-specific
 async def preprocess_video(
     vr,
-    image_factor: int = IMAGE_FACTOR,
-    video_min_pixels: int = VIDEO_MIN_PIXELS,
-    video_max_pixels: int = VIDEO_MAX_PIXELS,
-    fps: int | float = FPS,
-    fps_min_frames: int = FPS_MIN_FRAMES,
-    fps_max_frames: int = FPS_MAX_FRAMES,
+    image_factor: int,
+    video_min_pixels: int,
+    video_max_pixels: int,
+    fps: int | float,
+    fps_min_frames: int,
+    fps_max_frames: int,
     # vr: VideoReader, image_factor: int = IMAGE_FACTOR
 ) -> torch.Tensor:
     ele = {}
@@ -271,15 +263,16 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         self.NUM_TOKEN_PER_FRAME = 770
         # Use global defaults for other model types
+
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
-        self.MAX_RATIO = 200
-        self.VIDEO_MIN_PIXELS = VIDEO_MIN_PIXELS
-        self.VIDEO_MAX_PIXELS = VIDEO_MAX_PIXELS
-        self.FPS = FPS
-        self.FPS_MIN_FRAMES = FPS_MIN_FRAMES
-        self.FPS_MAX_FRAMES = FPS_MAX_FRAMES
+        self.MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
+
+        self.VIDEO_MIN_PIXELS = 128 * 28 * 28
+        self.VIDEO_MAX_PIXELS = 768 * 28 * 28
+        self.FPS = 2.0
+        self.FPS_MIN_FRAMES = 4
+        self.FPS_MAX_FRAMES = 768
 
         # Dynamically extract preprocessing parameters from processor for qwen3_vl models
         image_processor = getattr(_processor, "image_processor", None)
@@ -287,7 +280,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         if hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
             # Extract image processing parameters from processor if available
-            if not image_processor:
+            if image_processor:
                 size = getattr(image_processor, "size", {})
                 if size:
                     self.MIN_PIXELS = size.get("shortest_edge", 64 * 32 * 32)
@@ -299,8 +292,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             # Extract video processing parameters from video processor if available
             if video_processor:
                 video_size = getattr(video_processor, "size", {})
-                self.VIDEO_MIN_PIXELS = video_size.get("shortest_edge", 128 * 32 * 32)
-                self.VIDEO_MAX_PIXELS = video_size.get("longest_edge", 32 * 32 * 768)
+                self.VIDEO_MIN_PIXELS = video_size.get("shortest_edge", 4 * 32 * 32)
+                self.VIDEO_MAX_PIXELS = video_size.get("longest_edge", 32 * 32 * 24576)
                 self.FPS = getattr(video_processor, "fps", 2)
                 self.FPS_MIN_FRAMES = getattr(video_processor, "min_frames", 4)
                 self.FPS_MAX_FRAMES = getattr(video_processor, "max_frames", 768)
