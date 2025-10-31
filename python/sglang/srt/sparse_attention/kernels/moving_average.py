@@ -10,15 +10,15 @@ def moving_average_kernel(
     prev_req_pool_indices: tl.tensor,
     moving_average_factor: tl.constexpr,
     pre_bs: int,
-    cur_bs: int,
     q_stride_b: tl.constexpr,
+    new_q_stride_b: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     start_m = tl.program_id(1)
-    offs_m = pid * q_stride_b + start_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    q_ptr = query + offs_m
-    new_q_ptr = new_query + offs_m
+    offs_m = start_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    q_ptr = query + offs_m + pid * q_stride_b
+    new_q_ptr = new_query + offs_m + pid * new_q_stride_b
     factor = tl.full([], moving_average_factor, dtype=query.dtype.element_ty)
     cur_req_pool_idx = tl.load(cur_req_pool_indices + pid)
     
@@ -43,7 +43,8 @@ def moving_average_update(query: torch.Tensor, new_query: torch.Tensor, cur_req_
     BLOCK_SIZE = 64
     assert query.shape[1] % BLOCK_SIZE == 0
     grid = (cur_bs, query.shape[1] // BLOCK_SIZE)
-    moving_average_kernel[grid](query, new_query, cur_req_pool_indices, prev_req_pool_indices, moving_average_factor, pre_bs, cur_bs, query.stride(0), BLOCK_SIZE)
+    moving_average_kernel[grid](query, new_query, cur_req_pool_indices, prev_req_pool_indices, 
+                                moving_average_factor, pre_bs, query.stride(0), new_query.stride(0), BLOCK_SIZE)
 
 
 
