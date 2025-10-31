@@ -294,7 +294,7 @@ RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -
     && cd /sgl-workspace/sglang/sgl-router \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && python3 -m pip install --force-reinstall dist/*.whl \
-    && rm -rf /root/.cache /root/.cargo /root/.rustup target dist ~/.cargo
+    && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo
 
 
 # Add yank script
