@@ -171,7 +171,6 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
-    disable_request_logging,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -180,7 +179,6 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     numa_bind_to_node,
     point_to_point_pyobj,
-    pyspy_dump_schedulers,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
@@ -2305,59 +2303,6 @@ class Scheduler(
         for req in self.grammar_queue[:num_ready_reqs]:
             self._add_request_to_queue(req)
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
-
-    def watchdog_thread(self):
-        """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
-        self.watchdog_last_forward_ct = 0
-        self.watchdog_last_time = time.perf_counter()
-
-        while True:
-            current = time.perf_counter()
-            if self.cur_batch is not None:
-                if self.watchdog_last_forward_ct == self.forward_ct:
-                    if current > self.watchdog_last_time + self.watchdog_timeout:
-                        break
-                else:
-                    self.watchdog_last_forward_ct = self.forward_ct
-                    self.watchdog_last_time = current
-            time.sleep(self.watchdog_timeout // 2)
-
-        if not disable_request_logging():
-            # Print batch size and memory pool info to check whether there are de-sync issues.
-            if self.is_hybrid:
-                (
-                    _,
-                    _,
-                    _,
-                    _,
-                    full_available_size,
-                    full_evictable_size,
-                    swa_available_size,
-                    swa_evictable_size,
-                ) = self._get_swa_token_info()
-                info_msg = (
-                    f"{full_available_size=}, "
-                    f"{full_evictable_size=}, "
-                    f"{swa_available_size=}, "
-                    f"{swa_evictable_size=}, "
-                )
-            else:
-                _, _, available_size, evictable_size = self._get_token_info()
-                info_msg = f"{available_size=}, " f"{evictable_size=}, "
-            logger.error(
-                f"{self.cur_batch.batch_size()=}, "
-                f"{self.cur_batch.reqs=}, "
-                f"{info_msg}"
-            )
-
-        pyspy_dump_schedulers()
-        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
-        print(file=sys.stderr, flush=True)
-        print(file=sys.stdout, flush=True)
-
-        # Wait for some time so that the parent process can print the error.
-        time.sleep(5)
-        self.parent_process.send_signal(signal.SIGQUIT)
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
