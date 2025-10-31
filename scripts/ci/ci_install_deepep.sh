@@ -19,12 +19,11 @@ fi
 
 if [ "$ARCH" = "x86_64" ]; then
     # Install Mooncake+EP
-    curl -L https://cloud.tsinghua.edu.cn/f/c22ec766545e48bf99e8/?dl=1 -o mooncake_transfer_engine-0.3.6.post1+ep-cp310-cp310-manylinux_2_17_${ARCH}.manylinux_2_35_${ARCH}.whl
+    curl -L https://cloud.tsinghua.edu.cn/f/c22ec766545e48bf99e8/?dl=1 -o mooncake_transfer_engine-0.3.6.post1+ep-cp310-cp310-manylinux_2_17_x86_64.manylinux_2_35_x86_64.whl
+    UV_SYSTEM_PYTHON=true uv pip install mooncake_transfer_engine-0.3.6.post1+ep-cp310-cp310-manylinux_2_17_x86_64.manylinux_2_35_x86_64.whl
 else
-    # Use GitHub releases for ARM; This uses a released version of Mooncake and might be different from the one from Tsinghua.
-    curl -L "https://github.com/kvcache-ai/Mooncake/releases/download/v0.3.6.post1/mooncake_transfer_engine-0.3.6.post1-cp310-cp310-manylinux_2_17_${ARCH}.manylinux_2_35_${ARCH}.whl" -O
+    echo "Skipping Mooncake+EP installation for ARM architecture"
 fi
-UV_SYSTEM_PYTHON=true uv pip install mooncake_transfer_engine-0.3.6.post1*-cp310-cp310-manylinux_2_17_${ARCH}.manylinux_2_35_${ARCH}.whl
 
 if python3 -c "import deep_ep" >/dev/null 2>&1; then
     echo "deep_ep is already installed or importable. Skipping installation."
