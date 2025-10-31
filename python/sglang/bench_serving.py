@@ -2374,7 +2374,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--served-model-name",
         type=str,
-        help="Name of the model served name in serving service. If not set, the default model served name will the same with args.model",
+        help="The name of the model as served by the serving service. If not set, this defaults to the value of --model.",
     )
     parser.add_argument(
         "--tokenizer",
