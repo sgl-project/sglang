@@ -14,7 +14,6 @@ from transformers import (
 from sglang.srt.multimodal.customized_mm_processor_utils import (
     register_customized_processor,
 )
-
 from sglang.srt.sampling.custom_logit_processor import (
     DeepseekOCRNoRepeatNGramLogitProcessor,
 )
