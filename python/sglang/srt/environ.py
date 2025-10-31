@@ -256,6 +256,9 @@ class Envs:
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
+    # Tool-Call behavior
+    SGLANG_TOOL_STRICT_LEVEL = EnvInt(0)  # 0: off, 1: function strict, 2: parameter strict
+
     # fmt: on
 
 
