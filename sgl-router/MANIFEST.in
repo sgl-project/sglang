@@ -1,5 +1,7 @@
 # Must include:
 include Cargo.toml        # Rust project configuration
 include build.rs          # Build script for protobuf generation
+include ../LICENSE
 recursive-include src *.rs  # Rust source files
 recursive-include src/proto *.proto  # Protobuf definitions
+recursive-include py_src *.py  # Python source files

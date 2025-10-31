@@ -376,6 +376,15 @@ def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
 
 def save_configs(
     configs: Dict[int, BenchmarkConfig],
+    filename: str,
+) -> None:
+    print(f"Writing best config to {filename}...")
+    with open(filename, "w") as f:
+        json.dump(configs, f, indent=4)
+        f.write("\n")
+
+
+def get_filename(
     num_experts: int,
     shard_intermediate_size: int,
     hidden_size: int,
@@ -404,10 +413,7 @@ def save_configs(
         per_channel_quant,
     )
 
-    print(f"Writing best config to {filename}...")
-    with open(filename, "w") as f:
-        json.dump(configs, f, indent=4)
-        f.write("\n")
+    return filename
 
 
 def main(args: argparse.Namespace):
@@ -541,7 +547,22 @@ def main(args: argparse.Namespace):
                 for config in search_space
                 if block_k % config["BLOCK_SIZE_K"] == 0
             ]
-        print(f"Start tuning over {len(search_space)} configurations...")
+
+        filename = get_filename(
+            E,
+            shard_intermediate_size,
+            hidden_size,
+            topk,
+            dtype,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            per_channel_quant,
+            block_shape,
+        )
+        print(
+            f"Start tuning over {len(search_space)} configurations to create {filename}..."
+        )
 
         start = time.perf_counter()
         configs = _distribute(
@@ -569,16 +590,7 @@ def main(args: argparse.Namespace):
         }
         save_configs(
             best_configs,
-            E,
-            shard_intermediate_size,
-            hidden_size,
-            topk,
-            dtype,
-            use_fp8_w8a8,
-            use_int8_w8a8,
-            use_int8_w8a16,
-            per_channel_quant,
-            block_shape,
+            filename,
         )
         end = time.perf_counter()
         print(f"Tuning took {end - start:.2f} seconds")

@@ -13,16 +13,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.attention.mamba.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-    causal_conv1d_fn as causal_conv1d_fn_triton,
-)
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-    causal_conv1d_update as causal_conv1d_update_triton,
-)
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.attention.mamba.ops import (
@@ -40,7 +30,26 @@ from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
+
+if is_cuda():
+    from sglang.srt.layers.attention.mamba.causal_conv1d import (
+        causal_conv1d_fn,
+        causal_conv1d_update,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn as causal_conv1d_fn_triton,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_update as causal_conv1d_update_triton,
+    )
+elif is_npu():
+    from sgl_kernel_npu.mamba.causal_conv1d import (
+        causal_conv1d_fn_npu as causal_conv1d_fn,
+    )
+    from sgl_kernel_npu.mamba.causal_conv1d import (
+        causal_conv1d_update_npu as causal_conv1d_update,
+    )
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
 

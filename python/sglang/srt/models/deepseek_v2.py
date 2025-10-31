@@ -21,7 +21,7 @@ import concurrent.futures
 import logging
 import os
 from enum import IntEnum, auto
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -131,13 +131,11 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cpu,
     is_cuda,
-    is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
     is_nvidia_cublas_cu12_version_ge_12_9,
-    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -197,8 +195,6 @@ elif _is_npu:
 else:
     pass
 
-_is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and is_sm100_supported()
 _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
 logger = logging.getLogger(__name__)
@@ -226,6 +222,17 @@ def add_forward_absorb_core_attention_backend(backend_name):
     if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
         FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
         logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
+
+
+def is_nsa_indexer_wk_and_weights_proj_fused(config, quant_config):
+    """
+    NSA Indexer wk and weights_proj can be fused in FP4 model because they are both in BF16
+    """
+    return (
+        is_deepseek_nsa(config)
+        and quant_config is not None
+        and quant_config.get_name() == "modelopt_fp4"
+    )
 
 
 class AttnForwardMethod(IntEnum):
@@ -283,6 +290,7 @@ def handle_attention_ascend(attn, forward_batch):
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_target_verify()
         and not forward_batch.forward_mode.is_draft_extend()
+        and not forward_batch.forward_mode.is_draft_extend_v2()
     ):
         if hasattr(attn, "indexer"):
             return AttnForwardMethod.NPU_MLA_SPARSE
@@ -350,7 +358,11 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 
 def handle_attention_fa3(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "fa3")
+    # when deterministic inference is enabled, use MLA
+    if get_global_server_args().enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)
+    else:
+        return _handle_attention_backend(attn, forward_batch, "fa3")
 
 
 def handle_attention_flashmla(attn, forward_batch):
@@ -394,6 +406,10 @@ def handle_attention_nsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
+    # when deterministic inference is enabled, use MLA
+    if get_global_server_args().enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)
+
     if (
         _is_extend_without_speculative(forward_batch)
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
@@ -510,6 +526,9 @@ class MoEGate(nn.Module):
                 None,  # bias
                 True,  # is_vnni
             )
+
+        if get_global_server_args().enable_deterministic_inference:
+            return F.linear(hidden_states, self.weight, None)
 
         # NOTE: For some unknown reason, router_gemm seems degrade accept length.
         if (
@@ -997,16 +1016,14 @@ class DeepseekV2MoE(nn.Module):
                 )
 
     def op_experts(self, state):
-        state.hidden_states_experts_output = self.experts.run_moe_core(
+        state.combine_input = self.experts.run_moe_core(
             dispatch_output=state.dispatch_output,
         )
 
     def op_combine_a(self, state):
         if self.ep_size > 1:
             self.experts.dispatcher.combine_a(
-                hidden_states=state.pop("hidden_states_experts_output"),
-                topk_ids=state.dispatch_output.topk_ids,
-                topk_weights=state.dispatch_output.topk_weights,
+                combine_input=state.pop("combine_input"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
             state.pop("dispatch_output")
@@ -1138,6 +1155,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 quant_config=quant_config,
                 layer_id=layer_id,
                 alt_stream=alt_stream,
+                fuse_wk_and_weights_proj=is_nsa_indexer_wk_and_weights_proj_fused(
+                    config, quant_config
+                ),
             )
 
         self.kv_b_proj = ColumnParallelLinear(
@@ -1254,7 +1274,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
             and _is_cuda
-            and _device_sm >= 90
+            and 90 <= _device_sm < 120
         )
 
         self.qkv_proj_with_rope_is_int8 = (
@@ -2822,6 +2842,7 @@ class DeepseekV2Model(nn.Module):
                     self.embed_tokens.embedding_dim,
                 )
             )
+        self.layers_to_capture = []
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -2878,9 +2899,11 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = self.first_k_dense_replace
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
-
+        aux_hidden_states = []
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -2918,7 +2941,9 @@ class DeepseekV2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class DeepseekV2ForCausalLM(nn.Module):
@@ -2972,6 +2997,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 if isinstance(layer.mlp, DeepseekV2MoE)
             }
         )
+        self.capture_aux_hidden_states = False
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -2996,7 +3022,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
-        elif self.quant_config.get_name() == "w4afp8":
+        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
@@ -3025,10 +3051,13 @@ class DeepseekV2ForCausalLM(nn.Module):
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return hidden_states
@@ -3287,8 +3316,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 experts = layer.mlp.experts
                 if isinstance(experts, DeepEPMoE):
                     for w in [
-                        experts.w13_weight_fp8,
-                        experts.w2_weight_fp8,
+                        (experts.w13_weight, experts.w13_weight_scale_inv),
+                        (experts.w2_weight, experts.w2_weight_scale_inv),
                     ]:
                         requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
             else:
@@ -3336,10 +3365,26 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
 
         experts = layer.mlp.experts
+        w13_weight_fp8 = (
+            experts.w13_weight,
+            (
+                experts.w13_weight_scale_inv
+                if hasattr(experts, "w13_weight_scale_inv")
+                else experts.w13_weight_scale
+            ),
+        )
+        w2_weight_fp8 = (
+            experts.w2_weight,
+            (
+                experts.w2_weight_scale_inv
+                if hasattr(experts, "w2_weight_scale_inv")
+                else experts.w2_weight_scale
+            ),
+        )
         if isinstance(experts, DeepEPMoE):
             for w in [
-                experts.w13_weight_fp8,
-                experts.w2_weight_fp8,
+                w13_weight_fp8,
+                w2_weight_fp8,
             ]:
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 
@@ -3392,6 +3437,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
+        fuse_wk_and_weights_proj = is_nsa_indexer_wk_and_weights_proj_fused(
+            self.config, self.quant_config
+        )
+        cached_wk_and_weights_proj = {} if fuse_wk_and_weights_proj else None
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -3563,6 +3612,53 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 )
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
+                        elif fuse_wk_and_weights_proj and (
+                            "wk" in name or "weights_proj" in name
+                        ):
+                            cached_wk_and_weights_proj[name] = loaded_weight
+                            wk_name = (
+                                name
+                                if "wk" in name
+                                else name.replace("weights_proj", "wk")
+                            )
+                            weights_proj_name = (
+                                name
+                                if "weights_proj" in name
+                                else name.replace("wk", "weights_proj")
+                            )
+
+                            # When both wk and weights_proj has been cached, load the fused weight to parameter
+                            if (
+                                wk_name in cached_wk_and_weights_proj
+                                and weights_proj_name in cached_wk_and_weights_proj
+                            ):
+                                wk_weight = cached_wk_and_weights_proj[wk_name]
+                                weights_proj_weight = cached_wk_and_weights_proj[
+                                    weights_proj_name
+                                ]
+                                # todo dequantize wk for fp8
+                                assert wk_weight.dtype == weights_proj_weight.dtype
+                                fused_weight = torch.cat(
+                                    [wk_weight, weights_proj_weight], dim=0
+                                )
+                                param_name = (
+                                    name.replace("wk", "fused_wk_and_weights_proj")
+                                    if "wk" in name
+                                    else name.replace(
+                                        "weights_proj",
+                                        "fused_wk_and_weights_proj",
+                                    )
+                                )
+                                param = params_dict[param_name]
+
+                                weight_loader = getattr(
+                                    param, "weight_loader", default_weight_loader
+                                )
+                                futures.append(
+                                    executor.submit(weight_loader, param, fused_weight)
+                                )
+                                cached_wk_and_weights_proj.pop(wk_name)
+                                cached_wk_and_weights_proj.pop(weights_proj_name)
                         else:
                             if (
                                 "k_scale" in name or "v_scale" in name
@@ -3658,8 +3754,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if not _is_npu:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        else:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -3668,6 +3768,20 @@ class DeepseekV2ForCausalLM(nn.Module):
             num_logical_experts=config.n_routed_experts,
             num_groups=config.n_group,
         )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)

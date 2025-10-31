@@ -9,6 +9,22 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+from sglang.srt.utils.common import calc_diff, get_bool_env_var
+
+if ENABLE_JIT_DEEPGEMM:
+    import deep_gemm
+
+_ENABLE_MM_DEEPGEMM = get_bool_env_var(
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
+)
+_ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"
+)
+
+if not _ENABLE_MM_DEEPGEMM:
+    print("Disable DeepGEMM in batch invariant ops. Performance may be suboptimal.")
+
 __all__ = [
     "set_batch_invariant_mode",
     "is_batch_invariant_mode_enabled",
@@ -140,7 +156,7 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-def matmul_persistent(
+def _matmul_persistent_triton(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
     # Check constraints.
@@ -215,6 +231,54 @@ def matmul_persistent(
         **configs[dtype],
     )
     return c
+
+
+def _matmul_persistent_deepgemm(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+):
+    M, K = a.shape
+    K, N = b.shape
+    dtype = a.dtype
+    out = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    deep_gemm.bf16_gemm_nn(a, b, out)
+
+    # TODO can this be put in DeepGEMM's `c`?
+    if bias is not None:
+        out += bias
+
+    return out
+
+
+def matmul_persistent(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+):
+    if (
+        _ENABLE_MM_DEEPGEMM
+        and ENABLE_JIT_DEEPGEMM
+        and (a.dtype == torch.bfloat16)
+        and (b.dtype == torch.bfloat16)
+        and a.is_contiguous()
+        and b.transpose(0, 1).is_contiguous()
+    ):
+        if _ENABLE_MM_COMPARISON_TEST:
+            out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
+            out_deepgemm = _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+            diff = calc_diff(out_triton, out_deepgemm)
+            assert diff < 0.0001, f"{diff=} {out_triton=} {out_deepgemm=}"
+            # can be enabled for debugging
+            # print(
+            #     f"{diff=} "
+            #     f"{(out_triton - out_deepgemm).abs().mean()=} "
+            #     f"{(out_triton - out_deepgemm).abs().sum()=} "
+            #     f"{torch.sum(out_triton != out_deepgemm)=} "
+            # )
+            # print(f"{a=} {b=} {bias=} {out_triton=} {out_deepgemm=}")
+            return out_deepgemm
+
+        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+
+    return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
 
 @triton.jit
@@ -495,16 +559,159 @@ def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = 
         return torch.sum(input, dim=dim, keepdim=keepdim, dtype=torch.float32) / n_elems
 
 
+def bmm_batch_invariant(a, b, *, out=None):
+    # Batched matrix multiply: (B, M, K) x (B, K, N) -> (B, M, N)
+    # Process each batch separately with our persistent kernel
+    if a.ndim == 3 and b.ndim == 3:
+        results = []
+        for i in range(a.shape[0]):
+            results.append(matmul_persistent(a[i], b[i]))
+        result = torch.stack(results, dim=0)
+
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+    else:
+        raise ValueError(
+            f"bmm_batch_invariant expects 3D tensors, "
+            f"got shapes {a.shape} and {b.shape}"
+        )
+
+
+@triton.jit
+def _rms_norm_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    input_row_stride,
+    output_row_stride,
+    n_cols,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Compute RMS normalization along the last dimension of a 2D tensor.
+    RMS Norm: y = x / sqrt(mean(x^2) + eps) * weight
+    Each block handles one row of the input tensor.
+    """
+    row_idx = tl.program_id(0).to(tl.int64)
+    row_start_ptr = input_ptr + row_idx * input_row_stride
+    output_row_start_ptr = output_ptr + row_idx * output_row_stride
+
+    # Step 1: Compute sum of squares in float32 to avoid overflow
+    sum_sq = tl.zeros([1], dtype=tl.float32)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+
+        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
+        # Convert to float32 for accumulation to prevent overflow
+        vals_f32 = vals.to(tl.float32)
+        sq_vals = vals_f32 * vals_f32
+        sum_sq += tl.sum(tl.where(mask, sq_vals, 0.0))
+
+    # Step 2: Compute RMS (root mean square) in float32
+    mean_sq = sum_sq / n_cols
+    rms = tl.sqrt(mean_sq + eps)
+    inv_rms = 1.0 / rms
+
+    # Step 3: Normalize and apply weight
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
+        weight = tl.load(weight_ptr + col_idx, mask=mask, other=1.0)
+        # Compute in float32 then convert back to input dtype
+        vals_f32 = vals.to(tl.float32)
+        weight_f32 = weight.to(tl.float32)
+        output_f32 = vals_f32 * inv_rms * weight_f32
+        output = output_f32.to(vals.dtype)
+        tl.store(output_row_start_ptr + col_idx, output, mask=mask)
+
+
+def rms_norm(
+    input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Compute RMS normalization using Triton kernel.
+
+    RMS Norm normalizes the input by the root mean square and scales by weight:
+    output = input / sqrt(mean(input^2) + eps) * weight
+
+    Args:
+        input: Input tensor of shape (..., hidden_size)
+        weight: Weight tensor of shape (hidden_size,)
+        eps: Small constant for numerical stability
+
+    Returns:
+        Tensor with RMS normalization applied along the last dimension
+    """
+    assert weight.dim() == 1, "Weight must be 1-dimensional"
+    assert input.shape[-1] == weight.shape[0], (
+        f"Input last dimension ({input.shape[-1]}) must match "
+        f"weight dimension ({weight.shape[0]})"
+    )
+
+    # Flatten all dimensions except the last one
+    original_shape = input.shape
+    input_2d = input.reshape(-1, input.shape[-1])
+    input_2d = input_2d.contiguous()
+    weight = weight.contiguous()
+
+    n_rows, n_cols = input_2d.shape
+
+    output = torch.empty_like(input_2d)
+    BLOCK_SIZE = 1024
+    grid = (n_rows,)
+    _rms_norm_kernel[grid](
+        input_2d,
+        weight,
+        output,
+        input_2d.stride(0),
+        output.stride(0),
+        n_cols,
+        eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return output.reshape(original_shape)
+
+
+def rms_norm_batch_invariant(
+    input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Batch-invariant wrapper for RMS normalization.
+
+    This function provides a deterministic, batch-invariant implementation
+    of RMS normalization for use with the batch_invariant mode.
+
+    Adapted from @https://github.com/vllm-project/vllm/blob/66a168a197ba214a5b70a74fa2e713c9eeb3251a/vllm/model_executor/layers/batch_invariant.py#L649
+
+    Args:
+        input: Input tensor of shape (..., hidden_size)
+        weight: Weight tensor of shape (hidden_size,)
+        eps: Small constant for numerical stability
+
+    Returns:
+        RMS normalized tensor
+    """
+    return rms_norm(input, weight, eps=eps)
+
+
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
+_original_torch_bmm = None
 
 
 def is_batch_invariant_mode_enabled():
     return _batch_invariant_MODE
 
 
-def enable_batch_invariant_mode():
-    global _batch_invariant_MODE, _batch_invariant_LIB
+def enable_batch_invariant_mode(
+    enable_bmm: bool = True,
+):
+    global _batch_invariant_MODE, _batch_invariant_LIB, _original_torch_bmm
     if _batch_invariant_MODE:
         return
 
@@ -517,11 +724,21 @@ def enable_batch_invariant_mode():
     )
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, "CUDA")
 
+    if enable_bmm:
+        _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, "CUDA")
+
+        # Also monkeypatch torch.bmm directly as a fallback
+        _original_torch_bmm = torch.bmm
+        torch.bmm = bmm_batch_invariant
+
 
 def disable_batch_invariant_mode():
-    global _batch_invariant_MODE, _batch_invariant_LIB
+    global _batch_invariant_MODE, _batch_invariant_LIB, _original_torch_bmm
     if _batch_invariant_LIB is not None:
         _batch_invariant_LIB._destroy()
+    if _original_torch_bmm is not None:
+        torch.bmm = _original_torch_bmm
+        _original_torch_bmm = None
     _batch_invariant_MODE = False
     _batch_invariant_LIB = None
 

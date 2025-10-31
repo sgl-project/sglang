@@ -25,6 +25,13 @@ from sglang.srt.utils import (
     is_hip,
 )
 
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _support_tensor_descriptor = True
+except:
+    _support_tensor_descriptor = False
+
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -39,6 +46,10 @@ elif _is_hip:
     pass
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+
+
+def support_tensor_descriptor():
+    return _support_tensor_descriptor
 
 
 @triton.jit
@@ -108,6 +119,7 @@ def fused_moe_kernel_gptq_awq(
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
+    filter_expert: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -161,7 +173,7 @@ def fused_moe_kernel_gptq_awq(
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    if off_experts == -1:
+    if filter_expert and off_experts == -1:
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
         # in the current expert parallel rank.
@@ -296,7 +308,9 @@ def fused_moe_kernel_gptq_awq(
 def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
+    a_desc,
     b_ptr,
+    b_desc,
     bias_ptr,
     c_ptr,
     a_scale_ptr,
@@ -344,6 +358,8 @@ def fused_moe_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
+    c_sorted: tl.constexpr,
+    filter_expert: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -399,9 +415,10 @@ def fused_moe_kernel(
     offs_token = offs_token.to(tl.int64)
     token_mask = offs_token < num_valid_tokens
 
-    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    off_experts_i32 = tl.load(expert_ids_ptr + pid_m)
+    off_experts = off_experts_i32.to(tl.int64)
 
-    if off_experts == -1:
+    if filter_expert and off_experts == -1:
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
         # in the current expert parallel rank.
@@ -421,15 +438,23 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (
-        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-    )
+    if a_desc is not None:
+        assert use_fp8_w8a8 and group_n > 0 and group_k > 0
+        start_offs_m = pid_m * BLOCK_SIZE_M
+    else:
+        a_ptrs = a_ptr + (
+            offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+        )
 
-    b_ptrs = (
-        b_ptr
-        + off_experts * stride_be
-        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-    )
+    if b_desc is not None:
+        start_offs_n = pid_n * BLOCK_SIZE_N
+    else:
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        )
+
     if bias_ptr is not None:
         bias = tl.load(
             bias_ptr + off_experts * stride_bias_e + offs_bn[None, :] * stride_bias_n
@@ -443,8 +468,14 @@ def fused_moe_kernel(
     if use_fp8_w8a8 or use_int8_w8a8:
         # block-wise
         if group_k > 0 and group_n > 0:
-            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-            offs_bsn = offs_bn // group_n
+            if a_desc is not None:
+                a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
+            else:
+                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            if BLOCK_SIZE_N > group_n:
+                offs_bsn = offs_bn // group_n
+            else:
+                offs_bsn = pid_n * BLOCK_SIZE_N // group_n
             b_scale_ptrs = (
                 b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
             )
@@ -469,37 +500,49 @@ def fused_moe_kernel(
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k_start in range(0, K, BLOCK_SIZE_K):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
-        if even_Ks:
+        if a_desc is not None:
+            a = a_desc.load([start_offs_m, k_start])
+        elif even_Ks:
             a = tl.load(
                 a_ptrs,
                 mask=token_mask[:, None],
                 other=0.0,
             )
-            b = tl.load(b_ptrs)
         else:
             a = tl.load(
                 a_ptrs,
-                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k_start),
                 other=0.0,
             )
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+
+        if b_desc is not None:
+            b = (
+                b_desc.load([off_experts_i32, start_offs_n, k_start])
+                .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
+                .T
+            )
+        elif even_Ks:
+            b = tl.load(b_ptrs)
+        else:
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
 
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
         elif use_fp8_w8a8 or use_int8_w8a8:
             if group_k > 0 and group_n > 0:
-                k_start = k * BLOCK_SIZE_K
                 offs_ks = k_start // group_k
                 a_scale = tl.load(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
-
-                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                if BLOCK_SIZE_N > group_n:
+                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                else:
+                    accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
             else:
                 if use_fp8_w8a8:
                     accumulator = tl.dot(a, b, acc=accumulator)
@@ -508,8 +551,10 @@ def fused_moe_kernel(
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        if a_desc is None:
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+        if b_desc is None:
+            b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if use_int8_w8a16:
         accumulator *= b_scale
@@ -528,7 +573,12 @@ def fused_moe_kernel(
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    if c_sorted:
+        c_ptrs = (
+            c_ptr + stride_cm * offs_token_id[:, None] + stride_cn * offs_cn[None, :]
+        )
+    else:
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
@@ -557,6 +607,10 @@ def invoke_fused_moe_kernel(
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    a_use_tma: bool = False,
+    b_use_tma: bool = False,
+    c_sorted: bool = False,
+    filter_expert: bool = True,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -662,14 +716,38 @@ def invoke_fused_moe_kernel(
             use_int4_w4a16=use_int4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
+            filter_expert=filter_expert,
             **config,
         )
 
     else:
+        if a_use_tma or b_use_tma:
+            # TMA descriptors require a global memory allocation
+            def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+                return torch.empty(size, device="cuda", dtype=torch.int8)
+
+            triton.set_allocator(alloc_fn)
+        if a_use_tma:
+            a_desc = TensorDescriptor(
+                A, A.shape, A.stride(), [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
+            )
+        else:
+            a_desc = None
+        if b_use_tma:
+            b_desc = TensorDescriptor(
+                B,
+                B.shape,
+                B.stride(),
+                [1, config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"]],
+            )
+        else:
+            b_desc = None
 
         fused_moe_kernel[grid](
             A,
+            a_desc,
             B,
+            b_desc,
             bias,
             C,
             A_scale,
@@ -689,8 +767,8 @@ def invoke_fused_moe_kernel(
             B.stride(1),
             bias.stride(0) if bias is not None else 0,
             bias.stride(1) if bias is not None else 0,
-            C.stride(1),
-            C.stride(2),
+            C.stride(-2),
+            C.stride(-1),
             A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
             A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
             B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
@@ -706,6 +784,8 @@ def invoke_fused_moe_kernel(
             use_int8_w8a16=use_int8_w8a16,
             per_channel_quant=per_channel_quant,
             even_Ks=even_Ks,
+            c_sorted=c_sorted,
+            filter_expert=filter_expert,
             **config,
         )
 

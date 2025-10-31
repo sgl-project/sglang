@@ -26,6 +26,10 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Install Python dependencies
+        run: |
+          pip install tomli
+
       - name: Configure Git and branch
         run: |
           git config user.name "sglang-bot"
@@ -41,6 +45,6 @@ jobs:
 
       - name: Commit and create PR
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT_FOR_TAGGING }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
         run: |
           bash scripts/release/commit_and_pr.sh "SGLang" "${{ github.event.inputs.new_version }}" "$BRANCH_NAME"

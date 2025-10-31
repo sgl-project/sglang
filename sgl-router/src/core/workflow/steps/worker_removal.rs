@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use tracing::{debug, info};
 
 use crate::{
+    app_context::AppContext,
     core::{workflow::*, Worker},
-    server::AppContext,
 };
 
 /// Request structure for worker removal

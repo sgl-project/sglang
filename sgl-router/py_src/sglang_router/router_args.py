@@ -94,6 +94,8 @@ class RouterArgs:
     tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    # MCP server configuration
+    mcp_config_path: Optional[str] = None
     # Backend selection
     backend: str = "sglang"
     # History backend configuration
@@ -110,6 +112,9 @@ class RouterArgs:
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
     ca_cert_paths: List[str] = dataclasses.field(default_factory=list)
+    # Trace
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
 
     @staticmethod
     def add_cli_args(
@@ -512,6 +517,13 @@ class RouterArgs:
             default=None,
             help="Specify the parser for handling tool-call interactions",
         )
+        # MCP server configuration
+        parser.add_argument(
+            f"--{prefix}mcp-config-path",
+            type=str,
+            default=None,
+            help="Path to MCP (Model Context Protocol) server configuration file",
+        )
         # Backend selection
         parser.add_argument(
             f"--{prefix}backend",
@@ -598,6 +610,17 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="Path(s) to CA certificate(s) for verifying worker TLS certificates. Can specify multiple CAs.",
+        )
+        parser.add_argument(
+            f"--{prefix}enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            f"--{prefix}otlp-traces-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         )
 
     @classmethod
