@@ -1098,7 +1098,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        from flash_mla import flash_mla_sparse_fwd
+        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_all,
@@ -1119,7 +1119,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         metadata: NSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        from flash_mla import flash_mla_with_kvcache
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.nsa_cache_seqlens_int32
 
@@ -1222,11 +1222,9 @@ class NativeSparseAttnBackend(AttentionBackend):
         if self.enable_auto_select_prefill_impl:
             if self.nsa_kv_cache_store_fp8:
                 if (
-                    # TODO(hlu1): enable MTP
                     is_blackwell()
                     and forward_batch is not None
-                    and forward_batch.forward_mode.is_extend()
-                    and forward_batch.spec_algorithm.is_none()
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
                 ):
                     total_kv_tokens = forward_batch.seq_lens_sum
                     total_q_tokens = forward_batch.extend_num_tokens
@@ -1263,7 +1261,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        from flash_mla import get_mla_metadata
+        from sgl_kernel.flash_mla import get_mla_metadata
 
         flashmla_metadata, num_splits = get_mla_metadata(
             cache_seqlens=cache_seqlens,

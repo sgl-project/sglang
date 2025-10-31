@@ -135,6 +135,8 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
+
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 NSA_CHOICES = [
@@ -188,6 +190,10 @@ def add_moe_runner_backend_choices(choices):
 
 def add_deterministic_attention_backend_choices(choices):
     DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
+def add_radix_supported_deterministic_attention_backend_choices(choices):
+    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend(choices)
 
 
 def add_radix_eviction_policy_choices(choices):
@@ -505,6 +511,9 @@ class ServerArgs:
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
+    # -1 mean dump all layers.
+    debug_tensor_dump_layers: int = -1
+    # TODO(guoyuhong): clean the old dumper code.
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
 
@@ -822,7 +831,7 @@ class ServerArgs:
             capture_bs = (
                 list(range(1, 9, 1))
                 + list(range(10, 33, 2))
-                + list(range(40, 64, 4))
+                + list(range(40, 65, 4))
                 + list(range(72, 257, 8))
                 + list(range(272, self.cuda_graph_max_bs + 1, 16))
             )
@@ -1227,7 +1236,7 @@ class ServerArgs:
         # AMD platforms backends
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.90
+                self.mem_fraction_static *= 0.85
 
         # NPU platforms backends
         if is_npu() and self.attention_backend in ["ascend"]:
@@ -1746,13 +1755,17 @@ class ServerArgs:
                     f"but you explicitly specified '{self.attention_backend}'."
                 )
 
-            if self.attention_backend not in ["fa3", "triton"]:
-                if is_deepseek_model:
+            if is_deepseek_model:
+                if self.attention_backend not in ["fa3", "triton"]:
                     raise ValueError(
-                        f"Currently only fa3 and triton attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."
+                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."
                     )
 
-                # Currently, only FA3 and Triton supports radix cache. Support for other backends is in progress
+            if (
+                self.attention_backend
+                not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+            ):
+                # Currently, only certain backends support radix cache. Support for other backends is in progress
                 self.disable_radix_cache = True
                 logger.warning(
                     f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
@@ -1767,7 +1780,13 @@ class ServerArgs:
                 )
 
     def _handle_other_validations(self):
-        pass
+        # Handle model inference tensor dump.
+        if self.debug_tensor_dump_output_folder is not None:
+            logger.warning(
+                "Cuda graph and server warmup are disabled because of using tensor dump mode"
+            )
+            self.disable_cuda_graph = True
+            self.skip_server_warmup = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -3357,6 +3376,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_output_folder,
             help="The output folder for dumping tensors.",
+        )
+        parser.add_argument(
+            "--debug-tensor-dump-layers",
+            type=int,
+            default=-1,
+            help="The layer number for dumping tensors.",
         )
         parser.add_argument(
             "--debug-tensor-dump-input-file",
