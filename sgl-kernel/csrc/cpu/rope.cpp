@@ -550,8 +550,6 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
   int64_t num_kv_heads = key.size(-1) / head_size;
   int64_t key_stride_s = key.stride(0);
   int64_t query_stride_s = query.stride(0);
-  at::Tensor query_out = at::empty_like(query);
-  at::Tensor key_out = at::empty_like(key);
 
   if (positions.dim() == 2) {
     TORCH_CHECK(mrope_section.has_value(), "mrope_section must be provided when positions is 2D");
@@ -601,9 +599,6 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
             mrope_interleaved);
       }
     });
-    query_out = query;
-    key_out = key;
-
   } else {  // positions.dim() == 1
     AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
       if (is_neox) {
@@ -633,9 +628,7 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
             head_size,
             num_tokens);
       }
-      query_out = query;
-      key_out = key;
     });
   }
-  return std::make_tuple(query_out, key_out);
+  return std::make_tuple(query, key);
 }
