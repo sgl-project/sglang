@@ -38,7 +38,12 @@ class POINTSV15ChatProcessor(QwenVLImageProcessor):
         )
 
         if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
+            resize_tasks = [
+                resize_image_async(
+                    image, self.MIN_PIXELS, self.MAX_PIXELS, self.IMAGE_FACTOR
+                )
+                for image in base_output.images
+            ]
             base_output.images = await asyncio.gather(*resize_tasks)
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(

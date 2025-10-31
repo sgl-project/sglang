@@ -8,6 +8,7 @@ import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
+from transformers import BaseImageProcessorFast
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
@@ -250,9 +251,19 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         self.audio_token_id = getattr(hf_config, "audio_token_id", None)
 
         self.NUM_TOKEN_PER_FRAME = 770
-        self.IMAGE_FACTOR = 28
-        self.MIN_PIXELS = 4 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
+        self.PATCH_SIZE = hf_config.vision_config.patch_size
+        self.MERGE_SIZE = hf_config.vision_config.spatial_merge_size
+        self.IMAGE_FACTOR = self.PATCH_SIZE * self.MERGE_SIZE
+
+        processor = self._processor
+        if hasattr(processor, "image_processor") and isinstance(
+            processor.image_processor, BaseImageProcessorFast
+        ):
+            self.MIN_PIXELS = processor.image_processor.size["shortest_edge"]
+            self.MAX_PIXELS = processor.image_processor.size["longest_edge"]
+        else:
+            self.MIN_PIXELS = 4 * 28 * 28
+            self.MAX_PIXELS = 16384 * 28 * 28
         self.MAX_RATIO = 200
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
@@ -283,7 +294,12 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
+            resize_tasks = [
+                resize_image_async(
+                    image, self.MIN_PIXELS, self.MAX_PIXELS, self.IMAGE_FACTOR
+                )
+                for image in base_output.images
+            ]
             base_output.images = await asyncio.gather(*resize_tasks)
 
         video_metadata = None
