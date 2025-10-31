@@ -192,7 +192,7 @@ class BenchArgs:
         parser.add_argument(
             "--return-logprob",
             action="store_true",
-            help="Return logprob.",
+            help="Enable returning log probabilities.",
         )
         parser.add_argument(
             "--logprob-start-len",
