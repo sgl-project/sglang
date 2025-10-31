@@ -520,16 +520,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states
 
-    def _forward_shared_experts(
-        self, hidden_states
-    ):
-        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
-            return self.shared_experts(
-                hidden_states
-            )
-        else:
-            return None
-
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
