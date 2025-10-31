@@ -16,7 +16,7 @@
 import logging
 from typing import Any, Dict, List, Optional, Union
 
-# Use re._parser instead of deprecated sre_parse module.
+# Use re._parser instead of deprecated sre_parse module from Python 3.11.
 # Note that `re._parser` is a private API and may change without warning in future Python versions.
 try:
     from re import _parser as sre_parse
