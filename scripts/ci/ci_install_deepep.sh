@@ -66,7 +66,7 @@ wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.4.5/source/n
 tar -xf nvshmem_src_cuda12-all-all-3.4.5.tar.gz
 mv nvshmem_src nvshmem && cd nvshmem
 if [ "$GRACE_BLACKWELL" = "1" ]; then
-    CUDA_ARCH="90;100;103;120"
+    CUDA_ARCH="90;100;120"
 else
     CUDA_ARCH="90"
 fi
