@@ -878,6 +878,7 @@ impl HarmonyStreamingProcessor {
                 top_p: None,
                 truncation: None,
                 user: None,
+                safety_identifier: None,
                 metadata: HashMap::new(),
                 usage: Some(ResponsesUsage::Modern(ResponseUsage {
                     input_tokens: 0,
