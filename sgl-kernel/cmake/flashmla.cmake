@@ -13,6 +13,8 @@ set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
     "--use_fast_math"
+
+    "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
 )
 
 # The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
