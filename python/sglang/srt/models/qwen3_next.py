@@ -43,6 +43,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    is_cpu,
     is_cuda,
     is_npu,
     make_layers,
@@ -52,7 +53,7 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
-
+_is_cpu = is_cpu()
 import triton
 import triton.language as tl
 
@@ -248,8 +249,16 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_tp_size = get_attention_tp_size()
         self.hidden_size = config.hidden_size
-        self.num_v_heads = config.linear_num_value_heads
-        self.num_k_heads = config.linear_num_key_heads
+        self.num_v_heads = (
+            config.linear_num_value_heads
+            if not _is_cpu
+            else config.linear_num_value_heads_cpu
+        )
+        self.num_k_heads = (
+            config.linear_num_key_heads
+            if not _is_cpu
+            else config.linear_num_key_heads_cpu
+        )
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
