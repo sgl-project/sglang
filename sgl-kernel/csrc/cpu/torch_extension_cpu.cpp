@@ -29,6 +29,7 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input);
 
 // l2norm
 at::Tensor l2norm_cpu(at::Tensor& input, double eps);
+at::Tensor qwen3_next_l2norm_cpu(at::Tensor& input, double eps);
 
 // rmsnorm
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
@@ -99,6 +100,17 @@ void extend_attention_cpu(
     int64_t max_len_extend,
     double sm_scale,
     double logit_cap);
+
+// linear attention
+std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
+    at::Tensor& query,
+    at::Tensor& key,
+    at::Tensor& value,
+    at::Tensor& g,
+    at::Tensor& beta,
+    at::Tensor& cu_seqlens,
+    at::Tensor& initial_state,
+    bool use_qk_l2norm_in_kernel);
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -252,6 +264,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("l2norm_cpu", torch::kCPU, &l2norm_cpu);
   m.def("fused_rmsnorm_gated_cpu(Tensor input, Tensor weight, Tensor gate, float eps) -> Tensor");
   m.impl("fused_rmsnorm_gated_cpu", torch::kCPU, &fused_rmsnorm_gated_cpu);
+  m.def("qwen3_next_l2norm_cpu(Tensor input, float eps) -> Tensor");
+  m.impl("qwen3_next_l2norm_cpu", torch::kCPU, &qwen3_next_l2norm_cpu);
   m.def("fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor residual, Tensor weight, float eps) -> ()");
   m.impl("fused_add_rmsnorm_cpu", torch::kCPU, &fused_add_rmsnorm_cpu);
 
@@ -286,6 +300,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
+
+  // linear attn
+  m.def(
+      "chunk_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
+      "Tensor cu_seqlens, Tensor initial_state, bool use_qk_l2norm_in_kernel)"
+      " -> (Tensor, Tensor)");
+  m.impl("chunk_gated_delta_rule_cpu", torch::kCPU, &chunk_gated_delta_rule_cpu);
 
   // weight prepack
   m.def("convert_weight_packed(Tensor weight) -> Tensor");
