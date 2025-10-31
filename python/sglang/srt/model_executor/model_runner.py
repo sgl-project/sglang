@@ -29,7 +29,12 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs import FalconH1Config, NemotronHConfig, Qwen3NextConfig
+from sglang.srt.configs import (
+    FalconH1Config,
+    NemotronH_Nano_VL_V2_Config,
+    NemotronHConfig,
+    Qwen3NextConfig,
+)
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
@@ -1344,6 +1349,8 @@ class ModelRunner:
         config = self.model_config.hf_config
         if isinstance(config, FalconH1Config | NemotronHConfig):
             return config
+        if isinstance(config, NemotronH_Nano_VL_V2_Config):
+            return config.llm_config
         return None
 
     @property
