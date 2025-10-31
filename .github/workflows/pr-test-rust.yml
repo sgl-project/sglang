@@ -165,6 +165,7 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
+          pip install -e "sgl-router"
           cd sgl-router
           pip install maturin
           maturin build --release --out dist --features vendored-openssl
