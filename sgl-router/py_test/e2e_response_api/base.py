@@ -399,6 +399,72 @@ class ResponseCRUDBaseTest(ResponseAPIBaseTest):
         final_data = self.wait_for_background_task(response_id, timeout=60)
         self.assertEqual(final_data["status"], "completed")
 
+    def test_structured_output_json_schema(self):
+        """Test structured output with json_schema format."""
+        # Create response with structured output
+        data = {
+            "model": self.model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful math tutor. Guide the user through the solution step by step."
+                },
+                {
+                    "role": "user",
+                    "content": "how can I solve 8x + 7 = -23"
+                }
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "math_reasoning",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "steps": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "explanation": {"type": "string"},
+                                        "output": {"type": "string"}
+                                    },
+                                    "required": ["explanation", "output"],
+                                    "additionalProperties": False
+                                }
+                            },
+                            "final_answer": {"type": "string"}
+                        },
+                        "required": ["steps", "final_answer"],
+                        "additionalProperties": False
+                    },
+                    "strict": True
+                }
+            }
+        }
+
+        create_resp = self.make_request("/v1/responses", "POST", data)
+        self.assertEqual(create_resp.status_code, 200)
+
+        create_data = create_resp.json()
+        self.assertIn("id", create_data)
+        self.assertIn("output", create_data)
+
+        # Verify output is valid JSON matching the schema
+        output_text = create_data["output"][0]["content"][0]["text"]
+        output_json = json.loads(output_text)
+
+        # Verify schema structure
+        self.assertIn("steps", output_json)
+        self.assertIn("final_answer", output_json)
+        self.assertIsInstance(output_json["steps"], list)
+        self.assertGreater(len(output_json["steps"]), 0)
+
+        # Verify each step has required fields
+        for step in output_json["steps"]:
+            self.assertIn("explanation", step)
+            self.assertIn("output", step)
+
 
 class ConversationCRUDBaseTest(ResponseAPIBaseTest):
     """Base class for Conversation API CRUD tests."""

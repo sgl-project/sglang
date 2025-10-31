@@ -294,6 +294,38 @@ pub struct ReasoningInfo {
     pub summary: Option<String>,
 }
 
+// ============================================================================
+// Text Format (structured outputs)
+// ============================================================================
+
+/// Text configuration for structured output requests
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TextConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<TextFormat>,
+}
+
+/// Text format: text (default), json_object (legacy), or json_schema (recommended)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum TextFormat {
+    #[serde(rename = "text")]
+    Text,
+
+    #[serde(rename = "json_object")]
+    JsonObject,
+
+    #[serde(rename = "json_schema")]
+    JsonSchema {
+        name: String,
+        schema: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseTextFormat {
     pub format: TextFormatType,
@@ -541,6 +573,10 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation: Option<Truncation>,
 
+    /// Text format for structured outputs (text, json_object, json_schema)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextConfig>,
+
     /// User identifier
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -609,6 +645,7 @@ impl Default for ResponsesRequest {
             top_logprobs: None,
             top_p: None,
             truncation: None,
+            text: None,
             user: None,
             request_id: None,
             priority: 0,
