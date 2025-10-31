@@ -304,6 +304,7 @@ pub fn chat_to_responses(
         for tool_call in tool_calls {
             output.push(ResponseOutputItem::FunctionToolCall {
                 id: tool_call.id.clone(),
+                call_id: tool_call.id.clone(),
                 name: tool_call.function.name.clone(),
                 arguments: tool_call.function.arguments.clone().unwrap_or_default(),
                 output: None, // Tool hasn't been executed yet
