@@ -860,6 +860,9 @@ class BatchTokenIDOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -936,6 +939,9 @@ class BatchStrOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -977,6 +983,9 @@ class BatchEmbeddingOutput(BaseBatchReq):
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
 
 
 @dataclass
@@ -1465,6 +1474,16 @@ class WatchLoadUpdateReq(BaseReq):
 
 
 @dataclass
+class SetInjectDumpMetadataReqInput(BaseReq):
+    dump_metadata: Dict[str, Any]
+
+
+@dataclass
+class SetInjectDumpMetadataReqOutput(BaseReq):
+    success: bool
+
+
+@dataclass
 class LazyDumpTensorsReqInput(BaseReq):
     pass
 
@@ -1495,6 +1514,3 @@ def _check_all_req_types():
             raise ValueError(
                 f"{name} is a subclass of BaseReq but not follow the naming convention."
             )
-
-
-_check_all_req_types()
