@@ -18,7 +18,7 @@ torch.manual_seed(1234)
 class TestROPE(CustomTestCase):
     def test_mrope(self):
         head_size = 128
-        seq_len = 1024
+        seq_len = 512
         num_heads = 16
         num_kv_heads = 1
         rotary_dim = 128
@@ -36,8 +36,8 @@ class TestROPE(CustomTestCase):
             # (dtype, is_neox_stype, mrope_interleaved, positions, mrope_section)
             (torch.bfloat16, True, True, positions_mrope, mrope_section),
             (torch.bfloat16, True, False, positions_mrope, mrope_section),
-            # (torch.bfloat16, False, True, positions_mrope, mrope_section),
-            # (torch.bfloat16, False, False, positions_mrope, mrope_section),
+            (torch.bfloat16, False, True, positions_mrope, mrope_section),
+            (torch.bfloat16, False, False, positions_mrope, mrope_section),
             (torch.bfloat16, True, False, positions_text, None),
             (torch.bfloat16, False, False, positions_text, None),
         ]
