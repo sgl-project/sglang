@@ -1747,6 +1747,12 @@ class ModelRunner:
                     device=self.device,
                 )
             elif config := self.mambaish_config:
+                extra_args = {}
+                if self.use_mla_backend:
+                    extra_args = {
+                        "kv_lora_rank": self.model_config.kv_lora_rank,
+                        "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+                    }
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -1763,8 +1769,7 @@ class ModelRunner:
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     use_mla=self.use_mla_backend,
-                    kv_lora_rank=self.model_config.kv_lora_rank,
-                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    **extra_args,
                 )
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
