@@ -20,6 +20,7 @@ import time
 from abc import ABC
 from collections import deque
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Type
 
 import einops
@@ -27,6 +28,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
+from sglang.srt.metrics.collector import ExpertDispatchCollector
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, is_npu
@@ -660,6 +662,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self.window_sizes = [10, 100, 1000]
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._rank = torch.distributed.get_rank()
+            self._expert_dispatch_collector = ExpertDispatchCollector(
+                self._expert_location_metadata.ep_size
+            )
+            self._collection_counter = 0
 
     def append(
         self,
@@ -691,6 +697,8 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
 
         if self._rank == 0:
+            self._collect_metrics_if_needed(gpu_physical_count)
+
             utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
             utilization_rate = torch.mean(utilization_rate_tensor).item()
             self._history.append(utilization_rate)
@@ -705,6 +713,31 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 f"gpu_physical_count_sum={gpu_physical_count_sum}"
                 # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
             )
+
+    def _collect_metrics_if_needed(self, gpu_physical_count: torch.Tensor):
+        # sglang:eplb_gpu_physical_count metric is disabled if SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0
+        if (
+            envs.SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL > 0
+            and self._collection_counter % envs.SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL
+            == 0
+        ):
+            for layer_idx in range(self._expert_location_metadata.num_layers):
+                count_of_layer = (
+                    self._expert_dispatch_collector.eplb_gpu_physical_count.labels(
+                        layer=str(layer_idx)
+                    )
+                )
+                # Exclude the +Inf bucket.
+                assert (
+                    self._expert_location_metadata.ep_size
+                    == len(count_of_layer._buckets) - 1
+                ), f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
+                for gpu_rank in range(self._expert_location_metadata.ep_size):
+                    count = gpu_physical_count[layer_idx, gpu_rank]
+                    if count > 0:
+                        count_of_layer._sum.inc(count * gpu_rank)
+                        count_of_layer._buckets[gpu_rank].inc(count)
+        self._collection_counter += 1
 
 
 class _DequeCollection:
@@ -868,7 +901,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
 
 def _dump_to_file(name, data):
-    save_dir = envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()
+    save_dir = Path(envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get())
     path_output = save_dir / name
     logger.info(f"Write expert distribution to {path_output}")
     if not save_dir.exists():

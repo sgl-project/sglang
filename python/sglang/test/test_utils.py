@@ -84,6 +84,8 @@ DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST = "Tengyunw/qwen3_30b_moe_eagle3"
 DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
 DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
     "meta-llama/Llama-3.1-8B-Instruct"
@@ -92,6 +94,10 @@ DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST = "meta-llama/Llama-3.2-1B-I
 DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # Other use cases
+DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
+    "OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc",  # auto_round:auto_gptq
+    "Intel/Qwen2-0.5B-Instruct-int4-sym-AutoRound",  # auto_round:auto_awq
+)
 DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
     "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 )
