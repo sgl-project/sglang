@@ -873,10 +873,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         fused_kv = False  # Track if using fused KV write path
         
         if self.data_type == torch.float8_e4m3fn:
-            # For FP8 path, quantize and apply RoPE
+            # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
+            # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert all(
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
-            ), "For FP8 path we need all of q_rope, k_rope and cos_sin_cache to be not None."
+            ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
             
             # Call quantize_and_rope_for_fp8 with layer and save_kv_cache
             # This enables the fused kernel path when conditions are met
@@ -983,9 +984,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
 
+        # TODO refactor to avoid code duplication for forward_decode
         merge_query = q_rope is not None
         fused_kv = False  # Track if we used fused KV write path
         
+        # TODO: Check if the condition restrictions (target_verify/draft_extend only) are necessary
+        #       Consider if we can enable FP8 quantize_and_rope for all extend paths safely
         # For FP8 path in target_verify or draft_extend mode, use quantize_and_rope_for_fp8
         use_fp8_quantize = (
             self.data_type == torch.float8_e4m3fn
