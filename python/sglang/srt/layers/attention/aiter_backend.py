@@ -43,10 +43,15 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 
+from sglang.srt.utils import (
+    get_bool_env_var,
+)
+
 import math
 
 from aiter import get_mla_metadata_v1
 
+_use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST")
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
@@ -61,6 +66,12 @@ class ForwardMetadata:
     kv_last_page_len: torch.Tensor
     max_q_len: int
     max_kv_len: Optional[int]
+    work_metadata: Optional[torch.Tensor] = None
+    work_info_set: Optional[torch.Tensor] = None
+    work_indptr: Optional[torch.Tensor] = None
+    reduce_indptr: Optional[torch.Tensor] = None
+    reduce_final_map: Optional[torch.Tensor] = None
+    reduce_partial_map: Optional[torch.Tensor] = None
 
 
 global_workspace_buffer = None
@@ -370,6 +381,51 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        if self.use_mla and _use_mla_ps_kernel:
+            # for persistent mla_decode_fwd
+            gpu = torch.cuda.current_device()
+            device_properties = torch.cuda.get_device_properties(gpu)
+            cu_num = device_properties.multi_processor_count
+
+            nhead = self.num_head
+
+            max_seqlen_qo = (
+                1
+                if self.num_draft_tokens is None
+                else self.num_draft_tokens 
+            )
+
+            max_qo_tiles_per_batch = int(math.ceil(max_seqlen_qo * nhead / 128))
+
+            batch_size = max_bs
+
+            self.work_metadata = torch.empty([10], dtype=torch.uint64, device="cuda")
+            self.work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
+            self.work_info_set = torch.empty(
+                [batch_size * max_qo_tiles_per_batch * cu_num, 8],
+                dtype=torch.int32,
+                device="cuda",
+            ).fill_(-1)
+
+            self.reduce_indptr = torch.empty(
+                [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
+            )
+            self.reduce_final_map = torch.empty(
+                [batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
+            )
+            self.reduce_partial_map = torch.empty(
+                [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
+            )
+
+        else:
+            self.work_metadata = None
+            self.work_indptr = None
+            self.work_info_set = None
+
+            self.reduce_indptr = None
+            self.reduce_final_map = None
+            self.reduce_partial_map = None
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -408,7 +464,30 @@ class AiterAttnBackend(AttentionBackend):
                     self.cuda_graph_kv_last_page_len[:bs], dim=0
                 )
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+
                 max_q_len = 1
+
+                if _use_mla_ps_kernel:
+                    nhead_kv = 1
+                    page_size = 1
+
+                    meta = get_mla_metadata_v1(
+                        qo_indptr,
+                        kv_indptr,
+                        self.num_head // nhead_kv,
+                        nhead_kv,
+                        True,
+                        self.work_metadata,
+                        self.work_info_set,
+                        self.work_indptr,
+                        self.reduce_indptr,
+                        self.reduce_final_map,
+                        self.reduce_partial_map,
+                        kv_granularity=max(page_size, 16),
+                        max_seqlen_qo=max_q_len,
+                        uni_seqlen_qo=max_q_len,
+                        fast_mode=True,
+                    )
 
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
@@ -417,6 +496,12 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len,
                 max_q_len,
                 None,
+                work_metadata=self.work_metadata,
+                work_info_set=self.work_info_set,
+                work_indptr=self.work_indptr,
+                reduce_indptr=self.reduce_indptr,
+                reduce_final_map=self.reduce_final_map,
+                reduce_partial_map=self.reduce_partial_map,
             )
 
         elif forward_mode.is_target_verify():
@@ -534,6 +619,35 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
                 kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
+
+            if self.use_mla and _use_mla_ps_kernel:
+                qo_indptr = self.qo_indptr_[: bs + 1]
+                qo_indptr[1 : bs + 1] = torch.cumsum(
+                    self.cuda_graph_kv_last_page_len[:bs], dim=0
+                )
+
+                max_q_len = 1
+
+                nhead_kv = 1
+                page_size = 1
+
+                meta = get_mla_metadata_v1(
+                    qo_indptr,
+                    kv_indptr,
+                    self.num_head // nhead_kv,
+                    nhead_kv,
+                    True,
+                    self.work_metadata,
+                    self.work_info_set,
+                    self.work_indptr,
+                    self.reduce_indptr,
+                    self.reduce_final_map,
+                    self.reduce_partial_map,
+                    kv_granularity=max(page_size, 16),
+                    max_seqlen_qo=max_q_len,
+                    uni_seqlen_qo=max_q_len,
+                    fast_mode=True,
+                )
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
@@ -822,57 +936,15 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         if self.use_mla:
-            #k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(torch.bfloat16)
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
+            work_meta_data = self.forward_metadata.work_metadata
+            work_indptr = self.forward_metadata.work_indptr
+            work_info_set = self.forward_metadata.work_info_set
 
-            nhead = layer.tp_q_head_num
-            max_qo_tiles_per_batch = int(math.ceil(self.forward_metadata.max_q_len * nhead / 128))
-
-
-            batch_size = forward_batch.batch_size
-
-            work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
-            work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
-            work_info_set = torch.empty(
-                [batch_size * max_qo_tiles_per_batch * cu_num, 8],
-                dtype=torch.int32,
-                device="cuda",
-            ).fill_(-1)
-
-            reduce_indptr = torch.empty(
-                [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
-            )
-            reduce_final_map = torch.empty(
-                [batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
-            )
-            reduce_partial_map = torch.empty(
-                [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
-            )
-
-            page_size = 1
-            nhead_kv = 1
-
-            meta = get_mla_metadata_v1(
-                self.forward_metadata.qo_indptr,
-                self.forward_metadata.kv_indptr,
-                nhead // nhead_kv,
-                nhead_kv,
-                True,
-                work_meta_data,
-                work_info_set,
-                work_indptr,
-                reduce_indptr,
-                reduce_final_map,
-                reduce_partial_map,
-                kv_granularity=max(page_size, 16),
-                max_seqlen_qo=self.forward_metadata.max_q_len,
-                uni_seqlen_qo=self.forward_metadata.max_q_len,
-                fast_mode=True,
-            )
+            reduce_indptr = self.forward_metadata.reduce_indptr
+            reduce_final_map = self.forward_metadata.reduce_final_map
+            reduce_partial_map = self.forward_metadata.reduce_partial_map
 
             if self.kv_cache_dtype == fp8_dtype:
                 q_input, q_scale = scaled_fp8_quant(
@@ -896,12 +968,12 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata.max_q_len,
                 layer.scaling,
                 layer.logit_cap,
-                #work_meta_data=work_meta_data,
-                #work_indptr=work_indptr,
-                #work_info_set=work_info_set,
-                #reduce_indptr=reduce_indptr,
-                #reduce_final_map=reduce_final_map,
-                #reduce_partial_map=reduce_partial_map,
+                work_meta_data=work_meta_data,
+                work_indptr=work_indptr,
+                work_info_set=work_info_set,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
                 q_scale=q_scale,
                 kv_scale=kv_scale,
             )
