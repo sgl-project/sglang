@@ -14,7 +14,7 @@
 
 import torch
 
-from sglang.srt.model_executor.compilation.npu_compiler_backend import NpuBackend
+from sglang.srt.compilation.npu.npu_compiler_backend import NpuBackend
 
 
 class NpuGraphCompiler:

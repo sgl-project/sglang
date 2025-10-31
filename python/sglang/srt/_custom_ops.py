@@ -7,7 +7,6 @@ import torch
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
-    get_cmo_stream,
     is_hip,
     is_hpu,
     is_npu,
@@ -24,13 +23,17 @@ import sglang.srt.utils
 
 @torch.library.custom_op("sglang::wait_cmo_stream", mutates_args=())
 def wait_cmo_stream() -> None:
-    if is_npu() and get_cmo_stream():
+    if sglang.srt.utils.get_cmo_stream():
         sglang.srt.utils.wait_cmo_stream()
 
 
 @wait_cmo_stream.register_fake
 def wait_cmo_stream_fake() -> None:
     pass
+
+
+def get_cmo_stream() -> bool:
+    return True
 
 
 def prepare_weight_cache(handle: torch.Tensor, cache: List[torch.Tensor]) -> None:

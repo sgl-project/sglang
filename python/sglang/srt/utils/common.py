@@ -1888,7 +1888,7 @@ def direct_register_custom_op(
     op_func: Callable,
     mutates_args: List[str],
     fake_impl: Optional[Callable] = None,
-    target_lib: Optional[Library] = None
+    target_lib: Optional[Library] = None,
 ):
     """
     `torch.library.custom_op` can have significant overhead because it

@@ -5,12 +5,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-# TODO: refactor
-# if supports_custom_op():
-#     from sglang.srt._custom_ops import wait_cmo_stream, wait_cmo_stream_fake
-# else:
-#     from sglang.srt.utils import wait_cmo_stream
-from sglang.srt._custom_ops import wait_cmo_stream
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -36,7 +30,12 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, supports_custom_op
+
+if supports_custom_op() and get_global_server_args().enable_torch_compile:
+    from sglang.srt._custom_ops import get_cmo_stream, wait_cmo_stream
+else:
+    from sglang.srt.utils import get_cmo_stream, wait_cmo_stream
 
 Qwen3Config = None
 
@@ -281,10 +280,8 @@ class Qwen3DecoderLayer(nn.Module):
             ),
         )
         hidden_states = self.mlp(hidden_states)
-        # check if custom op is supported
-        # if _is_npu and get_cmo_stream():
-        #     wait_cmo_stream()
-        wait_cmo_stream()
+        if _is_npu and get_cmo_stream():
+            wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )

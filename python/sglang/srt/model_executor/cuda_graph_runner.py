@@ -75,7 +75,7 @@ except ImportError:
 
 _is_hip = is_hip()
 
-from sglang.srt.model_executor.compilation.custom_ops import (
+from sglang.srt.compilation.npu.custom_ops import (
     _set_dp_buffer_len,
     _set_is_extend_in_batch,
 )
