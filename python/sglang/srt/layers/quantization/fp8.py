@@ -984,13 +984,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
         moe_runner_config = self.moe_runner_config
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
-            topk_weights, topk_ids, _ = topk_output
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
             x, topk_weights = apply_topk_weights_cpu(
                 moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
@@ -1017,7 +1016,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ret = self.maybe_apply_hip_fused_experts(
                 layer,
                 x,
-                topk_output,
+                dispatch_output.topk_output,
                 moe_runner_config.activation,
                 moe_runner_config.no_combine,
             )
@@ -1027,7 +1026,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self._should_use_cutlass_fused_experts():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
-            topk_weights, topk_ids, _ = topk_output
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
             output = cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),

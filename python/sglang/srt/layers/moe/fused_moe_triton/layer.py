@@ -839,7 +839,7 @@ class FusedMoE(torch.nn.Module):
             dispatch_output=dispatch_output,
             **kwargs,
         )
-        final_hidden_states = self.dispatcher.combine(combine_input)
+        final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
         # TODO: should we add some conditions here?
         final_hidden_states = final_hidden_states[

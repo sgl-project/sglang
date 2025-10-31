@@ -821,8 +821,8 @@ class LongcatFlashForCausalLM(nn.Module):
             experts = layer.mlp.experts
             if isinstance(experts, DeepEPMoE):
                 for w in [
-                    experts.w13_weight_fp8,
-                    experts.w2_weight_fp8,
+                    (experts.w13_weight, experts.w13_weight_scale_inv),
+                    (experts.w2_weight, experts.w2_weight_scale_inv),
                 ]:
                     requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
 
