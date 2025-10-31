@@ -73,7 +73,7 @@ class LMCRadixCache(RadixCache):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         disable: bool = False,
-        enable_metrics=False,
+        enable_metrics: bool = False,
         enable_kv_cache_events: bool = False,
         model_config: Optional["ModelConfig"] = None,
         tp_size: int = 1,
