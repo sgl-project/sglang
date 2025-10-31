@@ -32,7 +32,7 @@ def parse_arguments(json_value):
 
     # Try unescaping quotes only (handles escaped JSON from raw strings)
     try:
-        unescaped = json_value.replace(r"\"", '"')
+        unescaped = json_value.replace('\\"', '"')
         parsed_value = json.loads(unescaped)
         return parsed_value, True
     except:
