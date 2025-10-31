@@ -405,11 +405,12 @@ python3 -m sglang.srt.disaggregation.mini_lb --host $HOST_IP \
 ```bash
 export PORT=8001
 export SGLANG_VLM_CACHE_SIZE_MB=40960
-export TENSOR_PARALLEL_SIZE=4
+export TENSOR_PARALLEL_SIZE=2
 export CHUNKED_PREFILL_SIZE=81920
-export MAX_RUNNING_REQUESTS=64
+export MAX_RUNNING_REQUESTS=128
 export MEM_FRACTION_STATIC=0.85
 export SGLANG_EMBEDDING_CACHE_BUFFER_SIZE=128
+export SGLANG_EMBEDDING_CACHE_BLOCK_SIZE=16384
 # Encode侧：负责视觉编码
 python3 -m sglang.launch_server --model-path ${MODEL_PATH} --enable-torch-compile --max-prefill-tokens $CHUNKED_PREFILL_SIZE \
         --host $HOST_IP --port $PORT --trust-remote-code --tp-size ${TENSOR_PARALLEL_SIZE} --mem-fraction-static ${MEM_FRACTION_STATIC} \
@@ -424,13 +425,16 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} --enable-torch-compil
 ```bash
 export PORT=8002
 export TENSOR_PARALLEL_SIZE=8
-export MAX_RUNNING_REQUESTS=64
+export MAX_RUNNING_REQUESTS=128
 export SGLANG_EMBEDDING_CACHE_BUFFER_SIZE=128
+export SGLANG_EMBEDDING_CACHE_BLOCK_SIZE=16384
 export MEM_FRACTION_STATIC=0.85
 export CHUNKED_PREFILL_SIZE=8192
 # 配置默认缓冲区大小
 export SGLANG_EMBEDDING_DEFAULT_ALLOCATE_BUFFER_SIZE=16384
+
 # Language侧：负责文本生成
+# Qwen2.5-VL: "architectures": ["Qwen2ForCausalLM"]
 python3 -m sglang.launch_server --model-path ${MODEL_PATH} --enable-torch-compile --disable-radix-cache \
         --host $HOST_IP --port $PORT --trust-remote-code --tp-size ${TENSOR_PARALLEL_SIZE} --served-model-name "qwen3-vl" \
         --enable-cache-report --log-level info  --max-running-requests ${MAX_RUNNING_REQUESTS} --json-model-override-args '{"architectures": ["Qwen3MoeForCausalLM"]}' \
@@ -450,7 +454,6 @@ python3 -m sglang.bench_serving \
                     --random-input-len $input_len \
                     --random-output-len $output_len \
                     --random-range-ratio 1 \
-                    --seed  $test_idx \
                     --num-prompt $num_prompt \
                     --warmup-requests 0 \
                     --flush-cache \
@@ -460,36 +463,33 @@ python3 -m sglang.bench_serving \
                     --image-content "random" \
                     --request-rate $qps \
                     --output-file $result_file \
-                    --max-concurrency 64 \
-                    --enable-uniform-sample
+                    --max-concurrency 128
 ```
-
-NOTE：
-
---enable-uniform-sample: 默认发压采用: `interval = np.random.exponential(1.0 / request_rate)`，抖动较大，当前测试采用均匀采样的方式: `interval = 1.0 / request_rate`
-
 
 ---
 ## 性能数据
 
+SLA: Mean TTFT< 4s; Mean TPOT< 100ms
+
+
 ### 单机（TP8）
 
-| 模型               | 场景                              | qps/gpu | TTFT(P50) | TPOT(P90) |
-|--------------------|-----------------------------------|---------|-----------|-----------|
-| qwen2.5-vl-72B     | 单图+文本 (2000x2000+1k), 输出300 | 0.06876 | 1760ms    | 97.44ms   |
-| qwen3-vl-235B-A22B | 单图+文本 (2000x2000+1k), 输出300 | 0.105   | 1164ms    | 91.57ms   |
+| 模型               | 场景                                       | qps/gpu           | TTFT(Mean) | TPOT(Mean) |
+|--------------------|--------------------------------------------|-------------------|------------|------------|
+| qwen2.5-vl-72B     | 单图+文本 (2000x2000+1k), 输出300, qps: 0.52 | 0.06625 req/s/gpu | 3826.07 ms | 78.63 ms   |
+| qwen3-vl-235B-A22B | 单图+文本 (2000x2000+1k), 输出300, qps: 0.85 | 0.1075 req/s/gpu  | 3738.24 ms | 91.24 ms   |
 
 ### 分离
 
-| 配置项  | Encode侧             | Language侧           |
-|---------|----------------------|----------------------|
-| GPU型号 | NVIDIA H20 96GB      | NVIDIA H20 96GB      |
-| GPU数量 | 2 (TP=2)             | 8 (TP=8)             |
+| 配置项  | Encode侧         | Language侧       |
+|---------|------------------|------------------|
+| GPU型号 | NVIDIA H20 96GB  | NVIDIA H20 96GB  |
+| GPU数量 | 2 (TP=2)         | 8 (TP=8)         |
 
-| 模型               | 场景                              | qps/gpu        | TTFT(P50) | TPOT(P90) |
-|--------------------|-----------------------------------|----------------|-----------|-----------|
-| qwen2.5-vl-72B     | 单图+文本 (2000x2000+1k), 输出300 | 0.08063 (+17%) | 1888ms    | 95.12ms   |
-| qwen3-vl-235B-A22B | 单图+文本 (2000x2000+1k), 输出300 | 0.137 (+30%)   | 1371ms    | 84.51ms   |
+| 模型               | 场景                                       | qps/gpu                  | TTFT(Mean)  | TPOT(Mean) |
+|--------------------|--------------------------------------------|--------------------------|------------|-----------|
+| qwen2.5-vl-72B     | 单图+文本 (2000x2000+1k), 输出300, qps: 0.78 | 0.07420 (+12%) req/s/gpu | 3632.70 ms | 95.61 ms  |
+| qwen3-vl-235B-A22B | 单图+文本 (2000x2000+1k), 输出300, qps: 1.40 | 0.141 (+31.2%) req/s/gpu | 3831.58 ms | 95.34 ms  |
 
 
 ## 未来优化方向
@@ -501,3 +501,7 @@ NOTE：
 ### 支持CachePool
 
 MultimodalDataBuffers支持CachePool，支持D2D传输
+
+### 支持chunk-prefill/transfer-embedding并行
+
+### 迁移mini-lb router
