@@ -126,11 +126,11 @@ __global__ void concat_mla_absorb_q_kernel(
     nv_bfloat16* out,
     const int num_items,
     const int dim_1,
-    const int a_stride_0,
+    const int64_t a_stride_0,
     const int a_stride_1,
-    const int b_stride_0,
+    const int64_t b_stride_0,
     const int b_stride_1,
-    const int out_stride_0,
+    const int64_t out_stride_0,
     const int out_stride_1) {
   const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
   const int lane_id = get_lane_id();
