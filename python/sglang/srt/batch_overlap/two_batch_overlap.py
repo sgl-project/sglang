@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
+import torch.nn as nn
 
 from sglang.srt.batch_overlap.operations import (
     execute_operations,
@@ -815,8 +816,10 @@ def model_forward_maybe_tbo(
         residual=residual,
         zero_allocator=zero_allocator,
     )
+
     def filter_real_layers(layers: nn.ModuleList) -> List[nn.Module]:
         return [l for l in layers if not isinstance(l, PPMissingLayer)]
+
     real_layers = filter_real_layers(layers)
     if not real_layers:
         return inputs["hidden_states"], inputs["residual"]
