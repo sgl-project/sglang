@@ -95,6 +95,22 @@ def run_eval(args):
         from sglang.test.simple_eval_humaneval import HumanEval
 
         eval_obj = HumanEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "longbench_v2":
+        from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval
+
+        # Default to HuggingFace dataset, can be overridden with --dataset-path
+        data_source = args.dataset_path
+        categories = args.categories.split(",") if args.categories else None
+
+        eval_obj = LongBenchV2Eval(
+            model=args.model,
+            data_source=data_source,
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            categories=categories,
+            max_context_length=getattr(args, "max_context_length", None),
+            min_context_length=getattr(args, "min_context_length", None),
+        )
     elif args.eval_name == "mmmu":
         # VLM MMMU evaluation with fixed 100 examples by default
         from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
@@ -192,6 +208,31 @@ if __name__ == "__main__":
         choices=THINKING_MODE_CHOICES,
         help="Enable thinking mode in Deepseek R1, V3.1/3.2, or Qwen3",
     )
+
+    # LongBench-v2 specific arguments
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default="THUDM/LongBench-v2",
+        help="Path to dataset file or HuggingFace dataset name for LongBench-v2",
+    )
+    parser.add_argument(
+        "--categories",
+        type=str,
+        default=None,
+        help="Comma-separated list of categories to evaluate for LongBench-v2",
+    )
+    parser.add_argument(
+        "--max-context-length",
+        type=int,
+        help="Maximum context length in characters for LongBench-v2",
+    )
+    parser.add_argument(
+        "--min-context-length",
+        type=int,
+        help="Minimum context length in characters for LongBench-v2",
+    )
+
     args = parser.parse_args()
 
     run_eval(args)

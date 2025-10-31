@@ -116,10 +116,9 @@ async fn test_llama_empty_arguments() {
 async fn test_llama_format_detection() {
     let parser = LlamaParser::new();
 
-    assert!(parser.detect_format(r#"<|python_tag|>{"name": "test"}"#));
-    assert!(parser.detect_format(r#"{"name": "test", "parameters": {}}"#));
-    assert!(!parser.detect_format("plain text"));
-    assert!(!parser.detect_format(r#"{"key": "value"}"#)); // No name field
+    assert!(parser.has_tool_markers(r#"<|python_tag|>{"name": "test"}"#));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "parameters": {}}"#));
+    assert!(!parser.has_tool_markers("plain text"));
 }
 
 #[tokio::test]

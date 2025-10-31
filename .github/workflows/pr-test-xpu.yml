@@ -1,0 +1,99 @@
+name: PR Test (XPU)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/ci/**"
+      - "test/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-xpu.yml"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/ci/**"
+      - "test/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-xpu.yml"
+    types: [synchronize, labeled]
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-xpu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: intel-bmg
+    env:
+      HF_HOME: /home/sdp/.cache/huggingface
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF=${{ github.head_ref }}
+          docker build \
+            ${PR_REPO:+--build-arg SG_LANG_REPO=$PR_REPO} \
+            ${PR_HEAD_REF:+--build-arg SG_LANG_BRANCH=$PR_HEAD_REF} \
+            --no-cache --progress=plain -f docker/xpu.Dockerfile -t xpu_sglang_main:bmg .
+
+      - name: Run container
+        id: start_container
+        run: |
+          container_id=$(docker run -dt \
+            --group-add 992 \
+            --group-add $(getent group video | cut -d: -f3) \
+            -v ${HF_HOME}:/root/.cache/huggingface \
+            --device /dev/dri \
+            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
+            xpu_sglang_main:bmg)
+          echo "Started container: $container_id"
+          echo "container_id=$container_id" >> "$GITHUB_OUTPUT"
+
+      - name: Install Dependency
+        timeout-minutes: 20
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
+          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
+          docker exec -u root "$cid" /bin/bash -c "ln -sf /home/sdp/miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
+
+      - name: Run E2E Bfloat16 tests
+        timeout-minutes: 20
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec -w /home/sdp/sglang/ "$cid" \
+            bash -c "LD_LIBRARY_PATH=/home/sdp/miniforge3/envs/py3.10/lib:$LD_LIBRARY_PATH && cd ./test/srt && python3 run_suite.py --suite per-commit-xpu"
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker rm -f "$cid" || true
+
+  finish:
+    if: always()
+    needs: [build-and-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job status
+        run: |
+          if [ "${{ needs.build-and-test.result }}" != "success" ]; then
+            echo "Job failed with result: ${{ needs.build-and-test.result }}"
+            exit 1
+          fi
+          echo "All jobs completed successfully"
+          exit 0

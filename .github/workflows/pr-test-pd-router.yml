@@ -1,4 +1,4 @@
-name: PR Test (PD Router)
+name: PR Benchmark (SMG PD Router)
 
 on:
   push:
@@ -28,7 +28,7 @@ permissions:
 jobs:
   test-disaggregation:
     if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'run-ci') && contains(github.event.pull_request.labels.*.name, 'router-benchmark'))
-    runs-on: [h200]
+    runs-on: [8-gpu-h200-oracle]
     timeout-minutes: 45
 
     steps:
@@ -138,7 +138,7 @@ jobs:
       run: |
         echo "Installing SGLang with all extras..."
         python3 -m pip --no-cache-dir install --upgrade pip
-        python3 -m pip --no-cache-dir install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
+        python3 -m pip --no-cache-dir install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu128
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
         python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.6.post1
         python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.2
@@ -148,7 +148,9 @@ jobs:
         source "$HOME/.cargo/env"
         echo "Building sgl-router..."
         cd sgl-router
-        cargo build && python3 -m build && pip install --force-reinstall dist/*.whl
+        pip install maturin
+        maturin build --release --out dist --features vendored-openssl
+        pip install --force-reinstall dist/*.whl
 
     - name: Start disaggregation servers
       id: start_servers
@@ -257,7 +259,7 @@ jobs:
                 {"role": "user", "content": "Write a Python function to calculate fibonacci numbers recursively"}
               ],
               "stream": false,
-              "max_tokens": 100
+              "max_completion_tokens": 100
             }')
 
           if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
@@ -279,7 +281,7 @@ jobs:
                 {"role": "user", "content": "Count from 1 to 5"}
               ],
               "stream": true,
-              "max_tokens": 50
+              "max_completion_tokens": 50
             }')
 
           if echo "$stream_response" | grep -q "data:"; then

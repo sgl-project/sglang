@@ -15,6 +15,7 @@ import requests
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.test_disaggregation_utils import get_rdma_devices_args
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     CustomTestCase,
@@ -192,7 +193,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         """Get additional server arguments specific to configuration - override in subclasses"""
 
         server_args = {
-            "--tp-size": 1,
+            "--tp-size": 2,
             "--hicache-ratio": 2,
             "--hicache-storage-backend": "mooncake",
         }
@@ -200,9 +201,9 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         # Set the environment variables for Mooncake using dynamic ports
         env_vars = {
             "MOONCAKE_MASTER": f"127.0.0.1:{cls.mooncake_master_port}",
-            "MOONCAKE_PROTOCOL": "rdma",
+            "MOONCAKE_PROTOCOL": "tcp",
             "MC_MS_AUTO_DISC": "0",
-            "MOONCAKE_DEVICE": "mlx5_roce0,mlx5_roce1",
+            "MOONCAKE_DEVICE": "",
             "MOONCAKE_TE_META_DATA_SERVER": f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4294967296",  # 4 GiB
         }

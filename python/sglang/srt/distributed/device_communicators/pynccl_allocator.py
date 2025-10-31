@@ -6,6 +6,7 @@ from packaging import version
 from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.server_args import get_global_server_args
 
 nccl_allocator_source = """
 #include <nccl.h>
@@ -33,10 +34,7 @@ _cached_pool_snapshot = None
 
 
 def is_symmetric_memory_enabled():
-    # Import here to avoid circular import
-    from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-    return global_server_args_dict["enable_symm_mem"]
+    return get_global_server_args().enable_symm_mem
 
 
 def is_symmetric_memory_tensor(tensor: torch.Tensor):
