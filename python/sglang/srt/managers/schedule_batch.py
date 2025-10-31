@@ -1415,6 +1415,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens += running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
+        self.is_prefill_only = False
 
     def new_page_count_next_decode(self, selected_indices: Optional[List[int]] = None):
         page_size = self.token_to_kv_pool_allocator.page_size
