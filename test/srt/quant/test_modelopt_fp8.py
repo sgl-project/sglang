@@ -97,7 +97,7 @@ class TestMOLlamaFP8(MOFP8Test):
     gsm8k_accuracy_threshold = 0.69
     throughput_threshold = 120
 
-class TestMOQwenVLFP8(MOFP8Test):
+class TestMOQwenFP8(MOFP8Test):
     model = "nvidia/Qwen3-8B-FP8"
     quantization = "modelopt"
     kv_cache_dtype = "fp8_e4m3"
