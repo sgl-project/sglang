@@ -2330,6 +2330,23 @@ class Scheduler(
                     f"{swa_available_size=}, "
                     f"{swa_evictable_size=}, "
                 )
+            elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
+                (
+                    _,
+                    _,
+                    _,
+                    _,
+                    full_available_size,
+                    full_evictable_size,
+                    mamba_available_size,
+                    mamba_evictable_size,
+                ) = self._get_mamba_token_info()
+                info_msg = (
+                    f"{full_available_size=}, "
+                    f"{full_evictable_size=}, "
+                    f"{mamba_available_size=}, "
+                    f"{mamba_evictable_size=}, "
+                )
             else:
                 _, _, available_size, evictable_size = self._get_token_info()
                 info_msg = f"{available_size=}, " f"{evictable_size=}, "
