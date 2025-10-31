@@ -78,7 +78,7 @@ suites = {
         TestFile("test_deterministic.py", 320),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
-        TestFile("test_eagle_infer_beta.py", 300),
+        TestFile("test_eagle_infer_beta.py", 90),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
@@ -184,6 +184,9 @@ suites = {
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
+    ],
+    "per-commit-4-gpu-gb200": [
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -359,6 +362,7 @@ suite_ascend = {
     ],
     "per-commit-16-ascend-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
+        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
 }
 
