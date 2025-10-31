@@ -28,6 +28,7 @@ suites = {
         TestFile("lora/test_lora_backend.py", 99),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_qwen3.py", 97),
+        TestFile("lora/test_lora_qwen3_vl.py", 200),
         TestFile("lora/test_lora_radix_cache.py", 100),
         TestFile("lora/test_lora_openai_api.py", 30),
         TestFile("lora/test_lora_update.py", 400),
