@@ -401,6 +401,9 @@ class ResponseCRUDBaseTest(ResponseAPIBaseTest):
 
     def test_structured_output_json_schema(self):
         """Test structured output with json_schema format."""
+        # Note: This test requires a model that supports structured outputs
+        # (e.g., gpt-4o-2024-08-06 or newer)
+
         # Create response with structured output
         data = {
             "model": self.model,
@@ -449,9 +452,30 @@ class ResponseCRUDBaseTest(ResponseAPIBaseTest):
         create_data = create_resp.json()
         self.assertIn("id", create_data)
         self.assertIn("output", create_data)
+        self.assertIn("text", create_data)
 
-        # Verify output is valid JSON matching the schema
-        output_text = create_data["output"][0]["content"][0]["text"]
+        # Verify text format was echoed back correctly
+        self.assertIn("format", create_data["text"])
+        self.assertEqual(create_data["text"]["format"]["type"], "json_schema")
+        self.assertEqual(create_data["text"]["format"]["name"], "math_reasoning")
+        self.assertIn("schema", create_data["text"]["format"])
+        self.assertEqual(create_data["text"]["format"]["strict"], True)
+
+        # Find the message output (output[0] may be reasoning, output[1] is message)
+        output_text = None
+        for item in create_data["output"]:
+            if item.get("type") == "message" and "content" in item:
+                for content in item["content"]:
+                    if content.get("type") == "output_text":
+                        output_text = content.get("text", "")
+                        break
+                if output_text:
+                    break
+
+        self.assertIsNotNone(output_text, "No output_text found in response")
+        self.assertTrue(output_text.strip(), "output_text is empty")
+
+        # Parse JSON output
         output_json = json.loads(output_text)
 
         # Verify schema structure
