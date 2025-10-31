@@ -20,8 +20,9 @@ def is_cuda_v2():
 PACKAGE_LIST = [
     "sglang",
     "sgl_kernel",
-    "flashinfer_cubin",
     "flashinfer_python",
+    "flashinfer_cubin",
+    "flashinfer-jit-cache",
     "triton",
     "transformers",
     "torchao",

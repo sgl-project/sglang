@@ -54,7 +54,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     PIP_INSTALL_SUFFIX="--break-system-packages"
 
     # Clean up existing installations
-    $PIP_CMD uninstall -y flashinfer_python flashinfer_cubin sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
+    $PIP_CMD uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
 
     # Install the main package
     $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} --extra-index-url https://flashinfer.ai/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
@@ -68,7 +68,7 @@ else
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
     # Clean up existing installations
-    $PIP_CMD uninstall flashinfer_python flashinfer_cubin sgl-kernel sglang vllm || true
+    $PIP_CMD uninstall flashinfer-python flashinfer-cubin sgl-kernel sglang vllm || true
 
     # Install the main package without deps
     $PIP_CMD install -e "python[dev]" --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
