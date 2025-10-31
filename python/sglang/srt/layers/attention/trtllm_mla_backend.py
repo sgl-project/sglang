@@ -563,6 +563,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             if forward_batch.forward_mode.is_target_verify():
                 max_seq = max_seq + self.num_draft_tokens
                 seq_lens = seq_lens + self.num_draft_tokens
+                self.forward_decode_metadata.seq_lens_k = seq_lens
             elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 max_seq = forward_batch.seq_lens_cpu.max().item()
 
@@ -574,7 +575,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     ),
                     (1, 0),
                 )
-                seq_lens = seq_lens - forward_batch.extend_seq_lens_cpu + max_seq_len_q
+                seq_lens = seq_lens - forward_batch.extend_seq_lens + max_seq_len_q
 
                 self.forward_decode_metadata.max_seq_len_q = max_seq_len_q
                 self.forward_decode_metadata.sum_seq_lens_q = sum_seq_lens_q
