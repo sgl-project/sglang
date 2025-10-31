@@ -61,16 +61,10 @@ def get_model_config(
         E = config.ffn_config.moe_num_experts
         topk = config.ffn_config.moe_top_k
         intermediate_size = config.ffn_config.ffn_hidden_size
-        shard_intermediate_size = calculate_shard_intermediate_size(
-            intermediate_size, tp_size, ep_size
-        )
     elif architecture == "JambaForCausalLM":
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
-        shard_intermediate_size = calculate_shard_intermediate_size(
-            intermediate_size, tp_size, ep_size
-        )
     elif architecture in [
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -80,9 +74,6 @@ def get_model_config(
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = calculate_shard_intermediate_size(
-            intermediate_size, tp_size, ep_size
-        )
     elif architecture in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
         E = (
             config.n_routed_experts + (0 if disable_shared_experts_fusion else 1)
@@ -91,16 +82,10 @@ def get_model_config(
         )
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = calculate_shard_intermediate_size(
-            intermediate_size, tp_size, ep_size
-        )
     elif architecture == "Llama4ForConditionalGeneration":
         E = config.num_local_experts + (0 if disable_shared_experts_fusion else 1)
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
-        shard_intermediate_size = calculate_shard_intermediate_size(
-            intermediate_size, tp_size, ep_size
-        )
     elif architecture in [
         "Grok1ForCausalLM",
         "Grok1ImgGen",
@@ -109,9 +94,6 @@ def get_model_config(
         E = config.num_local_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = calculate_shard_intermediate_size(
-            intermediate_size, tp_size, ep_size
-        )
     elif architecture in [
         "BailingMoEForCausalLM",
         "BailingMoeForCausalLM",
@@ -120,24 +102,19 @@ def get_model_config(
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = calculate_shard_intermediate_size(
-            intermediate_size, tp_size, ep_size
-        )
     elif architecture in ["Glm4MoeForCausalLM"]:
         E = config.n_routed_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = calculate_shard_intermediate_size(
-            intermediate_size, tp_size, ep_size
-        )
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
-        shard_intermediate_size = calculate_shard_intermediate_size(
-            intermediate_size, tp_size, ep_size
-        )
+
+    shard_intermediate_size = calculate_shard_intermediate_size(
+        intermediate_size, tp_size, ep_size
+    )
 
     return {
         "num_experts": E,
