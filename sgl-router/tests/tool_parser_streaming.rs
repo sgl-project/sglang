@@ -1,341 +1,322 @@
-//! Streaming Parser Tests
+//! Realistic Streaming Parser Tests
 //!
-//! Tests for incremental/streaming parsing capabilities across all parsers
+//! Tests incremental parsing with realistic char-level chunks (2-5 chars)
+//! that simulate how LLM tokens actually arrive.
+//!
+//! These tests are designed to catch bugs like `{"name": "` being parsed
+//! as an empty tool name.
 
-use sglang_router_rs::tool_parser::{
-    JsonParser, LlamaParser, MistralParser, ParseState, PythonicParser, QwenParser, StreamResult,
-    ToolParser,
-};
+use sglang_router_rs::tool_parser::{JsonParser, LlamaParser, QwenParser, ToolParser};
 
-#[tokio::test]
-async fn test_json_streaming_simple() {
-    let parser = JsonParser::new();
-    let mut state = ParseState::new();
+mod common;
+use common::{create_test_tools, streaming_helpers::*};
 
-    // Phase 2 note: This test sends the full JSON at once in the last chunk
-    // In real streaming, chunks would be smaller
-    let full_json = r#"{"name": "get_weather", "arguments": {"location": "San Francisco"}}"#;
-
-    let result = parser
-        .parse_incremental(full_json, &mut state)
-        .await
-        .unwrap();
-
-    // With complete JSON sent at once, we should get ToolComplete
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "get_weather");
-        }
-        _ => {
-            panic!("Expected ToolComplete for complete JSON input");
-        }
-    }
-}
+// =============================================================================
+// THE BUG SCENARIO - Most Critical Test
+// =============================================================================
 
 #[tokio::test]
-async fn test_json_streaming_array() {
-    let parser = JsonParser::new();
-    let mut state = ParseState::new();
+async fn test_json_bug_incomplete_tool_name_string() {
+    let tools = create_test_tools();
+    let mut parser = JsonParser::new();
 
-    // Stream a JSON array of tools
+    // This exact sequence triggered the bug:
+    // Parser receives {"name": " and must NOT parse it as empty name
     let chunks = vec![
-        r#"["#,
-        r#"{"name": "tool1", "#,
-        r#""arguments": {}}, "#,
-        r#"{"name": "tool2", "#,
-        r#""arguments": {"x": 1"#,
-        r#"}}]"#,
+        r#"{"#,
+        r#"""#,
+        r#"name"#,
+        r#"""#,
+        r#":"#,
+        r#" "#,
+        r#"""#, // ← Critical moment: parser has {"name": "
+        // At this point, partial_json should NOT allow incomplete strings
+        // when current_tool_name_sent=false
+        r#"search"#, // Use valid tool name from create_test_tools()
+        r#"""#,
+        r#", "#,
+        r#"""#,
+        r#"arguments"#,
+        r#"""#,
+        r#": {"#,
+        r#"""#,
+        r#"query"#,
+        r#"""#,
+        r#": "#,
+        r#"""#,
+        r#"rust programming"#,
+        r#"""#,
+        r#"}}"#,
     ];
 
-    let mut tool_count = 0;
+    let mut got_tool_name = false;
+    let mut saw_empty_name = false;
 
-    for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
-        if let StreamResult::ToolComplete(_) = result {
-            tool_count += 1;
+    for chunk in chunks.iter() {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+
+        for call in result.calls {
+            if let Some(name) = &call.name {
+                if name.is_empty() {
+                    saw_empty_name = true;
+                }
+                if name == "search" {
+                    got_tool_name = true;
+                }
+            }
         }
     }
 
-    // Current implementation may handle this differently
-    // We're mainly testing that it doesn't crash
-    assert!(tool_count <= 2, "Should parse at most 2 tools");
-}
-
-#[tokio::test]
-async fn test_mistral_streaming() {
-    let parser = MistralParser::new();
-    let mut state = ParseState::new();
-
-    let chunks = vec![
-        r#"Here is the result: "#,
-        r#"[TOOL_CALLS] ["#,
-        r#"{"name": "#,
-        r#""search", "#,
-        r#""arguments": "#,
-        r#"{"query": "#,
-        r#""rust lang""#,
-        r#"}}]"#,
-    ];
-
-    let mut got_complete = false;
-
-    for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
-        if let StreamResult::ToolComplete(tool) = result {
-            assert_eq!(tool.function.name, "search");
-            got_complete = true;
-        }
-    }
-
-    assert!(got_complete, "Should have completed parsing");
-}
-
-#[tokio::test]
-async fn test_pythonic_streaming() {
-    let parser = PythonicParser::new();
-    let mut state = ParseState::new();
-
-    // Send complete pythonic format at once
-    let full_input = r#"[get_weather(city="London", units="celsius")]"#;
-
-    let result = parser
-        .parse_incremental(full_input, &mut state)
-        .await
-        .unwrap();
-
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "get_weather");
-            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
-            assert_eq!(args["city"], "London");
-        }
-        _ => {
-            panic!("Expected ToolComplete for complete pythonic input");
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_llama_streaming_with_python_tag() {
-    let parser = LlamaParser::new();
-    let mut state = ParseState::new();
-
-    let chunks = vec![
-        r#"Let me help. "#,
-        r#"<|python"#,
-        r#"_tag|>"#,
-        r#"{"name": "#,
-        r#""calculate", "#,
-        r#""arguments": "#,
-        r#"{"x": 10}"#,
-        r#"}"#,
-    ];
-
-    let mut got_complete = false;
-
-    for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
-        if let StreamResult::ToolComplete(tool) = result {
-            assert_eq!(tool.function.name, "calculate");
-            got_complete = true;
-        }
-    }
-
-    assert!(got_complete, "Should have completed parsing");
-}
-
-#[tokio::test]
-async fn test_qwen_streaming() {
-    let parser = QwenParser::new();
-    let mut state = ParseState::new();
-
-    // Send complete Qwen format at once (with exact format expected by parser)
-    // Note: Parser expects newline after both tags
-    let full_input = "<tool_call>\n{\"name\": \"translate\", \"arguments\": {\"text\": \"hello\", \"to\": \"zh\"}}\n</tool_call>";
-
-    let result = parser
-        .parse_incremental(full_input, &mut state)
-        .await
-        .unwrap();
-
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "translate");
-        }
-        other => {
-            panic!(
-                "Expected ToolComplete for complete Qwen input, got: {:?}",
-                other
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_streaming_incomplete_stays_incomplete() {
-    let parser = JsonParser::new();
-    let mut state = ParseState::new();
-
-    // Send truly incomplete JSON that can't be auto-completed
-    let chunks = vec![r#"{"na"#, r#"me": "#];
-
-    for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
-        // Should return Incomplete for partial JSON that can't be auto-completed
-        assert!(
-            matches!(result, StreamResult::Incomplete),
-            "Should return Incomplete for partial JSON, got: {:?}",
-            result
-        );
-    }
-
-    // Buffer should contain the accumulated incomplete JSON
-    assert!(!state.buffer.is_empty());
-}
-
-#[tokio::test]
-async fn test_streaming_with_text_before_tool() {
-    let parser = JsonParser::new();
-    let mut state = ParseState::new();
-
-    // For streaming, the parser expects clean JSON
-    // Mixed text extraction only works in parse_complete, not parse_incremental
-    let full_input = r#"{"name": "test", "arguments": {}}"#;
-
-    let result = parser
-        .parse_incremental(full_input, &mut state)
-        .await
-        .unwrap();
-
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "test");
-        }
-        other => {
-            panic!("Expected ToolComplete, got: {:?}", other);
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_streaming_buffer_accumulation() {
-    let parser = JsonParser::new();
-
-    // Test: Complete JSON should clear buffer after parsing
-    let mut state = ParseState::new();
-
-    // Send partial JSON that can't be interpreted as complete
-    let result1 = parser
-        .parse_incremental(r#"{"na"#, &mut state)
-        .await
-        .unwrap();
-
-    assert!(matches!(result1, StreamResult::Incomplete));
     assert!(
-        !state.buffer.is_empty(),
-        "Buffer should accumulate incomplete JSON"
+        !saw_empty_name,
+        "Parser should NEVER return empty tool name"
     );
+    assert!(got_tool_name, "Should have parsed tool name correctly");
+}
 
-    // Send rest of JSON
-    let result2 = parser
-        .parse_incremental(r#"me": "test", "arguments": {}}"#, &mut state)
-        .await
-        .unwrap();
+// =============================================================================
+// JSON PARSER REALISTIC STREAMING
+// =============================================================================
 
-    match result2 {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "test");
-            assert!(
-                state.buffer.is_empty(),
-                "Buffer should be cleared after complete parse"
-            );
+#[tokio::test]
+async fn test_json_realistic_chunks_simple_tool() {
+    let tools = create_test_tools();
+    let mut parser = JsonParser::new();
+
+    let input = r#"{"name": "get_weather", "arguments": {"city": "Paris"}}"#;
+    let chunks = create_realistic_chunks(input);
+
+    assert!(chunks.len() > 10, "Should have many small chunks");
+
+    let mut got_tool_name = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(&chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if let Some(name) = call.name {
+                assert_eq!(name, "get_weather");
+                got_tool_name = true;
+            }
         }
-        _ => panic!(
-            "Expected ToolComplete for complete JSON, got: {:?}",
-            result2
-        ),
     }
+
+    assert!(got_tool_name, "Should have parsed tool name");
 }
 
 #[tokio::test]
-async fn test_streaming_multiple_tools_sequential() {
-    let parser = QwenParser::new();
-    let mut state = ParseState::new();
+async fn test_json_strategic_chunks_with_quotes() {
+    let tools = create_test_tools();
+    let mut parser = JsonParser::new();
 
-    // Send complete Qwen format with newlines
-    let full_input = r#"<tool_call>
-{"name": "tool1", "arguments": {}}
-</tool_call>"#;
+    let input = r#"{"name": "search", "arguments": {"query": "rust programming"}}"#;
+    let chunks = create_strategic_chunks(input);
 
-    let result = parser
-        .parse_incremental(full_input, &mut state)
-        .await
-        .unwrap();
+    // Strategic chunks break after quotes and colons
+    assert!(chunks.iter().any(|c| c.ends_with('"')));
 
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "tool1");
-        }
-        _ => {
-            panic!("Expected ToolComplete for first tool");
+    let mut got_tool_name = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(&chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if call.name.is_some() {
+                got_tool_name = true;
+            }
         }
     }
+
+    assert!(got_tool_name, "Should have parsed tool name");
 }
 
 #[tokio::test]
-async fn test_streaming_reset_after_error() {
-    let parser = JsonParser::new();
+async fn test_json_incremental_arguments_streaming() {
+    let tools = create_test_tools();
+    let mut parser = JsonParser::new();
 
-    // First attempt with invalid JSON
-    let mut state1 = ParseState::new();
-    let _ = parser
-        .parse_incremental(r#"{"name": invalid}"#, &mut state1)
-        .await;
+    let input = r#"{"name": "search", "arguments": {"query": "test", "limit": 10}}"#;
+    let chunks = create_realistic_chunks(input);
 
-    // Second attempt with valid JSON should work with fresh state
-    let mut state2 = ParseState::new();
-    let result = parser
-        .parse_incremental(r#"{"name": "test", "arguments": {}}"#, &mut state2)
-        .await
-        .unwrap();
+    let mut tool_name_sent = false;
+    let mut got_arguments = false;
 
-    if let StreamResult::ToolComplete(tool) = result {
-        assert_eq!(tool.function.name, "test");
+    for chunk in chunks {
+        let result = parser.parse_incremental(&chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if call.name.is_some() {
+                tool_name_sent = true;
+            }
+            if tool_name_sent && !call.parameters.is_empty() {
+                got_arguments = true;
+            }
+        }
     }
+
+    assert!(tool_name_sent, "Should have sent tool name");
+    assert!(got_arguments, "Should have sent arguments");
+}
+
+// =============================================================================
+// LLAMA PARSER REALISTIC STREAMING
+// =============================================================================
+
+#[tokio::test]
+async fn test_llama_realistic_chunks_with_python_tag() {
+    let tools = create_test_tools();
+    let mut parser = LlamaParser::new();
+
+    let input = r#"<|python_tag|>{"name": "calculate", "parameters": {"x": 10, "y": 20}}"#;
+    let chunks = create_realistic_chunks(input);
+
+    assert!(chunks.len() > 15, "Should have many small chunks");
+
+    let mut got_tool_name = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(&chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if let Some(name) = call.name {
+                assert_eq!(name, "calculate");
+                got_tool_name = true;
+            }
+        }
+    }
+
+    assert!(got_tool_name, "Should have parsed tool name");
 }
 
 #[tokio::test]
-async fn test_streaming_with_unicode_chunks() {
-    let parser = JsonParser::new();
-    let mut state = ParseState::new();
+async fn test_llama_python_tag_arrives_in_parts() {
+    let tools = create_test_tools();
+    let mut parser = LlamaParser::new();
 
-    // Send complete JSON with unicode
-    let full_input = r#"{"name": "translate", "arguments": {"text": "Hello 世界 🌍"}}"#;
+    // Python tag itself arrives in small chunks
+    let chunks = vec![
+        "<|p", "yth", "on_", "tag", "|>{", r#"""#, "na", r#"me""#, ": ", r#"""#, "sea", "rch",
+        r#"""#, ", ", r#"""#, "par", "ame", "ter", "s", r#"""#, ": {", r#"""#, "q", r#"""#, ": ",
+        r#"""#, "tes", "t", r#"""#, "}}",
+    ];
 
-    let result = parser
-        .parse_incremental(full_input, &mut state)
-        .await
-        .unwrap();
+    let mut got_tool_name = false;
 
-    // Phase 2 may return partial results even with complete JSON
-    // The important thing is that unicode is handled without crashes
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "translate");
-            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
-            assert!(args["text"].as_str().unwrap().contains("世界"));
-        }
-        StreamResult::ToolName { name, .. } => {
-            assert_eq!(name, "translate");
-            // Phase 2 partial streaming behavior - acceptable
-        }
-        StreamResult::ToolArguments { arguments, .. } => {
-            // Verify unicode was preserved
-            let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
-            assert!(args["text"].as_str().unwrap().contains("世界"));
-        }
-        other => {
-            panic!("Unexpected result: {:?}", other);
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if let Some(name) = call.name {
+                assert_eq!(name, "search");
+                got_tool_name = true;
+            }
         }
     }
+
+    assert!(got_tool_name, "Should have parsed tool name");
+}
+
+// =============================================================================
+// QWEN PARSER REALISTIC STREAMING
+// =============================================================================
+
+#[tokio::test]
+async fn test_qwen_realistic_chunks_with_xml_tags() {
+    let tools = create_test_tools();
+    let mut parser = QwenParser::new();
+
+    let input = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</tool_call>";
+    let chunks = create_realistic_chunks(input);
+
+    assert!(chunks.len() > 20, "Should have many small chunks");
+
+    let mut got_tool_name = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(&chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if let Some(name) = call.name {
+                assert_eq!(name, "get_weather");
+                got_tool_name = true;
+            }
+        }
+    }
+
+    assert!(got_tool_name, "Should have parsed tool name");
+}
+
+#[tokio::test]
+async fn test_qwen_xml_tag_arrives_in_parts() {
+    let tools = create_test_tools();
+    let mut parser = QwenParser::new();
+
+    let chunks = vec![
+        "<to", "ol_", "cal", "l>\n", "{", r#"""#, "na", "me", r#"""#, ": ", r#"""#, "tra", "nsl",
+        "ate", r#"""#, ", ", r#"""#, "arg", "ume", "nts", r#"""#, ": {", r#"""#, "tex", "t",
+        r#"""#, ": ", r#"""#, "hel", "lo", r#"""#, "}}\n", "</t", "ool", "_ca", "ll>",
+    ];
+
+    let mut got_tool_name = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if let Some(name) = call.name {
+                assert_eq!(name, "translate");
+                got_tool_name = true;
+            }
+        }
+    }
+
+    assert!(got_tool_name, "Should have parsed tool name");
+}
+
+// =============================================================================
+// EDGE CASES WITH REALISTIC CHUNKS
+// =============================================================================
+
+#[tokio::test]
+async fn test_json_very_long_url_in_arguments() {
+    let tools = create_test_tools();
+    let mut parser = JsonParser::new();
+
+    // Simulate long URL arriving in many chunks
+    let long_url = "https://example.com/very/long/path/".to_string() + &"segment/".repeat(50);
+    let input = format!(
+        r#"{{"name": "search", "arguments": {{"query": "{}"}}}}"#,
+        long_url
+    );
+    let chunks = create_realistic_chunks(&input);
+
+    assert!(chunks.len() > 100, "Long URL should create many chunks");
+
+    let mut got_tool_name = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(&chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if call.name.is_some() {
+                got_tool_name = true;
+            }
+        }
+    }
+
+    assert!(got_tool_name, "Should have parsed tool name");
+}
+
+#[tokio::test]
+async fn test_json_unicode_arrives_byte_by_byte() {
+    let tools = create_test_tools();
+    let mut parser = JsonParser::new();
+
+    let input = r#"{"name": "search", "arguments": {"query": "Hello 世界 🌍"}}"#;
+    let chunks = create_realistic_chunks(input);
+
+    let mut got_tool_name = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(&chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if call.name.is_some() {
+                got_tool_name = true;
+            }
+        }
+    }
+
+    assert!(got_tool_name, "Should have parsed with unicode");
 }

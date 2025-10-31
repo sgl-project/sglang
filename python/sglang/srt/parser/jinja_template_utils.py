@@ -89,6 +89,12 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
     - If template has loops like {%- for content in message['content'] -%} → 'openai'
     - Otherwise → 'string'
     """
+    # Shortcut for multimodal templates
+    if any(
+        keyword in chat_template for keyword in ["image", "audio", "video", "vision"]
+    ):
+        return "openai"
+
     jinja_ast = _try_extract_ast(chat_template)
     if jinja_ast is None:
         return "string"

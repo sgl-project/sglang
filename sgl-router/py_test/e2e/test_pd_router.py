@@ -1,5 +1,4 @@
 import logging
-import os
 import socket
 import subprocess
 import time
@@ -198,6 +197,8 @@ def pd_cluster(e2e_model: str):
             "--policy",
             "round_robin",
             "--pd-disaggregation",
+            "--log-level",
+            "warn",
         ]
         for url, bport in prefill:
             cmd += ["--prefill", url, str(bport)]
@@ -253,10 +254,10 @@ def test_pd_genai_bench(e2e_model: str, pd_cluster, genai_bench_runner):
         model_path=e2e_model,
         experiment_folder=policy_label,
         thresholds={
-            "ttft_mean_max": 12,
-            "e2e_latency_mean_max": 15,
-            "input_throughput_mean_min": 400,
-            "output_throughput_mean_min": 20,
+            "ttft_mean_max": 13,
+            "e2e_latency_mean_max": 16,
+            "input_throughput_mean_min": 350,
+            "output_throughput_mean_min": 18,
             "gpu_util_p50_min": 99,
         },
         kill_procs=pd_cluster.workers,

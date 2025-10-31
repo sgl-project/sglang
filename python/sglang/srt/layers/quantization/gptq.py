@@ -199,7 +199,6 @@ class GPTQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[LinearMethodBase]:
         # Delay the import to avoid circular dependency
-        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):

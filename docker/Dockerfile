@@ -1,13 +1,22 @@
 ARG CUDA_VERSION=12.9.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
 
+ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
+ARG GRACE_BLACKWELL=0
+
+ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
-ARG CMAKE_BUILD_PARALLEL_LEVEL=2
+ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
+
+ARG SGL_KERNEL_VERSION=0.3.16.post4
+ARG GDRCOPY_VERSION=2.5.1
+ARG NVSHMEM_VERSION=3.4.5
+
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
+    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
     NVSHMEM_DIR=/sgl-workspace/nvshmem/install
 # Add GKE default lib and bin locations.
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
@@ -29,8 +38,8 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     tzdata \
     software-properties-common netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
-    build-essential cmake \
-    libopenmpi-dev libnuma1 libnuma-dev \
+    build-essential cmake perl \
+    libopenmpi-dev libnuma1 libnuma-dev numactl \
     libibverbs-dev libibverbs1 libibumad3 \
     librdmacm1 libnl-3-200 libnl-route-3-200 libnl-route-3-dev libnl-3-dev \
     ibverbs-providers infiniband-diags perftest \
@@ -50,20 +59,21 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
- && git clone https://github.com/NVIDIA/gdrcopy.git -b v2.4.4 \
+ && git clone https://github.com/NVIDIA/gdrcopy.git -b v${GDRCOPY_VERSION} \
  && cd gdrcopy/packages \
  && CUDA=/usr/local/cuda ./build-deb-packages.sh \
  && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb gdrcopy-tests_*.deb gdrcopy_*.deb \
  && cd / && rm -rf /tmp/gdrcopy
 
 # Fix DeepEP IBGDA symlink
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
 FROM scratch AS local_src
 COPY . /src
 
 FROM base AS build-image
 # Install SGLang
+# Until torch 2.9 and cu13 are stable we manually update torch if you are on CUDA 13
 WORKDIR /sgl-workspace
 ARG BRANCH_TYPE
 COPY --from=local_src /src /tmp/local_src
@@ -79,26 +89,64 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       12.6.1) CUINDEX=126 ;; \
       12.8.1) CUINDEX=128 ;; \
       12.9.1) CUINDEX=129 ;; \
+      13.0.1) CUINDEX=130 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
- && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
- && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
- && python3 -m flashinfer --download-cubin \
  && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.11/sgl_kernel-0.3.11+cu124-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
-    fi
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+   ; \
+   elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
+      python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} \
+   ; \
+   elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+   ; \
+   else \
+      echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+   ; \
+   fi \
+ && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+      python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
+    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      python3 -m pip install --no-cache-dir nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+      python3 -m pip uninstall -y torch torchaudio torchvision ; \
+      python3 -m pip install --no-cache-dir torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
+    else \
+      echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
+    fi \
+ && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
-# Download source files
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    git clone https://github.com/deepseek-ai/DeepEP.git && \
-    cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-    cd .. && \
-    tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
+# Download NVSHMEM source files
+# We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
+RUN set -eux; \
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      wget "https://github.com/NVIDIA/nvshmem/releases/download/v${NVSHMEM_VERSION}-0/nvshmem_src_cuda-all-all-${NVSHMEM_VERSION}.tar.gz"; \
+      NVSHMEM_TARBALL="nvshmem_src_cuda-all-all-${NVSHMEM_VERSION}.tar.gz"; \
+    else \
+      wget "https://developer.download.nvidia.com/compute/redist/nvshmem/${NVSHMEM_VERSION}/source/nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz"; \
+      NVSHMEM_TARBALL="nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz"; \
+    fi && \
+    if [ "$GRACE_BLACKWELL" = "1" ]; then \
+      git clone https://github.com/fzyzcjy/DeepEP.git && \
+      cd DeepEP && \
+      git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
+    else \
+      git clone https://github.com/deepseek-ai/DeepEP.git && \
+      cd DeepEP && \
+      git checkout "${DEEPEP_COMMIT}" && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
+    fi && \
+    tar -xf "${NVSHMEM_TARBALL}" && \
     mv nvshmem_src nvshmem && \
-    rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+    rm -f "/sgl-workspace/${NVSHMEM_TARBALL}"
 
 # Build and install NVSHMEM
 RUN cd /sgl-workspace/nvshmem && \
+    if [ "$GRACE_BLACKWELL" = "1" ]; then CUDA_ARCH="90;100;103;120"; else CUDA_ARCH="90"; fi && \
     NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
@@ -107,23 +155,43 @@ RUN cd /sgl-workspace/nvshmem && \
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="90" && \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} && \
     cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
 
 # Install DeepEP
+# CTK13 requires the cccl include
 RUN cd /sgl-workspace/DeepEP && \
     case "$CUDA_VERSION" in \
       12.6.1) \
         CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
         ;; \
-      12.8.1|12.9.1) \
-        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
+      12.8.1|12.9.1|13.0.1) \
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
         ;; \
       *) \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
         ;; \
     esac && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
+    fi && \
+    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
+
+
+# In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
+# latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
+RUN python3 -m pip install --no-cache-dir --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0"
+
+# For cuda 13, we install triton from source to fix some sm103 issues
+# This can be reverted after >3.4.5 is released
+# See the conversation in: https://github.com/triton-lang/triton/pull/8536
+RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
+    git clone https://github.com/triton-lang/triton.git && \
+    cd triton && \
+    git checkout ${TRITON_LANG_COMMIT} && \
+    pip install --break-system-packages -r python/requirements.txt && \
+    MAX_JOBS=20 pip install --break-system-packages -e .; \
+fi
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
@@ -169,16 +237,16 @@ RUN apt-get update && apt-get install -y \
 
 RUN apt update -y \
     && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/amd64 /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
     && apt update -y \
     && apt install nsight-systems-cli -y
 
 # Set up locale
 RUN locale-gen en_US.UTF-8
-ENV LANG en_US.UTF-8
-ENV LANGUAGE en_US:en
-ENV LC_ALL en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
 
 # Install minimal Python packages
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
@@ -186,7 +254,7 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     black \
     isort \
     icdiff \
-    scikit_build_core \
+    scikit-build-core \
     uv \
     pre-commit \
     pandas \
@@ -209,177 +277,44 @@ RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-lin
     && rm -rf clangd_18.1.3 clangd.zip
 
 # Install CMake
-RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-x86_64.tar.gz \
-    && tar -xzf cmake-3.31.1-linux-x86_64.tar.gz \
-    && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
-    && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
-    && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
+RUN CMAKE_VERSION=3.31.1 \
+    && ARCH=$(uname -m) \
+    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
+    && wget "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
+    && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
+    && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
+    && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
-# Install Rust toolchain for sgl-router
-ENV PATH="/root/.cargo/bin:${PATH}"
+# Build and install sgl-router (Rust toolchain removed after build to save space)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustc --version && cargo --version
-
-# Build and install sgl-router
-RUN python3 -m pip install --no-cache-dir setuptools-rust \
+    && export PATH="/root/.cargo/bin:${PATH}" \
+    && rustc --version && cargo --version \
+    && python3 -m pip install --no-cache-dir maturin \
     && cd /sgl-workspace/sglang/sgl-router \
-    && cargo build --release \
-    && python3 -m pip install --no-cache-dir . \
-    && rm -rf /root/.cache
+    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
+    && python3 -m pip install --no-cache-dir --force-reinstall dist/*.whl \
+    && rm -rf /root/.cache /root/.cargo /root/.rustup target dist ~/.cargo
 
 
 # Add yank script
-COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
-#!/bin/bash
-put() {
-  esc=$1
-  test -n "$TMUX" -o -z "${TERM##screen*}" && esc="\033Ptmux;\033$esc\033\\"
-  printf "$esc"
-}
-put "\033]52;c;!\a"
-buf=$( cat "$@" )
-len=$( printf %s "$buf" | wc -c ) max=74994
-test $len -gt $max && echo "$0: input is $(( len - max )) bytes too long" >&2
-put "\033]52;c;$( printf %s "$buf" | head -c $max | base64 | tr -d '\r\n' )\a"
-test -n "$TMUX" && tmux set-buffer "$buf" ||:
-EOF
-
-RUN chmod +x /usr/local/bin/yank
+COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
 
 # Install oh-my-zsh and plugins
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
     && git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
     && git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
-# Configure Vim
-COPY --chown=root:root <<-"EOF" /root/.vimrc
-function! Yank(text) abort
-  let escape = system('yank', a:text)
-  if v:shell_error
-    echoerr escape
-  else
-    call writefile([escape], '/dev/tty', 'b')
-  endif
-endfunction
-
-noremap <silent> <Leader>y y:<C-U>call Yank(@0)<CR>
-
-" automatically run yank(1) whenever yanking in Vim
-function! CopyYank() abort
-  call Yank(join(v:event.regcontents, "\n"))
-endfunction
-
-autocmd TextYankPost * call CopyYank()
-
-" Basic settings
-set number
-syntax on
-set mouse=a
-filetype indent on
-
-" Indentation
-set autoindent nosmartindent
-set smarttab
-set expandtab
-set shiftwidth=4
-set softtabstop=4
-
-" Visual guides
-set colorcolumn=120
-highlight ColorColumn ctermbg=5
-
-" Status line
-set laststatus=2
-set statusline=%<%f\ %h%m%r%=%{\"[\".(&fenc==\"\"?&enc:&fenc).((exists(\"+bomb\")\ &&\ &bomb)?\",B\":\"\").\"]\ \"}%k\ %-14.(%l,%c%V%)\ %P
-
-" Backspace behavior
-set backspace=2
-
-" Encoding
-set encoding=utf-8
-set fileencoding=utf-8
-EOF
-
-# Configure tmux
-COPY --chown=root:root <<-"EOF" /root/.tmux.conf
-# Pane border styling
-set -g pane-border-style fg='#742727',bg=black
-set -g pane-active-border-style fg=red,bg=black
-
-# Status bar styling
-set -g status-style bg='#0C8A92',fg=black
-
-# Change prefix key to backtick
-set-option -g prefix `
-unbind C-b
-bind-key ` send-prefix
-
-# Split panes using - and = with current path
-unbind '"'
-bind - splitw -v -c '#{pane_current_path}'
-unbind '%'
-bind = splitw -h -c '#{pane_current_path}'
-
-# Vi mode settings
-bind-key -T copy-mode-vi Y send-keys -X copy-pipe 'yank > #{pane_tty}'
-set-window-option -g mode-keys vi
-
-# Other settings
-set-option -g escape-time 0
-set-option -g base-index 1
-set-window-option -g mouse on
-set -g history-limit 100000
-EOF
+# Configure Vim and tmux
+COPY docker/configs/.vimrc /root/.vimrc
+COPY docker/configs/.tmux.conf /root/.tmux.conf
 
 # Configure Git
-RUN git config --global core.editor "vim" \
-    && git config --global core.whitespace "fix,-indent-with-non-tab,trailing-space,cr-at-eol" \
-    && git config --global core.pager "diff-so-fancy | less --tabs=4 -RFX" \
-    && git config --global color.ui true \
-    && git config --global color."diff-highlight".oldNormal "red bold" \
-    && git config --global color."diff-highlight".oldHighlight "red bold 52" \
-    && git config --global color."diff-highlight".newNormal "green bold" \
-    && git config --global color."diff-highlight".newHighlight "green bold 22" \
-    && git config --global color.diff.meta "11" \
-    && git config --global color.diff.frag "magenta bold" \
-    && git config --global color.diff.commit "yellow bold" \
-    && git config --global color.diff.old "red bold" \
-    && git config --global color.diff.new "green bold" \
-    && git config --global color.diff.whitespace "red reverse" \
-    && git config --global alias.lg "log --color --graph --pretty=format:'%Cred%h%Creset - %s %Cgreen(%cr) %C(bold blue)<%an>%Creset%C(auto)%d%Creset' --abbrev-commit --" \
-    && git config --global http.sslVerify false \
-    && git config --global pull.rebase true
+COPY docker/configs/.gitconfig /tmp/.gitconfig
+RUN cat /tmp/.gitconfig >> /root/.gitconfig && rm /tmp/.gitconfig
 
 # Configure zsh
-COPY --chown=root:root <<-"EOF" /root/.zshrc
-export ZSH="/root/.oh-my-zsh"
-
-# Theme
-ZSH_THEME="robbyrussell"
-
-# Plugins
-plugins=(
-    git
-    z
-    zsh-autosuggestions
-    zsh-syntax-highlighting
-)
-
-source $ZSH/oh-my-zsh.sh
-
-# Aliases
-alias ll='ls -alF'
-alias la='ls -A'
-alias l='ls -CF'
-alias vi='vim'
-
-# Enhanced history
-HISTSIZE=10000
-SAVEHIST=10000
-setopt HIST_IGNORE_ALL_DUPS
-setopt HIST_FIND_NO_DUPS
-setopt INC_APPEND_HISTORY
-EOF
+COPY docker/configs/.zshrc /root/.zshrc
 
 RUN set -euxo ; \
     curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
