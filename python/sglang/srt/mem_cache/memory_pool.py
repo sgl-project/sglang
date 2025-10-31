@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import List
 
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -130,11 +130,15 @@ class MambaPool:
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
-            for k, v in vars(self).items():
-                if k == "conv" or k == "intermediate_conv_window":
-                    kwargs[k] = [conv[layer] for conv in v]
+            # Use fields instead of vars to avoid torch.compile graph break
+            for f in fields(self):
+                name = f.name
+                v = getattr(self, name)
+                if name in ("conv", "intermediate_conv_window"):
+                    kwargs[name] = [conv[layer] for conv in v]
                 else:
-                    kwargs[k] = v[layer]
+                    # temporal or intermediate_ssm
+                    kwargs[name] = v[layer]
             return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
