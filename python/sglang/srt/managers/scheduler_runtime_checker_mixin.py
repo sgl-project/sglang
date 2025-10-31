@@ -241,42 +241,11 @@ class SchedulerRuntimeCheckerMixin:
         if not disable_request_logging():
             # Print batch size and memory pool info to check whether there are de-sync issues.
             if self.is_hybrid:
-                (
-                    _,
-                    _,
-                    _,
-                    _,
-                    full_available_size,
-                    full_evictable_size,
-                    swa_available_size,
-                    swa_evictable_size,
-                ) = self._get_swa_token_info()
-                info_msg = (
-                    f"{full_available_size=}, "
-                    f"{full_evictable_size=}, "
-                    f"{swa_available_size=}, "
-                    f"{swa_evictable_size=}, "
-                )
+                _, info_msg = self._check_hybrid_memory()
             elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
-                (
-                    _,
-                    _,
-                    _,
-                    _,
-                    full_available_size,
-                    full_evictable_size,
-                    mamba_available_size,
-                    mamba_evictable_size,
-                ) = self._get_mamba_token_info()
-                info_msg = (
-                    f"{full_available_size=}, "
-                    f"{full_evictable_size=}, "
-                    f"{mamba_available_size=}, "
-                    f"{mamba_evictable_size=}, "
-                )
+                _, info_msg = self._check_mamba_memory()
             else:
-                _, _, available_size, evictable_size = self._get_token_info()
-                info_msg = f"{available_size=}, " f"{evictable_size=}, "
+                _, info_msg = self._check_radix_cache_memory()
             logger.error(
                 f"{self.cur_batch.batch_size()=}, "
                 f"{self.cur_batch.reqs=}, "
