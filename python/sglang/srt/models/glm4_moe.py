@@ -462,6 +462,71 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
+    def forward_deepep(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        shared_output = None
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            if not self._fuse_shared_experts_inside_sbo:
+                shared_output = self._forward_shared_experts(hidden_states)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        if self._fuse_shared_experts_inside_sbo:
+            shared_output = None
+
+            def _forward_shared_experts_and_put_results():
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(hidden_states)
+
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            **(
+                dict(
+                    forward_shared_experts=_forward_shared_experts_and_put_results,
+                    alt_stream=self.alt_stream,
+                    # SBO is not yet implemented for NextN
+                    disable_sbo=self.is_nextn,
+                )
+                if self._fuse_shared_experts_inside_sbo
+                else {}
+            ),
+        )
+
+        if shared_output is not None:
+            x = shared_output
+            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+                x.add_(final_hidden_states)
+            else:
+                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+                final_hidden_states *= self.routed_scaling_factor
+
+        return final_hidden_states
+
+    def _forward_shared_experts(
+        self, hidden_states
+    ):
+        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            return self.shared_experts(
+                hidden_states
+            )
+        else:
+            return None
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
