@@ -7,6 +7,7 @@ from transformers import PretrainedConfig
 from sglang.srt.sampling.custom_logit_processor import (
     DeepseekOCRNoRepeatNGramLogitProcessor,
 )
+
 BASE_SIZE = 1024
 IMAGE_SIZE = 640
 CROP_MODE = True
@@ -34,6 +35,7 @@ def get_default_ngram_custom_params() -> Dict[str, object]:
         "window_size": NGRAM_NO_REPEAT_WINDOW,
         "whitelist_token_ids": list(NGRAM_NO_REPEAT_WHITELIST),
     }
+
 
 PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
 

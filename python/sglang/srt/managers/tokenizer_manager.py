@@ -756,9 +756,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         DeepseekOCRNoRepeatNGramLogitProcessor,
                     )
 
-                    processor_str = (
-                        DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
-                    )
+                    processor_str = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
                     apply_defaults = False
                     if obj.custom_logit_processor is None:
                         obj.custom_logit_processor = processor_str
@@ -770,9 +768,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         default_custom_params = {
                             "ngram_size": NGRAM_NO_REPEAT_SIZE,
                             "window_size": NGRAM_NO_REPEAT_WINDOW,
-                            "whitelist_token_ids": list(
-                                NGRAM_NO_REPEAT_WHITELIST
-                            ),
+                            "whitelist_token_ids": list(NGRAM_NO_REPEAT_WHITELIST),
                         }
 
         # Parse sampling parameters
