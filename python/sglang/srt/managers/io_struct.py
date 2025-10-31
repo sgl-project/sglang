@@ -695,6 +695,9 @@ class EmbeddingReqInput(BaseReq):
     # tracing context
     trace_context: Optional[Dict] = None
 
+    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    dimensions: Optional[int] = None
+
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
@@ -771,6 +774,7 @@ class EmbeddingReqInput(BaseReq):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
         )
 
@@ -791,6 +795,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     data_parallel_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
+    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    dimensions: Optional[int] = None
 
 
 @dataclass
@@ -853,6 +859,9 @@ class BatchTokenIDOutput(BaseBatchReq):
     # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
@@ -930,6 +939,9 @@ class BatchStrOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -971,6 +983,9 @@ class BatchEmbeddingOutput(BaseBatchReq):
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
 
 
 @dataclass
@@ -1215,7 +1230,7 @@ class AbortReq(BaseReq):
     abort_all: bool = False
     # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
-    abort_reason: Optional[str] = None
+    abort_message: Optional[str] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
@@ -1459,6 +1474,16 @@ class WatchLoadUpdateReq(BaseReq):
 
 
 @dataclass
+class SetInjectDumpMetadataReqInput(BaseReq):
+    dump_metadata: Dict[str, Any]
+
+
+@dataclass
+class SetInjectDumpMetadataReqOutput(BaseReq):
+    success: bool
+
+
+@dataclass
 class LazyDumpTensorsReqInput(BaseReq):
     pass
 
@@ -1489,6 +1514,3 @@ def _check_all_req_types():
             raise ValueError(
                 f"{name} is a subclass of BaseReq but not follow the naming convention."
             )
-
-
-_check_all_req_types()
