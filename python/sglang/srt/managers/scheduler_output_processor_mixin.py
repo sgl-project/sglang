@@ -338,7 +338,7 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(indices_to_free)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                    # Asynchronously offload KV cache; cache_finished_req will be called after Device->Host transfer completes
+                    # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         release_kv_cache(req, self.tree_cache)
                 else:
