@@ -149,8 +149,8 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
                 continue
 
             try:
-                ngram_size = int(params.get("ngram_size", 0) or 0)
-                window_size = int(params.get("window_size", 0) or 0)
+                ngram_size = int(params.get("ngram_size") or 0)
+                window_size = int(params.get("window_size") or 0)
             except (TypeError, ValueError):
                 continue
 
