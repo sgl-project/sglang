@@ -427,6 +427,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_q = torch.full(
                 (bs,), num_tokens_per_bs, dtype=torch.int32, device=seq_lens.device
             )
+            # NOTE(draft_extend seq_len handling):
+            # forward_batch.seq_lens is the seq_lens of the prev_context + verified tokens.
+            # To account for pad_draft_extend_query, we need seq_lens = prev_context + max_draft_tokens.
+            # This will ensure queries align with kvs correctly when calling
+            # flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla.
             seq_lens = seq_lens - metadata.seq_lens_q + metadata.max_seq_len_q
             metadata.seq_lens_k = torch.zeros(
                 (bs,), dtype=torch.int32, device=seq_lens.device
@@ -502,6 +507,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 torch.cumsum(accept_length, dim=0, dtype=torch.int32)
             )
             metadata.seq_lens_q.copy_(accept_length)
+            # see NOTE(draft_extend seq_len handling)
             seq_lens = seq_lens[:bs] - metadata.seq_lens_q + metadata.max_seq_len_q
             metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
 
@@ -575,6 +581,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     ),
                     (1, 0),
                 )
+                # see NOTE(draft_extend seq_len handling)
                 seq_lens = seq_lens - forward_batch.extend_seq_lens + max_seq_len_q
 
                 self.forward_decode_metadata.max_seq_len_q = max_seq_len_q
