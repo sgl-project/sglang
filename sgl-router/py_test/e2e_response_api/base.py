@@ -410,12 +410,9 @@ class ResponseCRUDBaseTest(ResponseAPIBaseTest):
             "input": [
                 {
                     "role": "system",
-                    "content": "You are a helpful math tutor. Guide the user through the solution step by step."
+                    "content": "You are a helpful math tutor. Guide the user through the solution step by step.",
                 },
-                {
-                    "role": "user",
-                    "content": "how can I solve 8x + 7 = -23"
-                }
+                {"role": "user", "content": "how can I solve 8x + 7 = -23"},
             ],
             "text": {
                 "format": {
@@ -430,20 +427,20 @@ class ResponseCRUDBaseTest(ResponseAPIBaseTest):
                                     "type": "object",
                                     "properties": {
                                         "explanation": {"type": "string"},
-                                        "output": {"type": "string"}
+                                        "output": {"type": "string"},
                                     },
                                     "required": ["explanation", "output"],
-                                    "additionalProperties": False
-                                }
+                                    "additionalProperties": False,
+                                },
                             },
-                            "final_answer": {"type": "string"}
+                            "final_answer": {"type": "string"},
                         },
                         "required": ["steps", "final_answer"],
-                        "additionalProperties": False
+                        "additionalProperties": False,
                     },
-                    "strict": True
+                    "strict": True,
                 }
-            }
+            },
         }
 
         create_resp = self.make_request("/v1/responses", "POST", data)
@@ -469,7 +466,7 @@ class ResponseCRUDBaseTest(ResponseAPIBaseTest):
                     if content.get("type") == "output_text":
                         output_text = content.get("text", "")
                         break
-                if output_text:
+                if output_text is not None:
                     break
 
         self.assertIsNotNone(output_text, "No output_text found in response")

@@ -327,17 +327,6 @@ pub enum TextFormat {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ResponseTextFormat {
-    pub format: TextFormatType,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TextFormatType {
-    #[serde(rename = "type")]
-    pub format_type: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IncludeField {
     #[serde(rename = "code_interpreter_call.outputs")]
@@ -868,7 +857,7 @@ pub struct ResponsesResponse {
 
     /// Text format settings
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<ResponseTextFormat>,
+    pub text: Option<TextConfig>,
 
     /// Tool choice setting
     #[serde(default = "default_tool_choice")]
