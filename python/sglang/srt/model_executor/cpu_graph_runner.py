@@ -114,6 +114,7 @@ def register_fake_ops():
         "fused_add_rmsnorm_cpu",
         "decode_attention_cpu",
         "extend_attention_cpu",
+        "gemma_fused_add_rmsnorm_cpu",
     ]
     for op in none_return_ops:
 
@@ -126,6 +127,9 @@ def register_fake_ops():
         "l2norm_cpu",
         "fused_experts_cpu",
         "shared_expert_cpu",
+        "gemma_rmsnorm_cpu",
+        "causal_conv1d_update_cpu_ori",
+        "qwen3_next_rmsnorm_gated_cpu",
     ]:
 
         @torch.library.register_fake(f"sgl_kernel::{op}")
@@ -337,6 +341,73 @@ def register_fake_ops():
         N = mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
 
+    @torch.library.register_fake("sgl_kernel::fused_qkvzba_split_reshape_cat_cpu")
+    def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
+        batch = mixed_qkvz.shape[0]
+        qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+        mixed_qkv = mixed_qkvz.new_empty(batch, qkv_dim)
+        z = mixed_qkvz.new_empty(batch, num_heads_v, head_v)
+        b = mixed_ba.new_empty(batch, num_heads_v)
+        a = mixed_ba.new_empty(batch, num_heads_v)
+        return mixed_qkv, z, b, a
+
+    @torch.library.register_fake(
+        "sgl_kernel::fused_sigmoid_gating_delta_rule_update_cpu"
+    )
+    def _(
+        mixed_qkv,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        cache_indices,
+        initial_state,
+        use_qk_l2norm_in_kernel,
+    ):
+        batch_size = mixed_qkv.shape[0]
+        seq_len = 1
+        v_num_heads = initial_state.shape[1]
+        v_head_dim = initial_state.shape[3]
+        return mixed_qkv.new_empty(batch_size, seq_len, v_num_heads, v_head_dim)
+
+    @torch.library.register_fake("sgl_kernel::fma_linear")
+    def _(mat1, mat2, bias, post_mul):
+        M = mat1.shape[0]
+        N = mat2.shape[1]
+        K = mat1.shape[1]
+        if post_mul is not None:
+            return mat1.new_empty(M, K)
+        else:
+            return mat1.new_empty(M, N)
+
+    @torch.library.register_fake("sgl_kernel::chunk_gated_delta_rule_cpu")
+    def _(
+        query, key, value, g, beta, cu_seqlens, initial_state, use_qk_l2norm_in_kernel
+    ):
+        output = torch.empty_like(value)
+        assert initial_state is not None
+        final_state = initial_state.to(torch.float32)
+
+        return output, final_state
+
+    @torch.library.register_fake("sgl_kernel::fused_recurrent_gated_delta_rule_cpu")
+    def _(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        cache_indices,
+        initial_state,
+        use_qk_l2norm_in_kernel,
+    ):
+        batch_size = query.shape[1]
+        seq_len = query.shape[0]
+        v_num_heads = value.shape[2]
+        v_head_dim = value.shape[3]
+        output = query.new_empty(batch_size, seq_len, v_num_heads, v_head_dim)
+        return output
+
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
 # Re-abstract the graph runner and restructure CPUGraphRunner to reuse the same logic.
@@ -406,9 +477,12 @@ class CPUGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.model_runner.attn_backend.init_cpu_graph_state(
+            self.max_bs, self.max_num_token
+        )
 
         self.seq_len_fill_value = (
-            self.model_runner.attn_backend.get_graph_seq_len_fill_value()
+            self.model_runner.attn_backend.get_cpu_graph_seq_len_fill_value()
         )
 
         if self.enable_torch_compile:
@@ -497,7 +571,7 @@ class CPUGraphRunner:
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
-        mrope_positions = self.mrope_positions[:, :bs]
+        mrope_positions = self.mrope_positions[:, :num_tokens]
         self.num_token_non_padded[...] = num_tokens
 
         spec_info = self.get_spec_info(num_tokens)
@@ -528,14 +602,24 @@ class CPUGraphRunner:
         )
 
         # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        self.model_runner.attn_backend.init_forward_metadata_capture_cpu_graph(
+            bs,
+            num_tokens,
+            req_pool_indices,
+            seq_lens,
+            None,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
+        )
         # Do infernence to avoid setting attr at runtime, e.g.,
         # self.attn_mha.kv_b_proj = self.kv_b_proj for full graph compile on CPU
-        self.model_runner.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-        )
+        with torch.no_grad():
+            self.model_runner.tp_group.barrier()
+            self.model_runner.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+            )
 
         # Run and capture
         def run_once():
