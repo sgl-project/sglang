@@ -160,6 +160,7 @@ class _DpGatheredBufferWrapper:
     def is_dp_max_padding(cls) -> bool:
         return cls._dp_max_padding
 
+    @classmethod
     def set_is_extend_in_batch(cls, is_extend_in_batch: bool):
         cls._is_extend_in_batch = is_extend_in_batch
 
