@@ -3,8 +3,9 @@ import atexit
 import json
 import logging
 import threading
+from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, List, Optional, OrderedDict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import orjson
 import requests
@@ -136,7 +137,7 @@ class GlobalMetadataState:
                     num_pages = data["num_pages"]
                     rank_meta = RankMetadata(num_pages)
                     rank_meta.free_pages = data["free_pages"]
-                    rank_meta.key_to_index = dict(data["key_to_index"])
+                    rank_meta.key_to_index = OrderedDict(data["key_to_index"])
                     self.ranks[rank_id] = rank_meta
                 logging.info(
                     f"Successfully loaded metadata for {len(self.ranks)} ranks."
