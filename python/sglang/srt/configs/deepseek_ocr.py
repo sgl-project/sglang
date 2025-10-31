@@ -27,7 +27,7 @@ NGRAM_NO_REPEAT_WHITELIST = (128821, 128822)
 DEFAULT_CUSTOM_LOGIT_PROCESSOR = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
 
 
-def get_default_ngram_custom_params() -> Dict[str, object]:
+def get_default_ngram_custom_params() -> Dict[str, Any]:
     """Return default custom params for the DeepSeek-OCR n-gram no repeat processor."""
 
     return {
