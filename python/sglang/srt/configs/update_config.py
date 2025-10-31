@@ -152,5 +152,30 @@ def adjust_config_with_unaligned_cpu_tp(
             "intermediate_size",
             intermediate_padding_size,
         )
+    if hasattr(
+        model_config.hf_config, "vision_config"
+    ) and model_config.hf_config.vision_config.model_type in [
+        "qwen3_vl_moe",
+        "qwen3_vl",
+    ]:
+        model_config.hf_config.vision_config.original_num_heads = (
+            model_config.hf_config.vision_config.num_heads
+        )
+        if model_config.hf_config.vision_config.num_heads % tp_size != 0:
+            model_config.hf_config.vision_config.head_dim = (
+                model_config.hf_config.vision_config.hidden_size
+                // model_config.hf_config.vision_config.num_heads
+            )
+            from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+
+            pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
+            model_config.hf_config.vision_config.num_heads = pad_vocab_size(
+                model_config.hf_config.vision_config.num_heads, pad_size
+            )
+        model_config.hf_config.vision_config = update_intermediate_size(
+            model_config.hf_config.vision_config,
+            "intermediate_size",
+            intermediate_padding_size,
+        )
 
     return model_config

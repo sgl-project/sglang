@@ -128,6 +128,7 @@ class Qwen3_VisionBlock(nn.Module):
         self,
         dim: int,
         num_heads: int,
+        head_size: int,
         intermediate_dim: int,
         hidden_act="silu",
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
@@ -161,6 +162,7 @@ class Qwen3_VisionBlock(nn.Module):
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
+            head_size=head_size,
             projection_size=dim,
             use_qkv_parallel=True,
             rotary_embed="normal",
@@ -273,7 +275,10 @@ class Qwen3VLMoeVisionModel(nn.Module):
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        head_dim = self.hidden_size // self.num_heads
+        if _is_cpu:
+            head_dim = self.hidden_size // vision_config.original_num_heads
+        else:
+            head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
         self.blocks = nn.ModuleList(
@@ -281,6 +286,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
                 Qwen3_VisionBlock(
                     dim=self.hidden_size,
                     num_heads=self.num_heads,
+                    head_size=head_dim,
                     intermediate_dim=vision_config.intermediate_size,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
