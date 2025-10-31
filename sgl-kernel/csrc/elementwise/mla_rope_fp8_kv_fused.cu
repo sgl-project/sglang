@@ -38,6 +38,8 @@
 #endif
 #include <optional>
 #include <stdint.h>
+#include <cstdlib>  // For std::getenv
+#include <string>   // For std::string
 
 // Utility macros (borrowed from pytorch_extension_utils.h style)
 #define CHECK_INPUT(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
@@ -155,9 +157,7 @@ __global__ void FusedRopeQuantizeKernelVec(
     uint8_t* __restrict__ k_nope_out_fp8,
     uint8_t* __restrict__ k_rope_out_fp8,
     uint8_t* __restrict__ kv_buffer_bytes,
-    int64_t kv_stride_n_bytes,
-    int64_t kv_stride_m_bytes,  // NEW: stride for page-internal row
-    int page_size,              // NEW: page size for row offset calculation
+    int64_t kv_stride_row_bytes,  // 2D: row stride in bytes
     const int64_t* __restrict__ kv_cache_loc
 ) {
     constexpr int WARP_SIZE = 32;
@@ -187,21 +187,22 @@ __global__ void FusedRopeQuantizeKernelVec(
     uint8_t* kndst = k_nope_out_fp8 ? (k_nope_out_fp8 + size_t(token_id) * Dn) : nullptr;
     uint8_t* krdst = k_rope_out_fp8 ? (k_rope_out_fp8 + size_t(token_id) * Dr) : nullptr;
 
-    // Get position for RoPE and KV cache row calculation
+    // Get position for RoPE
     int pos = static_cast<int>(pos_ids[token_id]);
 
-    // KV cache destination: include row offset within page
-    // CRITICAL FIX: write to correct row in page (pos % page_size), not always row 0
+    // CRITICAL FIX: kv_cache_loc IS the flat row index (SGLang semantics)
+    // Do NOT use pos % page_size! That was causing KV to be written to wrong locations.
+    // In SGLang: kv_buffer is 2D [total_rows, kv_dim], loc = direct row index
     uint8_t* kvdst = nullptr;
     if (kv_buffer_bytes && kv_cache_loc) {
-        int64_t slot = kv_cache_loc[token_id];
-        int row = pos % page_size;  // ⬅️ Token's row within page
-        kvdst = kv_buffer_bytes 
-              + slot * kv_stride_n_bytes 
-              + static_cast<int64_t>(row) * kv_stride_m_bytes;
+        int64_t flat_row = kv_cache_loc[token_id];  // This IS the row index
+        kvdst = kv_buffer_bytes + flat_row * kv_stride_row_bytes;
     }
-    const float* cos_ptr = cos_sin + size_t(pos) * (2 * Dr);
-    const float* sin_ptr = cos_ptr + Dr;
+    
+    // CRITICAL FIX: cos_sin_cache layout is [max_pos, rope_dim] (not 2*rope_dim!)
+    // First half (rope_dim/2) is cos, second half is sin
+    const float* cos_ptr = cos_sin + size_t(pos) * Dr;  // rope_dim = Dr
+    const float* sin_ptr = cos_ptr + (Dr / 2);           // sin at offset Dr/2
 
     // Use traits for dtype-agnostic vectorized load
     using V2 = typename Vec2Traits<T>::v2;
@@ -220,16 +221,22 @@ __global__ void FusedRopeQuantizeKernelVec(
     }
 
     // Process Q_rope: paired rotation + vectorized quantize + write
+    // Each iteration processes 2 pairs: (c, c+1) and (c+2, c+3)
     for (int c = lane * 4; c < Dr; c += WARP_SIZE * 4) {
-        V2 h0 = *reinterpret_cast<const V2*>(qr + c + 0);
-        V2 h1 = *reinterpret_cast<const V2*>(qr + c + 2);
+        V2 h0 = *reinterpret_cast<const V2*>(qr + c + 0);  // [c+0, c+1]
+        V2 h1 = *reinterpret_cast<const V2*>(qr + c + 2);  // [c+2, c+3]
         float2 f0 = Vec2Traits<T>::to_float2(h0);
         float2 f1 = Vec2Traits<T>::to_float2(h1);
 
-        float c0 = cos_ptr[c + 0], s0 = sin_ptr[c + 0];
-        float c1 = cos_ptr[c + 2], s1 = sin_ptr[c + 2];
-        rope_rotate(f0.x, f0.y, c0, s0, is_neox);
-        rope_rotate(f1.x, f1.y, c1, s1, is_neox);
+        // CRITICAL: For GPT/interleaved RoPE, pair (2k, 2k+1) uses cos[k], NOT cos[2k]
+        // So: (qr[0],qr[1]) uses cos[0]; (qr[2],qr[3]) uses cos[1]
+        int base0 = (c + 0) >> 1;  // pair index: c=0 → base=0, c=4 → base=2
+        int base1 = (c + 2) >> 1;  // pair index: c=0 → base=1, c=4 → base=3
+        float c0 = cos_ptr[base0], s0 = sin_ptr[base0];
+        float c1 = cos_ptr[base1], s1 = sin_ptr[base1];
+        
+        rope_rotate(f0.x, f0.y, c0, s0, false);
+        rope_rotate(f1.x, f1.y, c1, s1, false);
 
         uint32_t packed = pack4(
             float_to_e4m3fn_byte(f0.x), float_to_e4m3fn_byte(f0.y),
@@ -255,17 +262,21 @@ __global__ void FusedRopeQuantizeKernelVec(
             if (kvdst) *reinterpret_cast<uint32_t*>(kvdst + c) = packed;
         }
 
-        // Process K_rope: paired rotation + vectorized quantize + write to k_rope_out and/or KV buffer
+        // Process K_rope: paired rotation + vectorized quantize + write
         for (int c = lane * 4; c < Dr; c += WARP_SIZE * 4) {
-            V2 h0 = *reinterpret_cast<const V2*>(kr + c + 0);
-            V2 h1 = *reinterpret_cast<const V2*>(kr + c + 2);
+            V2 h0 = *reinterpret_cast<const V2*>(kr + c + 0);  // [c+0, c+1]
+            V2 h1 = *reinterpret_cast<const V2*>(kr + c + 2);  // [c+2, c+3]
             float2 f0 = Vec2Traits<T>::to_float2(h0);
             float2 f1 = Vec2Traits<T>::to_float2(h1);
 
-            float c0 = cos_ptr[c + 0], s0 = sin_ptr[c + 0];
-            float c1 = cos_ptr[c + 2], s1 = sin_ptr[c + 2];
-            rope_rotate(f0.x, f0.y, c0, s0, is_neox);
-            rope_rotate(f1.x, f1.y, c1, s1, is_neox);
+            // CRITICAL: Use pair index (same as Q_rope above)
+            int base0 = (c + 0) >> 1;
+            int base1 = (c + 2) >> 1;
+            float c0 = cos_ptr[base0], s0 = sin_ptr[base0];
+            float c1 = cos_ptr[base1], s1 = sin_ptr[base1];
+            
+            rope_rotate(f0.x, f0.y, c0, s0, false);
+            rope_rotate(f1.x, f1.y, c1, s1, false);
 
             uint32_t packed = pack4(
                 float_to_e4m3fn_byte(f0.x), float_to_e4m3fn_byte(f0.y),
@@ -298,9 +309,7 @@ __global__ void FusedRopeQuantizeKernelScalar(
     uint8_t* __restrict__ k_nope_out_fp8,
     uint8_t* __restrict__ k_rope_out_fp8,
     uint8_t* __restrict__ kv_buffer_bytes,
-    int64_t kv_stride_n_bytes,
-    int64_t kv_stride_m_bytes,  // NEW: stride for page-internal row
-    int page_size,              // NEW: page size for row offset calculation
+    int64_t kv_stride_row_bytes,  // 2D: row stride in bytes
     const int64_t* __restrict__ kv_cache_loc
 ) {
     // Thread mapping: grid-stride loop over all (token, head) pairs
@@ -313,8 +322,10 @@ __global__ void FusedRopeQuantizeKernelScalar(
         int head_id = global_row % num_heads;
         
         int pos = static_cast<int>(pos_ids[token_id]);
-        const float* cos_ptr = cos_sin + size_t(pos) * (2 * Dr);
-        const float* sin_ptr = cos_ptr + Dr;
+        // CRITICAL FIX: cos_sin_cache is [max_pos, rope_dim]
+        // First half is cos, second half is sin
+        const float* cos_ptr = cos_sin + size_t(pos) * Dr;
+        const float* sin_ptr = cos_ptr + (Dr / 2);
 
         // ---- Quantize q ----
         // q_out: [nope | rope]
@@ -329,17 +340,32 @@ __global__ void FusedRopeQuantizeKernelScalar(
                 float x = Vec2Traits<T>::to_float(qn[i]);
                 qdst[i] = float_to_e4m3fn_byte(x);
             }
-            // rope part (avoid OOB read when Dr is odd)
-            for (int i = 0; i < Dr; i += 2) {
-                float xr = Vec2Traits<T>::to_float(qr[i + 0]);
-                float xi = 0.0f;
-                if (i + 1 < Dr) xi = Vec2Traits<T>::to_float(qr[i + 1]);
-                float c = cos_ptr[i + 0];
-                float s = sin_ptr[i + 0];
-                // NeoX interleave is typically handled by reindexing; for demo we still rotate pairs.
-                rope_rotate(xr, xi, c, s, is_neox);
-                qdst[Dn + i + 0] = float_to_e4m3fn_byte(xr);
-                if (i + 1 < Dr) qdst[Dn + i + 1] = float_to_e4m3fn_byte(xi);
+            // rope part: handle GPT vs NeoX layout
+            if (!is_neox) {
+                // GPT/interleaved style: pair (2k, 2k+1) uses cos[k], NOT cos[2k]
+                for (int i = 0; i < Dr; i += 2) {
+                    int base = i >> 1;  // CRITICAL: pair index
+                    float xr = Vec2Traits<T>::to_float(qr[i + 0]);
+                    float xi = 0.0f;
+                    if (i + 1 < Dr) xi = Vec2Traits<T>::to_float(qr[i + 1]);
+                    float c = cos_ptr[base];
+                    float s = sin_ptr[base];
+                    rope_rotate(xr, xi, c, s, false);
+                    qdst[Dn + i + 0] = float_to_e4m3fn_byte(xr);
+                    if (i + 1 < Dr) qdst[Dn + i + 1] = float_to_e4m3fn_byte(xi);
+                }
+            } else {
+                // NeoX style: pairs (i, i+Dr/2)
+                int half = Dr / 2;
+                for (int i = 0; i < half; ++i) {
+                    float xr = Vec2Traits<T>::to_float(qr[i]);         // real part
+                    float xi = Vec2Traits<T>::to_float(qr[i + half]);  // imag part (second half)
+                    float c = cos_ptr[i];
+                    float s = sin_ptr[i];
+                    rope_rotate(xr, xi, c, s, true);
+                    qdst[Dn + i]        = float_to_e4m3fn_byte(xr);
+                    qdst[Dn + i + half] = float_to_e4m3fn_byte(xi);
+                }
             }
         }
 
@@ -359,40 +385,69 @@ __global__ void FusedRopeQuantizeKernelScalar(
             }
             if (k_rope_out_fp8) {
                 uint8_t* krd = k_rope_out_fp8 + size_t(token_id) * Dr;
-                for (int i = 0; i < Dr; i += 2) {
-                    float xr = Vec2Traits<T>::to_float(kr[i + 0]);
-                    float xi = 0.0f;
-                    if (i + 1 < Dr) xi = Vec2Traits<T>::to_float(kr[i + 1]);
-                    float c = cos_ptr[i + 0];
-                    float s = sin_ptr[i + 0];
-                    rope_rotate(xr, xi, c, s, is_neox);
-                    krd[i + 0] = float_to_e4m3fn_byte(xr);
-                    if (i + 1 < Dr) krd[i + 1] = float_to_e4m3fn_byte(xi);
+                if (!is_neox) {
+                    // GPT/interleaved style: pair (2k, 2k+1) uses cos[k]
+                    for (int i = 0; i < Dr; i += 2) {
+                        int base = i >> 1;  // CRITICAL: pair index
+                        float xr = Vec2Traits<T>::to_float(kr[i + 0]);
+                        float xi = 0.0f;
+                        if (i + 1 < Dr) xi = Vec2Traits<T>::to_float(kr[i + 1]);
+                        float c = cos_ptr[base];
+                        float s = sin_ptr[base];
+                        rope_rotate(xr, xi, c, s, false);
+                        krd[i + 0] = float_to_e4m3fn_byte(xr);
+                        if (i + 1 < Dr) krd[i + 1] = float_to_e4m3fn_byte(xi);
+                    }
+                } else {
+                    // NeoX style: pairs (i, i+Dr/2)
+                    int half = Dr / 2;
+                    for (int i = 0; i < half; ++i) {
+                        float xr = Vec2Traits<T>::to_float(kr[i]);
+                        float xi = Vec2Traits<T>::to_float(kr[i + half]);
+                        float c = cos_ptr[i];
+                        float s = sin_ptr[i];
+                        rope_rotate(xr, xi, c, s, true);
+                        krd[i]        = float_to_e4m3fn_byte(xr);
+                        krd[i + half] = float_to_e4m3fn_byte(xi);
+                    }
                 }
             }
 
-            // Fused direct KV write (if kv_buffer provided)
-            // CRITICAL FIX: write to correct row in page (pos % page_size), not always row 0
+            // CRITICAL FIX: kv_cache_loc IS the flat row index (SGLang semantics)
+            // Do NOT use pos % page_size! That was causing KV to be written to wrong locations.
             if (kv_buffer_bytes && kv_cache_loc) {
-                int64_t slot = kv_cache_loc[token_id];
-                int row = pos % page_size;  // ⬅️ Token's row within page
-                uint8_t* dst = kv_buffer_bytes 
-                             + slot * kv_stride_n_bytes 
-                             + static_cast<int64_t>(row) * kv_stride_m_bytes;
+                int64_t flat_row = kv_cache_loc[token_id];  // This IS the row index
+                uint8_t* dst = kv_buffer_bytes + flat_row * kv_stride_row_bytes;
                 // Write nope first
                 for (int i = 0; i < Dn; ++i) {
                     dst[i] = float_to_e4m3fn_byte(Vec2Traits<T>::to_float(kn[i]));
                 }
-                // Then rope with rotation (avoid OOB read when Dr is odd)
-                for (int i = 0; i < Dr; i += 2) {
-                    float xr = Vec2Traits<T>::to_float(kr[i + 0]);
-                    float xi = 0.0f;
-                    if (i + 1 < Dr) xi = Vec2Traits<T>::to_float(kr[i + 1]);
-                    float c = cos_ptr[i + 0];
-                    float s = sin_ptr[i + 0];
-                    rope_rotate(xr, xi, c, s, is_neox);
-                    dst[Dn + i + 0] = float_to_e4m3fn_byte(xr);
-                    if (i + 1 < Dr) dst[Dn + i + 1] = float_to_e4m3fn_byte(xi);
+                // Then rope with rotation: handle GPT vs NeoX
+                if (!is_neox) {
+                    // GPT/interleaved style: pair (2k, 2k+1) uses cos[k]
+                    for (int i = 0; i < Dr; i += 2) {
+                        int base = i >> 1;  // CRITICAL: pair index
+                        float xr = Vec2Traits<T>::to_float(kr[i + 0]);
+                        float xi = 0.0f;
+                        if (i + 1 < Dr) xi = Vec2Traits<T>::to_float(kr[i + 1]);
+                        float c = cos_ptr[base];
+                        float s = sin_ptr[base];
+                        rope_rotate(xr, xi, c, s, false);
+                        dst[Dn + i + 0] = float_to_e4m3fn_byte(xr);
+                        if (i + 1 < Dr) dst[Dn + i + 1] = float_to_e4m3fn_byte(xi);
+                    }
+                } else {
+                    // NeoX style: pairs (i, i+Dr/2)
+                    int half = Dr / 2;
+                    for (int i = 0; i < half; ++i) {
+                        float xr = Vec2Traits<T>::to_float(kr[i]);
+                        float xi = Vec2Traits<T>::to_float(kr[i + half]);
+                        float c = cos_ptr[i];
+                        float s = sin_ptr[i];
+                        rope_rotate(xr, xi, c, s, true);
+                        dst[Dn + i]        = float_to_e4m3fn_byte(xr);
+                        dst[Dn + i + half] = float_to_e4m3fn_byte(xi);
+                    }
                 }
             }
         }
@@ -527,9 +582,7 @@ void mla_rope_quantize_fp8_fused(
     }
 
     uint8_t* kv_buf_ptr = nullptr;
-    int64_t kv_stride_n_bytes = 0;
-    int64_t kv_stride_m_bytes = 0;
-    int page_size = 0;
+    int64_t kv_stride_row_bytes = 0;
     const int64_t* kv_loc_ptr = nullptr;
     if (kv_buffer.has_value() || kv_cache_loc.has_value()) {
         TORCH_CHECK(kv_buffer.has_value() && kv_cache_loc.has_value(),
@@ -537,22 +590,24 @@ void mla_rope_quantize_fp8_fused(
         auto kv = kv_buffer.value();
         auto loc = kv_cache_loc.value();
         CHECK_INPUT(kv); CHECK_INPUT(loc);
-        CHECK_DIM(3, kv); CHECK_DIM(1, loc);
-        TORCH_CHECK(kv.size(2) == (Dn + Dr), "kv_buffer last dim must be Dn+Dr");
+        CHECK_DIM(1, loc);
+        
+        // CRITICAL FIX: Support 2D buffer [total_rows, kv_dim] (SGLang semantics)
+        // out_cache_loc is flat row index, NOT block ID
+        TORCH_CHECK(kv.dim() == 2, "kv_buffer must be 2D [total_rows, kv_dim]");
+        TORCH_CHECK(kv.size(1) == (Dn + Dr), "kv_buffer last dim must be Dn+Dr");
         TORCH_CHECK(loc.size(0) == nnz_k, "kv_cache_loc size must match K batch size");
         
         // CRITICAL: Check contiguity on last dim to avoid silent errors
-        TORCH_CHECK(kv.stride(2) == 1, "kv_buffer last dim must be contiguous (stride=1)");
+        TORCH_CHECK(kv.stride(1) == 1, "kv_buffer last dim must be contiguous (stride=1)");
         
         // Accept FP8 tensor, reinterpret as uint8*
         kv_buf_ptr = reinterpret_cast<uint8_t*>(kv.data_ptr());
         
-        // KV buffer layout: [num_blocks, page_size, kv_dim]
-        // stride(0): block stride in bytes (already uint8 elements = bytes)
-        // stride(1): page-internal row stride in bytes
-        page_size = kv.size(1);
-        kv_stride_n_bytes = kv.stride(0);  // Block stride
-        kv_stride_m_bytes = kv.stride(1);  // Row stride within page
+        // 2D KV buffer layout: [total_rows, kv_dim]
+        // stride(0): row stride in elements, convert to bytes
+        int elem_size = kv.element_size();
+        kv_stride_row_bytes = kv.stride(0) * elem_size;
         kv_loc_ptr = loc.data_ptr<int64_t>();
     }
 
@@ -570,7 +625,8 @@ void mla_rope_quantize_fp8_fused(
     
     // Dispatch: use vectorized kernel if dimensions are 4-byte aligned
     // Vectorized path requires (Dn+Dr) % 4 == 0 for uint32_t writes
-    bool can_vectorize = ((Dn & 3) == 0) && ((Dr & 3) == 0);
+    // CRITICAL: Disable vectorization for NeoX (pairs are (i, i+Dr/2), not adjacent)
+    bool can_vectorize = ((Dn & 3) == 0) && ((Dr & 3) == 0) && !is_neox;
     
     if (can_vectorize) {
         // Additional check: q_out strides must be 4-byte aligned for vectorized writes
@@ -585,6 +641,15 @@ void mla_rope_quantize_fp8_fused(
     
     // ===== Dtype dispatch: support both FP16 and BF16 =====
     auto dtype = q_nope.scalar_type();
+    
+    // DEBUG: Print which kernel path we're using
+    const char* debug_path = std::getenv("SGL_DEBUG_KERNEL_PATH");
+    if (debug_path && std::string(debug_path) == "1") {
+        printf("[KERNEL DEBUG] can_vectorize=%d, dtype=%s, Dn=%d, Dr=%d, is_neox=%d\n",
+               can_vectorize, 
+               dtype == at::kHalf ? "FP16" : (dtype == at::kBFloat16 ? "BF16" : "OTHER"),
+               Dn, Dr, is_neox);
+    }
     
     if (dtype == at::kHalf) {
         // FP16 path
@@ -603,7 +668,7 @@ void mla_rope_quantize_fp8_fused(
                 kn_ptr, kr_ptr, cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
                 q_out_ptr, qout_stride_tok_bytes, qout_stride_head_bytes,
                 k_nope_out_ptr, k_rope_out_ptr, 
-                kv_buf_ptr, kv_stride_n_bytes, kv_stride_m_bytes, page_size, kv_loc_ptr
+                kv_buf_ptr, kv_stride_row_bytes, kv_loc_ptr
             );
         } else {
             constexpr int BLOCK_THREADS = 256;
@@ -614,7 +679,7 @@ void mla_rope_quantize_fp8_fused(
                 kn_ptr, kr_ptr, cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
                 q_out_ptr, qout_stride_tok_bytes, qout_stride_head_bytes,
                 k_nope_out_ptr, k_rope_out_ptr, 
-                kv_buf_ptr, kv_stride_n_bytes, kv_stride_m_bytes, page_size, kv_loc_ptr
+                kv_buf_ptr, kv_stride_row_bytes, kv_loc_ptr
             );
         }
     } else if (dtype == at::kBFloat16) {
@@ -634,7 +699,7 @@ void mla_rope_quantize_fp8_fused(
                 kn_ptr, kr_ptr, cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
                 q_out_ptr, qout_stride_tok_bytes, qout_stride_head_bytes,
                 k_nope_out_ptr, k_rope_out_ptr, 
-                kv_buf_ptr, kv_stride_n_bytes, kv_stride_m_bytes, page_size, kv_loc_ptr
+                kv_buf_ptr, kv_stride_row_bytes, kv_loc_ptr
             );
         } else {
             constexpr int BLOCK_THREADS = 256;
@@ -645,7 +710,7 @@ void mla_rope_quantize_fp8_fused(
                 kn_ptr, kr_ptr, cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
                 q_out_ptr, qout_stride_tok_bytes, qout_stride_head_bytes,
                 k_nope_out_ptr, k_rope_out_ptr, 
-                kv_buf_ptr, kv_stride_n_bytes, kv_stride_m_bytes, page_size, kv_loc_ptr
+                kv_buf_ptr, kv_stride_row_bytes, kv_loc_ptr
             );
         }
     } else {
