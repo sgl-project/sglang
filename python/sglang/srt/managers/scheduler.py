@@ -63,6 +63,11 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    get_global_experts_capturer,
+    set_global_experts_capturer,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -191,11 +196,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-from sglang.srt.layers.moe.routed_experts_capturer import (
-    RoutedExpertsCapturer,
-    set_global_experts_capturer,
-    get_global_experts_capturer,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -724,7 +724,7 @@ class Scheduler(
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
-    
+
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
 
@@ -863,10 +863,10 @@ class Scheduler(
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
         init_embedding_cache(embedding_cache_size * 1024 * 1024)
-        
+
         # Init routed experts capturer
         self.init_routed_experts_capturer()
-        
+
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
@@ -1978,7 +1978,6 @@ class Scheduler(
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
-            
             # Copy cached routing experts' buffers back to CPU cache
             get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
                 batch.out_cache_loc

@@ -607,7 +607,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
-    
+
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
@@ -856,7 +856,7 @@ class BatchTokenIDOutput(BaseBatchReq):
 
     # The routed experts for each output token
     output_routed_experts: List[List[int]]
-    
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -935,7 +935,7 @@ class BatchStrOutput(BaseBatchReq):
 
     # The routed experts for each output token
     output_routed_experts: List[List[int]]
-    
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.

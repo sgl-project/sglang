@@ -834,7 +834,7 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
-        
+
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
             **kwargs,

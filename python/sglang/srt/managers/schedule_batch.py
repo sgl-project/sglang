@@ -603,7 +603,7 @@ class Req:
         # capture routed experts
         self.return_routed_experts = return_routed_experts
         self.routed_experts = []
-        
+
         # Embedding (return values)
         self.embedding = None
 
@@ -1035,7 +1035,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Whether to return captured experts
     return_routed_experts: bool = False
-    
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
