@@ -43,6 +43,7 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    JetNemotronConfig,
     KimiVLConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
