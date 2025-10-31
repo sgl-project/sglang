@@ -7,6 +7,7 @@ import torch
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -143,7 +144,7 @@ class DecodeKVCacheOffloadManager:
                 req, host_indices, tokens, start_time = self.ongoing_offload.pop(ack_id)
 
                 # Release device
-                self.tree_cache.cache_finished_req(req)
+                release_kv_cache(req, self.tree_cache)
 
                 # Trigger async backup from host to storage by cache controller
                 self._trigger_backup(req.rid, host_indices, tokens, start_time)

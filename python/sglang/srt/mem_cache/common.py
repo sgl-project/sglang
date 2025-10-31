@@ -462,6 +462,10 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    tree_cache.cache_finished_req(req, is_insert=is_insert)
+
+
 def available_and_evictable_str(tree_cache) -> str:
     token_to_kv_pool_allocator = tree_cache.token_to_kv_pool_allocator
     if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):

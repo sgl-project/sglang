@@ -50,6 +50,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -705,7 +706,7 @@ class DecodeTransferQueue:
                     [decode_req.req], decode_req.req.return_logprob
                 )
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                self.tree_cache.cache_finished_req(decode_req.req, is_insert=False)
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -771,7 +772,7 @@ class DecodeTransferQueue:
                     self.scheduler.stream_output(
                         [decode_req.req], decode_req.req.return_logprob
                     )
-                    self.tree_cache.cache_finished_req(decode_req.req)
+                    release_kv_cache(decode_req.req, self.tree_cache)
                     trace_slice_end(
                         RequestStage.DECODE_QUICK_FINISH,
                         decode_req.req.rid,
