@@ -1,7 +1,25 @@
-# Adapted from https://github.com/Dao-AILab/flash-attention/blob/54d8aa6751fc9d5f0357854079261913d5df1f9d/flash_attn/cute/interface.py
+# Adapted from https://github.com/sgl-project/sgl-flash-attn/blob/160cb20dd0c542580d10ec61600e245833a22514/flash_attn/cute/interface.py
 
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-10-14] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.2.1.
+# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
+
+# Supported features:
+# - BF16 & FP16 dtype
+# - noncausal & causal attention
+# - MHA, GQA, MQA
+# - hdim 64, 96, 128.
+# - (hdim_qk, hdim_v) = (192, 128) for Blackwell (i.e. DeepSeek shape)
+# - varlen
+# - sliding window
+# - bwd pass for Ampere (will also run on Hopper/Blackwell, but will be slow)
+
+# Features not supported yet:
+# - split (i.e. FlashDecoding)
+# - tuned block sizes
+# - paged KV
+# - append KV to existing KV cache
+# - FP8
+# - bwd pass optimized for Hopper/Blackwell
 
 
 import copy
@@ -19,6 +37,11 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 from flash_attn.cute import utils
+from flash_attn.cute.block_sparsity import (
+    BlockSparseTensorsTorch,
+    normalize_block_sparse_tensors,
+    to_cute_block_sparse_tensors,
+)
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
@@ -57,12 +80,24 @@ def _flash_attn_fwd(
     num_threads: int = 384,
     pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
-    score_mod: Callable | None = None,
+    score_mod: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-    buffers: Optional[list[torch.Tensor]] = None,
+    aux_tensors: Optional[list[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Forward pass for FlashAttention.
+
+    Args:
+        ...
+        score_mod: A callable that takes the attention scores and applies a modification.
+        return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
+        out: Optional pre-allocated output tensor. If None, will be allocated internally.
+        lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
+        aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+    """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -239,14 +274,39 @@ def _flash_attn_fwd(
         if page_table is not None
         else None
     )
-    if causal:
-        window_size_right = 0
-    local = window_size_left is not None or window_size_right is not None
-    if window_size_left is not None or window_size_right is not None:
-        if window_size_left is None and window_size_right == 0:
-            causal, local = True, False
-        else:
-            causal, local = False, True
+    sparse_tensors = None
+    if block_sparse_tensors is not None:
+        if seqlen_q is None:
+            raise ValueError(
+                "Block sparsity requires fixed-length sequences (seqlen_q must be known)."
+            )
+        expected_m_blocks = (seqlen_q + m_block_size - 1) // m_block_size
+        expected_n_blocks = (seqlen_k + n_block_size - 1) // n_block_size
+        block_sparse_tensors = normalize_block_sparse_tensors(
+            block_sparse_tensors,
+            expected_count_shape=(batch_size, num_head, expected_m_blocks),
+            expected_index_shape=(
+                batch_size,
+                num_head,
+                expected_m_blocks,
+                expected_n_blocks,
+            ),
+        )
+        sparse_tensors = to_cute_block_sparse_tensors(block_sparse_tensors)
+
+    use_block_sparsity = sparse_tensors is not None
+
+    if mask_mod is None:
+        if causal:
+            window_size_right = 0
+        local = window_size_left is not None or window_size_right is not None
+        if window_size_left is not None or window_size_right is not None:
+            if window_size_left is None and window_size_right == 0:
+                causal, local = True, False
+            else:
+                causal, local = False, True
+    else:
+        causal, local = False, False
     compute_capability = (
         torch.cuda.get_device_capability()[0]
         if _compute_capability is None
@@ -258,9 +318,13 @@ def _flash_attn_fwd(
     ], "Unsupported compute capability. Supported: 9.x, 10.x"
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    if compute_capability == 9:  # TODO: tune block size according to hdim
-        # Perf heuristic from upstream: hdim=128, noncausal, non-local benefits from larger n_block
-        if head_dim == head_dim_v == 128 and not causal and not local:
+    if compute_capability == 9:  # TODO: tune block size according to hdim.
+        if (
+            head_dim == head_dim_v == 128
+            and not causal
+            and not local
+            and not use_block_sparsity
+        ):
             n_block_size = 192
     if compute_capability == 10:
         # TODO: fix the varlen case
@@ -271,25 +335,55 @@ def _flash_attn_fwd(
         ):
             pack_gqa = False
 
+    # hash score and mask mods for compile cache
+    score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
+    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
+
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
 
+    is_varlen = (
+        cu_seqlens_q is not None
+        or cu_seqlens_k is not None
+        or seqused_q is not None
+        or seqused_k is not None
+    )
     if score_mod is not None:
-        is_varlen = (
-            cu_seqlens_q is not None
-            or cu_seqlens_k is not None
-            or seqused_q is not None
-            or seqused_k is not None
-        )
         if is_varlen:
             raise NotImplementedError(
-                "score_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR."
+                "score_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
             )
 
-    cute_buffers = None
-    if buffers is not None:
-        cute_buffers = [from_dlpack(buf) for buf in buffers]
+    if mask_mod is not None:
+        if not use_block_sparsity:
+            raise NotImplementedError(
+                "mask_mod requires the use of block sparsity. This will be fixed in a future PR."
+            )
+        if is_varlen:
+            raise NotImplementedError(
+                "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
+            )
+        if pack_gqa:
+            raise NotImplementedError(
+                "mask_mod with aux_tensors is not yet supported with pack_gqa=True. This will be fixed in a future PR."
+            )
+
+    if use_block_sparsity:
+        if is_varlen:
+            raise NotImplementedError(
+                "Block sparsity is not yet supported for varlen sequences. This will be fixed in a future PR."
+            )
+        if pack_gqa:
+            raise NotImplementedError(
+                "Block sparsity is not yet supported with pack_gqa=True. This will be fixed in a future PR."
+            )
+
+    cute_aux_tensors = None
+    if aux_tensors is not None:
+        cute_aux_tensors = [
+            from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors
+        ]
 
     compile_key = (
         dtype,
@@ -297,8 +391,10 @@ def _flash_attn_fwd(
         head_dim_v,
         qhead_per_kvhead,
         causal,
-        utils.hash_callable(score_mod) if score_mod is not None else None,
-        buffers is not None,
+        score_mod_hash,
+        mask_mod_hash,
+        use_block_sparsity,
+        len(aux_tensors) if aux_tensors is not None else 0,
         lse is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
@@ -332,14 +428,19 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
+                intra_wg_overlap=True,
+                mma_pv_is_rs=True,
+                mask_mod=mask_mod,
                 score_mod=score_mod,
-                has_buffers=buffers is not None,
+                has_aux_tensors=aux_tensors is not None,
             )
         elif compute_capability == 10:
             assert page_size in [
                 None,
                 128,
             ], "Only page_size=128 is supported for paged KV on SM 10.0"
+            if sparse_tensors is not None:
+                raise NotImplementedError("BlockSparsity not yet supported on SM 10.0")
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -352,14 +453,13 @@ def _flash_attn_fwd(
                 and cu_seqlens_q is None
                 and seqused_q is None,
                 score_mod=score_mod,
-                has_buffers=buffers is not None,
+                has_aux_tensors=aux_tensors is not None,
             )
         else:
             raise ValueError(
                 f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x"
             )
         # TODO: check @can_implement
-        # TODO caching for buffers; cute_buffers
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd,
             q_tensor,
@@ -377,7 +477,8 @@ def _flash_attn_fwd(
             window_size_left,
             window_size_right,
             learnable_sink_tensor,
-            cute_buffers,
+            sparse_tensors,
+            cute_aux_tensors,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor,
@@ -395,7 +496,8 @@ def _flash_attn_fwd(
         window_size_left,
         window_size_right,
         learnable_sink_tensor,
-        cute_buffers,
+        sparse_tensors,
+        cute_aux_tensors,
     )
     return out, lse
 
