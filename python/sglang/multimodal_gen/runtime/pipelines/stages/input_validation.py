@@ -28,6 +28,8 @@ logger = init_logger(__name__)
 # Alias for convenience
 V = StageValidators
 
+# TODO: since this might change sampling params after logging, should be do this beforehand?
+
 
 class InputValidationStage(PipelineStage):
     """
@@ -35,6 +37,8 @@ class InputValidationStage(PipelineStage):
 
     This stage validates that all required inputs are present and properly formatted
     before proceeding with the diffusion process.
+
+    In this stage, input image and output image may be resized
     """
 
     def _generate_seeds(self, batch: Req, server_args: ServerArgs):
@@ -151,7 +155,26 @@ class InputValidationStage(PipelineStage):
             img = img.unsqueeze(0)
             batch.height = oh
             batch.width = ow
+            # TODO: should we store in a new field: pixel values?
             batch.pil_image = img
+
+        if isinstance(server_args.pipeline_config, WanI2V480PConfig) or isinstance(
+            server_args.pipeline_config, WanI2V720PConfig
+        ):
+            # TODO: could we merge with above?
+            # resize image only, Wan2.1 I2V
+            max_area = 720 * 1280
+            aspect_ratio = image.height / image.width
+            mod_value = (
+                server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
+                * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
+            )
+            height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+            width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+
+            batch.pil_image = batch.pil_image.resize((width, height))
+            batch.height = height
+            batch.width = width
 
         return batch
 
