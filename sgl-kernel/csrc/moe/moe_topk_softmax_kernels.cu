@@ -319,30 +319,32 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
   }
 
   // Apply tanh softcapping and correction bias
+  if (moe_softcapping != 0.0f || correction_bias != nullptr) {
 #pragma unroll
-  for (int ii = 0; ii < VPT; ++ii) {
-    float val = row_chunk[ii];
+    for (int ii = 0; ii < VPT; ++ii) {
+      float val = row_chunk[ii];
 
-    // Apply tanh softcapping if enabled
-    if (moe_softcapping != 0.0f) {
-      val = tanhf(val / moe_softcapping) * moe_softcapping;
+      // Apply tanh softcapping if enabled
+      if (moe_softcapping != 0.0f) {
+        val = tanhf(val / moe_softcapping) * moe_softcapping;
+      }
+
+      // Apply correction bias if provided
+      if (correction_bias != nullptr) {
+        /*
+        LDG is interleaved
+        |thread0 LDG| |thread1 LDG| |thread0 LDG| |thread1 LDG|
+        |--------- group0 --------| |----------group1 --------|
+                                      ^ local2
+        */
+        const int group_id = ii / ELTS_PER_LDG;
+        const int local_id = ii % ELTS_PER_LDG;
+        const int expert_idx = first_elt_read_by_thread + group_id * THREADS_PER_ROW * ELTS_PER_LDG + local_id;
+        val = val + correction_bias[expert_idx];
+      }
+
+      row_chunk[ii] = val;
     }
-
-    // Apply correction bias if provided
-    if (correction_bias != nullptr) {
-      /*
-      LDG is interleaved
-      |thread0 LDG| |thread1 LDG| |thread0 LDG| |thread1 LDG|
-      |--------- group0 --------| |----------group1 --------|
-                                     ^ local2
-      */
-      const int group_id = ii / ELTS_PER_LDG;
-      const int local_id = ii % ELTS_PER_LDG;
-      const int expert_idx = first_elt_read_by_thread + group_id * THREADS_PER_ROW * ELTS_PER_LDG + local_id;
-      val = val + correction_bias[expert_idx];
-    }
-
-    row_chunk[ii] = val;
   }
 
   // First, we perform a max reduce within the thread. We can do the max in fp16 safely (I think) and just
