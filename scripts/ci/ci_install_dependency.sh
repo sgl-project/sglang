@@ -68,7 +68,7 @@ else
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
     # Clean up existing installations
-    $PIP_CMD uninstall flashinfer-python flashinfer-cubin sgl-kernel sglang vllm || true
+    $PIP_CMD uninstall flashinfer-python flashinfer-cubin flashinfer-jit-cache sgl-kernel sglang vllm || true
 
     # Install the main package without deps
     $PIP_CMD install -e "python[dev]" --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
