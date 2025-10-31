@@ -29,7 +29,12 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs import FalconH1Config, NemotronHConfig, Qwen3NextConfig
+from sglang.srt.configs import (
+    FalconH1Config,
+    JetNemotronConfig,
+    NemotronHConfig,
+    Qwen3NextConfig,
+)
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
@@ -1494,8 +1499,15 @@ class ModelRunner:
         return None
 
     @property
+    def jet_block_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, JetNemotronConfig):
+            return config
+        return None
+
+    @property
     def mambaish_config(self):
-        return self.mamba2_config or self.hybrid_gdn_config
+        return self.mamba2_config or self.hybrid_gdn_config or self.jet_block_config
 
     def set_num_token_hybrid(self):
         if (

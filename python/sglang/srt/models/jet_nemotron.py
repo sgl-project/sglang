@@ -1,13 +1,17 @@
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
+import einops
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
+    JetBlockAttnBackend,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -25,18 +29,6 @@ from sglang.srt.utils import add_prefix
 from .dynamic_conv import DynamicShortConvolution
 
 
-@dataclass
-class JetBlockConfig:
-    mode: str
-    expand_v: float
-    num_heads: int
-    head_dim: int
-    norm_eps: float
-    conv_size: int
-    dconv_generator_reduction: int
-    dconv_implementation: str
-
-
 def init_linear_conv1d(
     weight: torch.Tensor, std: float, bias: torch.Tensor | None = None
 ) -> None:
@@ -45,7 +37,6 @@ def init_linear_conv1d(
         if not getattr(bias, "_no_reinit", False):
             nn.init.zeros_(bias)
 
-class JetNemotronConfig(PretrainedConfig): ...
 
 class JetBlock(nn.Module):
     def __init__(
@@ -59,32 +50,34 @@ class JetBlock(nn.Module):
 
         self.config = config
 
-        assert self.config.efficient_attention_config is not None
         jet_block_config = JetBlockConfig(
             **self.config.efficient_attention_config[self.config.layer_types[layer_id]]
         )
-        jet_block_config.norm_eps = float(self.config.rms_norm_eps)  # Fix typing issue.
 
         hidden_size = self.config.hidden_size
         num_heads = jet_block_config.num_heads
-        key_dim = num_heads * jet_block_config.head_dim
-        value_dim = int(key_dim * jet_block_config.expand_v)
+        head_k_dim = jet_block_config.head_dim
+        total_k_dim = num_heads * head_k_dim
+        head_v_dim = int(head_k_dim * jet_block_config.expand_v)
+        total_v_dim = num_heads * head_v_dim
 
-        self.head_k_dim = jet_block_config.head_dim
-        self.head_v_dim = int(self.head_k_dim * jet_block_config.expand_v)
+        self.head_v_dim = head_v_dim
+        self.num_heads = num_heads
 
-        self.q_proj = nn.Linear(hidden_size, key_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, key_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, value_dim, bias=False)
-
-        self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        # Submodules.
+        self.q_proj = nn.Linear(hidden_size, total_k_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, total_k_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, total_v_dim, bias=False)
         self.a_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        self.g_proj = nn.Linear(hidden_size, total_v_dim, bias=False)
+        self.o_proj = nn.Linear(total_v_dim, hidden_size, bias=False)
 
         self.A_log = nn.Parameter(torch.empty(num_heads, dtype=torch.float32))
         self.dt_bias = nn.Parameter(torch.empty(num_heads))
 
         self.dynamic_conv1d = DynamicShortConvolution(
-            hidden_size=value_dim,
+            hidden_size=total_v_dim,
             kernel_size=jet_block_config.conv_size,
             generator_input_size=hidden_size,
             generator_reduction=jet_block_config.dconv_generator_reduction,
@@ -94,12 +87,10 @@ class JetBlock(nn.Module):
             implementation=jet_block_config.dconv_implementation,
         )
 
-        self.g_proj = nn.Linear(hidden_size, value_dim, bias=False)
         self.o_norm = RMSNormGated(
             self.head_v_dim,
-            eps=jet_block_config.norm_eps,
+            eps=flaot(jet_block_config.norm_eps),
         )
-        self.o_proj = nn.Linear(value_dim, hidden_size, bias=False)
 
     def forward(
         self,
@@ -111,11 +102,14 @@ class JetBlock(nn.Module):
 
         q = self.q_proj(hidden_states)
         q = nn.functional.silu(q)
+        q = einops.rearrange(q, "... (h d) -> ... h d", h=self.num_heads)
 
         k = self.k_proj(hidden_states)
         k = nn.functional.silu(k)
+        k = einops.rearrange(k, "... (h d) -> ... h d", h=self.num_heads)
 
         v = self.v_proj(hidden_states)
+        v = einops.rearrange(v, "... (h d) -> ... h d", h=self.num_heads)
 
         a = self.a_proj(hidden_states)
 
@@ -126,19 +120,25 @@ class JetBlock(nn.Module):
         assert isinstance(
             forward_batch.attn_backend.linear_attn_backend, JetBlockAttnBackend
         )
-        o = forward_batch.attn_backend.linear_attn_backend.forward(
+
+        attn_backend_kwargs: dict[str, Any] = dict(
             q=q,
             k=k,
             v=v,
-            a=a,
-            b=b,
+            layer=self,
             forward_batch=forward_batch,
-            layer=None,
         )
 
-        z = self.g_proj(hidden_states)
+        o = forward_batch.attn_backend.linear_attn_backend.forward(
+            **attn_backend_kwargs
+        )
 
-        o = self.o_norm(o, z)
+        g = self.g_proj(hidden_states)
+        g = einops.rearrange(g, "... (h d) -> ... h d", h=self.num_heads)
+
+        o = self.o_norm(o, g)
+
+        o = einops.rearrange(o, "... h d -> ... (h d)")
         o = self.o_proj(o)
 
         return o
@@ -191,7 +191,6 @@ class JetNemotronAttention(nn.Module):
                 sliding_window_size = -1
 
             case "swa":
-                assert isinstance(self.config.efficient_attention_config, dict)
                 sliding_window_size = self.config.efficient_attention_config["swa"][
                     "window_size"
                 ]
@@ -390,4 +389,5 @@ class JetNemotronForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
+EntryClass = JetNemotronForCausalLM
 EntryClass = JetNemotronForCausalLM
