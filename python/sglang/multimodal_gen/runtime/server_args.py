@@ -785,6 +785,16 @@ class ServerArgs:
                 raise ValueError(f"{self.num_gpus=} % {num_gpus_per_group} != 0")
             self.sp_degree = self.num_gpus // num_gpus_per_group
 
+        if (
+            self.ulysses_degree is None
+            and self.ring_degree is None
+            and self.sp_degree != 1
+        ):
+            self.ulysses_degree = self.sp_degree
+            logger.info(
+                f"Automatically set ulysses_degree=sp_degree={self.ulysses_degree} for best performance"
+            )
+
         if self.ulysses_degree is None:
             self.ulysses_degree = 1
             logger.info(
