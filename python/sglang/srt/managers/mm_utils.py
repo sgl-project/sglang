@@ -662,7 +662,7 @@ def general_mm_embed_routine(
     """
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
-    if language_model.pp_group.is_first_rank:
+    if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
         if (
             not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
