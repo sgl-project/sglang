@@ -686,11 +686,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn or None (if fused)
                 - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn or None (if fused)
         """
-        # Import at the beginning to avoid UnboundLocalError
-        import os
-        import torch
-        import sys
-        
         attn_dtype = torch.float8_e4m3fn
         q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
 
@@ -705,137 +700,52 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Determine if we can use the fused kernel (RoPE + quantization + direct KV write)
         # Conditions: save_kv_cache, layer provided, not NSA packed format, kernel available
-        
         compute_cap = torch.cuda.get_device_capability()
-        allow_fused_env = os.getenv("SGL_MLA_FUSED", "1") == "1"
         kernel_available = mla_rope_quantize_fp8_fused is not None
         has_layer = layer is not None
         nsa_flag = getattr(forward_batch.token_to_kv_pool, "nsa_kv_cache_store_fp8", False)
         
-        # CRITICAL: Only enable fusion on SM90+ (H100/B200)
-        # SM<90 (A100/H800) has fallback FP8 conversion that's too simplified
-        # and causes severe quantization errors, leading to 0 accuracy
-        # TEMPORARY DEBUG: Check if we should disable fused for specific paths
-        in_decode = os.getenv("_SGL_IN_DECODE", "0") == "1"  # Internal flag
-        allow_decode_fused = os.getenv("SGL_DECODE_FUSED", "0") == "1"
-        
+        # Only enable fusion on SM90+ (H100/B200) due to FP8 hardware support
         use_fused_kv_write = (
             kernel_available
-            and allow_fused_env
-            and (compute_cap[0] >= 9)  # Only SM90+ (H100/B200)
+            and (compute_cap[0] >= 9)
             and save_kv_cache
             and has_layer
             and not nsa_flag
-            and (not in_decode or allow_decode_fused)  # Can disable decode separately
         )
-        
-        # DEBUG: Basic branch tracking
-        if use_fused_kv_write:
-            sys.stderr.write(f"[MLA FUSION] ✅ Using fused kernel (layer={layer.layer_id}, tokens={q_len}, SM={compute_cap[0]}{compute_cap[1]})\n")
-        elif not kernel_available:
-            sys.stderr.write(f"[MLA FUSION] ❌ Kernel not available, using standard path\n")
-        elif compute_cap[0] < 9:
-            sys.stderr.write(f"[MLA FUSION] ⚠️  SM{compute_cap[0]}{compute_cap[1]} < SM90, using standard path (FP8 fallback not reliable)\n")
-        sys.stderr.flush()
 
         if use_fused_kv_write:
             # Fused path: RoPE + quantization + direct KV cache write
             # This eliminates the intermediate write/read of k_nope_out/k_rope_out
             
-            # CRITICAL FIX: Use 2D buffer with flat row indexing (SGLang semantics)
-            # out_cache_loc IS the flat row index, NOT a block ID
-            # Do NOT reshape to 3D or use pos % page_size
+            # Get KV buffer (2D: [total_rows, kv_dim])
             k_cache_raw = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            
-            # get_key_buffer returns (size+page_size, 1, kv_dim), squeeze to 2D
             if k_cache_raw.dim() == 3:
-                assert k_cache_raw.size(1) == 1, f"Expected middle dim=1, got {k_cache_raw.shape}"
-                kv_buffer = k_cache_raw.squeeze(1)  # [total_rows, kv_dim]
+                kv_buffer = k_cache_raw.squeeze(1)
             else:
-                kv_buffer = k_cache_raw  # Already 2D
+                kv_buffer = k_cache_raw
             
             # Prepare cache locations and positions as int64 contiguous
             kv_loc = forward_batch.out_cache_loc.to(torch.int64).contiguous()
             positions = forward_batch.positions.to(torch.int64).contiguous()
             
-            # Assertions to catch issues early
-            assert kv_buffer.dim() == 2, f"kv_buffer must be 2D, got shape {kv_buffer.shape}"
-            assert kv_buffer.size(1) == self.kv_cache_dim, f"kv_buffer last dim must be {self.kv_cache_dim}, got {kv_buffer.size(1)}"
-            assert kv_buffer.size(1) == (self.kv_lora_rank + self.qk_rope_head_dim), \
-                f"kv_buffer dim mismatch: expect {self.kv_lora_rank + self.qk_rope_head_dim}, got {kv_buffer.size(1)}"
-            assert (self.qk_rope_head_dim % 2) == 0, "RoPE dim (Dr) must be even for pairing"
-            assert kv_loc.dim() == 1, f"kv_loc must be 1D, got {kv_loc.dim()}"
-            assert kv_loc.numel() == q_len, f"kv_loc size {kv_loc.numel()} must match token count {q_len}"
-            assert q_nope.dtype in (torch.float16, torch.bfloat16), f"Unsupported dtype: {q_nope.dtype}"
-            assert k_nope.dtype == q_nope.dtype, "Q and K dtype mismatch"
-            # CRITICAL: Check cos_sin_cache dimension
-            assert cos_sin_cache.size(1) == self.qk_rope_head_dim, \
-                f"cos_sin_cache second dim must be rope_dim={self.qk_rope_head_dim}, got {cos_sin_cache.size(1)}"
-            # Check all kv_loc values are within valid range
-            assert kv_loc.min() >= 0 and kv_loc.max() < kv_buffer.size(0), \
-                f"kv_loc out of range: min={kv_loc.min()}, max={kv_loc.max()}, buffer_size={kv_buffer.size(0)}"
-            # Sanity check: positions should be reasonable
-            assert positions.min() >= 0, f"Invalid positions: min={positions.min()}"
-            # Check tensor contiguity
-            assert kv_buffer.is_contiguous() or kv_buffer.stride(-1) == 1, "kv_buffer last dim must be contiguous"
-            
-            # DEBUG: Check for potential issues with KV write
-            debug_kv = os.getenv("SGL_DEBUG_KV_WRITE", "0") == "1"
-            if debug_kv:
-                sys.stderr.write(f"[KV DEBUG] layer={layer.layer_id}, tokens={q_len}, "
-                               f"kv_loc={kv_loc.cpu().numpy()}, pos={positions.cpu().numpy()}, "
-                               f"kv_buffer.data_ptr={kv_buffer.data_ptr():#x}, "
-                               f"kv_buffer.size(0)={kv_buffer.size(0)}\n")
-                sys.stderr.flush()
-                
-                # Verify buffer is the same as what will be read later
-                k_cache_verify = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                if k_cache_verify.dim() == 3:
-                    k_cache_verify = k_cache_verify.squeeze(1)
-                assert k_cache_verify.data_ptr() == kv_buffer.data_ptr(), \
-                    f"KV buffer address changed! Expected {kv_buffer.data_ptr():#x}, got {k_cache_verify.data_ptr():#x}"
-            
-            # Debug output
-            sys.stderr.write(f"[FUSED DEBUG] kv.shape={tuple(kv_buffer.shape)}, loc.shape={tuple(kv_loc.shape)}, "
-                           f"q_nope.shape={tuple(q_nope.shape)}, dtype={q_nope.dtype}\n")
-            # DEBUG: Save inputs/outputs for offline comparison
-            debug_save = os.getenv("SGL_DEBUG_SAVE_ROPE", "0") == "1"
-            if debug_save and layer.layer_id == 0:  # Only save first layer
-                torch.save({
-                    'q_nope': q_nope.cpu(),
-                    'q_rope': q_rope.cpu(),
-                    'k_nope': k_nope.cpu(),
-                    'k_rope': k_rope.cpu(),
-                    'cos_sin_cache': cos_sin_cache.cpu(),
-                    'positions': positions.cpu(),
-                    'is_neox': is_neox,
-                }, '/tmp/rope_inputs.pt')
-                sys.stderr.write(f"[DEBUG] Saved inputs to /tmp/rope_inputs.pt\n")
-                sys.stderr.flush()
-            
-            # Call fused kernel
-            # Note: Kernel now natively supports both FP16 and BF16 via C++ templates
-            # Note: kernel accepts 2D or 3D Q inputs (handles stride properly)
-            # Note: Pass FP8 tensors as-is, C++ will reinterpret_cast to uint8*
-            # K inputs must be 2D
+            # Call fused kernel: RoPE + quantize + write KV cache
             mla_rope_quantize_fp8_fused(
-                q_nope,  # [nnz, num_heads, Dn] or [nnz, Dn] - kernel handles both, FP16/BF16
-                q_rope,  # [nnz, num_heads, Dr] or [nnz, Dr] - kernel handles both, FP16/BF16
-                k_nope,  # [nnz, Dn] - already 2D from squeeze(1), FP16/BF16
-                k_rope,  # [nnz, Dr] - already 2D from squeeze(1), FP16/BF16
+                q_nope,
+                q_rope,
+                k_nope,
+                k_rope,
                 cos_sin_cache,
-                positions,  # int64 contiguous
+                positions,
                 is_neox,
-                q_out,   # FP8 tensor, C++ will reinterpret as uint8*
+                q_out,
                 None,  # k_nope_out - skip intermediate output
                 None,  # k_rope_out - skip intermediate output
-                kv_buffer,  # 2D FP8 tensor [total_rows, kv_dim]
-                kv_loc,  # int64 flat row indices
+                kv_buffer,
+                kv_loc,
             )
             
             # Return Q output and None for K outputs (already written to cache)
-            sys.stderr.write(f"[FUSED] Returning from fused path: q_out.shape={q_out.shape}, k=None, k_rope=None\n")
-            sys.stderr.flush()
             return q_out, None, None
         else:
             # Standard path: RoPE + quantization only (backward compatible)
@@ -843,24 +753,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
             k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
 
-            # DEBUG: Save inputs for offline comparison
-            debug_save = os.getenv("SGL_DEBUG_SAVE_ROPE", "0") == "1"
-            if debug_save:
-                torch.save({
-                    'q_nope': q_nope.cpu(),
-                    'q_rope': q_rope.cpu(),
-                    'k_nope': k_nope.cpu(),
-                    'k_rope': k_rope.cpu(),
-                    'cos_sin_cache': cos_sin_cache.cpu(),
-                    'positions': forward_batch.positions.cpu(),
-                    'is_neox': is_neox,
-                }, '/tmp/flashinfer_rope_inputs.pt')
-                
             # Apply RoPE and quantize all components in a single kernel call
-            # This kernel handles:
-            # 1. RoPE application to q_rope and k_rope using cos_sin_cache and positions
-            # 2. Quantization of all components to FP8 format
-            # 3. Output placement into pre-allocated tensors
             flashinfer.rope.mla_rope_quantize_fp8(
                 q_rope=q_rope,
                 k_rope=k_rope,
@@ -978,18 +871,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Run forward for decode using TRTLLM MLA kernel."""
         merge_query = q_rope is not None
         fused_kv = False  # Track if using fused KV write path
+        
         if self.data_type == torch.float8_e4m3fn:
-            # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
-            # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
+            # For FP8 path, quantize and apply RoPE
             assert all(
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
-            ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
+            ), "For FP8 path we need all of q_rope, k_rope and cos_sin_cache to be not None."
             
-            # Call quantize_and_rope_for_fp8 with layer and save_kv_cache parameters
+            # Call quantize_and_rope_for_fp8 with layer and save_kv_cache
             # This enables the fused kernel path when conditions are met
-            # TEMPORARY: Disable fused in decode for debugging
-            import os
-            allow_decode_fused = os.getenv("SGL_DECODE_FUSED", "0") == "1"
             q, k, k_rope = self.quantize_and_rope_for_fp8(
                 q,
                 q_rope,
@@ -998,19 +888,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch,
                 cos_sin_cache,
                 is_neox,
-                layer=layer if allow_decode_fused else None,  # Disable fused by passing None
+                layer=layer,
                 save_kv_cache=save_kv_cache,
             )
             merge_query = False
             # Check if fused path was used (K outputs are None when directly written to KV cache)
             fused_kv = (k is None and k_rope is None)
-            if fused_kv:
-                import sys
-                sys.stderr.write(f"[DECODE] ✅ Fused path used\n")
-                sys.stderr.flush()
 
         # Save KV cache if requested (only if not using fused path)
-        # When k or k_rope is None, it means the fused kernel already wrote to KV cache
         if save_kv_cache and not fused_kv and k is not None and k_rope is not None:
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
@@ -1098,15 +983,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
 
-        # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
         fused_kv = False  # Track if we used fused KV write path
         
-        # For FP8 path, check if we should use quantize_and_rope_for_fp8
-        # Conditions:
-        # 1. Using FP8 data type
-        # 2. In target_verify or draft_extend mode
-        # 3. All rope-related parameters are available (not None)
+        # For FP8 path in target_verify or draft_extend mode, use quantize_and_rope_for_fp8
         use_fp8_quantize = (
             self.data_type == torch.float8_e4m3fn
             and (
@@ -1117,17 +997,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         
         if use_fp8_quantize:
-            # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
-            # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
-            
-            # Call quantize_and_rope_for_fp8 with layer and save_kv_cache parameters
-            # This enables the fused kernel path when conditions are met
-            # NOTE: Do NOT squeeze Q - fused kernel supports 3D Q: [nnz, num_heads, dim]
+            # FP8 path: quantize and apply RoPE with optional fused KV write
             q, k_fp8_nope, k_fp8_rope = self.quantize_and_rope_for_fp8(
-                q,  # ✅ Keep Q as is (supports both 2D and 3D)
-                q_rope,  # ✅ Keep Q_rope as is
-                k.squeeze(1) if k.dim() == 3 else k,  # K must be 2D
-                k_rope.squeeze(1) if k_rope.dim() == 3 else k_rope,  # K_rope must be 2D
+                q,
+                q_rope,
+                k.squeeze(1) if k.dim() == 3 else k,
+                k_rope.squeeze(1) if k_rope.dim() == 3 else k_rope,
                 forward_batch,
                 cos_sin_cache,
                 is_neox,
@@ -1137,16 +1012,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             merge_query = False
             # Fused path: K already written to KV cache, function returns None for K outputs
             fused_kv = (k_fp8_nope is None and k_fp8_rope is None)
-            if fused_kv:
-                import sys
-                sys.stderr.write(f"[EXTEND] ✅ Fused path used\n")
-                sys.stderr.flush()
             # Update local variables for subsequent logic
             k = k_fp8_nope
             k_rope = k_fp8_rope
 
         # Save KV cache if requested (only if not using fused path)
-        # When k or k_rope is None, it means the fused kernel already wrote to KV cache
         if save_kv_cache and not fused_kv and k is not None and k_rope is not None:
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
@@ -1214,7 +1084,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     q, padded_q, metadata.seq_lens_q, metadata.cu_seqlens_q
                 )
 
-            # TODO may use `mla_rope_quantize_fp8` fusion
             q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
             assert kv_cache.dtype == self.data_type
 

@@ -148,6 +148,8 @@ __global__ void FusedRopeQuantizeKernelVec(
     int64_t qr_stride_tok, int64_t qr_stride_head,  // Q_rope strides in elements
     const T* __restrict__ k_nope,
     const T* __restrict__ k_rope,
+    int64_t kn_stride_tok,  // NEW: K_nope stride(0) in elements
+    int64_t kr_stride_tok,  // NEW: K_rope stride(0) in elements
     const float* __restrict__ cos_sin,
     const int64_t* __restrict__ pos_ids,
     int nnz, int num_heads, int Dn, int Dr,
@@ -177,8 +179,9 @@ __global__ void FusedRopeQuantizeKernelVec(
     const T* qr = q_rope + size_t(token_id) * qr_stride_tok + size_t(head_id) * qr_stride_head;
     
     // K is always 2D: [nnz_tokens, dim]
-    const T* kn = k_nope + size_t(token_id) * Dn;
-    const T* kr = k_rope + size_t(token_id) * Dr;
+    // CRITICAL FIX: Use actual stride(0) instead of assuming Dn/Dr (handles non-contiguous K)
+    const T* kn = k_nope + size_t(token_id) * kn_stride_tok;
+    const T* kr = k_rope + size_t(token_id) * kr_stride_tok;
 
     // Q output using byte strides
     uint8_t* qdst = q_out_fp8 + size_t(token_id) * qout_stride_tok_bytes + size_t(head_id) * qout_stride_head_bytes;
@@ -300,6 +303,8 @@ __global__ void FusedRopeQuantizeKernelScalar(
     int64_t qr_stride_tok, int64_t qr_stride_head,
     const T* __restrict__ k_nope,
     const T* __restrict__ k_rope,
+    int64_t kn_stride_tok,  // NEW: K_nope stride(0) in elements
+    int64_t kr_stride_tok,  // NEW: K_rope stride(0) in elements
     const float* __restrict__ cos_sin,
     const int64_t* __restrict__ pos_ids,
     int nnz, int num_heads, int Dn, int Dr,
@@ -371,8 +376,9 @@ __global__ void FusedRopeQuantizeKernelScalar(
 
         // ---- Quantize k & optional fused KV write ----
         // K is always 2D: [nnz_tokens, dim]
-        const T* kn = k_nope + size_t(token_id) * Dn;
-        const T* kr = k_rope + size_t(token_id) * Dr;
+        // CRITICAL FIX: Use actual stride(0) instead of assuming Dn/Dr (handles non-contiguous K)
+        const T* kn = k_nope + size_t(token_id) * kn_stride_tok;
+        const T* kr = k_rope + size_t(token_id) * kr_stride_tok;
 
         // Optional: write k_nope_out / k_rope_out (only once per token, not per head)
         // Note: K outputs are 2D [nnz_tokens, dim], so only first head processes them
@@ -542,6 +548,12 @@ void mla_rope_quantize_fp8_fused(
     TORCH_CHECK(k_rope.size(0) == nnz_k && k_rope.size(1) == Dr, "k_rope shape mismatch");
     TORCH_CHECK(nnz_k == nnz_tokens, "K batch size must match Q token count");
     
+    // ===== K strides (CRITICAL FIX: use stride(0) to handle non-contiguous batches) =====
+    // In multi-req concurrent scenarios, K may have stride(0) != dim due to slicing/gather
+    // We MUST use the actual stride(0) instead of assuming Dn/Dr for correct row addressing
+    int64_t kn_stride_tok = k_nope.stride(0);  // elements per token
+    int64_t kr_stride_tok = k_rope.stride(0);  // elements per token
+    
     // ===== Robustness checks (expert suggestions) =====
     
     // 1. K must be contiguous on last dim (or explicitly handle stride)
@@ -665,7 +677,8 @@ void mla_rope_quantize_fp8_fused(
             
             FusedRopeQuantizeKernelVec<WARPS_PER_CTA, __half><<<vecGrid, vecBlock, 0, stream>>>(
                 qn_ptr, qr_ptr, qn_stride_tok, qn_stride_head, qr_stride_tok, qr_stride_head,
-                kn_ptr, kr_ptr, cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
+                kn_ptr, kr_ptr, kn_stride_tok, kr_stride_tok,
+                cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
                 q_out_ptr, qout_stride_tok_bytes, qout_stride_head_bytes,
                 k_nope_out_ptr, k_rope_out_ptr, 
                 kv_buf_ptr, kv_stride_row_bytes, kv_loc_ptr
@@ -676,7 +689,8 @@ void mla_rope_quantize_fp8_fused(
             
             FusedRopeQuantizeKernelScalar<BLOCK_THREADS, __half><<<grid, BLOCK_THREADS, 0, stream>>>(
                 qn_ptr, qr_ptr, qn_stride_tok, qn_stride_head, qr_stride_tok, qr_stride_head,
-                kn_ptr, kr_ptr, cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
+                kn_ptr, kr_ptr, kn_stride_tok, kr_stride_tok,
+                cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
                 q_out_ptr, qout_stride_tok_bytes, qout_stride_head_bytes,
                 k_nope_out_ptr, k_rope_out_ptr, 
                 kv_buf_ptr, kv_stride_row_bytes, kv_loc_ptr
@@ -696,7 +710,8 @@ void mla_rope_quantize_fp8_fused(
             
             FusedRopeQuantizeKernelVec<WARPS_PER_CTA, nv_bfloat16><<<vecGrid, vecBlock, 0, stream>>>(
                 qn_ptr, qr_ptr, qn_stride_tok, qn_stride_head, qr_stride_tok, qr_stride_head,
-                kn_ptr, kr_ptr, cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
+                kn_ptr, kr_ptr, kn_stride_tok, kr_stride_tok,
+                cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
                 q_out_ptr, qout_stride_tok_bytes, qout_stride_head_bytes,
                 k_nope_out_ptr, k_rope_out_ptr, 
                 kv_buf_ptr, kv_stride_row_bytes, kv_loc_ptr
@@ -707,7 +722,8 @@ void mla_rope_quantize_fp8_fused(
             
             FusedRopeQuantizeKernelScalar<BLOCK_THREADS, nv_bfloat16><<<grid, BLOCK_THREADS, 0, stream>>>(
                 qn_ptr, qr_ptr, qn_stride_tok, qn_stride_head, qr_stride_tok, qr_stride_head,
-                kn_ptr, kr_ptr, cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
+                kn_ptr, kr_ptr, kn_stride_tok, kr_stride_tok,
+                cs_ptr, pos_ptr, nnz_tokens, num_heads, Dn, Dr, is_neox,
                 q_out_ptr, qout_stride_tok_bytes, qout_stride_head_bytes,
                 k_nope_out_ptr, k_rope_out_ptr, 
                 kv_buf_ptr, kv_stride_row_bytes, kv_loc_ptr
