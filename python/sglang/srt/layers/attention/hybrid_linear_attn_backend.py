@@ -525,6 +525,30 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
 
+class JetBlockAttnBackend(MambaAttnBackendBase):
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        return v
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        return v
+
+
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
