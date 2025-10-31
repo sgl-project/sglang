@@ -52,6 +52,7 @@ class ParallelTiledVAE(ABC):
     def device(self):
         return next(self.parameters()).device
 
+    @property
     def temporal_compression_ratio(self) -> int:
         return cast(int, self.config.temporal_compression_ratio)
 
