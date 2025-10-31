@@ -128,6 +128,7 @@ class DeepSeekR1ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     NEW_LINE_TOKEN_ID: int = 201
 
 
+# Adapted from DeepSeek's implementation: https://github.com/deepseek-ai/DeepSeek-OCR/blob/main/DeepSeek-OCR-master/DeepSeek-OCR-vllm/process/ngram_norepeat.py
 class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
     """Block n-gram repetitions within a sliding window for DeepSeek-OCR outputs."""
 
