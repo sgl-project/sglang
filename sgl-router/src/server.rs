@@ -46,8 +46,6 @@ use crate::{
     routers::{router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::{
-        config::WasmRuntimeConfig,
-        module_manager::WasmModuleManager,
         route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     },
 };
