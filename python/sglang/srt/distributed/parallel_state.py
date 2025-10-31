@@ -50,11 +50,13 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_shm_available,
+    is_xpu,
     supports_custom_op,
 )
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _supports_custom_op = supports_custom_op()
 
 
@@ -66,7 +68,7 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
 @dataclass
 class GraphCaptureContext:
-    stream: torch.cuda.Stream if not _is_npu else torch.npu.Stream
+    stream: torch.get_device_module().Stream
 
 
 @dataclass
@@ -338,17 +340,10 @@ class GroupCoordinator:
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
-            if torch_compile is not None and torch_compile:
-                # For piecewise CUDA graph, the requirement for custom allreduce is larger to
-                # avoid illegal cuda memory access.
-                ca_max_size = 256 * 1024 * 1024
-            else:
-                ca_max_size = 8 * 1024 * 1024
             try:
                 self.ca_comm = CustomAllreduce(
                     group=self.cpu_group,
                     device=self.device,
-                    max_size=ca_max_size,
                 )
             except Exception as e:
                 logger.warning(
@@ -503,7 +498,7 @@ class GroupCoordinator:
                 maybe_pynccl_context = nullcontext()
             else:
                 maybe_pynccl_context = pynccl_comm.change_state(
-                    enable=True, stream=torch.cuda.current_stream()
+                    enable=True, stream=torch.get_device_module().current_stream()
                 )
 
             pymscclpp_comm = self.pymscclpp_comm
@@ -560,7 +555,7 @@ class GroupCoordinator:
             and input_.symmetric_memory
         ):
             with self.pynccl_comm.change_state(
-                enable=True, stream=torch.cuda.current_stream()
+                enable=True, stream=torch.get_device_module().current_stream()
             ):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
@@ -660,7 +655,9 @@ class GroupCoordinator:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
-        with pynccl_comm.change_state(enable=True, stream=torch.cuda.current_stream()):
+        with pynccl_comm.change_state(
+            enable=True, stream=torch.get_device_module().current_stream()
+        ):
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
             ), "pynccl is required for reduce_scatterv"
@@ -694,7 +691,7 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or not _supports_custom_op:
+        if _is_npu or _is_xpu or not _supports_custom_op:
             self._all_gather_into_tensor(output, input)
         else:
             torch.ops.sglang.reg_all_gather_into_tensor(
@@ -784,7 +781,9 @@ class GroupCoordinator:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
-        with pynccl_comm.change_state(enable=True, stream=torch.cuda.current_stream()):
+        with pynccl_comm.change_state(
+            enable=True, stream=torch.get_device_module().current_stream()
+        ):
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
             ), "pynccl is required for all_gatherv"
@@ -1298,7 +1297,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=not _is_npu,
+        use_pynccl=not (_is_npu or _is_xpu),
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem=use_symm_mem_allreduce,

@@ -21,11 +21,12 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅                 | ✅             |
 | **Torch Native (SDPA)**         | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
 | **FlexAttention (PyTorch)**     | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **TRTLLM MHA**                  | 16, 32 or 64                | ❌               | ✅              | ❌              | ❌                 | ❌             |
+| **TRTLLM MHA**                  | 16, 32 or 64                | ✅               | ✅              | ❌              | ❌                 | ❌             |
 | **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
 | **AITER (ROCm)**                | ✅                          | ❌               | ✅              | ✅              | ❌                 | ❌             |
 | **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
 | **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ✅                 | ❌             |
 
 ### MLA Backends
 
@@ -188,6 +189,13 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --attention-backend ascend
+```
+
+- Intel XPU
+```bash
+python3 -m sglang.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --attention-backend intel_xpu
 ```
 
 - Wave
