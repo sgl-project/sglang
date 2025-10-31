@@ -325,6 +325,7 @@ impl HarmonyResponseProcessor {
                 output_tokens_details: None,
             })),
             user: None,
+            safety_identifier: responses_request.user.clone(),
             metadata: responses_request.metadata.clone().unwrap_or_default(),
         };
 

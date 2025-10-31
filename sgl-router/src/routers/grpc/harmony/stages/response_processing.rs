@@ -40,25 +40,26 @@ impl Default for HarmonyResponseProcessingStage {
 #[async_trait]
 impl PipelineStage for HarmonyResponseProcessingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        // Get execution result (output tokens from model)
-        let execution_result = ctx
-            .state
-            .response
-            .execution_result
-            .take()
-            .ok_or_else(|| utils::internal_error_static("No execution result"))?;
-
         let is_streaming = ctx.is_streaming();
-        let dispatch = ctx
-            .state
-            .dispatch
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
 
         // Check request type to determine which processor method to call
         match &ctx.input.request_type {
             RequestType::Chat(_) => {
+                // Get execution result (output tokens from model)
+                let execution_result = ctx
+                    .state
+                    .response
+                    .execution_result
+                    .take()
+                    .ok_or_else(|| utils::internal_error_static("No execution result"))?;
+
+                let dispatch = ctx
+                    .state
+                    .dispatch
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
+
                 // For streaming, delegate to streaming processor and return SSE response
                 if is_streaming {
                     return Ok(Some(
@@ -83,13 +84,27 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                 Ok(None)
             }
             RequestType::Responses(_) => {
-                // For Responses API, process iteration and store result
-                // Streaming not yet supported for Responses API
+                // For streaming Responses API, leave execution_result in context
+                // for external streaming processor (serve_harmony_responses_stream)
                 if is_streaming {
-                    return Err(utils::internal_error_static(
-                        "Streaming not yet supported for Responses API",
-                    ));
+                    // Don't take execution_result - let the caller handle it
+                    return Ok(None);
                 }
+
+                // For non-streaming, process normally
+                let execution_result = ctx
+                    .state
+                    .response
+                    .execution_result
+                    .take()
+                    .ok_or_else(|| utils::internal_error_static("No execution result"))?;
+
+                let dispatch = ctx
+                    .state
+                    .dispatch
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
 
                 let responses_request = ctx.responses_request_arc();
                 let iteration_result = self

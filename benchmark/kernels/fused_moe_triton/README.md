@@ -40,19 +40,9 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --tp-size 16 \
     --dtype int8_w8a8 \
     --tune
-
-# Tune with Expert Parallelism (EP) mode
-python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
-    --model Qwen/Qwen3-30B-A3B-FP8 \
-    --tp-size 1 \
-    --ep-size 2 \
-    --dtype fp8_w8a8 \
-    --tune
 ```
 
 After tuning, a configuration file (e.g., `E=64,N=640,device_name=NVIDIA_GeForce_RTX_4090,dtype=fp8_w8a8.json`) will be generated in the current directory. You can move this file to `sglang/srt/layers/fused_moe_triton/configs/triton_version` dir to use it in `sglang`.
-
-**Note for EP mode**: When using Expert Parallelism (`--ep-size > 1`), `--tp-size` must be set to 1. The configuration file uses local expert count instead of total expert count. For example, with 64 total experts and EP=2, the config file will be named `E=32,N=640,device_name=...,dtype=...json`.
 
 ### Performance Comparison Tool
 

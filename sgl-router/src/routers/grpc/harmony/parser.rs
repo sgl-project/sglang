@@ -103,7 +103,7 @@ impl HarmonyParserAdapter {
     /// # Returns
     ///
     /// Tuple of (analysis, commentary, final_text)
-    fn parse_messages(
+    pub fn parse_messages(
         messages: &[openai_harmony::chat::Message],
     ) -> (Option<String>, Option<Vec<ToolCall>>, String) {
         let mut analysis = None;
@@ -258,6 +258,51 @@ impl HarmonyParserAdapter {
     /// Used for validation checks.
     pub fn get_messages(&self) -> Vec<openai_harmony::chat::Message> {
         self.parser.messages().to_vec()
+    }
+
+    /// Extract incomplete commentary content from parser state
+    ///
+    /// When the stream ends, there may be incomplete commentary content in the parser
+    /// that hasn't been finalized into a completed message. This method extracts
+    /// such content and converts it to tool calls.
+    ///
+    /// # Returns
+    ///
+    /// Optional vector of ToolCall if incomplete commentary is found
+    pub fn extract_incomplete_commentary(&self) -> Option<Vec<ToolCall>> {
+        // Check if current channel is commentary
+        let current_channel = self.parser.current_channel();
+        if current_channel.as_deref() != Some("commentary") {
+            return None;
+        }
+
+        // Get current recipient (should be "functions.{name}")
+        let recipient = self.parser.current_recipient()?;
+        if !recipient.starts_with("functions.") {
+            return None;
+        }
+
+        // Get current incomplete content
+        let content = self.parser.current_content().ok()?;
+        if content.is_empty() {
+            return None;
+        }
+
+        // Extract function name from recipient
+        let function_name = recipient.strip_prefix("functions.").unwrap();
+
+        // Create tool call from incomplete content
+        let call_id = format!("call_{}", Uuid::new_v4());
+        let tool_call = ToolCall {
+            id: call_id,
+            tool_type: "function".to_string(),
+            function: FunctionCallResponse {
+                name: function_name.to_string(),
+                arguments: Some(content),
+            },
+        };
+
+        Some(vec![tool_call])
     }
 
     /// Parse streaming chunk

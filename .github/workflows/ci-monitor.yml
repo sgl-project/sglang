@@ -2,7 +2,7 @@ name: CI Monitor
 
 on:
   schedule:
-    - cron: '0 */12 * * *'  # Every 12 hours for main analysis
+    - cron: '0 */12 * * *' # Every 12 hours for main analysis
   workflow_dispatch:
     inputs:
       limit:
@@ -65,6 +65,7 @@ jobs:
           retention-days: 30
 
   ci-monitor-balance:
+    needs: ci-monitor
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
