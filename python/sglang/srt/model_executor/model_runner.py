@@ -139,6 +139,7 @@ from sglang.srt.utils import (
     get_cpu_ids_by_node,
     init_custom_process_group,
     is_cuda,
+    is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
     log_info_on_rank0,
@@ -1275,10 +1276,7 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
-            if (
-                self.kv_cache_dtype == getattr(torch, "float4_e2m1fn_x2", None)
-                and _is_cuda
-            ):
+            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
                 cell_size = (cell_size // 2) + (

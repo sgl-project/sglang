@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda, is_flashinfer_available
+from sglang.srt.utils import is_cuda, is_flashinfer_available, is_float4_e2m1fn_x2
 from sglang.srt.utils.common import cached_triton_kernel
 
 if is_flashinfer_available():
@@ -360,7 +360,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         num_tokens_per_bs = max_num_tokens // max_bs
 
-        if self.data_type == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+        if is_float4_e2m1fn_x2(self.data_type):
             # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
             self.store_dtype = torch.uint8
             self.padded_q_buffer = torch.zeros(

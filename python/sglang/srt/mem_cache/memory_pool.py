@@ -48,7 +48,13 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_float4_e2m1fn_x2,
+    is_npu,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -1310,7 +1316,7 @@ class MLATokenToKVPool(KVCache):
                 if self.custom_mem_pool
                 else nullcontext()
             ):
-                if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+                if is_float4_e2m1fn_x2(self.dtype):
                     m = size + page_size
                     n = 1  # head_num
                     k = self.kv_cache_dim  # head_dim
@@ -1377,7 +1383,7 @@ class MLATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+            if is_float4_e2m1fn_x2(self.dtype):
                 cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(
                     torch.uint8
                 )
@@ -1419,7 +1425,7 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
         if cache_k.dtype != self.dtype:
-            if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+            if is_float4_e2m1fn_x2(self.dtype):
                 from sglang.srt.layers.quantization.kvfp4_tensor import (
                     KVFP4QuantizeUtil,
                 )
@@ -1431,7 +1437,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
-            if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+            if is_float4_e2m1fn_x2(self.dtype):
                 self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
                     self.store_dtype
                 )
@@ -1463,7 +1469,7 @@ class MLATokenToKVPool(KVCache):
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
         else:
             if cache_k_nope.dtype != self.dtype:
-                if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+                if is_float4_e2m1fn_x2(self.dtype):
                     from sglang.srt.layers.quantization.kvfp4_tensor import (
                         KVFP4QuantizeUtil,
                     )
@@ -1481,7 +1487,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+            if is_float4_e2m1fn_x2(self.dtype):
                 set_mla_kv_buffer_triton(
                     self.kv_buffer[layer_id - self.start_layer],
                     loc,
