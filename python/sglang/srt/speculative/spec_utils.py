@@ -584,7 +584,7 @@ def traverse_tree(
                         curr,
                     )
 
-            if curr != 0:
+            if curr != 0 and grammar.accept_token_length() > 0:
                 # Rollback the current token
                 grammar.rollback(1)
 
@@ -635,7 +635,8 @@ def generate_token_bitmask(
                 retrieve_next_token_cpu[i],
                 retrieve_next_sibling_cpu[i],
                 draft_tokens_cpu[i],
-                req.grammar,
+                # don't change the grammar state, it will be used in other places like spec.verify.
+                req.grammar.copy(),
                 allocate_token_bitmask[
                     i * num_draft_tokens : (i + 1) * num_draft_tokens
                 ],

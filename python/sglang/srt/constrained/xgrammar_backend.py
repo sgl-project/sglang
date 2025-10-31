@@ -158,6 +158,9 @@ class XGrammarGrammar(BaseGrammarObject):
         for i in range(k, len(new_output_ids)):
             assert self.matcher.accept_token(new_output_ids[i])
 
+    def accept_token_length(self) -> int:
+        return len(self.accepted_tokens)
+
     def __repr__(self):
         return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=}, {self.current_token=})"
 
