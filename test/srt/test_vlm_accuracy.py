@@ -25,13 +25,16 @@ from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProces
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.server_args import ServerArgs
 
+device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+torch.set_default_device(device_type)
+
 
 # Test the logits output between HF and SGLang
 class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         cls.image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.device = torch.device(device_type)
         cls.model_path = ""
         cls.chat_template = ""
         cls.processor = ""
@@ -174,7 +177,7 @@ class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
         )
         cls.chat_template = "minicpmv"
 
-        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.device = torch.device(device_type)
         cls.hf_model = (
             AutoModel.from_pretrained(
                 cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
@@ -280,7 +283,7 @@ class TestMiniCPMV4Logits(VisionLLMLogitsBase):
         )
         cls.chat_template = "minicpmv"
 
-        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.device = torch.device(device_type)
         cls.hf_model = (
             AutoModel.from_pretrained(
                 cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True

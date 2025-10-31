@@ -7,13 +7,15 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 
+device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+
 
 class TestBuildEagleTree(unittest.TestCase):
     """Unit tests for build_eagle_tree functionality."""
 
     def test_build_tree_kernel_efficient(self):
         """Test the build_tree_kernel_efficient function with known inputs and expected outputs."""
-        verified_id = torch.tensor([29974, 13], device="cuda", dtype=torch.int32)
+        verified_id = torch.tensor([29974, 13], device=device_type, dtype=torch.int32)
         score_list = [
             torch.tensor(
                 [
@@ -21,7 +23,7 @@ class TestBuildEagleTree(unittest.TestCase):
                     [[9.7476e-01, 2.2219e-02, 6.5031e-04, 1.3212e-04]],
                 ],
                 dtype=torch.float32,
-                device="cuda",
+                device=device_type,
             ),
             torch.tensor(
                 [
@@ -39,7 +41,7 @@ class TestBuildEagleTree(unittest.TestCase):
                     ],
                 ],
                 dtype=torch.float32,
-                device="cuda",
+                device=device_type,
             ),
             torch.tensor(
                 [
@@ -57,7 +59,7 @@ class TestBuildEagleTree(unittest.TestCase):
                     ],
                 ],
                 dtype=torch.float32,
-                device="cuda",
+                device=device_type,
             ),
             torch.tensor(
                 [
@@ -75,14 +77,14 @@ class TestBuildEagleTree(unittest.TestCase):
                     ],
                 ],
                 dtype=torch.float32,
-                device="cuda",
+                device=device_type,
             ),
         ]
         token_list = [
             torch.tensor(
                 [[29896, 29906, 29900, 29945], [13, 2, 29871, 28956]],
                 dtype=torch.int64,
-                device="cuda",
+                device=device_type,
             ),
             torch.tensor(
                 [
@@ -123,7 +125,7 @@ class TestBuildEagleTree(unittest.TestCase):
                         259,
                     ],
                 ],
-                device="cuda",
+                device=device_type,
             ),
             torch.tensor(
                 [
@@ -164,7 +166,7 @@ class TestBuildEagleTree(unittest.TestCase):
                         2186,
                     ],
                 ],
-                device="cuda",
+                device=device_type,
             ),
             torch.tensor(
                 [
@@ -205,7 +207,7 @@ class TestBuildEagleTree(unittest.TestCase):
                         13,
                     ],
                 ],
-                device="cuda",
+                device=device_type,
             ),
         ]
         parents_list = [

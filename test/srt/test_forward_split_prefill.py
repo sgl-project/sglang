@@ -23,6 +23,9 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
+device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+torch.set_default_device(device_type)
+
 
 class TestForwardSplitPrefill(CustomTestCase):
     """Test cases for forward_split_prefill functionality."""
@@ -32,7 +35,7 @@ class TestForwardSplitPrefill(CustomTestCase):
         """Set up the test environment once for all tests."""
         cls.model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.tp_size = 1
-        cls.device = "cuda"
+        cls.device = device_type
 
         # Initialize server args
         cls.server_args = ServerArgs(
