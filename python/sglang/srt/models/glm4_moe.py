@@ -427,6 +427,8 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
 
+        self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+
     def get_moe_weights(self):
         return [
             x.data
