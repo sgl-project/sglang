@@ -96,7 +96,7 @@ fi
 $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 # Install router for pd-disagg test
-$PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
+$PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
 # Install sgl-kernel
 SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
