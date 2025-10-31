@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, Any
+from typing import Any, Dict, Tuple
 
 import torchvision.transforms as T
 from PIL import Image
