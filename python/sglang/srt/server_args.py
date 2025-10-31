@@ -511,6 +511,9 @@ class ServerArgs:
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
+    # -1 mean dump all layers.
+    debug_tensor_dump_layers: int = -1
+    # TODO(guoyuhong): clean the old dumper code.
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
 
@@ -538,6 +541,10 @@ class ServerArgs:
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
     sm_group_num: int = 8
+
+    # For Multi-Modal
+    mm_max_concurrent_calls: int = 32
+    mm_per_request_timeout: float = 10.0
 
     def __post_init__(self):
         """
@@ -977,13 +984,6 @@ class ServerArgs:
                 logger.warning(
                     "Use trtllm_mha as attention backend on sm100 for Llama4 model"
                 )
-            if is_sm100_supported() and self.attention_backend == "trtllm_mha":
-                # TODO(brayden): remove this once TRTLLM MHA kernel for FP8 w/ tileSizeKv=128 is available.
-                # This is a Llama 4 specific issue only.
-                self.kv_cache_dtype = "bfloat16"
-                logger.warning(
-                    "Setting kv_cache_dtype to bfloat16 for Llama4 with trtllm_mha backend, due to a missing FlashInfer TRTLLM MHA kernel for FP8 KV Cache"
-                )
             if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -1028,6 +1028,11 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
+        elif model_arch in ["KimiLinearForCausalLM"]:
+            logger.warning(
+                f"Disabling Radix Cache for {model_arch} as it is not yet supported."
+            )
+            self.disable_radix_cache = True
 
         if is_deepseek_nsa(hf_config):
             if (
@@ -1784,7 +1789,13 @@ class ServerArgs:
                 )
 
     def _handle_other_validations(self):
-        pass
+        # Handle model inference tensor dump.
+        if self.debug_tensor_dump_output_folder is not None:
+            logger.warning(
+                "Cuda graph and server warmup are disabled because of using tensor dump mode"
+            )
+            self.disable_cuda_graph = True
+            self.skip_server_warmup = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -3376,6 +3387,12 @@ class ServerArgs:
             help="The output folder for dumping tensors.",
         )
         parser.add_argument(
+            "--debug-tensor-dump-layers",
+            type=int,
+            default=-1,
+            help="The layer number for dumping tensors.",
+        )
+        parser.add_argument(
             "--debug-tensor-dump-input-file",
             type=str,
             default=ServerArgs.debug_tensor_dump_input_file,
@@ -3509,6 +3526,20 @@ class ServerArgs:
             "--config",
             type=str,
             help="Read CLI options from a config file. Must be a YAML file with configuration options.",
+        )
+
+        # For Multi-Modal
+        parser.add_argument(
+            "--mm-max-concurrent-calls",
+            type=int,
+            default=ServerArgs.mm_max_concurrent_calls,
+            help="The max concurrent calls for async mm data processing.",
+        )
+        parser.add_argument(
+            "--mm-per-request-timeout",
+            type=int,
+            default=ServerArgs.mm_per_request_timeout,
+            help="The timeout for each multi-modal request in seconds.",
         )
 
     @classmethod

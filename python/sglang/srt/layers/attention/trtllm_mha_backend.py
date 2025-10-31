@@ -528,6 +528,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 layer, cache_loc, k, v, layer.k_scale, layer.v_scale
             )
 
+        if self.data_type == torch.float8_e4m3fn:
+            q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
@@ -566,6 +568,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             window_left=layer.sliding_window_size,
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
             sinks=attention_sink,
+            out_dtype=self.q_data_type,  # model_runner.dtype
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -585,6 +588,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, cache_loc, k, v, layer.k_scale, layer.v_scale
             )
+
+        if self.data_type == torch.float8_e4m3fn:
+            q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -624,6 +630,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             window_left=layer.sliding_window_size,
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
             sinks=attention_sink,
+            out_dtype=self.q_data_type,  # model_runner.dtype
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
