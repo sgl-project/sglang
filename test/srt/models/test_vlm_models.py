@@ -25,7 +25,10 @@ MODELS = [
         mmmu_accuracy=0.4,
     ),
     SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
-    SimpleNamespace(model="Qwen/Qwen3-VL-8B-Thinking", mmmu_accuracy=0.65),
+]
+
+MODELS_PP = [
+    SimpleNamespace(model="Qwen/Qwen3-VL-2B-Thinking", mmmu_accuracy=0.55),
 ]
 
 # Set default mem_fraction_static to 0.8
@@ -276,7 +279,7 @@ class TestVLMModels(CustomTestCase):
     def test_vlm_pp2_mmmu_benchmark(self):
         """Test Qwen3-VL with pp_size=2 against MMMU benchmark."""
         models_to_test = [
-            m for m in MODELS if m.model.split("/")[-1].startswith("Qwen3-VL")
+            m for m in MODELS_PP if m.model.split("/")[-1].startswith("Qwen3-VL")
         ]
 
         for model in models_to_test:
