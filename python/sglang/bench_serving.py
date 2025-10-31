@@ -1369,7 +1369,9 @@ def create_mm_data_row(
         )["input_ids"].numel()
     except Exception:
         # Fallback: just tokenize the text prompt directly
-        tokenizer_to_use = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        tokenizer_to_use = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
         text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
 
     # Vision tokens = total tokens - text tokens
