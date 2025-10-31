@@ -141,6 +141,9 @@ class Envs:
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
 
+    # Scheduler: spec decode batch size threshold
+    SGLANG_SPEC_DECODE_BATCH_SIZE_THRESHOLD = EnvInt(None)
+
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     # Test: pd-disaggregation

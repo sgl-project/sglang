@@ -262,7 +262,7 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none():
+        if not batch.is_spec_enabled_for_batch:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
@@ -272,7 +272,7 @@ class SchedulerOutputProcessorMixin:
             accept_lens_list = result.accept_lens.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
-        if not batch.spec_algorithm.is_none():
+        if batch.is_spec_enabled_for_batch:
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
         self.token_to_kv_pool_allocator.free_group_begin()
@@ -285,7 +285,7 @@ class SchedulerOutputProcessorMixin:
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
                 indices_to_free = None
-                if batch.spec_algorithm.is_eagle():
+                if batch.is_spec_enabled_for_batch and batch.spec_algorithm.is_eagle():
                     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
                     end_p = allocate_lens_list[i]
@@ -316,7 +316,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
+            if not batch.is_spec_enabled_for_batch:
                 req.output_ids.append(next_token_id)
             elif batch.is_v2_eagle:
                 # Only v2 eagle's output_ids are updated here.
@@ -350,7 +350,7 @@ class SchedulerOutputProcessorMixin:
 
                 req.time_stats.completion_time = time.perf_counter()
 
-            if req.return_logprob and batch.spec_algorithm.is_none():
+            if req.return_logprob and (not batch.is_spec_enabled_for_batch):
                 # speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
@@ -374,7 +374,7 @@ class SchedulerOutputProcessorMixin:
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
-            if req.grammar is not None and batch.spec_algorithm.is_none():
+            if req.grammar is not None and (not batch.is_spec_enabled_for_batch):
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
                     req.grammar.accept_token(next_token_id)

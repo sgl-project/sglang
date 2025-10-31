@@ -645,6 +645,8 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+        # This only counts the decode for a request, excluding the extended tokens.
+        self.last_spec_extended_index = 0
 
     @property
     def seqlen(self):
@@ -924,6 +926,9 @@ class Req:
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
 
+    def increment_last_spec_extended_index(self, extended_length: int):
+        self.last_spec_extended_index += extended_length
+
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
@@ -1023,6 +1028,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+    # Enable/disable speculative decoding from batch to batch
+    is_spec_enabled_for_batch: bool = False
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1072,6 +1079,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            is_spec_enabled_for_batch=(not spec_algorithm.is_none()),
         )
 
     def batch_size(self):
@@ -1515,9 +1523,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
-        if not self.spec_algorithm.is_none():
-            # if spec decoding is used, the decode batch is prepared inside
-            # `forward_batch_speculative_generation` after running draft models.
+
+        if not self.spec_algorithm.is_none() and self.is_spec_enabled_for_batch:
+            # if spec decoding is used and enabled for the batch, the decode 
+            # batch is prepared inside `forward_batch_speculative_generation`
+            # after running draft models.
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
@@ -1544,7 +1554,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         # Update fields
-        self.input_ids = self.output_ids
+        if not self.spec_algorithm.is_none() and not self.is_spec_enabled_for_batch:
+            # In the case of changing from spec decode -> regular decode
+            # input_ids should be the last token produced by verify
+            self.input_ids = self.output_ids.reshape(bs, -1)[:, -1]
+        else:
+            self.input_ids = self.output_ids
+        
         self.output_ids = None
 
         if self.model_config.is_encoder_decoder:
@@ -1768,6 +1784,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            is_spec_enabled_for_batch=self.is_spec_enabled_for_batch,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,

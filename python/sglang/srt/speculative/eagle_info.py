@@ -661,6 +661,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
+        """
+        In-place update the schedule batch for extend after decode. Produces
+        verified_id and positions for the extend.
+        args:
+            batch: the batch to be extended
+            speculative_num_steps: used for the static expression of upper bound in 
+                create_extend_after_decode_spec_info kernel.
+        """
 
         if batch.forward_mode.is_idle():
             return
@@ -684,7 +692,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             batch.seq_lens,
             self.accept_length,
             self.positions,
-            self.verified_id,
+            self.verified_id, # writing from input_ids to verified_id
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
 

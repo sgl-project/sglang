@@ -1870,6 +1870,11 @@ class Scheduler(
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
 
+        # Update speculative decoding enablement flag for the current batch
+        if not self.spec_algorithm.is_none() and batch is not None:
+            threshold = envs.SGLANG_SPEC_DECODE_BATCH_SIZE_THRESHOLD.get()
+            batch.is_spec_enabled_for_batch = threshold is None or batch.batch_size() <= threshold
+
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
@@ -2401,10 +2406,10 @@ class Scheduler(
             self.tp_worker.model_runner.graph_mem_usage, 2
         )
 
-        if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
+        if not self.spec_algorithm.is_none():
             ret["avg_spec_accept_length"] = (
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
-            )
+            ) if self.spec_total_num_forward_ct > 0 else 0
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 

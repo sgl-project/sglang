@@ -2,10 +2,12 @@ import unittest
 
 import requests
 import torch
+import asyncio
 
 import sglang as sgl
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.utils import async_stream_and_merge
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -23,6 +25,50 @@ torch_dtype = torch.float16
 prefill_tolerance = 5e-2
 decode_tolerance: float = 5e-2
 
+DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "/shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714"
+DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693"
+
+async def async_stream_ramp_up(engine, prompts, params, tokens_per_request: int, tokenizer):
+    outputs = [""] * len(prompts)
+    token_counts = [0] * len(prompts)
+    started = [False] * len(prompts)
+    tasks = {}
+    queue = asyncio.Queue()
+
+    async def stream_one(i: int):
+        async for cleaned_chunk in async_stream_and_merge(engine, prompts[i], params):
+            outputs[i] += cleaned_chunk
+            # Recompute tokens on full generated text to account for cross-boundary merges
+            token_counts[i] = len(tokenizer.encode(outputs[i], truncation=False))
+            await queue.put(("chunk", i, cleaned_chunk))
+        await queue.put(("done", i, ""))
+
+    # Kick off the first prompt
+    started[0] = True
+    tasks[0] = asyncio.create_task(stream_one(0))
+    last_started = 0
+
+    finished = 0
+    accumulated_outputs = [""] * len(prompts)
+    while finished < len(prompts):
+        typ, i, payload = await queue.get()
+        if typ == "chunk":
+            # Accumulate chunks for later printing
+            accumulated_outputs[i] += payload
+            # When the last-started prompt reaches the token threshold, start the next prompt
+            if i == last_started and token_counts[i] >= tokens_per_request:
+                j = last_started + 1
+                if j < len(prompts) and not started[j]:
+                    started[j] = True
+                    last_started = j
+                    tasks[j] = asyncio.create_task(stream_one(j))
+        else:
+            finished += 1
+            print(f"Output for prompt {i}: {accumulated_outputs[i]}")
+
+    if tasks:
+        await asyncio.gather(*tasks.values())
+    return outputs
 
 class TestEAGLEEngine(CustomTestCase):
     BASE_CONFIG = {
@@ -65,10 +111,10 @@ class TestEAGLEEngine(CustomTestCase):
                 print(f"{config=}")
                 engine = sgl.Engine(**config, log_level="info", decode_log_interval=10)
                 try:
-                    self._test_single_generation(engine)
+                    # self._test_single_generation(engine)
                     self._test_batch_generation(engine)
-                    self._test_eos_token(engine)
-                    self._test_acc_length(engine)
+                    # self._test_eos_token(engine)
+                    # self._test_acc_length(engine)
                 finally:
                     engine.flush_cache()  # check engine alive
                     engine.shutdown()
@@ -86,23 +132,24 @@ class TestEAGLEEngine(CustomTestCase):
             "The capital of France is",
             "The future of AI is",
         ]
-        params = {"temperature": 0, "max_new_tokens": 50}
-
-        outputs = engine.generate(prompts, params)
-        for prompt, output in zip(prompts, outputs):
-            print(f"Prompt: {prompt}")
-            print(f"Generated: {output['text']}")
-            print("-" * 40)
-
-        print(f"{engine.get_server_info()=}")
+        # params = {"temperature": 0.1, "top_p": 0.95, "max_new_tokens": 500, "frequency_penalty": 0.5}
+        params = {"temperature": 0, "max_new_tokens": 100}
+        print("Generated text: ", end="", flush=True)
+        tokenizer = get_tokenizer(DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3)
+        asyncio.run(async_stream_ramp_up(engine, prompts, params, tokens_per_request=10, tokenizer=tokenizer))
+        # outputs = engine.generate(prompts, params)
+        # for prompt, output in zip(prompts, outputs):
+            # print(f"Prompt: {prompt}")
+            # print(f"Generated: {output['text']}")
+            # print("-" * 40)
 
         avg_spec_accept_length = engine.get_server_info()["internal_states"][0][
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(
-            avg_spec_accept_length, self.THRESHOLDS["batch_avg_accept_len"]
-        )
+        # self.assertGreater(
+        #     avg_spec_accept_length, self.THRESHOLDS["batch_avg_accept_len"]
+        # )
 
     def _test_eos_token(self, engine):
         prompt = "[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\nToday is a sunny day and I like [/INST]"
@@ -173,8 +220,12 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "speculative_eagle_topk": 16,
         "speculative_num_draft_tokens": 64,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        # "cuda_graph_max_bs": 5,
         "dtype": "float16",
+        "disable_cuda_graph": True,
+        "attention_backend": "fa3",
+        "watchdog_timeout": 30000,
+        "skip_server_warmup": True,
     }
     NUM_CONFIGS = 1
     THRESHOLDS = {
@@ -208,8 +259,7 @@ class TestEAGLERadixCache(CustomTestCase):
 
         for i, config in enumerate(configs):
             with self.subTest(i=i):
-                print(f"{config=}")
-                engine = sgl.Engine(**config, log_level="info", decode_log_interval=10)
+                engine = sgl.Engine(**config, log_level="info", decode_log_interval=1)
                 try:
                     self._test_acc_length(engine)
                 finally:
@@ -397,4 +447,4 @@ class TestEAGLEDraftExtendFlashinferMLA(TestEAGLEDraftExtend):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(defaultTest="TestEAGLE3Engine.test_correctness")

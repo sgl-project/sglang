@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_last_loc,
+    alloc_for_decode,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -261,6 +262,17 @@ class EAGLEWorker(TpModelWorker):
                 num_accepted_tokens=0,
                 can_run_cuda_graph=False,
             )
+        elif batch.forward_mode.is_decode() and not batch.is_spec_enabled_for_batch:
+            model_worker_batch = batch.get_model_worker_batch()
+            model_worker_batch.spec_info = None
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            generation_batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+
+            # Need to reinitialize out_cache_loc for writing
+            # We need to run an extra extend on draft model after target decode
+
+            self.forward_draft_extend_after_target_decode(batch)
+            return generation_batch_result
         else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
@@ -277,6 +289,8 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
+                    # for i, req in enumerate(batch.reqs):
+                        # req.increment_last_spec_extended_index(verify_output.accept_length_per_req_cpu[i] + 1)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -303,6 +317,47 @@ class EAGLEWorker(TpModelWorker):
         need_forward = global_need_forward_cnt > 0
         return need_forward
 
+    def forward_draft_extend_after_target_decode(self, batch: ScheduleBatch):
+        return_logprob_backup = batch.return_logprob
+        batch.return_logprob = False
+        # TODO: Handle idle
+        batch.spec_info.num_tokens_per_batch = 1
+        batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        batch.spec_info.verified_id = batch.input_ids
+
+        batch.forward_mode = (
+            ForwardMode.DRAFT_EXTEND
+            if not batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
+        batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
+        batch.return_hidden_states = False
+        model_worker_batch = batch.get_model_worker_batch()
+        # TODO: only turn on after specdecode enabled
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        forward_batch = ForwardBatch.init_new(
+            model_worker_batch, self.draft_model_runner
+        )
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
+        else:
+            forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
+
+        forward_batch.can_run_dp_cuda_graph = False
+        if not forward_batch.forward_mode.is_idle():
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
+        logits_output, _ = self.draft_model_runner.forward(
+            forward_batch, skip_attn_backend_init=True
+        )
+        input_is_idle = batch.forward_mode.is_idle()
+        # TODO: Only turn on after specdecode enabled
+        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        batch.forward_mode = (
+            ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
+        )
+        batch.return_logprob = return_logprob_backup
+
+    
     def forward_target_extend(
         self, batch: ScheduleBatch
     ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, Optional[torch.Tensor]]:
