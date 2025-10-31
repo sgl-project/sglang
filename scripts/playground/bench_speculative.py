@@ -57,14 +57,14 @@ class FakeTokenizer:
 def send_one_batch(base_url, num_prompts, batch_size, tokenizer, is_multimodal):
     # format: (prompt, input_len, output len). We set input_len as a dummy value 0.
     if is_multimodal:
+        backend = "sglang-oai-chat"
+        api_url = f"{base_url}/v1/chat/completions"
         input_requests = sample_mmmu_requests(
             num_prompts,
             tokenizer,
-            512,
-            apply_chat_template=False,
+            backend=backend,
+            fixed_output_len=512,
         )
-        backend = "sglang-oai-chat"
-        api_url = f"{base_url}/v1/chat/completions"
     else:
         padded_prompts = (prompts * ((num_prompts + len(prompts) - 1) // len(prompts)))[
             :num_prompts
