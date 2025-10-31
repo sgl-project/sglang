@@ -178,16 +178,3 @@ def get_global_experts_capturer():
 def set_global_experts_capturer(capturer: RoutedExpertsCapturer):
     global _global_expert_capturer
     _global_expert_capturer = capturer
-
-
-def sync_fwd_experts_buffer_DtoH():
-    capturer = get_global_experts_capturer()
-    if isinstance(capturer, _RoutedExpertsCapturerReal):
-        device_cache = capturer.get_device_cache()
-        host_cache = capturer.get_host_cache()
-        for layer_id in range(device_cache.buffer.shape[0]):
-            host_cache.set_experts_buffer(
-                layer_id,
-                torch.arange(host_cache.num_tokens),
-                device_cache.get_experts_buffer(layer_id).cpu(),
-            )

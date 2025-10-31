@@ -106,16 +106,20 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        req.routed_experts = (
-                            get_global_experts_capturer()
-                            .get_host_cache()
-                            .buffer[
-                                self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                                    : len(req.fill_ids)
-                                ].cpu()
-                            ]
-                            .tolist()
-                        )
+                        if (
+                            self.server_args.enable_return_routed_experts
+                            and req.return_routed_experts
+                        ):
+                            req.routed_experts = (
+                                get_global_experts_capturer()
+                                .get_host_cache()
+                                .buffer[
+                                    self.req_to_token_pool.req_to_token[
+                                        req.req_pool_idx
+                                    ][: len(req.fill_ids)].cpu()
+                                ]
+                                .tolist()
+                            )
                         self.tree_cache.cache_finished_req(req)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -337,16 +341,20 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
-                req.routed_experts = (
-                    get_global_experts_capturer()
-                    .get_host_cache()
-                    .buffer[
-                        self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                            : len(req.output_ids) + len(req.fill_ids)
-                        ].cpu()
-                    ]
-                    .tolist()
-                )
+                if (
+                    self.server_args.enable_return_routed_experts
+                    and req.return_routed_experts
+                ):
+                    req.routed_experts = (
+                        get_global_experts_capturer()
+                        .get_host_cache()
+                        .buffer[
+                            self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                                : len(req.output_ids) + len(req.fill_ids)
+                            ].cpu()
+                        ]
+                        .tolist()
+                    )
                 if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
                     # FIXME(lsyin): fix the messy logic here
                     # 1) when not overlap (v2 impl), we free the extra tokens in the req
