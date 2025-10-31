@@ -13,14 +13,11 @@ Run with:
 """
 
 import json
-
-# CHANGE: Import router launcher instead of server launcher
 import sys
 import unittest
 from pathlib import Path
 
 import openai
-import requests
 
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
@@ -225,7 +222,6 @@ class TestOpenAIServer(CustomTestCase):
         try:
             js_obj = json.loads(text)
         except (TypeError, json.decoder.JSONDecodeError):
-            print("JSONDecodeError", text)
             raise
         assert isinstance(js_obj["name"], str)
         assert isinstance(js_obj["population"], int)
