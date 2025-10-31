@@ -315,11 +315,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
 
         # Recv embedding from encoding server
-        if (
-            self.disaggregation_mode == DisaggregationMode.PREFILL
-            and self.model_config.is_multimodal
-            and self.server_args.language_only
-        ):
+        if self.model_config.is_multimodal and self.server_args.language_only:
             self.recv_from_encoder = get_zmq_socket(
                 context, zmq.PULL, f"tcp://*:{server_args.embedding_port}", True
             )
@@ -735,10 +731,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
 
-            if (
-                self.disaggregation_mode == DisaggregationMode.PREFILL
-                and self.server_args.language_only
-            ):
+            if self.server_args.language_only:
                 # Use async lock to avoid race condition
                 async with self.embeddings_lock:
                     while (

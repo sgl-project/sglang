@@ -17,6 +17,7 @@ class RouterArgs:
     # PD-specific configuration
     mini_lb: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
+    e_disaggregation: bool = False  # Enable E disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
@@ -192,6 +193,11 @@ class RouterArgs:
             f"--{prefix}pd-disaggregation",
             action="store_true",
             help="Enable PD (Prefill-Decode) disaggregated mode",
+        )
+        parser.add_argument(
+            f"--{prefix}e-disaggregation",
+            action="store_true",
+            help="Enable E (Encode) disaggregated mode",
         )
         parser.add_argument(
             f"--{prefix}prefill",
