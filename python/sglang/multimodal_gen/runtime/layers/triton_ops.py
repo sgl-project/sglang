@@ -120,9 +120,11 @@ def _fused_scale_shift_4d_kernel(
     tl.store(out_ptrs, output, mask=mask)
 
 
+# FIXME: illegal memory access, disabled for now
 def fused_scale_shift(
     normalized: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
 ) -> torch.Tensor:
+    assert False, "Disabled for now"
     output = torch.empty_like(normalized)
 
     batch_size, seq_len, inner_dim = normalized.shape

@@ -265,12 +265,16 @@ class DenoisingStage(PipelineStage):
 
         # TI2V specific preparations
         z, mask2, seq_len = None, None, None
+        # FIXME: should probably move to latent preparation stage, to handle with offload
         if server_args.pipeline_config.ti2v_task and batch.pil_image is not None:
-            # TI2V directly replaces the first frame of the latent with
+            # Wan2.2 TI2V directly replaces the first frame of the latent with
             # the image latent instead of appending along the channel dim
             assert batch.image_latent is None, "TI2V task should not have image latents"
             assert self.vae is not None, "VAE is not provided for TI2V task"
+            self.vae = self.vae.to(batch.pil_image.device)
             z = self.vae.encode(batch.pil_image).mean.float()
+            if self.vae.device != "cpu" and server_args.vae_cpu_offload:
+                self.vae = self.vae.to("cpu")
             if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
                 if isinstance(self.vae.shift_factor, torch.Tensor):
                     z -= self.vae.shift_factor.to(z.device, z.dtype)
@@ -281,13 +285,12 @@ class DenoisingStage(PipelineStage):
                 z = z * self.vae.scaling_factor.to(z.device, z.dtype)
             else:
                 z = z * self.vae.scaling_factor
-
             latent_model_input = latents.to(target_dtype).squeeze(0)
+
             _, mask2 = masks_like([latent_model_input], zero=True)
 
             latents = (1.0 - mask2[0]) * z + mask2[0] * latent_model_input
             latents = latents.to(get_local_torch_device())
-
             F = batch.num_frames
             temporal_scale = (
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
@@ -649,9 +652,9 @@ class DenoisingStage(PipelineStage):
                             batch=batch,
                         )
                     )
-
                     # Expand latents for I2V
                     latent_model_input = latents.to(target_dtype)
+
                     if batch.image_latent is not None:
                         assert (
                             not server_args.pipeline_config.ti2v_task
@@ -681,7 +684,6 @@ class DenoisingStage(PipelineStage):
                     latent_model_input = self.scheduler.scale_model_input(
                         latent_model_input, t_device
                     )
-
                     # Predict noise residual
                     attn_metadata = self._build_attn_metadata(i, batch, server_args)
                     noise_pred = self._predict_noise_with_cfg(

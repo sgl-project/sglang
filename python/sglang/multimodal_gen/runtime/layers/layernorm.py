@@ -352,11 +352,24 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
         # Apply normalization
         normalized = self.norm(residual_output)
 
-        modulated = fused_scale_shift(
-            normalized,
-            scale,
-            shift,
-        )
+        # modulated = fused_scale_shift(
+        #     normalized,
+        #     scale,
+        #     shift,
+        # )
+        # Apply scale and shift
+        if isinstance(scale, torch.Tensor) and scale.dim() == 4:
+            # scale.shape: [batch_size, num_frames, 1, inner_dim]
+            # shift.shape: [batch_size, num_frames, 1, inner_dim]
+            num_frames = scale.shape[1]
+            frame_seqlen = normalized.shape[1] // num_frames
+            modulated = (
+                normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+                * (1.0 + scale)
+                + shift
+            ).flatten(1, 2)
+        else:
+            modulated = normalized * (1.0 + scale) + shift
         return modulated, residual_output
 
 

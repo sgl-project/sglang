@@ -131,6 +131,18 @@ class Wan2_2_TI2V_5B_Config(WanT2V480PConfig):
     flow_shift: float | None = 5.0
     ti2v_task: bool = True
     expand_timesteps: bool = True
+    # ti2v, 5B
+    vae_stride = (4, 16, 16)
+
+    def prepare_latent_shape(self, batch, batch_size, num_frames):
+        F = num_frames
+        z_dim = self.vae_config.arch_config.z_dim
+        vae_stride = self.vae_stride
+        oh = batch.height
+        ow = batch.width
+        shape = (z_dim, F, oh // vae_stride[1], ow // vae_stride[2])
+
+        return shape
 
     def __post_init__(self) -> None:
         self.vae_config.load_encoder = True

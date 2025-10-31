@@ -39,6 +39,21 @@ class TestWan2_1_I2V_14B_480P(TestGenerateTI2VBase):
         pass
 
 
+class TestWan2_2_TI2V_5B(TestGenerateTI2VBase):
+    model_path = "Wan-AI/Wan2.2-TI2V-5B"
+    # extra_args = ["--attention-backend=video_sparse_attn"]
+    data_type: DataType = DataType.VIDEO
+    thresholds = {
+        "test_single_gpu": 13.0,
+        "test_cfg_parallel": 191.7 * 1.05,
+        "test_usp": 15.0,
+        "test_mixed": 15.0,
+    }
+
+    def test_single_gpu(self):
+        pass
+
+
 if __name__ == "__main__":
     del TestGenerateTI2VBase, TestGenerateBase
     unittest.main()

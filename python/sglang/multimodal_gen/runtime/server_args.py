@@ -695,6 +695,7 @@ class ServerArgs:
         for attr in attrs:
             if attr == "pipeline_config":
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
+                logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
             elif attr == "preprocess_config":
                 preprocess_config = PreprocessConfig.from_kwargs(kwargs)

@@ -147,6 +147,8 @@ class LatentPreparationStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify latent preparation stage outputs."""
         result = VerificationResult()
+        if batch.debug:
+            logger.debug(f"{batch.raw_latent_shape=}")
         # disable temporarily for image-generation models
         # result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
         result.add_check("raw_latent_shape", batch.raw_latent_shape, V.is_tuple)
