@@ -247,8 +247,8 @@ class SchedulerRuntimeCheckerMixin:
             else:
                 _, info_msg = self._check_radix_cache_memory()
             logger.error(
-                f"{self.cur_batch.batch_size()=}, "
-                f"{self.cur_batch.reqs=}, "
+                f"{self.cur_batch.batch_size()=}\n"
+                f"{self.cur_batch.reqs=}\n"
                 f"{info_msg}"
             )
 
