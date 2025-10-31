@@ -340,6 +340,10 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+            causal_conv1d_fn,
+        )
+
         q_proj_states = kwargs["q_proj_states"]
         k_proj_states = kwargs["k_proj_states"]
         v_proj_states = kwargs["v_proj_states"]
@@ -387,6 +391,7 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
 
         k = causal_conv1d_fn(
@@ -398,6 +403,7 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
 
         v = causal_conv1d_fn(
@@ -409,6 +415,7 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
 
         q, k, v = map(

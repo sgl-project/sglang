@@ -362,7 +362,6 @@ class KimiDecoderLayer(nn.Module):
                 v_head_dim=config.v_head_dim,
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=config.kv_lora_rank,
-                # use_nope=config.mla_use_nope,
             )
 
         if (
