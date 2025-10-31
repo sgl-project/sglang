@@ -279,17 +279,6 @@ class MultimodalDataItem:
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
 
-    def clear_cuda_tensors(self):
-        if self.feature is not None and self.feature.device.type != "cpu":
-            del self.feature
-            self.feature = None
-        if (
-            self.precomputed_embeddings is not None
-            and self.precomputed_embeddings.device.type != "cpu"
-        ):
-            del self.precomputed_embeddings
-            self.precomputed_embeddings = None
-
 
 @dataclasses.dataclass
 class MultimodalInputs:

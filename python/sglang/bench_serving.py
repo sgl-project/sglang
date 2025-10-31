@@ -1578,7 +1578,6 @@ async def get_request(
     request_rate: float,
     use_trace_timestamps: bool = False,
     slowdown_factor: float = 1.0,
-    enable_uniform_sample: bool = False,
 ) -> AsyncGenerator[DatasetRow, None]:
     if use_trace_timestamps:
         print(
@@ -1609,10 +1608,7 @@ async def get_request(
                 continue
 
             # Sample the request interval from the exponential distribution.
-            if enable_uniform_sample:
-                interval = 1.0 / request_rate
-            else:
-                interval = np.random.exponential(1.0 / request_rate)
+            interval = np.random.exponential(1.0 / request_rate)
             # The next request will be sent after the interval.
             await asyncio.sleep(interval)
 
@@ -1723,7 +1719,6 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
-    enable_uniform_sample: Optional[bool] = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1852,9 +1847,7 @@ async def benchmark(
         )
         pbar_total *= args.mooncake_num_rounds
     else:
-        request_generator = get_request(
-            input_requests, request_rate, enable_uniform_sample=enable_uniform_sample
-        )
+        request_generator = get_request(input_requests, request_rate)
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     async for request in request_generator:
@@ -2277,7 +2270,6 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
-            enable_uniform_sample=getattr(args, "enable_uniform_sample", False),
         )
     )
 
@@ -2542,11 +2534,6 @@ if __name__ == "__main__":
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
-    )
-    parser.add_argument(
-        "--enable-uniform-sample",
-        action="store_true",
-        help="Enable uniform sampling for interval",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
