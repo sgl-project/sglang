@@ -532,7 +532,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-
+        shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
