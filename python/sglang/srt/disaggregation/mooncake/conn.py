@@ -851,7 +851,9 @@ class MooncakeKVManager(CommonKVManager):
                 )
 
     def start_prefill_thread(self):
-        self._bind_server_socket()
+        # self._bind_server_socket()
+        # already bound in CommonKVManager init
+        pass
 
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
@@ -889,7 +891,9 @@ class MooncakeKVManager(CommonKVManager):
         threading.Thread(target=bootstrap_thread).start()
 
     def start_decode_thread(self):
-        self._bind_server_socket()
+        # self._bind_server_socket()
+        # already bound in CommonKVManager init
+        pass
 
         def decode_thread():
             while True:
