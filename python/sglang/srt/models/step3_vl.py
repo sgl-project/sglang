@@ -129,6 +129,7 @@ class Step3TextMoEMLP(nn.Module):
             top_k=config.moe_top_k,
             renormalize=config.norm_expert_weight,
             use_grouped_topk=False,
+            layer_id=layer_id,
         )
 
         self.experts = get_moe_impl_class(quant_config)(

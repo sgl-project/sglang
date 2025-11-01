@@ -64,6 +64,11 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    get_global_experts_capturer,
+    set_global_experts_capturer,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -675,6 +680,17 @@ class Scheduler(
             get_int_env_var(env_var, default_size) if env_var else None
         )
 
+    def init_routed_experts_capturer(self):
+        set_global_experts_capturer(
+            RoutedExpertsCapturer.create(
+                get_global_server_args().enable_return_routed_experts,
+                self.model_config,
+                self.max_total_num_tokens + self.page_size,
+                self.max_running_requests,
+                self.device,
+            )
+        )
+
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
@@ -837,6 +853,9 @@ class Scheduler(
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
         init_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+        # Init routed experts capturer
+        self.init_routed_experts_capturer()
 
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
@@ -1249,6 +1268,7 @@ class Scheduler(
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=recv_req.custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
+                return_routed_experts=recv_req.return_routed_experts,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -2027,6 +2047,10 @@ class Scheduler(
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
+            # Copy cached routing experts' buffers back to CPU cache
+            get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
+                batch.out_cache_loc
+            )
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
             #       we shall still keep the original outputs, e.g. next_token_ids
