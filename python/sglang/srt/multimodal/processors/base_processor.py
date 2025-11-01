@@ -12,11 +12,6 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sglang.srt.managers.cuda_ipc_transport_utils import (
-    MM_FEATURE_CACHE_SIZE,
-    CudaIpcTensorTransportProxy,
-    MmItemMemoryPool,
-)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -25,6 +20,11 @@ from sglang.srt.utils import (
     load_image,
     load_video,
     logger,
+)
+from sglang.srt.utils.cuda_ipc_transport_utils import (
+    MM_FEATURE_CACHE_SIZE,
+    CudaIpcTensorTransportProxy,
+    MmItemMemoryPool,
 )
 
 _is_npu = is_npu()
