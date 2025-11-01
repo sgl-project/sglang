@@ -318,6 +318,12 @@ struct CliArgs {
 
     #[arg(long)]
     mcp_config_path: Option<String>,
+
+    #[arg(long, env = "SGLANG_ROUTER_GRPC_MODE", default_value_t = false)]
+    #[arg(
+        help = "Use gRPC protocol for worker communication. Incompatible with http:// or https:// URLs."
+    )]
+    grpc_mode: bool,
 }
 
 enum OracleConnectSource {
@@ -326,13 +332,37 @@ enum OracleConnectSource {
 }
 
 impl CliArgs {
-    fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
+    fn determine_connection_mode(
+        worker_urls: &[String],
+        grpc_mode_flag: bool,
+    ) -> ConfigResult<ConnectionMode> {
+        // If --grpc-mode flag is set, validate and return gRPC mode
+        if grpc_mode_flag {
+            // Check for conflicting HTTP/HTTPS URLs
+            for url in worker_urls {
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!(
+                            "--grpc-mode flag conflicts with HTTP/HTTPS URL: {}. Use grpc:// prefix or remove the flag.",
+                            url
+                        ),
+                    });
+                }
+            }
+            tracing::info!("Connection mode: gRPC (forced by --grpc-mode flag)");
+            return Ok(ConnectionMode::Grpc { port: None });
+        }
+
+        // If flag not set, detect from URL prefixes
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-                return ConnectionMode::Grpc { port: None };
+                tracing::info!("Connection mode: gRPC (detected from grpc:// URL prefixes)");
+                return Ok(ConnectionMode::Grpc { port: None });
             }
         }
-        ConnectionMode::Http
+
+        tracing::info!("Connection mode: HTTP (default)");
+        Ok(ConnectionMode::Http)
     }
 
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
@@ -526,7 +556,7 @@ impl CliArgs {
         }
         let connection_mode = match &mode {
             RoutingMode::OpenAI { .. } => ConnectionMode::Http,
-            _ => Self::determine_connection_mode(&all_urls),
+            _ => Self::determine_connection_mode(&all_urls, self.grpc_mode)?,
         };
 
         let history_backend = match self.history_backend.as_str() {

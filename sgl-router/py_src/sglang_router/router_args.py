@@ -115,6 +115,8 @@ class RouterArgs:
     # Trace
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    # gRPC configuration
+    grpc_mode: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -532,6 +534,13 @@ class RouterArgs:
             choices=["sglang", "openai"],
             help="Backend runtime to use (default: sglang)",
         )
+        parser.add_argument(
+            f"--{prefix}grpc-mode",
+            action="store_true",
+            help="Use gRPC protocol for worker communication."
+            "Overrides URL-based auto-detection and workflow probing. "
+            "Incompatible with http:// or https:// URLs.",
+        )
         # History backend configuration
         parser.add_argument(
             f"--{prefix}history-backend",
@@ -693,6 +702,52 @@ class RouterArgs:
                     f"Using --policy '{self.policy}' for prefill nodes "
                     f"and --decode-policy '{self.decode_policy}' for decode nodes."
                 )
+
+        # Validate grpc_mode configuration
+        self._validate_grpc_mode()
+
+    def _check_urls_for_http_conflict(self, urls, url_type: str):
+        """Helper to validate URLs don't conflict with gRPC mode.
+
+        Args:
+            urls: List of URLs (either strings or tuples where first element is URL)
+            url_type: Description of URL type for error messages (e.g., "worker", "prefill", "decode")
+
+        Raises:
+            ValueError: If any URL uses http:// or https:// protocol
+        """
+        if not urls:
+            return
+
+        for item in urls:
+            # Handle both plain URLs and tuples (url, port)
+            url = item[0] if isinstance(item, tuple) else item
+
+            if url.startswith("http://") or url.startswith("https://"):
+                raise ValueError(
+                    f"--grpc-mode flag conflicts with HTTP/HTTPS {url_type} URL: {url}. "
+                    f"Use grpc:// prefix or remove the flag."
+                )
+
+    def _validate_grpc_mode(self):
+        """Validate grpc_mode flag against worker URLs."""
+        if not self.grpc_mode:
+            return
+
+        # Check worker URLs
+        self._check_urls_for_http_conflict(self.worker_urls, "worker")
+
+        # Check prefill and decode URLs in PD mode
+        if self.pd_disaggregation:
+            self._check_urls_for_http_conflict(self.prefill_urls, "prefill")
+            self._check_urls_for_http_conflict(self.decode_urls, "decode")
+
+        # Log info for service discovery
+        if self.service_discovery:
+            logger.info(
+                "Using --grpc-mode with service discovery. "
+                "All discovered workers will use gRPC protocol."
+            )
 
     @staticmethod
     def _parse_selector(selector_list):
