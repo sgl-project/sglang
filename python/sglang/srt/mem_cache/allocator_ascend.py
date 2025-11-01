@@ -55,6 +55,8 @@ def alloc_extend_kernel_ascend(
 
         num3 = seq_lens[i] - seq_lens[i] // page_size * page_size
         if num3:
+            if end_pos[i] - num3 < 0:
+                num3 = extend_lens[i] - extend_lens[i] // page_size * page_size
             out_indices[end_pos[i] - num3 : end_pos[i]] = (
                 free_pages[end_new_pages[i] - 1] * page_size + pos_in_page[:num3]
             ).view(-1)
