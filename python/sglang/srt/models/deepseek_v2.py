@@ -414,7 +414,7 @@ def handle_attention_nsa(attn, forward_batch):
 def handle_attention_triton(attn, forward_batch):
     if is_in_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
-    
+
     # when deterministic inference is enabled, use MLA
     if get_global_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
