@@ -124,7 +124,7 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         type=bool,
         default=False,
-        help="Whether to profile prefill and decode separatedly",
+        help="Whether to profile prefill and decode separately",
     )
     parser.add_argument(
         "--cpu",
