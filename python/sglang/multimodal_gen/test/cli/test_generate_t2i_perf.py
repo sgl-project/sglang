@@ -40,16 +40,7 @@ class TestQwenImageEdit(TestGenerateBase):
         "Change the rabbit's color to purple, with a flash light background."
     )
 
-    def test_cfg_parallel(self):
-        pass
-
-    def test_mixed(self):
-        pass
-
-    def test_usp(self):
-        pass
-
-    def test_single_gpu(self):
+    def setUp(self):
         test_dir = Path(__file__).parent
         img_path = (test_dir / ".." / "test_files" / "rabbit.jpg").resolve().as_posix()
         self.base_command = [
@@ -65,6 +56,7 @@ class TestQwenImageEdit(TestGenerateBase):
             f"--output-path={self.output_path}",
         ] + [f"--image-path={img_path}"]
 
+    def test_single_gpu(self):
         self._run_test(
             name=f"{self.model_name()}, single gpu",
             args=None,
