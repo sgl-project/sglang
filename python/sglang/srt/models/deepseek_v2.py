@@ -1512,15 +1512,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         zero_allocator: BumpAllocator,
     ):
         if self.q_lora_rank is not None:
-            q_raw, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[
-                0
-            ].split(
+            q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            q_lora = self.q_a_layernorm(q_raw)
-            q = self.q_b_proj(q_lora)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
+            q_lora = self.q_a_layernorm(q)
+            q = self.q_b_proj(q_lora)[0].view(-1, self.num_local_heads, self.qk_head_dim)
 
             # NSA Indexer Call for MHA Path: only cache quantized keys, skip topk
             if self.use_nsa and _is_extend_without_speculative(forward_batch):
@@ -1555,7 +1551,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             kv_a, k_pe = self._get_mla_kv_buffer(
                 forward_batch.fetch_mha_one_shot_kv_indices(), q.dtype, forward_batch
             )
-
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
@@ -2378,7 +2373,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             kv_a_normed, k_pe = self._get_mla_kv_buffer(
                 kv_indices, q.dtype, forward_batch
             )
-
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
