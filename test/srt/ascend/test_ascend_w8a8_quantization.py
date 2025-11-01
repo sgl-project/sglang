@@ -100,5 +100,74 @@ class TestAscendW8A8(CustomTestCase):
             self.assertGreaterEqual(throughput, 25)
 
 
+class TestAscendW8A8CompressedTensors(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "RedHatAI/Qwen2.5-0.5B-Instruct-quantized.w8a8"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--disable-cuda-graph",
+                "--device",
+                "npu",
+                "--attention-backend",
+                "ascend",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        base_url = DEFAULT_URL_FOR_TEST
+        url = urlparse(base_url)
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host=f"http://{url.hostname}",
+            port=int(url.port),
+        )
+        metrics = run_eval(args)
+        print(metrics)
+
+        self.assertGreaterEqual(metrics["accuracy"], 0.3)
+        self.assertGreaterEqual(metrics["output_throughput"], 1000)
+
+    def run_decode(self, max_new_tokens):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                },
+                "ignore_eos": True,
+            },
+        )
+        return response.json()
+
+    def test_throughput(self):
+        max_tokens = 256
+
+        tic = time.perf_counter()
+        res = self.run_decode(max_tokens)
+        tok = time.perf_counter()
+        print(res["text"])
+        throughput = max_tokens / (tok - tic)
+        print(f"Throughput: {throughput} tokens/s")
+
+        if is_in_ci():
+            self.assertGreaterEqual(throughput, 25)
+
+
 if __name__ == "__main__":
     unittest.main()

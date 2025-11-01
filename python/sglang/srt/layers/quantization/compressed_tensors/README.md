@@ -3,4 +3,7 @@
 To support compressed_tensors format quantization models, we adapted https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors into SGLang.
 
 
-For practical purposes, we have only applied the compressed_tensors format of `w8a8_fp8`. If you have requirements for other formats, you can submit an issue through this [link](https://github.com/sgl-project/sglang/issues).
+For practical purposes, we have only applied the compressed_tensors format of:
+    1. `w8a8_fp8`
+    2. `w8a8_int8`
+If you have requirements for other formats, you can submit an issue through this [link](https://github.com/sgl-project/sglang/issues).

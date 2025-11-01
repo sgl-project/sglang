@@ -253,6 +253,10 @@ def get_quant_config(
                 return ModelOptFp8Config.from_config(config)
             elif "FP4" in quant_algo:
                 return ModelOptFp4Config.from_config(config)
+        elif model_config.quantization == "w8a8_int8":
+            config["packed_modules_mapping"] = packed_modules_mapping
+        elif model_config.quantization == "w4a4_int4":
+            config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(config)
 
 
