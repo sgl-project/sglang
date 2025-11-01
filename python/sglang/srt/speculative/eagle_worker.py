@@ -372,8 +372,8 @@ class EAGLEWorker(TpModelWorker):
         forward_batch.attn_backend = self.draft_extend_attn_backend
         logits_output, _ = self.draft_model_runner.forward(forward_batch, skip_attn_backend_init=True)
         input_is_idle = batch.forward_mode.is_idle()
-        # TODO: Only turn on after specdecode enabled
         batch.spec_info = spec_info_backup
+        # TODO: Only turn on after specdecode enabled
         self.capture_for_decode(logits_output, batch.spec_info)
         batch.forward_mode = (
             ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE

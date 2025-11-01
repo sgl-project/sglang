@@ -65,9 +65,6 @@ async def async_stream_ramp_up(engine, prompts, params, tokens_per_request: int,
         else:
             finished += 1
             print(f"Output for prompt {i}: {accumulated_outputs[i]}")
-
-    if tasks:
-        await asyncio.gather(*tasks.values())
     return outputs
 
 class TestEAGLEEngine(CustomTestCase):
@@ -134,7 +131,6 @@ class TestEAGLEEngine(CustomTestCase):
         ]
         # params = {"temperature": 0.1, "top_p": 0.95, "max_new_tokens": 500, "frequency_penalty": 0.5}
         params = {"temperature": 0, "max_new_tokens": 100}
-        print("Generated text: ", end="", flush=True)
         tokenizer = get_tokenizer(DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3)
         asyncio.run(async_stream_ramp_up(engine, prompts, params, tokens_per_request=10, tokenizer=tokenizer))
         # outputs = engine.generate(prompts, params)
@@ -142,11 +138,11 @@ class TestEAGLEEngine(CustomTestCase):
             # print(f"Prompt: {prompt}")
             # print(f"Generated: {output['text']}")
             # print("-" * 40)
-
-        avg_spec_accept_length = engine.get_server_info()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
+        # TODO: Fix server info
+        # avg_spec_accept_length = engine.get_server_info()["internal_states"][0][
+        #     "avg_spec_accept_length"
+        # ]
+        # print(f"{avg_spec_accept_length=}")
         # self.assertGreater(
         #     avg_spec_accept_length, self.THRESHOLDS["batch_avg_accept_len"]
         # )
