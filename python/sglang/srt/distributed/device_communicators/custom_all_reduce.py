@@ -421,3 +421,23 @@ class CustomAllreduce:
 
     def __del__(self):
         self.close()
+
+
+def dispatch_custom_allreduce():
+    """Return the CustomAllreduce class to use (aiter on ROCm if enabled)."""
+    if is_hip():
+        try:
+            from aiter.dist.custom_all_reduce import (
+                CustomAllreduce as AiterCustomAllreduce,
+            )
+
+            logger.info("Using AiterCustomAllreduce for ROCm.")
+            return AiterCustomAllreduce
+        except ImportError as e:
+            logger.warning(
+                "Aiter custom all-reduce not available (optional dependency missing); "
+                "falling back to sglang CustomAllreduce. Details: %s",
+                e,
+            )
+            return CustomAllreduce
+    return CustomAllreduce
