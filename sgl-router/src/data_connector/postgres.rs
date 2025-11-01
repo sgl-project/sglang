@@ -29,10 +29,6 @@ use crate::{
     },
 };
 
-// ============================================================================
-// PART 1: PostgresStore helper and common utilities
-// ============================================================================
-
 pub(crate) struct PostgresStore {
     pool: Pool,
 }
@@ -60,10 +56,6 @@ impl Clone for PostgresStore {
         }
     }
 }
-
-// ============================================================================
-// PART 2: PostgresConversationStorage
-// ============================================================================
 
 pub struct PostgresConversationStorage {
     store: PostgresStore,
@@ -204,10 +196,6 @@ impl ConversationStorage for PostgresConversationStorage {
         Ok(rows_deleted > 0)
     }
 }
-
-// ============================================================================
-// PART 3: PostgresConversationItemStorage
-// ============================================================================
 
 pub struct PostgresConversationItemStorage {
     store: PostgresStore,
@@ -488,10 +476,6 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
     }
 }
 
-// ============================================================================
-// PART 4: PostgresResponseStorage
-// ============================================================================
-
 pub struct PostgresResponseStorage {
     store: PostgresStore,
 }
@@ -558,7 +542,7 @@ impl PostgresResponseStorage {
             tool_calls,
             metadata,
             created_at,
-            user: safety_identifier, // TODO waiting another pr merge
+            safety_identifier,
             model,
             conversation_id,
             raw_response,
@@ -582,7 +566,7 @@ impl ResponseStorage for PostgresResponseStorage {
         let json_raw_response = &response.raw_response;
         let instructions = response.instructions.clone();
         let created_at = response.created_at;
-        let user = response.user.clone();
+        let safety_identifier = response.safety_identifier.clone();
         let model = response.model.clone();
         let conversation_id = response.conversation_id.clone();
         let client = self.store.pool.get().await.unwrap();
@@ -599,7 +583,7 @@ impl ResponseStorage for PostgresResponseStorage {
                 &serde_json::json!(&json_tool_calls),
                 &serde_json::json!(&json_metadata),
                 &created_at,
-                &user,
+                &safety_identifier,
                 &model,
                 &conversation_id,
                 &json_raw_response,
@@ -664,19 +648,19 @@ impl ResponseStorage for PostgresResponseStorage {
         Ok(chain)
     }
 
-    async fn list_user_responses(
+    async fn list_identifier_responses(
         &self,
-        user: &str,
+        identifier: &str,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
-        let user = user.to_string();
+        let identifier = identifier.to_string();
         let client = self.store.pool.get().await.unwrap();
         let rows = if let Some(l) = limit {
             let l_i64: i64 = l as i64;
             client
                 .query(
                     "SELECT * FROM responses WHERE safety_identifier = $1 ORDER BY created_at DESC LIMIT $2",
-                    &[&user, &l_i64],
+                    &[&identifier, &l_i64],
                 )
                 .await
                 .unwrap()
@@ -684,7 +668,7 @@ impl ResponseStorage for PostgresResponseStorage {
             client
                 .query(
                     "SELECT * FROM responses WHERE safety_identifier = $1 ORDER BY created_at DESC",
-                    &[&user],
+                    &[&identifier],
                 )
                 .await
                 .unwrap()
@@ -692,21 +676,21 @@ impl ResponseStorage for PostgresResponseStorage {
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let resp = Self::build_response_from_now(&row)
-                .map_err(ResponseStorageError::StorageError)?;
+            let resp =
+                Self::build_response_from_now(&row).map_err(ResponseStorageError::StorageError)?;
             out.push(resp);
         }
 
         Ok(out)
     }
 
-    async fn delete_user_responses(&self, user: &str) -> ResponseResult<usize> {
-        let user = user.to_string();
+    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
+        let identifier = identifier.to_string();
         let client = self.store.pool.get().await.unwrap();
         let rows_deleted = client
             .execute(
                 "DELETE FROM responses WHERE safety_identifier = $1",
-                &[&user],
+                &[&identifier],
             )
             .await
             .unwrap();

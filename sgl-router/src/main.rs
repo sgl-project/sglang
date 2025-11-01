@@ -456,7 +456,11 @@ impl CliArgs {
         let pool_max = self
             .postgres_pool_max_size
             .unwrap_or_else(PostgresConfig::default_pool_max);
-        Ok(PostgresConfig { db_url, pool_max })
+        let pcf = PostgresConfig { db_url, pool_max };
+        pcf.validate().map_err(|e| ConfigError::ValidationFailed {
+            reason: e.to_string(),
+        })?;
+        Ok(pcf)
     }
 
     fn to_router_config(
