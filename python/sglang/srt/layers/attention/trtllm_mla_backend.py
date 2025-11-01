@@ -897,7 +897,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             fused_kv = (k is None and k_rope is None)
 
         # Save KV cache if requested (only if not using fused path)
-        if save_kv_cache and not fused_kv and k is not None and k_rope is not None:
+        if save_kv_cache and not fused_kv:
+            assert (
+                k is not None and k_rope is not None
+            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
@@ -1005,8 +1008,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q, k_fp8_nope, k_fp8_rope = self.quantize_and_rope_for_fp8(
                 q,
                 q_rope,
-                k.squeeze(1) if k.dim() == 3 else k,
-                k_rope.squeeze(1) if k_rope.dim() == 3 else k_rope,
+                k.squeeze(1),
+                k_rope.squeeze(1),
                 forward_batch,
                 cos_sin_cache,
                 is_neox,
@@ -1021,7 +1024,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             k_rope = k_fp8_rope
 
         # Save KV cache if requested (only if not using fused path)
-        if save_kv_cache and not fused_kv and k is not None and k_rope is not None:
+        if save_kv_cache and not fused_kv:
+            assert (
+                k is not None and k_rope is not None
+            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
