@@ -64,7 +64,7 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         ):
             image_data = sum(image_data, [])
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,

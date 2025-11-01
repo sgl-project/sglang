@@ -901,59 +901,57 @@ def get_image_bytes(image_file: Union[str, bytes]):
         raise NotImplementedError(f"Invalid image: {image_file}")
 
 
-def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+def load_video(video_file: Union[str, bytes]):
+    if isinstance(video_file, bytes):
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tmp_file.write(video_file)
+        tmp_file.close()
+        return tmp_file
+    elif isinstance(video_file, str):
+        if video_file.startswith(("http://", "https://")):
+            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            response = requests.get(video_file, stream=True, timeout=timeout)
+            response.raise_for_status()
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            for chunk in response.iter_content(chunk_size=8192):
+                tmp_file.write(chunk)
+            tmp_file.close()
+            return tmp_file
+        elif video_file.startswith("data:"):
+            _, encoded = video_file.split(",", 1)
+            video_bytes = pybase64.b64decode(encoded, validate=True)
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            tmp_file.write(video_bytes)
+            tmp_file.close()
+            return tmp_file
+        elif os.path.isfile(video_file):
+            return video_file
+        else:
+            video_bytes = pybase64.b64decode(video_file, validate=True)
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            tmp_file.write(video_bytes)
+            tmp_file.close()
+            return tmp_file
+    else:
+        raise ValueError(f"Unsupported video input type: {type(video_file)}")
+
+
+def get_video_reader(video_file, use_gpu=True):
     # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
     from decord import VideoReader, cpu, gpu
 
-    try:
-        from decord.bridge import decord_bridge
+    ctx = cpu(0)
 
-        ctx = gpu(0)
-        _ = decord_bridge.get_ctx_device(ctx)
-    except Exception:
-        ctx = cpu(0)
+    if use_gpu:
+        try:
+            from decord.bridge import decord_bridge
 
-    tmp_file = None
-    vr = None
-    try:
-        if isinstance(video_file, bytes):
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            tmp_file.write(video_file)
-            tmp_file.close()
-            vr = VideoReader(tmp_file.name, ctx=ctx)
-        elif isinstance(video_file, str):
-            if video_file.startswith(("http://", "https://")):
-                timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-                response = requests.get(video_file, stream=True, timeout=timeout)
-                response.raise_for_status()
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                for chunk in response.iter_content(chunk_size=8192):
-                    tmp_file.write(chunk)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif video_file.startswith("data:"):
-                _, encoded = video_file.split(",", 1)
-                video_bytes = pybase64.b64decode(encoded, validate=True)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif os.path.isfile(video_file):
-                vr = VideoReader(video_file, ctx=ctx)
-            else:
-                video_bytes = pybase64.b64decode(video_file, validate=True)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-        else:
-            raise ValueError(f"Unsupported video input type: {type(video_file)}")
+            ctx = gpu(0)
+            _ = decord_bridge.get_ctx_device(ctx)
+        except:
+            ctx = cpu(0)
 
-        return vr
-
-    finally:
-        if tmp_file and os.path.exists(tmp_file.name):
-            os.unlink(tmp_file.name)
+    return VideoReader(video_file, ctx=ctx)
 
 
 def encode_video(video_path, frame_count_limit=None):
