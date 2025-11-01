@@ -210,6 +210,8 @@ class W8A8Int8Config(QuantizationConfig):
         )
 
         if _is_npu:
+            if self.is_dynamic:
+                return
             # Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models
             for name in self.quant_description.keys():
                 if "norm.bias" in name:
@@ -265,6 +267,10 @@ class W8A8Int8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if _is_npu:
+            if should_ignore_layer(
+                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            ):
+                return UnquantizedLinearMethod()
             if isinstance(layer, LinearBase):
                 key = "model"
                 if "vision_model" in prefix:
@@ -279,8 +285,10 @@ class W8A8Int8Config(QuantizationConfig):
                         proj_name, packed_modules_mapping_subset[proj_name][0]
                     )
                 self.is_dynamic = (
-                    self.quant_description[prefix_in_quant_config + ".weight"]
+                    self.quant_description.get(prefix_in_quant_config + ".weight", "")
                     == "W8A8_DYNAMIC"
+                    or self.quant_description.get("quant_method", "")
+                    == "compressed-tensors"
                 )
                 if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                     return UnquantizedLinearMethod()
@@ -317,7 +325,7 @@ class W8A8Int8Config(QuantizationConfig):
             is_skipped = None
             for shard_prefix in shard_prefixes:
                 is_shard_skipped = (
-                    self.quant_description[shard_prefix + ".weight"] == "FLOAT"
+                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
                 )
 
                 if is_skipped is None:
@@ -329,7 +337,7 @@ class W8A8Int8Config(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
-            is_skipped = self.quant_description[prefix + ".weight"] == "FLOAT"
+            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
 
         assert is_skipped is not None
         return is_skipped
