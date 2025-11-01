@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communic
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 try:
-    import torch_musa
+    import torch_musa  # noqa: F401
     from torch_musa.core.device import synchronize
 except ModuleNotFoundError:
     pass

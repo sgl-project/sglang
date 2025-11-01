@@ -5,7 +5,6 @@ import base64
 import subprocess
 import time
 import unittest
-from pathlib import Path
 
 from openai import OpenAI
 

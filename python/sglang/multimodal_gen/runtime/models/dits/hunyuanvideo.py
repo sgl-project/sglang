@@ -14,7 +14,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_worl
 from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,
     UlyssesAttention,
-    USPAttention,
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,

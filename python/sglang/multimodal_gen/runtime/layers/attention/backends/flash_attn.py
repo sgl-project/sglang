@@ -10,7 +10,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_c
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
 
 try:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
 
     # flash_attn 3 no longer have a different API, see following commit:
     # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7

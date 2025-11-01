@@ -5,7 +5,6 @@ from typing import Callable
 
 import torch
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import calculate_dimensions
-from transformers import Qwen2_5_VLForConditionalGeneration
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig

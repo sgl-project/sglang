@@ -10,11 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.layers.triton_ops import (
-    fused_scale_shift,
-    norm_infer,
-    rms_norm_fn,
-)
+from sglang.multimodal_gen.runtime.layers.triton_ops import norm_infer, rms_norm_fn
 from sglang.multimodal_gen.runtime.utils.common import (
     get_bool_env_var,
     is_cpu,

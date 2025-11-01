@@ -40,7 +40,6 @@ repos:
           python/sglang/srt/grpc/.*_pb2_grpc\.py$|
           python/sglang/srt/grpc/.*_pb2\.pyi$|
           python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|
-          .*/multimodal_gen/.*
           )$
   - repo: https://github.com/psf/black
     rev: 24.10.0

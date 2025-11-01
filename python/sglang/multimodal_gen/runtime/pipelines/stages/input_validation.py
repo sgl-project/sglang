@@ -9,7 +9,7 @@ import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
 
-from sglang.multimodal_gen.configs.pipelines import WanI2V480PConfig, WanI2V720PConfig
+from sglang.multimodal_gen.configs.pipelines import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipelines.qwen_image import (
     QwenImageEditPipelineConfig,
 )

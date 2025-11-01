@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import (
     APIRouter,
@@ -25,7 +25,6 @@ from sglang.multimodal_gen.configs.sample.base import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
     VideoListResponse,
-    VideoRemixRequest,
     VideoResponse,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE

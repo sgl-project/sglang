@@ -1,4 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+import importlib.util
 
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/envs.py
@@ -110,15 +111,7 @@ class PackagesEnvChecker:
         if not torch.cuda.is_available():
             return False
         try:
-            from yunchang import (
-                LongContextAttention,
-                LongContextAttentionQKVPacked,
-                UlyssesAttention,
-                ring_flash_attn_func,
-                set_seq_parallel_pg,
-            )
-
-            return True
+            return importlib.util.find_spec("yunchang") is not None
         except ImportError:
             logger.warning(
                 f'Ring Flash Attention library "yunchang" not found, '

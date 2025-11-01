@@ -1,10 +1,9 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import asyncio
 import base64
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse

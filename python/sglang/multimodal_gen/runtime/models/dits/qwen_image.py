@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
