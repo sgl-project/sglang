@@ -324,8 +324,6 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
-        from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
-
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -400,9 +398,6 @@ class ForwardBatch:
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
-            TboForwardBatchPreparer.prepare(
-                ret, is_draft_worker=model_runner.is_draft_worker
-            )
             return ret
 
         # Override the positions with spec_info
@@ -450,10 +445,6 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
-
-        TboForwardBatchPreparer.prepare(
-            ret, is_draft_worker=model_runner.is_draft_worker
-        )
 
         return ret
 
@@ -670,6 +661,8 @@ class ForwardBatch:
             )
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
+        from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
+
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -736,6 +729,9 @@ class ForwardBatch:
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
+        self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
+        if self.forward_mode.is_extend():
+            self.extend_num_tokens = num_tokens
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -784,6 +780,10 @@ class ForwardBatch:
             spec_info.hidden_states = self._pad_tensor_to_size(
                 spec_info.hidden_states, num_tokens
             )
+
+        TboForwardBatchPreparer.prepare(
+            batch=self, is_draft_worker=model_runner.is_draft_worker
+        )
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
 
