@@ -96,6 +96,41 @@ jobs:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
           path: sgl-kernel/dist/*
 
+  sgl-kernel-build-wheels-arm:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    runs-on: arm-kernel-build-node
+    strategy:
+      matrix:
+        include:
+          - python-version: "3.10"
+            cuda-version: "12.9"
+    name: Build Wheel
+    steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf $GITHUB_WORKSPACE/* || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
+        run: |
+          cd sgl-kernel
+          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
+          path: sgl-kernel/dist/*
+
   sgl-kernel-unit-test:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
