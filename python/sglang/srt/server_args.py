@@ -1089,9 +1089,23 @@ class ServerArgs:
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
-            self.sampling_backend = (
-                "flashinfer" if is_flashinfer_available() else "pytorch"
-            )
+            if is_hip() and envs.SGLANG_USE_AITER.value:
+                self.sampling_backend = "aiter"
+            else:
+                self.sampling_backend = (
+                    "flashinfer" if is_flashinfer_available() else "pytorch"
+                )
+        elif self.sampling_backend == "aiter":
+            if not is_hip():
+                raise ValueError(
+                    "AITER sampling backend is only supported on ROCm devices."
+                )
+            if not envs.SGLANG_USE_AITER.value:
+                log_once = getattr(logger, "info_once", logger.info)
+                log_once(
+                    "Enabling SGLANG_USE_AITER=1 to match requested AITER sampling backend."
+                )
+                envs.SGLANG_USE_AITER.set(True)
 
     def _handle_attention_backend_compatibility(self):
         model_config = self.get_model_config()
@@ -2605,7 +2619,7 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=["flashinfer", "pytorch"],
+            choices=["flashinfer", "pytorch", "aiter"],
             default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
         )
