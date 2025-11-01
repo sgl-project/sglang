@@ -322,29 +322,12 @@ class EAGLEWorker(TpModelWorker):
         return need_forward
 
     def forward_draft_extend_after_target_decode(self, batch: ScheduleBatch):
-        # torch.distributed.breakpoint()
         return_logprob_backup = batch.return_logprob
         batch.return_logprob = False
         # TODO: Handle idle
         batch.spec_info.num_tokens_per_batch = 1
-        # batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        # batch.spec_info.num_tokens_for_logprob_per_batch = 1 ?
         batch.spec_info.verified_id = batch.input_ids
-        # batch.extend_lens = [1] * batch.batch_size()
-        # batch.prefix_lens = [seq_len - 1 for seq_len in batch.seq_lens_cpu.tolist()]
-        # batch.extend_num_tokens = sum(batch.extend_lens)
-        # batch.extend_prefix_lens = 
-        # if self.forward_mode.is_decode_or_idle():
-        #     extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
-        # else:
-    #         prefix_lens: List[int] = None
-    # extend_lens: List[int] = None
-    # extend_num_tokens: Optional[int] = None
-        #     extend_seq_lens = self.extend_lens
-        #     extend_prefix_lens = self.prefix_lens
-        #     extend_logprob_start_lens = self.extend_logprob_start_lens
-
-        # Maybe can refactor to set spec_info=None for a regular decode
-        # hidden_states = forward_batch.spec_info.hidden_states became annoying
         batch.return_hidden_states = False
         target_hidden_states = batch.spec_info.hidden_states
         spec_info_backup = batch.spec_info
@@ -362,13 +345,12 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
-        # forward_batch.spec_info = None # we don't need if we can just remove from batch
         forward_batch.target_hidden_states = target_hidden_states
         forward_batch.can_run_dp_cuda_graph = False
-        # TODO: fix this for fa3
         if not forward_batch.forward_mode.is_idle():
             self.draft_extend_attn_backend.init_forward_metadata(forward_batch)
         # To use regular decoding with triton, we need to switch to draft_extend_backend
+        # For FA3, it is the same.
         forward_batch.attn_backend = self.draft_extend_attn_backend
         logits_output, _ = self.draft_model_runner.forward(forward_batch, skip_attn_backend_init=True)
         input_is_idle = batch.forward_mode.is_idle()
