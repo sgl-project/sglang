@@ -786,6 +786,14 @@ class GptOssForCausalLM(nn.Module):
         for name, weight in weights:
             weight = weight.cuda()
 
+            # Extract layer_id from name like "model.layers.6.mlp.experts..."
+            if self.pp_group.world_size > 1:
+                parts = name.split(".")
+                if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
+                    layer_id = int(parts[2])
+                    if not (self.model.start_layer <= layer_id < self.model.end_layer):
+                        continue  # Skip weights for layers not on this PP rank
+
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
                 new_name = name.replace("gate_up_proj_blocks", "w13_weight")
