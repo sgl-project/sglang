@@ -106,6 +106,10 @@ class AscendAttnBackend(AttentionBackend):
         self.mtp_mask = torch.tril(torch.ones(2048, 2048, dtype=torch.bool)).npu()
         self.mtp_mask = ~self.mtp_mask
 
+        max_total_tokens = model_runner.max_total_num_tokens
+        self.max_seqlen_pad = max_total_tokens // model_runner.server_args.page_size
+        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         tp_size = get_attention_tp_size()
@@ -113,17 +117,32 @@ class AscendAttnBackend(AttentionBackend):
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
             seq_lens_max += self.speculative_num_draft_tokens
-        self.forward_metadata.block_tables = (
+        block_tables = (
             forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :seq_lens_max
             ][:, :: self.page_size]
             // self.page_size
         )
+        if self.enable_torch_compile and forward_batch.forward_mode.is_decode_or_idle():
+            bs = forward_batch.input_ids.size(0)
+            device = forward_batch.input_ids.device
+            self.forward_metadata.block_tables = torch.full(
+                (bs, self.max_seqlen_pad), -1, dtype=torch.int32, device=device
+            )
+            self.forward_metadata.block_tables[:, : block_tables.size(1)].copy_(
+                block_tables
+            )
+        else:
+            self.forward_metadata.block_tables = block_tables
+
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens_cpu_int = (
                 forward_batch.extend_seq_lens.cpu().int()
             )
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        self.forward_metadata.seq_lens_cpu_list = (
+            self.forward_metadata.seq_lens_cpu_int.tolist()
+        )
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_draft_extend()
@@ -752,7 +771,7 @@ class AscendAttnBackend(AttentionBackend):
                     atten_mask=None,
                     block_size=self.page_size,
                     block_table=self.forward_metadata.block_tables,
-                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_list,
                     scale=layer.scaling,
                 )
             else:
