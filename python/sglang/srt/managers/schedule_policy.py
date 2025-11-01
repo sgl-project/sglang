@@ -657,8 +657,9 @@ class PrefillAdder:
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests
-        valid_running_reqs = (r for r in self.running_batch.reqs 
-                              if r not in self.preempt_list)
+        valid_running_reqs = (
+            r for r in self.running_batch.reqs if r not in self.preempt_list
+        )
         if server_args.schedule_low_priority_values_first:
             sorted_valid_running_reqs = sorted(
                 valid_running_reqs,
