@@ -72,6 +72,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
 )
+from sglang.srt.entrypoints.openai.utils import build_metric_labels
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -325,6 +326,9 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     For /v1/responses, emit OpenAI-style nested error envelope:
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
     """
+    # Increment received requests metric for HTTP exceptions
+    _observe_request_metric(request, str(exc.status_code))
+
     # adjust fmt for responses api
     if request.url.path.startswith("/v1/responses"):
         nested_error = {
@@ -353,6 +357,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     For /v1/responses, emit OpenAI-style nested error envelope; for other endpoints keep legacy format.
     """
+    # Increment received requests metric for validation failures
+    _observe_request_metric(request, "400")
+
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
@@ -530,7 +537,6 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 # fastapi implicitly converts json in the request to obj (dataclass)
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
-    """Handle a generate request."""
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -549,6 +555,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 ) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
+        _observe_request_metric(request, "200", obj.custom_labels)
+
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
@@ -559,9 +567,15 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
+
+            _observe_request_metric(request, "200", obj.custom_labels)
+
             return ret
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
+
+            _observe_request_metric(request, "400", obj.custom_labels)
+
             return _create_error_response(e)
 
 
@@ -583,9 +597,15 @@ async def generate_from_file_request(file: UploadFile, request: Request):
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
+
+        _observe_request_metric(request, "200", obj.custom_labels)
+
         return ret
     except ValueError as e:
         logger.error(f"Error: {e}")
+
+        _observe_request_metric(request, "400", obj.custom_labels)
+
         return _create_error_response(e)
 
 
@@ -596,8 +616,13 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
+
+        _observe_request_metric(request, "200")
+
         return ret
     except ValueError as e:
+        _observe_request_metric(request, "400")
+
         return _create_error_response(e)
 
 
@@ -608,8 +633,13 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
+
+        _observe_request_metric(request, "200")
+
         return ret
     except ValueError as e:
+        _observe_request_metric(request, "400")
+
         return _create_error_response(e)
 
 
@@ -1326,6 +1356,32 @@ def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
     """Update weight version if provided."""
     if weight_version is not None:
         _global_state.tokenizer_manager.server_args.weight_version = weight_version
+
+
+def _observe_request_metric(
+    request: Request,
+    http_status: str,
+    custom_labels: Optional[Dict[str, str]] = None,
+) -> None:
+    """Observe a received request metric with proper labels.
+
+    `custom_labels` should be from the request's `GenerateReqInput.custom_labels`."""
+    if not _global_state.tokenizer_manager.enable_metrics:
+        return
+
+    metric_labels = build_metric_labels(
+        _global_state.tokenizer_manager.server_args,
+        request.url.path,
+        http_status,
+    )
+    labels = {
+        **_global_state.tokenizer_manager.metrics_collector.labels,
+        **metric_labels,
+        **(custom_labels or {}),
+    }
+    _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+        labels
+    )
 
 
 def _create_error_response(e):
