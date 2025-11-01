@@ -265,6 +265,7 @@ class MooncakeStore(HiCacheStorage):
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
+            "page_head",
         ], "mooncake store storage backend only support page first or page first direct layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
