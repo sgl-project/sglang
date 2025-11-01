@@ -79,7 +79,8 @@ class MOFP8Test(CustomTestCase):
         return response.json()
 
     def test_throughput(self):
-
+        # Warm-up
+        self.run_decode(max_new_tokens=32)
         max_tokens = 256
         tic = time.perf_counter()
         res = self.run_decode(max_tokens)
@@ -90,19 +91,28 @@ class MOFP8Test(CustomTestCase):
         self.assertGreaterEqual(throughput, self.throughput_threshold)
 
 
+# At the top of the file
+LLAMA_MODEL = "nvidia/Llama-3.1-8B-Instruct-FP8"
+LLAMA_GSM8K_ACC_THRESHOLD = 0.69
+LLAMA_THROUGHPUT_THRESHOLD = 120
+
+QWEN_MODEL = "nvidia/Qwen3-8B-FP8"
+QWEN_GSM8K_ACC_THRESHOLD = 0.90
+QWEN_THROUGHPUT_THRESHOLD = 120
+
 class TestMOLlamaFP8(MOFP8Test):
-    model = "nvidia/Llama-3.1-8B-Instruct-FP8"
+    model = LLAMA_MODEL
     quantization = "modelopt"
     kv_cache_dtype = "fp8_e4m3"
-    gsm8k_accuracy_threshold = 0.69
-    throughput_threshold = 120
+    gsm8k_accuracy_threshold = LLAMA_GSM8K_ACC_THRESHOLD
+    throughput_threshold = LLAMA_THROUGHPUT_THRESHOLD
 
 class TestMOQwenFP8(MOFP8Test):
-    model = "nvidia/Qwen3-8B-FP8"
+    model = QWEN_MODEL
     quantization = "modelopt"
     kv_cache_dtype = "fp8_e4m3"
-    gsm8k_accuracy_threshold = 0.90
-    throughput_threshold = 120
+    gsm8k_accuracy_threshold = QWEN_GSM8K_ACC_THRESHOLD
+    throughput_threshold = QWEN_THROUGHPUT_THRESHOLD
 
 if __name__ == "__main__":
     unittest.main()
