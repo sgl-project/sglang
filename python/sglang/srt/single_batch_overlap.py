@@ -82,7 +82,11 @@ def execute_sbo(
     )
 
     combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
-        _compute_overlap_args(dispatch_output, alt_stream, disable_sbo=disable_sbo)
+        _compute_overlap_args(
+            dispatch_output,
+            alt_stream,
+            disable_sbo=disable_sbo,
+        )
     )
 
     combine_input = experts.run_moe_core(
