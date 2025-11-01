@@ -27,12 +27,15 @@ def parse_arguments(json_value):
         parsed_value = json.loads(json_value)
         return parsed_value, True
     except:
+        # If that fails, try wrapping it to unescape JSON characters
         try:
-            # If parsing fails, try unescaping JSON characters
-            unescaped = json_value.encode("utf-8").decode("unicode_escape")
-            parsed_value = json.loads(unescaped)
+            # Wrap the value as a JSON string field
+            wrapped = json.loads('{"tmp": "' + json_value + '"}')
+            # parse the unescaped value
+            parsed_value = json.loads(wrapped["tmp"])
             return parsed_value, True
         except:
+            # Final fallback to ast.literal_eval
             try:
                 parsed_value = ast.literal_eval(json_value)
                 return parsed_value, True
