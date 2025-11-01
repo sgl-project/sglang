@@ -135,6 +135,7 @@ class Envs:
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
+    SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
     SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK = EnvBool(False)
 
     # Scheduler: new token ratio hyperparameters
@@ -156,6 +157,9 @@ class Envs:
     # Constrained Decoding
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
     SGLANG_GRAMMAR_TIMEOUT = EnvFloat(300)
+
+    # Tool Calling
+    SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)

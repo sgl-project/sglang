@@ -110,7 +110,7 @@ impl ResponseProcessor {
         Ok(all_responses)
     }
 
-    /// Process a single choice from GenerateComplete response (EXACT COPY from router.rs:1573-1725)
+    /// Process a single choice from GenerateComplete response
     #[allow(clippy::too_many_arguments)]
     pub async fn process_single_choice(
         &self,
@@ -367,7 +367,7 @@ impl ResponseProcessor {
         Ok(response)
     }
 
-    /// Parse tool calls using model-specific parser (EXACT COPY from router.rs:296-361)
+    /// Parse tool calls using model-specific parser
     pub async fn parse_tool_calls(
         &self,
         processed_text: &str,
