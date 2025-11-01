@@ -100,6 +100,7 @@ QWEN_MODEL = "nvidia/Qwen3-8B-FP8"
 QWEN_GSM8K_ACC_THRESHOLD = 0.90
 QWEN_THROUGHPUT_THRESHOLD = 120
 
+
 class TestMOLlamaFP8(MOFP8Test):
     model = LLAMA_MODEL
     quantization = "modelopt"
@@ -107,12 +108,14 @@ class TestMOLlamaFP8(MOFP8Test):
     gsm8k_accuracy_threshold = LLAMA_GSM8K_ACC_THRESHOLD
     throughput_threshold = LLAMA_THROUGHPUT_THRESHOLD
 
+
 class TestMOQwenFP8(MOFP8Test):
     model = QWEN_MODEL
     quantization = "modelopt"
     kv_cache_dtype = "fp8_e4m3"
     gsm8k_accuracy_threshold = QWEN_GSM8K_ACC_THRESHOLD
     throughput_threshold = QWEN_THROUGHPUT_THRESHOLD
+
 
 if __name__ == "__main__":
     unittest.main()
