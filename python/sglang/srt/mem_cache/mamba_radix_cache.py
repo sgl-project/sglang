@@ -421,7 +421,7 @@ class MambaRadixCache(BasePrefixCache):
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
         return self._insert_helper(self.root_node, key, value, mamba_value)
 
-    def cache_finished_req(self, req: Req) -> None:
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
 
