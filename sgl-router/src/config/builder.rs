@@ -1,7 +1,7 @@
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
     HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig, RouterConfig,
-    RoutingMode, TokenizerCacheConfig,
+    RoutingMode, TokenizerCacheConfig, WorkerLoadLimitConfig,
 };
 use crate::{core::ConnectionMode, mcp::McpConfig};
 
@@ -263,6 +263,13 @@ impl RouterConfigBuilder {
 
     pub fn health_check_config(mut self, health_check: HealthCheckConfig) -> Self {
         self.config.health_check = health_check;
+        self
+    }
+
+    // ==================== Worker Load Limit ====================
+
+    pub fn worker_load_limit_config(mut self, worker_load_limit: WorkerLoadLimitConfig) -> Self {
+        self.config.worker_load_limit = worker_load_limit;
         self
     }
 

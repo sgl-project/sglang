@@ -407,6 +407,10 @@ impl JobQueue {
                         health_failure_threshold: router_config.health_check.failure_threshold,
                         max_connection_attempts: router_config.health_check.success_threshold * 10,
                         dp_aware: router_config.dp_aware,
+                        // Use router config defaults
+                        max_req_limit: router_config.worker_load_limit.max_req,
+                        max_waiting_req_limit: router_config.worker_load_limit.max_waiting_reqs,
+                        max_token_limit: router_config.worker_load_limit.max_token,
                     };
 
                     let job = Job::AddWorker {

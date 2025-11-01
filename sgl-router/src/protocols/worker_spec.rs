@@ -80,11 +80,35 @@ pub struct WorkerConfigRequest {
     /// Enable data parallelism aware scheduling (default: false)
     #[serde(default)]
     pub dp_aware: bool,
+
+    /// Maximum number of requests for engine load limit
+    #[serde(default = "default_max_req_limit")]
+    pub max_req_limit: u32,
+
+    /// Maximum number of waiting requests for engine load limit
+    #[serde(default = "default_max_waiting_req_limit")]
+    pub max_waiting_req_limit: u32,
+
+    /// Maximum number of tokens for engine load limit
+    #[serde(default = "default_max_token_limit")]
+    pub max_token_limit: u32,
 }
 
 // Default value functions for serde
 fn default_health_check_timeout() -> u64 {
     30
+}
+
+fn default_max_req_limit() -> u32 {
+    1024 * 1024 * 1024
+}
+
+fn default_max_waiting_req_limit() -> u32 {
+    1024 * 1024 * 1024
+}
+
+fn default_max_token_limit() -> u32 {
+    1024 * 1024 * 1024
 }
 
 fn default_health_check_interval() -> u64 {

@@ -24,7 +24,7 @@ use crate::{
     app_context::AppContext,
     core::{
         workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
-        DPAwareWorkerBuilder, HealthConfig, Worker, WorkerType,
+        DPAwareWorkerBuilder, EngineLoad, HealthConfig, Worker, WorkerType,
     },
     grpc_client::SglangSchedulerClient,
     protocols::worker_spec::WorkerConfigRequest,
@@ -518,6 +518,13 @@ impl StepExecutor for CreateWorkerStep {
             }
         };
 
+        // Get worker load limit config from WorkerConfigRequest
+        let engine_load = EngineLoad::new_with_limits(
+            config.max_req_limit,
+            config.max_waiting_req_limit,
+            config.max_token_limit,
+        );
+
         // Normalize URL: add protocol prefix only if missing
         let normalized_url = if config.url.starts_with("http://")
             || config.url.starts_with("https://")
@@ -561,7 +568,8 @@ impl StepExecutor for CreateWorkerStep {
                         .worker_type(worker_type.clone())
                         .connection_mode(connection_mode.as_ref().clone())
                         .circuit_breaker_config(circuit_breaker_config.clone())
-                        .health_config(health_config.clone());
+                        .health_config(health_config.clone())
+                        .engine_load(engine_load.clone());
 
                 if let Some(ref api_key) = config.api_key {
                     builder = builder.api_key(api_key.clone());
@@ -595,7 +603,8 @@ impl StepExecutor for CreateWorkerStep {
                 .worker_type(worker_type)
                 .connection_mode(connection_mode.as_ref().clone())
                 .circuit_breaker_config(circuit_breaker_config)
-                .health_config(health_config);
+                .health_config(health_config)
+                .engine_load(engine_load);
 
             if let Some(ref api_key) = config.api_key {
                 builder = builder.api_key(api_key.clone());
