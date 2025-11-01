@@ -28,7 +28,7 @@ have been verified on 6th Gen Intel® Xeon® P-core platforms.
 ### Install Using Docker
 
 It is recommended to use Docker for setting up the SGLang environment.
-A [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/Dockerfile.xeon) is provided to facilitate the installation.
+A [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xeon.Dockerfile) is provided to facilitate the installation.
 Replace `<secret>` below with your [HuggingFace access token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash
@@ -37,7 +37,7 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
-docker build -t sglang-cpu:latest -f Dockerfile.xeon .
+docker build -t sglang-cpu:latest -f xeon.Dockerfile .
 
 # Initiate a docker container
 docker run \

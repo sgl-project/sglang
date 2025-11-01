@@ -29,6 +29,7 @@ from typing import Deque, Dict, List, Optional, Tuple, Union
 import psutil
 import setproctitle
 import torch
+import torch.distributed
 import zmq
 from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
@@ -151,11 +152,13 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
+    trace_event_batch,
     trace_set_proc_propagate_context,
     trace_set_thread_info,
     trace_slice_batch,
@@ -168,7 +171,6 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
-    disable_request_logging,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -177,7 +179,6 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     numa_bind_to_node,
     point_to_point_pyobj,
-    pyspy_dump_schedulers,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
@@ -197,6 +198,7 @@ logger = logging.getLogger(__name__)
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
+TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
@@ -212,6 +214,7 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
+    SchedulerMultiplexMixin,
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
 ):
@@ -251,6 +254,7 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.enable_metrics_for_all_schedulers = (
@@ -283,6 +287,10 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
+
+        # Init pdmux context
+        if self.enable_pdmux:
+            self.init_pdmux()
 
         # Init tokenizer
         self.init_tokenizer()
@@ -320,8 +328,28 @@ class Scheduler(
 
         # Launch a draft worker for speculative decoding
 
-        self.launch_draft_worker(
-            gpu_id, tp_rank, moe_ep_rank, server_args, port_args, dp_rank
+        draft_worker_kwargs = dict(
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
+            server_args=server_args,
+            nccl_port=port_args.nccl_port,
+            target_worker=self.tp_worker,
+            dp_rank=dp_rank,
+        )
+
+        if server_args.speculative_draft_load_format is not None:
+            server_args.load_format = server_args.speculative_draft_load_format
+            logger.info(
+                f"Using draft model load_format: '{server_args.speculative_draft_load_format}'"
+            )
+
+        # Draft workers are looked up via `SpeculativeAlgorithm` registry; new
+        # algorithms should register their factory instead of patching this code.
+        if self.spec_algorithm.name in {"EAGLE", "EAGLE3"}:
+            draft_worker_kwargs["enable_overlap"] = self.enable_overlap
+        self.draft_worker = self.spec_algorithm.create_draft_worker(
+            **draft_worker_kwargs
         )
 
         # Dispatch the model worker
@@ -355,6 +383,17 @@ class Scheduler(
         self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+
+        # With DP attention enabled, the entry rank is attn_tp_rank==0;
+        # otherwise the entry rank is TP group local rank 0.
+        # For #11910, use the CPU communication group to broadcast VLM Python objects,
+        # avoiding any coupling with CUDA streams/devices.
+        if self.server_args.enable_dp_attention:
+            self.cpu_group = self.attn_tp_cpu_group
+            self.is_entry_rank = self.attn_tp_rank == 0
+        else:
+            self.cpu_group = self.tp_cpu_group
+            self.is_entry_rank = self.tp_group.rank == 0
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
@@ -392,6 +431,8 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
+        # The current split prefill batch
+        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
@@ -494,7 +535,7 @@ class Scheduler(
         )
         self.init_disaggregation()
 
-        if get_bool_env_var("SGLANG_GC_LOG"):
+        if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
@@ -547,57 +588,6 @@ class Scheduler(
                 (GetLoadReqInput, self.get_load),
             ]
         )
-
-    def launch_draft_worker(
-        self, gpu_id, tp_rank, moe_ep_rank, server_args, port_args, dp_rank
-    ):
-        if server_args.speculative_draft_load_format is not None:
-            server_args.load_format = server_args.speculative_draft_load_format
-            logger.info(
-                f"Using draft model load_format: '{server_args.speculative_draft_load_format}'"
-            )
-
-        if self.spec_algorithm.is_eagle():
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
-            from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
-
-            WorkerClass = EAGLEWorkerV2 if self.enable_overlap else EAGLEWorker
-
-            self.draft_worker = WorkerClass(
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                server_args=server_args,
-                nccl_port=port_args.nccl_port,
-                target_worker=self.tp_worker,
-                dp_rank=dp_rank,
-            )
-        elif self.spec_algorithm.is_standalone():
-            from sglang.srt.speculative.standalone_worker import StandaloneWorker
-
-            self.draft_worker = StandaloneWorker(
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                server_args=server_args,
-                nccl_port=port_args.nccl_port,
-                target_worker=self.tp_worker,
-                dp_rank=dp_rank,
-            )
-        elif self.spec_algorithm.is_ngram():
-            from sglang.srt.speculative.ngram_worker import NGRAMWorker
-
-            self.draft_worker = NGRAMWorker(
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                server_args=server_args,
-                nccl_port=port_args.nccl_port,
-                target_worker=self.tp_worker,
-                dp_rank=dp_rank,
-            )
-        else:
-            self.draft_worker = None
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
@@ -1162,6 +1152,70 @@ class Scheduler(
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
+    def _process_and_broadcast_mm_inputs(
+        self,
+        raw_mm_inputs: Optional[dict],
+    ):
+        """Materialize MultimodalInputs once on the entry rank and broadcast to others.
+
+        Entry rank:
+        - constructs MultimodalInputs.from_dict(raw_mm_inputs) once
+        - broadcasts to other ranks in self.cpu_group (if world_size > 1)
+
+        Non-entry ranks:
+        - receive the object via broadcast (if world_size > 1)
+        - otherwise (single-rank / no group) fall back to local from_dict
+
+        Returns:
+            MultimodalInputs | None
+        """
+        if raw_mm_inputs is None:
+            return None
+
+        group_world_size = 1
+        try:
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and self.cpu_group is not None
+            ):
+                group_world_size = torch.distributed.get_world_size(
+                    group=self.cpu_group
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to get world size in mm_inputs handling with {e}, fallback to 1."
+            )
+
+        # In case tp size > 1, all the Scheduler TP ranks runs the duplicated computing
+        # process in CPU which occupies the main thread CPU cycle. This computing logic
+        # merely needs to be run on TP0 and be broadcast to other TP ranks.
+        # Since the Scheduler is single-threaded, any large CPU cost will impact
+        # handling of other messages. For example, CPU hits 99.9% can significantly
+        # increase the CUDA kernel launch time.
+        if self.is_entry_rank:
+            # Only the entry rank materializes once from dict.
+            image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
+            # Broadcast to other TP ranks (use src=0 within the group).
+            if group_world_size > 1:
+                obj_list = [image_inputs]
+                torch.distributed.broadcast_object_list(
+                    obj_list, src=0, group=self.cpu_group
+                )
+                image_inputs = obj_list[0]
+        else:
+            # Non-entry ranks: receive if group size > 1; otherwise materialize locally.
+            if group_world_size > 1:
+                obj_list = [None]
+                torch.distributed.broadcast_object_list(
+                    obj_list, src=0, group=self.cpu_group
+                )
+                image_inputs = obj_list[0]
+            else:
+                image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
+
+        return image_inputs
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1243,7 +1297,9 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+            image_inputs = self._process_and_broadcast_mm_inputs(recv_req.mm_inputs)
+
+            # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -1376,7 +1432,7 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
-            trace_slice_end("process req", req.rid, auto_next_anon=True)
+            trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1466,13 +1522,14 @@ class Scheduler(
             recv_req.sampling_params,
             token_type_ids=recv_req.token_type_ids,
             priority=recv_req.priority,
+            dimensions=recv_req.dimensions,
             http_worker_ipc=recv_req.http_worker_ipc,
         )
         req.tokenizer = self.tokenizer
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
-            image_inputs = MultimodalInputs.from_dict(recv_req.image_inputs)
+            image_inputs = self._process_and_broadcast_mm_inputs(recv_req.image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -1639,6 +1696,10 @@ class Scheduler(
         if need_dp_attn_preparation:
             ret = self.prepare_mlp_sync_batch(ret)
 
+        if ret:
+            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
+            trace_event_batch("schedule", ret.reqs, attrs=attrs)
+
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -1681,6 +1742,12 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
+
+        if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+            # If we are testing retraction and the running batch size exceeds
+            # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
+            # in the waiting queue.
+            return None
 
         # Prefill policy
         adder = PrefillAdder(
@@ -1848,14 +1915,14 @@ class Scheduler(
             self.num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
+                abort_reason: FINISH_ABORT = req.to_finish
                 self.send_to_tokenizer.send_output(
-                    AbortReq(abort_reason=req.to_abort_message, rid=req.rid), req
+                    AbortReq(abort_message=abort_reason.message, rid=req.rid), req
                 )
 
             logger.info(
                 "KV cache pool is full. Retract requests. "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
-                f"#aborted_retracted_reqs: {len(reqs_to_abort)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
             )
 
@@ -1894,7 +1961,6 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-
             batch_or_worker_batch = batch
 
             if self.enable_overlap or self.spec_algorithm.is_none():
@@ -1951,6 +2017,9 @@ class Scheduler(
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
@@ -2012,13 +2081,10 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
-            if self.enable_trace:
-                trace_slice_batch("decode loop", batch.reqs)
+            trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
 
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
-            if self.enable_trace:
-                trace_slice_batch("prefill", batch.reqs)
 
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
@@ -2238,59 +2304,6 @@ class Scheduler(
             self._add_request_to_queue(req)
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
 
-    def watchdog_thread(self):
-        """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
-        self.watchdog_last_forward_ct = 0
-        self.watchdog_last_time = time.perf_counter()
-
-        while True:
-            current = time.perf_counter()
-            if self.cur_batch is not None:
-                if self.watchdog_last_forward_ct == self.forward_ct:
-                    if current > self.watchdog_last_time + self.watchdog_timeout:
-                        break
-                else:
-                    self.watchdog_last_forward_ct = self.forward_ct
-                    self.watchdog_last_time = current
-            time.sleep(self.watchdog_timeout // 2)
-
-        if not disable_request_logging():
-            # Print batch size and memory pool info to check whether there are de-sync issues.
-            if self.is_hybrid:
-                (
-                    _,
-                    _,
-                    _,
-                    _,
-                    full_available_size,
-                    full_evictable_size,
-                    swa_available_size,
-                    swa_evictable_size,
-                ) = self._get_swa_token_info()
-                info_msg = (
-                    f"{full_available_size=}, "
-                    f"{full_evictable_size=}, "
-                    f"{swa_available_size=}, "
-                    f"{swa_evictable_size=}, "
-                )
-            else:
-                _, _, available_size, evictable_size = self._get_token_info()
-                info_msg = f"{available_size=}, " f"{evictable_size=}, "
-            logger.error(
-                f"{self.cur_batch.batch_size()=}, "
-                f"{self.cur_batch.reqs=}, "
-                f"{info_msg}"
-            )
-
-        pyspy_dump_schedulers()
-        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
-        print(file=sys.stderr, flush=True)
-        print(file=sys.stdout, flush=True)
-
-        # Wait for some time so that the parent process can print the error.
-        time.sleep(5)
-        self.parent_process.send_signal(signal.SIGQUIT)
-
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
@@ -2305,13 +2318,30 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
-    def flush_cache(self):
-        """Flush the memory pool and cache."""
-        if (
+    def _is_no_request(self):
+        no_request = (
             len(self.waiting_queue) == 0
             and self.running_batch.is_empty()
+            and (self.last_batch is None or self.last_batch.is_empty())
+            and (self.cur_batch is None or self.cur_batch.is_empty())
+            and (not self.enable_overlap or len(self.result_queue) == 0)
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
-        ):
+        )
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            no_request &= (
+                len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                and len(self.disagg_prefill_inflight_queue) == 0
+            )
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            no_request &= (
+                len(self.disagg_decode_prealloc_queue.queue) == 0
+                and len(self.disagg_decode_transfer_queue.queue) == 0
+            )
+        return no_request
+
+    def flush_cache(self):
+        """Flush the memory pool and cache."""
+        if self._is_no_request():
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -2325,10 +2355,10 @@ class Scheduler(
 
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0
-            self.spec_num_total_accepted_tokens = 0
-            self.spec_num_total_forward_ct = 0
-            self.cum_spec_accept_length = 0
-            self.cum_spec_accept_count = 0
+            self.spec_num_accepted_tokens = 0
+            self.spec_num_forward_ct = 0
+            self.spec_total_num_accepted_tokens = 0
+            self.spec_total_num_forward_ct = 0
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
             if_success = True
@@ -2401,12 +2431,15 @@ class Scheduler(
             self.tp_worker.model_runner.graph_mem_usage, 2
         )
 
-        if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
+        if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
-                self.cum_spec_accept_length / self.cum_spec_accept_count
+                self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
             )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
+
+        # This field is not serializable.
+        ret.pop("model_config", None)
 
         return GetInternalStateReqOutput(internal_state=ret)
 
@@ -2434,12 +2467,12 @@ class Scheduler(
                 if_success = False
                 break
         if if_success:
-            if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
+            if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
                 avg_spec_accept_length = (
-                    self.cum_spec_accept_length / self.cum_spec_accept_count
+                    self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
                 )
                 logger.info(f"{avg_spec_accept_length=}")
-            self.cum_spec_accept_length = self.cum_spec_accept_count = 0
+            self.spec_total_num_accepted_tokens = self.spec_total_num_forward_ct = 0
             for k, v in server_args_dict.items():
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")
@@ -2542,11 +2575,11 @@ class Scheduler(
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
-                # Abort method 3: set `to_abort=True`
+                # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_abort = True
+                req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -2740,10 +2773,13 @@ def run_scheduler_process(
 
     # Set up tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-        if server_args.disaggregation_mode == "null":
-            thread_label = "Scheduler"
-            trace_set_thread_info(thread_label, tp_rank, dp_rank)
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        thread_label = "Scheduler"
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill Scheduler"
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode Scheduler"
+        trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
     # Create a scheduler and run the event loop
     try:
@@ -2766,7 +2802,9 @@ def run_scheduler_process(
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
-            if server_args.pp_size > 1:
+            if scheduler.enable_pdmux:
+                scheduler.event_loop_pdmux()
+            elif server_args.pp_size > 1:
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap()
