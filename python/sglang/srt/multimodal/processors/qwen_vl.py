@@ -2,6 +2,7 @@ import asyncio
 import math
 import os
 import re
+from functools import partial
 from typing import List, Union
 
 import torch
@@ -20,6 +21,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.utils.common import get_video_reader
 from sglang.utils import logger
 
 IMAGE_FACTOR = 28
@@ -169,61 +171,6 @@ def smart_nframes(
     return nframes
 
 
-# process video, qwen-specific
-async def preprocess_video(
-    vr,
-    image_factor: int = IMAGE_FACTOR,
-    # vr: VideoReader, image_factor: int = IMAGE_FACTOR
-) -> torch.Tensor:
-    ele = {}
-    total_frames, video_fps = len(vr), vr.get_avg_fps()
-    nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
-    idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
-    video = vr.get_batch(idx).asnumpy()
-    video = torch.tensor(video).permute(0, 3, 1, 2)  # Convert to TCHW format
-    nframes, _, height, width = video.shape
-    min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
-    total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
-    max_pixels = max(
-        min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
-        int(min_pixels * 1.05),
-    )
-    max_pixels_supposed = ele.get("max_pixels", max_pixels)
-    if max_pixels_supposed > max_pixels:
-        logger.warning(
-            f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}]."
-        )
-    max_pixels = min(max_pixels_supposed, max_pixels)
-    if "resized_height" in ele and "resized_width" in ele:
-        resized_height, resized_width = smart_resize(
-            ele["resized_height"],
-            ele["resized_width"],
-            factor=image_factor,
-        )
-    else:
-        resized_height, resized_width = smart_resize(
-            height,
-            width,
-            factor=image_factor,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-        )
-    video = torchvision.transforms.functional.resize(
-        video,
-        [resized_height, resized_width],
-        interpolation=InterpolationMode.BICUBIC,
-        antialias=True,
-    ).float()
-    video_metadata = {
-        "fps": video_fps,
-        "duration": total_frames / video_fps,
-        "total_num_frames": total_frames,
-        "frames_indices": idx,
-        "video_backend": "torchvision",
-    }
-    return video, video_metadata
-
-
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(SGLangBaseProcessor):
     models = [
@@ -265,6 +212,83 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
+    @staticmethod
+    def _process_video_task(video_file, image_factor):
+        vr = get_video_reader(video_file)
+        ele = {}
+        total_frames, video_fps = len(vr), vr.get_avg_fps()
+        nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
+        idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
+        video = vr.get_batch(idx).asnumpy()
+        video = torch.tensor(video).permute(0, 3, 1, 2)  # Convert to TCHW format
+        nframes, _, height, width = video.shape
+        min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
+        total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
+        max_pixels = max(
+            min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
+            int(min_pixels * 1.05),
+        )
+        max_pixels_supposed = ele.get("max_pixels", max_pixels)
+        if max_pixels_supposed > max_pixels:
+            logger.warning(
+                f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}]."
+            )
+        max_pixels = min(max_pixels_supposed, max_pixels)
+        if "resized_height" in ele and "resized_width" in ele:
+            resized_height, resized_width = smart_resize(
+                ele["resized_height"],
+                ele["resized_width"],
+                factor=image_factor,
+            )
+        else:
+            resized_height, resized_width = smart_resize(
+                height,
+                width,
+                factor=image_factor,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )
+        video = torchvision.transforms.functional.resize(
+            video,
+            [resized_height, resized_width],
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        ).float()
+        video_metadata = {
+            "fps": video_fps,
+            "duration": total_frames / video_fps,
+            "total_num_frames": total_frames,
+            "frames_indices": idx,
+            "video_backend": "torchvision",
+        }
+        return video, video_metadata
+
+    async def preprocess_video(
+        self, video_file_handle, image_factor: int = IMAGE_FACTOR
+    ):
+        video_file = video_file_handle
+
+        if hasattr(video_file_handle, "name"):
+            video_file = video_file_handle.name
+
+        result = None
+        try:
+            if self.cpu_executor is not None:
+                loop = asyncio.get_event_loop()
+                task = partial(
+                    QwenVLImageProcessor._process_video_task, video_file, image_factor
+                )
+                result = await loop.run_in_executor(self.cpu_executor, task)
+            else:
+                result = QwenVLImageProcessor._process_video_task(
+                    video_file, image_factor
+                )
+        finally:
+            if hasattr(video_file_handle, "name"):
+                video_file_handle.close()
+
+        return result
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
@@ -273,7 +297,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
@@ -289,7 +313,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         video_metadata = None
         if base_output.videos:
             video_results = await asyncio.gather(
-                *[preprocess_video(video) for video in base_output.videos]
+                *[self.preprocess_video(video) for (video, _) in base_output.videos]
             )
             base_output.videos, video_metadata = map(list, zip(*video_results))
 

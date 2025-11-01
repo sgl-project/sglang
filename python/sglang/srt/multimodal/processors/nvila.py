@@ -1,3 +1,5 @@
+import asyncio
+from functools import partial
 from typing import Any
 
 import torch.nn as nn
@@ -13,6 +15,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import get_video_reader
 
 NUM_VIDEO_FRAMES = 8
 
@@ -44,6 +47,39 @@ class NVILAMultimodalProcessor(BaseMultimodalProcessor):
             video_token_id=hf_config.video_token_id,
         ).build(_processor)
 
+    @staticmethod
+    def _process_video_task(video_file):
+        vr = get_video_reader(video_file)
+        return [x.asnumpy() for x in vr]
+
+    async def preprocess_video(self, video_file_handle):
+        """
+        Preprocess video using VideoReader from Decord backend.
+
+        Args:
+            video_file_handle: Either a video file path or a temporary file
+
+        Returns:
+            tuple: A tuple containing processed frames and metadata
+        """
+        video_file = video_file_handle
+        if hasattr(video_file_handle, "name"):
+            video_file = video_file_handle.name
+
+        result = None
+        try:
+            if self.cpu_executor is not None:
+                loop = asyncio.get_event_loop()
+                task = partial(NVILAMultimodalProcessor._process_video_task, video_file)
+                result = await loop.run_in_executor(self.cpu_executor, task)
+            else:
+                result = NVILAMultimodalProcessor._process_video_task(video_file)
+        finally:
+            if hasattr(video_file_handle, "name"):
+                video_file_handle.close()
+
+        return result
+
     async def process_mm_data_async(
         self,
         image_data,
@@ -52,15 +88,15 @@ class NVILAMultimodalProcessor(BaseMultimodalProcessor):
         request_obj: GenerateReqInput,
         **kwargs,
     ) -> dict[str, Any] | None:
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
             image_data=request_obj.image_data,  # type: ignore
             video_data=request_obj.video_data,  # type: ignore
         )
 
-        for i, video in enumerate(base_output.videos):  # type: ignore
-            base_output.videos[i] = [x.asnumpy() for x in video]  # type: ignore
+        for i, (video, _) in enumerate(base_output.videos):  # type: ignore
+            base_output.videos[i] = await self.preprocess_video(video)  # type: ignore
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output,

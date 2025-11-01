@@ -78,7 +78,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
         *args,
         **kwargs,
     ):
-        mm_data = self.load_mm_data(
+        mm_data = await self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
             image_data=image_data,

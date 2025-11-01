@@ -1,6 +1,6 @@
+import asyncio
+from functools import partial
 from typing import List, Union
-
-from decord import VideoReader
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
@@ -9,6 +9,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.utils.common import get_video_reader
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
@@ -46,17 +47,9 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
 
-    # adapted from https://github.com/huggingface/transformers/blob/369c99d0cea403b77bd0aef818527106453fd9fc/src/transformers/video_utils.py#L312
-    async def preprocess_video(self, vr: VideoReader):
-        """
-        Preprocess video using VideoReader from Decord backend.
-
-        Args:
-            vr (VideoReader): VideoReader object from decord
-
-        Returns:
-            tuple: A tuple containing processed frames and metadata
-        """
+    @staticmethod
+    def _process_video_task(video_file):
+        vr = get_video_reader(video_file)
         video_fps = vr.get_avg_fps()
         total_num_frames = len(vr)
         duration = total_num_frames / video_fps if video_fps else 0
@@ -76,6 +69,35 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
 
         return frames, metadata
 
+    # adapted from https://github.com/huggingface/transformers/blob/369c99d0cea403b77bd0aef818527106453fd9fc/src/transformers/video_utils.py#L312
+    async def preprocess_video(self, video_file_handle):
+        """
+        Preprocess video using VideoReader from Decord backend.
+
+        Args:
+            video_file_handle: Either a video file path, a BytesIO for in-memory data or a temporary file
+
+        Returns:
+            tuple: A tuple containing processed frames and metadata
+        """
+        video_file = video_file_handle
+        if hasattr(video_file_handle, "name"):
+            video_file = video_file_handle.name
+
+        result = None
+        try:
+            if self.cpu_executor is not None:
+                loop = asyncio.get_event_loop()
+                task = partial(Glm4vImageProcessor._process_video_task, video_file)
+                result = await loop.run_in_executor(self.cpu_executor, task)
+            else:
+                result = Glm4vImageProcessor._process_video_task(video_file)
+        finally:
+            if hasattr(video_file_handle, "name"):
+                video_file_handle.close()
+
+        return result
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
@@ -84,7 +106,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
@@ -95,7 +117,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
 
         if base_output.videos:
             videos_processed = [
-                await self.preprocess_video(video) for video in base_output.videos
+                await self.preprocess_video(video)
+                for (video, frame_limit) in base_output.videos
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
             # transformer requires the video inputs to be under this format
