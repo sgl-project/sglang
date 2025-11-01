@@ -786,6 +786,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                custom_request_attributes=obj.custom_request_attributes,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -1466,6 +1467,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
+
+            # Add custom request attributes as top-level fields if enabled
+            if (
+                self.server_args.log_requests_custom_attributes
+                and hasattr(state.obj, "custom_request_attributes")
+                and state.obj.custom_request_attributes
+            ):
+                out_dict.update(state.obj.custom_request_attributes)
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
