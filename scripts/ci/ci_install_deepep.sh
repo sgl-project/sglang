@@ -85,7 +85,7 @@ make -j$(nproc) install
 # Install DeepEP
 DEEPEP_DIR=/root/.cache/deepep
 GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
-CUDA_VERSION=$($(nvidia-smi | grep "CUDA Version" | head -n1 | awk '{print $9}')
+CUDA_VERSION=$(nvidia-smi | grep "CUDA Version" | head -n1 | awk '{print $9}')
 rm -rf ${DEEPEP_DIR}
 if [ "$GRACE_BLACKWELL" = "1" ]; then
     git clone https://github.com/fzyzcjy/DeepEP.git ${DEEPEP_DIR} && \
