@@ -402,12 +402,13 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_mooncake()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
             )
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -423,6 +424,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 else None
             )
 
+            self._enable_a2a_moe = (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            )
+
     def get_moe_weights(self):
         return [
             x.data
@@ -431,12 +436,29 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         ]
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-        if get_moe_a2a_backend().is_deepep():
-            return self.forward_deepep(hidden_states, forward_batch)
+        if not self._enable_a2a_moe:
+            DUAL_STREAM_TOKEN_THRESHOLD = 1024
+            if (
+                self.alt_stream is not None
+                and self.num_fused_shared_experts == 0
+                and hidden_states.shape[0] > 0
+                and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            ):
+                return self.forward_normal_dual_stream(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
+            else:
+                return self.forward_normal(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
         else:
-            return self.forward_normal(hidden_states)
+            return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(
         self,
@@ -510,7 +532,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        shared_output = None
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
