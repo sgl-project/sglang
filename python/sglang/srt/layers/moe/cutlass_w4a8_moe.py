@@ -3,12 +3,18 @@
 from typing import Optional
 
 import torch
-from sgl_kernel import (
-    cutlass_w4a8_moe_mm,
-    get_cutlass_w4a8_moe_mm_data,
-    sgl_per_tensor_quant_fp8,
-    silu_and_mul,
-)
+
+from sglang.srt.utils import is_cuda_alike
+
+_is_cuda_alike = is_cuda_alike()
+
+if _is_cuda_alike:
+    from sgl_kernel import (
+        cutlass_w4a8_moe_mm,
+        get_cutlass_w4a8_moe_mm_data,
+    )
+
+from sgl_kernel import sgl_per_tensor_quant_fp8, silu_and_mul
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
