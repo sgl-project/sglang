@@ -67,6 +67,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
     is_cuda,
+    is_npu,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
 )
@@ -77,6 +78,7 @@ _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -355,6 +357,7 @@ class Qwen3MoeAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
+        self.layer_id = layer_id
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -415,6 +418,7 @@ class Qwen3MoeAttention(nn.Module):
                 and self.compatible_with_fused_kv_buffer
                 else None
             ),
+            layer_id=self.layer_id if _is_npu else None
         )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state

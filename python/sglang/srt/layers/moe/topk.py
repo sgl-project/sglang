@@ -68,6 +68,7 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_gating_topk_fused = get_bool_env_var("SGLANG_USE_GATING_TOPK_FUSED")
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -874,18 +875,22 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
     elif torch_native and custom_routing_function is None:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in fused_topk_native"
-        assert expert_location_dispatch_info is None
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
-        topk_weights, topk_ids = fused_topk_native(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=top_k,
-            renormalize=renormalize,
-            correction_bias=correction_bias,
-        )
+        if _use_gating_topk_fused:
+            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k_softmax(
+                x=router_logits,
+                finished=None,
+                k=top_k
+            )
+            topk_weights = topk_weights.to(torch.float)
+        else:
+            topk_weights, topk_ids = fused_topk_native(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+                correction_bias=correction_bias,
+            )
     elif custom_routing_function is None:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         # Qwen3MOE uses fused_topk

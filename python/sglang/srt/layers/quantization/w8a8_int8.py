@@ -1002,12 +1002,19 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        w13_weight_1 = layer.w13_weight.data.transpose(1, 2)
+        w13_weight_2 = w13_weight_1.contiguous()
         layer.w13_weight = Parameter(
-            layer.w13_weight.data.transpose(1, 2).contiguous(), requires_grad=False
+            w13_weight_2, requires_grad=False
         )
+        w13_weight_1.untyped_storage().resize_(0)
+
+        w2_weight_1 = layer.w2_weight.data.transpose(1, 2)
+        w2_weight_2 = w2_weight_1.contiguous()
         layer.w2_weight = Parameter(
-            layer.w2_weight.data.transpose(1, 2).contiguous(), requires_grad=False
+            w2_weight_2, requires_grad=False
         )
+        w2_weight_1.untyped_storage().resize_(0)
         layer.w13_weight_scale = Parameter(
             layer.w13_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
         )
