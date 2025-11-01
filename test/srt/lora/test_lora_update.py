@@ -768,7 +768,7 @@ EVICTION_TESTS = [
                     "lora_path": "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
                     "pinned": True,
                 },
-                expected_error="starvation",
+                expected_error="unpin some adapters",
             ),
             Operation(
                 type=OperationType.LOAD,
@@ -809,7 +809,7 @@ EVICTION_TESTS = [
                     "lora_path": "philschmid/code-llama-3-1-8b-text-to-sql-lora",
                     "pinned": True,
                 },
-                expected_error="starvation",
+                expected_error="unpin some adapters",
             ),
             Operation(
                 type=OperationType.LOAD,
