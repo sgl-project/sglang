@@ -207,6 +207,7 @@ class TRTLLMMLAPrefillMetadata:
     max_seq_len: int
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
+    fallback_to_flashinfer_mla: bool = False
 
 
 @dataclass
@@ -516,7 +517,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
-            if self.disable_chunked_prefix_cache:
+            # For extend batch with prefix length > 0, fallback to flashinfer MLA kernel when chunked prefix cache is disabled.
+            has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+            fallback_to_flashinfer_mla = (
+                self.disable_chunked_prefix_cache and has_prefix
+            )
+            if fallback_to_flashinfer_mla:
                 super().init_forward_metadata(forward_batch)
 
             seq_lens = forward_batch.seq_lens - forward_batch.extend_prefix_lens
@@ -531,6 +537,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq_len,
                 cum_seq_lens_q,
                 seq_lens,
+                fallback_to_flashinfer_mla,
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -860,6 +867,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
     ) -> torch.Tensor:
+
+        if (
+            self.forward_prefill_metadata is not None
+            and self.forward_prefill_metadata.fallback_to_flashinfer_mla
+        ):
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
+
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
         if (
@@ -1003,6 +1019,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             return output
 
+        # When chunked prefix cache is enabled, dispatch to different path for ragged attention.
         if forward_batch.attn_attend_prefix_cache:
             # MHA for chunked prefix kv cache when running model with MLA
             assert forward_batch.prefix_chunk_idx is not None
