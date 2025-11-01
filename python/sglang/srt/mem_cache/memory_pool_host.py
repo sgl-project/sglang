@@ -238,12 +238,16 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        return torch.empty(
+        buffer = torch.empty(
             dims,
             dtype=self.dtype,
             device=self.device,
-            pin_memory=self.pin_memory,
         )
+        if self.pin_memory:
+            torch.cuda.cudart().cudaHostRegister(
+                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
+            )
+        return buffer
 
     @property
     def k_buffer(self):
@@ -551,13 +555,16 @@ class MLATokenToKVPoolHost(HostKVCache):
             self.kv_lora_rank + self.qk_rope_head_dim
         ) * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-
-        return torch.empty(
+        buffer = torch.empty(
             dims,
             dtype=self.dtype,
             device=self.device,
-            pin_memory=self.pin_memory,
         )
+        if self.pin_memory:
+            torch.cuda.cudart().cudaHostRegister(
+                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
+            )
+        return buffer
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
