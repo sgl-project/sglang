@@ -79,6 +79,9 @@ if [ "$IS_BLACKWELL" = "1" ]; then
 
     # Clean up existing installations
     $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
+
+    # Install the main package
+    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
@@ -90,6 +93,15 @@ else
 
     # Clean up existing installations
     $PIP_CMD uninstall sgl-kernel sglang || true
+
+    # Install the main package without deps
+    $PIP_CMD install -e "python[dev]" --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
+
+    # Install flashinfer-python 0.4.0 dependency that requires prerelease (This should be removed when flashinfer fixes this issue)
+    $PIP_CMD install flashinfer-python==0.4.1 --prerelease=allow $PIP_INSTALL_SUFFIX
+
+    # Install the main package
+    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --upgrade
 fi
 
 # Install the main package
