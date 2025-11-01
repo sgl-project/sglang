@@ -35,9 +35,6 @@ COPY . /src
 ######################### BUILD IMAGE #########################
 FROM base AS build-image
 
-ARG SGLANG_REPO_REF=main
-ARG BRANCH_TYPE=remote
-
 # set the environment variables
 ENV PATH="/root/.cargo/bin:${PATH}"
 
@@ -51,26 +48,17 @@ RUN apt update -y \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version && protoc --version
 
-# pull the github repository or use local source
-COPY --from=local_src /src /tmp/local_src
-RUN if [ "$BRANCH_TYPE" = "local" ]; then \
-        cp -r /tmp/local_src /opt/sglang; \
-    else \
-        cd /opt \
-        && git clone --depth=1 https://github.com/sgl-project/sglang.git \
-        && cd /opt/sglang \
-        && git checkout ${SGLANG_REPO_REF}; \
-    fi \
-    && rm -rf /tmp/local_src
+# copy source code
+COPY --from=local_src /src /opt/sglang
 
 # working directory
 WORKDIR /opt/sglang/sgl-router
 
-# build the rust dependencies
-RUN cargo clean \
+# install maturin and build the wheel with vendored OpenSSL
+RUN uv pip install maturin \
+    && cargo clean \
     && rm -rf dist/ \
-    && cargo build --release \
-    && uv build \
+    && maturin build --release --features vendored-openssl --out dist \
     && rm -rf /root/.cache
 
 ######################### ROUTER IMAGE #########################
@@ -83,7 +71,7 @@ COPY --from=build-image /opt/sglang/sgl-router/dist/*.whl dist/
 RUN uv pip install --force-reinstall dist/*.whl
 
 # Clean up unnecessary files to reduce the image size
-RUN rm -rf /root/.cache \
+RUN rm -rf /root/.cache dist/ \
     && apt purge -y --auto-remove curl
 
 # Set the entrypoint to the main command

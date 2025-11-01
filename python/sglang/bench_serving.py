@@ -88,6 +88,7 @@ class RequestFuncOutput:
     latency: float = 0.0
     ttft: float = 0.0  # Time to first token
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
+    text_chunks: List[str] = field(default_factory=list)
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
@@ -258,6 +259,9 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
+                                    output.text_chunks.append(
+                                        data["choices"][0]["text"]
+                                    )
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
@@ -574,9 +578,8 @@ async def async_request_sglang_generate(
                                     num_new_tokens = output_len - last_output_len
                                     if num_new_tokens == 0:
                                         continue
-                                    adjust_itl = (
-                                        timestamp - most_recent_timestamp
-                                    ) / num_new_tokens
+                                    chunk_gap = timestamp - most_recent_timestamp
+                                    adjust_itl = chunk_gap / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
 
                                 most_recent_timestamp = timestamp
@@ -1011,7 +1014,7 @@ async def get_mooncake_request_over_time(
 def sample_mmmu_requests(
     num_requests: int,
     processor: AutoProcessor | AutoTokenizer,
-    backend: str,
+    backend: str = "sglang",
     fixed_output_len: Optional[int] = None,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
@@ -1366,7 +1369,10 @@ def create_mm_data_row(
         )["input_ids"].numel()
     except Exception:
         # Fallback: just tokenize the text prompt directly
-        text_prompt_len = len(processor.tokenizer.encode(text_prompt))
+        tokenizer_to_use = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
 
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
@@ -1638,6 +1644,14 @@ def calculate_metrics(
     tpots: List[float] = []
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
+    retokenized_itls: List[float] = []
+
+    use_retokenized_itl = (
+        accept_length is not None
+        and accept_length > 0
+        and backend in ("sglang-oai", "sglang-oai-chat")
+    )
+
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_len
@@ -1651,12 +1665,15 @@ def calculate_metrics(
             total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
-            if (
-                accept_length
-                and accept_length > 0
-                and backend in ("sglang-oai", "sglang-oai-chat")
-            ):
-                itls += [v / accept_length for v in outputs[i].itl]
+            if use_retokenized_itl:
+                for k, itl in enumerate(outputs[i].itl):
+                    num_tokens = len(
+                        tokenizer.encode(
+                            outputs[i].text_chunks[k], add_special_tokens=False
+                        )
+                    )
+                    adjusted_itl = itl / num_tokens
+                    retokenized_itls.extend([adjusted_itl] * num_tokens)
             else:
                 itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
@@ -1674,6 +1691,8 @@ def calculate_metrics(
             "on the benchmark arguments.",
             stacklevel=2,
         )
+
+    itls = retokenized_itls if use_retokenized_itl else itls
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -2017,6 +2036,7 @@ async def benchmark(
     ):
         result = {
             # Arguments
+            "tag": getattr(args, "tag", None),
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,
@@ -2142,6 +2162,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
 
+    if not hasattr(args, "served_model_name"):
+        args.served_model_name = None
+
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -2255,7 +2278,7 @@ def run_benchmark(args_: argparse.Namespace):
 
     # Read dataset
     backend = args.backend
-    model_id = args.model
+    model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
@@ -2353,6 +2376,11 @@ if __name__ == "__main__":
         "--model",
         type=str,
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        help="The name of the model as served by the serving service. If not set, this defaults to the value of --model.",
     )
     parser.add_argument(
         "--tokenizer",
@@ -2610,6 +2638,9 @@ if __name__ == "__main__":
             "toolagent",
         ],
         help="Underlying workload for the mooncake dataset.",
+    )
+    parser.add_argument(
+        "--tag", type=str, default=None, help="The tag to be dumped to output."
     )
     args = parser.parse_args()
     run_benchmark(args)
