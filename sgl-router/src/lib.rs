@@ -719,6 +719,7 @@ fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BackendType>()?;
     m.add_class::<HistoryBackendType>()?;
     m.add_class::<PyOracleConfig>()?;
+    m.add_class::<PyPostgresConfig>()?;
     m.add_class::<Router>()?;
     Ok(())
 }
