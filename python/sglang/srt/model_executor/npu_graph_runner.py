@@ -35,13 +35,13 @@ if TYPE_CHECKING:
 
 from torch._dynamo.eval_frame import DisableContext
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.compilation.npu.npu_graph_compiler import NpuGraphCompiler
 from sglang.srt.compilation.npu.patch_dynamo import (
     patch_dynamo_context,
     patch_dynamo_context_call,
     restore_dynamo_context_call,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 
