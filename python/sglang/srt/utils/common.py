@@ -2351,16 +2351,24 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     )
     server = uvicorn.Server(config=config)
 
-    try:
-        loop = asyncio.get_running_loop()
-        logger.info(
-            f"Dummy health check server scheduled on existing loop at {host}:{port}"
-        )
-        loop.create_task(server.serve())
+    # Run server in a background daemon thread with its own event loop
+    # This prevents blocking the main thread while still serving health checks
+    def run_server():
+        try:
+            asyncio.run(server.serve())
+        except Exception as e:
+            logger.error(f"Dummy health check server failed to start: {e}")
+            raise
+        finally:
+            logger.info(f"Dummy health check server stopped at {host}:{port}")
 
-    except RuntimeError:
-        logger.info(f"Starting dummy health check server at {host}:{port}")
-        server.run()
+    thread = threading.Thread(
+        target=run_server, daemon=True, name="health-check-server"
+    )
+    thread.start()
+    logger.info(
+        f"Dummy health check server started in background thread at {host}:{port}"
+    )
 
 
 def create_checksum(directory: str):
@@ -3106,12 +3114,16 @@ def apply_module_patch(target_module, target_function, wrappers):
         setattr(original_module, target_function, candidate)
 
     for key, value in sys.modules.copy().items():
-        if (
-            target_function is not None
-            and hasattr(value, target_function)
-            and id(getattr(value, target_function)) == original_function_id
-        ):
-            setattr(value, target_function, candidate)
+        try:
+            if (
+                target_function is not None
+                and hasattr(value, target_function)
+                and id(getattr(value, target_function)) == original_function_id
+            ):
+                setattr(value, target_function, candidate)
+        except ImportError as e:
+            # Ignore some modules reporting ImportError when calling hasattr
+            logger.warning(f"Ignore {value} reports ImportError with:\n{str(e)}")
 
 
 def parse_module_path(module_path, function_name, create_dummy):
