@@ -263,10 +263,7 @@ def _test_mode_p_vs_d(args, batch_size):
         "logprob_start_len": 0,
         "return_text_in_logprobs": True,
     }
-    import torch
-    torch.sin
-    import jax
-    jax.numpy.sin(1)
+
     def _create_prompts():
         ans = [PROMPT_1, PROMPT_2]
         for i in range(batch_size - len(ans)):
