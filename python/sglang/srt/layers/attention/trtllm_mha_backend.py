@@ -488,10 +488,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
-            ):
+            if any(
+                forward_batch.extend_prefix_lens_cpu
+            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(

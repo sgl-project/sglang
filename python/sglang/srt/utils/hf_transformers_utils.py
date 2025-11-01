@@ -15,6 +15,7 @@
 
 import contextlib
 import json
+import logging
 import os
 import tempfile
 import warnings
@@ -348,6 +349,12 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
+# Filter warnings like: https://github.com/sgl-project/sglang/issues/8082
+class TokenizerWarningsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Calling super().encode with" not in record.getMessage()
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -392,6 +399,10 @@ def get_tokenizer(
             tokenizer_revision=tokenizer_revision,
             clean_up_tokenization_spaces=False,
             **kwargs,
+        )
+        # Filter tokenizer warnings
+        logging.getLogger(tokenizer.__class__.__module__).addFilter(
+            TokenizerWarningsFilter()
         )
     except TypeError as e:
         # The LLaMA tokenizer causes a protobuf error in some environments.
