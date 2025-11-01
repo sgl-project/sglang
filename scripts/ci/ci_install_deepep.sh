@@ -100,9 +100,6 @@ else
     popd
 fi
 case "$CUDA_VERSION" in \
-    12.6.1) \
-    CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
-    ;; \
     12.8) \
     CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
     ;; \
