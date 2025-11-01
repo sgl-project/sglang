@@ -176,9 +176,10 @@ class TestGenerateBase(TestCLIBase):
         for result in ordered_results:
             if not result:
                 continue
-            print(
-                f"| {result['name']:<30} | {result['duration']:<8} | {result['status']:<7} |"
+            status = (
+                result["status"] and result["duration"] <= cls.thresholds[result["key"]]
             )
+            print(f"| {result['name']:<30} | {result['duration']:<8} | {status:<7} |")
         print()
         durations = [result["duration"] for result in cls.results]
         print(" | ".join([""] + durations + [""]))
