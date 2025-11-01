@@ -43,6 +43,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.lora.lora_registry import LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -214,6 +215,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # images even with skip_tokenizer_init=False.
             self.mm_processor = get_mm_processor(
                 self.model_config.hf_config, server_args, _processor, transport_mode
+            )
+            self.mm_data_processor = AsyncMMDataProcessor(
+                self.mm_processor,
+                max_concurrent_calls=self.server_args.mm_max_concurrent_calls,
+                timeout_s=self.server_args.mm_per_request_timeout,
             )
 
             if server_args.skip_tokenizer_init:
@@ -598,10 +604,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
+            mm_inputs: Dict = await self.mm_data_processor.process(
                 image_data=obj.image_data,
                 audio_data=obj.audio_data,
-                input_text=input_text or input_ids,
+                input_text_or_ids=(input_text or input_ids),
                 request_obj=obj,
                 max_req_input_len=self.max_req_input_len,
             )
@@ -1781,7 +1787,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         state = self.rid_to_state[recv_obj.rid]
         state.finished = True
 
-        abort_message = recv_obj.abort_reason or "Abort in waiting queue"
+        abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {
             "type": "abort",
             "message": abort_message,

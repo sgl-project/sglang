@@ -1014,7 +1014,7 @@ async def get_mooncake_request_over_time(
 def sample_mmmu_requests(
     num_requests: int,
     processor: AutoProcessor | AutoTokenizer,
-    backend: str,
+    backend: str = "sglang",
     fixed_output_len: Optional[int] = None,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
@@ -1369,7 +1369,10 @@ def create_mm_data_row(
         )["input_ids"].numel()
     except Exception:
         # Fallback: just tokenize the text prompt directly
-        text_prompt_len = len(processor.tokenizer.encode(text_prompt))
+        tokenizer_to_use = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
 
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
@@ -2159,6 +2162,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
 
+    if not hasattr(args, "served_model_name"):
+        args.served_model_name = None
+
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -2272,7 +2278,7 @@ def run_benchmark(args_: argparse.Namespace):
 
     # Read dataset
     backend = args.backend
-    model_id = args.model
+    model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
@@ -2370,6 +2376,11 @@ if __name__ == "__main__":
         "--model",
         type=str,
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        help="The name of the model as served by the serving service. If not set, this defaults to the value of --model.",
     )
     parser.add_argument(
         "--tokenizer",
