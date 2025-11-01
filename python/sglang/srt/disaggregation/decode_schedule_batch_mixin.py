@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -119,7 +120,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
-                    self.tree_cache.cache_finished_req(req)
+                    release_kv_cache(req, self.tree_cache)
                     prepare_abort(
                         req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                     )
