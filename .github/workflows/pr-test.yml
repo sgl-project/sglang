@@ -128,7 +128,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
+          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}-aarch64
           path: sgl-kernel/dist/*
 
   sgl-kernel-unit-test:
