@@ -154,7 +154,7 @@ class HiCacheHF3FS(HiCacheStorage):
     def __init__(
         self,
         rank: int,
-        file_path: str,
+        file_path_prefix: str,
         file_size: int,
         numjobs: int,
         bytes_per_page: int,
@@ -164,55 +164,69 @@ class HiCacheHF3FS(HiCacheStorage):
         is_mla_model: bool = False,
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
+        attn_tp_info: Optional[Tuple[int, int, bool, bool]] = None,
     ):
         self.rank = rank
-        self.file_path = file_path
+        self.file_path_prefix = file_path_prefix
         self.file_size = file_size
         self.numjobs = numjobs
         self.bytes_per_page = bytes_per_page
-        self.gb_per_page = bytes_per_page / (1 << 30)
         self.entries = entries
         self.dtype = dtype
         self.metadata_client = metadata_client
         self.is_mla_model = is_mla_model
         self.is_page_first_layout = is_page_first_layout
-        self.numel = self.bytes_per_page // self.dtype.itemsize
-        self.num_pages = self.file_size // self.bytes_per_page
         self.skip_backup = False
+        self.use_mock_client = use_mock_client
         if self.is_mla_model and self.rank != 0:
             self.skip_backup = True
             self.rank = 0
 
         self.is_zero_copy = False
 
-        logger.info(
-            f"[Rank {self.rank}] HiCacheHF3FS Client Initializing: "
-            f"file_path={self.file_path}, "
-            f"file_size={self.file_size / (2 ** 30):.2f} GB, "
-            f"num_pages={self.num_pages}, "
-            f"is_mla_model={self.is_mla_model}"
+        (
+            self.decode_tp_size,
+            self.prefill_tp_size,
+            self.is_decode_side,
+            self.should_split_heads,
+        ) = (
+            attn_tp_info if attn_tp_info else (None, None, False, False)
         )
+        self.split_factor = 1
+        self.target_ranks = [self.rank]
+        self.rank_clients = {}
 
         self.ac = AtomicCounter(self.numjobs)
-        self.clients = [
-            create_hf3fs_client(
-                self.file_path,
-                self.file_size,
-                self.bytes_per_page,
-                self.entries,
-                use_mock_client,
-            )
-            for _ in range(numjobs)
-        ]
-        self.executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.numjobs, thread_name_prefix=f"HiCacheHF3FS-Rank{self.rank}"
-        )
-
-        self.metadata_client.initialize(self.rank, self.num_pages)
         self.lock = threading.RLock()
 
-        atexit.register(self.close)
+        if self.should_split_heads:
+            self.split_factor = self.prefill_tp_size // self.decode_tp_size
+            base_rank = self.rank * self.split_factor
+            self.target_ranks = [base_rank + i for i in range(self.split_factor)]
+            logger.info(
+                f"[D Rank {self.rank}] PD separation enabled: "
+                f"split_factor={self.split_factor}, target_ranks={self.target_ranks}"
+            )
 
+        self.bytes_per_page = self.bytes_per_page // self.split_factor
+        self.numel = self.bytes_per_page // self.dtype.itemsize
+        self.num_pages = self.file_size // self.bytes_per_page
+        self.gb_per_page = self.bytes_per_page / (1 << 30)
+
+        self._init_target_rank_clients()
+
+        for rank in self.target_ranks:
+            self.metadata_client.initialize(rank, self.num_pages)
+
+        self.io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.numjobs, thread_name_prefix=f"HiCacheHF3FS-Rank{self.rank}"
+        )
+        self.rank_executors = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(self.target_ranks),
+            thread_name_prefix=f"HiCacheHF3FS-Rank{self.rank}",
+        )
+
+        atexit.register(self.close)
         signal.signal(signal.SIGINT, lambda sig, frame: self.close())
         signal.signal(signal.SIGTERM, lambda sig, frame: self.close())
         signal.signal(signal.SIGQUIT, lambda sig, frame: self.close())
@@ -221,6 +235,28 @@ class HiCacheHF3FS(HiCacheStorage):
         self.backup_pgs = []
         self.prefetch_bandwidth = []
         self.backup_bandwidth = []
+
+        logger.info(
+            f"[Rank {self.rank}] HiCacheHF3FS Client Initializing: "
+            f"file_path={self.file_path_prefix}, "
+            f"file_size={self.file_size / (2 ** 30):.2f} GB, "
+            f"num_pages={self.num_pages}, "
+            f"is_mla_model={self.is_mla_model}"
+        )
+
+    def _init_target_rank_clients(self):
+        for target_rank in self.target_ranks:
+            rank_file_path = f"{self.file_path_prefix}.{target_rank}.bin"
+            self.rank_clients[target_rank] = [
+                create_hf3fs_client(
+                    rank_file_path,
+                    self.file_size,
+                    self.bytes_per_page,
+                    self.entries,
+                    self.use_mock_client,
+                )
+                for _ in range(self.numjobs)
+            ]
 
     @staticmethod
     def from_env_config(
@@ -261,8 +297,18 @@ class HiCacheHF3FS(HiCacheStorage):
                 False,
             )
 
-        mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
+        attn_tp_info = (
+            (
+                storage_config.decode_tp_size,
+                storage_config.prefill_tp_size,
+                storage_config.is_decode_side,
+                storage_config.should_split_heads,
+            )
+            if storage_config.is_decode_side
+            else None
+        )
 
+        mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
             if is_mla_model:
@@ -270,7 +316,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
             return HiCacheHF3FS(
                 rank=rank,
-                file_path=f"/data/hicache.{rank}.bin",
+                file_path_prefix=f"/data/hicache",
                 file_size=1 << 40,
                 numjobs=16,
                 bytes_per_page=bytes_per_page,
@@ -279,6 +325,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 metadata_client=Hf3fsLocalMetadataClient(),
                 is_page_first_layout=is_page_first_layout,
                 use_mock_client=use_mock_client,
+                attn_tp_info=attn_tp_info,
             )
 
         try:
@@ -315,11 +362,10 @@ class HiCacheHF3FS(HiCacheStorage):
             # Use local metadata client for single-machine deployment
             metadata_client = Hf3fsLocalMetadataClient()
 
-        rank_for_path = 0 if is_mla_model else rank
         return HiCacheHF3FS(
             rank=rank,
             # Let all ranks use the same file path for MLA model
-            file_path=f"{config['file_path_prefix']}.{rank_for_path}.bin",
+            file_path_prefix=f"{config['file_path_prefix']}",
             file_size=int(config["file_size"]),
             numjobs=int(config["numjobs"]),
             bytes_per_page=bytes_per_page,
@@ -329,6 +375,7 @@ class HiCacheHF3FS(HiCacheStorage):
             is_mla_model=is_mla_model,
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
+            attn_tp_info=attn_tp_info,
         )
 
     @synchronized()
@@ -352,8 +399,8 @@ class HiCacheHF3FS(HiCacheStorage):
         start_time = time.perf_counter()
 
         futures = [
-            self.executor.submit(
-                self.clients[self.ac.next()].batch_read,
+            self.io_executor.submit(
+                self.rank_clients[self.rank][self.ac.next()].batch_read,
                 file_offsets[i : i + self.entries],
                 file_results[i : i + self.entries],
             )
@@ -379,20 +426,20 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return results
 
-    @synchronized()
     def _batch_set(
         self,
         keys: List[str],
         values: Optional[Any] = None,
+        target_rank: Optional[int] = None,
     ) -> List[bool]:
-        # In MLA backend, only one rank needs to backup the KV cache
         if self.skip_backup:
-            return True
+            return [True] * len(keys)
 
-        # Todo: Add prefix block's hash key
+        write_rank = target_rank if target_rank is not None else self.rank
+
         key_with_prefix = [(key, "") for key in keys]
         indices = self.metadata_client.reserve_and_allocate_page_indices(
-            self.rank, key_with_prefix
+            write_rank, key_with_prefix
         )
 
         batch_indices, file_offsets, file_values = [], [], []
@@ -410,8 +457,8 @@ class HiCacheHF3FS(HiCacheStorage):
         start_time = time.perf_counter()
 
         futures = [
-            self.executor.submit(
-                self.clients[self.ac.next()].batch_write,
+            self.io_executor.submit(
+                self.rank_clients[write_rank][self.ac.next()].batch_write,
                 file_offsets[i : i + self.entries],
                 file_values[i : i + self.entries],
             )
@@ -436,13 +483,13 @@ class HiCacheHF3FS(HiCacheStorage):
             if write_result:
                 written_keys_to_confirm.append((key, page_index))
             else:
-                logger.error(f"[Rank {self.rank}] HiCacheHF3FS set {key} failed")
+                logger.error(f"[Rank {write_rank}] HiCacheHF3FS set {key} failed")
                 pages_to_release.append(page_index)
             results[batch_index] = write_result
 
         if len(written_keys_to_confirm) > 0 or len(pages_to_release) > 0:
             self.metadata_client.confirm_write(
-                self.rank, written_keys_to_confirm, pages_to_release
+                write_rank, written_keys_to_confirm, pages_to_release
             )
 
         return results
@@ -479,9 +526,11 @@ class HiCacheHF3FS(HiCacheStorage):
 
     def close(self) -> None:
         try:
-            for c in self.clients:
-                c.close()
-            self.executor.shutdown(wait=True)
+            for rank, clients in self.rank_clients.items():
+                for c in clients:
+                    c.close()
+            self.io_executor.shutdown(wait=True)
+            self.rank_executors.shutdown(wait=True)
         except Exception as e:
             logger.error(f"close HiCacheHF3FS: {e}")
         logger.info("close HiCacheHF3FS")
@@ -504,6 +553,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.is_zero_copy = self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
+            "page_head",
         ]
 
         logger.info(f"{self.is_zero_copy=}, layout={self.mem_pool_host.layout}")
@@ -516,12 +566,21 @@ class HiCacheHF3FS(HiCacheStorage):
         return _keys
 
     def _get_mha_zero_copy_values(
-        self, values: List[torch.Tensor]
+        self, values: List[torch.Tensor], head_slice: Optional[Tuple[int, int]] = None
     ) -> List[torch.Tensor]:
         _values = []
+
         for value in values:
-            _values.append(value[0])
-            _values.append(value[1])
+            k_tensor = value[0]
+            v_tensor = value[1]
+
+            if head_slice is not None and self.mem_pool_host.layout == "page_head":
+                start_head, end_head = head_slice
+                k_tensor = k_tensor[:, start_head:end_head, :, :, :]
+                v_tensor = v_tensor[:, start_head:end_head, :, :, :]
+
+            _values.append(k_tensor)
+            _values.append(v_tensor)
         return _values
 
     def _batch_get_preprocess(self, keys, host_indices):
@@ -577,9 +636,10 @@ class HiCacheHF3FS(HiCacheStorage):
         results = self._batch_get(keys, values)
         return self._batch_get_postprocess(host_indices, values, results)
 
-    def _batch_set_preprocess(self, keys, host_indices):
+    def _batch_set_preprocess(
+        self, keys, host_indices, head_slice: Optional[Tuple[int, int]] = None
+    ):
         page_num = len(host_indices) // self.mem_pool_host.page_size
-        # host_indices to kv_buffer
         flat = not self.is_zero_copy
         values = [
             self.mem_pool_host.get_data_page(
@@ -590,9 +650,22 @@ class HiCacheHF3FS(HiCacheStorage):
 
         if self.is_zero_copy and not self.is_mla_model:
             keys = self._get_mha_zero_copy_keys(keys)
-            values = self._get_mha_zero_copy_values(values)
+            values = self._get_mha_zero_copy_values(values, head_slice=head_slice)
 
         return keys, values
+
+    def _write_single_rank(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        target_rank: int,
+        head_slice: Optional[Tuple[int, int]] = None,
+    ) -> List[bool]:
+        split_keys, split_values = self._batch_set_preprocess(
+            keys, host_indices, head_slice=head_slice
+        )
+
+        return self._batch_set(split_keys, split_values, target_rank=target_rank)
 
     def batch_set_v1(
         self,
@@ -600,10 +673,38 @@ class HiCacheHF3FS(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        len_keys = len(keys)
-        keys, values = self._batch_set_preprocess(keys, host_indices)
-        results = self._batch_set(keys, values)
-        return results
+        if self.split_factor == 1:
+            return self._write_single_rank(keys, host_indices, self.rank)
+
+        head_num = self.mem_pool_host.head_num
+        heads_per_split = head_num // self.split_factor
+
+        write_results = []
+        for split_idx, target_rank in enumerate(self.target_ranks):
+            start_head = split_idx * heads_per_split
+            end_head = (split_idx + 1) * heads_per_split
+
+            future = self.rank_executors.submit(
+                self._write_single_rank,
+                keys,
+                host_indices,
+                target_rank,
+                (start_head, end_head),
+            )
+            write_results.append(future)
+
+        write_results = [future.result() for future in write_results]
+        final_results = [
+            all(write_results[i][j] for i in range(self.split_factor))
+            for j in range(len(keys))
+        ]
+
+        if self.split_factor > 1:
+            logger.info(
+                f"Write done batch_set_v1, len keys: {len(keys)}, write_results: {final_results}"
+            )
+
+        return final_results
 
     # Deprecated
     def get(

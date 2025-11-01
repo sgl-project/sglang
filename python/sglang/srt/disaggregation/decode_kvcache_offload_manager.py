@@ -1,6 +1,8 @@
+import json
 import logging
 import threading
 import time
+from typing import Optional
 
 import torch
 
@@ -60,6 +62,7 @@ class DecodeKVCacheOffloadManager:
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             mem_pool_host=self.decode_host_mem_pool,
@@ -69,12 +72,26 @@ class DecodeKVCacheOffloadManager:
             load_cache_event=threading.Event(),
             storage_backend=server_args.hicache_storage_backend,
             model_name=server_args.served_model_name,
-            storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
+            storage_backend_extra_config=self._parse_storage_backend_extra_config(
+                server_args.hicache_storage_backend_extra_config
+            ),
         )
 
         self.ongoing_offload = {}
         self.ongoing_backup = {}
         logger.info("Enable offload kv cache for decode side")
+
+    def _parse_storage_backend_extra_config(self, config_str: Optional[str]):
+        """Parse storage backend extra config JSON and extract specific parameters."""
+        result = {"role": "decode"}
+
+        if config_str is not None:
+            try:
+                result.update(json.loads(config_str))
+            except Exception as e:
+                logger.warning(f"Failed to parse storage backend config: {e}")
+
+        return result
 
     def offload_kv_cache(self, req) -> bool:
         """Offload a finished request's KV cache to storage."""
@@ -82,23 +99,20 @@ class DecodeKVCacheOffloadManager:
         if self.cache_controller is None or self.decode_host_mem_pool is None:
             return False
 
-        if req.req_pool_idx == -1:
+        if req.req_pool_idx == -1 or len(req.output_ids) == 0:
             return False
 
         token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
         if token_indices.dim() == 0 or token_indices.numel() == 0:
-            logger.debug(
-                f"Request {req.rid} has invalid token_indices: {token_indices}"
-            )
             return False
 
-        tokens = req.origin_input_ids + req.output_ids
-        aligned_len = (len(tokens) // self.page_size) * self.page_size
+        all_tokens = req.origin_input_ids + req.output_ids[:-1]
+        aligned_len = (len(all_tokens) // self.page_size) * self.page_size
         if aligned_len == 0:
             return False
 
         token_indices = token_indices[:aligned_len]
-        tokens = tokens[:aligned_len]
+        tokens = all_tokens[:aligned_len]
 
         # Asynchronously offload KV cache from device to host by cache controller
         self.request_counter += 1
@@ -159,7 +173,7 @@ class DecodeKVCacheOffloadManager:
             # Release host memory
             self.decode_host_mem_pool.free(host_indices)
 
-            logger.debug(
+            logger.info(
                 f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} seconds."
             )
 
