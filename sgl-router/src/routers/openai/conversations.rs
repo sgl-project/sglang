@@ -11,14 +11,14 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use super::{responses::build_stored_response, utils::generate_id};
+use super::responses::build_stored_response;
 use crate::{
     data_connector::{
         Conversation, ConversationId, ConversationItemId, ConversationItemStorage,
         ConversationStorage, ListParams, NewConversation, NewConversationItem, ResponseId,
-        ResponseStorage, SharedConversationItemStorage, SharedConversationStorage, SortOrder,
+        ResponseStorage, SortOrder,
     },
-    protocols::responses::{ResponseInput, ResponsesRequest},
+    protocols::responses::{generate_id, ResponseInput, ResponsesRequest},
 };
 
 /// Maximum number of properties allowed in conversation metadata
@@ -30,7 +30,7 @@ pub(crate) const MAX_METADATA_PROPERTIES: usize = 16;
 
 /// Create a new conversation
 pub(super) async fn create_conversation(
-    conversation_storage: &SharedConversationStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
     body: Value,
 ) -> Response {
     // TODO: The validation should be done in the right place
@@ -83,7 +83,7 @@ pub(super) async fn create_conversation(
 
 /// Get a conversation by ID
 pub(super) async fn get_conversation(
-    conversation_storage: &SharedConversationStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
     conv_id: &str,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
@@ -112,7 +112,7 @@ pub(super) async fn get_conversation(
 
 /// Update a conversation's metadata
 pub(super) async fn update_conversation(
-    conversation_storage: &SharedConversationStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
     conv_id: &str,
     body: Value,
 ) -> Response {
@@ -224,7 +224,7 @@ pub(super) async fn update_conversation(
 
 /// Delete a conversation
 pub(super) async fn delete_conversation(
-    conversation_storage: &SharedConversationStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
     conv_id: &str,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
@@ -280,8 +280,8 @@ pub(super) async fn delete_conversation(
 
 /// List items in a conversation with pagination
 pub(super) async fn list_conversation_items(
-    conversation_storage: &SharedConversationStorage,
-    item_storage: &SharedConversationItemStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
+    item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &str,
     query_params: HashMap<String, String>,
 ) -> Response {
@@ -384,9 +384,9 @@ const SUPPORTED_ITEM_TYPES: &[&str] = &[
     "mcp_list_tools",
     "mcp_call",
     "item_reference",
-    // Accepted but not yet implemented (stored, warning returned)
-    "function_tool_call",
+    "function_call",
     "function_call_output",
+    // Accepted but not yet implemented (stored, warning returned)
     "file_search_call",
     "computer_call",
     "computer_call_output",
@@ -412,8 +412,8 @@ const IMPLEMENTED_ITEM_TYPES: &[&str] = &[
 
 /// Create items in a conversation (bulk operation)
 pub(super) async fn create_conversation_items(
-    conversation_storage: &SharedConversationStorage,
-    item_storage: &SharedConversationItemStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
+    item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &str,
     body: Value,
 ) -> Response {
@@ -681,8 +681,8 @@ pub(super) async fn create_conversation_items(
 /// Get a single conversation item
 /// Note: `include` query parameter is accepted but not yet implemented
 pub(super) async fn get_conversation_item(
-    conversation_storage: &SharedConversationStorage,
-    item_storage: &SharedConversationItemStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
+    item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &str,
     item_id: &str,
     _include: Option<Vec<String>>, // Reserved for future use
@@ -761,8 +761,8 @@ pub(super) async fn get_conversation_item(
 
 /// Delete a conversation item
 pub(super) async fn delete_conversation_item(
-    conversation_storage: &SharedConversationStorage,
-    item_storage: &SharedConversationItemStorage,
+    conversation_storage: &Arc<dyn ConversationStorage>,
+    item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &str,
     item_id: &str,
 ) -> Response {
@@ -933,6 +933,26 @@ fn item_to_json(item: &crate::data_connector::ConversationItem) -> Value {
                 }
                 if let Some(server_label) = content_obj.get("server_label") {
                     obj.insert("server_label".to_string(), server_label.clone());
+                }
+            }
+        }
+        "function_call" => {
+            // Extract function_call fields: call_id, name, arguments, output
+            if let Some(content_obj) = item.content.as_object() {
+                for field in ["call_id", "name", "arguments", "output"] {
+                    if let Some(value) = content_obj.get(field) {
+                        obj.insert(field.to_string(), value.clone());
+                    }
+                }
+            }
+        }
+        "function_call_output" => {
+            // Extract function_call_output fields: call_id, output
+            if let Some(content_obj) = item.content.as_object() {
+                for field in ["call_id", "output"] {
+                    if let Some(value) = content_obj.get(field) {
+                        obj.insert(field.to_string(), value.clone());
+                    }
                 }
             }
         }
@@ -1144,7 +1164,7 @@ fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
                             }))
                         }
                         _ => {
-                            // For other item types (Message, Reasoning, FunctionToolCall), serialize and ensure ID
+                            // For other item types (Message, Reasoning, FunctionToolCall, FunctionCallOutput), serialize and ensure ID
                             let mut value = serde_json::to_value(item)
                                 .map_err(|e| format!("Failed to serialize item: {}", e))?;
 
@@ -1157,7 +1177,15 @@ fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
                                         .map(|s| s.is_empty())
                                         .unwrap_or(true)
                                 {
-                                    obj.insert("id".to_string(), json!(generate_id("item")));
+                                    // Generate ID with appropriate prefix based on type
+                                    let item_type =
+                                        obj.get("type").and_then(|v| v.as_str()).unwrap_or("item");
+                                    let prefix = match item_type {
+                                        "function_call" | "function_call_output" => "fc",
+                                        "message" => "msg",
+                                        _ => "item",
+                                    };
+                                    obj.insert("id".to_string(), json!(generate_id(prefix)));
                                 }
                             }
 
@@ -1201,17 +1229,31 @@ async fn link_items_to_conversation(
             .get("role")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let content = input_item_value
-            .get("content")
-            .cloned()
-            .unwrap_or(json!([]));
+
+        // For function_call and function_call_output, store the entire item as content
+        // For message types, extract just the content field
+        let content = if item_type == "function_call" || item_type == "function_call_output" {
+            input_item_value.clone()
+        } else {
+            input_item_value
+                .get("content")
+                .cloned()
+                .unwrap_or(json!([]))
+        };
+
         let status = input_item_value
             .get("status")
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        // Extract the original item ID from input if present
+        let item_id = input_item_value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(ConversationItemId::from);
+
         let new_item = NewConversationItem {
-            id: None, // Let storage generate ID
+            id: item_id, // Preserve ID if present
             response_id: response_id_opt.clone(),
             item_type: item_type.to_string(),
             role,
@@ -1252,7 +1294,7 @@ async fn link_items_to_conversation(
                 .cloned()
                 .unwrap_or(json!([]))
         } else {
-            // For other types (reasoning, function_tool_call, mcp_call, etc.)
+            // For other types (reasoning, function_call, function_call_output, mcp_call, etc.)
             // store the entire item structure
             output_item_value.clone()
         };
