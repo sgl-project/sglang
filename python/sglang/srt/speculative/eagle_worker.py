@@ -263,6 +263,10 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         elif batch.forward_mode.is_decode() and not batch.is_spec_enabled_for_batch:
+            if batch.seq_lens_cpu is not None:
+                batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+            else:
+                batch.seq_lens_sum = batch.seq_lens.sum().item()
             model_worker_batch = batch.get_model_worker_batch()
             model_worker_batch.spec_info = None
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -318,40 +322,59 @@ class EAGLEWorker(TpModelWorker):
         return need_forward
 
     def forward_draft_extend_after_target_decode(self, batch: ScheduleBatch):
+        # torch.distributed.breakpoint()
         return_logprob_backup = batch.return_logprob
         batch.return_logprob = False
         # TODO: Handle idle
         batch.spec_info.num_tokens_per_batch = 1
-        batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        # batch.spec_info.num_tokens_for_logprob_per_batch = 1
         batch.spec_info.verified_id = batch.input_ids
+        # batch.extend_lens = [1] * batch.batch_size()
+        # batch.prefix_lens = [seq_len - 1 for seq_len in batch.seq_lens_cpu.tolist()]
+        # batch.extend_num_tokens = sum(batch.extend_lens)
+        # batch.extend_prefix_lens = 
+        # if self.forward_mode.is_decode_or_idle():
+        #     extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+        # else:
+    #         prefix_lens: List[int] = None
+    # extend_lens: List[int] = None
+    # extend_num_tokens: Optional[int] = None
+        #     extend_seq_lens = self.extend_lens
+        #     extend_prefix_lens = self.prefix_lens
+        #     extend_logprob_start_lens = self.extend_logprob_start_lens
 
+        # Maybe can refactor to set spec_info=None for a regular decode
+        # hidden_states = forward_batch.spec_info.hidden_states became annoying
+        batch.return_hidden_states = False
+        target_hidden_states = batch.spec_info.hidden_states
+        spec_info_backup = batch.spec_info
+        batch.spec_info = None
         batch.forward_mode = (
-            ForwardMode.DRAFT_EXTEND
+            ForwardMode.DECODE
             if not batch.forward_mode.is_idle()
             else ForwardMode.IDLE
         )
-        batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
-        batch.return_hidden_states = False
+        # token_to_kv_pool_allocator is shared between target and draft
+        # reuse the out_cache_loc from target model
         model_worker_batch = batch.get_model_worker_batch()
         # TODO: only turn on after specdecode enabled
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
-        if forward_batch.seq_lens_cpu is not None:
-            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
-        else:
-            forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
-
+        # forward_batch.spec_info = None # we don't need if we can just remove from batch
+        forward_batch.target_hidden_states = target_hidden_states
         forward_batch.can_run_dp_cuda_graph = False
+        # TODO: fix this for fa3
         if not forward_batch.forward_mode.is_idle():
-            self.draft_attn_backend.init_forward_metadata(forward_batch)
-        logits_output, _ = self.draft_model_runner.forward(
-            forward_batch, skip_attn_backend_init=True
-        )
+            self.draft_extend_attn_backend.init_forward_metadata(forward_batch)
+        # To use regular decoding with triton, we need to switch to draft_extend_backend
+        forward_batch.attn_backend = self.draft_extend_attn_backend
+        logits_output, _ = self.draft_model_runner.forward(forward_batch, skip_attn_backend_init=True)
         input_is_idle = batch.forward_mode.is_idle()
         # TODO: Only turn on after specdecode enabled
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        batch.spec_info = spec_info_backup
+        self.capture_for_decode(logits_output, batch.spec_info)
         batch.forward_mode = (
             ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
         )

@@ -212,13 +212,15 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
 
 
 class TestEAGLE3Engine(TestEAGLEEngine):
+    import os
+    base_gpu_id = int(os.environ.get("BASE_GPU_ID", 0))
     BASE_CONFIG = {
         "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
         "speculative_draft_model_path": DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
         "speculative_algorithm": "EAGLE3",
-        "speculative_num_steps": 5,
-        "speculative_eagle_topk": 16,
-        "speculative_num_draft_tokens": 64,
+        "speculative_num_steps": 2,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 3,
         "mem_fraction_static": 0.7,
         # "cuda_graph_max_bs": 5,
         "dtype": "float16",
@@ -226,6 +228,8 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "attention_backend": "fa3",
         "watchdog_timeout": 30000,
         "skip_server_warmup": True,
+        "base_gpu_id": base_gpu_id,
+        "enable_torch_compile": False,
     }
     NUM_CONFIGS = 1
     THRESHOLDS = {

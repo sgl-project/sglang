@@ -222,6 +222,7 @@ class ForwardBatch:
     # For split prefill
     # intermediate values for split prefill
     hidden_states: torch.Tensor = None
+    target_hidden_states = None
     residual: torch.Tensor = None
     model_specific_states: Dict[str, any] = None
     # current split index of layer
