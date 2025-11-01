@@ -15,7 +15,8 @@ limitations under the License.
 
 // Adapted from: https://github.com/vllm-project/vllm/blob/main/csrc/ops.h
 
-#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <ATen/Tensor.h>
 #include <vector>
 
 at::Tensor weak_ref_tensor(const at::Tensor& tensor) {
@@ -27,7 +28,7 @@ at::Tensor weak_ref_tensor(const at::Tensor& tensor) {
 
   auto options = tensor.options();
 
-  auto new_tensor = torch::from_blob(data_ptr, sizes, strides, options);
+  auto new_tensor = at::from_blob(data_ptr, sizes, strides, options);
 
   return new_tensor;
 }
