@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use super::ConfigResult;
 use crate::core::ConnectionMode;
@@ -199,14 +200,38 @@ impl PostgresConfig {
     pub fn default_pool_max() -> usize {
         16
     }
-}
 
-impl Default for PostgresConfig {
-    fn default() -> Self {
-        Self {
-            db_url: "postgresql://localhost:5432/sglang".to_string(),
-            pool_max: 16,
+    pub fn validate(&self) -> Result<(), String> {
+        let s = self.db_url.trim();
+        if s.is_empty() {
+            return Err("db_url is not empty".to_string());
         }
+
+        let url = Url::parse(s).map_err(|e| format!("invalidate db_url: {}", e))?;
+
+        let scheme = url.scheme();
+        if scheme != "postgres" && scheme != "postgresql" {
+            return Err(format!("don't support URL scheme: {}", scheme));
+        }
+
+        if url.host().is_none() {
+            return Err("db_url must need host".to_string());
+        }
+
+        let path = url.path();
+        let dbname = path
+            .strip_prefix('/')
+            .filter(|p| !p.is_empty())
+            .map(|s| s.to_string());
+        if dbname.is_none() {
+            return Err("db_url must need database name".to_string());
+        }
+
+        if self.pool_max == 0 {
+            return Err("pool_max must gate than 1, default is 16".to_string());
+        }
+
+        Ok(())
     }
 }
 
