@@ -16,8 +16,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    AscendMHATokenToKVPoolHost,
-    AscendMLATokenToKVPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
@@ -62,23 +60,23 @@ class HiRadixCache(RadixCache):
 
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            host_pool_class = (
-                AscendMHATokenToKVPoolHost if _is_npu else MHATokenToKVPoolHost
+            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+                self.kv_cache,
+                hicache_ratio,
+                hicache_size,
+                page_size,
+                hicache_mem_layout,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-            host_pool_class = (
-                AscendMLATokenToKVPoolHost if _is_npu else MLATokenToKVPoolHost
+            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
+                self.kv_cache,
+                hicache_ratio,
+                hicache_size,
+                page_size,
+                hicache_mem_layout,
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
-
-        self.token_to_kv_pool_host = host_pool_class(
-            self.kv_cache,
-            hicache_ratio,
-            hicache_size,
-            page_size,
-            hicache_mem_layout,
-        )
 
         self.tp_group = tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
