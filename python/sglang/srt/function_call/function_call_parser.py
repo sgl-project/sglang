@@ -8,7 +8,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCallConstraint,
     ToolChoice,
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -144,7 +144,9 @@ class FunctionCallParser:
             info = get_structure_info(name)
 
             # accept all if not strict, otherwise only accept the schema
-            is_strict = function.strict or self.tool_strict_level >= 2
+            is_strict = (
+                function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
+            )
             schema = function.parameters if is_strict else {}
 
             tool_structures.append(
@@ -185,7 +187,7 @@ class FunctionCallParser:
             and tool_choice == "auto"
             and (
                 any(tool.function.strict for tool in self.tools)
-                or self.tool_strict_level >= 1
+                or self.tool_strict_level >= ToolStrictLevel.FUNCTION
             )
         ):
             tag = self.get_structure_tag()
