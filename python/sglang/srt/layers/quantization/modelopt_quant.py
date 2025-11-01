@@ -810,6 +810,12 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     first_group = next(iter(config_groups.values()), {})
                     weights_config = first_group.get("weights", {})
                     group_size = weights_config.get("group_size")
+            # If still missing, default to 16.
+            if group_size is None:
+                logger.warning(
+                    "NVFP4 group_size not found in config.json; defaulting to 16"
+                )
+                group_size = 16
 
             exclude_modules = config.get("ignore", [])
         else:
@@ -820,7 +826,16 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 kv_cache_quant_algo = quant_config.get("kv_cache_quant_algo")
                 if not kv_cache_quant_algo:
                     kv_cache_quant_algo = "auto"
-                group_size = ModelOptFp4Config.common_group_size(config)
+                # Prefer explicit group_size in the quantization block; otherwise try common_group_size.
+                group_size = quant_config.get("group_size")
+                if not isinstance(group_size, int):
+                    try:
+                        group_size = ModelOptFp4Config.common_group_size(config)
+                    except Exception:
+                        logger.warning(
+                            "NVFP4 group_size not found in hf_quant_config.json; defaulting to 16"
+                        )
+                        group_size = 16
                 exclude_modules = quant_config.get("exclude_modules", [])
             except (ValueError, KeyError):
                 raise ValueError(
@@ -836,16 +851,12 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             )
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
 
-        if group_size is None or exclude_modules is None:
-            logger.warning(
-                f"group_size: {group_size},"
-                f"kv_cache_quant_algo: {kv_cache_quant_algo},"
-                f"exclude_modules: {exclude_modules}"
-            )
-            raise ValueError(
-                "NVFP4 quantization requires group_size and exclude_modules "
-                "specified in the quantization config"
-            )
+        # Ensure defaults if missing
+        if group_size is None:
+            logger.warning("NVFP4 group_size missing after parsing; defaulting to 16")
+            group_size = 16
+        if exclude_modules is None:
+            exclude_modules = []
         return cls(
             is_checkpoint_nvfp4_serialized,
             kv_cache_quant_algo,
