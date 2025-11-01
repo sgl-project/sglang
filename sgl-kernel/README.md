@@ -105,3 +105,5 @@ m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 ## FAQ
 - Q: Segmentation fault with CUDA 12.6
 - A: Update ptxas to 12.8, reference: [segment fault error](https://github.com/Dao-AILab/flash-attention/issues/1453)
+
+Trigger arm build test (Should be removed later)
