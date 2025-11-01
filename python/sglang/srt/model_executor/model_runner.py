@@ -602,7 +602,7 @@ class ModelRunner:
         if self.server_args.dist_init_addr:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
-            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
+            dist_init_method = f"tcp://{self.server_args.host}:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
         set_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
