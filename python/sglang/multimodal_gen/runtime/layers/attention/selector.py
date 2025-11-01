@@ -139,7 +139,9 @@ def _cached_get_attn_backend(
                 )
 
     # get device-specific attn_backend
-    if (
+    if selected_backend is None:
+        logger.debug(f"Attention backend not specified")
+    elif (
         not supported_attention_backends
         or selected_backend not in supported_attention_backends
     ):
@@ -151,6 +153,7 @@ def _cached_get_attn_backend(
             f"Selected attention backend: '{selected_backend}' not in supported attention backends: {supported_attention_backends_str}"
         )
         selected_backend = None
+
     attention_cls = current_platform.get_attn_backend_cls_str(
         selected_backend, head_size, dtype
     )

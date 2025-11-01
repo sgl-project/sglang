@@ -362,7 +362,7 @@ def maybe_download_model(
 
     # If the path exists locally, return it
     if os.path.exists(model_name_or_path):
-        logger.info("Model already exists locally at %s", model_name_or_path)
+        logger.info("Model already exists locally")
         return model_name_or_path
 
     # Otherwise, assume it's a HF Hub model ID and try to download it
