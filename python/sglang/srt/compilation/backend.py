@@ -17,24 +17,30 @@ from torch._dispatch.python import enable_python_dispatcher
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
-from sglang.srt.compilation.compiler_interface import InductorAdaptor
+from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdaptor
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
 from sglang.srt.compilation.pass_manager import PostGradPassManager
 
 logger = logging.getLogger(__name__)
 
 
-def make_compiler():
-    return InductorAdaptor()
+def make_compiler(config: CompilationConfig):
+    if config.compiler == "eager":
+        return EagerAdapter()
+    elif config.compiler == "inductor":
+        return InductorAdaptor()
+    else:
+        raise ValueError(f"Unknown compiler: {config.compiler}")
 
 
 class CompilerManager:
     def __init__(
         self,
+        config: CompilationConfig,
     ):
         self.cache = dict()
         self.is_cache_updated = False
-        self.compiler = make_compiler()
+        self.compiler = make_compiler(config)
 
     def compute_hash(self):
         return self.compiler.compute_hash()
@@ -348,7 +354,7 @@ class SGLangBackend:
         self.sym_tensor_indices = []
         self.input_buffers = []
 
-        self.compiler_manager = CompilerManager()
+        self.compiler_manager = CompilerManager(config)
         self.inductor_config = {
             "enable_auto_functionalized_v2": False,
         }
@@ -386,7 +392,7 @@ class SGLangBackend:
         self.configure_post_pass()
 
         self.split_gm, self.piecewise_graphs = split_graph(
-            graph, ["sglang.unified_attention_with_output"]
+            graph, ["sglang.unified_attention_with_output", "sglang.inplace_all_reduce"]
         )
 
         from torch._dynamo.utils import lazy_format_graph_code

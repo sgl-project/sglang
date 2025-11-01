@@ -56,6 +56,51 @@ pub struct WorkerConfigRequest {
     /// Additional labels (optional)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
+
+    /// Health check timeout in seconds (default: 30)
+    #[serde(default = "default_health_check_timeout")]
+    pub health_check_timeout_secs: u64,
+
+    /// Health check interval in seconds (default: 60)
+    #[serde(default = "default_health_check_interval")]
+    pub health_check_interval_secs: u64,
+
+    /// Number of successful health checks needed to mark worker as healthy (default: 2)
+    #[serde(default = "default_health_success_threshold")]
+    pub health_success_threshold: u32,
+
+    /// Number of failed health checks before marking worker as unhealthy (default: 3)
+    #[serde(default = "default_health_failure_threshold")]
+    pub health_failure_threshold: u32,
+
+    /// Maximum connection attempts during worker registration (default: 20)
+    #[serde(default = "default_max_connection_attempts")]
+    pub max_connection_attempts: u32,
+
+    /// Enable data parallelism aware scheduling (default: false)
+    #[serde(default)]
+    pub dp_aware: bool,
+}
+
+// Default value functions for serde
+fn default_health_check_timeout() -> u64 {
+    30
+}
+
+fn default_health_check_interval() -> u64 {
+    60
+}
+
+fn default_health_success_threshold() -> u32 {
+    2
+}
+
+fn default_health_failure_threshold() -> u32 {
+    3
+}
+
+fn default_max_connection_attempts() -> u32 {
+    20
 }
 
 /// Worker information for API responses

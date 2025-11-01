@@ -5,11 +5,12 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use validator::Validate;
 
 // Import shared types from common module
 use super::common::{
-    default_true, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo, StringOrArray, ToolChoice,
-    UsageInfo,
+    default_model, default_true, ChatLogProbs, Function, GenerationRequest, PromptTokenUsageInfo,
+    StringOrArray, ToolChoice, UsageInfo,
 };
 
 // ============================================================================
@@ -20,6 +21,11 @@ use super::common::{
 pub struct ResponseTool {
     #[serde(rename = "type")]
     pub r#type: ResponseToolType,
+    // Function tool fields (used when type == "function")
+    // In Responses API, function fields are flattened at the top level
+    #[serde(flatten)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<Function>,
     // MCP-specific fields (used when type == "mcp")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
@@ -39,6 +45,7 @@ impl Default for ResponseTool {
     fn default() -> Self {
         Self {
             r#type: ResponseToolType::WebSearchPreview,
+            function: None,
             server_url: None,
             authorization: None,
             server_label: None,
@@ -52,6 +59,7 @@ impl Default for ResponseTool {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseToolType {
+    Function,
     WebSearchPreview,
     CodeInterpreter,
     Mcp,
@@ -94,6 +102,14 @@ pub enum ReasoningSummary {
 // Input/Output Items
 // ============================================================================
 
+/// Content can be either a simple string or array of content parts (for SimpleInputMessage)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum StringOrContentParts {
+    String(String),
+    Array(Vec<ResponseContentPart>),
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -109,21 +125,38 @@ pub enum ResponseInputOutputItem {
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
         summary: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
         content: Vec<ResponseReasoningContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
-    #[serde(rename = "function_tool_call")]
+    #[serde(rename = "function_call")]
     FunctionToolCall {
         id: String,
+        call_id: String,
         name: String,
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        id: Option<String>,
+        call_id: String,
+        output: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    #[serde(untagged)]
+    SimpleInputMessage {
+        content: StringOrContentParts,
+        role: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "type")]
+        r#type: Option<String>,
     },
 }
 
@@ -178,15 +211,15 @@ pub enum ResponseOutputItem {
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
         summary: Vec<String>,
         content: Vec<ResponseReasoningContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
-    #[serde(rename = "function_tool_call")]
+    #[serde(rename = "function_call")]
     FunctionToolCall {
         id: String,
+        call_id: String,
         name: String,
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -411,11 +444,19 @@ fn default_repetition_penalty() -> f32 {
     1.0
 }
 
+fn default_temperature() -> Option<f32> {
+    Some(1.0)
+}
+
+fn default_top_p() -> Option<f32> {
+    Some(1.0)
+}
+
 // ============================================================================
 // Request/Response Types
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct ResponsesRequest {
     /// Run the request in the background
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -444,12 +485,13 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, Value>>,
 
-    /// Model to use (optional to match vLLM)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    /// Model to use
+    #[serde(default = "default_model")]
+    pub model: String,
 
     /// Optional conversation id to persist input/output as items
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_conversation_id"))]
     pub conversation: Option<String>,
 
     /// Whether to enable parallel tool calls
@@ -473,11 +515,14 @@ pub struct ResponsesRequest {
     pub store: Option<bool>,
 
     /// Whether to stream the response
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub stream: Option<bool>,
 
     /// Temperature for sampling
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "default_temperature",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub temperature: Option<f32>,
 
     /// Tool choice behavior
@@ -493,7 +538,7 @@ pub struct ResponsesRequest {
     pub top_logprobs: Option<u32>,
 
     /// Top-p sampling parameter
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_top_p", skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
     /// Truncation behavior
@@ -540,8 +585,8 @@ pub struct ResponsesRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ResponseInput {
-    Text(String),
     Items(Vec<ResponseInputOutputItem>),
+    Text(String),
 }
 
 impl Default for ResponsesRequest {
@@ -554,7 +599,7 @@ impl Default for ResponsesRequest {
             max_output_tokens: None,
             max_tool_calls: None,
             metadata: None,
-            model: None,
+            model: default_model(),
             conversation: None,
             parallel_tool_calls: None,
             previous_response_id: None,
@@ -587,7 +632,7 @@ impl GenerationRequest for ResponsesRequest {
     }
 
     fn get_model(&self) -> Option<&str> {
-        self.model.as_deref()
+        Some(self.model.as_str())
     }
 
     fn extract_text_for_routing(&self) -> String {
@@ -611,6 +656,28 @@ impl GenerationRequest for ResponsesRequest {
                             Some(texts.join(" "))
                         }
                     }
+                    ResponseInputOutputItem::SimpleInputMessage { content, .. } => {
+                        match content {
+                            StringOrContentParts::String(s) => Some(s.clone()),
+                            StringOrContentParts::Array(parts) => {
+                                // SimpleInputMessage only supports InputText
+                                let texts: Vec<String> = parts
+                                    .iter()
+                                    .filter_map(|part| match part {
+                                        ResponseContentPart::InputText { text } => {
+                                            Some(text.clone())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                if texts.is_empty() {
+                                    None
+                                } else {
+                                    Some(texts.join(" "))
+                                }
+                            }
+                        }
+                    }
                     ResponseInputOutputItem::Reasoning { content, .. } => {
                         let texts: Vec<String> = content
                             .iter()
@@ -627,11 +694,85 @@ impl GenerationRequest for ResponsesRequest {
                     ResponseInputOutputItem::FunctionToolCall { arguments, .. } => {
                         Some(arguments.clone())
                     }
+                    ResponseInputOutputItem::FunctionCallOutput { output, .. } => {
+                        Some(output.clone())
+                    }
                 })
                 .collect::<Vec<String>>()
                 .join(" "),
         }
     }
+}
+
+/// Validate conversation ID format
+pub fn validate_conversation_id(conv_id: &str) -> Result<(), validator::ValidationError> {
+    if !conv_id.starts_with("conv_") {
+        let mut error = validator::ValidationError::new("invalid_conversation_id");
+        error.message = Some(std::borrow::Cow::Owned(format!(
+            "Invalid 'conversation': '{}'. Expected an ID that begins with 'conv_'.",
+            conv_id
+        )));
+        return Err(error);
+    }
+
+    // Check if the conversation ID contains only valid characters
+    let is_valid = conv_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+
+    if !is_valid {
+        let mut error = validator::ValidationError::new("invalid_conversation_id");
+        error.message = Some(std::borrow::Cow::Owned(format!(
+            "Invalid 'conversation': '{}'. Expected an ID that contains letters, numbers, underscores, or dashes, but this value contained additional characters.",
+            conv_id
+        )));
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Normalize a SimpleInputMessage to a proper Message item
+///
+/// This helper converts SimpleInputMessage (which can have flexible content)
+/// into a fully-structured Message item with a generated ID, role, and content array.
+///
+/// SimpleInputMessage items are converted to Message items with IDs generated using
+/// the centralized ID generation pattern with "msg_" prefix for consistency.
+///
+/// # Arguments
+/// * `item` - The input item to normalize
+///
+/// # Returns
+/// A normalized ResponseInputOutputItem (either Message if converted, or original if not SimpleInputMessage)
+pub fn normalize_input_item(item: &ResponseInputOutputItem) -> ResponseInputOutputItem {
+    match item {
+        ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
+            let content_vec = match content {
+                StringOrContentParts::String(s) => {
+                    vec![ResponseContentPart::InputText { text: s.clone() }]
+                }
+                StringOrContentParts::Array(parts) => parts.clone(),
+            };
+
+            ResponseInputOutputItem::Message {
+                id: generate_id("msg"),
+                role: role.clone(),
+                content: content_vec,
+                status: Some("completed".to_string()),
+            }
+        }
+        _ => item.clone(),
+    }
+}
+
+pub fn generate_id(prefix: &str) -> String {
+    use rand::RngCore;
+    let mut rng = rand::rng();
+    // Generate exactly 50 hex characters (25 bytes) for the part after the underscore
+    let mut bytes = [0u8; 25];
+    rng.fill_bytes(&mut bytes);
+    let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("{}_{}", prefix, hex_string)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -720,6 +861,10 @@ pub struct ResponsesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
+    /// Safety identifier for content moderation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+
     /// Additional metadata
     #[serde(default)]
     pub metadata: HashMap<String, Value>,
@@ -784,6 +929,7 @@ impl ResponseOutputItem {
     /// Create a new function tool call output item
     pub fn new_function_tool_call(
         id: String,
+        call_id: String,
         name: String,
         arguments: String,
         output: Option<String>,
@@ -791,6 +937,7 @@ impl ResponseOutputItem {
     ) -> Self {
         Self::FunctionToolCall {
             id,
+            call_id,
             name,
             arguments,
             output,

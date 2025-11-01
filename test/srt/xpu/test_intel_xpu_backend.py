@@ -8,6 +8,7 @@ import unittest
 from functools import wraps
 
 from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
     is_in_ci,
@@ -54,6 +55,10 @@ class TestIntelXPUBackend(CustomTestCase):
     @intel_xpu_benchmark(min_throughput=10)
     def test_latency_qwen_model(self):
         return DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
+
+    @intel_xpu_benchmark(["--attention-backend", "intel_xpu", "--page-size", "128"])
+    def test_attention_backend(self):
+        return DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE
 
 
 if __name__ == "__main__":

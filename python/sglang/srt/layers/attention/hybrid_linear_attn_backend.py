@@ -1,6 +1,7 @@
 from typing import Optional, Union
 
 import torch
+from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -9,6 +10,11 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 )
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
+)
+from sglang.srt.layers.attention.fla.kda import (
+    chunk_kda,
+    fused_kda_gate,
+    fused_recurrent_kda,
 )
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
@@ -291,6 +297,223 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1  # Mamba attn does not use seq lens to index kv cache
+
+
+class KimiLinearAttnBackend(MambaAttnBackendBase):
+    """Attention backend using Mamba kernel."""
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        q_proj_states = kwargs["q_proj_states"]
+        k_proj_states = kwargs["k_proj_states"]
+        v_proj_states = kwargs["v_proj_states"]
+        q_conv_weights = kwargs["q_conv_weights"]
+        k_conv_weights = kwargs["k_conv_weights"]
+        v_conv_weights = kwargs["v_conv_weights"]
+
+        q_conv_bias = kwargs["q_conv_bias"]
+        k_conv_bias = kwargs["k_conv_bias"]
+        v_conv_bias = kwargs["v_conv_bias"]
+
+        A_log = kwargs["A_log"]
+        dt_bias = kwargs["dt_bias"]
+        b_proj = kwargs["b_proj"]
+        f_a_proj = kwargs["f_a_proj"]
+        f_b_proj = kwargs["f_b_proj"]
+        hidden_states = kwargs["hidden_states"]
+        head_dim = kwargs["head_dim"]
+        layer_id = kwargs["layer_id"]
+
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        q_conv_state, k_conv_state, v_conv_state = layer_cache.conv
+        ssm_states = layer_cache.temporal
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
+
+        q_conv_state = q_conv_state.transpose(-1, -2)
+        k_conv_state = k_conv_state.transpose(-1, -2)
+        v_conv_state = v_conv_state.transpose(-1, -2)
+
+        q = causal_conv1d_update(
+            q_proj_states,
+            q_conv_state,
+            q_conv_weights,
+            q_conv_bias,
+            activation="silu",
+            conv_state_indices=cache_indices,
+        )
+        k = causal_conv1d_update(
+            k_proj_states,
+            k_conv_state,
+            k_conv_weights,
+            k_conv_bias,
+            activation="silu",
+            conv_state_indices=cache_indices,
+        )
+        v = causal_conv1d_update(
+            v_proj_states,
+            v_conv_state,
+            v_conv_weights,
+            v_conv_bias,
+            activation="silu",
+            conv_state_indices=cache_indices,
+        )
+
+        q, k, v = map(
+            lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
+        )
+
+        beta = b_proj(hidden_states)[0].float().sigmoid()
+
+        g = f_b_proj(f_a_proj(hidden_states)[0])[0]
+        g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
+
+        beta = beta.unsqueeze(0)
+        g = g.unsqueeze(0)
+
+        initial_state = ssm_states[cache_indices].contiguous()
+        (
+            core_attn_out,
+            last_recurrent_state,
+        ) = fused_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=query_start_loc,
+        )
+        ssm_states[cache_indices] = last_recurrent_state
+        return core_attn_out
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+            causal_conv1d_fn,
+        )
+
+        q_proj_states = kwargs["q_proj_states"]
+        k_proj_states = kwargs["k_proj_states"]
+        v_proj_states = kwargs["v_proj_states"]
+        q_conv_weights = kwargs["q_conv_weights"]
+        k_conv_weights = kwargs["k_conv_weights"]
+        v_conv_weights = kwargs["v_conv_weights"]
+
+        q_conv_bias = kwargs["q_conv_bias"]
+        k_conv_bias = kwargs["k_conv_bias"]
+        v_conv_bias = kwargs["v_conv_bias"]
+
+        A_log = kwargs["A_log"]
+        dt_bias = kwargs["dt_bias"]
+        b_proj = kwargs["b_proj"]
+        f_a_proj = kwargs["f_a_proj"]
+        f_b_proj = kwargs["f_b_proj"]
+        hidden_states = kwargs["hidden_states"]
+        head_dim = kwargs["head_dim"]
+        layer_id = kwargs["layer_id"]
+
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
+
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        conv_state_q, conv_state_k, conv_state_v = mamba_cache_params.conv
+        # deal with strides
+        conv_state_q = conv_state_q.transpose(-1, -2)
+        conv_state_k = conv_state_k.transpose(-1, -2)
+        conv_state_v = conv_state_v.transpose(-1, -2)
+
+        ssm_states = mamba_cache_params.temporal
+
+        has_initial_state = forward_batch.extend_prefix_lens > 0
+
+        q_proj_states = q_proj_states.transpose(0, 1)
+        k_proj_states = k_proj_states.transpose(0, 1)
+        v_proj_states = v_proj_states.transpose(0, 1)
+
+        q = causal_conv1d_fn(
+            q_proj_states,
+            q_conv_weights,
+            q_conv_bias,
+            activation="silu",
+            conv_states=conv_state_q,
+            has_initial_state=has_initial_state,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ).transpose(0, 1)
+
+        k = causal_conv1d_fn(
+            k_proj_states,
+            k_conv_weights,
+            k_conv_bias,
+            activation="silu",
+            conv_states=conv_state_k,
+            has_initial_state=has_initial_state,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ).transpose(0, 1)
+
+        v = causal_conv1d_fn(
+            v_proj_states,
+            v_conv_weights,
+            v_conv_bias,
+            activation="silu",
+            conv_states=conv_state_v,
+            has_initial_state=has_initial_state,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ).transpose(0, 1)
+
+        q, k, v = map(
+            lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
+        )
+
+        beta = b_proj(hidden_states)[0].float().sigmoid()
+
+        g = f_b_proj(f_a_proj(hidden_states)[0])[0]
+        g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
+
+        beta = beta.unsqueeze(0)
+        g = g.unsqueeze(0)
+
+        initial_state = ssm_states[cache_indices].contiguous()
+        (
+            core_attn_out,
+            last_recurrent_state,
+        ) = chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=query_start_loc,
+        )
+        ssm_states[cache_indices] = last_recurrent_state
+
+        return core_attn_out
 
 
 class GDNAttnBackend(MambaAttnBackendBase):

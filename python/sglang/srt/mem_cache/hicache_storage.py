@@ -19,7 +19,13 @@ def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
         hasher.update(bytes.fromhex(prior_hash))
 
     for t in token_ids:
-        hasher.update(t.to_bytes(4, byteorder="little", signed=False))
+        if isinstance(t, tuple):
+            # EAGLE bigram mode: hash both elements to uniquely identify the bigram
+            for elem in t:
+                hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
+        else:
+            # Regular mode: single integer token
+            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
 
     return hasher.hexdigest()
 

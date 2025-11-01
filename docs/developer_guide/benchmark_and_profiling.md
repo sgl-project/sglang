@@ -152,7 +152,8 @@ curl -X POST <BASE_URL>/start_profile \
 # Start profiling with merge enabled
 python -m sglang.profiler \
   --num-steps 10 \
-  --activities CPU GPU \
+  --cpu \
+  --gpu \
   --output-dir /tmp/profiles \
   --merge-profiles # optional argument to merge profile traces (default=False)
 ```

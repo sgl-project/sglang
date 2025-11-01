@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -52,8 +53,11 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     is_cuda,
+    is_npu,
     next_power_of_2,
 )
+
+_is_npu = is_npu()
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -117,7 +121,11 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = None
 
         # Init draft worker
-        with empty_context():
+        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
+            ctx = draft_tp_context(get_attention_tp_group())
+        else:
+            ctx = empty_context()
+        with ctx:
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -200,7 +208,7 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if self.server_args.disable_cuda_graph or _is_npu:
             return
 
         # Capture draft
@@ -613,8 +621,8 @@ class EAGLEWorker(TpModelWorker):
         return parent_list, top_scores_index, draft_tokens
 
     def clear_cache_pool(self):
-        self.model_runner.req_to_token_pool.clear()
-        self.model_runner.token_to_kv_pool_allocator.clear()
+        # allocator and kv cache pool are shared with target worker
+        pass
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
@@ -962,7 +970,7 @@ class EAGLEWorker(TpModelWorker):
         draft_input.hidden_states = logits_output.hidden_states
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
