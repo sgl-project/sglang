@@ -225,9 +225,6 @@ class Envs:
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
 
-    # DeepSeek V2/V3 MHA Optimizations
-    SGLANG_MHA_USE_WKC_WVC = EnvBool(False)  # Use w_kc/w_vc for MHA K/V construction (numerical alignment with MLA)
-
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 

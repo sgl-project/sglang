@@ -1199,8 +1199,15 @@ class NativeSparseAttnBackend(AttentionBackend):
             cu_seqlens_q = metadata.cu_seqlens_q
         else:
             cu_seqlens_q = metadata.cu_seqlens_q
-            cu_seqlens_k = metadata.cu_seqlens_q
-            max_seqlen_k = metadata.max_seq_len_q
+            mha_one_shot = getattr(forward_batch, "mha_one_shot", False)
+            if mha_one_shot:
+                # MHA_ONE_SHOT: k/v include all tokens (prefix + current)
+                cu_seqlens_k = metadata.cu_seqlens_k
+                max_seqlen_k = metadata.max_seq_len_k
+            else:
+                # MHA_CHUNKED_KV: k/v only include current tokens
+                cu_seqlens_k = metadata.cu_seqlens_q
+                max_seqlen_k = metadata.max_seq_len_q
             causal = True
 
         # Verify batch sizes match (length of cu_seqlens should be batch_size + 1)

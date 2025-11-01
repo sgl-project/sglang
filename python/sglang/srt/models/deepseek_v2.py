@@ -417,20 +417,25 @@ def handle_attention_nsa(attn, forward_batch):
     if _is_extend_without_speculative(forward_batch):
         NSA_THRESHOLD = getattr(attn, "nsa_seq_len_threshold", 2048)
 
-        if forward_batch.seq_lens_cpu is not None:
-            max_kv_len = forward_batch.seq_lens_cpu.max().item()
-        else:
-            max_kv_len = 0
+        assert forward_batch.seq_lens_cpu is not None
+        max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
         # B200 (SM100) is temporarily disabled for MHA due to FA4 accuracy issues
         # Currently only H200 (SM90) with FA3 is allowed to use MHA path
         is_supported_gpu = _device_sm == 90
 
-        return (
-            AttnForwardMethod.MHA_CHUNKED_KV
-            if (max_kv_len <= NSA_THRESHOLD and is_supported_gpu)
-            else AttnForwardMethod.MLA
-        )
+        if max_kv_len <= NSA_THRESHOLD and is_supported_gpu:
+            # NSA backend uses varlen kernel which supports MHA_ONE_SHOT
+            # Check if total sequence length fits in chunk capacity
+            sum_seq_lens = sum(forward_batch.seq_lens_cpu)
+            if sum_seq_lens <= forward_batch.get_max_chunk_capacity():
+                # Use MHA_ONE_SHOT for best performance (processes prefix and extended KV in one shot)
+                return AttnForwardMethod.MHA_ONE_SHOT
+            else:
+                # Fallback to MHA_CHUNKED_KV when total length exceeds capacity
+                return AttnForwardMethod.MHA_CHUNKED_KV
+        else:
+            return AttnForwardMethod.MLA
 
     return AttnForwardMethod.MLA
 
@@ -1551,29 +1556,10 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch.fetch_mha_one_shot_kv_indices(), q.dtype, forward_batch
             )
 
-        # Optional:Use w_kc/w_vc to build K/V from latent (numerical alignment with MLA)
-        if (
-            self.w_kc is not None
-            and self.w_vc is not None
-            and envs.SGLANG_MHA_USE_WKC_WVC.get()
-        ):
-            # kv_a: [N, 1, kv_lora_rank] → squeeze to [N, kv_lora_rank]
-            kv_a_2d = kv_a.squeeze(1)
-            # Single GEMM: [N, r] @ [r, H*(dk+dv)] → [N, H*(dk+dv)]
-            kv_flat = torch.matmul(kv_a_2d, self.mha_kv_merged_weight)
-            # Reshape: [N, H*(dk+dv)] → [N, H, dk+dv]
-            kv = kv_flat.view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            # Split K and V
-            k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        else:
-            kv = self.kv_b_proj(kv_a)[0]
-            kv = kv.view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            k_nope = kv[..., : self.qk_nope_head_dim]
-            v = kv[..., self.qk_nope_head_dim :]
+        kv = self.kv_b_proj(kv_a)[0]
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope = kv[..., : self.qk_nope_head_dim]
+        v = kv[..., self.qk_nope_head_dim :]
 
         k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
@@ -2393,28 +2379,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                 kv_indices, q.dtype, forward_batch
             )
 
-            # Optional:Use w_kc/w_vc to build K/V from latent (numerical alignment with MLA)
-            if (
-                self.w_kc is not None
-                and self.w_vc is not None
-                and envs.SGLANG_MHA_USE_WKC_WVC.get()
-            ):
-                # kv_a_normed: [N, 1, kv_lora_rank]
-                kv_a_2d = kv_a_normed.squeeze(1)
-                # Single GEMM: [N, r] @ [r, H*(dk+dv)] → [N, H*(dk+dv)]
-                kv_flat = torch.matmul(kv_a_2d, self.mha_kv_merged_weight)
-                # Reshape and split
-                kv = kv_flat.view(
-                    -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-                )
-                k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            else:
-                kv = self.kv_b_proj(kv_a_normed)[0]
-                kv = kv.view(
-                    -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-                )
-                v = kv[..., self.qk_nope_head_dim :]
-                k_nope = kv[..., : self.qk_nope_head_dim]
+            kv = self.kv_b_proj(kv_a_normed)[0]
+            kv = kv.view(
+                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            v = kv[..., self.qk_nope_head_dim :]
+            k_nope = kv[..., : self.qk_nope_head_dim]
 
             k = torch.empty(
                 (
@@ -2555,50 +2525,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             kv_a = kv_a.squeeze(1).contiguous()
         return kv_a, k_pe
-
-    def _build_mha_merged_kv_weight(self):
-        """
-        Build merged KV projection weight for MHA: W_merged = [w_kc^T | w_vc]
-        This combines K and V projections into a single GEMM to reduce numerical error.
-
-        Called once in post_load_weights() after w_kc and w_vc are ready.
-        """
-        # w_kc: [H, dk, r] → transpose to [H, r, dk]
-        # w_vc: [H, r, dv]
-        # Concatenate: [H, r, dk+dv]
-        w_kc_t = self.w_kc.transpose(-2, -1)  # [H, r, dk]
-        w_kv_cat = torch.cat([w_kc_t, self.w_vc], dim=-1)  # [H, r, dk+dv]
-
-        # Reshape to [r, H*(dk+dv)] for GEMM: kv_a @ W_merged
-        H = self.num_local_heads
-        r = self.kv_lora_rank
-        dk = self.qk_nope_head_dim
-        dv = self.v_head_dim
-
-        # [H, r, dk+dv] → [r, H, dk+dv] → [r, H*(dk+dv)]
-        W_merged = w_kv_cat.permute(1, 0, 2).reshape(r, H * (dk + dv))
-
-        # Register as buffer (non-trainable parameter)
-        self.register_buffer(
-            "mha_kv_merged_weight", W_merged.contiguous(), persistent=False
-        )
-
-        # Also handle FP8 scales if present
-        if (
-            hasattr(self, "w_scale_k")
-            and hasattr(self, "w_scale_v")
-            and self.w_scale_k is not None
-        ):
-            # For deep_gemm_bmm path, need to merge scales too
-            # w_scale_k: [H, num_tiles_k], w_scale_v: [H, num_tiles_v]
-            # Concatenate to [H, num_tiles_k + num_tiles_v]
-            scale_cat = torch.cat(
-                [self.w_scale_k, self.w_scale_v], dim=-1
-            )  # [H, total_tiles]
-            # Reshape to [total_tiles * H] or keep as [H, total_tiles] depending on usage
-            self.register_buffer(
-                "mha_kv_merged_scale", scale_cat.contiguous(), persistent=False
-            )
 
     def _concat_and_cast_mha_k(self, k_nope, k_pe, forward_batch):
         # Temporary for DeepSeek V3/R1 only, but can generalize if needed
@@ -3382,14 +3308,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
-
-            # Build merged KV weight after w_kc and w_vc are ready (in either branch)
-            if (
-                self_attn.w_kc is not None
-                and self_attn.w_vc is not None
-                and envs.SGLANG_MHA_USE_WKC_WVC.get()
-            ):
-                self_attn._build_mha_merged_kv_weight()
 
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
