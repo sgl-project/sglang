@@ -307,7 +307,7 @@ class Llama4VisionRotaryEmbedding(nn.Module):
         frequencies_x = img_idx % idx  # get the coordinates of the 2d matrix along x
         frequencies_y = img_idx // idx  # get the coordinates of the 2d matrix along y
         orig_hidden_size = config.original_hidden_size if hasattr(config, "original_hidden_size") else config.hidden_size
-        orig_num_att_heads = config.original_num_attention_heads if hasattr(config, "num_attention_heads") else config.num_attention_heads
+        orig_num_att_heads = config.original_num_attention_heads if hasattr(config, "original_num_attention_heads") else config.num_attention_heads
         freq_dim = orig_hidden_size // orig_num_att_heads // 2
         rope_freq = 1.0 / (
             config.rope_theta
