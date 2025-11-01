@@ -143,8 +143,12 @@ def _cached_get_attn_backend(
         not supported_attention_backends
         or selected_backend not in supported_attention_backends
     ):
+        supported_attention_backends_str = [
+            supported_attention_backend.__str__()
+            for supported_attention_backend in supported_attention_backends
+        ]
         logger.debug(
-            f"Selected attention backend: '{selected_backend}' not in supported attention backends: {supported_attention_backends}"
+            f"Selected attention backend: '{selected_backend}' not in supported attention backends: {supported_attention_backends_str}"
         )
         selected_backend = None
     attention_cls = current_platform.get_attn_backend_cls_str(

@@ -135,7 +135,7 @@ class DenoisingStage(PipelineStage):
                 AttentionBackendEnum.SLIDING_TILE_ATTN,
                 AttentionBackendEnum.VIDEO_SPARSE_ATTN,
                 AttentionBackendEnum.VMOBA_ATTN,
-                AttentionBackendEnum.FLASH_ATTN,
+                AttentionBackendEnum.FA3,
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN_THREE,
             ),  # hack
@@ -285,12 +285,13 @@ class DenoisingStage(PipelineStage):
                 z = z * self.vae.scaling_factor.to(z.device, z.dtype)
             else:
                 z = z * self.vae.scaling_factor
-
+            print(f"288 {latents.shape=}")
             latent_model_input = latents.to(target_dtype).squeeze(0)
             _, mask2 = masks_like([latent_model_input], zero=True)
 
             latents = (1.0 - mask2[0]) * z + mask2[0] * latent_model_input
             latents = latents.to(get_local_torch_device())
+            print(f"294 {latents.shape=}")
 
             F = batch.num_frames
             temporal_scale = (
@@ -309,6 +310,7 @@ class DenoisingStage(PipelineStage):
             seq_len = (
                 int(math.ceil(seq_len / get_sp_world_size())) * get_sp_world_size()
             )
+            print(f"{seq_len=}")
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?

@@ -214,7 +214,7 @@ class CudaPlatformBase(Platform):
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-        elif selected_backend == AttentionBackendEnum.FLASH_ATTN:
+        elif selected_backend == AttentionBackendEnum.FA3:
             if is_blackwell():
                 raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
         elif selected_backend:
@@ -224,7 +224,7 @@ class CudaPlatformBase(Platform):
                 target_backend = AttentionBackendEnum.TORCH_SDPA
                 logger.debug(f"Use torch_sdpa as default backend")
             else:
-                target_backend = AttentionBackendEnum.FLASH_ATTN
+                target_backend = AttentionBackendEnum.FA3
                 logger.debug(f"Use fa3 as default backend")
 
         if not cls.has_device_capability(80):
@@ -241,7 +241,7 @@ class CudaPlatformBase(Platform):
 
         # FlashAttn is valid for the model, checking if the package is
         # installed.
-        if target_backend == AttentionBackendEnum.FLASH_ATTN:
+        if target_backend == AttentionBackendEnum.FA3:
             try:
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
                     FlashAttentionBackend,

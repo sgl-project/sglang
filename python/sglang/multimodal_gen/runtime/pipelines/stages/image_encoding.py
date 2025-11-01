@@ -414,7 +414,9 @@ class ImageVAEEncodingStage(PipelineStage):
             mask_lat_size[:, :, list(range(1, num_frames))] = 0
             first_frame_mask = mask_lat_size[:, :, 0:1]
             first_frame_mask = torch.repeat_interleave(
-                first_frame_mask, dim=2, repeats=self.vae.temporal_compression_ratio
+                first_frame_mask,
+                repeats=self.vae.temporal_compression_ratio,
+                dim=2,
             )
             mask_lat_size = torch.concat(
                 [first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2
