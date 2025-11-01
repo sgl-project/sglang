@@ -22,7 +22,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import orjson
 
@@ -282,6 +282,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
+    mm_process_config: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     # Logging
     log_level: str = "info"
@@ -2234,6 +2235,12 @@ class ServerArgs:
             "--sleep-on-idle",
             action="store_true",
             help="Reduce CPU usage when sglang is idle.",
+        )
+        parser.add_argument(
+            "--mm-process-config",
+            type=json.loads,
+            default={},
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
         )
 
         # Logging
