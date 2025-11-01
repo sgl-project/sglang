@@ -391,6 +391,8 @@ class PiecewiseCudaGraphRunner:
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
         # Run and capture
         def run_once():
             # Clean intermediate result cache for DP attention
@@ -485,6 +487,8 @@ class PiecewiseCudaGraphRunner:
             top_p=forward_batch.top_p,
         )
 
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
         return static_forward_batch
 
     def replay(
@@ -508,7 +512,9 @@ class PiecewiseCudaGraphRunner:
                     )
                 if isinstance(output, LogitsProcessorOutput):
                     return LogitsProcessorOutput(
-                        next_token_logits=output.next_token_logits[: self.raw_num_tokens],
+                        next_token_logits=output.next_token_logits[
+                            : self.raw_num_tokens
+                        ],
                         hidden_states=(
                             output.hidden_states[: self.raw_num_tokens]
                             if output.hidden_states is not None
