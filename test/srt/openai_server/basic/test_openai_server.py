@@ -181,23 +181,39 @@ class TestOpenAIServer(CustomTestCase):
                 index, True
             ), f"index {index} is not found in the response"
 
-    def run_chat_completion(self, logprobs, parallel_sample_num):
+    def run_chat_completion(self, logprobs, parallel_sample_num, use_input_ids=False):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant"},
-                {
-                    "role": "user",
-                    "content": "What is the capital of France? Answer in a few words.",
-                },
-            ],
-            temperature=0,
-            logprobs=logprobs is not None and logprobs > 0,
-            top_logprobs=logprobs,
-            n=parallel_sample_num,
-        )
 
+        messages = [
+            {"role": "system", "content": "You are a helpful AI assistant"},
+            {
+                "role": "user",
+                "content": "What is the capital of France? Answer in a few words.",
+            },
+        ]
+
+        # Prepare request parameters
+        request_params = {
+            "model": self.model,
+            "temperature": 0,
+            "logprobs": logprobs is not None and logprobs > 0,
+            "top_logprobs": logprobs,
+            "n": parallel_sample_num,
+            "messages": messages,  # Always provide messages
+        }
+
+        if use_input_ids:
+            # Convert messages to input_ids and pass via extra_body
+            input_ids = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            request_params["extra_body"] = {"input_ids": input_ids}
+            request_params["messages"] = [{"role": "user", "content": ""}]
+
+        response = client.chat.completions.create(**request_params)
+        print(response.choices[0].message.content)
         if logprobs:
             assert isinstance(
                 response.choices[0].logprobs.content[0].top_logprobs[0].token, str
@@ -209,7 +225,6 @@ class TestOpenAIServer(CustomTestCase):
             assert (
                 ret_num_top_logprobs == logprobs
             ), f"{ret_num_top_logprobs} vs {logprobs}"
-
         assert len(response.choices) == parallel_sample_num
         assert response.choices[0].message.role == "assistant"
         assert isinstance(response.choices[0].message.content, str)
@@ -219,21 +234,39 @@ class TestOpenAIServer(CustomTestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
-    def run_chat_completion_stream(self, logprobs, parallel_sample_num=1):
+    def run_chat_completion_stream(
+        self, logprobs, parallel_sample_num=1, use_input_ids=False
+    ):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        generator = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant"},
-                {"role": "user", "content": "What is the capital of France?"},
-            ],
-            temperature=0,
-            logprobs=logprobs is not None and logprobs > 0,
-            top_logprobs=logprobs,
-            stream=True,
-            stream_options={"include_usage": True},
-            n=parallel_sample_num,
-        )
+
+        messages = [
+            {"role": "system", "content": "You are a helpful AI assistant"},
+            {"role": "user", "content": "What is the capital of France?"},
+        ]
+
+        # Prepare request parameters
+        request_params = {
+            "model": self.model,
+            "temperature": 0,
+            "logprobs": logprobs is not None and logprobs > 0,
+            "top_logprobs": logprobs,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "n": parallel_sample_num,
+            "messages": messages,  # Always provide messages
+        }
+
+        if use_input_ids:
+            # Convert messages to input_ids and pass via extra_body
+            input_ids = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            request_params["extra_body"] = {"input_ids": input_ids}
+            request_params["messages"] = [{"role": "user", "content": ""}]
+
+        generator = client.chat.completions.create(**request_params)
 
         is_firsts = {}
         is_finished = {}
@@ -337,6 +370,22 @@ class TestOpenAIServer(CustomTestCase):
         for logprobs in [None, 5]:
             for parallel_sample_num in [1, 2]:
                 self.run_chat_completion_stream(logprobs, parallel_sample_num)
+
+    def test_chat_completion_with_input_ids(self):
+        """Test chat completion using input_ids instead of messages"""
+        for logprobs in [None, 5]:
+            for parallel_sample_num in [1, 2]:
+                self.run_chat_completion(
+                    logprobs, parallel_sample_num, use_input_ids=True
+                )
+
+    def test_chat_completion_with_input_ids_stream(self):
+        """Test streaming chat completion using input_ids"""
+        for logprobs in [None, 5]:
+            for parallel_sample_num in [1, 2]:
+                self.run_chat_completion_stream(
+                    logprobs, parallel_sample_num, use_input_ids=True
+                )
 
     def test_regex(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
