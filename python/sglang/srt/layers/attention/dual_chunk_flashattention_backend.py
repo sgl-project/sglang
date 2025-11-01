@@ -596,23 +596,30 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         metadata = self.decode_metadata[bs]
 
         metadata.seq_lens_tensor.copy_(seq_lens.to(torch.int32))
-        metadata.seq_lens = seq_lens.tolist()
-        metadata.max_seq_len = seq_lens.max().item()
-
         metadata.orig_seq_lens_tensor.copy_(seq_lens)
-        metadata.orig_seq_lens = seq_lens.tolist()
 
-        block_tables = self.req_to_token[req_pool_indices, : metadata.max_seq_len]
-        # Convert the block table to a strided format.
+        # Prefer CPU to avoid GPU sync.
+        seq_lens_cpu_view = None
+        if seq_lens_cpu is not None:
+            seq_lens_cpu_view = seq_lens_cpu[:bs]
+        if seq_lens_cpu_view is not None:
+            metadata.max_seq_len = int(seq_lens_cpu_view.max().item())
+        else:
+            metadata.max_seq_len = int(seq_lens.max().item())
+
+        rows = torch.index_select(self.req_to_token, 0, req_pool_indices)
+        block_tables = rows[:, : metadata.max_seq_len]
         if self.page_size > 1:
-            strided_indices = torch.arange(
-                0, block_tables.shape[1], self.page_size, device=self.device
+            block_tables = block_tables[:, :: self.page_size] // self.page_size
+
+        used_cols = block_tables.shape[1]
+        if used_cols > 0:
+            metadata.block_tables[:, :used_cols].zero_()
+            metadata.block_tables[: block_tables.shape[0], :used_cols].copy_(
+                block_tables
             )
-            block_tables = block_tables[:, strided_indices] // self.page_size
-        metadata.block_tables.fill_(0)
-        metadata.block_tables[: block_tables.shape[0], : block_tables.shape[1]].copy_(
-            block_tables
-        )
+        else:
+            metadata.block_tables[:, :1].zero_()
 
         if self.original_max_position_embeddings > 0:
             scaling_factor = (
@@ -626,44 +633,83 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             metadata.scaling_factor.copy_(scaling_factor)
 
         cache_seq_lens = metadata.orig_seq_lens_tensor
-
         chunk_len = self.chunk_size - self.local_size
+        chunk_len_pages = max(1, chunk_len // self.page_size)
+
+        if seq_lens_cpu_view is not None:
+            chunk_num_curr_cpu = (seq_lens_cpu_view - 1) // chunk_len
+            cache_seq_lens_cpu = seq_lens_cpu_view
+        else:
+            chunk_num_curr_cpu = ((cache_seq_lens - 1) // chunk_len).cpu()
+            cache_seq_lens_cpu = cache_seq_lens.cpu()
         chunk_num_curr = (cache_seq_lens - 1) // chunk_len
 
+        # Intra lengths
         seq_lens_intra = cache_seq_lens - chunk_num_curr * chunk_len
-        max_seq_len_intra = seq_lens_intra.max().item()
+        if seq_lens_cpu_view is not None:
+            max_seq_len_intra = int(
+                (cache_seq_lens_cpu - chunk_num_curr_cpu * chunk_len).max().item()
+            )
+        else:
+            max_seq_len_intra = int(seq_lens_intra.max().item())
         metadata.seq_lens_intra.copy_(seq_lens_intra)
         metadata.max_seq_len_intra = max_seq_len_intra
 
-        metadata.block_tables_intra.fill_(0)
-        for i in range(bs):
-            st = chunk_num_curr[i] * chunk_len // self.page_size
-            ed = min(
-                st + (max_seq_len_intra - 1) // self.page_size + 1,
-                (cache_seq_lens[i] - 1) // self.page_size + 1,
-            )
-            metadata.block_tables_intra[i, : ed - st] = metadata.block_tables[i, st:ed]
+        intra_cols = (
+            (max_seq_len_intra - 1) // self.page_size + 1
+            if max_seq_len_intra > 0
+            else 0
+        )
+        if intra_cols > 0:
+            metadata.block_tables_intra[:, :intra_cols].zero_()
+            for i in range(bs):
+                st_pages = int(chunk_num_curr_cpu[i].item()) * chunk_len_pages
+                end_pages_cap = int(
+                    (cache_seq_lens_cpu[i].item() - 1) // self.page_size + 1
+                )
+                ed_pages = min(st_pages + intra_cols, end_pages_cap)
+                if ed_pages > st_pages:
+                    metadata.block_tables_intra[i, : ed_pages - st_pages] = (
+                        metadata.block_tables[i, st_pages:ed_pages]
+                    )
+        else:
+            metadata.block_tables_intra[:, :1].zero_()
 
         seq_lens_succ = (chunk_num_curr - (chunk_num_curr - 1).clip(min=0)) * chunk_len
         metadata.seq_lens_succ.copy_(seq_lens_succ)
-        metadata.max_seq_len_succ = metadata.seq_lens_succ.max().item()
+        if seq_lens_cpu_view is not None:
+            seq_lens_succ_cpu = (
+                chunk_num_curr_cpu - (chunk_num_curr_cpu - 1).clamp(min=0)
+            ) * chunk_len
+            metadata.max_seq_len_succ = int(seq_lens_succ_cpu.max().item())
+        else:
+            metadata.max_seq_len_succ = int(metadata.seq_lens_succ.max().item())
+
         if metadata.max_seq_len_succ:
-            metadata.block_tables_succ.fill_(0)
+            succ_cols = (metadata.max_seq_len_succ - 1) // self.page_size + 1
+            metadata.block_tables_succ[:, :succ_cols].zero_()
             for i in range(bs):
-                start = (
-                    (chunk_num_curr[i] - 1).clip(min=0) * chunk_len // self.page_size
+                prev_chunks = int(max(chunk_num_curr_cpu[i].item() - 1, 0))
+                start_pages = prev_chunks * chunk_len_pages
+                end_pages_cap = int(
+                    (cache_seq_lens_cpu[i].item() - 1) // self.page_size + 1
                 )
-                end = min(
-                    start + (metadata.max_seq_len_succ - 1) // self.page_size + 1,
-                    (cache_seq_lens[i] - 1) // self.page_size + 1,
-                )
-                metadata.block_tables_succ[i, : end - start] = metadata.block_tables[
-                    i, start:end
-                ]
+                end_pages = min(start_pages + succ_cols, end_pages_cap)
+                if end_pages > start_pages:
+                    metadata.block_tables_succ[i, : end_pages - start_pages] = (
+                        metadata.block_tables[i, start_pages:end_pages]
+                    )
+        else:
+            metadata.block_tables_succ[:, :1].zero_()
 
         seq_lens_inter = (chunk_num_curr - 1).clip(min=0) * chunk_len
         metadata.seq_lens_inter.copy_(seq_lens_inter)
-        metadata.max_seq_len_inter = metadata.seq_lens_inter.max().item()
+        if seq_lens_cpu_view is not None:
+            metadata.max_seq_len_inter = int(
+                ((chunk_num_curr_cpu - 1).clamp(min=0) * chunk_len).max().item()
+            )
+        else:
+            metadata.max_seq_len_inter = int(metadata.seq_lens_inter.max().item())
 
         self.forward_metadata = metadata
 
