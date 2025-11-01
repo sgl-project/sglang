@@ -412,7 +412,7 @@ class PiecewiseCudaGraphRunner:
                 )
             return
 
-        for _ in range(2):
+        for _ in range(3):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
@@ -487,8 +487,6 @@ class PiecewiseCudaGraphRunner:
             top_p=forward_batch.top_p,
         )
 
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-
         return static_forward_batch
 
     def replay(
@@ -500,6 +498,7 @@ class PiecewiseCudaGraphRunner:
             if self.model_runner.tp_group.ca_comm is not None:
                 old_ca_disable = self.model_runner.tp_group.ca_comm.disabled
                 self.model_runner.tp_group.ca_comm.disabled = True
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
             with set_forward_context(static_forward_batch, self.attention_layers):
