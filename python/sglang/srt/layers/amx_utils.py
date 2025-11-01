@@ -54,6 +54,13 @@ def _amx_process_weight_after_loading(
                 f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
             )
             module.use_intel_amx_backend = False
+            if weight_tensor.dim() == 2:
+                packed_weight = torch.nn.Parameter(weight_tensor.t().contiguous(), requires_grad=False)
+                packed_weight.__dict__ = weight_tensor.__dict__
+                setattr(module, weight_name, packed_weight)
+                logger.warning(
+                    f"Using transposed plain for shape {weight_tensor.shape} in {module}. "
+                )
             return
 
         packed_weight = torch.nn.Parameter(

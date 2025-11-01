@@ -85,6 +85,26 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 }
 
 template <typename scalar_t>
+inline void copy_up_stub(const scalar_t* __restrict__ input, float* __restrict__ out, int64_t size) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    fVec data0, data1;
+    bVec b_vec = bVec::loadu(input);
+    std::tie(data0, data1) = at::vec::convert_to_float(b_vec);
+    data0.store(out + d);
+    data1.store(out + d + fVec::size());
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<float>(input[d]);
+  }
+}
+
+template <typename scalar_t>
 inline void copy_add_stub(
     scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -378,6 +398,137 @@ void weight_packed_linear_kernel_impl(
   });
 }
 
+template <typename scalar_t>
+inline void sigmoid_mul(scalar_t* __restrict__ out, const float* __restrict__ input, const scalar_t* __restrict__ mul,  int SIZE) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  const fVec one = fVec(1.f);
+  fVec X = fVec(input[0]);
+  X = one / (one + X.neg().exp_u20());
+  constexpr int kVecSize = bVec::size();
+  for (int d = 0; d < SIZE; d += kVecSize) {
+    bVec m_bvec = bVec::loadu(mul + d);
+    fVec m_fvec0, m_fvec1;
+    std::tie(m_fvec0, m_fvec1) = at::vec::convert_to_float(m_bvec);
+    m_fvec0 = m_fvec0*X;
+    m_fvec1 = m_fvec1*X;
+
+    bVec out_vec = convert_from_float_ext<scalar_t>(m_fvec0, m_fvec1);
+    out_vec.store(out + d);
+  }
+}
+
+
+template <typename scalar_t>
+inline void bias_sigmoid_mul(scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, const scalar_t* __restrict__ mul,  int SIZE) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  const fVec one = fVec(1.f);
+  fVec X = fVec(input[0] + bias[0]);
+  X = one / (one + X.neg().exp_u20());
+  constexpr int kVecSize = bVec::size();
+  for (int d = 0; d < SIZE; d += kVecSize) {
+    bVec m_bvec = bVec::loadu(mul + d);
+    fVec m_fvec0, m_fvec1;
+    std::tie(m_fvec0, m_fvec1) = at::vec::convert_to_float(m_bvec);
+    m_fvec0 = m_fvec0*X;
+    m_fvec1 = m_fvec1*X;
+
+    bVec out_vec = convert_from_float_ext<scalar_t>(m_fvec0, m_fvec1);
+    out_vec.store(out + d);
+  }
+}
+
+template <typename scalar_t, bool has_bias>
+void tinygemm_kernel_f32(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    scalar_t* __restrict__ C,
+    float* __restrict__ Ctmp,
+    const float* __restrict__ bias,
+    const scalar_t* __restrict__ post_mul,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg) {
+
+    at::native::cpublas::brgemm(M, N, K, lda, ldb, ldc, /* add_C */ false, A, B, Ctmp);
+    // copy from Ctmp to C
+    for (int64_t m = 0; m < M; ++m) {
+      if constexpr (has_bias) {
+        if (post_mul != nullptr){
+            bias_sigmoid_mul<scalar_t>(C + m * K, Ctmp + m * N, bias, post_mul+m * K, K);
+        }else{
+            copy_add_stub(C + m * ldc, Ctmp + m * N, bias, N);
+        }
+      } else {
+        if (post_mul != nullptr){
+            sigmoid_mul<scalar_t>(C + m * K, Ctmp + m * N, post_mul+m * K, K);
+        }else{
+            copy_stub(C + m * ldc, Ctmp + m * N, N);
+        }
+      }
+    }
+    return;
+
+}
+
+template <typename scalar_t>
+void fma_linear_kernel_impl(
+    scalar_t* __restrict__ out,
+    float* __restrict__ mat1_f32,
+    float* __restrict__ mat2_f32,
+    const float* __restrict__ bias,
+    const scalar_t* __restrict__ post_mul,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+  constexpr int64_t BLOCK_M = block_size_m();
+  const int64_t MB = div_up(M, BLOCK_M);
+  // parallel on [MB, NB]
+
+  AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
+    at::parallel_for(0, MB, 0, [&](int64_t begin, int64_t end) {
+      int64_t mb{0};
+      data_index_init(begin, mb, MB);
+      // for brgemm, use float32 for accumulate
+      alignas(64) float Ctmp[BLOCK_M * N];
+
+      for (int64_t i = begin; i < end; ++i) {
+        UNUSED(i);
+        int64_t mb_start = mb * BLOCK_M;
+        int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+        // bf16 -> fp32
+        tinygemm_kernel_f32<scalar_t, has_bias>(
+            /*   A */ mat1_f32 + mb_start * K,
+            /*   B */ mat2_f32,
+            /*   C */ post_mul==nullptr? out + mb_start * N: out + mb_start * K,
+            /* Ctmp*/ Ctmp,
+            /* bias*/ bias,
+            post_mul==nullptr? post_mul : post_mul + mb_start * K,
+            /*   M */ mb_size,
+            /*   N */ N,
+            /*   K */ K,
+            /* lda */ K,
+            /* ldb */ N,
+            /* ldc */ N,
+            /* brg */ true);
+
+        // move to the next index
+        data_index_step(mb, MB);
+      }
+
+        at::native::cpublas::brgemm_release();
+
+    });
+  });
+}
+
 }  // anonymous namespace
 
 // tinygemm interface
@@ -519,6 +670,57 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
         K,
         mat1_strideM,
         out_strideM);
+  });
+
+  return out;
+}
+
+// mat1 : [M, K]
+// mat2 : [K, N]
+// bias : [N]
+// out  : [M, N]
+//
+at::Tensor
+fma_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, const std::optional<at::Tensor>& post_mul) {
+  RECORD_FUNCTION("sgl-kernel::fma_linear", std::vector<c10::IValue>({mat1, mat2, bias}));
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
+  const bool has_post_mul = post_mul.has_value();
+  int64_t M = mat1.size(0);
+  int64_t N = mat2.size(1);
+  int64_t K = mat1.size(1);
+  auto dispatch_type = mat1.scalar_type();
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
+
+  auto out = has_post_mul ? at::empty({M, K}, mat1.options()) : at::empty({M, N}, mat1.options());
+  auto a_f32 = at::empty({M, K});
+  auto w_f32 = at::empty({K, N});
+  mat1 = mat1.to(at::kFloat);
+  mat2 = mat2.to(at::kFloat);
+
+
+  const bool has_bias = bias.has_value();
+  const float* bias_data = nullptr;
+  if (has_bias) {
+    CHECK_EQ(bias.value().size(0), N);
+    bias_data = bias.value().data_ptr<float>();
+  }
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(dispatch_type, "fma_linear_kernel_impl", [&] {
+    const scalar_t* post_mul_data = nullptr;
+    if (has_post_mul) {
+      post_mul_data = post_mul.value().data_ptr<scalar_t>();
+    }
+    fma_linear_kernel_impl<scalar_t>(
+        out.data_ptr<scalar_t>(),
+        mat1.data_ptr<float>(),
+        mat2.data_ptr<float>(),
+        bias_data,
+        post_mul_data,
+        M,
+        N,
+        K);
   });
 
   return out;

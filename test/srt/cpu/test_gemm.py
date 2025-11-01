@@ -80,6 +80,41 @@ class TestGemm(CustomTestCase):
             ):
                 self._bf16_gemm(*params)
 
+    def _fp32_gemm(self, M, N, K, has_bias, use_post_sigmul):
+        use_post_sigmul = use_post_sigmul and N == 1
+        mat1 = torch.randn(M, K, dtype=torch.bfloat16)
+        mat2 = torch.randn(N, K, dtype=torch.bfloat16)
+
+        ref = torch.nn.functional.linear(mat1, mat2)
+        if has_bias:
+            bias = torch.randn(N, dtype=torch.float32)
+            ref.add_(bias)
+
+        if use_post_sigmul:
+            ref  = torch.nn.functional.sigmoid(ref) * mat1
+        out = torch.ops.sgl_kernel.fma_linear(
+            mat1, mat2.t().contiguous(), bias if has_bias else None, mat1 if use_post_sigmul else None
+        )
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    def test_fp32_gemm(self):
+        for params in itertools.product(
+            [1, 8 , 32, 1024],
+            [12, 1],
+            self.K,
+            self.has_bias,
+            [True, False]
+        ):
+            with self.subTest(
+                M=params[0],
+                N=params[1],
+                K=params[2],
+                has_bias=params[3],
+                use_post_sigmul = params[4],
+            ):
+                self._fp32_gemm(*params)
+
     def _int8_gemm(self, M, N, K, has_bias):
         dtype = torch.bfloat16
         A = torch.randn((M, K), dtype=dtype) / 10
