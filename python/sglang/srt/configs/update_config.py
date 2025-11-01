@@ -161,8 +161,10 @@ def adjust_config_with_unaligned_cpu_tp(
                 vision_cfg_obj.original_hidden_size = vision_cfg_obj.hidden_size
                 vision_cfg_obj.hidden_size = vision_cfg_obj.head_dim * att_heads
             if hasattr(vision_cfg_obj, "num_attention_heads"):
+                vision_cfg_obj.original_num_attention_heads = vision_cfg_obj.num_attention_heads
                 vision_cfg_obj.num_attention_heads = att_heads
             if hasattr(vision_cfg_obj, "attention_heads"):
+                vision_cfg_obj.original_attention_heads = vision_cfg_obj.attention_heads
                 vision_cfg_obj.attention_heads = att_heads
         vision_cfg_obj = update_intermediate_size(
             vision_cfg_obj,

@@ -306,7 +306,9 @@ class Llama4VisionRotaryEmbedding(nn.Module):
         img_idx[-1, -1] = -2  # ID_CLS_TOKEN
         frequencies_x = img_idx % idx  # get the coordinates of the 2d matrix along x
         frequencies_y = img_idx // idx  # get the coordinates of the 2d matrix along y
-        freq_dim = config.hidden_size // config.num_attention_heads // 2
+        orig_hidden_size = config.original_hidden_size if hasattr(config, "original_hidden_size") else config.hidden_size
+        orig_num_att_heads = config.original_num_attention_heads if hasattr(config, "num_attention_heads") else config.num_attention_heads
+        freq_dim = orig_hidden_size // orig_num_att_heads // 2
         rope_freq = 1.0 / (
             config.rope_theta
             ** (torch.arange(0, freq_dim, 2)[: (freq_dim // 2)].float() / freq_dim)
@@ -355,14 +357,14 @@ class Llama4VisionModel(nn.Module):
         orig_hidden_size = config.original_hidden_size if hasattr(config, "original_hidden_size") else self.hidden_size
         self.class_embedding = nn.Parameter(self.scale * torch.randn(orig_hidden_size))
         self.positional_embedding_vlm = nn.Parameter(
-            self.scale * torch.randn(self.num_patches, self.orig_hidden_size)
+            self.scale * torch.randn(self.num_patches, orig_hidden_size)
         )
 
         self.rotary_embedding = Llama4VisionRotaryEmbedding(config)
 
         # layer norms
-        self.layernorm_pre = nn.LayerNorm(self.hidden_size, eps=1e-5)
-        self.layernorm_post = nn.LayerNorm(self.hidden_size, eps=1e-5)
+        self.layernorm_pre = nn.LayerNorm(orig_hidden_size, eps=1e-5)
+        self.layernorm_post = nn.LayerNorm(orig_hidden_size, eps=1e-5)
 
         # encoders
         self.model = Llama4VisionEncoder(
