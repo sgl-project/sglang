@@ -44,6 +44,11 @@ limitations under the License.
 using fptr_t = int64_t;
 
 /*
+ * From csrc/memory
+ */
+at::Tensor weak_ref_tensor(const at::Tensor& tensor);
+
+/*
  * From csrc/allreduce
  */
 #ifdef USE_ROCM
