@@ -69,7 +69,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import RequestStage
+from sglang.srt.managers.schedule_batch import Modality, RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -163,6 +163,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         )
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
 
         # Read model args
         self.model_path = server_args.model_path
@@ -275,6 +278,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+
+        # Recv embedding from encoding server
+        if self.model_config.is_multimodal and self.server_args.language_only:
+            self.recv_from_encoder = get_zmq_socket(
+                context, zmq.PULL, f"tcp://*:{server_args.embedding_port}", True
+            )
+            self.received_embeddings = dict()
+            self.embeddings_lock = asyncio.Lock()
 
         # Request states
         self._chosen_loop = None
@@ -613,6 +624,21 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+
+            if self.server_args.language_only:
+                # Use async lock to avoid race condition
+                async with self.embeddings_lock:
+                    while (
+                        obj.bootstrap_room not in self.received_embeddings
+                        or not self.received_embeddings[obj.bootstrap_room].ready
+                    ):
+                        await self.handle_embedding()
+                    for mm_item in mm_inputs["mm_items"]:
+                        if mm_item.modality == Modality.IMAGE:
+                            mm_item.precomputed_embeddings = self.received_embeddings[
+                                obj.bootstrap_room
+                            ].get()
+                    del self.received_embeddings[obj.bootstrap_room]
         else:
             mm_inputs = None
 
@@ -1380,6 +1406,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
+
+    async def handle_embedding(self):
+        recv_obj = await self.recv_from_encoder.recv_pyobj()
+        if recv_obj.req_id not in self.received_embeddings:
+            self.received_embeddings[recv_obj.req_id] = recv_obj
+        else:
+            self.received_embeddings[recv_obj.req_id].add(recv_obj)
 
     def _handle_batch_output(
         self,

@@ -68,6 +68,9 @@ class MiniLoadBalancer:
                 "Tracing is not supported in this environment. Please install sglang."
             )
             self.enable_trace = False
+        self.encode_urls = router_args.encode_urls
+
+        self.encode_idx = list(range(len(self.encode_urls)))
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -79,13 +82,25 @@ class MiniLoadBalancer:
             logger.warning("[MiniLB] Overriding policy to random")
             router_args.policy = "random"
 
-        if not router_args.pd_disaggregation:
-            raise ValueError("MiniLB only supports PD disaggregation mode")
+        if not router_args.pd_disaggregation and not router_args.e_disaggregation:
+            raise ValueError("MiniLB only supports PD/E disaggregation mode")
 
-        if len(router_args.prefill_urls) == 0 or len(router_args.decode_urls) == 0:
+        if router_args.pd_disaggregation and router_args.e_disaggregation:
             raise ValueError(
-                "MiniLB requires at least one prefill and one decode server"
+                "MiniLB does not support PD and E disaggregation modes at the same time."
             )
+
+        if len(router_args.prefill_urls) == 0:
+            raise ValueError("MiniLB requires at least one prefill server")
+
+        if router_args.pd_disaggregation and len(router_args.decode_urls) == 0:
+            raise ValueError(
+                "The PD disaggregation mode requires at least one decode server."
+            )
+
+        if router_args.e_disaggregation and len(router_args.decode_urls) != 0:
+            logger.warning("The E disaggregation mode doesn't require decode server")
+            router_args.decode_urls = []
 
     def start(self):
         global lb
@@ -96,15 +111,74 @@ class MiniLoadBalancer:
         uvicorn.run(app, host=self.host, port=self.port)
 
     def select_pair(self):
-        assert len(self.prefill_urls) > 0, "No prefill servers available"
-        assert len(self.decode_urls) > 0, "No decode servers available"
         pidx = random.randint(0, len(self.prefill_urls) - 1)
-        didx = random.randint(0, len(self.decode_urls) - 1)
+        if len(self.decode_urls) != 0:
+            didx = random.randint(0, len(self.decode_urls) - 1)
+            decode_url = self.decode_urls[didx]
+        else:
+            decode_url = None
         return (
             self.prefill_urls[pidx],
             self.prefill_bootstrap_ports[pidx],
-            self.decode_urls[didx],
+            decode_url,
         )
+
+    async def encode(self, request_data, encode_urls, endpoint):
+        messages = request_data.get("messages")
+        if messages is None or len(encode_urls) == 0:
+            return
+
+        # Extract mm_items
+        img_list = []
+        for message in messages:
+            for item in message.get("content"):
+                if item.get("type") == "image_url":
+                    img_url = item.get("image_url").get("url")
+                    img_list.append(img_url)
+
+        if len(img_list) == 0:
+            return
+
+        # Split mm_items
+        encode_requests = []
+        random.shuffle(self.encode_idx)
+        num_items_assigned = [
+            (idx + len(img_list)) // len(self.encode_urls) for idx in self.encode_idx
+        ]
+        num_parts = sum(1 for x in num_items_assigned if x != 0)
+        cum_num_items = 0
+        cum_idx = 0
+        for idx, assigned_num in enumerate(num_items_assigned):
+            if assigned_num == 0:
+                continue
+            encode_requests.append(
+                {
+                    "encoder_idx": idx,
+                    "mm_items": img_list[cum_num_items : cum_num_items + assigned_num],
+                    "num_parts": num_parts,
+                    "part_idx": cum_idx,
+                    "req_id": request_data.get("bootstrap_room"),
+                    "bootstrap_host": request_data.get("bootstrap_host"),
+                }
+            )
+            cum_idx += 1
+            cum_num_items += assigned_num
+
+        # Send encode requests
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(
+                total=self.timeout
+            )  # Add timeout for request reliability
+        ) as session:
+            tasks = [
+                session.post(
+                    f"{encode_urls[encode_request['encoder_idx']]}/{endpoint}",
+                    json=encode_request,
+                )
+                for encode_request in encode_requests
+            ]
+
+            await asyncio.gather(*tasks)
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
@@ -128,25 +202,23 @@ class MiniLoadBalancer:
                 headers = {"trace_context": trace_context}
 
             tasks = [
-                session.post(
-                    f"{prefill_server}/{endpoint}",
-                    json=modified_request,
-                    headers=headers,
-                ),
-                session.post(
-                    f"{decode_server}/{endpoint}",
-                    json=modified_request,
-                    headers=headers,
-                ),
+                session.post(f"{prefill_server}/{endpoint}", json=modified_request)
             ]
+            if decode_server is not None:
+                tasks.append(
+                    session.post(f"{decode_server}/{endpoint}", json=modified_request)
+                )
 
             for bootstrap_room in bootstrap_room_list:
                 trace_slice_end("mini_lb_launch", bootstrap_room, auto_next_anon=True)
 
             # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
-
-            if "return_logprob" in modified_request:
+            responses = await asyncio.gather(*tasks)
+            prefill_response = responses[0]
+            decode_response = (
+                responses[1] if decode_server is not None else prefill_response
+            )
+            if "return_logprob" in modified_request and decode_server is not None:
 
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
@@ -200,26 +272,30 @@ class MiniLoadBalancer:
                     headers = {"trace_context": trace_context}
 
                 tasks = [
-                    session.post(
-                        f"{prefill_server}/{endpoint}",
-                        json=modified_request,
-                        headers=headers,
-                    ),
-                    session.post(
-                        f"{decode_server}/{endpoint}",
-                        json=modified_request,
-                        headers=headers,
-                    ),
+                    session.post(f"{prefill_server}/{endpoint}", json=modified_request)
                 ]
+                if decode_server is not None:
+                    tasks.append(
+                        session.post(
+                            f"{decode_server}/{endpoint}", json=modified_request
+                        )
+                    )
 
                 for bootstrap_room in bootstrap_room_list:
                     trace_slice_end(
                         "mini_lb_launch", bootstrap_room, auto_next_anon=True
                     )
                 # Wait for both responses to complete. Since this is streaming, they return immediately.
-                prefill_response, decode_response = await asyncio.gather(*tasks)
+                responses = await asyncio.gather(*tasks)
+                prefill_response = responses[0]
+                decode_response = (
+                    responses[1] if decode_server is not None else prefill_response
+                )
 
-                if modified_request.get("return_logprob", False):
+                if (
+                    modified_request.get("return_logprob", False)
+                    and decode_server is not None
+                ):
                     prefill_chunks = []
                     async for chunk in prefill_response.content:
                         prefill_chunks.append(chunk)
@@ -420,14 +496,20 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-    modified_request = request_data.copy()
-    modified_request.update(
+    bootstrap_room = _generate_bootstrap_room()
+
+    # Send requests to encode server
+    encode_request = request_data.copy()
+    encode_request.update(
         {
+            "bootstrap_room": bootstrap_room,
             "bootstrap_host": hostname,
-            "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
         }
     )
+    asyncio.create_task(lb.encode(encode_request, lb.encode_urls, "encode"))
+
+    modified_request = encode_request.copy()
+    modified_request.update({"bootstrap_port": bootstrap_port})
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
