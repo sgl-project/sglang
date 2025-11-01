@@ -12,7 +12,26 @@ Start your SGLang Pod while specifying 3FS-related labels in the YAML configurat
 ## Step 3: Configure Usrbio Client in SGLang Pod
 The Usrbio client is required for accessing 3FS. Install it in your SGLang Pod using either method below:
 
-**Alternative 1 (Recommend):** Build from source (refer to [setup_usrbio_client.md](setup_usrbio_client.md))
+**Alternative 1 (Recommend):** Built from the source code, the following provides quick installation commands (refer to [setup_usrbio_client.md](setup_usrbio_client.md))
+
+```
+apt-get update && apt-get install -y --no-install-recommends \
+    clang-format-14 clang-14 clang-tidy-14 lld-14 meson google-perftools \
+    libaio-dev libdouble-conversion-dev libdwarf-dev libgflags-dev libgmock-dev libgoogle-perftools-dev liblz4-dev liblzma-dev libuv1-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    apt-get clean
+
+git clone https://github.com/deepseek-ai/3fs 3fs \
+      && cd 3fs \
+      && git checkout 6f029c439d0d22995900ca357d51b37975c6ffb5 \
+      && git submodule update --init --recursive \
+      && ./patches/apply.sh \
+      && CMAKE_BUILD_PARALLEL_LEVEL=32 python3 setup.py bdist_wheel -d dist \
+      && pip install dist/*.whl \
+      && cd .. \
+      && rm -rf 3fs
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.12/dist-packages
+```
 
 **Alternative 2:** Run `pip3 install hf3fs-py-usrbio` (Follow https://pypi.org/project/hf3fs-py-usrbio/#files)
 
