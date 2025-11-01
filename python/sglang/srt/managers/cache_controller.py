@@ -472,8 +472,8 @@ class HiCacheController:
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
-            self.record_stream(host_indices, self.load_stream)
-            self.record_stream(device_indices, self.load_stream)
+            self.record_stream(host_indices, self.write_stream)
+            self.record_stream(device_indices, self.write_stream)
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 

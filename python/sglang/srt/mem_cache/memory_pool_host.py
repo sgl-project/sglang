@@ -7,13 +7,7 @@ from typing import Optional
 import psutil
 import torch
 
-from sglang.srt.mem_cache.memory_pool import (
-    AscendMLAPagedTokenToKVPool,
-    AscendTokenToKVPool,
-    KVCache,
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-)
+from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.utils import is_npu, is_xpu
 
 _is_npu = is_npu()
@@ -282,7 +276,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
-        if is_npu:
+        if _is_npu:
             if layer_id == 0:
                 torch.ops.npu.transfer_kv_dim_exchange(
                     device_pool.k_buffer,
@@ -574,9 +568,9 @@ class MLATokenToKVPoolHost(HostKVCache):
     def init_kv_buffer(self):
         if _is_npu:
             dims = (
-                self.size // self.page_size + 1, 
-                self.layer_num, 
-                self.page_size, 
+                self.size // self.page_size + 1,
+                self.layer_num,
+                self.page_size,
                 1,
             )
             self.k_buffer = torch.empty(

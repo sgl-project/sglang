@@ -24,10 +24,6 @@ from sglang.srt.metrics.collector import StorageMetricsCollector
 
 logger = logging.getLogger(__name__)
 
-from sglang.srt.utils import is_npu
-
-_is_npu = is_npu()
-
 
 class HiRadixCache(RadixCache):
 
