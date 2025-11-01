@@ -614,7 +614,12 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
-            async with session.post(url=api_url) as response:
+            payload = {
+                "output_dir": os.getenv("SGLANG_TORCH_PROFILER_DIR"),
+            }
+            async with session.post(
+                url=api_url, json=payload, headers=get_auth_headers()
+            ) as response:
                 if response.status == 200:
                     output.success = True
                 else:
