@@ -285,6 +285,10 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+        self._capture_seq_lens_cpu: Optional[torch.Tensor] = None
+
+    def set_capture_seq_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> None:
+        self._capture_seq_lens_cpu = seq_lens_cpu
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -539,6 +543,11 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
+        cpu_view = (
+            self._capture_seq_lens_cpu[:bs]
+            if self._capture_seq_lens_cpu is not None
+            else None
+        )
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
@@ -559,7 +568,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_decode.update(
                 req_pool_indices,
                 seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
+                (cpu_view if cpu_view is not None else seq_lens.cpu()),
                 seq_lens_sum,
                 decode_wrappers=decode_wrappers,
                 encoder_lens=encoder_lens,
@@ -593,7 +602,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
+                (cpu_view if cpu_view is not None else seq_lens.cpu()),
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=prefill_wrappers,
@@ -623,7 +632,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
+                (cpu_view if cpu_view is not None else seq_lens.cpu()),
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=prefill_wrappers,
@@ -1208,7 +1217,7 @@ class FlashInferIndicesUpdaterPrefill:
                 # window attention use paged only
                 paged_kernel_lens = torch.minimum(
                     seq_lens,
-                    torch.tensor(self.sliding_window_size) + seq_lens - prefix_lens,
+                    seq_lens - prefix_lens + self.sliding_window_size,
                 )
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
             else:
@@ -1435,6 +1444,11 @@ class FlashInferMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+
+    def set_capture_seq_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> None:
+        for ab in self.attn_backends:
+            if hasattr(ab, "set_capture_seq_lens_cpu"):
+                ab.set_capture_seq_lens_cpu(seq_lens_cpu)
 
     def common_template(
         self,
