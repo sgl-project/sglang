@@ -875,11 +875,7 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
     elif torch_native and custom_routing_function is None:
-        # assert (
-        #     num_token_non_padded is None
-        # ), "num_token_non_padded is not yet supported in fused_topk_native"
-        # assert expert_location_dispatch_info is None
-        # assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        assert not apply_routed_scaling_factor_on_output, "Not implemented"
         if _use_gating_topk_fused:
             topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k_softmax(
                 x=router_logits,

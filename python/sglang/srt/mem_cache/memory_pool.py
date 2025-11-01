@@ -1760,8 +1760,6 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
             )
 
         import torch_npu
-        if loc.dtype != torch.int32:
-            loc = loc.to(torch.int32)
 
         torch_npu._npu_reshape_and_cache(
             key=cache_k,

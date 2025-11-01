@@ -614,7 +614,12 @@ def set_cmo_stream(stream):
     cmo_stream = stream
 
 
-def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE = 1000000000):
+def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
+    """
+    Maximum size (bytes) for each prefetch operation.
+    This affects the time spent in prefetch:
+        time ≈ PREFETCH_MAX_SIZE / system_bandwidth
+    """
     import torch_npu
 
     stream = get_cmo_stream()
