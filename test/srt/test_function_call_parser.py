@@ -2215,38 +2215,34 @@ class TestGlm4MoeDetector(unittest.TestCase):
         ]
 
         def check_params(result):
-            self.assertEqual(len(result.calls), 1)
-            self.assertEqual(result.calls[0].name, "todo_write")
+            self.assertEqual(1, len(result.calls))
+            self.assertEqual("todo_write", result.calls[0].name)
             params = json.loads(result.calls[0].parameters)
-            self.assertIsInstance(
-                params["todos"],
-                list,
-                f"todos should be a list, not a string",
-            )
-            self.assertEqual(len(params["todos"]), 4)
-            self.assertEqual(params["todos"][0]["id"], "1")
+            self.assertIsInstance(params["todos"], list)
+            self.assertEqual(4, len(params["todos"]))
+            self.assertEqual("1", params["todos"][0]["id"])
             self.assertEqual(
-                params["todos"][0]["task"],
                 "Check for hard-coded issues in the backend code",
+                params["todos"][0]["task"],
             )
-            self.assertEqual(params["todos"][0]["status"], "in_progress")
-            self.assertEqual(params["todos"][1]["id"], "2")
+            self.assertEqual("in_progress", params["todos"][0]["status"])
+            self.assertEqual("2", params["todos"][1]["id"])
             self.assertEqual(
-                params["todos"][1]["task"],
                 "Check for hard-coded issues in the frontend code",
+                params["todos"][1]["task"],
             )
-            self.assertEqual(params["todos"][1]["status"], "pending")
-            self.assertEqual(params["todos"][2]["id"], "3")
+            self.assertEqual("pending", params["todos"][1]["status"])
+            self.assertEqual("3", params["todos"][2]["id"])
             self.assertEqual(
-                params["todos"][2]["task"],
                 "Check for code violating the Single Responsibility Principle",
+                params["todos"][2]["task"],
             )
-            self.assertEqual(params["todos"][2]["status"], "pending")
-            self.assertEqual(params["todos"][3]["id"], "4")
+            self.assertEqual("pending", params["todos"][2]["status"])
+            self.assertEqual("4", params["todos"][3]["id"])
             self.assertEqual(
-                params["todos"][3]["task"], "Generate a rectification proposal report"
+                "Generate a rectification proposal report", params["todos"][3]["task"]
             )
-            self.assertEqual(params["todos"][3]["status"], "pending")
+            self.assertEqual("pending", params["todos"][3]["status"])
 
         # Simulate the raw response from GLM-4.6 model with normal and escaped JSON in XML
         result = self.detector.detect_and_parse(
@@ -2262,6 +2258,41 @@ class TestGlm4MoeDetector(unittest.TestCase):
         )
         check_params(result)
 
+        def check_single_todos(tool_result, expected):
+            self.assertEqual(1, len(tool_result.calls))
+            self.assertEqual("todo_write", tool_result.calls[0].name)
+            params = json.loads(tool_result.calls[0].parameters)
+            self.assertIsInstance(params["todos"], list)
+            self.assertEqual(1, len(params["todos"]))
+            self.assertEqual("1", params["todos"][0]["id"])
+            self.assertEqual(expected, params["todos"][0]["task"])
+            self.assertEqual("pending", params["todos"][0]["status"])
+
+        # Test with escaped JSON containing backslashes in content (e.g., Windows paths)
+        expected_path = r"Check file at C:\Users\test.txt"
+        result = self.detector.detect_and_parse(
+            """<tool_call>todo_write\n<arg_key>todos</arg_key>\n<arg_value>[{\"id\": \"1\", \"task\": \"Check file at C:\\\\Users\\\\test.txt\", \"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_path)
+        result = self.detector.detect_and_parse(
+            r"""<tool_call>todo_write\n<arg_key>todos</arg_key>\n<arg_value>[{\"id\": \"1\", \"task\": \"Check file at C:\\\\Users\\\\test.txt\", \"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_path)
+
+        # Should contain literal \n, not actual newline
+        expected_output = r"Print \n to see newline"
+        result = self.detector.detect_and_parse(
+            """<tool_call>todo_write\n<arg_key>todos</arg_key>\n<arg_value>[{\"id\": \"1\", \"task\": \"Print \\\\n to see newline\",\"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_output)
+        result = self.detector.detect_and_parse(
+            r"""<tool_call>todo_write\n<arg_key>todos</arg_key>\n<arg_value>[{\"id\": \"1\", \"task\": \"Print \\\\n to see newline\",\"status\": \"pending\"}]</arg_value></tool_call>""",
+            tools_with_array,
+        )
+        check_single_todos(result, expected_output)
 
 class TestJsonArrayParser(unittest.TestCase):
     def setUp(self):
