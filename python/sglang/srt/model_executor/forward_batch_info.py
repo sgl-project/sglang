@@ -184,6 +184,10 @@ class ForwardBatch:
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # For mix chunk
+    running_decode_bs: int
+    prefill_input_ids: int
+
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
@@ -360,6 +364,8 @@ class ForwardBatch:
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
+            running_decode_bs=batch.running_decode_bs,
+            prefill_input_ids=batch.prefill_input_ids,
         )
         device = model_runner.device
 
