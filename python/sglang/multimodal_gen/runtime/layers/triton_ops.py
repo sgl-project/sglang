@@ -20,64 +20,6 @@ from torch import Tensor
     key=["inner_dim"],
 )
 @triton.jit
-def _fused_scale_shift_broadcast_kernel(
-    output_ptr,
-    normalized_ptr,
-    scale_ptr,
-    shift_ptr,
-    rows,
-    inner_dim,
-    seq_len,
-    scale_stride_b,
-    scale_stride_t,
-    scale_stride_c,
-    shift_stride_b,
-    shift_stride_t,
-    shift_stride_c,
-    BLOCK_N: tl.constexpr,
-):
-    pid_row = tl.program_id(0)
-    pid_col = tl.program_id(1)
-
-    col_offsets = pid_col * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = col_offsets < inner_dim
-
-    # Pointers for normalized and output
-    row_base = pid_row * inner_dim
-    norm_ptrs = normalized_ptr + row_base + col_offsets
-    out_ptrs = output_ptr + row_base + col_offsets
-
-    # Pointers for scale and shift using strides
-    b_idx = pid_row // seq_len
-    t_idx = pid_row % seq_len
-
-    scale_offset = b_idx * scale_stride_b + t_idx * scale_stride_t
-    scale_ptrs = scale_ptr + scale_offset + col_offsets * scale_stride_c
-
-    shift_offset = b_idx * shift_stride_b + t_idx * shift_stride_t
-    shift_ptrs = shift_ptr + shift_offset + col_offsets * shift_stride_c
-
-    normalized = tl.load(norm_ptrs, mask=mask, other=0.0)
-    scale = tl.load(scale_ptrs, mask=mask, other=0.0)
-    shift = tl.load(shift_ptrs, mask=mask, other=0.0)
-
-    one = tl.full([BLOCK_N], 1.0, dtype=scale.dtype)
-    output = normalized * (one + scale) + shift
-
-    tl.store(out_ptrs, output, mask=mask)
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 64}, num_warps=2),
-        triton.Config({"BLOCK_N": 128}, num_warps=4),
-        triton.Config({"BLOCK_N": 256}, num_warps=4),
-        triton.Config({"BLOCK_N": 512}, num_warps=4),
-        triton.Config({"BLOCK_N": 1024}, num_warps=8),
-    ],
-    key=["inner_dim"],
-)
-@triton.jit
 def _fused_scale_shift_4d_kernel(
     output_ptr,
     normalized_ptr,
@@ -120,75 +62,182 @@ def _fused_scale_shift_4d_kernel(
     tl.store(out_ptrs, output, mask=mask)
 
 
-# FIXME: illegal memory access, disabled for now
-def fused_scale_shift(
-    normalized: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-) -> torch.Tensor:
-    assert False, "Disabled for now"
-    output = torch.empty_like(normalized)
+@triton.jit
+def fuse_scale_shift_kernel_blc_opt(
+    x_ptr,
+    shift_ptr,
+    scale_ptr,
+    y_ptr,
+    B,
+    L,
+    C,
+    stride_x_b,
+    stride_x_l,
+    stride_x_c,
+    stride_s_b,
+    stride_s_l,
+    stride_s_c,
+    stride_sc_b,
+    stride_sc_l,
+    stride_sc_c,
+    SCALE_IS_SCALAR: tl.constexpr,
+    SHIFT_IS_SCALAR: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    pid_l = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    pid_b = tl.program_id(2)
 
-    batch_size, seq_len, inner_dim = normalized.shape
-    assert normalized.is_contiguous()
+    l_offsets = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    c_offsets = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
 
-    rows = batch_size * seq_len
-    normalized_2d = normalized.view(rows, inner_dim)
-    output_2d = output.view(rows, inner_dim)
+    mask_l = l_offsets < L
+    mask_c = c_offsets < C
+    mask = mask_l[:, None] & mask_c[None, :]
 
-    grid = lambda META: (rows, triton.cdiv(inner_dim, META["BLOCK_N"]))
+    x_off = (
+        pid_b * stride_x_b
+        + l_offsets[:, None] * stride_x_l
+        + c_offsets[None, :] * stride_x_c
+    )
+    x = tl.load(x_ptr + x_off, mask=mask, other=0)
+
+    if SHIFT_IS_SCALAR:
+        shift_val = tl.load(shift_ptr)
+        shift = tl.full((BLOCK_L, BLOCK_C), shift_val, dtype=shift_val.dtype)
+    else:
+        s_off = (
+            pid_b * stride_s_b
+            + l_offsets[:, None] * stride_s_l
+            + c_offsets[None, :] * stride_s_c
+        )
+        shift = tl.load(shift_ptr + s_off, mask=mask, other=0)
+
+    if SCALE_IS_SCALAR:
+        scale_val = tl.load(scale_ptr)
+        scale = tl.full((BLOCK_L, BLOCK_C), scale_val, dtype=scale_val.dtype)
+    else:
+        sc_off = (
+            pid_b * stride_sc_b
+            + l_offsets[:, None] * stride_sc_l
+            + c_offsets[None, :] * stride_sc_c
+        )
+        scale = tl.load(scale_ptr + sc_off, mask=mask, other=0)
+
+    y = x * (1 + scale) + shift
+    tl.store(y_ptr + x_off, y, mask=mask)
+
+
+def fuse_scale_shift_kernel(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    block_l: int = 128,
+    block_c: int = 128,
+):
+    assert x.is_cuda and scale.is_cuda
+    assert x.is_contiguous()
+
+    B, L, C = x.shape
+    output = torch.empty_like(x)
 
     if scale.dim() == 4:
-        # scale: [B, F, 1, C]
+        # scale/shift: [B, F, 1, C]
+        rows = B * L
+        x_2d = x.view(rows, C)
+        output_2d = output.view(rows, C)
+        grid = lambda META: (rows, triton.cdiv(C, META["BLOCK_N"]))
         num_frames = scale.shape[1]
         assert (
-            seq_len % num_frames == 0
+            L % num_frames == 0
         ), "seq_len must be divisible by num_frames for 4D scale/shift"
-        frame_seqlen = seq_len // num_frames
+        frame_seqlen = L // num_frames
 
-        # Pass a view, not materialized tensor
-        scale_reshaped = scale.squeeze(2).reshape(-1, inner_dim).contiguous()
-        shift_reshaped = shift.squeeze(2).reshape(-1, inner_dim).contiguous()
+        # Compact [B, F, C] without the singleton dim into [B*F, C]
+        scale_reshaped = scale.squeeze(2).reshape(-1, C).contiguous()
+        shift_reshaped = shift.squeeze(2).reshape(-1, C).contiguous()
 
         _fused_scale_shift_4d_kernel[grid](
             output_2d,
-            normalized_2d,
+            x_2d,
             scale_reshaped,
             shift_reshaped,
             rows,
-            inner_dim,
-            seq_len,
+            C,
+            L,
             num_frames,
             frame_seqlen,
         )
     else:
-        # Handle broadcasting for dims 1, 2, 3 by passing strides
-        # This is a cheap view operation
-        scale_expanded = scale.expand(batch_size, seq_len, inner_dim)
-        shift_expanded = shift.expand(batch_size, seq_len, inner_dim)
+        # 2D: [B, C] or [1, C]  -> treat as [B, 1, C] and broadcast over L
+        # 3D: [B, L, C] (or broadcastable variants like [B, 1, C], [1, L, C], [1, 1, C])
+        # Also support scalar (0D or 1-element)
+        if scale.dim() == 0 or (scale.dim() == 1 and scale.numel() == 1):
+            scale_blc = scale.reshape(1)
+        elif scale.dim() == 2:
+            scale_blc = scale[:, None, :]
+        elif scale.dim() == 3:
+            scale_blc = scale
+        else:
+            raise ValueError("scale must be 0D/1D(1)/2D/3D or 4D")
 
-        # Get strides
-        s_s_b, s_s_t, s_s_c = scale_expanded.stride()
-        s_h_b, s_h_t, s_h_c = shift_expanded.stride()
+        if shift.dim() == 0 or (shift.dim() == 1 and shift.numel() == 1):
+            shift_blc = shift.reshape(1)
+        elif shift.dim() == 2:
+            shift_blc = shift[:, None, :]
+        elif shift.dim() == 3:
+            shift_blc = shift
+        else:
+            # broadcast later via expand if possible
+            shift_blc = shift
 
-        # Pass original tensors to kernel, which are smaller
-        scale_c = scale.contiguous()
-        shift_c = shift.contiguous()
+        need_scale_scalar = scale_blc.dim() == 1 and scale_blc.numel() == 1
+        need_shift_scalar = shift_blc.dim() == 1 and shift_blc.numel() == 1
 
-        _fused_scale_shift_broadcast_kernel[grid](
-            output_2d,
-            normalized_2d,
-            scale_c,
-            shift_c,
-            rows,
-            inner_dim,
-            seq_len,
-            s_s_b,
-            s_s_t,
-            s_s_c,
-            s_h_b,
-            s_h_t,
-            s_h_c,
+        if not need_scale_scalar:
+            scale_exp = scale_blc.expand(B, L, C)
+            s_sb, s_sl, s_sc = scale_exp.stride()
+        else:
+            s_sb = s_sl = s_sc = 0
+
+        if not need_shift_scalar:
+            shift_exp = shift_blc.expand(B, L, C)
+            sh_sb, sh_sl, sh_sc = shift_exp.stride()
+        else:
+            sh_sb = sh_sl = sh_sc = 0
+
+        # If both scalars and both zero, copy fast-path
+        if need_scale_scalar and need_shift_scalar:
+            if (scale_blc.abs().max() == 0) and (shift_blc.abs().max() == 0):
+                output.copy_(x)
+                return output
+
+        grid = (triton.cdiv(L, block_l), triton.cdiv(C, block_c), B)
+        fuse_scale_shift_kernel_blc_opt[grid](
+            x,
+            shift_blc if need_shift_scalar else shift_exp,
+            scale_blc if need_scale_scalar else scale_exp,
+            output,
+            B,
+            L,
+            C,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            sh_sb,
+            sh_sl,
+            sh_sc,
+            s_sb,
+            s_sl,
+            s_sc,
+            SCALE_IS_SCALAR=need_scale_scalar,
+            SHIFT_IS_SCALAR=need_shift_scalar,
+            BLOCK_L=block_l,
+            BLOCK_C=block_c,
+            num_warps=4,
+            num_stages=2,
         )
-
     return output
 
 

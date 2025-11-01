@@ -8,8 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
-import triton
-import triton.language as tl
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -19,7 +17,10 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConf
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
-from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embedding
+from sglang.multimodal_gen.runtime.layers.triton_ops import (
+    apply_rotary_embedding,
+    fuse_scale_shift_kernel,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -287,10 +288,10 @@ class QwenImageCrossAttention(nn.Module):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
-            supported_attention_backends=(
+            supported_attention_backends={
                 AttentionBackendEnum.FA3,
                 AttentionBackendEnum.TORCH_SDPA,
-            ),
+            },
         )
 
     def forward(
@@ -378,90 +379,6 @@ class QwenImageCrossAttention(nn.Module):
         return img_attn_output, txt_attn_output
 
 
-@triton.jit
-def modulate_kernel(
-    x_ptr,
-    shift_ptr,
-    scale_ptr,
-    y_ptr,
-    B,
-    L,
-    C,
-    stride_x_b,
-    stride_x_l,
-    stride_x_c,
-    stride_s_b,
-    stride_s_c,
-    stride_sc_b,
-    stride_sc_c,
-    BLOCK_L: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    pid_l = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    pid_b = tl.program_id(2)
-
-    l_offsets = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
-    c_offsets = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-
-    mask_l = l_offsets < L
-    mask_c = c_offsets < C
-    mask = mask_l[:, None] & mask_c[None, :]
-
-    x_off = (
-        pid_b * stride_x_b
-        + l_offsets[:, None] * stride_x_l
-        + c_offsets[None, :] * stride_x_c
-    )
-    s_off = pid_b * stride_s_b + c_offsets[None, :] * stride_s_c
-    sc_off = pid_b * stride_sc_b + c_offsets[None, :] * stride_sc_c
-
-    x = tl.load(x_ptr + x_off, mask=mask, other=0)
-    shift = tl.load(shift_ptr + s_off, mask=mask_c[None, :], other=0)
-    scale = tl.load(scale_ptr + sc_off, mask=mask_c[None, :], other=0)
-
-    # 广播到 (BLOCK_L, BLOCK_C)
-    shift = tl.broadcast_to(shift, (BLOCK_L, BLOCK_C))
-    scale = tl.broadcast_to(scale, (BLOCK_L, BLOCK_C))
-
-    y = x * (1 + scale) + shift
-    tl.store(y_ptr + x_off, y, mask=mask)
-
-
-def modulate_triton(
-    x: torch.Tensor, mod_params: torch.Tensor, block_l: int = 128, block_c: int = 128
-):
-    assert x.is_cuda and mod_params.is_cuda, "Triton 仅支持 CUDA/GPU"
-    B, L, C = x.shape
-    shift, scale, gate = mod_params.chunk(3, dim=-1)  # [B, C] 各一
-
-    y = torch.empty_like(x)
-
-    grid = (triton.cdiv(L, block_l), triton.cdiv(C, block_c), B)
-    modulate_kernel[grid](
-        x,
-        shift,
-        scale,
-        y,
-        B,
-        L,
-        C,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        shift.stride(0),
-        shift.stride(1),
-        scale.stride(0),
-        scale.stride(1),
-        BLOCK_L=block_l,
-        BLOCK_C=block_c,
-        num_warps=4,
-        num_stages=2,
-    )
-    # gate.unsqueeze(1) 是 view，不需要在 kernel 里做
-    return y, gate.unsqueeze(1)
-
-
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -514,10 +431,8 @@ class QwenImageTransformerBlock(nn.Module):
 
     def _modulate(self, x, mod_params):
         """Apply modulation to input tensor"""
-        # TODO: needs further profile
-        return modulate_triton(x, mod_params)
         shift, scale, gate = mod_params.chunk(3, dim=-1)
-        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate.unsqueeze(1)
+        return fuse_scale_shift_kernel(x, scale, shift), gate.unsqueeze(1)
 
     def forward(
         self,

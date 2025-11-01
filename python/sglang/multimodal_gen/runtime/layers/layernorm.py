@@ -10,7 +10,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.layers.triton_ops import norm_infer, rms_norm_fn
+from sglang.multimodal_gen.runtime.layers.triton_ops import (
+    fuse_scale_shift_kernel,
+    norm_infer,
+    rms_norm_fn,
+)
 from sglang.multimodal_gen.runtime.utils.common import (
     get_bool_env_var,
     is_cpu,
@@ -296,7 +300,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                     hidden_size, elementwise_affine=elementwise_affine, eps=eps
                 )
             else:
-                self.norm = nn.LayerNorm(
+                self.norm = LayerNorm(
                     hidden_size,
                     elementwise_affine=elementwise_affine,
                     eps=eps,
@@ -353,19 +357,11 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
         #     scale,
         #     shift,
         # )
-        # Apply scale and shift
-        if isinstance(scale, torch.Tensor) and scale.dim() == 4:
-            # scale.shape: [batch_size, num_frames, 1, inner_dim]
-            # shift.shape: [batch_size, num_frames, 1, inner_dim]
-            num_frames = scale.shape[1]
-            frame_seqlen = normalized.shape[1] // num_frames
-            modulated = (
-                normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
-                * (1.0 + scale)
-                + shift
-            ).flatten(1, 2)
-        else:
-            modulated = normalized * (1.0 + scale) + shift
+        modulated = fuse_scale_shift_kernel(
+            normalized,
+            scale,
+            shift,
+        )
         return modulated, residual_output
 
 
