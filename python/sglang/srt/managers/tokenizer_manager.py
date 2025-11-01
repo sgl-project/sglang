@@ -455,7 +455,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     )
                     if (
                         not load_result.success
-                        and "already exists" not in load_result.error_message
+                        and "already loaded" not in load_result.error_message
                     ):
                         raise ValueError(
                             f"Failed to implicitly load LoRA adapter {lora_path}: {load_result.error_message}"
