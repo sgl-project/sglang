@@ -2792,6 +2792,8 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
+        # Reconfigure logger as Scheduler init may have dependencies that override logging config.
+        configure_logger(server_args, prefix=prefix)
         pipe_writer.send(
             {
                 "status": "ready",
