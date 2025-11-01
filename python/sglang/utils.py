@@ -120,15 +120,36 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
 
 
 class HttpResponse:
-    def __init__(self, resp):
-        self.resp = resp
+    """Eager response wrapper to avoid leaking sockets:
+    store status + body (bytes) + headers dict; do not keep the live response object.
+    """
+
+    def __init__(self, status: int, data: bytes, headers: Optional[dict] = None):
+        self._status = status
+        self._data = data
+        self._headers = headers or {}
 
     def json(self):
-        return json.loads(self.resp.read())
+        return json.loads(self._data)
 
     @property
     def status_code(self):
-        return self.resp.status
+        return self._status
+
+    @property
+    def headers(self):
+        return self._headers
+
+    @property
+    def content(self):
+        return self._data
+
+    @property
+    def text(self):
+        try:
+            return self._data.decode("utf-8")
+        except Exception:
+            return self._data.decode("utf-8", errors="replace")
 
 
 def http_request(
@@ -139,35 +160,51 @@ def http_request(
     verify=None,
     method: Optional[str] = None,
 ):
-    """A faster version of requests.post with low-level urllib API."""
+    """A faster version of requests.post with low-level urllib API.
+    Non-streaming path eagerly reads & closes the response to prevent FD leaks.
+    """
+    from urllib.error import HTTPError  # local import to avoid NameError in error path
+
     headers = {"Content-Type": "application/json; charset=utf-8"}
 
-    # add the Authorization header if an api key is provided
     if api_key is not None:
         headers["Authorization"] = f"Bearer {api_key}"
 
     if stream:
+        # Streaming branch unchanged (caller must consume and close the stream)
         return requests.post(url, json=json, stream=True, headers=headers)
-    else:
-        req = urllib.request.Request(url, headers=headers, method=method)
-        if json is None:
-            data = None
-        else:
-            data = bytes(dumps(json), encoding="utf-8")
 
-        try:
-            if sys.version_info >= (3, 13):
-                # Python 3.13+: Use SSL context (cafile removed)
-                if verify and isinstance(verify, str):
-                    context = ssl.create_default_context(cafile=verify)
-                else:
-                    context = ssl.create_default_context()
-                resp = urllib.request.urlopen(req, data=data, context=context)
+    # Non-streaming: read fully with a context manager, then return a wrapped response
+    req = urllib.request.Request(url, headers=headers, method=method)
+    data = None if json is None else bytes(dumps(json), encoding="utf-8")
+
+    try:
+        if sys.version_info >= (3, 13):
+            # Python 3.13+: 'cafile' param removed; use an SSL context
+            if verify and isinstance(verify, str):
+                context = ssl.create_default_context(cafile=verify)
             else:
-                resp = urllib.request.urlopen(req, data=data, cafile=verify)
-            return HttpResponse(resp)
-        except urllib.error.HTTPError as e:
-            return HttpResponse(e)
+                context = ssl.create_default_context()
+            with urllib.request.urlopen(req, data=data, context=context) as resp:
+                body = resp.read()
+                return HttpResponse(
+                    getattr(resp, "status", 200), body, dict(resp.headers)
+                )
+        else:
+            with urllib.request.urlopen(req, data=data, cafile=verify) as resp:
+                body = resp.read()
+                return HttpResponse(
+                    getattr(resp, "status", 200), body, dict(resp.headers)
+                )
+    except HTTPError as e:
+        # Read the error body as well and return a closed HttpResponse wrapper
+        try:
+            body = e.read()
+        except Exception:
+            body = b""
+        status = getattr(e, "code", 500)
+        headers_dict = dict(getattr(e, "headers", {}) or {})
+        return HttpResponse(status, body, headers_dict)
 
 
 def encode_image_base64(image_path: Union[str, bytes]):
