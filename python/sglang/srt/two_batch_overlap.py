@@ -24,6 +24,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
     MooncakeEPDispatcher,
+    MoRIDispatcher,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -73,6 +74,8 @@ def compute_split_seq_index(
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
+    if get_moe_a2a_backend().is_mori():
+        return None
     if forward_mode == ForwardMode.EXTEND:
         assert extend_lens is not None
         return _split_extend_seqs(extend_lens)
@@ -968,6 +971,8 @@ def _model_forward_tbo_merge_outputs(output_a, output_b):
 # -------------------------------- Utilities and wrappers ---------------------------------------
 
 
+# TODO: We must change the name 'DeepEP' to 'All2All' later
+#       because mori also using this function.
 class MaybeTboDeepEPDispatcher:
     def __init__(self, **kwargs):
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
@@ -978,6 +983,10 @@ class MaybeTboDeepEPDispatcher:
         elif get_moe_a2a_backend().is_mooncake():
             self._inners = [
                 MooncakeEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_mori():
+            self._inners = [
+                MoRIDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):

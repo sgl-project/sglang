@@ -12,6 +12,11 @@ if TYPE_CHECKING:
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
+        DeepEPNormalOutput,
+        MoRILLCombineInput,
+        MoRILLOutput,
+        MoRINormalCombineInput,
+        MoRINormalOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -52,12 +57,32 @@ class DispatchOutputChecker:
     ) -> TypeGuard[Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput]]:
         return dispatch_output.format.is_deepep()
 
+    @staticmethod
+    def format_is_mori(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[Union[MoRINormalOutput, MoRILLOutput]]:
+        return dispatch_output.format.is_mori()
+
+    @staticmethod
+    def format_is_mori_normal(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MoRINormalOutput]:
+        return dispatch_output.format.is_mori_normal()
+
+    @staticmethod
+    def format_is_mori_ll(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MoRILLOutput]:
+        return dispatch_output.format.is_mori_ll()
+
 
 class DispatchOutputFormat(Enum):
 
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    MORI_NORMAL = "mori_normal"
+    MORI_LL = "mori_ll"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -73,6 +98,18 @@ class DispatchOutputFormat(Enum):
             DispatchOutputFormat.DEEPEP_NORMAL,
             DispatchOutputFormat.DEEPEP_LL,
         ]
+
+    def is_mori(self) -> bool:
+        return self in [
+            DispatchOutputFormat.MORI_NORMAL,
+            DispatchOutputFormat.MORI_LL,
+        ]
+
+    def is_mori_normal(self) -> bool:
+        return self == DispatchOutputFormat.MORI_NORMAL
+
+    def is_mori_ll(self) -> bool:
+        return self == DispatchOutputFormat.MORI_LL
 
 
 @runtime_checkable
@@ -116,11 +153,34 @@ class CombineInputChecker:
             CombineInputFormat.DEEPEP_LL,
         ]
 
+    @staticmethod
+    def format_is_mori_normal(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MoRINormalCombineInput]:
+        return combine_input.format == CombineInputFormat.MORI_NORMAL
+
+    @staticmethod
+    def format_is_mori_ll(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MoRILLCombineInput]:
+        return combine_input.format == CombineInputFormat.MORI_LL
+
+    @staticmethod
+    def format_is_mori(
+        combine_input: CombineInput,
+    ) -> TypeGuard[Union[MoRINormalOutput, MoRILLOutput]]:
+        return combine_input.format in [
+            CombineInputFormat.MORI_NORMAL,
+            CombineInputFormat.MORI_LL,
+        ]
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    MORI_NORMAL = "mori_normal"
+    MORI_LL = "mori_ll"
 
 
 @runtime_checkable
