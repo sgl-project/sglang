@@ -12,7 +12,10 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     maybe_init_distributed_environment_and_model_parallel,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_cfg_group
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_cfg_group,
+    get_tp_group,
+)
 from sglang.multimodal_gen.runtime.pipelines import build_pipeline
 from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
@@ -52,6 +55,9 @@ class GPUWorker:
         self.init_device_and_model()
         self.sp_group = get_sp_group()
         self.sp_cpu_group = self.sp_group.cpu_group
+        self.tp_group = get_tp_group()
+        self.tp_cpu_group = self.tp_group.cpu_group
+
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
 

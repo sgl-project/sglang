@@ -681,8 +681,8 @@ class ServerArgs:
             provided_args = {**config_args, **provided_args}
 
         # Handle special cases
-        if "tp_size" in provided_args:
-            provided_args["tp"] = provided_args.pop("tp_size")
+        # if "tp_size" in provided_args:
+        #     provided_args["tp"] = provided_args.pop("tp_size")
 
         return cls.from_dict(provided_args)
 
@@ -779,7 +779,7 @@ class ServerArgs:
 
         if self.sp_degree == -1:
             # assume we leave all remaining gpus to sp
-            num_gpus_per_group = self.dp_size
+            num_gpus_per_group = self.dp_size * self.tp_size
             if self.enable_cfg_parallel:
                 num_gpus_per_group *= 2
             if self.num_gpus % num_gpus_per_group != 0:
@@ -895,6 +895,7 @@ class ServerArgs:
 
         # parallelism
         self.check_server_dp_args()
+        # allocate all remaining gpus for sp-size
         self.check_server_sp_args()
 
         if self.enable_cfg_parallel:

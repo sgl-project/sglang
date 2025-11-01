@@ -94,6 +94,14 @@ class Scheduler:
                 src=self.worker.cfg_group.ranks[0],
             )
 
+        if self.server_args.tp_size > 1:
+            recv_reqs = broadcast_pyobj(
+                recv_reqs,
+                self.worker.tp_group.rank,
+                self.worker.tp_cpu_group,
+                src=self.worker.tp_group.ranks[0],
+            )
+
         assert recv_reqs is not None
 
         return recv_reqs
