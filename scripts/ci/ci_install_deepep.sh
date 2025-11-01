@@ -84,10 +84,10 @@ make -j$(nproc) install
 
 # Install DeepEP
 DEEPEP_DIR=/root/.cache/deepep
-GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
-CUDA_VERSION=$(nvidia-smi | grep "CUDA Version" | head -n1 | awk '{print $9}')
 rm -rf ${DEEPEP_DIR}
 if [ "$GRACE_BLACKWELL" = "1" ]; then
+    # We use Tom's DeepEP fork for GB200 for now, which supports fp4 dispatch.
+    GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
     git clone https://github.com/fzyzcjy/DeepEP.git ${DEEPEP_DIR} && \
     pushd ${DEEPEP_DIR} && \
     git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
@@ -99,22 +99,20 @@ else
     git checkout 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee && \
     popd
 fi
-case "$CUDA_VERSION" in \
-    12.8) \
-    CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
-    ;; \
-    12.8.1|12.9.1|13.0.1) \
-    CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
-    ;; \
-    *) \
-    echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
-    ;; \
-esac && \
-if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
-fi
+
 cd ${DEEPEP_DIR}
 if [ "$GRACE_BLACKWELL" = "1" ]; then
+    CUDA_VERSION=$(nvidia-smi | grep "CUDA Version" | head -n1 | awk '{print $9}')
+    if [ "$CUDA_VERSION" = "12.8" ]; then
+        CHOSEN_TORCH_CUDA_ARCH_LIST='10.0'
+    elif awk -v ver="$CUDA_VERSION" 'BEGIN {exit !(ver > 12.8)}'; then
+        CHOSEN_TORCH_CUDA_ARCH_LIST='10.0;10.3'
+    else
+        echo "Unsupported CUDA version for Grace Blackwell: $CUDA_VERSION" && exit 1
+    fi && \
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
+    fi
     NVSHMEM_DIR=/opt/nvshmem/install TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
 else
     python3 setup.py install
