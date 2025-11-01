@@ -2,7 +2,7 @@ import functools
 from typing import Optional
 
 import torch
-from sgl_kernel import silu_and_mul
+from sgl_kernel.elementwise import silu_and_mul
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):

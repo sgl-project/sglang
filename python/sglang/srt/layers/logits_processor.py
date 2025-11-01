@@ -134,10 +134,7 @@ class LogitsMetadata:
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
-            (
-                forward_batch.forward_mode.is_extend()
-                or forward_batch.forward_mode.is_split_prefill()
-            )
+            forward_batch.forward_mode.is_extend()
             and forward_batch.return_logprob
             and not forward_batch.forward_mode.is_target_verify()
         ):
@@ -384,8 +381,8 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices = None
         elif (
             logits_metadata.forward_mode.is_extend()
-            or logits_metadata.forward_mode.is_split_prefill()
-        ) and not logits_metadata.extend_return_logprob:
+            and not logits_metadata.extend_return_logprob
+        ):
             # Prefill without input logprobs.
             if logits_metadata.padded_static_len < 0:
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
