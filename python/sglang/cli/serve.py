@@ -33,7 +33,7 @@ def serve(args, extra_argv):
             execute_serve_cmd(parsed_args, remaining_argv)
         else:
             # Logic for Standard Language Models
-            from sglang.srt.entrypoints.run_server import run_server
+            from sglang.launch_server import run_server
             from sglang.srt.server_args import prepare_server_args
 
             # Add a dummy argument for the program name, expected by prepare_server_args
