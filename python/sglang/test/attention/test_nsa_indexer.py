@@ -208,12 +208,6 @@ class TestNSAIndexer(CustomTestCase):
         self.device = "cuda"
         self.dtype = torch.bfloat16
 
-        # Use class-level supports_fp8 if available
-        if not hasattr(self, 'supports_fp8'):
-            if torch.cuda.is_available():
-                compute_capability = torch.cuda.get_device_capability()
-                self.supports_fp8 = compute_capability[0] >= 9  # Hopper or newer
-
     def _init_model_runner(self, config_override=None):
         """Initialize model runner with optional config override."""
         config = self.config.copy()
@@ -547,11 +541,6 @@ class TestNSAIndexer(CustomTestCase):
         # Using lenient tolerance due to bfloat16 precision and quantization effects
         mean_close = torch.allclose(mean, torch.zeros_like(mean), atol=1e-3)
         var_close = torch.allclose(var, torch.ones_like(var), atol=5e-2)  # More lenient for variance
-
-        if not mean_close:
-            print(f"Mean check failed: max_abs_mean={mean.abs().max().item():.6f}")
-        if not var_close:
-            print(f"Var check failed: max_var_error={(var - 1.0).abs().max().item():.6f}")
 
         self.assertTrue(mean_close, f"Mean not close to 0, max_abs_mean={mean.abs().max().item():.6f}")
         self.assertTrue(var_close, f"Variance not close to 1, max_var_error={(var - 1.0).abs().max().item():.6f}")
