@@ -65,26 +65,24 @@ def get_nccl_mem_pool():
 
 class use_symmetric_memory:
     def __init__(self, group_coordinator: GroupCoordinator):
-        if not is_symmetric_memory_enabled():
-            self.group_coordinator = None
-            self._mem_pool_ctx = None
-            self.is_graph_capture = None
-            self.device = None
-        else:
-            self.group_coordinator = group_coordinator
-            self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
-            self.is_graph_capture = torch.cuda.is_current_stream_capturing()
-            self.device = torch.cuda.current_device()
+        self.enabled = is_symmetric_memory_enabled()
+
+        if not self.enabled:
+            return
+
+        self.group_coordinator = group_coordinator
+        self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
+        self.is_graph_capture = torch.cuda.is_current_stream_capturing()
+        self.device = torch.cuda.current_device()
 
     def __enter__(self):
-        if not is_symmetric_memory_enabled():
+        if not self.enabled:
             return self
+
         assert (
             self.group_coordinator.pynccl_comm is not None
         ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.group_name}'"
-        assert (
-            self.group_coordinator.pynccl_comm.nccl_version >= 22703
-        ), "NCCL version 2.27.3 or higher is required for NCCL symmetric memory"
+
         if self.is_graph_capture:
             assert (
                 _graph_pool_id is not None
@@ -94,16 +92,18 @@ class use_symmetric_memory:
         self._mem_pool_ctx.__enter__()
         return self
 
-    def tag(self, tensor: torch.Tensor):
-        if not is_symmetric_memory_enabled():
-            return
-        tensor.symmetric_memory = True
-
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not is_symmetric_memory_enabled():
+        if not self.enabled:
             return
+
         global _registered_base_addrs
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
+
+        if self.is_graph_capture:
+            torch._C._cuda_beginAllocateCurrentThreadToPool(
+                self.device, _graph_pool_id
+            )
+
         for segment in get_nccl_mem_pool().snapshot():
             if segment["address"] not in _registered_base_addrs:
                 self.group_coordinator.pynccl_comm.register_comm_window_raw(
@@ -111,7 +111,9 @@ class use_symmetric_memory:
                 )
                 _registered_base_addrs.add(segment["address"])
 
-        if self.is_graph_capture:
-            torch._C._cuda_beginAllocateCurrentThreadToPool(
-                self.device, _graph_pool_id
-            )
+    def tag(self, tensor: torch.Tensor):
+        if not self.enabled:
+            return
+
+        tensor.symmetric_memory = True
+
