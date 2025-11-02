@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Set
 
 import torch
@@ -49,6 +50,7 @@ class RadixCacheCpp(BasePrefixCache):
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
+        enable_metrics: bool = False,
         enable_kv_cache_events: bool = False,
         hicache_oracle: bool = False,
         enable_write_cancel: bool = False,
@@ -75,6 +77,9 @@ class RadixCacheCpp(BasePrefixCache):
         self.page_size = page_size
 
         self.tp_group = tp_cache_group
+
+        if enable_metrics:
+            self.init_metrics_collector()
 
         if not use_hicache:
             self.tree = RadixTreeCpp(
@@ -138,9 +143,15 @@ class RadixCacheCpp(BasePrefixCache):
         self.tree.lock_ref(node, True)
 
     def evict(self, num_tokens: int):
+        start_time = time.perf_counter()
         evicted_device_indices = self.tree.evict(num_tokens)
         for indice in evicted_device_indices:
             self.token_to_kv_pool.free(indice)
+        if evicted_device_indices and self.metrics_collector is not None:
+            self.metrics_collector.observe_eviction_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_eviction_num_tokens(num_tokens)
 
     def evictable_size(self):
         return self.tree.evictable_size()

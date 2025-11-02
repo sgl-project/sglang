@@ -422,6 +422,10 @@ class Scheduler(
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
+        # Init metrics stats
+        self.init_metrics(tp_rank, pp_rank, dp_rank)
+        self.init_kv_events(server_args.kv_events_config)
+
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
 
@@ -522,9 +526,6 @@ class Scheduler(
             if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
             else None
         )
-
-        # Init metrics stats
-        self.init_metrics(tp_rank, pp_rank, dp_rank)
 
         if self.enable_kv_cache_events:
             self.init_kv_events(server_args.kv_events_config)
@@ -734,6 +735,7 @@ class Scheduler(
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
+                    enable_metrics=self.enable_metrics,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                 )
             elif self.enable_hierarchical_cache:
@@ -770,6 +772,7 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                     is_eagle=self.spec_algorithm.is_eagle(),
+                    enable_metrics=self.enable_metrics,
                 )
             elif self.is_hybrid_gdn:
                 self.tree_cache = MambaRadixCache(
@@ -777,6 +780,7 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    enable_metrics=self.enable_metrics,
                 )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
@@ -788,6 +792,7 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    enable_metrics=self.enable_metrics,
                     model_config=self.model_config,
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
@@ -800,6 +805,7 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    enable_metrics=self.enable_metrics,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                     eviction_policy=server_args.radix_eviction_policy,
                     is_eagle=self.spec_algorithm.is_eagle(),
