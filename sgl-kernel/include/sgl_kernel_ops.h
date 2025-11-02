@@ -665,6 +665,7 @@ void transfer_kv_all_layer_direct_lf_pf(
 /*
  * From csrc/memory
  */
+at::Tensor weak_ref_tensor(const at::Tensor& tensor);
 void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
 
 /*
