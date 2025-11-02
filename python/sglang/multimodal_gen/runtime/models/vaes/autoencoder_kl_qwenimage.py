@@ -13,6 +13,7 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -832,6 +833,20 @@ class AutoencoderKLQwenImage(nn.Module):
             if self.encoder is not None
             else 0,
         }
+        cuda_device = get_local_torch_device()
+        # FIXME: hardcode
+        dtype = torch.bfloat16
+        latent_channels = config.arch_config.z_dim
+
+        self.shift_factor = (
+            torch.tensor(
+                config.arch_config.latents_mean
+            )
+            .view(1, latent_channels, 1, 1, 1)
+            .to(cuda_device, dtype)
+        )
+        latents_std_tensor = torch.tensor(config.arch_config.latents_std, dtype=dtype, device=cuda_device)
+        self.scaling_factor = (1.0 / latents_std_tensor).view(1, latent_channels, 1, 1, 1)
 
     def enable_tiling(
         self,
@@ -926,7 +941,7 @@ class AutoencoderKLQwenImage(nn.Module):
 
     def encode(
         self, x: torch.Tensor, return_dict: bool = True
-    ) -> Union[AutoencoderKLOutput, Tuple[DiagonalGaussianDistribution]]:
+    ) -> DiagonalGaussianDistribution:
         r"""
         Encode a batch of images into latents.
 
@@ -948,7 +963,7 @@ class AutoencoderKLQwenImage(nn.Module):
 
         if not return_dict:
             return (posterior,)
-        return AutoencoderKLOutput(latent_dist=posterior)
+        return posterior
 
     def _decode(self, z: torch.Tensor, return_dict: bool = True):
         _, _, num_frame, height, width = z.shape
