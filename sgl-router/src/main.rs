@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, ValueEnum};
+use rand::{distr::Alphanumeric, Rng};
 use sglang_router_rs::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
@@ -8,6 +9,7 @@ use sglang_router_rs::{
         RoutingMode, TokenizerCacheConfig,
     },
     core::ConnectionMode,
+    ha::service::HAServerConfig,
     metrics::PrometheusConfig,
     server::{self, ServerConfig},
     service_discovery::ServiceDiscoveryConfig,
@@ -318,6 +320,21 @@ struct CliArgs {
 
     #[arg(long)]
     mcp_config_path: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    ha_enable: bool,
+
+    #[arg(long)]
+    ha_server_name: Option<String>,
+
+    #[arg(long, default_value = "0.0.0.0")]
+    ha_host: String,
+
+    #[arg(long, default_value_t = 39527)]
+    ha_port: u16,
+
+    #[arg(long, num_args = 0..)]
+    peer_urls: Vec<String>,
 }
 
 enum OracleConnectSource {
@@ -628,6 +645,37 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
+        let ha_server_config = if self.ha_enable {
+            let self_name = if let Some(name) = &self.ha_server_name {
+                name.to_string()
+            } else {
+                // If name is not set, use a random name
+                let mut rng = rand::rng();
+                let random_string: String =
+                    (0..4).map(|_| rng.sample(Alphanumeric) as char).collect();
+                format!("HA_{}", random_string)
+            };
+
+            let peer = self
+                .peer_urls
+                .first()
+                .and_then(|url| url.parse::<std::net::SocketAddr>().ok());
+            if let Ok(addr) =
+                format!("{}:{}", self.ha_host, self.ha_port).parse::<std::net::SocketAddr>()
+            {
+                Some(HAServerConfig {
+                    self_name: self_name,
+                    self_addr: addr,
+                    init_peer: peer,
+                })
+            } else {
+                tracing::warn!("Invalid HA server address, so HA server will not be started");
+                None
+            }
+        } else {
+            None
+        };
+
         ServerConfig {
             host: self.host.clone(),
             port: self.port,
@@ -643,6 +691,7 @@ impl CliArgs {
             } else {
                 Some(self.request_id_headers.clone())
             },
+            ha_server_config,
         }
     }
 }

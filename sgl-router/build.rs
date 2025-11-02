@@ -12,6 +12,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Compile the proto file
         .compile_protos(&["src/proto/sglang_scheduler.proto"], &["src/proto"])?;
 
+    tonic_prost_build::configure()
+        // Generate both client and server code
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(
+            &["src/ha/proto/gossip.proto"],
+            &["src/ha/proto"],
+        )?;
+
     println!("cargo:warning=Protobuf compilation completed successfully");
 
     Ok(())
