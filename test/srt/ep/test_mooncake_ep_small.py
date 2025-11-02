@@ -115,7 +115,7 @@ class TestTBO(TestTP):
     ]
 
 
-class TestMooncakeWitchEPLB(TestTP):
+class TestMooncakeWithEPLB(TestTP):
     extra_args = [
         "--tp",
         "4",
