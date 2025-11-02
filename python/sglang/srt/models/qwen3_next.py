@@ -237,7 +237,18 @@ def fused_gdn_gating(
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
     fused_gdn_gating_kernel[grid](
-        g, beta_output, A_log, a, b, dt_bias, seq_len, num_heads, beta, threshold, 8, num_warps=1
+        g,
+        beta_output,
+        A_log,
+        a,
+        b,
+        dt_bias,
+        seq_len,
+        num_heads,
+        beta,
+        threshold,
+        8,
+        num_warps=1,
     )
     return g, beta_output
 
