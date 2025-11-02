@@ -331,17 +331,17 @@ def apply_rope_with_cos_sin_cache_inplace(
         (not is_neox),
         enable_pdl,
         (
-            _view_3d(fused_set_kv_buffer_arg.value)
+            _view_3d(fused_set_kv_buffer_arg.value, head_size)
             if fused_set_kv_buffer_arg is not None
             else None
         ),
         (
-            _view_3d(fused_set_kv_buffer_arg.k_buffer)
+            _view_3d(fused_set_kv_buffer_arg.k_buffer, head_size)
             if fused_set_kv_buffer_arg is not None
             else None
         ),
         (
-            _view_3d(fused_set_kv_buffer_arg.v_buffer)
+            _view_3d(fused_set_kv_buffer_arg.v_buffer, head_size)
             if fused_set_kv_buffer_arg is not None
             else None
         ),
