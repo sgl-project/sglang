@@ -70,13 +70,11 @@ class use_symmetric_memory:
             self._mem_pool_ctx = None
             self.is_graph_capture = None
             self.device = None
-            self.pre_2_8_0 = None
         else:
             self.group_coordinator = group_coordinator
             self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
             self.is_graph_capture = torch.cuda.is_current_stream_capturing()
             self.device = torch.cuda.current_device()
-            self.pre_2_8_0 = version.parse(torch.__version__) < version.parse("2.8.0")
 
     def __enter__(self):
         if not is_symmetric_memory_enabled():
@@ -92,12 +90,7 @@ class use_symmetric_memory:
                 _graph_pool_id is not None
             ), "graph_pool_id is not set under graph capture"
             # Pause graph memory pool to use symmetric memory with cuda graph
-            if self.pre_2_8_0:
-                torch._C._cuda_endAllocateCurrentStreamToPool(
-                    self.device, _graph_pool_id
-                )
-            else:
-                torch._C._cuda_endAllocateToPool(self.device, _graph_pool_id)
+            torch._C._cuda_endAllocateToPool(self.device, _graph_pool_id)
         self._mem_pool_ctx.__enter__()
         return self
 
@@ -113,21 +106,12 @@ class use_symmetric_memory:
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
         for segment in get_nccl_mem_pool().snapshot():
             if segment["address"] not in _registered_base_addrs:
-                if segment["stream"] == 0 and self.pre_2_8_0:
-                    # PyTorch version < 2.8.0 has a multi-thread MemPool bug
-                    # See https://github.com/pytorch/pytorch/issues/152861
-                    # Fixed at https://github.com/pytorch/pytorch/commit/f01e628e3b31852983ab30b25bf251f557ba9c0b
-                    # WAR is to skip allocations on the default stream since the forward_pass thread always runs on a custom stream
-                    continue
                 self.group_coordinator.pynccl_comm.register_comm_window_raw(
                     segment["address"], segment["total_size"]
                 )
                 _registered_base_addrs.add(segment["address"])
 
         if self.is_graph_capture:
-            if self.pre_2_8_0:
-                torch._C._cuda_beginAllocateToPool(self.device, _graph_pool_id)
-            else:
-                torch._C._cuda_beginAllocateCurrentThreadToPool(
-                    self.device, _graph_pool_id
-                )
+            torch._C._cuda_beginAllocateCurrentThreadToPool(
+                self.device, _graph_pool_id
+            )
