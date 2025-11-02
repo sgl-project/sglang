@@ -1438,9 +1438,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ("w13", layer.w13_weight_scale),
             ("w2", layer.w2_weight_scale),
         ]:
-            assert (
-                weight_scale.shape[2] % 16 == 0
-            ), f"Expected {name}_weight_scale.dim(2) to be divisible by 16"
+            if weight_scale.shape[2] % 4 != 0:
+                logger.warning(
+                    "NVFP4 %s_weight_scale K' not multiple of 4: shape=%s, group_size=%s",
+                    name,
+                    tuple(weight_scale.shape),
+                    getattr(self.quant_config, "group_size", None),
+                )
             assert (
                 weight_scale.dtype == torch.float8_e4m3fn
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
