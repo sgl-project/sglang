@@ -369,7 +369,7 @@ def downcast_fp8(
     )
 
 
-def copy_to_gpu_no_ce(input: List[int], output: torch.Tensor):
+def copy_to_gpu_no_ce(input: torch.Tensor, output: torch.Tensor):
     torch.ops.sgl_kernel.copy_to_gpu_no_ce(input, output)
 
 
