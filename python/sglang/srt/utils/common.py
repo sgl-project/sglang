@@ -297,6 +297,7 @@ def xpu_has_xmx_support():
     return False
 
 
+@lru_cache(maxsize=1)
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.

@@ -263,6 +263,10 @@ class FusedSetKVBufferArg:
     cache_loc: torch.Tensor
 
 
+def _view_3d(x, head_size: int):
+    return x.view(x.shape[0], -1, head_size)
+
+
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -317,14 +321,11 @@ def apply_rope_with_cos_sin_cache_inplace(
         assert a.v_scale is None, "v_scale is not yet supported"
         assert a.cache_loc.dtype == torch.int64, f"{a.cache_loc.dtype=}"
 
-    def _view_3d(x):
-        return x.view(x.shape[0], -1, head_size)
-
     torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
-        _view_3d(query),
-        _view_3d(key),
-        _view_3d(query),
-        _view_3d(key),
+        _view_3d(query, head_size),
+        _view_3d(key, head_size),
+        _view_3d(query, head_size),
+        _view_3d(key, head_size),
         cos_sin_cache,
         positions.long(),
         (not is_neox),
