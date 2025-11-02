@@ -91,8 +91,8 @@ diffusion = [
     "torchcodec==0.5.0",
     # required by vsa
     "pytest",
-    "st_attn ==0.0.6",
-    "vsa==0.0.3",
+    "st_attn ==0.0.7",
+    "vsa==0.0.4",
 ]
 
 [tool.uv.extra-build-dependencies]
