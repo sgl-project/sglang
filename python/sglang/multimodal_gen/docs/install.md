@@ -23,11 +23,10 @@ cd sglang
 
 # Install the Python packages
 pip install --upgrade pip
-pip install --no-build-isolation -e "python/.[diffusion]"
+pip install -e "python/.[diffusion]"
 
 # With uv
-uv pip install -U "torch==2.8.0" "setuptools"
-uv pip install --no-build-isolation --prerelease=allow  -e "python/.[diffusion]"
+uv pip install --prerelease=allow  -e "python/.[diffusion]"
 ```
 
 **Quick fixes for common problems:**
