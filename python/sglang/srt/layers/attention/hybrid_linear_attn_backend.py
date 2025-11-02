@@ -625,11 +625,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, actual_seq_len, num_heads, head_k_dim)
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
-        beta = b.sigmoid()
-        g = fused_gdn_gating(A_log, a, dt_bias)
-
-        g = g.unsqueeze(0)
-        beta = beta.unsqueeze(0)
+        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
 
         if is_target_verify:
             core_attn_out = fused_recurrent_gated_delta_rule_update(
