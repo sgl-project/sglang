@@ -992,20 +992,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         merge_query = q_rope is not None
         fused_kv = False  # Track if we used fused KV write path
 
-        # TODO: Check if the condition restrictions (target_verify/draft_extend only) are necessary
-        #       Consider if we can enable FP8 quantize_and_rope for all extend paths safely
-        # For FP8 path in target_verify or draft_extend mode, use quantize_and_rope_for_fp8
         use_fp8_quantize = (
             self.data_type == torch.float8_e4m3fn
             and (
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             )
-            and all(x is not None for x in [q_rope, k_rope, cos_sin_cache])
         )
 
         if use_fp8_quantize:
-            # FP8 path: quantize and apply RoPE with optional fused KV write
+            assert all(
+                x is not None for x in [q_rope, k_rope, cos_sin_cache]
+            ), "For FP8 path in target_verify/draft_extend, need all of q_rope, k_rope and cos_sin_cache to be not None."
+            
             q, k_fp8_nope, k_fp8_rope = self.quantize_and_rope_for_fp8(
                 q,
                 q_rope,
@@ -1020,7 +1019,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             merge_query = False
             # Fused path: K already written to KV cache, function returns None for K outputs
             fused_kv = k_fp8_nope is None and k_fp8_rope is None
-            # Update local variables for subsequent logic
             k = k_fp8_nope
             k_rope = k_fp8_rope
 
