@@ -954,3 +954,47 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             use_wna16=True,
         )
         return StandardCombineInput(hidden_states=output)
+
+
+# Register fake implementations for torch.compile support
+if _is_cuda:
+
+    @torch.library.register_fake("sgl_kernel::gptq_marlin_gemm")
+    def _(
+        a,
+        c,
+        b_q_weight,
+        b_scales,
+        global_scale,
+        b_zeros,
+        g_idx,
+        perm,
+        workspace,
+        b_q_type,
+        size_m,
+        size_n,
+        size_k,
+        is_k_full,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    ):
+        return a.new_empty((size_m, size_n), dtype=a.dtype)
+
+    @torch.library.register_fake("sgl_kernel::awq_dequantize")
+    def _(
+        qweight,
+        scales,
+        qzeros,
+        ch_axis,
+        group_size,
+        num_bits,
+    ):
+        out_shape = qweight.shape[:-1] + (qweight.shape[-1] * 32 // num_bits,)
+        return qweight.new_empty(out_shape, dtype=scales.dtype)
+
+    @torch.library.register_fake("sgl_kernel::awq_marlin_repack")
+    def _(b_q_weight, size_k, size_n, num_bits):
+        return b_q_weight.new_empty(
+            (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
+        )
