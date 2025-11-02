@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools-rust>=1.5.2"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "sglang-router"
-version = "0.2.1"
+version = "0.2.2"
 description = "High-performance Rust-based load balancer for SGLang with multiple routing algorithms and prefill-decode disaggregation support"
 authors = [
     {name = "Byron Hsu", email = "byronhsu1230@gmail.com"},
@@ -18,6 +18,13 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 
 dependencies = [
@@ -34,10 +41,6 @@ dev = [
 ]
 
 
-# https://github.com/PyO3/setuptools-rust?tab=readme-ov-file
-[tool.setuptools.packages]
-find = { where = ["py_src"] }
-
-# workaround for https://github.com/pypa/twine/issues/1216
-[tool.setuptools]
-license-files = []
+[tool.maturin]
+python-source = "py_src"
+module-name = "sglang_router.sglang_router_rs"
