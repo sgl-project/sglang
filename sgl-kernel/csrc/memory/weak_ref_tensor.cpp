@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <ATen/ATen.h>
 #include <ATen/Tensor.h>
+
 #include <vector>
 
 at::Tensor weak_ref_tensor(const at::Tensor& tensor) {
