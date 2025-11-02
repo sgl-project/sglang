@@ -1,6 +1,6 @@
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import einops
 import torch
@@ -8,6 +8,10 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
+from sglang.srt.layers.attention.fla.fused_recurrent import (
+    fused_recurrent_gated_delta_rule,
+    fused_recurrent_gated_delta_rule_update,
+)
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -21,7 +25,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.utils import add_prefix
@@ -60,9 +64,7 @@ class JetBlock(nn.Module):
         total_k_dim = num_heads * head_k_dim
         head_v_dim = int(head_k_dim * jet_block_config.expand_v)
         total_v_dim = num_heads * head_v_dim
-
-        self.head_v_dim = head_v_dim
-        self.num_heads = num_heads
+        conv_size = jet_block_config.conv_size
 
         # Submodules.
         self.q_proj = nn.Linear(hidden_size, total_k_dim, bias=False)
@@ -78,19 +80,27 @@ class JetBlock(nn.Module):
 
         self.dynamic_conv1d = DynamicShortConvolution(
             hidden_size=total_v_dim,
-            kernel_size=jet_block_config.conv_size,
+            kernel_size=conv_size,
             generator_input_size=hidden_size,
             generator_reduction=jet_block_config.dconv_generator_reduction,
             static_conv_init=lambda x: init_linear_conv1d(
                 x, std=self.config.initializer_range
             ),
-            implementation=jet_block_config.dconv_implementation,
+            implementation="naive",  # DEBUG
         )
 
         self.o_norm = RMSNormGated(
-            self.head_v_dim,
-            eps=flaot(jet_block_config.norm_eps),
+            head_v_dim,
+            eps=float(jet_block_config.norm_eps),
         )
+
+        # Attributes.
+        self.conv_size = conv_size
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.layer_id = layer_id
+        self.num_heads = num_heads
+        self.total_v_dim = total_v_dim
 
     def forward(
         self,
@@ -98,47 +108,120 @@ class JetBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        seq_len, _ = hidden_states.shape
-
-        q = self.q_proj(hidden_states)
-        q = nn.functional.silu(q)
-        q = einops.rearrange(q, "... (h d) -> ... h d", h=self.num_heads)
-
-        k = self.k_proj(hidden_states)
-        k = nn.functional.silu(k)
-        k = einops.rearrange(k, "... (h d) -> ... h d", h=self.num_heads)
-
-        v = self.v_proj(hidden_states)
-        v = einops.rearrange(v, "... (h d) -> ... h d", h=self.num_heads)
-
-        a = self.a_proj(hidden_states)
-
-        b = self.b_proj(hidden_states)
-        b = nn.functional.sigmoid(b)
-
         assert isinstance(forward_batch.attn_backend, HybridLinearAttnBackend)
         assert isinstance(
             forward_batch.attn_backend.linear_attn_backend, JetBlockAttnBackend
         )
-
-        attn_backend_kwargs: dict[str, Any] = dict(
-            q=q,
-            k=k,
-            v=v,
-            layer=self,
-            forward_batch=forward_batch,
+        linear_attn_backend = forward_batch.attn_backend.linear_attn_backend
+        mamba2_layer_cache = linear_attn_backend.req_to_token_pool.mamba2_layer_cache(
+            self.layer_id
         )
 
-        o = forward_batch.attn_backend.linear_attn_backend.forward(
-            **attn_backend_kwargs
+        q = self.q_proj(hidden_states)  # (seq_len, total_k_dim)
+        q = nn.functional.silu(q)
+        q = einops.rearrange(q, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
+
+        k = self.k_proj(hidden_states)  # (seq_len, total_k_dim)
+        k = nn.functional.silu(k)
+        k = einops.rearrange(k, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
+
+        v = self.v_proj(hidden_states)  # (seq_len, total_v_dim)
+
+        # Dynamic Convolution.
+        new_v = torch.empty_like(v)
+        new_conv_states = torch.empty(
+            (forward_batch.batch_size, self.total_v_dim, self.conv_size),
+            dtype=mamba2_layer_cache.conv.dtype,
+            device=mamba2_layer_cache.conv.device,
         )
 
-        g = self.g_proj(hidden_states)
-        g = einops.rearrange(g, "... (h d) -> ... h d", h=self.num_heads)
+        match forward_batch.forward_mode:
+            case ForwardMode.EXTEND:
+                assert forward_batch.extend_start_loc is not None
+                assert forward_batch.extend_seq_lens is not None
 
-        o = self.o_norm(o, g)
+                for i in range(forward_batch.batch_size):
+                    v_single = v[
+                        forward_batch.extend_start_loc[
+                            i
+                        ] : forward_batch.extend_start_loc[i]
+                        + forward_batch.extend_seq_lens[i]
+                    ]
+                    generator_input = hidden_states[
+                        forward_batch.extend_start_loc[
+                            i
+                        ] : forward_batch.extend_start_loc[i]
+                        + forward_batch.extend_seq_lens[i]
+                    ]
 
-        o = einops.rearrange(o, "... h d -> ... (h d)")
+                    v_single, new_conv_state_single = self.dynamic_conv1d(
+                        v_single.unsqueeze(0),
+                        cache=None,
+                        output_final_state=True,
+                        generator_input=generator_input.unsqueeze(0),
+                    )
+                    v_single = v_single.squeeze(0)
+                    new_conv_state_single = new_conv_state_single.squeeze(0)
+
+                    new_v[
+                        forward_batch.extend_start_loc[
+                            i
+                        ] : forward_batch.extend_start_loc[i]
+                        + forward_batch.extend_seq_lens[i]
+                    ] = v_single
+                    new_conv_states[i] = new_conv_state_single
+
+            case ForwardMode.DECODE:
+                new_v, new_conv_states = self.dynamic_conv1d(
+                    v.unsqueeze(1),  # (batch_size, 1, total_v_dim)
+                    cache=None,
+                    output_final_state=True,
+                    generator_input=hidden_states.unsqueeze(
+                        1
+                    ),  # (batch_size, 1, hidden_size)
+                )  # (batch_size, 1, total_v_dim), (batch_size, total_v_dim, conv_size)
+
+                new_v = new_v.squeeze(1)  # (batch_size, total_v_dim)
+
+            case _:
+                raise NotImplementedError
+
+        v = new_v
+        mamba2_layer_cache.conv[
+            linear_attn_backend.forward_metadata.mamba_cache_indices,
+            -self.total_v_dim :,
+            :,
+        ] = new_conv_states[:, :, :-1]
+
+        v = einops.rearrange(v, "l (h d) -> l h d", h=self.num_heads, d=self.head_v_dim)
+
+        a = self.a_proj(hidden_states)
+        g = -self.A_log.float().exp() * nn.functional.softplus(a.float())
+
+        beta = self.b_proj(hidden_states)
+        beta = nn.functional.sigmoid(beta)
+
+        o = fused_recurrent_gated_delta_rule_update(
+            q=q.unsqueeze(0),
+            k=k.unsqueeze(0),
+            v=v.unsqueeze(0),
+            g=g.unsqueeze(0),
+            beta=beta.unsqueeze(0),
+            initial_state_source=mamba2_layer_cache.temporal,
+            initial_state_indices=linear_attn_backend.forward_metadata.mamba_cache_indices,
+            cu_seqlens=cast(
+                torch.LongTensor, linear_attn_backend.forward_metadata.query_start_loc
+            ),
+            use_qk_l2norm_in_kernel=True,
+        )
+        o = o.squeeze(0)
+
+        z = self.g_proj(hidden_states)
+        z = einops.rearrange(z, "l (h d) -> l h d", h=self.num_heads)
+
+        o = self.o_norm(o, z)
+
+        o = einops.rearrange(o, "l h d -> l (h d)")
         o = self.o_proj(o)
 
         return o

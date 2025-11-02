@@ -24,6 +24,7 @@ class JetNemotronConfig(PretrainedConfig):
 
     efficient_attention_config: dict[str, dict[str, Any]]
     hidden_size: int
+    initializer_range: float
     layer_types: list[str]
     max_position_embeddings: int
     num_attention_heads: int
