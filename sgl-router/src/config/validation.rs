@@ -462,9 +462,10 @@ impl ConfigValidator {
             && config.tokenizer_path.is_none()
             && config.model_path.is_none()
         {
-            return Err(ConfigError::ValidationFailed {
-                reason: "gRPC connection mode requires either --tokenizer-path or --model-path to be specified".to_string(),
-            });
+            // Note: In gRPC mode, if tokenizer-path and model-path are not specified,
+            // the router will attempt to fetch tokenizer from the worker via GetTokenizerInfo RPC.
+            // This validation check is removed to allow that fallback mechanism.
+            // If the fetch fails, it will be caught during AppContext initialization.
         }
 
         Self::validate_mtls(config)?;

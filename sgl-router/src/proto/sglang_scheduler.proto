@@ -23,6 +23,9 @@ service SglangScheduler {
   // Get model information
   rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
 
+  // Get tokenizer information and file contents
+  rpc GetTokenizerInfo(GetTokenizerInfoRequest) returns (GetTokenizerInfoResponse);
+
   // Get server information
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
 
@@ -456,4 +459,33 @@ message GetServerInfoResponse {
   // Scheduler-side metrics (memory usage, throughput) require
   // bidirectional communicator infrastructure not available in gRPC.
   // Use HTTP /get_server_info if scheduler internal state is needed.
+}
+
+// =====================
+// GetTokenizerInfo RPC
+// =====================
+
+message GetTokenizerInfoRequest {
+  // List of tokenizer files to request (e.g., "tokenizer.json", "tokenizer_config.json", "chat_template.jinja")
+  repeated string requested_files = 1;
+}
+
+message GetTokenizerInfoResponse {
+  // Tokenizer files content
+  // Key: filename (e.g., "tokenizer.json")
+  // Value: file content as string (JSON, text, etc.)
+  map<string, string> files = 1;
+
+  // Base directory path (for reference, actual content in files map)
+  string base_path = 2;
+
+  // Original tokenizer_path from model config
+  string tokenizer_path = 3;
+
+  // Model path (for fallback discovery)
+  string model_path = 4;
+
+  // Metadata
+  bool success = 5;
+  string error_message = 6;  // If success is false
 }

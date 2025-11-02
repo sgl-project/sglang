@@ -1,6 +1,7 @@
-use std::{fs::File, io::Read, path::Path, sync::Arc};
+use std::{fs, fs::File, io::Read, path::Path, sync::Arc};
 
 use anyhow::{Error, Result};
+use serde_json;
 use tracing::{debug, info};
 
 use super::{huggingface::HuggingFaceTokenizer, tiktoken::TiktokenTokenizer, traits};
@@ -154,6 +155,108 @@ fn is_likely_sentencepiece(buffer: &[u8]) -> bool {
             || buffer.windows(4).any(|w| w == b"<unk")
             || buffer.windows(4).any(|w| w == b"<s>")
             || buffer.windows(4).any(|w| w == b"</s>"))
+}
+
+/// Create a tokenizer from in-memory file contents
+/// This is used when fetching tokenizer files via gRPC
+pub fn create_tokenizer_from_memory(
+    tokenizer_json_content: &str,
+    tokenizer_config_content: Option<&str>,
+    chat_template_content: Option<&str>,
+) -> Result<Arc<dyn traits::Tokenizer>> {
+    use tempfile::TempDir;
+    
+    // Create a temporary directory
+    let temp_dir = TempDir::new()
+        .map_err(|e| Error::msg(format!("Failed to create temp directory: {}", e)))?;
+    let temp_path = temp_dir.path();
+
+    // Write tokenizer.json (required)
+    let tokenizer_json_path = temp_path.join("tokenizer.json");
+    fs::write(&tokenizer_json_path, tokenizer_json_content)
+        .map_err(|e| Error::msg(format!("Failed to write tokenizer.json: {}", e)))?;
+    info!("Wrote tokenizer.json to temporary directory: {:?}", temp_path);
+
+    // Write tokenizer_config.json if provided
+    if let Some(config_content) = tokenizer_config_content {
+        let config_path = temp_path.join("tokenizer_config.json");
+        fs::write(&config_path, config_content)
+            .map_err(|e| Error::msg(format!("Failed to write tokenizer_config.json: {}", e)))?;
+        debug!("Wrote tokenizer_config.json to temporary directory");
+    }
+
+    // Write chat template if provided as standalone file
+    // Note: chat_template.json might contain Jinja template as string content, not JSON format
+    // We always write it as .jinja to avoid confusion with JSON parsing
+    let chat_template_path = if let Some(template_content) = chat_template_content {
+        // Always write as .jinja file, even if the source file was named chat_template.json
+        // This ensures it's treated as a Jinja template, not JSON
+        let template_path = temp_path.join("chat_template.jinja");
+        
+        fs::write(&template_path, template_content)
+            .map_err(|e| Error::msg(format!("Failed to write chat template: {}", e)))?;
+        debug!("Wrote chat template to temporary directory");
+        Some(template_path.to_str().map(|s| s.to_string()).ok_or_else(|| {
+            Error::msg("Chat template path is not valid UTF-8")
+        })?)
+    } else {
+        None
+    };
+
+    // Try to discover chat template from tokenizer_config.json if not explicitly provided
+    let final_chat_template = chat_template_path.or_else(|| {
+        let config_path = temp_path.join("tokenizer_config.json");
+        if config_path.exists() {
+            // Try to extract chat_template field from tokenizer_config.json
+            if let Ok(content) = fs::read_to_string(&config_path) {
+                if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(template_str) = config_json.get("chat_template").and_then(|v| v.as_str()) {
+                        // Write extracted template to a separate file
+                        let extracted_path = temp_path.join("chat_template.jinja");
+                        if fs::write(&extracted_path, template_str).is_ok() {
+                            info!(
+                                config_path = ?config_path,
+                                extracted_path = ?extracted_path,
+                                temp_dir = ?temp_path,
+                                "Extracted chat template from tokenizer_config.json and saved to temporary file"
+                            );
+                            extracted_path.to_str().map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+
+    // Create tokenizer from the temporary directory
+    let tokenizer_path_str = tokenizer_json_path.to_str().ok_or_else(|| {
+        Error::msg("Tokenizer path is not valid UTF-8")
+    })?;
+
+    let tokenizer = create_tokenizer_with_chat_template(
+        tokenizer_path_str,
+        final_chat_template.as_deref(),
+    )?;
+
+    // Note: temp_dir will be dropped, but tokenizer should have loaded all necessary data into memory
+    // If tokenizer needs file access at runtime, we'll need to keep temp_dir alive
+    // For now, HuggingFace tokenizer loads everything into memory, so this should be fine
+    info!(
+        "Created tokenizer from in-memory content, temp_dir: {:?}",
+        temp_path
+    );
+
+    Ok(tokenizer)
 }
 
 /// Helper function to discover chat template files in a directory

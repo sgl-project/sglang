@@ -258,10 +258,36 @@ impl AppContextBuilder {
         router_config: RouterConfig,
         request_timeout_secs: u64,
     ) -> Result<Self, String> {
-        Ok(Self::new()
+        let ctx = Self::new()
             .with_client(&router_config, request_timeout_secs)?
-            .maybe_rate_limiter(&router_config)
-            .maybe_tokenizer(&router_config)?
+            .maybe_rate_limiter(&router_config);
+
+        // Try to create tokenizer - if no path provided, fallback to fetching from worker
+        let ctx = match ctx.maybe_tokenizer(&router_config) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                // Check if error is due to missing tokenizer_path/model_path
+                if router_config.tokenizer_path.is_none() && router_config.model_path.is_none() {
+                    // Fallback: try to fetch tokenizer from worker
+                    // Note: ctx was moved, so we need to create a new builder
+                    let ctx_for_fallback = Self::new()
+                        .with_client(&router_config, request_timeout_secs)?
+                        .maybe_rate_limiter(&router_config);
+                    ctx_for_fallback.maybe_tokenizer_from_worker(&router_config).await
+                        .map_err(|worker_err| {
+                            format!(
+                                "Failed to create tokenizer: {}. Also failed to fetch from worker: {}",
+                                e, worker_err
+                            )
+                        })?
+                } else {
+                    // Tokenizer path provided but failed to load - return original error
+                    return Err(e);
+                }
+            }
+        };
+
+        Ok(ctx
             .maybe_reasoning_parser_factory(&router_config)
             .maybe_tool_parser_factory(&router_config)
             .with_worker_registry()
@@ -359,14 +385,14 @@ impl AppContextBuilder {
     /// Create tokenizer for gRPC mode
     fn maybe_tokenizer(mut self, config: &RouterConfig) -> Result<Self, String> {
         if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
-            let tokenizer_path = config
-                .tokenizer_path
-                .clone()
-                .or_else(|| config.model_path.clone())
-                .ok_or_else(|| {
-                    "gRPC mode requires either --tokenizer-path or --model-path to be specified"
-                        .to_string()
-                })?;
+            // If no tokenizer_path or model_path is provided, return an error
+            // This will trigger the fallback to fetch from worker in from_config
+            let tokenizer_path = match config.tokenizer_path.clone().or_else(|| config.model_path.clone()) {
+                Some(path) => path,
+                None => {
+                    return Err("No tokenizer path specified. Will attempt to fetch from worker.".to_string());
+                }
+            };
 
             let base_tokenizer = tokenizer_factory::create_tokenizer_with_chat_template_blocking(
                 &tokenizer_path,
@@ -397,6 +423,121 @@ impl AppContextBuilder {
                 Some(base_tokenizer)
             };
         }
+
+        Ok(self)
+    }
+
+    /// Fetch tokenizer from worker via gRPC (fallback when no tokenizer_path/model_path provided)
+    async fn maybe_tokenizer_from_worker(mut self, config: &RouterConfig) -> Result<Self, String> {
+        use tracing::info;
+        use crate::grpc_client::SglangSchedulerClient;
+
+        // Only proceed if in gRPC mode
+        if !matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
+            return Err("Cannot fetch tokenizer from worker: not in gRPC mode".to_string());
+        }
+
+        // Find a gRPC worker URL
+        let worker_url = match &config.mode {
+            crate::config::types::RoutingMode::Regular { worker_urls }
+            | crate::config::types::RoutingMode::OpenAI { worker_urls } => {
+                worker_urls
+                    .iter()
+                    .find(|url| url.starts_with("grpc://"))
+                    .ok_or_else(|| {
+                        "No gRPC worker URL found. Cannot fetch tokenizer from worker".to_string()
+                    })?
+            }
+            crate::config::types::RoutingMode::PrefillDecode { prefill_urls, decode_urls, .. } => {
+                // Try prefill workers first, then decode workers
+                // prefill_urls is Vec<(String, Option<u16>)>, decode_urls is Vec<String>
+                prefill_urls
+                    .iter()
+                    .map(|(url, _)| url)
+                    .chain(decode_urls.iter())
+                    .find(|url| url.starts_with("grpc://"))
+                    .ok_or_else(|| {
+                        "No gRPC worker URL found. Cannot fetch tokenizer from worker".to_string()
+                    })?
+            }
+        };
+
+        info!(
+            "No tokenizer path specified, attempting to fetch from worker: {}",
+            worker_url
+        );
+
+        // Connect to worker
+        let client = SglangSchedulerClient::connect(worker_url)
+            .await
+            .map_err(|e| format!("Failed to connect to worker {}: {}", worker_url, e))?;
+
+        // Request tokenizer files
+        let requested_files = vec![
+            "tokenizer.json".to_string(),
+            "tokenizer_config.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "chat_template.json".to_string(),
+        ];
+
+        let tokenizer_info = client
+            .get_tokenizer_info(requested_files)
+            .await
+            .map_err(|e| format!("Failed to fetch tokenizer info from worker: {}", e))?;
+
+        // Check success field (field 5 in proto)
+        if !tokenizer_info.success {
+            return Err(format!(
+                "Worker returned error when fetching tokenizer: {}",
+                tokenizer_info.error_message
+            ));
+        }
+
+        if tokenizer_info.files.is_empty() {
+            return Err("Worker returned no tokenizer files".to_string());
+        }
+
+        // Extract file contents
+        let tokenizer_json = tokenizer_info
+            .files
+            .get("tokenizer.json")
+            .ok_or_else(|| "tokenizer.json not found in worker response".to_string())?;
+        let tokenizer_config = tokenizer_info.files.get("tokenizer_config.json");
+        let chat_template = tokenizer_info
+            .files
+            .get("chat_template.jinja")
+            .or_else(|| tokenizer_info.files.get("chat_template.json"));
+
+        info!(
+            "Fetched tokenizer from worker: tokenizer.json={}, tokenizer_config={}, chat_template={}",
+            !tokenizer_json.is_empty(),
+            tokenizer_config.is_some(),
+            chat_template.is_some()
+        );
+
+        // Create tokenizer from memory
+        let base_tokenizer = tokenizer_factory::create_tokenizer_from_memory(
+            tokenizer_json,
+            tokenizer_config.map(|s| s.as_str()),
+            chat_template.map(|s| s.as_str()),
+        )
+        .map_err(|e| format!("Failed to create tokenizer from worker files: {}", e))?;
+
+        // Conditionally wrap with caching layer if at least one cache is enabled
+        self.tokenizer = if config.tokenizer_cache.enable_l0 || config.tokenizer_cache.enable_l1
+        {
+            let cache_config = CacheConfig {
+                enable_l0: config.tokenizer_cache.enable_l0,
+                l0_max_entries: config.tokenizer_cache.l0_max_entries,
+                enable_l1: config.tokenizer_cache.enable_l1,
+                l1_max_memory: config.tokenizer_cache.l1_max_memory,
+            };
+            Some(Arc::new(CachedTokenizer::new(base_tokenizer, cache_config))
+                as Arc<dyn Tokenizer>)
+        } else {
+            // Use base tokenizer directly without caching
+            Some(base_tokenizer)
+        };
 
         Ok(self)
     }

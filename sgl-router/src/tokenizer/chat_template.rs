@@ -392,11 +392,20 @@ impl ChatTemplateProcessor {
         // Convert messages to minijinja::Value (messages already processed by router)
         let minijinja_messages: Vec<Value> = messages.iter().map(Value::from_serialize).collect();
 
+        // Convert tools and documents to empty arrays if None to avoid None length errors
+        // Template might use .length or |length filter which doesn't work on None values
+        let tools_value: Vec<Value> = params.tools
+            .map(|tools| tools.iter().map(Value::from_serialize).collect())
+            .unwrap_or_default();
+        let documents_value: Vec<Value> = params.documents
+            .map(|docs| docs.iter().map(Value::from_serialize).collect())
+            .unwrap_or_default();
+
         let base_context = context! {
             messages => &minijinja_messages,
             add_generation_prompt => params.add_generation_prompt,
-            tools => params.tools,
-            documents => params.documents,
+            tools => tools_value,
+            documents => documents_value,
         };
 
         // Merge with template_kwargs if provided
@@ -420,12 +429,18 @@ impl ChatTemplateProcessor {
 
 /// Load chat template from tokenizer config JSON
 pub fn load_chat_template_from_config(config_path: &str) -> Result<Option<String>> {
+    use tracing::info;
+    
     let content = fs::read_to_string(config_path)?;
     let config: serde_json::Value = serde_json::from_str(&content)?;
 
     // Look for chat_template in the config
     if let Some(template) = config.get("chat_template") {
         if let Some(template_str) = template.as_str() {
+            info!(
+                config_path = %config_path,
+                "Loaded chat template from tokenizer_config.json"
+            );
             return Ok(Some(template_str.to_string()));
         }
     }
