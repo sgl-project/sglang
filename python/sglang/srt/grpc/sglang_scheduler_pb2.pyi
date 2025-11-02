@@ -488,3 +488,32 @@ class GetServerInfoResponse(_message.Message):
     server_type: str
     start_time: _timestamp_pb2.Timestamp
     def __init__(self, server_args: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., scheduler_info: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., active_requests: _Optional[int] = ..., is_paused: bool = ..., last_receive_timestamp: _Optional[float] = ..., uptime_seconds: _Optional[float] = ..., sglang_version: _Optional[str] = ..., server_type: _Optional[str] = ..., start_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class GetTokenizerInfoRequest(_message.Message):
+    __slots__ = ("requested_files",)
+    REQUESTED_FILES_FIELD_NUMBER: _ClassVar[int]
+    requested_files: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, requested_files: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class GetTokenizerInfoResponse(_message.Message):
+    __slots__ = ("files", "base_path", "tokenizer_path", "model_path", "success", "error_message")
+    class FilesEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    FILES_FIELD_NUMBER: _ClassVar[int]
+    BASE_PATH_FIELD_NUMBER: _ClassVar[int]
+    TOKENIZER_PATH_FIELD_NUMBER: _ClassVar[int]
+    MODEL_PATH_FIELD_NUMBER: _ClassVar[int]
+    SUCCESS_FIELD_NUMBER: _ClassVar[int]
+    ERROR_MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    files: _containers.ScalarMap[str, str]
+    base_path: str
+    tokenizer_path: str
+    model_path: str
+    success: bool
+    error_message: str
+    def __init__(self, files: _Optional[_Mapping[str, str]] = ..., base_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., model_path: _Optional[str] = ..., success: bool = ..., error_message: _Optional[str] = ...) -> None: ...
