@@ -18,11 +18,11 @@ __global__ void concat_mla_k_kernel(
     const nv_bfloat16* __restrict__ k_nope,
     const nv_bfloat16* __restrict__ k_rope,
     const int num_tokens,
-    const int k_stride_0,
+    const int64_t k_stride_0,
     const int k_stride_1,
-    const int k_nope_stride_0,
+    const int64_t k_nope_stride_0,
     const int k_nope_stride_1,
-    const int k_rope_stride_0) {
+    const int64_t k_rope_stride_0) {
   const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
   const int token_id = flat_warp_id / NUM_HEAD_CHUNKS;
   const int head_chunk_id = flat_warp_id % NUM_HEAD_CHUNKS;
