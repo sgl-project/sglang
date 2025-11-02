@@ -229,7 +229,6 @@ class Envs:
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
     # vLLM dependencies (TODO: they have been deprecated, we can remove them safely)
-    USE_VLLM_CUSTOM_ALLREDUCE = EnvBool(False)
     USE_VLLM_CUTLASS_W8A8_FP8_KERNEL = EnvBool(False)
 
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)

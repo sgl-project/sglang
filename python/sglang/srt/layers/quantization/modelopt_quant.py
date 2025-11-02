@@ -8,7 +8,14 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import get_dp_global_num_tokens, get_local_dp_buffer
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_local_dp_buffer,
+    is_allocation_symmetric,
+)
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
@@ -1565,27 +1572,42 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             output_dtype = x.dtype
+            output_col = x.shape[1]
             x_sf = None
+
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 from flashinfer import nvfp4_block_scale_interleave
 
                 # Quantize before comm, swizzle after.
-                if x.shape[0] > 0:
-                    x, x_sf = fp4_quantize(
-                        x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
-                    )
-                else:
-                    x_col = x.shape[1]
-                    x = torch.zeros(0, x_col // 2, dtype=torch.uint8, device=x.device)
-                    x_sf = torch.zeros(
-                        0, x_col // 16, dtype=torch.uint8, device=x.device
-                    )
+                with use_symmetric_memory(
+                    get_tp_group(), disabled=not is_allocation_symmetric()
+                ):
+                    if x.shape[0] > 0:
+                        x, x_sf = fp4_quantize(
+                            x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
+                        )
+                    else:
+                        x_col = x.shape[1]
+                        x = torch.zeros(
+                            0, x_col // 2, dtype=torch.uint8, device=x.device
+                        )
+                        x_sf = torch.zeros(
+                            0, x_col // 16, dtype=torch.uint8, device=x.device
+                        )
                 topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
                     [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
                 )
                 x_sf = nvfp4_block_scale_interleave(x_sf)
 
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                symm_output = torch.empty(
+                    x.shape[0], output_col, dtype=output_dtype, device=x.device
+                )
+
             output = flashinfer_cutlass_fused_moe(
+                output=symm_output,
                 input=x,
                 token_selected_experts=topk_ids.to(torch.int),
                 token_final_scales=topk_weights,
