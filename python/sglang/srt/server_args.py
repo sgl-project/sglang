@@ -162,6 +162,8 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
 ]
 
+MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -198,6 +200,10 @@ def add_radix_supported_deterministic_attention_backend_choices(choices):
 
 def add_radix_eviction_policy_choices(choices):
     RADIX_EVICTION_POLICY_CHOICES.extend(choices)
+
+
+def add_mamba_ssm_dtype_choices(choices):
+    MAMBA_SSM_DTYPE_CHOICES.extend(choices)
 
 
 @dataclasses.dataclass
@@ -2902,7 +2908,7 @@ class ServerArgs:
             "--mamba-ssm-dtype",
             type=str,
             default=ServerArgs.mamba_ssm_dtype,
-            choices=["float32", "bfloat16"],
+            choices=MAMBA_SSM_DTYPE_CHOICES,
             help="The data type of the SSM states in mamba cache.",
         )
         parser.add_argument(
