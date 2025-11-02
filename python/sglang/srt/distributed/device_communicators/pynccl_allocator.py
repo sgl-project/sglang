@@ -1,3 +1,4 @@
+import os
 import tempfile
 
 import torch
@@ -9,13 +10,22 @@ from sglang.srt.server_args import get_global_server_args
 
 nccl_allocator_source = """
 #include <nccl.h>
+
 extern "C" {
 
 void* nccl_alloc_plug(size_t size, int device, void* stream) {
   void* ptr;
   ncclResult_t err = ncclMemAlloc(&ptr, size);
-  return ptr;
 
+  const char *str_val = getenv("SGLANG_TMP_NCCL_COMM_VALUE");
+  char *endptr;
+  void* int_val = (void *)strtoull(str_val, &endptr, 0);
+
+  ncclComm_t comm = (ncclComm_t)(int_val);
+  ncclWindow_t win;
+  ncclResult_t err2 = ncclCommWindowRegister(comm, ptr, size, &win, NCCL_WIN_COLL_SYMMETRIC);
+
+  return ptr;
 }
 
 void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
@@ -89,7 +99,11 @@ class use_symmetric_memory:
             ), "graph_pool_id is not set under graph capture"
             # Pause graph memory pool to use symmetric memory with cuda graph
             torch._C._cuda_endAllocateToPool(self.device, _graph_pool_id)
+
         self._mem_pool_ctx.__enter__()
+
+        # Set the env var to pass this argument to the C functions.
+        os.environ["SGLANG_TMP_NCCL_COMM_VALUE"] = str(self.group_coordinator.pynccl_comm.comm.value)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -103,13 +117,6 @@ class use_symmetric_memory:
             torch._C._cuda_beginAllocateCurrentThreadToPool(
                 self.device, _graph_pool_id
             )
-
-        for segment in get_nccl_mem_pool().snapshot():
-            if segment["address"] not in _registered_base_addrs:
-                self.group_coordinator.pynccl_comm.register_comm_window_raw(
-                    segment["address"], segment["total_size"]
-                )
-                _registered_base_addrs.add(segment["address"])
 
     def tag(self, tensor: torch.Tensor):
         if not self.enabled:
