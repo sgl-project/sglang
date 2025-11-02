@@ -30,13 +30,12 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    add_prefix,
-    get_cmo_stream,
-    is_cuda,
-    is_npu,
-    wait_cmo_stream,
-)
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, supports_custom_op
+
+if supports_custom_op() and get_global_server_args().enable_torch_compile:
+    from sglang.srt._custom_ops import get_cmo_stream, wait_cmo_stream
+else:
+    from sglang.srt.utils import get_cmo_stream, wait_cmo_stream
 
 Qwen3Config = None
 

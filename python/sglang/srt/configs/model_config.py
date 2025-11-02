@@ -97,6 +97,7 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
+        enable_torch_compile: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -106,6 +107,7 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
+        self.enable_torch_compile = enable_torch_compile
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -234,6 +236,7 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
+            enable_torch_compile=server_args.enable_torch_compile,
             **kwargs,
         )
 
