@@ -110,9 +110,12 @@ class RadixAttention(nn.Module):
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            output = torch.empty_like(q)
+            if self.qk_head_dim != self.v_head_dim:
+                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+            else:
+                output = torch.empty_like(q)
             torch.ops.sglang.unified_attention_with_output(
-                q, k, v, output, save_kv_cache, self.layer_id
+                q, k, v, output, save_kv_cache, self.layer_id, **kwargs
             )
             return output
         else:
@@ -134,13 +137,26 @@ def unified_attention_with_output(
     output: torch.Tensor,
     save_kv_cache: bool,
     layer_id: int,
+    *,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
 ) -> None:
     context = get_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
+
+    kwargs = {}
+    if q_rope is not None:
+        kwargs["q_rope"] = q_rope
+    if k_rope is not None:
+        kwargs["k_rope"] = k_rope
+    if sinks is not None:
+        kwargs["sinks"] = sinks
+
     ret = forward_batch.attn_backend.forward(
-        query, key, value, attention_layer, forward_batch, save_kv_cache
+        query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
     )
     assert (
         output.numel() == ret.numel()
@@ -157,6 +173,10 @@ def unified_attention_with_output_fake(
     output: torch.Tensor,
     save_kv_cache: bool,
     layer_id: int,
+    *,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
 ) -> None:
     return
 
