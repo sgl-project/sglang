@@ -15,9 +15,8 @@
 
 """Inference-only NemotronH model."""
 
-import typing
 from collections.abc import Iterable
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import torch
 from torch import nn
@@ -151,6 +150,7 @@ class NemotronHMoE(nn.Module):
             activation=config.mlp_hidden_act,
             layer_id=layer_idx,
             is_gated=False,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
@@ -642,10 +642,7 @@ class NemotronHForCausalLM(nn.Module):
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
                     param = params_dict[name_mapped]
-                    weight_loader = typing.cast(
-                        Callable[..., bool], param.weight_loader
-                    )
-                    weight_loader(
+                    param.weight_loader(
                         param,
                         loaded_weight,
                         name_mapped,
