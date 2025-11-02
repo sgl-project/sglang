@@ -13,6 +13,8 @@
 # ==============================================================================
 """Utilities for Huggingface Transformers."""
 
+from __future__ import annotations
+
 import contextlib
 import json
 import logging
@@ -20,78 +22,81 @@ import os
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
-from transformers import (
-    AutoConfig,
-    AutoProcessor,
-    AutoTokenizer,
-    GenerationConfig,
-    PretrainedConfig,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerBase,
-    PreTrainedTokenizerFast,
-)
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-from sglang.srt.configs import (
-    ChatGLMConfig,
-    DbrxConfig,
-    DeepseekVL2Config,
-    DotsOCRConfig,
-    DotsVLMConfig,
-    ExaoneConfig,
-    FalconH1Config,
-    JetNemotronConfig,
-    JetVLMConfig,
-    KimiLinearConfig,
-    KimiVLConfig,
-    LongcatFlashConfig,
-    MultiModalityConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    Olmo3Config,
-    Qwen3NextConfig,
-    Step3VLConfig,
-)
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 
-_CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
-    ChatGLMConfig,
-    DbrxConfig,
-    ExaoneConfig,
-    DeepseekVL2Config,
-    MultiModalityConfig,
-    KimiVLConfig,
-    InternVLChatConfig,
-    Step3VLConfig,
-    LongcatFlashConfig,
-    Olmo3Config,
-    KimiLinearConfig,
-    Qwen3NextConfig,
-    FalconH1Config,
-    DotsVLMConfig,
-    DotsOCRConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    DeepseekVLV2Config,
-    JetNemotronConfig,
-    JetVLMConfig,
+if TYPE_CHECKING:
+    from transformers import (
+        PretrainedConfig,
+        PreTrainedTokenizer,
+        PreTrainedTokenizerBase,
+        PreTrainedTokenizerFast,
+    )
+
+
+def _register_custom_configs():
+    from transformers import AutoConfig
+
+    from sglang.srt.configs import (
+        ChatGLMConfig,
+        DbrxConfig,
+        DeepseekVL2Config,
+        DotsOCRConfig,
+        DotsVLMConfig,
+        ExaoneConfig,
+        FalconH1Config,
+        JetVLMConfig,
+        KimiLinearConfig,
+        KimiVLConfig,
+        LongcatFlashConfig,
+        MultiModalityConfig,
+        NemotronH_Nano_VL_V2_Config,
+        NemotronHConfig,
+        Olmo3Config,
+        Qwen3NextConfig,
+        Step3VLConfig,
+        JetNemotronConfig,
+    )
+
+    _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
+        ChatGLMConfig,
+        DbrxConfig,
+        ExaoneConfig,
+        DeepseekVL2Config,
+        MultiModalityConfig,
+        KimiVLConfig,
+        InternVLChatConfig,
+        Step3VLConfig,
+        LongcatFlashConfig,
+        Olmo3Config,
+        KimiLinearConfig,
+        Qwen3NextConfig,
+        FalconH1Config,
+        DotsVLMConfig,
+        DotsOCRConfig,
+        NemotronH_Nano_VL_V2_Config,
+        NemotronHConfig,
+        DeepseekVLV2Config,
+        JetNemotronConfig,
+        JetVLMConfig,
 ]
 
-_CONFIG_REGISTRY = {
-    config_cls.model_type: config_cls for config_cls in _CONFIG_REGISTRY
-}
+    _CONFIG_REGISTRY = {
+        config_cls.model_type: config_cls for config_cls in _CONFIG_REGISTRY
+    }
+    for name, cls in _CONFIG_REGISTRY.items():
+        with contextlib.suppress(ValueError):
+            AutoConfig.register(name, cls)
 
-for name, cls in _CONFIG_REGISTRY.items():
-    with contextlib.suppress(ValueError):
-        AutoConfig.register(name, cls)
+    return _CONFIG_REGISTRY
 
 
 def download_from_hf(
@@ -159,6 +164,8 @@ def _load_deepseek_v32_model(
     revision: Optional[str] = None,
     **kwargs,
 ):
+    from transformers import AutoConfig
+
     # first get the local path
     local_path = download_from_hf(model_path)
     # then load the config file in json
@@ -202,6 +209,10 @@ def get_config(
     model_override_args: Optional[dict] = None,
     **kwargs,
 ):
+    from transformers import AutoConfig
+
+    _CONFIG_REGISTRY = _register_custom_configs()
+
     is_gguf = check_gguf_file(model)
     if is_gguf:
         kwargs["gguf_file"] = model
@@ -277,6 +288,10 @@ def get_config(
 
     # Special architecture mapping check for GGUF models
     if is_gguf:
+        from transformers.models.auto.modeling_auto import (
+            MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
+        )
+
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
@@ -293,6 +308,8 @@ def get_generation_config(
     **kwargs,
 ):
     try:
+        from transformers import GenerationConfig
+
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
@@ -372,6 +389,8 @@ def get_tokenizer(
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
+    from transformers import AutoTokenizer
+
     if tokenizer_name.endswith(".json"):
         from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 
@@ -463,6 +482,8 @@ def get_processor(
     use_fast: Optional[bool] = True,
     **kwargs,
 ):
+    from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
 

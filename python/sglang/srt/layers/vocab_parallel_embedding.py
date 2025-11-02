@@ -1,8 +1,10 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -21,18 +23,18 @@ from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.parameter import BasevLLMParameter
-from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-    method_has_implemented_embedding,
-)
-from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
     is_cpu,
     set_weight_attrs,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import (
+        QuantizationConfig,
+        QuantizeMethodBase,
+    )
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -255,6 +257,12 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.tp_size,
         )
         self.embedding_dim = embedding_dim
+
+        # Lazy import to avoid loading quantization at module level
+        from sglang.srt.layers.quantization.base_config import (
+            method_has_implemented_embedding,
+        )
+        from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 
         quant_method = None
         if quant_config is not None:

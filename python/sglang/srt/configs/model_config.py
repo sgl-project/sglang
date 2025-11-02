@@ -12,18 +12,19 @@
 # limitations under the License.
 # ==============================================================================
 
+from __future__ import annotations
+
 import json
 import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from typing import Any, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, retry
 from sglang.srt.utils.hf_transformers_utils import (
@@ -36,6 +37,9 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 
 class AttentionArch(IntEnum):
@@ -632,6 +636,8 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
+        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",

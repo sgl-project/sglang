@@ -22,15 +22,13 @@ import logging
 import os
 import random
 import tempfile
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 import orjson
 
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import ToolStrictLevel, envs
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -63,6 +61,10 @@ from sglang.srt.utils.common import (
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
+
+if TYPE_CHECKING:
+    from sglang.srt.function_call.function_call_parser import FunctionCallParser
+    from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 logger = logging.getLogger(__name__)
 
