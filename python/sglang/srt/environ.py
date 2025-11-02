@@ -2,6 +2,7 @@ import os
 import subprocess
 import warnings
 from contextlib import ExitStack, contextmanager
+from enum import IntEnum
 from typing import Any
 
 
@@ -103,6 +104,20 @@ class EnvFloat(EnvField):
             return float(value)
         except ValueError:
             raise ValueError(f'"{value}" is not a valid float value')
+
+
+class ToolStrictLevel(IntEnum):
+    """
+    Defines the strictness levels for tool call parsing and validation.
+
+    OFF: No strict validation
+    FUNCTION: Enables structural tag constraints for all tools
+    PARAMETER: Enforces strict parameter validation for all tools
+    """
+
+    OFF = 0
+    FUNCTION = 1
+    PARAMETER = 2
 
 
 class Envs:
@@ -258,6 +273,9 @@ class Envs:
 
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
+
+    # Tool-Call behavior
+    SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
 
     # fmt: on
 
