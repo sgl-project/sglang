@@ -444,17 +444,25 @@ class FlashAttentionBackend(AttentionBackend):
                     self.forward_metadata_spec_decode_expand = metadata_expand
             else:
                 # Normal Decode
+                seqlens_in_batch = torch.clamp(seqlens_in_batch, max=8192)
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = min(forward_batch.seq_lens_cpu.max().item(), 8192)
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
+                assert batch_size == 1, "Only batch size 1 is supported in decode mode for now"
+                if forward_batch.seq_lens_cpu.max().item() > 8192:
+                    metadata.page_table = torch.cat([
+                        forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, : 1024],
+                        forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, forward_batch.seq_lens_cpu.max().item() - 7168: forward_batch.seq_lens_cpu.max().item()]
+                    ], dim=1)
+                else:
+                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
