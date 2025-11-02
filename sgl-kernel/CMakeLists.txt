@@ -92,7 +92,7 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        f20a52329482ddca4a627b2f028f88c2959ee299
+    GIT_TAG        160cb20dd0c542580d10ec61600e245833a22514
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
@@ -101,7 +101,7 @@ FetchContent_Populate(repo-flash-attention)
 FetchContent_Declare(
     repo-flash-attention-origin
     GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
-    GIT_TAG        9dbed03d1a7a5862998c182c83d8265fea9dc21b
+    GIT_TAG        0256114fe2381ab293503219bdd9078de3cd26b3
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention-origin)
