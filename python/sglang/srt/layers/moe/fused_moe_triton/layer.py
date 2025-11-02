@@ -341,12 +341,12 @@ class FusedMoE(torch.nn.Module):
             # if this weight is a bias, the last dimension must be the sharded dimension
             shard_dim = -1
 
-        if shard_id in {"w1", "w3"} or (
-            shard_id in {"w13"} and not self.moe_runner_config.is_gated
-        ):
+        if shard_id in {"w1", "w3"} and self.moe_runner_config.is_gated:
             # non-fused version
             shard_size = expert_data.shape[shard_dim] // 2
-        elif shard_id in {"w13"} and self.moe_runner_config.is_gated:
+        elif shard_id in {"w13"} or (
+            shard_id in {"w1", "w3"} and not self.moe_runner_config.is_gated
+        ):
             # fused version
             shard_size = expert_data.shape[shard_dim]
         else:
