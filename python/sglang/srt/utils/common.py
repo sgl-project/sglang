@@ -152,6 +152,12 @@ def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
 
+def is_float4_e2m1fn_x2(dtype) -> bool:
+    """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
+    target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    return is_cuda() and dtype == target_dtype
+
+
 def get_cuda_version():
     if torch.version.cuda:
         return tuple(map(int, torch.version.cuda.split(".")))
@@ -297,6 +303,7 @@ def xpu_has_xmx_support():
     return False
 
 
+@lru_cache(maxsize=1)
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
