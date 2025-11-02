@@ -27,11 +27,10 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
     return ServerArgs.add_cli_args(parser)
 
 
-def serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
+def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the serve command."""
     server_args = ServerArgs.from_cli_args(args, unknown_args)
     server_args.post_init_serve()
-
     launch_server(server_args)
 
 
@@ -45,7 +44,7 @@ class ServeSubcommand(CLISubcommand):
     def cmd(
         self, args: argparse.Namespace, unknown_args: list[str] | None = None
     ) -> None:
-        serve_cmd(args, unknown_args)
+        execute_serve_cmd(args, unknown_args)
 
     def validate(self, args: argparse.Namespace) -> None:
         """Validate the arguments for this command"""

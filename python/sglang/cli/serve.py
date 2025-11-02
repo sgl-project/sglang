@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
-import asyncio
 import logging
 import os
 
@@ -22,9 +21,7 @@ def serve(args, extra_argv):
             # Logic for Diffusion Models
             from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
                 add_multimodal_gen_serve_args,
-            )
-            from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
-                serve_cmd as multimodal_gen_serve,
+                execute_serve_cmd,
             )
 
             parser = argparse.ArgumentParser(
@@ -32,20 +29,17 @@ def serve(args, extra_argv):
             )
             add_multimodal_gen_serve_args(parser)
             parsed_args, remaining_argv = parser.parse_known_args(extra_argv)
-            multimodal_gen_serve(parsed_args, remaining_argv)
+
+            execute_serve_cmd(parsed_args, remaining_argv)
         else:
             # Logic for Standard Language Models
-            from sglang.srt.entrypoints.grpc_server import serve_grpc
-            from sglang.srt.entrypoints.http_server import launch_server
+            from sglang.srt.entrypoints.run_server import run_server
             from sglang.srt.server_args import prepare_server_args
 
             # Add a dummy argument for the program name, expected by prepare_server_args
             # as it typically processes sys.argv
             server_args = prepare_server_args(extra_argv)
 
-            if server_args.grpc_mode:
-                asyncio.run(serve_grpc(server_args))
-            else:
-                launch_server(server_args)
+            run_server(server_args)
     finally:
         kill_process_tree(os.getpid(), include_parent=False)
