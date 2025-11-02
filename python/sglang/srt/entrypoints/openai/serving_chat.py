@@ -34,6 +34,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    build_metric_labels,
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
@@ -161,8 +162,12 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
-        # Extract custom labels from raw request headers
-        custom_labels = self.extract_custom_labels(raw_request)
+        # Extract custom labels from raw request headers and build metric labels
+        custom_labels = self.extract_custom_labels(raw_request) or {}
+        metric_labels = build_metric_labels(
+            self.tokenizer_manager.server_args, "/v1/chat/completions"
+        )
+        custom_labels = {**custom_labels, **metric_labels}
 
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)

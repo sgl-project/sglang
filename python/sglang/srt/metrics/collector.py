@@ -703,6 +703,12 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.num_requests_received = Counter(
+            name="sglang:num_requests_received_total",
+            documentation="Number of requests received.",
+            labelnames=labels.keys(),
+        )
+
         self.num_so_requests_total = Counter(
             name="sglang:num_so_requests_total",
             documentation="Number of structured output requests processed.",
@@ -897,6 +903,9 @@ class TokenizerMetricsCollector:
 
     def observe_one_aborted_request(self, labels: Dict[str, str]):
         self.num_aborted_requests_total.labels(**labels).inc(1)
+
+    def observe_one_received_request(self, labels: Dict[str, str]):
+        self.num_requests_received.labels(**labels).inc(1)
 
 
 @dataclass
