@@ -258,7 +258,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
         self.embedding_dim = embedding_dim
 
-        # Lazy import to avoid loading quantization at module level
         from sglang.srt.layers.quantization.base_config import (
             method_has_implemented_embedding,
         )
