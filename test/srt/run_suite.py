@@ -14,6 +14,7 @@ class TestFile:
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
+        TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_eagle.py", 150),
@@ -107,7 +108,7 @@ suites = {
         TestFile("test_no_overlap_scheduler.py", 234),
         TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
-        TestFile("test_penalty.py", 41),
+        TestFile("test_penalty.py", 82),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
@@ -150,6 +151,7 @@ suites = {
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 50),
         TestFile("lora/test_lora_tp.py", 116),
         TestFile("models/test_glm4_moe_models.py", 100),
+        TestFile("models/test_kimi_linear_models.py", 90),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_disaggregation_basic.py", 400),
@@ -265,7 +267,7 @@ suite_amd = {
         TestFile("test_mla_deepseek_v3.py", 221),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_page_size.py", 60),
-        TestFile("test_penalty.py", 41),
+        TestFile("test_penalty.py", 180),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
         TestFile("test_reasoning_parser.py", 5),
