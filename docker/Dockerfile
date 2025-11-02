@@ -296,6 +296,11 @@ RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -
     && python3 -m pip install --force-reinstall dist/*.whl \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo
 
+# Install S3 dependencies
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+    boto3 \
+    runai-model-streamer \
+    runai-model-streamer-s3
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
