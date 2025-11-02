@@ -6,7 +6,9 @@ import dataclasses
 import hashlib
 import json
 import os.path
+import re
 import time
+import unicodedata
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
@@ -38,6 +40,27 @@ def _json_safe(obj: Any):
 
 def generate_request_id() -> str:
     return str(uuid.uuid4())
+
+
+def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:
+    """Create a filesystem- and ffmpeg-friendly filename.
+
+    - Normalize to ASCII (drop accents and unsupported chars)
+    - Replace spaces with underscores
+    - Replace any char not in [A-Za-z0-9_.-] with replacement
+    - Collapse multiple underscores
+    - Trim leading/trailing dots/underscores and limit length
+    """
+    normalized = unicodedata.normalize("NFKD", name)
+    ascii_name = normalized.encode("ascii", "ignore").decode("ascii")
+    ascii_name = ascii_name.replace(" ", "_")
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]", replacement, ascii_name)
+    ascii_name = re.sub(r"_+", "_", ascii_name).strip("._")
+    if not ascii_name:
+        ascii_name = "output"
+    if max_length and len(ascii_name) > max_length:
+        ascii_name = ascii_name[:max_length]
+    return ascii_name
 
 
 class DataType(Enum):
@@ -144,18 +167,21 @@ class SamplingParams:
             param_hash = hasher.hexdigest()[:8]
 
             timestamp = time.strftime("%Y%m%d-%H%M%S")
-            self.output_file_name = (
-                f"{self.prompt[:100].replace(' ', '_')}_{timestamp}_{param_hash}"
-            )
+            base = f"{self.prompt[:100]}_{timestamp}_{param_hash}"
+            self.output_file_name = base
 
         if self.output_file_name is None:
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             self.output_file_name = f"output_{timestamp}"
 
+        self.output_file_name = _sanitize_filename(self.output_file_name)
+
+        # Ensure a proper extension is present
+        self.set_output_file_ext()
+
     def __post_init__(self) -> None:
         assert self.num_frames >= 1
         self.data_type = DataType.VIDEO if self.num_frames > 1 else DataType.IMAGE
-        self.set_output_file_name()
 
         if self.width is None:
             self.width_not_provided = True
