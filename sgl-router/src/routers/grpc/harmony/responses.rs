@@ -912,6 +912,7 @@ fn build_next_request_with_tools(
     for tool_call in tool_calls {
         items.push(ResponseInputOutputItem::FunctionToolCall {
             id: tool_call.id.clone(),
+            call_id: tool_call.id.clone(),
             name: tool_call.function.name.clone(),
             arguments: tool_call
                 .function
