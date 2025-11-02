@@ -47,9 +47,7 @@ docker run --gpus all \
     --env "HF_TOKEN=<secret>" \
     --ipc=host \
     lmsysorg/sglang:diffusion \
-    sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-          --use-fsdp-inference \
-          --text-encoder-cpu-offload --pin-cpu-memory \
-          --prompt "A curious raccoon" \
-          --save-output
+    sglang generate --model-path black-forest-labs/FLUX.1-dev \
+    --prompt "A logo With Bold Large text: SGL Diffusion" \
+    --save-output
 ```
