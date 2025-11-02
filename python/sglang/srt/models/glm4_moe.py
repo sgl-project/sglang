@@ -15,7 +15,7 @@
 """Inference-only GLM-4.5, GLM-4.6 model compatible with HuggingFace weights"""
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -83,6 +83,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_non_idle_and_non_empty,
     make_layers,
 )
 
@@ -423,9 +424,9 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 else None
             )
 
-        self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
-        )
+            self._enable_a2a_moe = (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            )
 
     def get_moe_weights(self):
         return [
@@ -445,19 +446,16 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
             if (
                 self.alt_stream is not None
+                and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
                 return self.forward_normal_dual_stream(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
                 )
             else:
                 return self.forward_normal(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -531,11 +529,13 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
-    def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+    def forward_deepep(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+            router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -553,7 +553,15 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         )
 
         if shared_output is not None:
-            final_hidden_states.add_(shared_output)
+            x = shared_output
+            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+                x.add_(final_hidden_states)
+            else:
+                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+                final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
 
@@ -562,6 +570,91 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         if hidden_states.shape[0] > 0:
             shared_output = self.shared_experts(hidden_states)
         return shared_output
+
+    def op_gate(self, state):
+        if is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+        ):
+            # router_logits: (num_tokens, n_experts)
+            state.router_logits = self.gate(state.hidden_states_mlp_input)
+        else:
+            state.router_logits = None
+
+    def op_shared_experts(self, state):
+        hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
+        if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, hidden_states_mlp_input
+        ):
+            state.shared_output = self.shared_experts(hidden_states_mlp_input)
+        else:
+            state.shared_output = None
+
+    def op_select_experts(self, state):
+        router_logits = state.pop("router_logits")
+        hidden_states = state.hidden_states_mlp_input
+
+        if router_logits is not None:
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                state.topk_output = self.topk(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
+        else:
+            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+    def op_dispatch_a(self, state):
+        if self.ep_size > 1:
+            self.experts.dispatcher.dispatch_a(
+                hidden_states=state.hidden_states_mlp_input,
+                topk_output=state.pop("topk_output"),
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            )
+
+    def op_dispatch_b(self, state):
+        if self.ep_size > 1:
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                state.dispatch_output = self.experts.dispatcher.dispatch_b(
+                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
+                )
+
+    def op_experts(self, state):
+        state.combine_input = self.experts.run_moe_core(
+            dispatch_output=state.dispatch_output,
+        )
+
+    def op_combine_a(self, state):
+        if self.ep_size > 1:
+            self.experts.dispatcher.combine_a(
+                combine_input=state.pop("combine_input"),
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            )
+            state.pop("dispatch_output")
+
+    def op_combine_b(self, state):
+        if self.ep_size > 1:
+            state.hidden_states_after_combine = self.experts.dispatcher.combine_b(
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            )
+
+    def op_output(self, state):
+        final_hidden_states = state.pop("hidden_states_after_combine")
+
+        if (shared_output := state.pop("shared_output")) is not None:
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            final_hidden_states *= self.routed_scaling_factor
+
+        state.hidden_states_mlp_output = final_hidden_states
 
 
 class Glm4MoeDecoderLayer(nn.Module):
@@ -701,6 +794,7 @@ class Glm4MoeModel(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.vocab_size = config.vocab_size
+        self.first_k_dense_replace = config.first_k_dense_replace
         self.embed_dim = config.hidden_size
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -729,6 +823,8 @@ class Glm4MoeModel(nn.Module):
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+
+        self.layers_to_capture = []
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -763,8 +859,11 @@ class Glm4MoeModel(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
 
+        aux_hidden_states = []
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -799,7 +898,9 @@ class Glm4MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+        if len(aux_hidden_states) == 0:
             return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class Glm4MoeForCausalLM(nn.Module):
@@ -810,10 +911,10 @@ class Glm4MoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        self.pp_group = get_pp_group()
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
         self.model = Glm4MoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -844,10 +945,13 @@ class Glm4MoeForCausalLM(nn.Module):
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return hidden_states
@@ -1023,6 +1127,20 @@ class Glm4MoeForCausalLM(nn.Module):
             num_logical_experts=config.n_routed_experts,
             num_groups=config.n_group,
         )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = [Glm4MoeForCausalLM]
