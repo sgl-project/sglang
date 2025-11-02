@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch
 import torch.fx as fx
 
+import sglang.srt.compilation.weak_ref_tensor_jit  # noqa: F401
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 
@@ -22,7 +23,8 @@ def weak_ref_tensor(tensor: Any) -> Any:
     but will not keep the original tensor alive.
     """
     if isinstance(tensor, torch.Tensor):
-        return torch.ops.sgl_kernel.weak_ref_tensor(tensor)
+        # TODO(yuwei): introduce weak_ref_tensor from sgl_kernel
+        return torch.ops.jit_weak_ref_tensor.weak_ref_tensor(tensor)
     return tensor
 
 
