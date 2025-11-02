@@ -1,3 +1,4 @@
+import asyncio
 import concurrent
 import concurrent.futures
 import dataclasses
@@ -5,6 +6,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
+from functools import partial
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
@@ -300,7 +302,6 @@ class BaseMultimodalProcessor(ABC):
     def _load_single_item(
         data,
         modality: Modality,
-        frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
     ):
@@ -319,7 +320,7 @@ class BaseMultimodalProcessor(ABC):
                     img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                return load_video(data)
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
@@ -372,16 +373,16 @@ class BaseMultimodalProcessor(ABC):
                             "Mismatch between image tokens and estimated frame counts."
                         )
 
-                futures.append(
-                    self.io_executor.submit(
-                        BaseMultimodalProcessor._load_single_item,
-                        data,
-                        modality,
-                        frame_count_limit,
-                        audio_sample_rate,
-                        discard_alpha_channel,
-                    )
+                loop = asyncio.get_event_loop()
+                fn = partial(
+                    BaseMultimodalProcessor._load_single_item,
+                    data,
+                    modality,
+                    audio_sample_rate,
+                    discard_alpha_channel,
                 )
+                futures.append(loop.run_in_executor(self.io_executor, fn))
+
                 task_info.append((modality, data, frame_count_limit))
 
         for modality, iterator in data_iterators.items():
@@ -397,7 +398,7 @@ class BaseMultimodalProcessor(ABC):
 
         return futures, task_info
 
-    def load_mm_data(
+    async def load_mm_data(
         self,
         prompt: str,
         multimodal_tokens: MultimodalSpecialTokens,
@@ -458,7 +459,7 @@ class BaseMultimodalProcessor(ABC):
                 if multimodal_tokens_pattern.match(text_part):
                     modality, raw_data, frame_limit = next(task_info_iter)
                     is_precomputed = isinstance(raw_data, dict)
-                    result = next(futures_iter).result()
+                    result = await next(futures_iter)
 
                     if modality == Modality.IMAGE:
                         # If data is already processed it will be a
@@ -483,7 +484,7 @@ class BaseMultimodalProcessor(ABC):
                             if is_precomputed
                             else multimodal_tokens.video_token
                         )
-                        videos += [result]
+                        videos += [(result, frame_limit)]
                         new_text_parts += mm_tokens
                     elif modality == Modality.AUDIO:
                         # audio
