@@ -8,4 +8,3 @@ version = "0.1.0"
 description = "Standalone MLA RoPE + FP8 Fusion Kernel"
 requires-python = ">=3.8"
 dependencies = ["torch"]
-

@@ -15,11 +15,13 @@ import torch
 try:
     # Try standalone build first
     from mla_fusion_kernel import mla_rope_quantize_fp8_fused
+
     _has_sgl_kernel = True
 except ImportError:
     # Fallback to sgl_kernel
     try:
         from sgl_kernel import mla_rope_quantize_fp8_fused
+
         _has_sgl_kernel = True
     except ImportError:
         mla_rope_quantize_fp8_fused = None  # Will use non-fused path
@@ -66,9 +68,7 @@ def test_fused_matches_baseline(nnz, num_heads, Dn, Dr, dtype):
 
     # Create cos/sin cache
     max_seq = max(2048, nnz)
-    t = torch.linspace(0, 1, steps=max_seq, device=device, dtype=torch.float32)[
-        :, None
-    ]
+    t = torch.linspace(0, 1, steps=max_seq, device=device, dtype=torch.float32)[:, None]
     idx = torch.arange(Dr, device=device, dtype=torch.float32)[None, :]
     freqs = 0.1 * (idx + 1.0)  # Small frequencies to avoid overflow
     cos = torch.cos(t * freqs)
@@ -173,9 +173,7 @@ def test_baseline_only_path(nnz, Dn, Dr):
 
     # Create cos/sin cache
     max_seq = 2048
-    t = torch.linspace(0, 1, steps=max_seq, device=device, dtype=torch.float32)[
-        :, None
-    ]
+    t = torch.linspace(0, 1, steps=max_seq, device=device, dtype=torch.float32)[:, None]
     idx = torch.arange(Dr, device=device, dtype=torch.float32)[None, :]
     freqs = 0.1 * (idx + 1.0)
     cos = torch.cos(t * freqs)
@@ -234,9 +232,7 @@ def test_fused_only_path():
 
     # Create cos/sin cache
     max_seq = 2048
-    t = torch.linspace(0, 1, steps=max_seq, device=device, dtype=torch.float32)[
-        :, None
-    ]
+    t = torch.linspace(0, 1, steps=max_seq, device=device, dtype=torch.float32)[:, None]
     idx = torch.arange(Dr, device=device, dtype=torch.float32)[None, :]
     freqs = 0.1 * (idx + 1.0)
     cos = torch.cos(t * freqs)
@@ -250,7 +246,9 @@ def test_fused_only_path():
     # Allocate only Q output and KV buffer
     q_out = torch.empty(nnz, Dn + Dr, device=device, dtype=torch.uint8)
     slots = nnz + 16
-    kv_buffer = torch.zeros(slots, Dn + Dr, device=device, dtype=torch.uint8)  # 2D format
+    kv_buffer = torch.zeros(
+        slots, Dn + Dr, device=device, dtype=torch.uint8
+    )  # 2D format
     loc = torch.arange(nnz, device=device, dtype=torch.long)
 
     # Call kernel (fused path only)
@@ -279,5 +277,3 @@ def test_fused_only_path():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
-

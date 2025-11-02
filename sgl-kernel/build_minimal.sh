@@ -22,4 +22,3 @@ pip install -e . --no-build-isolation -v 2>&1 | tee build.log
 
 echo ""
 echo "Build completed! Check build.log for details."
-
