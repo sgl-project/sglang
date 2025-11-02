@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from python.sglang.srt.utils.common import is_npu
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -331,14 +333,18 @@ class PrefillAdder:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
-        self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
-        if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= mixed_with_decode_tokens
+        if is_npu():
+            self.rem_input_tokens = rem_input_tokens
+            self.rem_total_token_offset = 0
+            self.cur_rem_token_offset = 0
+        else:
+            self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
+            if self.rem_chunk_tokens is not None:
+                self.rem_chunk_tokens -= mixed_with_decode_tokens
 
-        self.rem_total_token_offset = mixed_with_decode_tokens
-        self.cur_rem_token_offset = mixed_with_decode_tokens
-
+            self.rem_total_token_offset = mixed_with_decode_tokens
+            self.cur_rem_token_offset = mixed_with_decode_tokens
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []

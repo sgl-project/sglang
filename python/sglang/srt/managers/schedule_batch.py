@@ -1076,6 +1076,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
+    # mix chunk
+    running_decode_bs: int = 0
+    prefill_input_ids: int = 0
+
     @classmethod
     def init_new(
         cls,
@@ -1393,12 +1397,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
+        self.running_decode_bs = running_bs
 
         for req in running_batch.reqs:
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.extend_input_len = 1
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
+        self.prefill_input_ids = self.input_ids
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
         self.merge_batch(running_batch)
@@ -1791,6 +1797,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
+            running_decode_bs=self.running_decode_bs,
+            prefill_input_ids=self.prefill_input_ids,
             input_embeds=self.input_embeds,
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
@@ -1899,6 +1907,10 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    # For mixed chunk
+    running_decode_bs: int
+    prefill_input_ids: int
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: Optional[torch.Tensor] = None
