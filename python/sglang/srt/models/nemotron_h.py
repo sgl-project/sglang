@@ -15,8 +15,9 @@
 
 """Inference-only NemotronH model."""
 
+import typing
 from collections.abc import Iterable
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 from torch import nn
@@ -107,7 +108,7 @@ class NemotronHMoE(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        print("Another MoE", layer_idx)
+
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
 
@@ -138,7 +139,6 @@ class NemotronHMoE(nn.Module):
             scoring_func="sigmoid",
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
-            num_fused_shared_experts=config.n_shared_experts,
         )
         self.experts = FusedMoE(
             num_experts=config.n_routed_experts,
@@ -151,8 +151,18 @@ class NemotronHMoE(nn.Module):
             activation=config.mlp_hidden_act,
             layer_id=layer_idx,
             is_gated=False,
-            num_fused_shared_experts=config.n_shared_experts,
         )
+        if config.n_shared_experts:
+            self.shared_experts = NemotronHMLP(
+                config,
+                intermediate_size=config.moe_shared_expert_intermediate_size
+                * config.n_shared_experts,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=f"{prefix}.shared_experts",
+            )
+        else:
+            self.shared_experts = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -162,6 +172,13 @@ class NemotronHMoE(nn.Module):
         router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
+        if self.shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+        else:
+            shared_output = None
+
+        if shared_output is not None:
+            final_hidden_states += shared_output
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -587,6 +604,14 @@ class NemotronHForCausalLM(nn.Module):
             name = replace_prefix(name, self.remap_prefix)
             name = replace_substrings(name, self.remap_substr)
             updated_weights.append((name, loaded_weight))
+
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="up_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="",
+            num_experts=self.config.n_routed_experts,
+        )
+
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in updated_weights:
@@ -609,17 +634,40 @@ class NemotronHForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name in params_dict.keys():
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
+                is_expert_weight = False
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    is_expert_weight = True
+                    name_mapped = name.replace(weight_name, param_name)
+                    param = params_dict[name_mapped]
+                    weight_loader = typing.cast(
+                        Callable[..., bool], param.weight_loader
                     )
-                    weight_loader(param, loaded_weight)
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name_mapped,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+                    name = name_mapped
+                    break
                 else:
-                    logger.warning(f"Parameter {name} not found in params_dict")
+                    if is_expert_weight:
+                        continue
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                    else:
+                        logger.warning(f"Parameter {name} not found in params_dict")
 
 
 EntryClass = [NemotronHForCausalLM]
