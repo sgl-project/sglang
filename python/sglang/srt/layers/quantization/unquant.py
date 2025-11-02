@@ -7,7 +7,10 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.amx_utils import (
+    CPUMoECompMethod,
+    _amx_process_weight_after_loading,
+)
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
@@ -333,10 +336,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 topk_weights,
                 topk_ids,
                 False,  # inplace # See [Note] inplace should be False in fused_experts.
-                False,  # use_int8_w8a8
-                False,  # use_fp8_w8a16
+                CPUMoECompMethod.BF16_GEMM,
                 None,  # w1_scale
                 None,  # w2_scale
+                None,  # w1_zp
+                None,  # w2_zp
                 None,  # block_size
                 None,  # a1_scale
                 None,  # a2_scale
