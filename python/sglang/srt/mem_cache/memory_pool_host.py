@@ -221,6 +221,21 @@ class MHATokenToKVPoolHost(HostKVCache):
         return self.get_size_per_token() // 2
 
     def init_kv_buffer(self):
+        if _is_npu:
+            dims = (
+                2,
+                self.size // self.page_size + 1,
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            )
+            return torch.empty(
+                dims,
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
         if self.layout == "layer_first":
             dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
         elif self.layout == "page_first":
@@ -265,6 +280,20 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
+        if _is_npu:
+            if layer_id == 0:
+                torch.ops.npu.transfer_kv_dim_exchange(
+                    device_pool.k_buffer,
+                    self.k_buffer,
+                    device_pool.v_buffer,
+                    self.v_buffer,
+                    device_indices,
+                    host_indices,
+                    self.page_size,
+                    1,
+                    2,
+                )
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 transfer_kv_per_layer(
@@ -322,6 +351,19 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if _is_npu:
+            torch.ops.npu.transfer_kv_dim_exchange(
+                device_pool.k_buffer,
+                self.k_buffer,
+                device_pool.v_buffer,
+                self.v_buffer,
+                device_indices,
+                host_indices,
+                self.page_size,
+                2,
+                2,
+            )
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 transfer_kv_all_layer(
@@ -504,12 +546,13 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
         )
-        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
+        if not _is_npu:
+            self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+            self.data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.data_refs],
+                dtype=torch.uint64,
+                device=self.device_pool.device,
+            )
 
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
@@ -527,6 +570,24 @@ class MLATokenToKVPoolHost(HostKVCache):
         return self.get_size_per_token()
 
     def init_kv_buffer(self):
+        if _is_npu:
+            dims = (
+                self.size // self.page_size + 1,
+                self.layer_num,
+                self.page_size,
+                1,
+            )
+            self.k_buffer = torch.empty(
+                (*dims, self.kv_lora_rank),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.v_buffer = torch.empty(
+                (*dims, self.qk_rope_head_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            return (self.k_buffer, self.v_buffer)
         if self.layout == "layer_first":
             dims = (
                 self.layer_num,
@@ -569,6 +630,20 @@ class MLATokenToKVPoolHost(HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        if _is_npu:
+            if layer_id == 0:
+                torch.ops.npu.transfer_kv_dim_exchange(
+                    device_pool.k_buffer,
+                    self.k_buffer,
+                    device_pool.v_buffer,
+                    self.v_buffer,
+                    device_indices,
+                    host_indices,
+                    self.page_size,
+                    1,
+                    2,
+                )
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
@@ -614,6 +689,19 @@ class MLATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if _is_npu:
+            torch.ops.npu.transfer_kv_dim_exchange(
+                device_pool.k_buffer,
+                self.k_buffer,
+                device_pool.v_buffer,
+                self.v_buffer,
+                device_indices,
+                host_indices,
+                self.page_size,
+                2,
+                2,
+            )
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 transfer_kv_all_layer_mla(
