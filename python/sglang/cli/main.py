@@ -1,16 +1,126 @@
 import argparse
+import hashlib
+import json
+import logging
+import os
+import tempfile
+from typing import Optional
+
+import filelock
+from huggingface_hub import hf_hub_download
+
+logger = logging.getLogger(__name__)
+
+temp_dir = tempfile.gettempdir()
+
+
+def _get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
+    lock_dir = cache_dir or temp_dir
+    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
+    model_name = model_name_or_path.replace("/", "-")
+    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
+    # add hash to avoid conflict with old users' lock files
+    lock_file_name = hash_name + model_name + ".lock"
+    # mode 0o666 is required for the filelock to be shared across users
+    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
+    return lock
+
+
+# Copied and adapted from hf_diffusers_utils.py
+def _maybe_download_model(
+    model_name_or_path: str, local_dir: str | None = None, download: bool = True
+) -> str:
+    """
+    Resolve a model path. If it's a local directory, return it.
+    If it's a Hugging Face Hub ID, download only the config file
+    (`model_index.json` or `config.json`) and return its directory.
+
+    Args:
+        model_name_or_path: Local path or Hugging Face Hub model ID
+        local_dir: Local directory to save the downloaded file (if any)
+        download: Whether to download from Hugging Face Hub when needed
+
+    Returns:
+        Local directory path that contains the downloaded config file, or the original local directory.
+    """
+
+    if os.path.exists(model_name_or_path):
+        logger.info("Model already exists locally")
+        return model_name_or_path
+
+    if not download:
+        return model_name_or_path
+
+    with _get_lock(model_name_or_path):
+        # Try `model_index.json` first (diffusers models)
+        try:
+            logger.info(
+                "Downloading model_index.json from HF Hub for %s...",
+                model_name_or_path,
+            )
+            file_path = hf_hub_download(
+                repo_id=model_name_or_path,
+                filename="model_index.json",
+                local_dir=local_dir,
+            )
+            logger.info("Downloaded to %s", file_path)
+            return os.path.dirname(file_path)
+        except Exception as e_index:
+            logger.debug("model_index.json not found or failed: %s", e_index)
+
+        # Fallback to `config.json`
+        try:
+            logger.info(
+                "Downloading config.json from HF Hub for %s...", model_name_or_path
+            )
+            file_path = hf_hub_download(
+                repo_id=model_name_or_path,
+                filename="config.json",
+                local_dir=local_dir,
+            )
+            logger.info("Downloaded to %s", file_path)
+            return os.path.dirname(file_path)
+        except Exception as e_config:
+            raise ValueError(
+                (
+                    "Could not find model locally at %s and failed to download "
+                    "model_index.json/config.json from HF Hub: %s"
+                )
+                % (model_name_or_path, e_config)
+            ) from e_config
+
+
+# Copied and adapted from hf_diffusers_utils.py
+def _verify_model_config_and_directory(model_path: str) -> True:
+    """
+    Verify if the model directory contains a valid diffusers configuration.
+
+    Args:
+        model_path: Path to the model directory
+
+    Returns:
+        The loaded model configuration as a dictionary if the model is a diffusers model
+        None if the model is not a diffusers model
+    """
+
+    # Prefer model_index.json which indicates a diffusers pipeline
+    config_path = os.path.join(model_path, "model_index.json")
+    if not os.path.exists(config_path):
+        return None
+
+    # Load the config
+    with open(config_path) as f:
+        config = json.load(f)
+
+    # Verify diffusers version exists
+    if "_diffusers_version" not in config:
+        return None
+    return True
 
 
 def get_is_diffusion_model(model_path: str):
-    lowered_path = model_path.lower()
-    return (
-        "diffusion" in lowered_path
-        or "wan" in lowered_path
-        or "video" in lowered_path
-        or "image" in lowered_path
-        or "hunyuan" in lowered_path
-        or "flux" in lowered_path
-    )
+    model_path = _maybe_download_model(model_path)
+    return _verify_model_config_and_directory(model_path)
 
 
 def get_model_path(extra_argv):
