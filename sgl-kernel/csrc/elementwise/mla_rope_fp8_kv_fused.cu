@@ -89,7 +89,7 @@ __device__ inline uint32_t pack4(uint8_t a0, uint8_t a1, uint8_t a2, uint8_t a3)
   return (uint32_t)a0 | ((uint32_t)a1 << 8) | ((uint32_t)a2 << 16) | ((uint32_t)a3 << 24);
 }
 
-__device__ inline void rope_rotate(float& xr, float& xi, float c, float s, bool) {
+__device__ inline void rope_rotate(float& xr, float& xi, float c, float s) {
   float xr_new = xr * c - xi * s;
   float xi_new = xr * s + xi * c;
   xr = xr_new;
@@ -178,8 +178,8 @@ __global__ void FusedRopeQuantizeKernelVec(
     float c0 = cos_ptr[base0], s0 = sin_ptr[base0];
     float c1 = cos_ptr[base1], s1 = sin_ptr[base1];
 
-    rope_rotate(f0.x, f0.y, c0, s0, false);
-    rope_rotate(f1.x, f1.y, c1, s1, false);
+    rope_rotate(f0.x, f0.y, c0, s0);
+    rope_rotate(f1.x, f1.y, c1, s1);
 
     uint32_t packed = pack4(
         float_to_e4m3fn_byte(f0.x), float_to_e4m3fn_byte(f0.y), float_to_e4m3fn_byte(f1.x), float_to_e4m3fn_byte(f1.y));
@@ -214,8 +214,8 @@ __global__ void FusedRopeQuantizeKernelVec(
       float c0 = cos_ptr[base0], s0 = sin_ptr[base0];
       float c1 = cos_ptr[base1], s1 = sin_ptr[base1];
 
-      rope_rotate(f0.x, f0.y, c0, s0, false);
-      rope_rotate(f1.x, f1.y, c1, s1, false);
+      rope_rotate(f0.x, f0.y, c0, s0);
+      rope_rotate(f1.x, f1.y, c1, s1);
 
       uint32_t packed = pack4(
           float_to_e4m3fn_byte(f0.x),
@@ -283,7 +283,7 @@ __global__ void FusedRopeQuantizeKernelScalar(
           int base = i >> 1;
           float xr = Vec2Traits<T>::to_float(qr[i + 0]);
           float xi = (i + 1 < Dr) ? Vec2Traits<T>::to_float(qr[i + 1]) : 0.0f;
-          rope_rotate(xr, xi, cos_ptr[base], sin_ptr[base], false);
+          rope_rotate(xr, xi, cos_ptr[base], sin_ptr[base]);
           qdst[Dn + i] = float_to_e4m3fn_byte(xr);
           if (i + 1 < Dr) qdst[Dn + i + 1] = float_to_e4m3fn_byte(xi);
         }
@@ -292,7 +292,7 @@ __global__ void FusedRopeQuantizeKernelScalar(
         for (int i = 0; i < half; ++i) {
           float xr = Vec2Traits<T>::to_float(qr[i]);
           float xi = Vec2Traits<T>::to_float(qr[i + half]);
-          rope_rotate(xr, xi, cos_ptr[i], sin_ptr[i], true);
+          rope_rotate(xr, xi, cos_ptr[i], sin_ptr[i]);
           qdst[Dn + i] = float_to_e4m3fn_byte(xr);
           qdst[Dn + i + half] = float_to_e4m3fn_byte(xi);
         }
@@ -316,7 +316,7 @@ __global__ void FusedRopeQuantizeKernelScalar(
             int base = i >> 1;
             float xr = Vec2Traits<T>::to_float(kr[i]);
             float xi = (i + 1 < Dr) ? Vec2Traits<T>::to_float(kr[i + 1]) : 0.0f;
-            rope_rotate(xr, xi, cos_ptr[base], sin_ptr[base], false);
+            rope_rotate(xr, xi, cos_ptr[base], sin_ptr[base]);
             krd[i] = float_to_e4m3fn_byte(xr);
             if (i + 1 < Dr) krd[i + 1] = float_to_e4m3fn_byte(xi);
           }
@@ -325,7 +325,7 @@ __global__ void FusedRopeQuantizeKernelScalar(
           for (int i = 0; i < half; ++i) {
             float xr = Vec2Traits<T>::to_float(kr[i]);
             float xi = Vec2Traits<T>::to_float(kr[i + half]);
-            rope_rotate(xr, xi, cos_ptr[i], sin_ptr[i], true);
+            rope_rotate(xr, xi, cos_ptr[i], sin_ptr[i]);
             krd[i] = float_to_e4m3fn_byte(xr);
             krd[i + half] = float_to_e4m3fn_byte(xi);
           }
@@ -343,7 +343,7 @@ __global__ void FusedRopeQuantizeKernelScalar(
             int base = i >> 1;
             float xr = Vec2Traits<T>::to_float(kr[i]);
             float xi = (i + 1 < Dr) ? Vec2Traits<T>::to_float(kr[i + 1]) : 0.0f;
-            rope_rotate(xr, xi, cos_ptr[base], sin_ptr[base], false);
+            rope_rotate(xr, xi, cos_ptr[base], sin_ptr[base]);
             dst[Dn + i] = float_to_e4m3fn_byte(xr);
             if (i + 1 < Dr) dst[Dn + i + 1] = float_to_e4m3fn_byte(xi);
           }
@@ -352,7 +352,7 @@ __global__ void FusedRopeQuantizeKernelScalar(
           for (int i = 0; i < half; ++i) {
             float xr = Vec2Traits<T>::to_float(kr[i]);
             float xi = Vec2Traits<T>::to_float(kr[i + half]);
-            rope_rotate(xr, xi, cos_ptr[i], sin_ptr[i], true);
+            rope_rotate(xr, xi, cos_ptr[i], sin_ptr[i]);
             dst[Dn + i] = float_to_e4m3fn_byte(xr);
             dst[Dn + i + half] = float_to_e4m3fn_byte(xi);
           }
