@@ -70,7 +70,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.utils import add_prefix, is_cuda, make_layers, is_flashinfer_available
+from sglang.srt.utils import add_prefix, is_cuda, is_flashinfer_available, make_layers
 
 if is_flashinfer_available():
     from flashinfer import RoutingMethodType
@@ -165,7 +165,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            routing_method_type=RoutingMethodType.RenormalizeNaive if is_flashinfer_available() else None,
+            routing_method_type=(
+                RoutingMethodType.RenormalizeNaive
+                if is_flashinfer_available()
+                else None
+            ),
         )
 
         self.gate = ReplicatedLinear(
