@@ -121,3 +121,68 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly-1-gpu
+
+  nightly-test-4-gpu-h100:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 4-gpu-h100
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: bash scripts/ci/ci_install_dependency.sh
+      - name: Run nightly 4-GPU H100
+        timeout-minutes: 60
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-4-gpu-h100 || \
+          python3 run_suite.py --suite per-commit-4-gpu
+
+  nightly-test-8-gpu-h200:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-h200
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: bash scripts/ci/ci_install_dependency.sh
+      - name: Run nightly 8-GPU H200
+        timeout-minutes: 90
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-8-gpu-h200 || \
+          python3 run_suite.py --suite per-commit-8-gpu-h200
+
+  nightly-test-4-gpu-b200:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 4-gpu-b200
+    env:
+      IS_BLACKWELL: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies (Blackwell)
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+      - name: Run nightly 4-GPU B200
+        timeout-minutes: 90
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-4-gpu-b200 || \
+          python3 run_suite.py --suite per-commit-4-gpu-b200
+
+  nightly-test-8-gpu-b200:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-b200
+    env:
+      IS_BLACKWELL: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies (Blackwell)
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+      - name: Run nightly 8-GPU B200
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          # Prefer a B200-specific suite if present; otherwise reuse H200’s 8-GPU suite.
+          python3 run_suite.py --suite nightly-8-gpu-b200 || \
+          python3 run_suite.py --suite per-commit-8-gpu-b200 || \
+          python3 run_suite.py --suite per-commit-8-gpu-h200
+

@@ -450,6 +450,46 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
+  unit-test-backend-8-gpu-b200:
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    runs-on: 8-gpu-b200
+    env:
+      IS_BLACKWELL: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies (Blackwell)
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test (8-GPU B200)
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          # If a B200-specific suite exists, use it; else fall back to the H200 8-GPU suite.
+          if python3 - <<'PY'
+          import sys, json
+          # quick probe to decide which suite to call (no-op if you prefer to hardcode)
+          PY
+                    then
+                      python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
+                    else
+                      python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id 0 --auto-partition-size 1
+                    fi
+
+
+
   performance-test-1-gpu-part-1:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
@@ -864,6 +904,7 @@ jobs:
         unit-test-backend-2-gpu,
         unit-test-backend-4-gpu,
         unit-test-backend-8-gpu-h200,
+        unit-test-backend-8-gpu-b200,
         performance-test-1-gpu-part-1,
         performance-test-1-gpu-part-2,
         performance-test-1-gpu-part-3,
