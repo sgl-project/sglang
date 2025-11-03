@@ -559,7 +559,7 @@ def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = 
         return torch.sum(input, dim=dim, keepdim=keepdim, dtype=torch.float32) / n_elems
 
 
-@triton.jit(launch_metadata=_matmul_launch_metadata)
+@triton.jit
 def bmm_kernel_persistent(
     a_ptr,
     b_ptr,
@@ -701,7 +701,7 @@ def bmm_batch_invariant(a, b, *, out=None):
 
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-        # Use fixed kernel configuration for determinism (same as matmul_persistent)
+        # Use fixed kernel configuration for determinism
         configs = {
             torch.bfloat16: {
                 "BLOCK_SIZE_M": 128,
@@ -731,16 +731,10 @@ def bmm_batch_invariant(a, b, *, out=None):
 
         config = configs.get(dtype)
         if config is None:
-            # Fallback to sequential processing for unsupported dtypes
-            print(f"Unsupported dtype: {dtype}, falling back to sequential processing")
-            results = []
-            for i in range(B):
-                results.append(matmul_persistent(a[i], b[i]))
-            result = torch.stack(results, dim=0)
-            if out is not None:
-                out.copy_(result)
-                return out
-            return result
+            raise ValueError(
+                f"Unsupported dtype {dtype} for bmm_batch_invariant. "
+                f"Supported dtypes are: {list(configs.keys())}"
+            )
 
         # Grid: limit by NUM_SMS for persistent kernel approach
         num_tiles_per_batch = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
