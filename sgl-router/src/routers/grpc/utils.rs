@@ -44,7 +44,7 @@ pub async fn get_grpc_client_from_worker(
 
 /// Process tool call arguments in messages
 /// Per Transformers docs, tool call arguments in assistant messages should be dicts
-pub fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
+fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
     for msg in messages {
         // Early return if not assistant message
         let role = msg.get("role").and_then(|v| v.as_str());
@@ -107,7 +107,7 @@ pub fn process_content_format(
 }
 
 /// Transform a single content field based on content format
-pub fn transform_content_field(
+fn transform_content_field(
     content_value: &mut Value,
     content_format: ChatTemplateContentFormat,
 ) {
@@ -209,7 +209,7 @@ pub fn generate_tool_constraints(
 
 /// Build JSON schema for required tool calls (array with minItems: 1)
 /// Includes $defs consolidation from all tools (matching Python's behavior)
-pub fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
+fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     // Build anyOf schemas for each tool
     let mut any_of_schemas = Vec::new();
     for tool in tools {
