@@ -708,12 +708,12 @@ class FlashInferAttnBackend(AttentionBackend):
 
             # Wrap the forward methods if tracing or kernel substitution is enabled
             if envs.FIB_ENABLE_TRACING.get() or envs.FIB_ENABLE_APPLY.get():
-                self.forward_extend = wrap_attention_kernel("flashinfer_prefill_attention")(
-                    self.forward_extend
-                )
-                self.forward_decode = wrap_attention_kernel("flashinfer_decode_attention")(
-                    self.forward_decode
-                )
+                self.forward_extend = wrap_attention_kernel(
+                    "flashinfer_prefill_attention"
+                )(self.forward_extend)
+                self.forward_decode = wrap_attention_kernel(
+                    "flashinfer_decode_attention"
+                )(self.forward_decode)
 
             logger.info("FlashInfer-Bench integration initialized")
         except ImportError as e:
