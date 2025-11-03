@@ -36,7 +36,9 @@ class TestNorm(CustomTestCase):
         else:
             return x, residual
 
-    def _qwen3_next_l2norm(self, x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
+    def _qwen3_next_l2norm(
+        self, x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6
+    ):
         inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
         return x * inv_norm
 
