@@ -89,15 +89,12 @@ diffusion = [
     "cloudpickle",
     "remote-pdb",
     "torchcodec==0.5.0",
-    # required by vsa
-    "pytest",
     "st_attn ==0.0.7",
     "vsa==0.0.4",
 ]
 
 [tool.uv.extra-build-dependencies]
 st-attn = ["torch", "setuptools"]
-st_attn = ["torch", "setuptools"]
 vsa = ["torch", "setuptools"]
 
 test = [
