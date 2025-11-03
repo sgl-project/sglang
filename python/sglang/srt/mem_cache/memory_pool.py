@@ -59,9 +59,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
-
-SUPPORTED_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX"]
-
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 if _is_npu:
