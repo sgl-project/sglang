@@ -13,15 +13,15 @@ from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
-GB = 1024 * 1024 * 1024
-MB = 1024 * 1024
+_GB = 1024 * 1024 * 1024
+_MB = 1024 * 1024
 
 
 def get_tensor_size_bytes(t: torch.Tensor):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
-class RoutedExpertsDeviceCache:
+class _RoutedExpertsDeviceCache:
     def __init__(
         self, model_config: ModelConfig, max_running_requests: int, device: str
     ) -> None:
@@ -49,13 +49,13 @@ class RoutedExpertsDeviceCache:
 
     def _finalize_allocation_log(self):
         """Common logging and memory usage computation for captured experts buffers."""
-        buffer_size_MB = self.get_buffer_size_bytes() / MB
+        buffer_size_MB = self.get_buffer_size_bytes() / _MB
         logger.info(
             f"Routing experts device buffer allocated. #shape: {tuple(self.buffer.shape)}, size: {buffer_size_MB:.2f} MB"
         )
 
 
-class RoutedExpertsHostCache:
+class _RoutedExpertsHostCache:
     def __init__(
         self,
         model_config: ModelConfig,
@@ -82,7 +82,7 @@ class RoutedExpertsHostCache:
 
     def _finalize_allocation_log(self):
         """Common logging and memory usage computation for captured experts buffers."""
-        buffer_size_GB = self.get_buffer_size_bytes() / GB
+        buffer_size_GB = self.get_buffer_size_bytes() / _GB
         logger.info(
             f"Routing experts host buffer allocated. #tokens: {self.num_tokens}, size: {buffer_size_GB:.2f} GB"
         )
@@ -131,9 +131,9 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         device: str,
     ):
 
-        self.host_cache = RoutedExpertsHostCache(model_config, num_tokens)
+        self.host_cache = _RoutedExpertsHostCache(model_config, num_tokens)
 
-        self.device_cache = RoutedExpertsDeviceCache(
+        self.device_cache = _RoutedExpertsDeviceCache(
             model_config, max_running_requests, device
         )
 
