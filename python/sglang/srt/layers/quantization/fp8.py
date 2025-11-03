@@ -1187,6 +1187,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         activation = self.moe_runner_config.activation
         routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
 
+
+        from flashinfer import RoutingMethodType
         from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
 
         from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -1201,19 +1203,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # NOTE: scales of hidden states have to be transposed!
         a_sf_t = a_sf.t().contiguous()
 
-        assert (
-            topk_config.num_expert_group is not None
-            and topk_config.topk_group is not None
-        ), "Current trtllm_fp8_block_scale_moe kernel does not support these two arguments as None"
-
         correction_bias = (
             None
             if topk_config.correction_bias is None
             else topk_config.correction_bias.to(x.dtype)
         )
 
+        routing_method_type = getattr(layer, "routing_method_type", RoutingMethodType.DeepSeekV3)
+        
+                
         return trtllm_fp8_block_scale_moe(
-            routing_logits=router_logits.to(torch.float32),
+            routing_logits=router_logits.to(torch.float32) if routing_method_type == RoutingMethodType.DeepSeekV3 else router_logits,
             routing_bias=correction_bias,
             hidden_states=a_q,
             hidden_states_scale=a_sf_t,
@@ -1234,7 +1234,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             tile_tokens_dim=get_tile_tokens_dim(
                 x.shape[0], topk_config.top_k, layer.num_experts
             ),
-            routing_method_type=2,  # DeepSeek-styled routing method
+            routing_method_type=routing_method_type, 
             use_shuffled_weight=False,
         )
 

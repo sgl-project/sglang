@@ -142,6 +142,7 @@ class FusedMoE(torch.nn.Module):
         gemm1_clamp_limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
         with_bias=False,
+        routing_method_type: Optional[RoutingMethodType] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -234,6 +235,8 @@ class FusedMoE(torch.nn.Module):
             isinstance(self.quant_method, Fp8MoEMethod)
             and self.quant_method._should_use_cutlass_fused_experts()
         )
+
+        self.routing_method_type = routing_method_type
 
     def _load_per_tensor_weight_scale(
         self,
