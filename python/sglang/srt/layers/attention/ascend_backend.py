@@ -145,7 +145,7 @@ class AscendAttnBackend(AttentionBackend):
                 self.forward_metadata.seq_lens_cpu_int,
                 self.forward_metadata.extend_seq_lens_cpu_int,
             )
-            self.attn_mask = self.get_splitfuse_attn_mask(  # type: ignore
+            self.attn_mask = self.get_splitfuse_attn_mask(
                 seq_lens=self.forward_metadata.seq_lens_cpu_int,
                 position=attn_mask_id,
                 dtype=torch.float16,
