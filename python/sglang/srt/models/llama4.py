@@ -17,7 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -44,11 +44,16 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+)
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.utils import (
@@ -542,6 +547,270 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
+
+    def permute_qk_weight_for_rotary(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+    ) -> Tuple[str, torch.Tensor]:
+
+        # Helper function to permute the weight's channels
+        def permute(w: torch.Tensor, n_heads: int, is_weight_scale: bool):
+            attn_in = self.config.head_dim * n_heads
+            attn_out = self.config.hidden_size
+
+            # If the weight is FP4 packed as uint8, divide attn_out by 2
+            if w.dtype == torch.uint8 and w.shape[1] * 2 == attn_out:
+                attn_out = attn_out // 2
+            # If the weight is a weight block scale, divide by block size (16)
+            elif (
+                w.dtype == torch.float8_e4m3fn
+                and is_weight_scale
+                and w.shape[1] * 16 == attn_out
+            ):
+                attn_out = attn_out // 16
+
+            return (
+                w.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
+                .transpose(1, 2)
+                .reshape(attn_in, attn_out)
+            )
+
+        modules = name.split(".")
+
+        # Permute Q/K weights and NVFP4 weight block scales for rotary embedding
+        is_weight = modules[-1] == "weight"
+        is_nvfp4_weight_scale = (
+            modules[-1] == "weight_scale" and loaded_weight.dtype == torch.float8_e4m3fn
+        )
+
+        if is_weight or is_nvfp4_weight_scale:
+            if "wk" in modules or "k_proj" in modules:
+                dim = self.config.num_key_value_heads
+                loaded_weight = permute(loaded_weight, dim, is_nvfp4_weight_scale)
+            elif "wq" in modules or "q_proj" in modules:
+                dim = self.config.num_attention_heads
+                loaded_weight = permute(loaded_weight, dim, is_nvfp4_weight_scale)
+
+        return name, loaded_weight
+
+    def _transform_expert_name(
+        self, name: str, is_weight: bool = False
+    ) -> Tuple[str, str, List[str]]:
+        suffix = "_weight" if is_weight else ""
+
+        if ".gate_up_proj" in name:
+            transformed_name = name.replace(
+                ".experts.gate_up_proj", f".experts.w13{suffix}"
+            )
+            shard_id = "w13"
+            shard_id_list = ["w1", "w3"]
+        else:  # down_proj
+            transformed_name = name.replace(
+                ".experts.down_proj", f".experts.w2{suffix}"
+            )
+            shard_id = "w2"
+            shard_id_list = ["w2"]
+
+        return transformed_name, shard_id, shard_id_list
+
+    def _handle_expert_scale_params(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict,
+        num_experts: int,
+        loaded_params: set,
+    ) -> bool:
+        import re
+
+        expert_match = re.search(r"experts\.(\d+)\.", name)
+
+        transformed_name, shard_id, shard_id_list = self._transform_expert_name(name)
+
+        if transformed_name not in params_dict:
+            return True
+
+        param = params_dict[transformed_name]
+
+        # Transpose if weight scales are FP8 block scales with shape [num_experts, hidden_in, hidden_out]
+        if (
+            name.endswith("weight_scale")
+            and loaded_weight.dtype == torch.float8_e4m3fn
+            and loaded_weight.ndim == 3
+        ):
+            loaded_weight = loaded_weight.transpose(-1, -2)
+
+        actual_shard_ids = shard_id_list if shard_id == "w13" else [shard_id]
+
+        def load_for_expert(weight_tensor, expert_id):
+            for actual_shard_id in actual_shard_ids:
+                param.weight_loader(
+                    param,
+                    weight_tensor,
+                    name,
+                    shard_id=actual_shard_id,
+                    expert_id=expert_id,
+                )
+
+        if expert_match:
+            expert_id = int(expert_match.group(1))
+            load_for_expert(loaded_weight, expert_id)
+        else:
+            if loaded_weight.dim() == 3 and loaded_weight.shape[0] == num_experts:
+                for expert_id in range(num_experts):
+                    load_for_expert(loaded_weight[expert_id], expert_id)
+            else:
+                for expert_id in range(num_experts):
+                    load_for_expert(loaded_weight, expert_id)
+        loaded_params.add(transformed_name)
+        return True
+
+    def _handle_expert_weight_params(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict,
+        num_experts: int,
+        loaded_params: set,
+    ) -> bool:
+        transformed_name, _, shard_id_list = self._transform_expert_name(
+            name, is_weight=True
+        )
+
+        fused = loaded_weight.dim() == 3 and loaded_weight.shape[0] == num_experts
+
+        if ".gate_up_proj" in name:
+            if fused:
+                loaded_weight = loaded_weight.transpose(-1, -2)
+            loaded_weight_list = loaded_weight.chunk(2, dim=-2)
+        else:  # down_proj
+            if fused:
+                loaded_weight = loaded_weight.transpose(-1, -2)
+            loaded_weight_list = [loaded_weight]
+
+        for param_name, weight_chunk, shard_id in zip(
+            [transformed_name] * len(shard_id_list), loaded_weight_list, shard_id_list
+        ):
+            if param_name not in params_dict:
+                continue
+
+            param = params_dict[param_name]
+            weight_loader = param.weight_loader
+            loaded_params.add(param_name)
+
+            if weight_chunk.dim() == 2:
+                for expert_id in range(num_experts):
+                    weight_loader(
+                        param,
+                        weight_chunk,
+                        param_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+            elif weight_chunk.dim() == 3 and weight_chunk.shape[0] == num_experts:
+                for expert_id in range(num_experts):
+                    weight_loader(
+                        param,
+                        weight_chunk[expert_id],
+                        param_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+            else:
+                for expert_id in range(num_experts):
+                    weight_loader(
+                        param,
+                        weight_chunk[expert_id],
+                        param_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+        return True
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
+            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
+            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
+            (".feed_forward.gate_up_proj", ".feed_forward.gate_proj", 0),
+            (".feed_forward.gate_up_proj", ".feed_forward.up_proj", 1),
+        ]
+
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        num_experts = getattr(self.config, "num_local_experts", 0)
+
+        for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            # Permute Q/K weights and NVFP4 weight block scales for rotary embedding
+            name, loaded_weight = self.permute_qk_weight_for_rotary(name, loaded_weight)
+
+            # Remap FP8 kv-scale names (non-expert scales)
+            if "scale" in name and "expert" not in name:
+                remapped = maybe_remap_kv_scale_name(name, params_dict)
+                if remapped is None:
+                    continue
+                name = remapped
+
+            # Stacked parameters (skip experts so they can be handled later)
+            handled_stacked = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name in name and "experts" not in name:
+                    mapped_name = name.replace(weight_name, param_name)
+                    if mapped_name.endswith(".bias") and mapped_name not in params_dict:
+                        handled_stacked = True
+                        break
+                    if mapped_name not in params_dict:
+                        handled_stacked = True
+                        break
+                    param = params_dict[mapped_name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(mapped_name)
+                    handled_stacked = True
+                    break
+            if handled_stacked:
+                continue
+
+            # Expert weights and scales
+            if ".experts" in name and num_experts > 0:
+                if "scale" in name:
+                    if self._handle_expert_scale_params(
+                        name, loaded_weight, params_dict, num_experts, loaded_params
+                    ):
+                        continue
+                else:
+                    if self._handle_expert_weight_params(
+                        name, loaded_weight, params_dict, num_experts, loaded_params
+                    ):
+                        continue
+
+            # Default weights
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            if name not in params_dict:
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
+        return loaded_params
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
