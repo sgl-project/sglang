@@ -310,25 +310,38 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
         ]
 
         for bs, hidden_dim, inter_dim, topk in test_cases:
-            with self.subTest(bs=bs, hidden_dim=hidden_dim, inter_dim=inter_dim, topk=topk):
-                print(f"Testing with bs={bs}, hidden_dim={hidden_dim}, inter_dim={inter_dim}, topk={topk}")
+            with self.subTest(
+                bs=bs, hidden_dim=hidden_dim, inter_dim=inter_dim, topk=topk
+            ):
+                print(
+                    f"Testing with bs={bs}, hidden_dim={hidden_dim}, inter_dim={inter_dim}, topk={topk}"
+                )
                 with torch.inference_mode():
                     torch.manual_seed(42)
                     device = "cuda"
                     dtype = torch.bfloat16
                     num_experts = 8
                     hidden_states = (
-                        torch.randn(bs, hidden_dim, dtype=torch.bfloat16, device=device) / 5.0
+                        torch.randn(bs, hidden_dim, dtype=torch.bfloat16, device=device)
+                        / 5.0
                     )
                     w1 = (
                         torch.randn(
-                            num_experts, 2 * inter_dim, hidden_dim, dtype=torch.bfloat16, device=device
+                            num_experts,
+                            2 * inter_dim,
+                            hidden_dim,
+                            dtype=torch.bfloat16,
+                            device=device,
                         )
                         / 10.0
                     )
                     w2 = (
                         torch.randn(
-                            num_experts, hidden_dim, inter_dim, dtype=torch.bfloat16, device=device
+                            num_experts,
+                            hidden_dim,
+                            inter_dim,
+                            dtype=torch.bfloat16,
+                            device=device,
                         )
                         / 10.0
                     )
@@ -339,8 +352,10 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                         .repeat(1, topk, 1)
                         .reshape(-1, hidden_dim)
                     )
-                    hidden_states_3d, masked_m, topk_idx, routing_weights = prepare_inputs(
-                        hidden_states_expanded, router_logits, num_experts, topk
+                    hidden_states_3d, masked_m, topk_idx, routing_weights = (
+                        prepare_inputs(
+                            hidden_states_expanded, router_logits, num_experts, topk
+                        )
                     )
 
                     w1_amax = w1.abs().amax(dim=(1, 2)).to(torch.float32).to(w1.device)
@@ -358,12 +373,15 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                     w1_fp4, w1_blockscale = scaled_fp4_grouped_quant(
                         w1,
                         w1_global_scale,
-                        torch.ones(num_experts, dtype=torch.int32, device=w1.device) * 2 * inter_dim,
+                        torch.ones(num_experts, dtype=torch.int32, device=w1.device)
+                        * 2
+                        * inter_dim,
                     )
                     w2_fp4, w2_blockscale = scaled_fp4_grouped_quant(
                         w2,
                         w2_global_scale,
-                        torch.ones(num_experts, dtype=torch.int32, device=w2.device) * hidden_dim,
+                        torch.ones(num_experts, dtype=torch.int32, device=w2.device)
+                        * hidden_dim,
                     )
 
                     w1_alpha = 1.0 / (input_global_scale * w1_global_scale)
@@ -383,7 +401,9 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                     )
 
                     # reference
-                    a_fp4, a_scale_interleaved = fp4_quantize(hidden_states, input_global_scale)
+                    a_fp4, a_scale_interleaved = fp4_quantize(
+                        hidden_states, input_global_scale
+                    )
                     a_in_dtype = dequantize_nvfp4_to_dtype(
                         a_fp4,
                         a_scale_interleaved,
@@ -393,10 +413,14 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                         block_size=16,
                     )
                     w1_d = torch.empty(
-                        (num_experts, 2 * inter_dim, hidden_dim), device=w1.device, dtype=w1.dtype
+                        (num_experts, 2 * inter_dim, hidden_dim),
+                        device=w1.device,
+                        dtype=w1.dtype,
                     )
                     w2_d = torch.empty(
-                        (num_experts, hidden_dim, inter_dim), device=w2.device, dtype=w2.dtype
+                        (num_experts, hidden_dim, inter_dim),
+                        device=w2.device,
+                        dtype=w2.dtype,
                     )
 
                     for idx in range(0, num_experts):
@@ -431,7 +455,9 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                         routing_weights.to(a_in_dtype.device),
                         topk_idx.to(a_in_dtype.device),
                     )
-                    out_weighted = torch.zeros_like(ref_output, device=out.device, dtype=out.dtype)
+                    out_weighted = torch.zeros_like(
+                        ref_output, device=out.device, dtype=out.dtype
+                    )
 
                     positions = torch.nonzero(masked_m[topk_idx], as_tuple=False)
                     rows, cols = positions[:, 0], positions[:, 1]
@@ -441,13 +467,15 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                         if mask.any():
                             idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
                             r, c = rows[idx], cols[idx]
-                            out_weighted[r] += out[i, : len(r), :] * routing_weights[r, c].to(
-                                out.device
-                            ).unsqueeze(-1)
+                            out_weighted[r] += out[i, : len(r), :] * routing_weights[
+                                r, c
+                            ].to(out.device).unsqueeze(-1)
                     torch.testing.assert_close(
                         out_weighted.cpu(), ref_output.cpu(), atol=5e-2, rtol=5e-2
                     )
-                print(f"Test passed with bs={bs}, hidden_dim={hidden_dim}, inter_dim={inter_dim}, topk={topk}")
+                print(
+                    f"Test passed with bs={bs}, hidden_dim={hidden_dim}, inter_dim={inter_dim}, topk={topk}"
+                )
 
 
 if __name__ == "__main__":
