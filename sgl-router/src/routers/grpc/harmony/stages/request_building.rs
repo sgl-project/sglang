@@ -1,22 +1,15 @@
 //! Harmony Request Building Stage: Build gRPC request from Harmony-encoded tokens
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use axum::response::Response;
-use rand::Rng;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::{
-    core::Worker,
-    grpc_client::proto::{DisaggregatedParams, GenerateRequest},
-    routers::grpc::{
-        common::stages::PipelineStage,
-        context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
-        utils,
-        error,
-    },
+use crate::routers::grpc::{
+    common::stages::PipelineStage,
+    context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
+    utils,
+    error,
 };
 
 /// Harmony Request Building stage: Convert Harmony tokens to gRPC request
@@ -31,34 +24,6 @@ impl HarmonyRequestBuildingStage {
     /// Create a new Harmony request building stage
     pub fn new(inject_pd_metadata: bool) -> Self {
         Self { inject_pd_metadata }
-    }
-
-    /// Inject PD (prefill-decode) bootstrap metadata
-    fn inject_bootstrap_metadata(
-        &self,
-        request: &mut GenerateRequest,
-        prefill_worker: &Arc<dyn Worker>,
-    ) {
-        let hostname = prefill_worker.bootstrap_host();
-        let bootstrap_port = prefill_worker.bootstrap_port().unwrap_or(8998);
-
-        // Generate room ID for bootstrap
-        let room_id = rand::rng().random_range(0..i32::MAX);
-
-        // Create DisaggregatedParams
-        let disagg_params = DisaggregatedParams {
-            bootstrap_host: hostname.to_string(),
-            bootstrap_port: bootstrap_port as i32,
-            bootstrap_room: room_id,
-        };
-
-        // Inject metadata directly into request
-        request.disaggregated_params = Some(disagg_params);
-
-        debug!(
-            "Injected Harmony bootstrap metadata: host={}, port={}, room={}",
-            hostname, bootstrap_port, room_id
-        );
     }
 }
 
@@ -142,7 +107,10 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
             if let Some(WorkerSelection::Dual { prefill, .. }) = ctx.state.workers.as_ref() {
-                self.inject_bootstrap_metadata(&mut proto_request, prefill);
+                crate::routers::grpc::common::stages::helpers::inject_bootstrap_metadata(
+                    &mut proto_request,
+                    prefill,
+                );
             }
         }
 
