@@ -161,13 +161,15 @@ class TestMambaAttention(CustomTestCase):
         initial_state = initial_state_.clone()
 
         core_attn_out, last_recurrent_state = torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
-            query=query.contiguous(),
-            key=key.contiguous(),
+            query=query,
+            key=key,
             value=value,
             g=g,
             beta=beta,
-            cu_seqlens=cu_seqlens,
-            initial_state=initial_state,
+            initial_state=initial_state_,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens_,
+            head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
         atol = rtol = precision[core_attn_out.dtype]
