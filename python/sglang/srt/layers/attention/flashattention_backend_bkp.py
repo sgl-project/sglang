@@ -444,17 +444,25 @@ class FlashAttentionBackend(AttentionBackend):
                     self.forward_metadata_spec_decode_expand = metadata_expand
             else:
                 # Normal Decode
+                seqlens_in_batch = torch.clamp(seqlens_in_batch, max=8192)
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = min(forward_batch.seq_lens_cpu.max().item(), 8192)
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
+                assert batch_size == 1, "Only batch size 1 is supported in decode mode for now"
+                if forward_batch.seq_lens_cpu.max().item() > 8192:
+                    metadata.page_table = torch.cat([
+                        forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, : 1024],
+                        forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, forward_batch.seq_lens_cpu.max().item() - 7168: forward_batch.seq_lens_cpu.max().item()]
+                    ], dim=1)
+                else:
+                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -1088,28 +1096,9 @@ class FlashAttentionBackend(AttentionBackend):
                 page_table = metadata.page_table
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
-                cu_seqlens_q = metadata.cu_seqlens_q
                 max_seqlen_q = metadata.max_seq_len_q
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
-                )
-
-                FIRST_WINDOW, LAST_WINDOW = 1024, 7168
-                # FIRST_WINDOW, LAST_WINDOW = 1024, 10
-                FULL_WINDOW = FIRST_WINDOW + LAST_WINDOW
-                page_table = forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, : metadata.max_seq_len_k + 1].clone()
-                cache_seqlens = cache_seqlens.clone()
-                for bi in range(forward_batch.batch_size):
-                    seqlen = cache_seqlens[bi].item()
-                    if seqlen > FULL_WINDOW:
-                        page_table = torch.cat([
-                            page_table[:bi],
-                            torch.cat([page_table[bi, :FIRST_WINDOW], page_table[bi, seqlen - LAST_WINDOW: seqlen], page_table[bi, -1:].repeat(metadata.max_seq_len_k + 1 - FULL_WINDOW,)], dim=0).unsqueeze(0),
-                            page_table[bi + 1:],
-                        ], dim=0)
-                        cache_seqlens[bi] = FULL_WINDOW
-                cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
                 )
 
                 # Default: single-token self-attention
@@ -1119,7 +1108,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_cache=value_cache,
                     page_table=page_table,
                     cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k,
                     max_seqlen_q=max_seqlen_q,
                     softmax_scale=layer.scaling,
