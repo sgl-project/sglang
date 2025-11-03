@@ -119,24 +119,51 @@ class JetBlock(nn.Module):
 
         q = self.q_proj(hidden_states)  # (seq_len, total_k_dim)
         q = nn.functional.silu(q)
-        q = einops.rearrange(q, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
 
         k = self.k_proj(hidden_states)  # (seq_len, total_k_dim)
         k = nn.functional.silu(k)
-        k = einops.rearrange(k, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
 
         v = self.v_proj(hidden_states)  # (seq_len, total_v_dim)
 
         # Dynamic Convolution.
-        new_v = torch.empty_like(v)
-        new_conv_states = torch.empty(
-            (forward_batch.batch_size, self.total_v_dim, self.conv_size),
-            dtype=mamba2_layer_cache.conv.dtype,
-            device=mamba2_layer_cache.conv.device,
-        )
+        conv_states = torch.cat(
+            (
+                torch.empty(
+                    (
+                        forward_batch.batch_size,
+                        self.total_v_dim,
+                        1,
+                    ),
+                    dtype=mamba2_layer_cache.conv.dtype,
+                    device=mamba2_layer_cache.conv.device,
+                ),
+                mamba2_layer_cache.conv[
+                    linear_attn_backend.forward_metadata.mamba_cache_indices,
+                    -self.total_v_dim :,
+                    :,
+                ],
+            ),
+            dim=2,
+        )  # (batch_size, total_v_dim, conv_size)
+
+        v_batched = nn.utils.rnn.pad_sequence(
+            [
+                v[
+                    forward_batch.seq_lens[:i]
+                    .sum() : forward_batch.seq_lens[: i + 1]
+                    .sum()
+                ]
+                for i in range(forward_batch.batch_size)
+            ],
+            batch_first=True,
+            padding_side="left",
+        )  # (batch_size, max_seq_len, total_v_dim)
 
         match forward_batch.forward_mode:
             case ForwardMode.EXTEND:
+                new_v = torch.empty_like(v)
+                new_conv_states = torch.empty_like(conv_states)
+
                 assert forward_batch.extend_start_loc is not None
                 assert forward_batch.extend_seq_lens is not None
 
@@ -156,7 +183,7 @@ class JetBlock(nn.Module):
 
                     v_single, new_conv_state_single = self.dynamic_conv1d(
                         v_single.unsqueeze(0),
-                        cache=None,
+                        cache=conv_states,
                         output_final_state=True,
                         generator_input=generator_input.unsqueeze(0),
                     )
@@ -174,14 +201,11 @@ class JetBlock(nn.Module):
             case ForwardMode.DECODE:
                 new_v, new_conv_states = self.dynamic_conv1d(
                     v.unsqueeze(1),  # (batch_size, 1, total_v_dim)
-                    cache=None,
+                    cache=conv_states,
                     output_final_state=True,
-                    generator_input=hidden_states.unsqueeze(
-                        1
-                    ),  # (batch_size, 1, hidden_size)
+                    generator_input=hidden_states.unsqueeze(1),
                 )  # (batch_size, 1, total_v_dim), (batch_size, total_v_dim, conv_size)
-
-                new_v = new_v.squeeze(1)  # (batch_size, total_v_dim)
+                new_v = new_v.squeeze(1)
 
             case _:
                 raise NotImplementedError
@@ -191,15 +215,17 @@ class JetBlock(nn.Module):
             linear_attn_backend.forward_metadata.mamba_cache_indices,
             -self.total_v_dim :,
             :,
-        ] = new_conv_states[:, :, :-1]
-
-        v = einops.rearrange(v, "l (h d) -> l h d", h=self.num_heads, d=self.head_v_dim)
+        ] = new_conv_states[:, :, 1:]
 
         a = self.a_proj(hidden_states)
-        g = -self.A_log.float().exp() * nn.functional.softplus(a.float())
+        g = -self.A_log.float().exp() * nn.functional.softplus(a.float() + self.dt_bias)
 
         beta = self.b_proj(hidden_states)
         beta = nn.functional.sigmoid(beta)
+
+        q = einops.rearrange(q, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
+        k = einops.rearrange(k, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
+        v = einops.rearrange(v, "l (h d) -> l h d", h=self.num_heads, d=self.head_v_dim)
 
         o = fused_recurrent_gated_delta_rule_update(
             q=q.unsqueeze(0),
@@ -217,11 +243,13 @@ class JetBlock(nn.Module):
         o = o.squeeze(0)
 
         z = self.g_proj(hidden_states)
+
         z = einops.rearrange(z, "l (h d) -> l h d", h=self.num_heads)
 
         o = self.o_norm(o, z)
 
         o = einops.rearrange(o, "l h d -> l (h d)")
+
         o = self.o_proj(o)
 
         return o
@@ -357,11 +385,9 @@ class JetNemotronDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -369,10 +395,18 @@ class JetNemotronDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
+        hidden_states = residual + hidden_states
+
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = hidden_states
+
+        hidden_states = self.post_attention_layernorm(hidden_states)
+
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+
+        hidden_states = residual + hidden_states
+
+        return hidden_states, None
 
 
 class JetNemotronForCausalLM(nn.Module):

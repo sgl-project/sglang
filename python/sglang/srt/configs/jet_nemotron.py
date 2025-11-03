@@ -29,6 +29,7 @@ class JetNemotronConfig(PretrainedConfig):
     max_position_embeddings: int
     num_attention_heads: int
     num_key_value_heads: int
+    rms_norm_eps: float
     rope_scaling: None
     rope_theta: float
 
