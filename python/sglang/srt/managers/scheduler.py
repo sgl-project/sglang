@@ -683,11 +683,11 @@ class Scheduler(
     def init_routed_experts_capturer(self):
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                get_global_server_args().enable_return_routed_experts,
-                self.model_config,
-                self.max_total_num_tokens + self.page_size,
-                self.max_running_requests,
-                self.device,
+                enable=get_global_server_args().enable_return_routed_experts,
+                model_config=self.model_config,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
             )
         )
 
