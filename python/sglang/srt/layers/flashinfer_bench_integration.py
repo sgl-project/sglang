@@ -1,20 +1,48 @@
 """
 FlashInfer-Bench integration for SGLang.
 
-This module provides integration with FlashInfer-Bench for:
-1. Automatic workload tracing
-2. Kernel benchmarking
-3. Dynamic kernel substitution
+This module provides integration with FlashInfer-Bench for automatic kernel
+optimization based on production workloads.
 
-Usage:
-    # Enable tracing to collect workloads
-    FIB_ENABLE_TRACING=1 python -m sglang.launch_server ...
+Features:
+    - Automatic workload tracing
+    - Kernel benchmarking
+    - Dynamic kernel substitution
+    - Zero-code integration via environment variables
 
-    # Enable kernel substitution for optimization
-    FIB_ENABLE_APPLY=1 python -m sglang.launch_server ...
+Quick Start:
+    # 1. Install FlashInfer-Bench
+    pip install flashinfer-bench
 
-    # Set custom dataset path
-    FIB_DATASET_PATH=/path/to/traces python -m sglang.launch_server ...
+    # 2. Enable tracing to collect workloads
+    FIB_ENABLE_TRACING=1 python -m sglang.launch_server --model-path meta-llama/Llama-3-8b
+
+    # 3. Enable kernel substitution for optimization
+    FIB_ENABLE_APPLY=1 python -m sglang.launch_server --model-path meta-llama/Llama-3-8b
+
+Environment Variables:
+    FIB_ENABLE_TRACING: Enable workload collection (default: False)
+    FIB_ENABLE_APPLY: Enable kernel substitution (default: False)
+    FIB_DATASET_PATH: Path to store/load traces (default: ~/.cache/flashinfer_bench/dataset)
+
+Command-Line Arguments:
+    --enable-flashinfer-bench-tracing: Enable tracing
+    --enable-flashinfer-bench-apply: Enable kernel substitution
+    --flashinfer-bench-dataset-path: Custom dataset path
+
+Example:
+    # Collect workloads during production
+    FIB_ENABLE_TRACING=1 FIB_DATASET_PATH=./traces python -m sglang.launch_server ...
+
+    # Benchmark (offline)
+    flashinfer-bench run --local ./traces
+
+    # Deploy optimizations
+    FIB_ENABLE_APPLY=1 FIB_DATASET_PATH=./traces python -m sglang.launch_server ...
+
+For more information:
+    - Documentation: docs/flashinfer_bench_integration.md
+    - FlashInfer-Bench: https://bench.flashinfer.ai
 """
 
 import logging
