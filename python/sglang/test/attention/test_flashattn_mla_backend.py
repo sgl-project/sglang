@@ -1,5 +1,6 @@
 import unittest
 
+import pytest
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
@@ -67,7 +68,10 @@ class MockReqToTokenPool:
         )
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+    reason="Test requires Hopper (sm_90) or newer GPU.",
+)
 class TestFlashAttentionMLABackend(CustomTestCase):
     def setUp(self):
         # Test parameters
