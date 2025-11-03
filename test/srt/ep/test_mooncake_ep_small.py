@@ -58,7 +58,7 @@ class TestTP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=50,
+            num_questions=100,
             max_new_tokens=128,
             parallel=128,
             host="http://127.0.0.1",
@@ -67,7 +67,7 @@ class TestTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.40)
+        self.assertGreater(metrics["accuracy"], 0.60)
 
 
 class TestPureDP(TestTP):
