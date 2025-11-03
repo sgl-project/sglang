@@ -10,14 +10,14 @@ To serve the model:
 
 ```bash
 python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
-  --host 0.0.0.0
-  --tp 4
+  --model-path Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
+  --tp 8 \
+  --ep 8
 ```
 
 ## Sending Image/Video Requests
 
-#### Image input:
+### Image input:
 
 ```python
 import requests
@@ -47,7 +47,7 @@ response = requests.post(url, json=data)
 print(response.text)
 ```
 
-#### Video Input:
+### Video Input:
 
 ```python
 import requests
