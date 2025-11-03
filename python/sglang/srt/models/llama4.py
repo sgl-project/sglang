@@ -647,7 +647,7 @@ class Llama4ForCausalLM(LlamaForCausalLM):
                 param.weight_loader(
                     param,
                     weight_tensor,
-                    name,
+                    transformed_name,
                     shard_id=actual_shard_id,
                     expert_id=expert_id,
                 )
