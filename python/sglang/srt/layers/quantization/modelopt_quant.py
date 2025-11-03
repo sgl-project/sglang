@@ -1571,7 +1571,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             x_sf = None
             # Support applying router weights on input for topK==1
             if moe_runner_config.apply_router_weight_on_input:
-                top_k = topk_output.topk_config.top_k
+                top_k = topk_weights.shape[1]
                 assert (
                     top_k == 1
                 ), "apply_router_weight_on_input is only implemented for topK==1"
