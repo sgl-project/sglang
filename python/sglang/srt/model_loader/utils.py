@@ -120,16 +120,16 @@ def post_load_weights(model: nn.Module, model_config: ModelConfig):
 
 
 def should_async_load(weight: torch.Tensor) -> bool:
-    """
+    """Return True if we should load the given weight asynchronously.
+
     For host (CPU) tensors, using a threadpool can overlap H2D copies
     and improve throughput. For device tensors, threading often adds overhead
     (e.g., GIL contention) without benefit, so we do it synchronously.
     """
-    try:
-        return weight.device.type == "cpu"
-    except Exception:
-        # Be conservative if device info is not available
+    device = getattr(weight, "device", None)
+    if device is None:
         return False
+    return device.type == "cpu"
 
 
 def maybe_executor_submit(
