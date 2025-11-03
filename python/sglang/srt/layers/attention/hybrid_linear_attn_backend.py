@@ -1,6 +1,5 @@
 from typing import Optional, Union
 
-import einops
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -25,7 +24,6 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.models.dynamic_conv import DynamicShortConvolution
 from sglang.srt.models.qwen3_next import fused_gdn_gating
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
@@ -525,32 +523,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         raise NotImplementedError(
             "Mamba2AttnBackend's forward is called directly instead of through HybridLinearAttnBackend, as it supports mixed prefill and decode"
         )
-
-
-class JetBlockAttnBackend(MambaAttnBackendBase):
-    def forward_decode(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
-        **kwargs,
-    ):
-        return v
-
-    def forward_extend(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention | None,
-        forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
-        **kwargs,
-    ):
-        return v
 
 
 class HybridLinearAttnBackend(AttentionBackend):

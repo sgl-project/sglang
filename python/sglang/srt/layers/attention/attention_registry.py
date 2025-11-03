@@ -189,7 +189,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             GDNAttnBackend,
             HybridLinearAttnBackend,
-            JetBlockAttnBackend,
             Mamba2AttnBackend,
         )
         from sglang.srt.utils import is_blackwell, is_npu
@@ -209,7 +208,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.jet_block_config is not None:
-            linear_attn_backend = JetBlockAttnBackend(runner)
+            linear_attn_backend = GDNAttnBackend(runner)
         else:
             raise ValueError(
                 "Expected hybrid GDN or NemotronH models, but got unknown model."

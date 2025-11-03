@@ -13,7 +13,7 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
-    JetBlockAttnBackend,
+    MambaAttnBackendBase,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -222,7 +222,7 @@ class JetBlock(nn.Module):
     ) -> torch.Tensor:
         assert isinstance(forward_batch.attn_backend, HybridLinearAttnBackend)
         assert isinstance(
-            forward_batch.attn_backend.linear_attn_backend, JetBlockAttnBackend
+            forward_batch.attn_backend.linear_attn_backend, MambaAttnBackendBase
         )
         linear_attn_backend = forward_batch.attn_backend.linear_attn_backend
         forward_metadata = linear_attn_backend.forward_metadata
