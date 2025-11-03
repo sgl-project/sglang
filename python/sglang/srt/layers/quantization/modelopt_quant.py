@@ -56,6 +56,8 @@ try:
         from flashinfer import fp4_quantize
     else:
         from sgl_kernel import scaled_fp4_quant as fp4_quantize
+
+    from flashinfer import fp4_quantize as fp4_quantize_flashinfer
 except ImportError:
     fp4_quantize = None
 
@@ -1571,7 +1573,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
                 # Quantize before comm, swizzle after.
                 if x.shape[0] > 0:
-                    x, x_sf = fp4_quantize(
+                    x, x_sf = fp4_quantize_flashinfer(
                         x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
                     )
                 else:
