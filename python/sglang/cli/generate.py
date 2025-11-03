@@ -17,5 +17,5 @@ def generate(args, extra_argv):
         generate_cmd(parsed_args)
     else:
         raise Exception(
-            f"Generate subcommand is not supported for model: {model_path} for now"
+            f"Generate subcommand is not yet supported for model: {model_path}"
         )
