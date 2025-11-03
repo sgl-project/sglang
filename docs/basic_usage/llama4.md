@@ -11,7 +11,10 @@ Ongoing optimizations are tracked in the [Roadmap](https://github.com/sgl-projec
 To serve Llama 4 models on 8xH100/H200 GPUs:
 
 ```bash
-python3 -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct --tp 8 --context-length 1000000
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct \
+  --tp 8 \
+  --context-length 1000000
 ```
 
 ### Configuration Tips
@@ -29,7 +32,16 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-In
 **Usage**:
 Add arguments `--speculative-draft-model-path`, `--speculative-algorithm`, `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:
 ```
-python3 -m sglang.launch_server --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct --speculative-algorithm EAGLE3  --speculative-draft-model-path nvidia/Llama-4-Maverick-17B-128E-Eagle3 --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --trust-remote-code --tp 8 --context-length 1000000
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path nvidia/Llama-4-Maverick-17B-128E-Eagle3 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --trust-remote-code \
+  --tp 8 \
+  --context-length 1000000
 ```
 
 - **Note** The Llama 4 draft model *nvidia/Llama-4-Maverick-17B-128E-Eagle3* can only recognize conversations in chat mode.
@@ -50,11 +62,21 @@ Commands:
 
 ```bash
 # Llama-4-Scout-17B-16E-Instruct model
-python -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct --port 30000 --tp 8 --mem-fraction-static 0.8 --context-length 65536
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct \
+  --port 30000 \
+  --tp 8 \
+  --mem-fraction-static 0.8 \
+  --context-length 65536
 lm_eval --model local-chat-completions --model_args model=meta-llama/Llama-4-Scout-17B-16E-Instruct,base_url=http://localhost:30000/v1/chat/completions,num_concurrent=128,timeout=999999,max_gen_toks=2048 --tasks mmlu_pro --batch_size 128 --apply_chat_template --num_fewshot 0
 
 # Llama-4-Maverick-17B-128E-Instruct
-python -m sglang.launch_server --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct --port 30000 --tp 8 --mem-fraction-static 0.8 --context-length 65536
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct \
+  --port 30000 \
+  --tp 8 \
+  --mem-fraction-static 0.8 \
+  --context-length 65536
 lm_eval --model local-chat-completions --model_args model=meta-llama/Llama-4-Maverick-17B-128E-Instruct,base_url=http://localhost:30000/v1/chat/completions,num_concurrent=128,timeout=999999,max_gen_toks=2048 --tasks mmlu_pro --batch_size 128 --apply_chat_template --num_fewshot 0
 ```
 

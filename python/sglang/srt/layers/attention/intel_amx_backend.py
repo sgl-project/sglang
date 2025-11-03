@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 class IntelAMXAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
-        import sgl_kernel
+        import sgl_kernel  # noqa: F401
 
         super().__init__()
         self.forward_metadata = None
@@ -48,6 +48,9 @@ class IntelAMXAttnBackend(AttentionBackend):
         else:
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
         self.forward_metadata = (attn_logits, max_extend_len)
+
+    def get_graph_seq_len_fill_value(self):
+        return 1
 
     def forward_extend(
         self,

@@ -1,8 +1,10 @@
 // Step3 specific reasoning parser.
 // Uses the same format as DeepSeek-R1 but has its own implementation for debugging.
 
-use crate::reasoning_parser::parsers::BaseReasoningParser;
-use crate::reasoning_parser::traits::{ParseError, ParserConfig, ParserResult, ReasoningParser};
+use crate::reasoning_parser::{
+    parsers::BaseReasoningParser,
+    traits::{ParseError, ParserConfig, ParserResult, ReasoningParser},
+};
 
 /// Step3 reasoning parser.
 ///
@@ -53,6 +55,10 @@ impl ReasoningParser for Step3Parser {
 
     fn model_type(&self) -> &str {
         self.base.model_type()
+    }
+
+    fn is_in_reasoning(&self) -> bool {
+        self.base.is_in_reasoning()
     }
 }
 

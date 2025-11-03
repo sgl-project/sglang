@@ -148,7 +148,7 @@ class Llama4MoE(nn.Module):
         return out_aD
 
     def _forward_core(self, hidden_states, forward_mode: ForwardMode):
-        if hidden_states.shape[0] < 4 and _is_cuda:
+        if _is_cuda:
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
@@ -423,6 +423,12 @@ class Llama4DecoderLayer(nn.Module):
             return self.config.num_local_experts > 0
         return (layer_id + 1) % self.config.interleave_moe_layer_step == 0
 
+    def get_intermediate_size(self) -> int:
+        if isinstance(self.feed_forward, Llama4MoE):
+            return self.config.intermediate_size
+        else:
+            return self.config.intermediate_size_mlp
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -539,6 +545,9 @@ class Llama4ForCausalLM(LlamaForCausalLM):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def get_layers(self):
+        return self.model.layers
 
     def _init_model(
         self,

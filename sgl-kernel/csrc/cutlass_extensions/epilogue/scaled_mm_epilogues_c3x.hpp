@@ -1,4 +1,5 @@
-// Adapted from https://github.com/vllm-project/vllm/blob/16bff144be6739c9f773968ace0b9cd239f67f19/csrc/cutlass_extensions/epilogue/scaled_mm_epilogues_c3x.hpp
+// Adapted from
+// https://github.com/vllm-project/vllm/blob/16bff144be6739c9f773968ace0b9cd239f67f19/csrc/cutlass_extensions/epilogue/scaled_mm_epilogues_c3x.hpp
 
 #pragma once
 

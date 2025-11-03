@@ -1,4 +1,5 @@
-// Adapted from https://github.com/vllm-project/vllm/blob/4d4061b6e73d82f7e561fff64c2bd914d66ebaff/csrc/cutlass_extensions/epilogue/broadcast_load_epilogue_array_c3x.hpp
+// Adapted from
+// https://github.com/vllm-project/vllm/blob/4d4061b6e73d82f7e561fff64c2bd914d66ebaff/csrc/cutlass_extensions/epilogue/broadcast_load_epilogue_array_c3x.hpp
 
 /***************************************************************************************************
  * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights

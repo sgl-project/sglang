@@ -4,11 +4,15 @@ set -euxo pipefail
 
 bash scripts/ci/ci_install_dependency.sh
 
-export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
+export GDRCOPY_HOME=/usr/src/gdrdrv-2.5.1/
 export NVSHMEM_DIR=/opt/nvshmem/install
 export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH"
 export PATH="${NVSHMEM_DIR}/bin:$PATH"
 export CUDA_HOME=/usr/local/cuda
+
+# Install Mooncake+EP
+curl -L https://cloud.tsinghua.edu.cn/f/c22ec766545e48bf99e8/?dl=1 -o mooncake_transfer_engine-0.3.6.post1+ep-cp310-cp310-manylinux_2_17_x86_64.manylinux_2_35_x86_64.whl
+UV_SYSTEM_PYTHON=true uv pip install mooncake_transfer_engine-0.3.6.post1+ep-cp310-cp310-manylinux_2_17_x86_64.manylinux_2_35_x86_64.whl
 
 if python3 -c "import deep_ep" >/dev/null 2>&1; then
     echo "deep_ep is already installed or importable. Skipping installation."
@@ -23,9 +27,9 @@ rm -rf /opt/gdrcopy && mkdir -p /opt/gdrcopy
 rm -rf /opt/nvshmem && mkdir -p /opt/nvshmem
 cd /opt/gdrcopy
 git clone https://github.com/NVIDIA/gdrcopy.git .
-git checkout v2.4.4
+git checkout v2.5.1
 apt update
-apt install -y nvidia-dkms-535
+apt install -y nvidia-dkms-580
 apt install -y build-essential devscripts debhelper fakeroot pkg-config dkms
 apt install -y check libsubunit0 libsubunit-dev python3-venv
 cd packages
@@ -42,8 +46,8 @@ apt-get update && apt-get install -y libfabric-dev
 
 # Install NVSHMEM
 cd /opt/nvshmem
-wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
-tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.4.5/source/nvshmem_src_cuda12-all-all-3.4.5.tar.gz
+tar -xf nvshmem_src_cuda12-all-all-3.4.5.tar.gz
 mv nvshmem_src nvshmem && cd nvshmem
 NVSHMEM_SHMEM_SUPPORT=0 \
 NVSHMEM_UCX_SUPPORT=0 \
@@ -58,11 +62,9 @@ cd build
 make -j$(nproc) install
 
 # Install DeepEP
-rm -rf /root/.cache/deepep && git clone https://github.com/deepseek-ai/DeepEP.git /root/.cache/deepep && cd /root/.cache/deepep && git checkout b92d0d4860ce6866cd6d31bfbae937f9a7a3772b
+rm -rf /root/.cache/deepep && git clone https://github.com/deepseek-ai/DeepEP.git /root/.cache/deepep && cd /root/.cache/deepep && git checkout 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 cd /root/.cache/deepep && python3 setup.py install
 
 # Verify configuration
-echo "=== Verify GDRCOPY ==="
-gdrcopy_copybw
 echo "=== Verify NVSHMEM ==="
 nvshmem-info -a
