@@ -79,10 +79,9 @@ class Llama4MoE(nn.Module):
         topk: int,
         renormalize: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Match vLLM: keep routing weights in float32.
         router_scores_aK, router_indices_aK = fast_topk(gating_output, topk, dim=-1)
-        router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
-            hidden_states.dtype
-        )
+        router_scores_aK = torch.sigmoid(router_scores_aK.float())
         return (
             router_scores_aK.view(-1).reshape(router_scores_aK.shape),
             router_indices_aK.to(torch.int32),

@@ -1597,6 +1597,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
                     [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
                 )
+                # Ensure dtypes match FlashInfer expectations
+                topk_weights = topk_weights.to(torch.float32)
+                topk_ids = topk_ids.to(torch.int32)
                 x_sf = nvfp4_block_scale_interleave(x_sf)
 
             with use_symmetric_memory(get_tp_group()) as sm:
