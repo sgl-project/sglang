@@ -14,7 +14,7 @@
 
 import itertools
 import logging
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -73,12 +73,17 @@ class AutoWeightsLoader:
         ignore_unexpected_suffixes: Optional[list] = None,
     ) -> None:
         self.module = module
-        self.skip_prefixes = skip_prefixes or []
-        self.skip_substrs = skip_substrs or []
-        self.ignore_unexpected_prefixes = ignore_unexpected_prefixes or []
-        self.ignore_unexpected_suffixes = ignore_unexpected_suffixes or []
+        # Create copies to avoid mutating caller's lists
+        self.skip_prefixes = list(skip_prefixes) if skip_prefixes else []
+        self.skip_substrs = list(skip_substrs) if skip_substrs else []
+        self.ignore_unexpected_prefixes = (
+            list(ignore_unexpected_prefixes) if ignore_unexpected_prefixes else []
+        )
+        self.ignore_unexpected_suffixes = (
+            list(ignore_unexpected_suffixes) if ignore_unexpected_suffixes else []
+        )
         # Always skip common rotary embedding weights
-        self.skip_substrs += self.ROTARY_EMBEDS_UNUSED_WEIGHTS
+        self.skip_substrs.extend(self.ROTARY_EMBEDS_UNUSED_WEIGHTS)
 
     def _groupby_prefix(
         self,
@@ -127,7 +132,7 @@ class AutoWeightsLoader:
     def _load_param(
         self,
         base_prefix: str,
-        param: nn.Parameter,
+        param: torch.Tensor,
         weights: Iterable[Tuple[str, torch.Tensor]],
     ) -> Iterable[str]:
         """Load weights into a single parameter."""
