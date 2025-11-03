@@ -2,6 +2,7 @@ import os
 import subprocess
 import warnings
 from contextlib import ExitStack, contextmanager
+from enum import IntEnum
 from typing import Any
 
 
@@ -103,6 +104,20 @@ class EnvFloat(EnvField):
             return float(value)
         except ValueError:
             raise ValueError(f'"{value}" is not a valid float value')
+
+
+class ToolStrictLevel(IntEnum):
+    """
+    Defines the strictness levels for tool call parsing and validation.
+
+    OFF: No strict validation
+    FUNCTION: Enables structural tag constraints for all tools
+    PARAMETER: Enforces strict parameter validation for all tools
+    """
+
+    OFF = 0
+    FUNCTION = 1
+    PARAMETER = 2
 
 
 class Envs:
@@ -214,7 +229,6 @@ class Envs:
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
     # vLLM dependencies (TODO: they have been deprecated, we can remove them safely)
-    USE_VLLM_CUSTOM_ALLREDUCE = EnvBool(False)
     USE_VLLM_CUTLASS_W8A8_FP8_KERNEL = EnvBool(False)
 
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
@@ -258,6 +272,9 @@ class Envs:
 
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
+
+    # Tool-Call behavior
+    SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
 
     # fmt: on
 
