@@ -49,7 +49,9 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     get_bool_env_var,
+    is_cpu,
     is_cuda,
     is_float4_e2m1fn_x2,
     is_npu,
@@ -66,6 +68,8 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_cpu_has_amx_support = cpu_has_amx_support()
 if _is_npu:
     import torch_npu
 
@@ -192,12 +196,23 @@ class MambaPool:
                 ]
             else:
                 # assume conv_state = (dim, state_len)
+
                 assert conv_state_shape[0] > conv_state_shape[1]
                 conv_state = torch.zeros(
                     size=(num_mamba_layers, size + 1) + conv_state_shape,
                     dtype=conv_dtype,
                     device=device,
                 )
+                if _is_cpu and _cpu_has_amx_support:
+                    conv_state = conv_state.as_strided_(
+                        conv_state.size(),
+                        (
+                            conv_state.stride(0),
+                            conv_state.stride(1),
+                            1,
+                            conv_state.size(2),
+                        ),
+                    )
             temporal_state = torch.zeros(
                 size=(num_mamba_layers, size + 1) + temporal_state_shape,
                 dtype=ssm_dtype,
