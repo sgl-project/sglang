@@ -6,10 +6,8 @@ import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
-
-# from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-# from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +108,14 @@ class RoutedExpertsCapturer(ABC):
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         raise NotImplementedError
 
+    def get_routed_experts(
+        self,
+        req_pool_idx: int,
+        seqlen: int,
+        req_to_token_pool: ReqToTokenPool,
+    ):
+        raise NotImplementedError
+
     def sync_fwd_experts_buffer_DtoH(self, batch: int, loc: torch.Tensor):
         raise NotImplementedError
 
@@ -144,6 +150,18 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         batch = loc.shape[0]
         self.host_cache.buffer[loc] = self.device_cache.buffer[:batch].cpu()
 
+    def get_routed_experts(
+        self,
+        req_pool_idx: int,
+        seqlen: int,
+        req_to_token_pool: ReqToTokenPool,
+    ):
+        cache_pool_idx = (
+            req_to_token_pool.req_to_token[req_pool_idx][:seqlen].cpu().clone()
+        )
+
+        return self.get_host_cache().buffer[cache_pool_idx].tolist()
+
     def get_host_cache(self):
         return self.host_cache
 
@@ -156,6 +174,14 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         pass
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
+        pass
+
+    def get_routed_experts(
+        self,
+        req_pool_idx: int,
+        seqlen: int,
+        req_to_token_pool: ReqToTokenPool,
+    ):
         pass
 
     def sync_fwd_experts_buffer_DtoH(self, loc: torch.Tensor):
