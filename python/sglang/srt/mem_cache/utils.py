@@ -262,8 +262,6 @@ def init_custom_mem_pool(
                     f"Unsupported custom mem pool type: {custom_mem_pool_type}"
                 )
 
-            import torch
-
             custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
             logger.debug(
                 f"Initialized custom memory pool: {custom_mem_pool_type} on device {device}"
