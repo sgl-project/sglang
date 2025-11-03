@@ -751,6 +751,7 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
             threadpool_count=self.threadpool_count,
             amx_weight_path=self.amx_weight_path,
             chunked_prefill_size=self.chunked_prefill_size,
+            amx_method=envs.SGLANG_KT_AMX_METHOD.value,
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
