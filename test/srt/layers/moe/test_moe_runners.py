@@ -152,7 +152,7 @@ class TestMoERunner(CustomTestCase):
             ],
         },
         "moe_runner_flashinfer_cutedsl": {
-            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
@@ -170,7 +170,7 @@ class TestMoERunner(CustomTestCase):
             ],
         },
         "moe_runner_cutlass": {
-            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
