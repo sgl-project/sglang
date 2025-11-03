@@ -3,6 +3,7 @@ Usage:
 python3 -m unittest test_pp_single_node.TestPPAccuracy.test_gsm8k
 python3 -m unittest test_pp_single_node.TestQwenPPAccuracy.test_pp_consistency
 python3 -m unittest test_pp_single_node.TestFixedBugs.test_chunked_prefill_with_small_bs
+python3 -m unittest test_pp_single_node.TestQwenVLPPAccuracy.test_mmmu
 """
 
 import time
@@ -21,6 +22,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST_VL_PP,
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
@@ -128,6 +130,42 @@ class TestDPAttentionDP2PP2(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
+
+
+class TestQwenVLPPAccuracy(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_VL_PP
+        cls.base_url = "http://127.0.0.1:23333"
+        cls.process = popen_launch_server(
+            DEFAULT_MODEL_NAME_FOR_TEST_VL_PP,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--tp-size",
+                1,
+                "--pp-size",
+                2,
+                "--chunked-prefill-size",
+                256,
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_mmmu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmmu",
+            num_examples=None,
+            num_threads=32,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.55)
 
 
 class TestQwenPPAccuracy(unittest.TestCase):
