@@ -55,9 +55,12 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
         self.func_call_regex = r"<tool_call>.*?</tool_call>"
-        self.func_detail_regex = r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>"
-        self.func_arg_regex = (
-            r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>"
+        self.func_detail_regex = re.compile(
+            r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
+        )
+        self.func_arg_regex = re.compile(
+            r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
+            re.DOTALL,
         )
 
     def has_tool_call(self, text: str) -> bool:
@@ -81,14 +84,10 @@ class Glm4MoeDetector(BaseFormatDetector):
         try:
             for match_result in match_result_list:
                 # Get function name
-                func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
+                func_detail = self.func_detail_regex.search(match_result)
                 func_name = func_detail.group(1)
                 func_args = func_detail.group(2)
-                pairs = re.findall(
-                    self.func_arg_regex,
-                    func_args,
-                    re.DOTALL,
-                )
+                pairs = self.func_arg_regex.findall(func_args)
                 arguments = {}
                 for arg_key, arg_value in pairs:
                     arg_key = arg_key.strip()
