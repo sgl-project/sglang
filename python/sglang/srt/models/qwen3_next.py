@@ -17,7 +17,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.layernorm import GemmaRMSNorm, Qwen3NextRMSNormGated
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -43,6 +43,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
     is_cuda,
     is_npu,
     make_layers,
@@ -52,6 +54,10 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_is_amx_available = cpu_has_amx_support()
+if _is_cpu and _is_amx_available:
+    pass
 
 import triton
 import triton.language as tl
@@ -326,15 +332,18 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
-
-        self.norm = RMSNormGated(
-            self.head_v_dim,
-            eps=self.layer_norm_epsilon,
-            group_size=None,
-            norm_before_gate=True,
-            device=torch.get_device_module().current_device(),
-            dtype=config.torch_dtype,
-        )
+        if _is_cpu:
+            self.norm = Qwen3NextRMSNormGated(
+                self.head_v_dim, eps=self.layer_norm_epsilon
+            )
+            self.norm = RMSNormGated(
+                self.head_v_dim,
+                eps=self.layer_norm_epsilon,
+                group_size=None,
+                norm_before_gate=True,
+                device=torch.get_device_module().current_device(),
+                dtype=config.torch_dtype,
+            )
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -428,6 +437,17 @@ class Qwen3GatedDeltaNet(nn.Module):
                 triton.cdiv(self.num_v_heads, self.attn_tp_size),
                 self.head_k_dim,
                 self.head_v_dim,
+            )
+        elif _is_cpu and _is_amx_available:
+            mixed_qkv, z, b, a = (
+                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    self.num_k_heads // self.attn_tp_size,
+                    self.num_v_heads // self.attn_tp_size,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
             )
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(

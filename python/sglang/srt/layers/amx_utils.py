@@ -7,13 +7,17 @@ from sglang.srt.utils import cpu_has_amx_support
 logger = logging.getLogger(__name__)
 
 
-def amx_process_weight_after_loading(weight):
+def amx_process_weight_after_loading(weight, is_conv=False):
     if weight.device != torch.device("cpu"):
         return weight
     if not cpu_has_amx_support():
         return weight
-
-    return torch.ops.sgl_kernel.convert_weight_packed(weight)
+    if is_conv:
+        return torch.ops.sgl_kernel.causal_conv1d_weight_pack(
+            weight.view(-1, weight.size(-1))
+        )
+    else:
+        return torch.ops.sgl_kernel.convert_weight_packed(weight)
 
 
 # TODO: currently gemm kernel has the below requirements:
@@ -26,6 +30,10 @@ def dim_is_supported(weight):
     OC = weight.size(1) if ndim == 3 else weight.size(0)
     IC = weight.size(2) if ndim == 3 else weight.size(1)
     return OC % TILE_N == 0 and IC % TILE_K == 0
+
+
+def is_dim_conv_weight(weight):
+    weight.dim() == 3 and weight.size(1) == 1
 
 
 def _amx_process_weight_after_loading(
@@ -46,9 +54,9 @@ def _amx_process_weight_after_loading(
 
         if transpose_dims and transpose_dims[i]:
             weight_tensor = weight_tensor.transpose(*transpose_dims[i])
-
+        is_conv_weight = is_dim_conv_weight(weight_tensor)
         # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
-        if not dim_is_supported(weight_tensor):
+        if (not dim_is_supported(weight_tensor)) and (not is_conv_weight):
             logger.warning(
                 f"Unsupported dimension for prepacking for weight '{weight_name}' with shape {weight_tensor.shape} in {module}. "
                 f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
@@ -57,7 +65,7 @@ def _amx_process_weight_after_loading(
             return
 
         packed_weight = torch.nn.Parameter(
-            amx_process_weight_after_loading(weight_tensor),
+            amx_process_weight_after_loading(weight_tensor, is_conv_weight),
             requires_grad=False,
         )
         packed_weight.__dict__ = weight_tensor.__dict__

@@ -33,7 +33,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.qwen3_next import fused_gdn_gating
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -55,6 +55,14 @@ elif is_npu():
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
     causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
+elif is_cpu() and cpu_has_amx_support():
+    chunk_gated_delta_rule = torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu
+    causal_conv1d_fn = torch.ops.sgl_kernel.causal_conv1d_fwd_cpu
+    causal_conv1d_update = torch.ops.sgl_kernel.causal_conv1d_update_cpu
+    fused_sigmoid_gating_delta_rule_update = (
+        torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
+    )
+    fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
 class MambaAttnBackendBase(AttentionBackend):
