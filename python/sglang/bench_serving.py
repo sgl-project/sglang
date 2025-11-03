@@ -25,6 +25,7 @@ import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
@@ -1484,9 +1485,15 @@ def sample_image_requests(
     return dataset
 
 
+@lru_cache(maxsize=1)
+def get_available_tokens(tokenizer):
+    """Get all available token ids from the tokenizer vocabulary."""
+    return list(tokenizer.get_vocab().values())
+
+
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
+    all_available_tokens = get_available_tokens(tokenizer)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
