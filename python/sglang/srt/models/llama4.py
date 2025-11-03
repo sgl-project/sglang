@@ -163,7 +163,7 @@ class Llama4MoE(nn.Module):
     def _forward_core_normal(self, hidden_states):
         # router_scores: [num_tokens, num_experts]
         router_logits, _ = self.router(hidden_states)
-        shared_out = self.shared_expert(hidden_states.clone())
+        shared_out = self.shared_expert(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         routed_out = self.experts(hidden_states, topk_output)
         return shared_out, routed_out
