@@ -24,7 +24,7 @@ class TestTP(CustomTestCase):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
 
-        other_args=[
+        other_args = [
             "--trust-remote-code",
             "--tp",
             "4",
