@@ -426,11 +426,13 @@ class Qwen2_5_VisionTransformer(nn.Module):
             position_embeddings[1].to(x.device, x.dtype),
         )
 
-        # compute cu_seqlens
+        # compute cu_seqlens - move cu_seqlens to GPU and make it int32
         cu_seqlens = torch.cat(
             [
-                torch.tensor([0], device=grid_thw.device),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).cumsum(dim=0),
+                torch.tensor([0], device=x.device, dtype=torch.int32),
+                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                .cumsum(dim=0)
+                .to(device=x.device, dtype=torch.int32),
             ]
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
