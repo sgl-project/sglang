@@ -102,7 +102,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             num_q_heads = self.num_q_heads * (self.num_draft_tokens or 1)
             mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
+                forward_batch.seq_lens.to(torch.int32),
                 num_q_heads,
                 1,
             )

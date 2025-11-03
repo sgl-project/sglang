@@ -32,8 +32,6 @@ from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
-import logging
-logger = logging.getLogger(__name__)
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
@@ -556,13 +554,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # --- KERNEL REPLACEMENT - END ---
         
         
-        logger.info("--- [ALLOC_EXTEND DEBUG] AFTER KERNEL EXECUTION ---")
+        # logger.info("--- [ALLOC_EXTEND DEBUG] AFTER KERNEL EXECUTION ---")
         unique_vals, counts = torch.unique(out_indices, return_counts=True)
         is_correct = (len(unique_vals) == len(out_indices))
         
-        logger.info(f"Validation Result: {'SUCCESS' if is_correct else 'FAILURE'}")
-        logger.info(f"  - out_indices length: {len(out_indices)}")
-        logger.info(f"  - unique values count: {len(unique_vals)}")
+        # logger.info(f"Validation Result: {'SUCCESS' if is_correct else 'FAILURE'}")
+        # logger.info(f"  - out_indices length: {len(out_indices)}")
+        # logger.info(f"  - unique values count: {len(unique_vals)}")
 
         # 检查我们的实现是否正确，这是一个可选的调试步骤
         if self.debug_mode:

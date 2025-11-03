@@ -370,8 +370,8 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
-    speculative_attention_mode: str = "prefill"
     requests_all_greedy: Optional[bool] = True
+    speculative_attention_mode: str = "prefill"
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -1465,27 +1465,13 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm in (
-            "EAGLE",
-            "EAGLE3",
-            "STANDALONE",
-            "SIMPLE_EAGLE",
-        ):
-            # Set parameters for SIMPLE_EAGLE
-            if self.speculative_algorithm == "SIMPLE_EAGLE":
-                self.speculative_num_steps = 1
-                self.speculative_eagle_topk = 1
-                self.speculative_num_draft_tokens = 2
-                # self.attention_backend = "flashinfer"
-                logger.warning(
-                    "SIMPLE_EAGLE only supports using flashinfer attention backend currently. "
-                    "Attention backend is automatically set to flashinfer."
-                )
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE","SIMPLE_EAGLE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
                 raise ValueError(
                     "Currently standalone speculative decoding does not support dp attention."
                 )
+
             if (
                 self.max_running_requests is None
                 and self.speculative_algorithm != "SIMPLE_EAGLE"
@@ -1611,8 +1597,6 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
-            #If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
-            # assert self.speculative_num_steps < self.speculative_num_draft_tokens
 
     def _handle_load_format(self):
         if (

@@ -466,6 +466,7 @@ class ModelRunner:
             self.init_cublas()
             self.init_attention_backend()
             # self.init_device_graphs()
+            # NOTE: hard code, we init target model cuda graphs in simple_eagle
             if self.spec_algorithm.is_simple_eagle():
                 self.graph_runner = None
                 self.graph_mem_usage = 0
@@ -2095,9 +2096,9 @@ class ModelRunner:
         )
         can_run_graph = bool(
             mode_check()
+            and not self.spec_algorithm.is_simple_eagle()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
-            and not self.spec_algorithm.is_simple_eagle()
         )
 
         if can_run_graph:
