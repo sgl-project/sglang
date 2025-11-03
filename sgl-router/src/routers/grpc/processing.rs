@@ -11,13 +11,13 @@ use tracing::error;
 
 use super::{
     context::{DispatchMetadata, ExecutionResult},
-    error, utils,
+    response_collection, response_formatting, utils, error
 };
 use crate::{
     grpc_client::proto,
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-        common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage},
+        common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue},
         generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
@@ -59,56 +59,6 @@ impl ResponseProcessor {
         }
     }
 
-    /// Helper to collect responses from execution result and merge logprobs if needed
-    async fn collect_and_merge_responses(
-        execution_result: ExecutionResult,
-        request_logprobs: bool,
-    ) -> Result<Vec<proto::GenerateComplete>, axum::response::Response> {
-        let all_responses = match execution_result {
-            ExecutionResult::Single { mut stream } => {
-                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
-                stream.mark_completed();
-                responses
-            }
-            ExecutionResult::Dual {
-                mut prefill,
-                decode,
-            } => {
-                // Collect prefill for input_logprobs (don't mark completed yet)
-                let prefill_responses =
-                    utils::collect_stream_responses(&mut prefill, "Prefill").await?;
-
-                // Collect decode for actual output (don't mark completed yet)
-                let mut decode_stream = *decode;
-                let mut decode_responses =
-                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
-
-                // Mark both streams as completed now that both succeeded
-                prefill.mark_completed();
-                decode_stream.mark_completed();
-
-                // Merge prefill input_logprobs if requested
-                if request_logprobs {
-                    if let Some(prefill_input_logprobs) = prefill_responses
-                        .first()
-                        .and_then(|r| r.input_logprobs.clone())
-                    {
-                        for response in &mut decode_responses {
-                            response.input_logprobs = Some(prefill_input_logprobs.clone());
-                        }
-                    }
-                }
-
-                decode_responses
-            }
-        };
-
-        if all_responses.is_empty() {
-            return Err(error::internal_error("No responses from server"));
-        }
-
-        Ok(all_responses)
-    }
 
     /// Process a single choice from GenerateComplete response
     #[allow(clippy::too_many_arguments)]
@@ -275,7 +225,7 @@ impl ResponseProcessor {
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
         // Collect all responses from the execution result
         let all_responses =
-            Self::collect_and_merge_responses(execution_result, request_logprobs).await?;
+            response_collection::collect_responses(execution_result, request_logprobs).await?;
 
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
@@ -341,28 +291,15 @@ impl ResponseProcessor {
         }
 
         // Build usage
-        let total_prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
-        let total_completion_tokens: u32 = all_responses
-            .iter()
-            .map(|r| r.completion_tokens as u32)
-            .sum();
-        let usage = Usage {
-            prompt_tokens: total_prompt_tokens,
-            completion_tokens: total_completion_tokens,
-            total_tokens: total_prompt_tokens + total_completion_tokens,
-            completion_tokens_details: None,
-        };
+        let usage = response_formatting::build_usage(&all_responses);
 
         // Build final ChatCompletionResponse
-        let response = ChatCompletionResponse {
-            id: dispatch.request_id.clone(),
-            object: "chat.completion".to_string(),
-            created: dispatch.created,
-            model: dispatch.model.clone(),
+        let response = response_formatting::build_chat_response(
             choices,
-            usage: Some(usage),
-            system_fingerprint: dispatch.weight_version.clone(),
-        };
+            &dispatch,
+            dispatch.model.clone(),
+            usage,
+        );
 
         Ok(response)
     }
@@ -447,7 +384,7 @@ impl ResponseProcessor {
             let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
                 Ok(outputs) => outputs,
                 Err(e) => {
-                    return Err(error::internal_error(format!(
+                    return Err(utils::internal_error_message(format!(
                         "Failed to process tokens: {}",
                         e
                     )))

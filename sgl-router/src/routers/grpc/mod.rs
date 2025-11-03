@@ -8,6 +8,8 @@ pub mod harmony;
 pub mod pd_router;
 pub mod pipeline;
 pub mod processing;
+pub mod response_collection;
+pub mod response_formatting;
 pub mod responses;
 pub mod router;
 pub mod stages;
