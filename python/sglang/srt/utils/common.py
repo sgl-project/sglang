@@ -1322,7 +1322,8 @@ def get_zmq_socket(
     socket_type: zmq.SocketType,
     endpoint: Optional[str] = None,
     bind: bool = True,
-) -> Union[zmq.Socket, Tuple[int, zmq.Socket]]:
+    port_range: Optional[Tuple[int, int]] = None,
+) -> zmq.Socket:
     """Create and configure a ZeroMQ socket.
 
     Args:
@@ -1330,18 +1331,26 @@ def get_zmq_socket(
         socket_type: Type of ZeroMQ socket to create.
         endpoint: Optional endpoint to bind/connect to. If None, binds to a random TCP port.
         bind: Whether to bind (True) or connect (False) to the endpoint. Ignored if endpoint is None.
+        port_range: Optional tuple (min_port, max_port) specifying the range of ports 
+                    [min_port, max_port) to use when binding to a random port. 
+                    Only effective when endpoint is None or ends with ":*".
 
     Returns:
-        If endpoint is None: Tuple of (port, socket) where port is the randomly assigned TCP port.
-        If endpoint is provided: The configured ZeroMQ socket.
+        The configured ZeroMQ socket.
     """
-    socket = context.socket(socket_type)
+    socket: zmq.Socket = context.socket(socket_type)
+
+    random_port_args = (
+        {"min_port": port_range[0], "max_port": port_range[1]}
+        if port_range is not None
+        else {}
+    )
 
     if endpoint is None:
         # Bind to random TCP port
         config_socket(socket, socket_type)
-        port = socket.bind_to_random_port("tcp://*")
-        return port, socket
+        _ = socket.bind_to_random_port("tcp://*", **random_port_args)
+        return socket
     else:
         # Handle IPv6 if endpoint contains brackets
         if endpoint.find("[") != -1:
@@ -1350,11 +1359,33 @@ def get_zmq_socket(
         config_socket(socket, socket_type)
 
         if bind:
-            socket.bind(endpoint)
+            if endpoint.endswith(":*"):
+                _ = socket.bind_to_random_port(endpoint[:-2], **random_port_args)
+            else:
+                socket.bind(endpoint)
         else:
             socket.connect(endpoint)
 
         return socket
+    
+def get_zmq_socket_port(socket: zmq.Socket) -> int:
+    """Get the port number a ZeroMQ socket is bound to.
+
+    Args:
+        socket: The ZeroMQ socket.
+
+    Returns:
+        The port number the socket is bound to.
+    Raises:
+        ValueError: If the socket is not bound to any endpoint.
+    """
+    endpoint = socket.getsockopt(zmq.LAST_ENDPOINT).decode("utf-8")
+    if not endpoint:
+        raise ValueError("Socket is not bound to any endpoint.")
+    else:
+        # format: `tcp://0.0.0.0:56328` or `tcp://[::1]:56328`
+        port = int(endpoint.rsplit(":", 1)[-1])
+        return port
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
