@@ -37,8 +37,8 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
 
 _allocator = None
 _mem_pool = None
-_registered_base_addrs = set()
 _graph_pool_id = None
+_cur_device = None
 
 
 def is_symmetric_memory_enabled():
@@ -51,7 +51,7 @@ def set_graph_pool_id(graph_pool_id):
 
 
 def get_nccl_mem_pool():
-    global _allocator, _mem_pool
+    global _allocator, _mem_pool, _cur_device
     if _mem_pool is None:
         out_dir = tempfile.gettempdir()
         nccl_allocator_libname = "nccl_allocator"
@@ -70,6 +70,7 @@ def get_nccl_mem_pool():
             "nccl_free_plug",
         ).allocator()
         _mem_pool = torch.cuda.MemPool(_allocator)
+        _cur_device = torch.cuda.current_device()
     return _mem_pool
 
 
@@ -95,7 +96,6 @@ class use_symmetric_memory:
         self.group_coordinator = group_coordinator
         self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
         self.is_graph_capture = torch.cuda.is_current_stream_capturing()
-        self.device = torch.cuda.current_device()
 
     def __enter__(self):
         if not self.enabled:
@@ -110,7 +110,7 @@ class use_symmetric_memory:
                 _graph_pool_id is not None
             ), "graph_pool_id is not set under graph capture"
             # Pause graph memory pool to use symmetric memory with cuda graph
-            torch._C._cuda_endAllocateToPool(self.device, _graph_pool_id)
+            torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
 
         self._mem_pool_ctx.__enter__()
 
@@ -124,11 +124,10 @@ class use_symmetric_memory:
         if not self.enabled:
             return
 
-        global _registered_base_addrs
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
 
         if self.is_graph_capture:
-            torch._C._cuda_beginAllocateCurrentThreadToPool(self.device, _graph_pool_id)
+            torch._C._cuda_beginAllocateCurrentThreadToPool(_cur_device, _graph_pool_id)
 
     def tag(self, tensor: torch.Tensor):
         if not self.enabled:
