@@ -24,11 +24,11 @@ sgl-diffusion has the following features:
 ## Getting Started
 
 ```bash
-# Linux + h100
-uv sync && uv pip install -e '.[h100]'
-# Linux + NVIDIA (A100/4090/etc., VSA only):
-uv sync && uv pip install -e '.[kernels]'
+uv pip install sglang[.diffusion] --prerelease=allow
 ```
+
+For more information, check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
+
 
 ## Inference
 
@@ -62,13 +62,13 @@ if __name__ == '__main__':
 Or, more simply, with the CLI:
 
 ```bash
-sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers
-    --text-encoder-cpu-offload --pin-cpu-memory
-    --prompt "A curious raccoon"
+sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --text-encoder-cpu-offload --pin-cpu-memory \
+    --prompt "A curious raccoon" \
     --save-output
 ```
 
-For more information, check the [docs](https://github.com/sgl-project/sgl-diffusion/tree/main/docs).
+For more information, check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/cli.md).
 
 ## Contributing
 
