@@ -10,7 +10,7 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
 
-ARG SGL_KERNEL_VERSION=0.3.16.post4
+ARG SGL_KERNEL_VERSION=0.3.16.post5
 ARG GDRCOPY_VERSION=2.5.1
 ARG NVSHMEM_VERSION=3.4.5
 
@@ -22,7 +22,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
-RUN apt update && apt install wget -y && apt install software-properties-common -y \
+RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y && apt install software-properties-common -y \
  && add-apt-repository ppa:deadsnakes/ppa -y \
   && apt install python3.12-full python3.12-dev python3.10-venv -y \
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
@@ -32,7 +32,7 @@ RUN apt update && apt install wget -y && apt install software-properties-common 
  && python3 get-pip.py
 
 # Set timezone and install all packages
-RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
+RUN --mount=type=cache,target=/var/cache/apt echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
  && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
  && apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
@@ -83,7 +83,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
  && rm -rf /tmp/local_src
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
+RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
  && cd sglang \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
@@ -93,25 +93,25 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
  && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+      python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
    ; \
    elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-      python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} \
+      python3 -m pip install sgl-kernel==${SGL_KERNEL_VERSION} \
    ; \
    elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+      python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
    ; \
    else \
       echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
    ; \
    fi \
- && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-      python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
+      python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-      python3 -m pip install --no-cache-dir nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+      python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
       python3 -m pip uninstall -y torch torchaudio torchvision ; \
-      python3 -m pip install --no-cache-dir torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
+      python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
     else \
       echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
     fi \
@@ -160,7 +160,7 @@ RUN cd /sgl-workspace/nvshmem && \
 
 # Install DeepEP
 # CTK13 requires the cccl include
-RUN cd /sgl-workspace/DeepEP && \
+RUN --mount=type=cache,target=/root/.cache/pip cd /sgl-workspace/DeepEP && \
     case "$CUDA_VERSION" in \
       12.6.1) \
         CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
@@ -180,12 +180,12 @@ RUN cd /sgl-workspace/DeepEP && \
 
 # In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
 # latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
-RUN python3 -m pip install --no-cache-dir --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0"
+RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0"
 
 # For cuda 13, we install triton from source to fix some sm103 issues
 # This can be reverted after >3.4.5 is released
 # See the conversation in: https://github.com/triton-lang/triton/pull/8536
-RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
+RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]; then \
     git clone https://github.com/triton-lang/triton.git && \
     cd triton && \
     git checkout ${TRITON_LANG_COMMIT} && \
@@ -194,9 +194,9 @@ RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
 fi
 
 # Python tools
-RUN python3 -m pip install --no-cache-dir \
+RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     datamodel_code_generator \
-    mooncake-transfer-engine==0.3.6.post1 \
+    mooncake-transfer-engine==0.3.7.post1 \
     pre-commit \
     pytest \
     black \
@@ -209,7 +209,7 @@ RUN python3 -m pip install --no-cache-dir \
     py-spy
 
 # Install development tools and utilities
-RUN apt-get update && apt-get install -y \
+RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -y \
     gdb \
     ninja-build \
     vim \
@@ -235,7 +235,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-RUN apt update -y \
+RUN --mount=type=cache,target=/var/cache/apt apt update -y \
     && apt install -y --no-install-recommends gnupg \
     && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
     && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
@@ -249,7 +249,7 @@ ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
 # Install minimal Python packages
-RUN python3 -m pip install --no-cache-dir --break-system-packages \
+RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --break-system-packages \
     pytest \
     black \
     isort \
@@ -287,14 +287,14 @@ RUN CMAKE_VERSION=3.31.1 \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Build and install sgl-router (Rust toolchain removed after build to save space)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && rustc --version && cargo --version \
-    && python3 -m pip install --no-cache-dir maturin \
+    && python3 -m pip install maturin \
     && cd /sgl-workspace/sglang/sgl-router \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
-    && python3 -m pip install --no-cache-dir --force-reinstall dist/*.whl \
-    && rm -rf /root/.cache /root/.cargo /root/.rustup target dist ~/.cargo
+    && python3 -m pip install --force-reinstall dist/*.whl \
+    && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo
 
 
 # Add yank script
