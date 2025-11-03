@@ -102,6 +102,14 @@ class Sampler(nn.Module):
             if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
 
+            if get_global_server_args().rl_on_policy_target == "fsdp":
+                logits_div_temperature = (
+                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
+                )
+                logprobs_via_logsoftmax_kernel = torch.log_softmax(
+                    logits_div_temperature, dim=-1
+                )
+
             # Post process logits
             logits.div_(sampling_info.temperatures)
             logits[:] = torch.softmax(logits, dim=-1)
@@ -148,8 +156,11 @@ class Sampler(nn.Module):
                     )
 
             if return_logprob:
+                if get_global_server_args().rl_on_policy_target == "fsdp":
+                    logprobs = logprobs_via_logsoftmax_kernel
+                    del logprobs_via_logsoftmax_kernel
                 # clamp to avoid -inf
-                if SGLANG_RETURN_ORIGINAL_LOGPROB:
+                elif SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = torch.log(probs_without_temp_scaling).clamp(
                         min=torch.finfo(probs_without_temp_scaling.dtype).min
                     )

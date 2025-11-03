@@ -7,6 +7,8 @@ import base64
 import json
 import os
 import sys
+import time
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
@@ -28,14 +30,17 @@ def make_github_request(url, token, method="GET", data=None):
     try:
         with urlopen(req) as response:
             return response.read().decode("utf-8")
-    except Exception as e:
+    except HTTPError as e:
         print(f"GitHub API request failed: {e}")
-        if hasattr(e, "read"):
-            try:
-                error_body = e.read().decode("utf-8")
-                print(f"Error response body: {error_body}")
-            except:
-                pass
+        try:
+            error_body = e.read().decode("utf-8")
+            print(f"Error response body: {error_body}")
+            e.error_body = error_body  # Attach for later inspection
+        except Exception:
+            e.error_body = ""
+        raise
+    except Exception as e:
+        print(f"GitHub API request failed with a non-HTTP error: {e}")
         raise
 
 
@@ -196,37 +201,60 @@ def publish_traces(traces_dir, run_id, run_number, is_vlm=False):
         )
         sys.exit(1)
 
-    try:
-        # Get current branch head
-        branch_sha = get_branch_sha(repo_owner, repo_name, branch, token)
-        print(f"Current branch head: {branch_sha}")
+    max_retries = 5
+    retry_delay = 5  # seconds
 
-        # Get current tree
-        tree_sha = get_tree_sha(repo_owner, repo_name, branch_sha, token)
-        print(f"Current tree SHA: {tree_sha}")
+    for attempt in range(max_retries):
+        try:
+            # Get current branch head
+            branch_sha = get_branch_sha(repo_owner, repo_name, branch, token)
+            print(f"Current branch head: {branch_sha}")
 
-        # Create new tree with all files
-        new_tree_sha = create_tree(
-            repo_owner, repo_name, tree_sha, files_to_upload, token
-        )
-        print(f"Created new tree: {new_tree_sha}")
+            # Get current tree
+            tree_sha = get_tree_sha(repo_owner, repo_name, branch_sha, token)
+            print(f"Current tree SHA: {tree_sha}")
 
-        # Create commit
-        commit_message = f"Nightly traces for run {run_id} at {run_number} ({len(files_to_upload)} files)"
-        commit_sha = create_commit(
-            repo_owner, repo_name, new_tree_sha, branch_sha, commit_message, token
-        )
-        print(f"Created commit: {commit_sha}")
+            # Create new tree with all files
+            new_tree_sha = create_tree(
+                repo_owner, repo_name, tree_sha, files_to_upload, token
+            )
+            print(f"Created new tree: {new_tree_sha}")
 
-        # Update branch reference
-        update_branch_ref(repo_owner, repo_name, branch, commit_sha, token)
-        print("Updated branch reference")
+            # Create commit
+            commit_message = f"Nightly traces for run {run_id} at {run_number} ({len(files_to_upload)} files)"
+            commit_sha = create_commit(
+                repo_owner,
+                repo_name,
+                new_tree_sha,
+                branch_sha,
+                commit_message,
+                token,
+            )
+            print(f"Created commit: {commit_sha}")
 
-        print("Successfully published all traces in a single commit")
+            # Update branch reference
+            update_branch_ref(repo_owner, repo_name, branch, commit_sha, token)
+            print("Updated branch reference")
 
-    except Exception as e:
-        print(f"Failed to publish traces: {e}")
-        raise
+            print("Successfully published all traces in a single commit")
+            return
+
+        except Exception as e:
+            is_ff_error = False
+            if (
+                hasattr(e, "error_body")
+                and "Update is not a fast forward" in e.error_body
+            ):
+                is_ff_error = True
+
+            if is_ff_error and attempt < max_retries - 1:
+                print(
+                    f"Attempt {attempt + 1} failed: not a fast-forward update. Retrying in {retry_delay} seconds..."
+                )
+                time.sleep(retry_delay)
+            else:
+                print(f"Failed to publish traces: {e}")
+                raise
 
 
 def main():

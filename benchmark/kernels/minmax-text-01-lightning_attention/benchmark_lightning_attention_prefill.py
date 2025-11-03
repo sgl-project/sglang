@@ -1,4 +1,5 @@
 import itertools
+import logging
 import math
 import os
 from typing import Optional, Tuple
@@ -9,6 +10,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from einops import rearrange
+
+logger = logging.getLogger(__name__)
 
 
 # Adapted from https://github.com/OpenNLPLab/lightning-attention/blob/main/lightning_attn/ops/triton/lightning_attn2.py
@@ -302,6 +305,7 @@ class MiniMaxText01LightningAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         use_cache: bool = False,
         slope_rate: Optional[torch.Tensor] = None,
+        do_eval: bool = False,
         **kwargs,
     ):
         if (not self.training) and (not do_eval):

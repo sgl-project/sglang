@@ -6,6 +6,7 @@ from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.janus_pro import MultiModalityConfig
+from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
@@ -31,6 +32,7 @@ __all__ = [
     "Step3TextConfig",
     "Step3VisionEncoderConfig",
     "Olmo3Config",
+    "KimiLinearConfig",
     "Qwen3NextConfig",
     "DotsVLMConfig",
     "DotsOCRConfig",

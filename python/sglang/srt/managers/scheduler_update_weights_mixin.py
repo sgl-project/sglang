@@ -5,7 +5,12 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.constants import (
+    GPU_MEMORY_ALL_TYPES,
+    GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+)
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
@@ -21,6 +26,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -80,6 +87,18 @@ class SchedulerUpdateWeightsMixin:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        """Update the online model parameter from IPC for checkpoint-engine integration."""
+        success, message = self.tp_worker.update_weights_from_ipc(recv_req)
+        if success:
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return UpdateWeightsFromIPCReqOutput(success, message)
+
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
@@ -87,10 +106,14 @@ class SchedulerUpdateWeightsMixin:
     def release_memory_occupation(
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
     ):
+        assert (
+            self._is_no_request()
+        ), "release_memory_occupation should be called only when no ongoing request."
+
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
-            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
+            tags = GPU_MEMORY_ALL_TYPES
 
         for tag in tags:
             self.offload_tags.add(tag)
@@ -106,6 +129,9 @@ class SchedulerUpdateWeightsMixin:
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(
@@ -114,10 +140,13 @@ class SchedulerUpdateWeightsMixin:
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
-            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
+            tags = GPU_MEMORY_ALL_TYPES
 
         for tag in tags:
             self.offload_tags.remove(tag)
+
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)

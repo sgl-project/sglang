@@ -6,8 +6,7 @@ including router initialization, configuration validation, and startup flow.
 """
 
 import logging
-from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sglang_router.launch_router import RouterArgs, launch_router
@@ -29,7 +28,7 @@ def setup_logger():
     return logger
 
 
-from sglang_router_rs import PolicyType
+from sglang_router.sglang_router_rs import PolicyType
 
 
 class TestSetupLogger:
@@ -743,7 +742,7 @@ def test_router_defaults_and_start(monkeypatch):
     assert captured["decode_selector"] is None
     assert captured["cors_allowed_origins"] is None
     assert captured["worker_urls"] == ["http://w1:8000"]
-    from sglang_router_rs import PolicyType
+    from sglang_router.sglang_router_rs import PolicyType
 
     assert captured["policy"] == PolicyType.RoundRobin
 

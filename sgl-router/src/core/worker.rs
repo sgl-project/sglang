@@ -8,6 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json;
 use tokio::{sync::RwLock, time};
 
@@ -240,13 +241,17 @@ pub trait Worker: Send + Sync + fmt::Debug {
 }
 
 /// Connection mode for worker communication
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum ConnectionMode {
     /// HTTP/REST connection
+    #[default]
     Http,
     /// gRPC connection
     Grpc {
         /// Optional port for gRPC endpoint (if different from URL)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         port: Option<u16>,
     },
 }

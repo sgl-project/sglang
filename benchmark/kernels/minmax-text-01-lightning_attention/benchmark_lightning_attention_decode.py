@@ -167,6 +167,7 @@ class MiniMaxText01LightningAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         use_cache: bool = False,
         slope_rate: Optional[torch.Tensor] = None,
+        do_eval: bool = False,
         **kwargs,
     ):
         if (not self.training) and (not do_eval):

@@ -1,4 +1,4 @@
-name: PR Benchmark (Rust Router)
+name: PR Benchmark (SMG Components)
 
 on:
   push:

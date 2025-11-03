@@ -88,7 +88,7 @@ class StandardDispatcher(BaseDispatcher):
                 topk_output = topk_output._replace(
                     topk_ids=self.local_expert_mapping[topk_output.topk_ids]
                 )
-            elif TopKOutputChecker.format_is_triton_kernel(topk_output):
+            elif TopKOutputChecker.format_is_triton_kernels(topk_output):
                 raise NotImplementedError()
 
         return StandardDispatchOutput(

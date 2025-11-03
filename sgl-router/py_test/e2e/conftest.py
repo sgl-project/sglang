@@ -85,6 +85,8 @@ def _popen_launch_router(
         str(prom_port),
         "--router-prometheus-host",
         "127.0.0.1",
+        "--router-log-level",
+        "warn",
     ]
 
     proc = subprocess.Popen(cmd)
