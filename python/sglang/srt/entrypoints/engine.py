@@ -147,6 +147,12 @@ class Engine(EngineBase):
                 thread_label = "Tokenizer"
                 trace_set_thread_info(thread_label)
 
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
