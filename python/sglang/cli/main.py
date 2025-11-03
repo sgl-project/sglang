@@ -107,7 +107,7 @@ def _verify_model_config_and_directory(model_path: str) -> True:
     # Prefer model_index.json which indicates a diffusers pipeline
     config_path = os.path.join(model_path, "model_index.json")
     if not os.path.exists(config_path):
-        return None
+        return False
 
     # Load the config
     with open(config_path) as f:
@@ -115,7 +115,7 @@ def _verify_model_config_and_directory(model_path: str) -> True:
 
     # Verify diffusers version exists
     if "_diffusers_version" not in config:
-        return None
+        return False
     return True
 
 
