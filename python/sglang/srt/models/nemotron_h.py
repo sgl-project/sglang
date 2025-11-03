@@ -137,7 +137,7 @@ class NemotronHMoE(nn.Module):
             renormalize=config.norm_topk_prob,
             scoring_func="sigmoid",
             correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
+            routed_scaling_factor=1.0,
         )
         self.experts = FusedMoE(
             num_experts=config.n_routed_experts,
@@ -150,7 +150,6 @@ class NemotronHMoE(nn.Module):
             activation=config.mlp_hidden_act,
             layer_id=layer_idx,
             is_gated=False,
-            routed_scaling_factor=self.routed_scaling_factor,
         )
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
@@ -170,12 +169,19 @@ class NemotronHMoE(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         else:
             shared_output = None
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
+
+        # Fix FP16 overflow
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states *= self.routed_scaling_factor
+        elif self.shared_experts is not None:
+            assert shared_output is not None
+            shared_output *= 1.0 / self.routed_scaling_factor
 
         if shared_output is not None:
             final_hidden_states += shared_output
