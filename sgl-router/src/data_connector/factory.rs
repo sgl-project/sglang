@@ -9,12 +9,20 @@ use std::sync::Arc;
 use tracing::info;
 
 use super::{
-    core::{SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage},
+    core::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     memory::{MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage},
     noop::{NoOpConversationItemStorage, NoOpConversationStorage, NoOpResponseStorage},
     oracle::{OracleConversationItemStorage, OracleConversationStorage, OracleResponseStorage},
 };
 use crate::config::{HistoryBackend, OracleConfig, RouterConfig};
+
+/// Type alias for the storage tuple returned by factory functions.
+/// This avoids clippy::type_complexity warnings while keeping Arc explicit.
+pub type StorageTuple = (
+    Arc<dyn ResponseStorage>,
+    Arc<dyn ConversationStorage>,
+    Arc<dyn ConversationItemStorage>,
+);
 
 /// Create all three storage backends based on router configuration.
 ///
@@ -26,16 +34,7 @@ use crate::config::{HistoryBackend, OracleConfig, RouterConfig};
 ///
 /// # Errors
 /// Returns error string if Oracle configuration is missing or initialization fails
-pub fn create_storage(
-    config: &RouterConfig,
-) -> Result<
-    (
-        SharedResponseStorage,
-        SharedConversationStorage,
-        SharedConversationItemStorage,
-    ),
-    String,
-> {
+pub fn create_storage(config: &RouterConfig) -> Result<StorageTuple, String> {
     match config.history_backend {
         HistoryBackend::Memory => {
             info!("Initializing data connector: Memory");
@@ -73,16 +72,7 @@ pub fn create_storage(
 }
 
 /// Create Oracle storage backends
-fn create_oracle_storage(
-    oracle_cfg: &OracleConfig,
-) -> Result<
-    (
-        SharedResponseStorage,
-        SharedConversationStorage,
-        SharedConversationItemStorage,
-    ),
-    String,
-> {
+fn create_oracle_storage(oracle_cfg: &OracleConfig) -> Result<StorageTuple, String> {
     let response_storage = OracleResponseStorage::new(oracle_cfg.clone())
         .map_err(|err| format!("failed to initialize Oracle response storage: {err}"))?;
 

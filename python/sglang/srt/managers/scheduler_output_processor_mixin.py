@@ -15,7 +15,13 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
 )
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    BaseFinishReason,
+    Req,
+    RequestStage,
+    ScheduleBatch,
+)
+from sglang.srt.tracing.trace import trace_slice
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
@@ -175,6 +181,14 @@ class SchedulerOutputProcessorMixin:
                             )
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
+
+                    trace_slice(
+                        RequestStage.PREFILL_FORWARD,
+                        req.rid,
+                        auto_next_anon=not req.finished(),
+                        thread_finish_flag=req.finished(),
+                    )
+
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
@@ -203,6 +217,12 @@ class SchedulerOutputProcessorMixin:
                                 )
                             logprob_pt += num_input_logprobs
 
+                    trace_slice(
+                        RequestStage.PREFILL_CHUNKED_FORWARD,
+                        req.rid,
+                        auto_next_anon=True,
+                    )
+
         else:  # embedding or reward model
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
@@ -218,7 +238,10 @@ class SchedulerOutputProcessorMixin:
                         i
                     ].item()
             else:
-                embeddings = embeddings.tolist()
+                if isinstance(embeddings, torch.Tensor):
+                    embeddings = embeddings.tolist()
+                else:
+                    embeddings = [tensor.tolist() for tensor in embeddings]
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -238,6 +261,13 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
+
+                trace_slice(
+                    RequestStage.PREFILL_FORWARD,
+                    req.rid,
+                    auto_next_anon=not req.finished(),
+                    thread_finish_flag=req.finished(),
+                )
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
@@ -756,6 +786,7 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         spec_verify_ct = []
         spec_accepted_tokens = []
+        retraction_counts = []
         output_hidden_states = None
         output_routed_experts = None
 
@@ -788,7 +819,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
-            if self.model_config.is_multimodal_gen and req.to_abort:
+            if self.model_config.is_multimodal_gen and req.to_finish:
                 continue
 
             if req.finished():
@@ -857,6 +888,8 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+
+                retraction_counts.append(req.retraction_count)
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -985,6 +1018,7 @@ class SchedulerOutputProcessorMixin:
                     http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
+                    retraction_counts=retraction_counts,
                 )
             )
 
@@ -996,6 +1030,7 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
+        retraction_counts = []
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
@@ -1004,6 +1039,7 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+                retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 finished_reasons,
@@ -1014,5 +1050,6 @@ class SchedulerOutputProcessorMixin:
                 http_worker_ipcs=http_worker_ipcs,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
+                retraction_counts=retraction_counts,
             )
         )

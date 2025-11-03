@@ -235,6 +235,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     new_text = ""
                 else:
                     new_text = find_printable_text(new_text)
+            else:
+                del self.decode_status[recv_obj.rids[i]]
 
             output_str = self.trim_matched_stop(
                 s.decoded_text + new_text,
@@ -274,6 +276,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_routed_experts=recv_obj.output_routed_experts,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
         )
 
