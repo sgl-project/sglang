@@ -271,10 +271,6 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch.spec_info = None
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             generation_batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
-
-            # Need to reinitialize out_cache_loc for writing
-            # We need to run an extra extend on draft model after target decode
-
             self.forward_draft_extend_after_target_decode(batch)
             return generation_batch_result
         else:
@@ -322,15 +318,22 @@ class EAGLEWorker(TpModelWorker):
         return need_forward
 
     def forward_draft_extend_after_target_decode(self, batch: ScheduleBatch):
+        """
+        Running a simple decoding step for draft model to fill the KV
+        cache for each target decode step when spec decode is turned off.
+        """
         return_logprob_backup = batch.return_logprob
         batch.return_logprob = False
         # TODO: Handle idle
         batch.spec_info.num_tokens_per_batch = 1
         # batch.spec_info.num_tokens_for_logprob_per_batch = 1 ?
+        # When merge in a new batch, it has verified id, need to merge with 
+        # the verified_id collected
         batch.spec_info.verified_id = batch.input_ids
         batch.return_hidden_states = False
         target_hidden_states = batch.spec_info.hidden_states
         spec_info_backup = batch.spec_info
+        # Set to none to trigger regular decode
         batch.spec_info = None
         batch.forward_mode = (
             ForwardMode.DECODE

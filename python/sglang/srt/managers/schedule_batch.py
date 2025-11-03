@@ -1653,6 +1653,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 has_been_filtered = False
             else:
                 has_been_filtered = True
+            if not self.is_spec_enabled_for_batch:
+                # Decode mode does not filter batch
+                has_been_filtered = False
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
