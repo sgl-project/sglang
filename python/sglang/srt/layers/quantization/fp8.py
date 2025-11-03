@@ -1048,6 +1048,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes1,
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
+                activation=self.moe_runner_config.activation,
+                gemm1_alpha=self.moe_runner_config.gemm1_alpha,
+                gemm1_limit=self.moe_runner_config.gemm1_clamp_limit,
             )
             return StandardCombineInput(hidden_states=output)
 
