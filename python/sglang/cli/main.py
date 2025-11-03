@@ -19,9 +19,7 @@ def _get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
     os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
     model_name = model_name_or_path.replace("/", "-")
     hash_name = hashlib.sha256(model_name.encode()).hexdigest()
-    # add hash to avoid conflict with old users' lock files
     lock_file_name = hash_name + model_name + ".lock"
-    # mode 0o666 is required for the filelock to be shared across users
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
 
@@ -120,7 +118,10 @@ def _verify_model_config_and_directory(model_path: str) -> True:
 
 def get_is_diffusion_model(model_path: str):
     model_path = _maybe_download_model(model_path)
-    return _verify_model_config_and_directory(model_path)
+    is_diffusion_model = _verify_model_config_and_directory(model_path)
+    if is_diffusion_model:
+        logger.info("Diffusion model detected")
+    return is_diffusion_model
 
 
 def get_model_path(extra_argv):

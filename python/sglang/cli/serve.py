@@ -15,9 +15,6 @@ def serve(args, extra_argv):
     try:
         is_diffusion_model = get_is_diffusion_model(model_path)
         if is_diffusion_model:
-            logger.info("Diffusion model detected")
-
-        if is_diffusion_model:
             # Logic for Diffusion Models
             from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
                 add_multimodal_gen_serve_args,
