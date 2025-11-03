@@ -2,7 +2,6 @@ import os
 import tempfile
 
 import torch
-from packaging import version
 from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
