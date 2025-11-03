@@ -336,6 +336,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             self.norm = Qwen3NextRMSNormGated(
                 self.head_v_dim, eps=self.layer_norm_epsilon
             )
+        else:
             self.norm = RMSNormGated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
