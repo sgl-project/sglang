@@ -88,6 +88,8 @@ DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST = "Tengyunw/qwen3_30b_moe_eagle3"
 DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
 DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
     "meta-llama/Llama-3.1-8B-Instruct"
@@ -153,7 +155,7 @@ def _use_cached_default_models(model_repo: str):
 
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
+        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
     )
 else:
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
