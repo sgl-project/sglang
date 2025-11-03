@@ -159,7 +159,7 @@ class AscendAttnBackend(AttentionBackend):
         mask_flag = torch.ones((max_seq_len, max_seq_len), dtype=torch.bool).tril_()
         # Create upper triangle matrix used to mark mask positions.
         mask_flag = ~mask_flag
-        mask_value = -10000 if dtype == torch.float16 else 1
+        mask_value = float("-inf") if dtype in [torch.float16, torch.bfloat16] else 1
         attn_mask = torch.zeros(
             size=(max_seq_len, max_seq_len), dtype=dtype
         ).masked_fill_(mask_flag, mask_value)
