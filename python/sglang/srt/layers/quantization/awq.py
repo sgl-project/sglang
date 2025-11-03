@@ -959,28 +959,6 @@ class AWQMoEAscendMethod(AWQMoEMethod):
 # Register fake implementations for torch.compile support
 if _is_cuda:
 
-    @torch.library.register_fake("sgl_kernel::gptq_marlin_gemm")
-    def _(
-        a,
-        c,
-        b_q_weight,
-        b_scales,
-        global_scale,
-        b_zeros,
-        g_idx,
-        perm,
-        workspace,
-        b_q_type,
-        size_m,
-        size_n,
-        size_k,
-        is_k_full,
-        use_atomic_add,
-        use_fp32_reduce,
-        is_zp_float,
-    ):
-        return a.new_empty((size_m, size_n), dtype=a.dtype)
-
     @torch.library.register_fake("sgl_kernel::awq_dequantize")
     def _(
         qweight,
