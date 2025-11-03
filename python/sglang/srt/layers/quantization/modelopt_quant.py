@@ -1597,9 +1597,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
                     [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
                 )
-                # Ensure dtypes match FlashInfer expectations
-                topk_weights = topk_weights.to(torch.float32)
-                topk_ids = topk_ids.to(torch.int32)
                 x_sf = nvfp4_block_scale_interleave(x_sf)
 
             with use_symmetric_memory(get_tp_group()) as sm:
@@ -1608,12 +1605,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 sm.tag(symm_output)
 
-            # FlashInfer CUTLASS expects token_final_scales (routing weights)
-            # to be float32. Ensure dtype to avoid capture-time mismatches.
             output = flashinfer_cutlass_fused_moe(
                 input=x,
                 token_selected_experts=topk_ids.to(torch.int),
-                token_final_scales=topk_weights.to(torch.float32),
+                token_final_scales=topk_weights,
                 fc1_expert_weights=layer.w13_weight.view(torch.long),
                 fc2_expert_weights=layer.w2_weight.view(torch.long),
                 output_dtype=output_dtype,
