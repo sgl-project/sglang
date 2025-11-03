@@ -41,6 +41,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
+from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -51,7 +52,10 @@ if TYPE_CHECKING:
     from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
 try:
-    from flashinfer import fp4_quantize
+    if is_sm120_supported():
+        from flashinfer import fp4_quantize
+    else:
+        from sgl_kernel import scaled_fp4_quant as fp4_quantize
 except ImportError:
     fp4_quantize = None
 
