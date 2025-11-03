@@ -1,15 +1,13 @@
+from collections import OrderedDict
 from collections.abc import Iterable
-from dataclasses import dataclass
-from typing import Any, cast
+from typing import cast
 
 import einops
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
 
 from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
 from sglang.srt.layers.attention.fla.fused_recurrent import (
-    fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_update,
 )
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -25,21 +23,139 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.utils import add_prefix
 
-from .dynamic_conv import DynamicShortConvolution
 
+class DynamicShortConvolution(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        kernel_size: int,
+        generator_input_size: int,
+        generator_reduction: int,
+    ) -> None:
+        super().__init__()
 
-def init_linear_conv1d(
-    weight: torch.Tensor, std: float, bias: torch.Tensor | None = None
-) -> None:
-    weight.data.normal_(mean=0.0, std=std)
-    if bias is not None:
-        if not getattr(bias, "_no_reinit", False):
-            nn.init.zeros_(bias)
+        generator_hidden_size = hidden_size // generator_reduction
+
+        self.kernel_generator = nn.Sequential(
+            OrderedDict(
+                [
+                    (
+                        "w1",
+                        nn.Linear(
+                            generator_input_size,
+                            generator_hidden_size,
+                            bias=False,
+                        ),
+                    ),
+                    ("act", nn.SiLU()),
+                    (
+                        "w2",
+                        nn.Linear(
+                            generator_hidden_size,
+                            hidden_size * kernel_size,
+                            bias=True,
+                        ),
+                    ),
+                ]
+            )
+        )
+
+        self.hidden_size = hidden_size
+        self.kernel_size = kernel_size
+
+    def forward(
+        self,
+        x: torch.Tensor,  # (cu_seq_len, hidden_size)
+        *,
+        conv_state: torch.Tensor,  # (batch_size, hidden_size, kernel_size - 1)
+        generator_input: torch.Tensor,  # (cu_seq_len, generator_input_size)
+        seq_lens: torch.Tensor,  # (batch_size,)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (cu_seq_len, hidden_size)
+            conv_state: (batch_size, hidden_size, kernel_size - 1)
+            generator_input: (cu_seq_len, generator_input_size)
+            seq_lens: (batch_size,)
+
+        Returns:
+            out: (cu_seq_len, hidden_size)
+            conv_state: (batch_size, hidden_size, kernel_size - 1)
+        """
+
+        x_seqs = self._continuous_to_seqs(x, seq_lens=seq_lens)
+        conv_state = einops.rearrange(conv_state, "b d k -> b k d")
+        x_seqs = [torch.cat([conv_state[i], x_seqs[i]]) for i in range(len(x_seqs))]
+        x = self._seqs_to_batch(
+            x_seqs
+        )  # (batch_size, max_seq_len + kernel_size - 1, hidden_size)
+
+        x = einops.rearrange(x, "b l d -> b d l")
+
+        new_conv_state = x[
+            :, :, -(self.kernel_size - 1) :
+        ]  # (batch_size, hidden_size, kernel_size - 1)
+
+        x = x.unfold(
+            dimension=-1, size=self.kernel_size, step=1
+        )  # (batch_size, hidden_size, max_seq_len, kernel_size)
+        x = einops.rearrange(x, "b d l k -> b l d k")
+
+        kernels = self.kernel_generator(
+            generator_input
+        )  # (cu_seq_len, hidden_size * kernel_size)
+        kernels = einops.rearrange(
+            kernels,
+            "l (d k) -> l d k",
+            d=self.hidden_size,
+            k=self.kernel_size,
+        )
+        kernels = self._seqs_to_batch(
+            self._continuous_to_seqs(kernels, seq_lens=seq_lens)
+        )  # (batch_size, max_seq_len, hidden_size, kernel_size)
+
+        out = torch.einsum("b l d k, b l d k -> b l d", x, kernels)
+
+        out = self._batch_to_continuous(
+            out, seq_lens=seq_lens
+        )  # (cu_seq_len, hidden_size)
+
+        return out, new_conv_state
+
+    def _batch_to_continuous(
+        self,
+        x: torch.Tensor,
+        *,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.cat([x[i, -seq_lens[i] :] for i in range(seq_lens.size(0))])
+
+    def _continuous_to_seqs(
+        self,
+        x: torch.Tensor,
+        *,
+        seq_lens: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        return [
+            x[(seq_lens[:i].sum()) : (seq_lens[: i + 1].sum())]
+            for i in range(seq_lens.size(0))
+        ]
+
+    def _seqs_to_batch(
+        self,
+        seqs: list[torch.Tensor],
+    ) -> torch.Tensor:
+        return nn.utils.rnn.pad_sequence(
+            seqs,
+            batch_first=True,
+            padding_side="left",
+        )
 
 
 class JetBlock(nn.Module):
@@ -83,10 +199,6 @@ class JetBlock(nn.Module):
             kernel_size=conv_size,
             generator_input_size=hidden_size,
             generator_reduction=jet_block_config.dconv_generator_reduction,
-            static_conv_init=lambda x: init_linear_conv1d(
-                x, std=self.config.initializer_range
-            ),
-            implementation="naive",  # DEBUG
         )
 
         self.o_norm = RMSNormGated(
@@ -113,109 +225,37 @@ class JetBlock(nn.Module):
             forward_batch.attn_backend.linear_attn_backend, JetBlockAttnBackend
         )
         linear_attn_backend = forward_batch.attn_backend.linear_attn_backend
-        mamba2_layer_cache = linear_attn_backend.req_to_token_pool.mamba2_layer_cache(
+        forward_metadata = linear_attn_backend.forward_metadata
+        layer_cache = linear_attn_backend.req_to_token_pool.mamba2_layer_cache(
             self.layer_id
         )
 
-        q = self.q_proj(hidden_states)  # (seq_len, total_k_dim)
+        q: torch.Tensor = self.q_proj(hidden_states)  # (cu_seq_len, total_k_dim)
         q = nn.functional.silu(q)
 
-        k = self.k_proj(hidden_states)  # (seq_len, total_k_dim)
+        k: torch.Tensor = self.k_proj(hidden_states)  # (seq_len, total_k_dim)
         k = nn.functional.silu(k)
 
-        v = self.v_proj(hidden_states)  # (seq_len, total_v_dim)
+        v: torch.Tensor = self.v_proj(hidden_states)  # (cu_seq_len, total_v_dim)
 
-        # Dynamic Convolution.
-        conv_states = torch.cat(
-            (
-                torch.empty(
-                    (
-                        forward_batch.batch_size,
-                        self.total_v_dim,
-                        1,
-                    ),
-                    dtype=mamba2_layer_cache.conv.dtype,
-                    device=mamba2_layer_cache.conv.device,
-                ),
-                mamba2_layer_cache.conv[
-                    linear_attn_backend.forward_metadata.mamba_cache_indices,
-                    -self.total_v_dim :,
-                    :,
-                ],
-            ),
-            dim=2,
-        )  # (batch_size, total_v_dim, conv_size)
-
-        v_batched = nn.utils.rnn.pad_sequence(
-            [
-                v[
-                    forward_batch.seq_lens[:i]
-                    .sum() : forward_batch.seq_lens[: i + 1]
-                    .sum()
-                ]
-                for i in range(forward_batch.batch_size)
+        v, new_conv_state = self.dynamic_conv1d(
+            v,
+            conv_state=layer_cache.conv[
+                forward_metadata.mamba_cache_indices, -self.total_v_dim :, :
             ],
-            batch_first=True,
-            padding_side="left",
-        )  # (batch_size, max_seq_len, total_v_dim)
-
-        match forward_batch.forward_mode:
-            case ForwardMode.EXTEND:
-                new_v = torch.empty_like(v)
-                new_conv_states = torch.empty_like(conv_states)
-
-                assert forward_batch.extend_start_loc is not None
-                assert forward_batch.extend_seq_lens is not None
-
-                for i in range(forward_batch.batch_size):
-                    v_single = v[
-                        forward_batch.extend_start_loc[
-                            i
-                        ] : forward_batch.extend_start_loc[i]
-                        + forward_batch.extend_seq_lens[i]
-                    ]
-                    generator_input = hidden_states[
-                        forward_batch.extend_start_loc[
-                            i
-                        ] : forward_batch.extend_start_loc[i]
-                        + forward_batch.extend_seq_lens[i]
-                    ]
-
-                    v_single, new_conv_state_single = self.dynamic_conv1d(
-                        v_single.unsqueeze(0),
-                        cache=conv_states,
-                        output_final_state=True,
-                        generator_input=generator_input.unsqueeze(0),
-                    )
-                    v_single = v_single.squeeze(0)
-                    new_conv_state_single = new_conv_state_single.squeeze(0)
-
-                    new_v[
-                        forward_batch.extend_start_loc[
-                            i
-                        ] : forward_batch.extend_start_loc[i]
-                        + forward_batch.extend_seq_lens[i]
-                    ] = v_single
-                    new_conv_states[i] = new_conv_state_single
-
-            case ForwardMode.DECODE:
-                new_v, new_conv_states = self.dynamic_conv1d(
-                    v.unsqueeze(1),  # (batch_size, 1, total_v_dim)
-                    cache=conv_states,
-                    output_final_state=True,
-                    generator_input=hidden_states.unsqueeze(1),
-                )  # (batch_size, 1, total_v_dim), (batch_size, total_v_dim, conv_size)
-                new_v = new_v.squeeze(1)
-
-            case _:
-                raise NotImplementedError
-
-        v = new_v
-        mamba2_layer_cache.conv[
-            linear_attn_backend.forward_metadata.mamba_cache_indices,
-            -self.total_v_dim :,
-            :,
-        ] = new_conv_states[:, :, 1:]
+            generator_input=hidden_states,
+            seq_lens=(
+                forward_batch.extend_seq_lens
+                if forward_batch.extend_seq_lens is not None
+                else torch.ones(
+                    (forward_batch.batch_size,),
+                    dtype=torch.long,
+                )
+            ),
+        )
+        layer_cache.conv[
+            forward_metadata.mamba_cache_indices, -self.total_v_dim :, :
+        ] = new_conv_state
 
         a = self.a_proj(hidden_states)
         g = -self.A_log.float().exp() * nn.functional.softplus(a.float() + self.dt_bias)
@@ -233,11 +273,9 @@ class JetBlock(nn.Module):
             v=v.unsqueeze(0),
             g=g.unsqueeze(0),
             beta=beta.unsqueeze(0),
-            initial_state_source=mamba2_layer_cache.temporal,
-            initial_state_indices=linear_attn_backend.forward_metadata.mamba_cache_indices,
-            cu_seqlens=cast(
-                torch.LongTensor, linear_attn_backend.forward_metadata.query_start_loc
-            ),
+            initial_state_source=layer_cache.temporal,
+            initial_state_indices=forward_metadata.mamba_cache_indices,
+            cu_seqlens=cast(torch.LongTensor, forward_metadata.query_start_loc),
             use_qk_l2norm_in_kernel=True,
         )
         o = o.squeeze(0)
