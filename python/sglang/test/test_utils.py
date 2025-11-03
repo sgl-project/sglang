@@ -58,6 +58,7 @@ DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
 # NVFP4 models
 DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-R1-0528-FP4"
+DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4 = "nvidia/Qwen3-30B-A3B-FP4"
 
 # FP8 models
 DEFAULT_MODEL_NAME_FOR_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
@@ -950,7 +951,6 @@ def run_score_benchmark(
     )
 
     async def _run_benchmark():
-
         # Load tokenizer for generating test data
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
