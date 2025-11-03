@@ -10,7 +10,7 @@ use crate::{
     routers::grpc::{
         common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
-        utils,
+        error, utils,
     },
 };
 
@@ -47,7 +47,7 @@ impl ChatPreparationStage {
             match utils::process_chat_messages(&body_ref, &*ctx.components.tokenizer) {
                 Ok(msgs) => msgs,
                 Err(e) => {
-                    return Err(utils::bad_request_error(e));
+                    return Err(error::bad_request(e));
                 }
             };
 
@@ -55,10 +55,7 @@ impl ChatPreparationStage {
         let encoding = match ctx.components.tokenizer.encode(&processed_messages.text) {
             Ok(encoding) => encoding,
             Err(e) => {
-                return Err(utils::internal_error_message(format!(
-                    "Tokenization failed: {}",
-                    e
-                )));
+                return Err(error::internal_error(format!("Tokenization failed: {}", e)));
             }
         };
 
@@ -66,9 +63,8 @@ impl ChatPreparationStage {
 
         // Step 4: Build tool constraints if needed
         let tool_call_constraint = if let Some(tools) = body_ref.tools.as_ref() {
-            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model).map_err(
-                |e| utils::bad_request_error(format!("Invalid tool configuration: {}", e)),
-            )?
+            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
+                .map_err(|e| error::bad_request(format!("Invalid tool configuration: {}", e)))?
         } else {
             None
         };

@@ -19,7 +19,7 @@ use crate::{
     routers::grpc::{
         common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
-        utils, error,
+        error,
     },
 };
 

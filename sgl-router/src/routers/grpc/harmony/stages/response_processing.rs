@@ -9,7 +9,6 @@ use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
 use crate::routers::grpc::{
     common::stages::PipelineStage,
     context::{FinalResponse, RequestContext, RequestType},
-    utils,
     error,
 };
 

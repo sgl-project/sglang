@@ -20,7 +20,7 @@ use crate::{
     routers::grpc::{
         common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
-        utils,
+        error, utils,
     },
     tokenizer::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
@@ -373,7 +373,7 @@ impl ResponseProcessor {
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
         // Collect all responses from the execution result
         let all_responses =
-            Self::collect_and_merge_responses(execution_result, request_logprobs).await?;
+            response_collection::collect_responses(execution_result, request_logprobs).await?;
 
         // Process each completion
         let mut result_array = Vec::new();
@@ -384,7 +384,7 @@ impl ResponseProcessor {
             let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
                 Ok(outputs) => outputs,
                 Err(e) => {
-                    return Err(utils::internal_error_message(format!(
+                    return Err(error::internal_error(format!(
                         "Failed to process tokens: {}",
                         e
                     )))
@@ -411,7 +411,7 @@ impl ResponseProcessor {
             }
 
             let output_ids = std::mem::take(&mut complete.output_ids);
-            let finish_reason_str = std::mem::take(&mut complete.finish_reason);
+            let finish_reason_str = complete.finish_reason.to_string();
 
             // Parse finish_reason from string to proper type
             let finish_reason =

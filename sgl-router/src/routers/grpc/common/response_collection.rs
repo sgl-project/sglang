@@ -7,7 +7,7 @@ use axum::response::Response;
 
 use crate::{
     grpc_client::proto,
-    routers::grpc::{context::ExecutionResult, utils},
+    routers::grpc::{context::ExecutionResult, error, utils},
 };
 
 /// Collect and merge responses from execution result
@@ -58,7 +58,7 @@ pub async fn collect_responses(
     };
 
     if all_responses.is_empty() {
-        return Err(utils::internal_error_static("No responses from server"));
+        return Err(error::internal_error("No responses from server"));
     }
 
     Ok(all_responses)

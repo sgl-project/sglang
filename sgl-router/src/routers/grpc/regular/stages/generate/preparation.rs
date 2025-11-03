@@ -10,7 +10,7 @@ use crate::{
     routers::grpc::{
         common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
-        utils,
+        error, utils,
     },
     tokenizer::traits::Tokenizer,
 };
@@ -44,7 +44,7 @@ impl GeneratePreparationStage {
         let (original_text, token_ids) = match self.resolve_generate_input(ctx, request) {
             Ok(res) => res,
             Err(msg) => {
-                return Err(utils::bad_request_error(msg));
+                return Err(error::bad_request(msg));
             }
         };
 

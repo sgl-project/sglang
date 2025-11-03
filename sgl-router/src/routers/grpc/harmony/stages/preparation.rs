@@ -14,8 +14,7 @@ use crate::{
     routers::grpc::{
         common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext, RequestType},
-        error,
-        utils,
+        error, utils,
     },
 };
 

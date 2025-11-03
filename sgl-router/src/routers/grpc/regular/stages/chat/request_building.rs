@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::routers::grpc::{
     common::stages::PipelineStage,
     context::{ClientSelection, RequestContext, WorkerSelection},
-    utils,
+    error,
 };
 
 /// Chat request building stage
@@ -30,13 +30,13 @@ impl PipelineStage for ChatRequestBuildingStage {
             .state
             .preparation
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Preparation not completed"))?;
+            .ok_or_else(|| error::internal_error("Preparation not completed"))?;
 
         let clients = ctx
             .state
             .clients
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Client acquisition not completed"))?;
+            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
 
         let chat_request = ctx.chat_request_arc();
 
@@ -63,7 +63,7 @@ impl PipelineStage for ChatRequestBuildingStage {
                     .clone(),
                 prep.tool_constraints.clone(),
             )
-            .map_err(|e| utils::bad_request_error(format!("Invalid request parameters: {}", e)))?;
+            .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?;
 
         // Inject PD metadata if needed
         if self.inject_pd_metadata {

@@ -8,7 +8,6 @@ use uuid::Uuid;
 use crate::routers::grpc::{
     common::stages::PipelineStage,
     context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
-    utils,
     error,
 };
 

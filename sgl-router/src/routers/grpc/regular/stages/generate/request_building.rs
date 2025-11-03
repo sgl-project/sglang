@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::routers::grpc::{
     common::stages::PipelineStage,
     context::{ClientSelection, RequestContext, WorkerSelection},
-    utils,
+    error,
 };
 
 /// Generate request building stage
@@ -30,13 +30,13 @@ impl PipelineStage for GenerateRequestBuildingStage {
             .state
             .preparation
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Preparation not completed"))?;
+            .ok_or_else(|| error::internal_error("Preparation not completed"))?;
 
         let clients = ctx
             .state
             .clients
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Client acquisition not completed"))?;
+            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
 
         let generate_request = ctx.generate_request_arc();
 
@@ -59,7 +59,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
                 prep.original_text.clone(),
                 prep.token_ids.clone(),
             )
-            .map_err(utils::bad_request_error)?;
+            .map_err(error::bad_request)?;
 
         // Inject PD metadata if needed
         if self.inject_pd_metadata {

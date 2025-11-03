@@ -9,8 +9,8 @@ use super::{chat::ChatResponseProcessingStage, generate::GenerateResponseProcess
 use crate::routers::grpc::{
     common::stages::PipelineStage,
     context::{RequestContext, RequestType},
+    error,
     regular::{processor, streaming},
-    utils, error,
 };
 
 /// Response processing stage (delegates to endpoint-specific implementations)

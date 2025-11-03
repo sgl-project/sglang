@@ -8,8 +8,8 @@ use axum::response::Response;
 use crate::routers::grpc::{
     common::stages::PipelineStage,
     context::{FinalResponse, RequestContext},
+    error,
     regular::{processor, streaming},
-    utils,
 };
 
 /// Generate response processing stage
@@ -57,14 +57,14 @@ impl GenerateResponseProcessingStage {
             .response
             .execution_result
             .take()
-            .ok_or_else(|| utils::internal_error_static("No execution result"))?;
+            .ok_or_else(|| error::internal_error("No execution result"))?;
 
         // Get dispatch metadata (needed by both streaming and non-streaming)
         let dispatch = ctx
             .state
             .dispatch
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?
+            .ok_or_else(|| error::internal_error("Dispatch metadata not set"))?
             .clone();
 
         if is_streaming {
@@ -87,7 +87,7 @@ impl GenerateResponseProcessingStage {
             .response
             .stop_decoder
             .as_mut()
-            .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
+            .ok_or_else(|| error::internal_error("Stop decoder not initialized"))?;
 
         let result_array = self
             .processor
