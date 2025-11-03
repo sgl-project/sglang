@@ -29,7 +29,12 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs import FalconH1Config, NemotronHConfig, Qwen3NextConfig
+from sglang.srt.configs import (
+    FalconH1Config,
+    KimiLinearConfig,
+    NemotronHConfig,
+    Qwen3NextConfig,
+)
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
@@ -40,6 +45,9 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.debug_utils.tensor_dump_forward_hook import (
+    register_forward_hook_for_model,
+)
 from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
@@ -48,7 +56,7 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
-    set_symm_mem_all_reduce,
+    set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -77,7 +85,6 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -131,6 +138,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_cuda,
+    is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
     log_info_on_rank0,
@@ -188,6 +197,7 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
         )
 
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -349,7 +359,11 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
-                compute_initial_expert_location_metadata(server_args, self.model_config)
+                compute_initial_expert_location_metadata(
+                    server_args=server_args,
+                    model_config=self.model_config,
+                    moe_ep_rank=self.moe_ep_rank,
+                )
             )
             if self.tp_rank == 0 and get_bool_env_var(
                 "SGLANG_LOG_EXPERT_LOCATION_METADATA"
@@ -594,7 +608,7 @@ class ModelRunner:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
-        set_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
+        set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
 
         if not self.is_draft_worker:
             if self.device == "cpu":
@@ -730,7 +744,6 @@ class ModelRunner:
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
-        monkey_patch_isinstance_for_vllm_base_layer()
 
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
@@ -742,7 +755,6 @@ class ModelRunner:
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
         monkey_patch_vllm_parallel_state(reverse=True)
-        monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
         get_offloader().post_init()
 
@@ -790,6 +802,15 @@ class ModelRunner:
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
+        if self.server_args.debug_tensor_dump_output_folder is not None:
+            register_forward_hook_for_model(
+                self.model,
+                self.server_args.debug_tensor_dump_output_folder,
+                self.server_args.debug_tensor_dump_layers,
+                self.tp_size,
+                self.tp_rank,
+                self.pp_rank,
+            )
 
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
@@ -1255,6 +1276,21 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                # kv_scale_buffer
+                scale_block_size = 16
+                cell_size = (cell_size // 2) + (
+                    (
+                        (
+                            self.model_config.kv_lora_rank
+                            + self.model_config.qk_rope_head_dim
+                        )
+                        // scale_block_size
+                    )
+                    * num_layers
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
+
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(self.model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
@@ -1346,8 +1382,15 @@ class ModelRunner:
         return None
 
     @property
+    def kimi_linear_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, KimiLinearConfig):
+            return config
+        return None
+
+    @property
     def mambaish_config(self):
-        return self.mamba2_config or self.hybrid_gdn_config
+        return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
 
     def set_num_token_hybrid(self):
         if (
@@ -1484,6 +1527,15 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
+        elif self.server_args.kv_cache_dtype == "fp4_e2m1":
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                self.kv_cache_dtype = torch.float4_e2m1fn_x2
+                logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
+            else:
+                logger.warning(
+                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
+                )
+                self.kv_cache_dtype = self.dtype
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -1658,9 +1710,11 @@ class ModelRunner:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
-                    layer_num=self.model_config.num_hidden_layers,
+                    layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
             self.token_to_kv_pool = NSATokenToKVPool(
@@ -1676,7 +1730,7 @@ class ModelRunner:
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
             )
-        elif self.use_mla_backend:
+        elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
@@ -1720,6 +1774,12 @@ class ModelRunner:
                     device=self.device,
                 )
             elif config := self.mambaish_config:
+                extra_args = {}
+                if self.use_mla_backend:
+                    extra_args = {
+                        "kv_lora_rank": self.model_config.kv_lora_rank,
+                        "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+                    }
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -1735,6 +1795,8 @@ class ModelRunner:
                     enable_kvcache_transpose=False,
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
+                    use_mla=self.use_mla_backend,
+                    **extra_args,
                 )
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(

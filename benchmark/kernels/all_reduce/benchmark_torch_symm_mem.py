@@ -1,6 +1,19 @@
-"""For Now, SYMM_MEM is only supported on TP8 case
+"""For Now, TORCH_SYMM_MEM is only supported on following limited tp case
 
-export WORLD_SIZE=1
+SM90: {
+    2: 64 * MiB,  # 64 MB
+    4: 64 * MiB,  # 64 MB
+    6: 128 * MiB,  # 128 MB
+    8: 128 * MiB,  # 128 MB
+},
+SM100: {
+    2: 64 * MiB,  # 64 MB
+    4: 64 * MiB,  # 64 MB
+    6: 128 * MiB,  # 128 MB
+    8: 128 * MiB,  # 128 MB
+}
+
+export WORLD_SIZE=8
 export RANK=0
 export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=12345
@@ -9,7 +22,7 @@ torchrun --nproc_per_node gpu \
 --nnodes $WORLD_SIZE \
 --node_rank $RANK \
 --master_addr $MASTER_ADDR \
---master_port $MASTER_PORT ./benchmark/kernels/all_reduce/benchmark_symm_mem.py
+--master_port $MASTER_PORT ./benchmark/kernels/all_reduce/benchmark_torch_symm_mem.py
 """
 
 import os
@@ -22,12 +35,14 @@ from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
-from sglang.srt.distributed.device_communicators.symm_mem import SymmMemCommunicator
+from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+    TorchSymmMemCommunicator,
+)
 from sglang.srt.distributed.parallel_state import (
     get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
-    set_symm_mem_all_reduce,
+    set_torch_symm_mem_all_reduce,
 )
 
 # CI environment detection
@@ -42,10 +57,10 @@ def torch_allreduce(torch_input: torch.Tensor, group: ProcessGroup) -> torch.Ten
     return torch_input
 
 
-def symm_mem_allreduce(
-    symm_mem_input: torch.Tensor, symm_mem_comm: SymmMemCommunicator
+def torch_symm_mem_allreduce(
+    torch_symm_mem_input: torch.Tensor, torch_symm_mem_comm: TorchSymmMemCommunicator
 ) -> torch.Tensor:
-    return symm_mem_comm.all_reduce(symm_mem_input)
+    return torch_symm_mem_comm.all_reduce(torch_symm_mem_input)
 
 
 def pynccl_allreduce(
@@ -170,7 +185,7 @@ if __name__ == "__main__":
     rank = dist.get_rank()
     torch.cuda.set_device(rank % 8)
     device = torch.cuda.current_device()
-    set_symm_mem_all_reduce(True)
+    set_torch_symm_mem_all_reduce(True)
     init_distributed_environment(
         world_size=world_size,
         rank=rank,
@@ -180,7 +195,7 @@ if __name__ == "__main__":
     group = get_tensor_model_parallel_group().device_group
     cpu_group = get_tensor_model_parallel_group().cpu_group
     pynccl_comm = get_tensor_model_parallel_group().pynccl_comm
-    symm_mem_comm = get_tensor_model_parallel_group().symm_mem_comm
+    torch_symm_mem_comm = get_tensor_model_parallel_group().torch_symm_mem_comm
     dist.barrier()
     profile = False
     dtype = torch.bfloat16
@@ -204,10 +219,12 @@ if __name__ == "__main__":
                 lambda inp: torch_allreduce(inp, group), inp_randn
             )
             symm_mem_eager_output, symm_mem_eager_time = _bench_eager_time(
-                lambda inp: symm_mem_allreduce(inp, symm_mem_comm), inp_randn
+                lambda inp: torch_symm_mem_allreduce(inp, torch_symm_mem_comm),
+                inp_randn,
             )
             symm_mem_graph_output, symm_mem_graph_time = _bench_graph_time(
-                lambda inp: symm_mem_allreduce(inp, symm_mem_comm), inp_randn
+                lambda inp: torch_symm_mem_allreduce(inp, torch_symm_mem_comm),
+                inp_randn,
             )
             # since pynccl is inplace op, this return result is not correct if graph loop > 1
             _, pynccl_graph_time = _bench_graph_time(
@@ -229,6 +246,6 @@ if __name__ == "__main__":
     if rank == 0:
         print_markdown_table(result)
     if profile:
-        prof_dir = f"prof/symm_mem"
+        prof_dir = f"prof/torch_symm_mem"
         os.makedirs(prof_dir, exist_ok=True)
         ctx.export_chrome_trace(f"{prof_dir}/trace_rank{dist.get_rank()}.json.gz")
