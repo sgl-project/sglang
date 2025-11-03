@@ -194,6 +194,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
+            reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
@@ -1011,6 +1012,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_calls = getattr(msg, "tool_calls", None)
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
+
+    def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
+        if self.reasoning_parser in ["deepseek-v3"]:
+            return (
+                request.chat_template_kwargs
+                and request.chat_template_kwargs.get("thinking") == True
+            )
+        elif self.reasoning_parser in ["qwen3", "glm45"]:
+            # qwen3 and glm45 are reasoning by default
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking") == True
+            )
+        return False
 
     def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
         """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
