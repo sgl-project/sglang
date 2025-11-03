@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import signal
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -7,9 +10,12 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.utils.common import disable_request_logging, pyspy_dump_schedulers
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+logger = logging.getLogger(__name__)
 
 
 class SchedulerRuntimeCheckerMixin:
@@ -215,3 +221,42 @@ class SchedulerRuntimeCheckerMixin:
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()
+
+    def watchdog_thread(self: Scheduler):
+        """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
+        self.watchdog_last_forward_ct = 0
+        self.watchdog_last_time = time.perf_counter()
+
+        while True:
+            current = time.perf_counter()
+            if self.cur_batch is not None:
+                if self.watchdog_last_forward_ct == self.forward_ct:
+                    if current > self.watchdog_last_time + self.watchdog_timeout:
+                        break
+                else:
+                    self.watchdog_last_forward_ct = self.forward_ct
+                    self.watchdog_last_time = current
+            time.sleep(self.watchdog_timeout // 2)
+
+        if not disable_request_logging():
+            # Print batch size and memory pool info to check whether there are de-sync issues.
+            if self.is_hybrid:
+                _, info_msg = self._check_hybrid_memory()
+            elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
+                _, info_msg = self._check_mamba_memory()
+            else:
+                _, info_msg = self._check_radix_cache_memory()
+            logger.error(
+                f"{self.cur_batch.batch_size()=}\n"
+                f"{self.cur_batch.reqs=}\n"
+                f"{info_msg}"
+            )
+
+        pyspy_dump_schedulers()
+        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
+        print(file=sys.stderr, flush=True)
+        print(file=sys.stdout, flush=True)
+
+        # Wait for some time so that the parent process can print the error.
+        time.sleep(5)
+        self.parent_process.send_signal(signal.SIGQUIT)
