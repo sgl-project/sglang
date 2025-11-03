@@ -914,7 +914,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
-    if let Some(mut ha_handler) = ha_handler {
+    if let Some(ha_handler) = ha_handler {
         info!("Shutting down HA server");
         ha_handler.shutdown();
     }

@@ -11,7 +11,7 @@ use tracing::instrument;
 
 use super::gossip::{gossip_message, NodeState, NodeStatus, Ping, PingReq, StateSync};
 
-use super::try_ping;
+use super::service::{broadcast_node_states, try_ping};
 use super::ClusterState;
 
 pub struct HAController {
@@ -59,7 +59,9 @@ impl HAController {
             } else {
                 let mut map = init_state.read().clone();
                 map.retain(|k, v| {
-                    k.ne(&self.self_name.to_string()) && v.status != NodeStatus::Down as i32
+                    k.ne(&self.self_name.to_string())
+                        && v.status != NodeStatus::Down as i32
+                        && v.status != NodeStatus::Leaving as i32
                 });
                 let random_nodes = get_random_values_refs(&map, 1);
                 random_nodes.first().map(|&node| node.clone())
@@ -108,7 +110,10 @@ impl HAController {
         {
             Ok(node_update) => {
                 log::info!("Received NodeUpdate from peer: {:?}", node_update);
-                if node_update.status == NodeStatus::Alive as i32 {
+                // Update state for Alive or Leaving status
+                if node_update.status == NodeStatus::Alive as i32
+                    || node_update.status == NodeStatus::Leaving as i32
+                {
                     let mut s = read_state.write();
                     s.entry(node_update.name.clone())
                         .and_modify(|e| e.status = node_update.status)
@@ -128,6 +133,7 @@ impl HAController {
                     k.ne(&self.self_name)
                         && k.ne(&peer_name)
                         && v.status == NodeStatus::Alive as i32
+                        && v.status != NodeStatus::Leaving as i32
                 });
                 let random_nodes = get_random_values_refs(&map, 3);
                 let mut reachable = false;
@@ -161,28 +167,36 @@ impl HAController {
                             unreachable_node.status = NodeStatus::Suspected as i32
                         }
                         unreachable_node.version += 1;
-                        let stat_sync = StateSync {
-                            nodes: vec![unreachable_node.clone()],
-                        };
+
                         // Broadcast target nodes should include self.
-                        target.retain(|k, v| {
-                            k.ne(&peer_name) && v.status == NodeStatus::Alive as i32
-                        });
+                        let target_nodes: Vec<NodeState> = target
+                            .values()
+                            .filter(|v| {
+                                v.name.ne(&peer_name)
+                                    && v.status == NodeStatus::Alive as i32
+                                    && v.status != NodeStatus::Leaving as i32
+                            })
+                            .cloned()
+                            .collect();
+
                         log::info!(
-                        "Broadcasting node status to all alive nodes, new_state: {:?}, nodes:{:?}",
-                        unreachable_node,
-                        target
-                    );
-                        for node in target.values() {
-                            try_ping(
-                                node,
-                                Some(gossip_message::Payload::Ping(Ping {
-                                    state_sync: Some(stat_sync.clone()),
-                                })),
-                            )
-                            .await
-                            .ok();
-                        }
+                            "Broadcasting node status to {} alive nodes, new_state: {:?}",
+                            target_nodes.len(),
+                            unreachable_node
+                        );
+
+                        let (success_count, total_count) = broadcast_node_states(
+                            vec![unreachable_node],
+                            target_nodes,
+                            None, // Use default timeout
+                        )
+                        .await;
+
+                        log::info!(
+                            "Broadcast node status: {}/{} successful",
+                            success_count,
+                            total_count
+                        );
                     }
                 }
             }
@@ -208,108 +222,3 @@ fn get_random_values_refs<K, V>(map: &BTreeMap<K, V>, k: usize) -> Vec<&V> {
 
     values.choose_multiple(&mut rng, k).cloned().collect()
 }
-
-// pub async fn connect_to_peer(state: &ClusterState, peer: NodeState, self_name: &str) -> Result<()> {
-//     log::info!("Connecting to peer {} at {}", peer.name, peer.address);
-
-//     let read_state = state.clone();
-
-//     // TODO: Maybe we don't need to send the whole state.
-//     let state_sync = StateSync {
-//         nodes: state.read().values().cloned().collect(),
-//     };
-//     let peer_addr = peer.address.parse::<SocketAddr>()?;
-//     let peer_name = peer.name.clone();
-//     match try_ping(
-//         &self.clients,
-//         &peer,
-//         Some(gossip_message::Payload::Ping(Ping {
-//             state_sync: Some(state_sync),
-//         })),
-//     )
-//     .await
-//     {
-//         Ok(node_update) => {
-//             log::info!("Received NodeUpdate from peer: {:?}", node_update);
-//             if node_update.status == NodeStatus::Alive as i32 {
-//                 let mut s = read_state.write();
-//                 s.entry(node_update.name.clone())
-//                     .and_modify(|e| e.status = node_update.status)
-//                     .or_insert(NodeState {
-//                         name: node_update.name,
-//                         address: node_update.address,
-//                         status: node_update.status,
-//                         version: 1,
-//                         metadata: HashMap::new(),
-//                     });
-//             }
-//         }
-//         Err(e) => {
-//             log::info!("Failed to connect to peer: {}, now try ping-req", e);
-//             let mut map = read_state.read().clone();
-//             map.retain(|k, v| {
-//                 k.ne(self_name) && k.ne(&peer_name) && v.status == NodeStatus::Alive as i32
-//             });
-//             let random_nodes = get_random_values_refs(&map, 3);
-//             let mut reachable = false;
-//             for node in random_nodes {
-//                 log::info!(
-//                     "Trying to ping-req node {}, req target: {}",
-//                     node.address,
-//                     peer_addr
-//                 );
-//                 if try_ping(
-//                     &self.clients,
-//                     &node,
-//                     Some(gossip_message::Payload::PingReq(PingReq {
-//                         node: Some(peer.clone()),
-//                     })),
-//                 )
-//                 .await
-//                 .is_ok()
-//                 {
-//                     reachable = true;
-//                     break;
-//                 }
-//             }
-//             if !reachable {
-//                 let mut target = read_state.read().clone();
-
-//                 // Broadcast only the unreachable node's status is enough.
-//                 if let Some(mut unreachable_node) = target.remove(&peer_name) {
-//                     if unreachable_node.status == NodeStatus::Suspected as i32 {
-//                         unreachable_node.status = NodeStatus::Down as i32
-//                     } else {
-//                         unreachable_node.status = NodeStatus::Suspected as i32
-//                     }
-//                     unreachable_node.version += 1;
-//                     let stat_sync = StateSync {
-//                         nodes: vec![unreachable_node.clone()],
-//                     };
-//                     // Broadcast target nodes should include self.
-//                     target.retain(|k, v| k.ne(&peer_name) && v.status == NodeStatus::Alive as i32);
-//                     log::info!(
-//                         "Broadcasting node status to all alive nodes, new_state: {:?}, nodes:{:?}",
-//                         unreachable_node,
-//                         target
-//                     );
-//                     for node in target.values() {
-//                         try_ping(
-//                             &self.clients.clone(),
-//                             node,
-//                             Some(gossip_message::Payload::Ping(Ping {
-//                                 state_sync: Some(stat_sync.clone()),
-//                             })),
-//                         )
-//                         .await
-//                         .ok();
-//                     }
-//                 }
-//             }
-//         }
-//     }
-
-//     log::info!("Successfully connected to peer {}", peer_addr);
-
-//     Ok(())
-// }

@@ -23,11 +23,7 @@ pub struct GossipService {
 }
 
 impl GossipService {
-    pub fn new(
-        state: ClusterState,
-        self_addr: SocketAddr,
-        self_name: &str,
-    ) -> Self {
+    pub fn new(state: ClusterState, self_addr: SocketAddr, self_name: &str) -> Self {
         Self {
             state,
             self_addr: self_addr,
@@ -87,10 +83,18 @@ impl Gossip for GossipService {
                     log::info!("Merging state from Ping: {} nodes", stat_sync.nodes.len());
                     self.merge_state(stat_sync.nodes).await;
                 }
+                // Return current status of self node (could be Alive or Leaving)
+                let current_status = {
+                    let state = self.state.read();
+                    state
+                        .get(&self.self_name)
+                        .map(|n| n.status)
+                        .unwrap_or(NodeStatus::Alive as i32)
+                };
                 Ok(Response::new(NodeUpdate {
                     name: self.self_name.clone(),
                     address: self.self_addr.to_string(),
-                    status: NodeStatus::Alive as i32,
+                    status: current_status,
                 }))
             }
             Some(gossip::gossip_message::Payload::PingReq(PingReq { node: Some(node) })) => {
