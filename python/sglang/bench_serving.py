@@ -614,7 +614,10 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
-            async with session.post(url=api_url) as response:
+            body = {
+                "activities": getattr(args, "profile_activities", []),
+            }
+            async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -2519,6 +2522,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    # TODO unify all these
+    parser.add_argument(
+        "--profile-activities",
+        type=str,
+        nargs="+",
+        default=["CPU", "GPU"],
+        choices=["CPU", "GPU", "CUDA_PROFILER"],
     )
     parser.add_argument(
         "--lora-name",
