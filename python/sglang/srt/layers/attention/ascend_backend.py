@@ -76,7 +76,8 @@ class AscendAttnBackend(AttentionBackend):
         self.mtp_mask = ~self.mtp_mask
 
         # enable-mixed-chunk
-        attn_mask = self._generate_attn_mask(8192)
+        _ASCEND_MIXED_CHUNK_CACHE_SIZE = 8192
+        attn_mask = self._generate_attn_mask(_ASCEND_MIXED_CHUNK_CACHE_SIZE)
         self._seq_len_cached = attn_mask.shape[0]
         self.attn_mask_cache = attn_mask
 
@@ -158,10 +159,7 @@ class AscendAttnBackend(AttentionBackend):
         mask_flag = torch.ones((max_seq_len, max_seq_len), dtype=torch.bool).tril_()
         # Create upper triangle matrix used to mark mask positions.
         mask_flag = ~mask_flag
-        # Currently for fp16 dtype, the mask value should be set to -inf.
-        # TODO: Eliminate this part in the future.
-        mask_value = float("-inf") if dtype == torch.float16 else 1
-        # mask_value = -10000 if dtype == torch.float16 else 1
+        mask_value = -10000 if dtype == torch.float16 else 1
         attn_mask = torch.zeros(
             size=(max_seq_len, max_seq_len), dtype=dtype
         ).masked_fill_(mask_flag, mask_value)
@@ -185,14 +183,9 @@ class AscendAttnBackend(AttentionBackend):
             raise ValueError("splitfuse_attn_mask now only supports bf16 and fp16")
         max_seq_len = max(seq_lens, default=0)
         self._update_attn_cache(max_seq_len, dtype)
-        # FIXME: Currently the mask value of chunked-prefill situation and Prefill-Only situation
-        # is not the same. Fix this in the future when kernel is ready.
-        # mask_scale_factor = AttentionMaskBuilder.get_mask_scale_factor(
-        #     dtype)
         attn_mask = torch.index_select(self.attn_mask_cache, dim=0, index=position)[
             :, :max_seq_len
         ]
-        # attn_mask *= mask_scale_factor
         return attn_mask.contiguous().to(device, non_blocking=True)
 
     def get_attention_mask_id(self, seq_lens, extend_lens):
