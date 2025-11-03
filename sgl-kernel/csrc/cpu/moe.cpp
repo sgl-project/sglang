@@ -1093,7 +1093,7 @@ void fused_experts_kernel_impl(
       }
       // 1.d silu and mul
       const int64_t offset = offsets[mb];
-      if (act_func == 1 && is_brgemm_used) {
+      if (act_func == 1 && use_brgemm) {
         silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N);
       } else {
         clamp_sigmoid_and_mul_blockfree<scalar_t, BLOCK_N>(
