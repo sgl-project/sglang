@@ -13,8 +13,8 @@ use crate::{
     grpc_client::proto::{DisaggregatedParams, GenerateRequest},
     routers::grpc::{
         context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
+        error,
         stages::PipelineStage,
-        utils,
     },
 };
 
@@ -69,14 +69,14 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             .state
             .preparation
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Preparation not completed"))?;
+            .ok_or_else(|| error::internal_error("Preparation not completed"))?;
 
         // Get clients
         let clients = ctx
             .state
             .clients
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Client acquisition not completed"))?;
+            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
@@ -87,7 +87,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             RequestType::Chat(_) => format!("chatcmpl-{}", Uuid::new_v4()),
             RequestType::Responses(_) => format!("responses-{}", Uuid::new_v4()),
             RequestType::Generate(_) => {
-                return Err(utils::bad_request_error(
+                return Err(error::bad_request(
                     "Generate requests are not supported with Harmony models".to_string(),
                 ));
             }
@@ -111,9 +111,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                         None,
                         prep.tool_constraints.clone(),
                     )
-                    .map_err(|e| {
-                        utils::bad_request_error(format!("Invalid request parameters: {}", e))
-                    })?
+                    .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?
             }
             RequestType::Responses(request) => builder_client
                 .build_generate_request_from_responses(
@@ -123,9 +121,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     prep.token_ids.clone(),
                     prep.harmony_stop_ids.clone(),
                 )
-                .map_err(|e| {
-                    utils::bad_request_error(format!("Invalid request parameters: {}", e))
-                })?,
+                .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?,
             _ => unreachable!(),
         };
 
