@@ -13,7 +13,10 @@ pub mod gossip {
     #![allow(unused_qualifications)]
     tonic::include_proto!("sglang.ha.gossip");
 }
-use gossip::{gossip_client, gossip_message, GossipMessage, NodeState, NodeStatus, NodeUpdate};
+use gossip::{
+    gossip_client, gossip_message, GossipMessage, NodeState, NodeStatus, NodeUpdate, Ping,
+    StateSync,
+};
 
 use crate::ha::controller::HAController;
 use crate::ha::ping_server::GossipService;
@@ -51,8 +54,87 @@ impl HAServerHandler {
             signal_tx: signal_tx,
         }
     }
-    pub fn shutdown(&mut self) {
+
+    /// Shutdown immediately without graceful shutdown
+    pub fn shutdown(&self) {
         self.signal_tx.send(()).ok();
+    }
+
+    /// Graceful shutdown: broadcast LEAVING status to all alive nodes,
+    /// wait for propagation, then shutdown
+    pub async fn graceful_shutdown(&self) -> Result<()> {
+        log::info!("Starting graceful shutdown for node {}", self.self_name);
+
+        // 1. Update self status to LEAVING
+        let mut state = self.state.write();
+        if let Some(self_node) = state.get_mut(&self.self_name) {
+            if self_node.status == NodeStatus::Leaving as i32 {
+                log::info!("Node {} is already in LEAVING state", self.self_name);
+                drop(state);
+                self.signal_tx.send(()).ok();
+                return Ok(());
+            }
+
+            self_node.status = NodeStatus::Leaving as i32;
+            self_node.version += 1;
+            log::info!(
+                "Updated self status to LEAVING, version: {}",
+                self_node.version
+            );
+        } else {
+            log::warn!("Self node {} not found in state", self.self_name);
+            drop(state);
+            self.signal_tx.send(()).ok();
+            return Ok(());
+        }
+
+        // 2. Create LEAVING state update for broadcasting
+        let leaving_node = state.get(&self.self_name).cloned().unwrap();
+        let alive_nodes: Vec<NodeState> = state
+            .values()
+            .filter(|node| node.name != self.self_name && node.status == NodeStatus::Alive as i32)
+            .cloned()
+            .collect();
+        drop(state);
+
+        if alive_nodes.is_empty() {
+            log::info!("No alive nodes to broadcast LEAVING status to");
+            self.signal_tx.send(()).ok();
+            return Ok(());
+        }
+
+        log::info!(
+            "Broadcasting LEAVING status to {} alive nodes",
+            alive_nodes.len()
+        );
+
+        // 3. Broadcast LEAVING status to all alive nodes
+        let (success_count, total_count) = broadcast_node_states(
+            vec![leaving_node],
+            alive_nodes,
+            Some(Duration::from_secs(3)),
+        )
+        .await;
+
+        log::info!(
+            "Broadcast LEAVING status: {}/{} successful",
+            success_count,
+            total_count
+        );
+
+        // 4. Wait a bit more for state propagation
+        let propagation_delay = Duration::from_secs(1);
+        log::info!(
+            "Waiting {} seconds for LEAVING status propagation",
+            propagation_delay.as_secs()
+        );
+        tokio::time::sleep(propagation_delay).await;
+
+        // 5. Send shutdown signal
+        log::info!("Sending shutdown signal");
+        self.signal_tx.send(()).ok();
+
+        Ok(())
     }
 
     pub fn write_data(&self, key: String, value: Vec<u8>) {
@@ -187,6 +269,74 @@ impl HAServer {
     }
 }
 
+/// Broadcast node state updates to target nodes
+/// Returns (success_count, total_count)
+pub async fn broadcast_node_states(
+    nodes_to_broadcast: Vec<NodeState>,
+    target_nodes: Vec<NodeState>,
+    timeout: Option<Duration>,
+) -> (usize, usize) {
+    if nodes_to_broadcast.is_empty() || target_nodes.is_empty() {
+        log::debug!(
+            "Nothing to broadcast: nodes_to_broadcast={}, target_nodes={}",
+            nodes_to_broadcast.len(),
+            target_nodes.len()
+        );
+        return (0, target_nodes.len());
+    }
+
+    let mut broadcast_tasks = Vec::new();
+    for target_node in &target_nodes {
+        let target_node_clone = target_node.clone();
+        let nodes_for_task = nodes_to_broadcast.clone();
+        let task = tokio::spawn(async move {
+            let state_sync = StateSync {
+                nodes: nodes_for_task,
+            };
+            let ping_payload = gossip_message::Payload::Ping(Ping {
+                state_sync: Some(state_sync),
+            });
+            match try_ping(&target_node_clone, Some(ping_payload)).await {
+                Ok(_) => {
+                    log::debug!("Successfully broadcasted to {}", target_node_clone.name);
+                    Ok(())
+                }
+                Err(e) => {
+                    log::warn!("Failed to broadcast to {}: {}", target_node_clone.name, e);
+                    Err(e)
+                }
+            }
+        });
+        broadcast_tasks.push(task);
+    }
+
+    let timeout_duration = timeout.unwrap_or(Duration::from_secs(3));
+    let broadcast_result = tokio::time::timeout(timeout_duration, async {
+        futures::future::join_all(broadcast_tasks).await
+    })
+    .await;
+
+    match broadcast_result {
+        Ok(results) => {
+            let success_count = results.iter().filter(|r| r.is_ok()).count();
+            let total_count = target_nodes.len();
+            log::info!(
+                "Broadcast completed: {}/{} successful",
+                success_count,
+                total_count
+            );
+            (success_count, total_count)
+        }
+        Err(_) => {
+            log::warn!(
+                "Broadcast timeout after {} seconds",
+                timeout_duration.as_secs()
+            );
+            (0, target_nodes.len())
+        }
+    }
+}
+
 pub async fn try_ping(
     peer_node: &NodeState,
     payload: Option<gossip_message::Payload>,
@@ -226,8 +376,7 @@ macro_rules! ha_run {
     ($name:expr, $addr:expr, $init_peer:expr) => {{
         tracing::info!("Starting HA server : {}", $addr);
         let (server, handler) =
-            $crate::ha::service::HAServerBuilder::new($name.to_string(), $addr, $init_peer)
-                .build();
+            $crate::ha::service::HAServerBuilder::new($name.to_string(), $addr, $init_peer).build();
         tokio::spawn(async move {
             if let Err(e) = server.start_serve().await {
                 tracing::error!("HA server failed: {}", e);
@@ -312,19 +461,23 @@ mod tests {
         // 4. add node E and wait for it to sync and kill it
         {
             let addr_e = get_node().await;
-            let mut handler_e = ha_run!("E", addr_e, Some(addr_d));
+            let handler_e = ha_run!("E", addr_e, Some(addr_d));
             tokio::time::sleep(Duration::from_secs(3)).await;
             log::info!("State E: {:?}", print_state(&handler_e));
             // killing_button.send(()).unwrap();
             handler_e.shutdown();
         }
 
+        handler_d.graceful_shutdown().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        log::info!("================================================");
+
         // 5. wait for node status to sync
         tokio::time::sleep(Duration::from_secs(8)).await;
         log::info!("================================================");
 
         // 6. verify node status, status of all nodes should be same, and node E should be down
-        let final_state = String::from("A: Alive - {\"hello\": [119, 111, 114, 108, 100]}, B: Alive - {}, C: Alive - {}, D: Alive - {}, E: Down - {}");
+        let final_state = String::from("A: Alive - {\"hello\": [119, 111, 114, 108, 100]}, B: Alive - {}, C: Alive - {}, D: Leaving - {}, E: Down - {}");
         assert_eq!(
             print_state(&handler_a),
             final_state,
@@ -342,12 +495,6 @@ mod tests {
             final_state,
             "State C: {:?}",
             print_state(&handler_c)
-        );
-        assert_eq!(
-            print_state(&handler_d),
-            final_state,
-            "State D: {:?}",
-            print_state(&handler_d)
         );
     }
 }

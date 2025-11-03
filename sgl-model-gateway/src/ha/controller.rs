@@ -11,7 +11,7 @@ use tracing::instrument;
 
 use super::gossip::{gossip_message, NodeState, NodeStatus, Ping, PingReq, StateSync};
 
-use super::try_ping;
+use super::service::{broadcast_node_states, try_ping};
 use super::ClusterState;
 
 pub struct HAController {
@@ -59,7 +59,9 @@ impl HAController {
             } else {
                 let mut map = init_state.read().clone();
                 map.retain(|k, v| {
-                    k.ne(&self.self_name.to_string()) && v.status != NodeStatus::Down as i32
+                    k.ne(&self.self_name.to_string())
+                        && v.status != NodeStatus::Down as i32
+                        && v.status != NodeStatus::Leaving as i32
                 });
                 let random_nodes = get_random_values_refs(&map, 1);
                 random_nodes.first().map(|&node| node.clone())
@@ -108,7 +110,10 @@ impl HAController {
         {
             Ok(node_update) => {
                 log::info!("Received NodeUpdate from peer: {:?}", node_update);
-                if node_update.status == NodeStatus::Alive as i32 {
+                // Update state for Alive or Leaving status
+                if node_update.status == NodeStatus::Alive as i32
+                    || node_update.status == NodeStatus::Leaving as i32
+                {
                     let mut s = read_state.write();
                     s.entry(node_update.name.clone())
                         .and_modify(|e| e.status = node_update.status)
@@ -128,6 +133,7 @@ impl HAController {
                     k.ne(&self.self_name)
                         && k.ne(&peer_name)
                         && v.status == NodeStatus::Alive as i32
+                        && v.status != NodeStatus::Leaving as i32
                 });
                 let random_nodes = get_random_values_refs(&map, 3);
                 let mut reachable = false;
@@ -161,28 +167,36 @@ impl HAController {
                             unreachable_node.status = NodeStatus::Suspected as i32
                         }
                         unreachable_node.version += 1;
-                        let stat_sync = StateSync {
-                            nodes: vec![unreachable_node.clone()],
-                        };
+
                         // Broadcast target nodes should include self.
-                        target.retain(|k, v| {
-                            k.ne(&peer_name) && v.status == NodeStatus::Alive as i32
-                        });
+                        let target_nodes: Vec<NodeState> = target
+                            .values()
+                            .filter(|v| {
+                                v.name.ne(&peer_name)
+                                    && v.status == NodeStatus::Alive as i32
+                                    && v.status != NodeStatus::Leaving as i32
+                            })
+                            .cloned()
+                            .collect();
+
                         log::info!(
-                        "Broadcasting node status to all alive nodes, new_state: {:?}, nodes:{:?}",
-                        unreachable_node,
-                        target
-                    );
-                        for node in target.values() {
-                            try_ping(
-                                node,
-                                Some(gossip_message::Payload::Ping(Ping {
-                                    state_sync: Some(stat_sync.clone()),
-                                })),
-                            )
-                            .await
-                            .ok();
-                        }
+                            "Broadcasting node status to {} alive nodes, new_state: {:?}",
+                            target_nodes.len(),
+                            unreachable_node
+                        );
+
+                        let (success_count, total_count) = broadcast_node_states(
+                            vec![unreachable_node],
+                            target_nodes,
+                            None, // Use default timeout
+                        )
+                        .await;
+
+                        log::info!(
+                            "Broadcast node status: {}/{} successful",
+                            success_count,
+                            total_count
+                        );
                     }
                 }
             }

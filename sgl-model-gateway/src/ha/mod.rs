@@ -1,5 +1,5 @@
 mod controller;
-pub mod service;
 mod ping_server;
+pub mod service;
 
-use service::{gossip, try_ping, ClusterState};
+pub use service::{broadcast_node_states, gossip, try_ping, ClusterState};
