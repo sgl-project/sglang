@@ -424,9 +424,9 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 else None
             )
 
-            self._enable_a2a_moe = (
-                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
-            )
+        self._enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+        )
 
     def get_moe_weights(self):
         return [
