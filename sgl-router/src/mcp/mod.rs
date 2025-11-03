@@ -1,11 +1,7 @@
-// MCP Client for SGLang Router
-//
-// This module provides a complete MCP (Model Context Protocol) client implementation
-// supporting multiple transport types (stdio, SSE, HTTP) and all MCP features:
-// - Tools: Discovery and execution
-// - Prompts: Reusable templates for LLM interactions
-// - Resources: File/data access with subscription support
-// - OAuth: Secure authentication for remote servers
+//! Model Context Protocol (MCP) client implementation.
+//!
+//! Provides MCP client functionality including tools, prompts, resources, and OAuth.
+//! Supports stdio, SSE, and HTTP transports with connection pooling and caching.
 
 pub mod config;
 pub mod connection_pool;
@@ -19,7 +15,7 @@ pub mod tool_args;
 // Re-export the main types for convenience
 pub use config::{
     InventoryConfig, McpConfig, McpPoolConfig, McpProxyConfig, McpServerConfig, McpTransport,
-    PromptInfo, ResourceInfo, ToolInfo, WarmupServer,
+    Prompt, RawResource, Tool, WarmupServer,
 };
 pub use connection_pool::{CachedConnection, McpConnectionPool, PoolStats};
 pub use error::{McpError, McpResult};
