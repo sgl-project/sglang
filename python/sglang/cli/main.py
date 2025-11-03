@@ -92,7 +92,7 @@ def _maybe_download_model(
 
 
 # Copied and adapted from hf_diffusers_utils.py
-def _verify_model_config_and_directory(model_path: str) -> True:
+def is_diffusers_model_path(model_path: str) -> True:
     """
     Verify if the model directory contains a valid diffusers configuration.
 
@@ -121,7 +121,7 @@ def _verify_model_config_and_directory(model_path: str) -> True:
 
 def get_is_diffusion_model(model_path: str):
     model_path = _maybe_download_model(model_path)
-    is_diffusion_model = _verify_model_config_and_directory(model_path)
+    is_diffusion_model = is_diffusers_model_path(model_path)
     if is_diffusion_model:
         logger.info("Diffusion model detected")
     return is_diffusion_model
