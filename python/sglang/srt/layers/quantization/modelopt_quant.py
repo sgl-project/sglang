@@ -1593,12 +1593,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         0, x_col // 16, dtype=torch.uint8, device=x.device
                     )
 
-                # Gather router outputs separately from activations to preserve dtypes
-                topk_weights, topk_ids = get_tp_group().all_gatherv(
-                    [topk_weights, topk_ids], sizes=get_dp_global_num_tokens()
-                )
-                x, x_sf = get_tp_group().all_gatherv(
-                    [x, x_sf], sizes=get_dp_global_num_tokens()
+                # Mirror vLLM: gather router outputs and activations together
+                topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
+                    [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
                 )
                 x_sf = nvfp4_block_scale_interleave(x_sf)
 
