@@ -27,7 +27,6 @@ MODELS = [
     SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
 ]
 
-
 # Set default mem_fraction_static to 0.8
 DEFAULT_MEM_FRACTION_STATIC = 0.8
 
