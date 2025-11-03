@@ -8,8 +8,8 @@ use axum::response::Response;
 use crate::{
     protocols::chat::ChatCompletionRequest,
     routers::grpc::{
+        common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
-        stages::PipelineStage,
         utils,
     },
 };

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use axum::response::Response;
 
-use crate::routers::grpc::stages::PipelineStage;
+use super::PipelineStage;
 use crate::{
     grpc_client::{proto, sglang_scheduler::AbortOnDropStream},
     routers::grpc::{

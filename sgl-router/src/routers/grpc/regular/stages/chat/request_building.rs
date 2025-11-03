@@ -1,30 +1,30 @@
-//! Generate request building stage: Build proto GenerateRequest for generate requests
+//! Chat request building stage: Build proto GenerateRequest for chat requests
 
 use async_trait::async_trait;
 use axum::response::Response;
 use uuid::Uuid;
 
 use crate::routers::grpc::{
+    common::stages::PipelineStage,
     context::{ClientSelection, RequestContext, WorkerSelection},
-    stages::PipelineStage,
     utils,
 };
 
-/// Generate request building stage
+/// Chat request building stage
 ///
-/// Extracts generate-specific request building logic from the old unified RequestBuildingStage.
-pub struct GenerateRequestBuildingStage {
+/// Extracts chat-specific request building logic from the old unified RequestBuildingStage.
+pub struct ChatRequestBuildingStage {
     inject_pd_metadata: bool,
 }
 
-impl GenerateRequestBuildingStage {
+impl ChatRequestBuildingStage {
     pub fn new(inject_pd_metadata: bool) -> Self {
         Self { inject_pd_metadata }
     }
 }
 
 #[async_trait]
-impl PipelineStage for GenerateRequestBuildingStage {
+impl PipelineStage for ChatRequestBuildingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         let prep = ctx
             .state
@@ -38,7 +38,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
             .as_ref()
             .ok_or_else(|| utils::internal_error_static("Client acquisition not completed"))?;
 
-        let generate_request = ctx.generate_request_arc();
+        let chat_request = ctx.chat_request_arc();
 
         // Get client for building request (use prefill client if PD mode)
         let builder_client = match clients {
@@ -46,20 +46,26 @@ impl PipelineStage for GenerateRequestBuildingStage {
             ClientSelection::Dual { prefill, .. } => prefill,
         };
 
-        // Build generate request
-        let request_id = generate_request
-            .rid
-            .clone()
-            .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
+        // Build chat request
+        let request_id = format!("chatcmpl-{}", Uuid::new_v4());
+        let body_ref = prep.filtered_request.as_ref().unwrap_or(&chat_request);
 
         let mut proto_request = builder_client
-            .build_plain_generate_request(
+            .build_generate_request(
                 request_id,
-                &generate_request,
-                prep.original_text.clone(),
+                body_ref,
+                prep.processed_messages.as_ref().unwrap().text.clone(),
                 prep.token_ids.clone(),
+                prep.processed_messages
+                    .as_ref()
+                    .unwrap()
+                    .multimodal_inputs
+                    .clone(),
+                prep.tool_constraints.clone(),
             )
-            .map_err(utils::bad_request_error)?;
+            .map_err(|e| {
+                utils::bad_request_error(format!("Invalid request parameters: {}", e))
+            })?;
 
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
@@ -73,6 +79,6 @@ impl PipelineStage for GenerateRequestBuildingStage {
     }
 
     fn name(&self) -> &'static str {
-        "GenerateRequestBuilding"
+        "ChatRequestBuilding"
     }
 }

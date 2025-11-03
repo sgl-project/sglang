@@ -9,9 +9,11 @@ use axum::response::{IntoResponse, Response};
 use tokio::sync::RwLock;
 use tracing::{debug, error};
 
-// Import all stage types from the stages module
-use super::stages::*;
-use super::{context::*, error, harmony, processing, responses::BackgroundTaskInfo, streaming};
+// Import common stages (used by all pipelines)
+use super::common::stages::*;
+// Import regular stages
+use super::regular::{processing, stages::*, error, streaming};
+use super::{context::*, harmony, responses::BackgroundTaskInfo, utils};
 use crate::{
     core::WorkerRegistry,
     policies::PolicyRegistry,

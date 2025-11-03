@@ -1,29 +1,26 @@
-//! Chat response processing stage: Handles both streaming and non-streaming responses
-//!
-//! - For streaming: Spawns background task and returns SSE response (early exit)
-//! - For non-streaming: Collects all responses and builds final ChatCompletionResponse
+//! Generate response processing stage: Handles both streaming and non-streaming responses
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::response::Response;
 
 use crate::routers::grpc::{
+    common::stages::PipelineStage,
     context::{FinalResponse, RequestContext},
-    processing, streaming,
-    stages::PipelineStage,
+    regular::{processing, streaming},
     utils,
 };
 
-/// Chat response processing stage
+/// Generate response processing stage
 ///
-/// Extracts chat-specific response processing logic from the old unified ResponseProcessingStage.
-pub struct ChatResponseProcessingStage {
+/// Extracts generate-specific response processing logic from the old unified ResponseProcessingStage.
+pub struct GenerateResponseProcessingStage {
     processor: processing::ResponseProcessor,
     streaming_processor: Arc<streaming::StreamingProcessor>,
 }
 
-impl ChatResponseProcessingStage {
+impl GenerateResponseProcessingStage {
     pub fn new(
         processor: processing::ResponseProcessor,
         streaming_processor: Arc<streaming::StreamingProcessor>,
@@ -36,21 +33,22 @@ impl ChatResponseProcessingStage {
 }
 
 #[async_trait]
-impl PipelineStage for ChatResponseProcessingStage {
+impl PipelineStage for GenerateResponseProcessingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        self.process_chat_response(ctx).await
+        self.process_generate_response(ctx).await
     }
 
     fn name(&self) -> &'static str {
-        "ChatResponseProcessing"
+        "GenerateResponseProcessing"
     }
 }
 
-impl ChatResponseProcessingStage {
-    async fn process_chat_response(
+impl GenerateResponseProcessingStage {
+    async fn process_generate_response(
         &self,
         ctx: &mut RequestContext,
     ) -> Result<Option<Response>, Response> {
+        let start_time = Instant::now();
         let is_streaming = ctx.is_streaming();
 
         // Extract execution result
@@ -72,18 +70,17 @@ impl ChatResponseProcessingStage {
         if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response (done)
             return Ok(Some(
-                self.streaming_processor.clone().process_streaming_response(
+                self.streaming_processor.clone().process_streaming_generate(
                     execution_result,
-                    ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
+                    ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
                     dispatch,
                 ),
             ));
         }
 
         // Non-streaming: Delegate to ResponseProcessor
-        let request_logprobs = ctx.chat_request().logprobs;
-
-        let chat_request = ctx.chat_request_arc();
+        let request_logprobs = ctx.generate_request().return_logprob.unwrap_or(false);
+        let generate_request = ctx.generate_request_arc();
 
         let stop_decoder = ctx
             .state
@@ -92,19 +89,20 @@ impl ChatResponseProcessingStage {
             .as_mut()
             .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
 
-        let response = self
+        let result_array = self
             .processor
-            .process_non_streaming_chat_response(
+            .process_non_streaming_generate_response(
                 execution_result,
-                chat_request,
+                generate_request,
                 dispatch,
                 stop_decoder,
                 request_logprobs,
+                start_time,
             )
             .await?;
 
         // Store the final response
-        ctx.state.response.final_response = Some(FinalResponse::Chat(response));
+        ctx.state.response.final_response = Some(FinalResponse::Generate(result_array));
 
         Ok(None)
     }

@@ -5,12 +5,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::response::Response;
 
-use super::{
-    chat::ChatResponseProcessingStage, generate::GenerateResponseProcessingStage, PipelineStage,
-};
+use super::{chat::ChatResponseProcessingStage, generate::GenerateResponseProcessingStage};
 use crate::routers::grpc::{
+    common::stages::PipelineStage,
     context::{RequestContext, RequestType},
-    processing, streaming, utils, error,
+    regular::{processing, streaming},
+    utils, error,
 };
 
 /// Response processing stage (delegates to endpoint-specific implementations)

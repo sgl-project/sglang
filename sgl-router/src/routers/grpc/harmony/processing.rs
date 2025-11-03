@@ -18,7 +18,7 @@ use crate::{
     },
     routers::grpc::{
         context::{DispatchMetadata, ExecutionResult},
-        response_collection, response_formatting, utils, error,
+        common::response_collection, common::response_formatting, utils, error,
     },
 };
 

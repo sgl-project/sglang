@@ -8,8 +8,8 @@ use axum::response::Response;
 use crate::{
     protocols::{common::InputIds, generate::GenerateRequest},
     routers::grpc::{
+        common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
-        stages::PipelineStage,
         utils,
     },
     tokenizer::traits::Tokenizer,

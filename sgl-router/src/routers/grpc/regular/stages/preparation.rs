@@ -6,8 +6,11 @@
 use async_trait::async_trait;
 use axum::response::Response;
 
-use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage, PipelineStage};
-use crate::routers::grpc::context::{RequestContext, RequestType};
+use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage};
+use crate::routers::grpc::{
+    common::stages::PipelineStage,
+    context::{RequestContext, RequestType},
+};
 
 /// Preparation stage (delegates to endpoint-specific implementations)
 pub struct PreparationStage {

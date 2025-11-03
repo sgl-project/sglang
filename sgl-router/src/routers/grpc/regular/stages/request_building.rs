@@ -4,12 +4,10 @@ use async_trait::async_trait;
 use axum::response::Response;
 use uuid::Uuid;
 
-use super::{
-    chat::ChatRequestBuildingStage, generate::GenerateRequestBuildingStage, PipelineStage,
-};
+use super::{chat::ChatRequestBuildingStage, generate::GenerateRequestBuildingStage};
 use crate::{
     grpc_client::proto,
-    routers::grpc::context::{RequestContext, RequestType},
+    routers::grpc::{common::stages::PipelineStage, context::{RequestContext, RequestType}},
 };
 
 /// Request building stage (delegates to endpoint-specific implementations)

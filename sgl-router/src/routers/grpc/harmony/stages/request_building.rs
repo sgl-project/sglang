@@ -12,9 +12,10 @@ use crate::{
     core::Worker,
     grpc_client::proto::{DisaggregatedParams, GenerateRequest},
     routers::grpc::{
+        common::stages::PipelineStage,
         context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
+        utils,
         error,
-        stages::PipelineStage,
     },
 };
 
