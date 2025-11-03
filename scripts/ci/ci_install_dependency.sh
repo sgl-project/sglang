@@ -86,7 +86,7 @@ else
     export UV_SYSTEM_PYTHON=true
 
     PIP_CMD="uv pip"
-    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
+    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --prerelease allow"
 
     # Clean up existing installations
     $PIP_CMD uninstall sgl-kernel sglang || true
