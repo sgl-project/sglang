@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use axum::response::Response;
 
-use super::PipelineStage;
+use crate::routers::grpc::stages::PipelineStage;
 use crate::routers::grpc::{
     context::{ClientSelection, RequestContext, WorkerSelection},
     error, utils,

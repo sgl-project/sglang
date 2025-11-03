@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::warn;
 
-use super::PipelineStage;
+use crate::routers::grpc::stages::PipelineStage;
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,

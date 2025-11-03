@@ -31,22 +31,27 @@ pub trait PipelineStage: Send + Sync {
 // Stage Modules
 // ============================================================================
 
-mod client_acquisition;
-mod dispatch_metadata;
+// New modular structure
+pub mod chat;
+pub mod common;
+pub mod generate;
+
+// Old stages (currently active - only endpoint-specific ones remain)
 mod preparation;
 mod request_building;
-mod request_execution;
 mod response_processing;
-mod worker_selection;
 
 // ============================================================================
 // Public Exports
 // ============================================================================
 
-pub use client_acquisition::ClientAcquisitionStage;
-pub use dispatch_metadata::DispatchMetadataStage;
+// Export common stages from new location (these are identical to old ones)
+pub use common::{
+    ClientAcquisitionStage, DispatchMetadataStage, ExecutionMode, RequestExecutionStage,
+    WorkerSelectionMode, WorkerSelectionStage,
+};
+
+// Export old endpoint-specific stages (to be replaced by chat/generate modules)
 pub use preparation::PreparationStage;
 pub use request_building::RequestBuildingStage;
-pub use request_execution::{ExecutionMode, RequestExecutionStage};
 pub use response_processing::ResponseProcessingStage;
-pub use worker_selection::{WorkerSelectionMode, WorkerSelectionStage};
