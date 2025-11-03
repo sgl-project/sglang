@@ -246,7 +246,7 @@ class _MooncakeEPDispatcherImpl:
         )
         return hidden_states, event, hook, overlap_args
 
-    def combine_b(self, hidden_states, event, hook):
+    def combine_b(self, hidden_states, event, hook, overlap_args):
         hook() if self.return_recv_hook else event.current_stream_wait()
         return hidden_states
 

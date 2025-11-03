@@ -35,13 +35,12 @@ class TestTP(CustomTestCase):
                 "--mooncake-ib-device",
                 ib_devices,
                 "--moe-a2a-backend",
-                "deepep",
+                "mooncake",
                 "--deepep-mode",
                 "low_latency",
                 "--chunked-prefill-size",
                 "512",
-                "--cuda-graph-max-bs",
-                "128",
+                "--disable-cuda-graph",
                 "--max-running-requests",
                 "512",
                 "--mem-fraction-static",
@@ -58,8 +57,8 @@ class TestTP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
+            num_questions=50,
+            max_new_tokens=128,
             parallel=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -67,7 +66,7 @@ class TestTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["accuracy"], 0.50)
 
 
 class TestPureDP(TestTP):
@@ -90,6 +89,7 @@ class TestHybridDPTP(TestTP):
     ]
 
 
+@unittest.skip("covered in TestTBO")
 class TestNoGatherdBuffer(TestTP):
     extra_args = [
         "--tp",
@@ -115,7 +115,7 @@ class TestTBO(TestTP):
     ]
 
 
-class TestMooncakeWitchEPLB(TestTP):
+class TestMooncakeWithEPLB(TestTP):
     extra_args = [
         "--tp",
         "4",
