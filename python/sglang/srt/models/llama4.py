@@ -46,6 +46,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -153,14 +154,16 @@ class Llama4MoE(nn.Module):
 
     def _forward_core(self, hidden_states, forward_mode: ForwardMode):
         if _is_cuda:
-            return self._forward_core_shared_routed_overlap(hidden_states)
+            if hidden_states.shape[0] > 0 and get_is_capture_mode():
+                return self._forward_core_shared_routed_overlap(hidden_states)
+            return self._forward_core_normal(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
 
     def _forward_core_normal(self, hidden_states):
         # router_scores: [num_tokens, num_experts]
         router_logits, _ = self.router(hidden_states)
-        shared_out = self.shared_expert(hidden_states)
+        shared_out = self.shared_expert(hidden_states.clone())
         topk_output = self.topk(hidden_states, router_logits)
         routed_out = self.experts(hidden_states, topk_output)
         return shared_out, routed_out
