@@ -17,10 +17,11 @@ Usage:
     FIB_DATASET_PATH=/path/to/traces python -m sglang.launch_server ...
 """
 
-import os
 import logging
 from typing import Optional, Dict, Any
 from functools import wraps
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -70,21 +71,21 @@ class SGLangFlashInferBenchIntegration:
             return
 
         # Use environment variables as defaults
-        enable_tracing = enable_tracing or os.environ.get("FIB_ENABLE_TRACING") == "1"
-        enable_apply = enable_apply or os.environ.get("FIB_ENABLE_APPLY") == "1"
-        dataset_path = dataset_path or os.environ.get("FIB_DATASET_PATH")
+        enable_tracing = enable_tracing or envs.FIB_ENABLE_TRACING.get()
+        enable_apply = enable_apply or envs.FIB_ENABLE_APPLY.get()
 
         if not (enable_tracing or enable_apply):
             return
 
         self.enabled = True
-        self.dataset_path = dataset_path or os.path.expanduser("~/.cache/flashinfer_bench/dataset")
+        self.dataset_path = dataset_path or envs.FIB_DATASET_PATH.get()
 
         # Configure tracing
         if enable_tracing:
+            tracing_config = tracing_config or {}
             config = TracingConfig(
-                input_dump_policy=tracing_config.get("input_dump_policy", "dump_non_float") if tracing_config else "dump_non_float",
-                filter_policy=tracing_config.get("filter_policy", "keep_first_by_axes") if tracing_config else "keep_first_by_axes"
+                input_dump_policy=tracing_config.get("input_dump_policy", "dump_non_float"),
+                filter_policy=tracing_config.get("filter_policy", "keep_first_by_axes"),
             )
             self.config = config
             self.tracing_enabled = True
@@ -110,8 +111,9 @@ class SGLangFlashInferBenchIntegration:
 
             @wraps(func)
             def wrapper(*args, **kwargs):
-                # If apply is enabled, try to substitute with optimized kernel
-                if self.apply_enabled:
+                # If tracing or apply is enabled, use flashinfer_bench.apply()
+                # The apply() function handles both tracing and kernel substitution
+                if self.tracing_enabled or self.apply_enabled:
                     try:
                         return apply(
                             def_name_or_resolver=kernel_name,
@@ -119,7 +121,7 @@ class SGLangFlashInferBenchIntegration:
                             fallback=lambda **kw: func(*kw["args"], **kw["kwargs"])
                         )
                     except Exception as e:
-                        logger.debug(f"Kernel substitution failed for {kernel_name}: {e}")
+                        logger.debug(f"FlashInfer-Bench operation failed for {kernel_name}: {e}")
 
                 # Fall back to original implementation
                 return func(*args, **kwargs)

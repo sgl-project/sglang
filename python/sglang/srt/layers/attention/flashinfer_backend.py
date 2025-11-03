@@ -706,8 +706,8 @@ class FlashInferAttnBackend(AttentionBackend):
             initialize_flashinfer_bench()
             self.flashinfer_bench_enabled = True
 
-            # Wrap the forward methods if kernel substitution is enabled
-            if envs.FIB_ENABLE_APPLY.get():
+            # Wrap the forward methods if tracing or kernel substitution is enabled
+            if envs.FIB_ENABLE_TRACING.get() or envs.FIB_ENABLE_APPLY.get():
                 self.forward_extend = wrap_attention_kernel("flashinfer_prefill_attention")(
                     self.forward_extend
                 )
