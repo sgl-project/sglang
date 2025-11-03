@@ -60,6 +60,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sk=None,
     ):
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -90,7 +91,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
             layer.is_cross_attention,
+            layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
+            sk,
         )
         return o
 
@@ -102,6 +105,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sk=None,
     ):
         attn_logits, _ = self.forward_metadata
 
@@ -131,7 +135,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
             layer.is_cross_attention,
+            layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
+            sk,
         )
         return o
 

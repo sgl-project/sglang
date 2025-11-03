@@ -10,6 +10,91 @@ torch.manual_seed(1234)
 
 
 class TestDecodeAttention(CustomTestCase):
+    def _scaled_dot_product_attention(self, Q, K, V, S, scaling, sliding_window):
+        # sliding_window <= 0 means no sliding window
+        # Q: [n_tokens_q, n_heads, q_mult, d_head]
+        # K: [n_tokens_kv, n_heads, d_head]
+        # V: [n_tokens_kv, n_heads, d_head]
+        n_tokens_q, n_heads, q_mult, d_head = Q.shape
+        n_tokens_kv = K.shape[0]
+        assert K.shape == (n_tokens_kv, n_heads, d_head)
+        assert V.shape == (n_tokens_kv, n_heads, d_head)
+        K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
+        V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
+        S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens_q, -1)
+        if n_tokens_q == n_tokens_kv:  # Prefill
+            mask = torch.triu(
+                Q.new_full((n_tokens_q, n_tokens_kv), -float("inf")), diagonal=1
+            )
+        else:  # Decode
+            mask = Q.new_zeros((n_tokens_q, n_tokens_kv))
+        if sliding_window is not None and sliding_window > 0:
+            mask += torch.tril(
+                mask.new_full((n_tokens_q, n_tokens_kv), -float("inf")),
+                diagonal=n_tokens_kv - n_tokens_q - sliding_window,
+            )
+        QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
+        QK *= scaling
+        QK += mask[None, None, :, :]
+        QK = torch.cat([QK, S], dim=-1)
+        W = torch.softmax(QK, dim=-1)
+        W = W[..., :-1]
+        attn = torch.einsum("hmqk,khmd->qhmd", W, V)
+        return attn.reshape(n_tokens_q, -1)
+
+    def _run_sdpa_forward_decode_sink(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_kv_heads: int,
+        q_mult: int,
+        scaling=None,
+        sliding_window=None,
+        attention_sinks=None,
+        enable_gqa=False,
+        causal=False,
+    ):
+        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
+        query = query.movedim(0, query.dim() - 2)
+        start_q, start_kv = 0, 0
+        for seq_idx in range(seq_lens.shape[0]):
+            # TODO: this loop process a sequence per iter, this is inefficient.
+            # Need optimize the performance later.
+            seq_len_q = 1
+            seq_len_kv = seq_lens[seq_idx]
+            end_q = start_q + seq_len_q
+            end_kv = start_kv + seq_len_kv
+            per_req_query = query[:, start_q:end_q, :]
+            # get key and value from cache. per_req_tokens contains the kv cache
+            # index for each token in the sequence.
+            req_pool_idx = req_pool_indices[seq_idx]
+            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+
+            per_req_query = per_req_query.permute(1, 0, 2).reshape(
+                seq_len_q, num_kv_heads, q_mult, per_req_query.shape[-1]
+            )
+            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_key = per_req_key.permute(1, 0, 2)
+            per_req_value = per_req_value.permute(1, 0, 2)
+
+            per_req_out = self._scaled_dot_product_attention(
+                per_req_query,
+                per_req_key,
+                per_req_value,
+                attention_sinks,
+                scaling=scaling,
+                sliding_window=sliding_window,
+            ).reshape(seq_len_q, -1, per_req_value.shape[-1])
+            output[start_q:end_q, :, :] = per_req_out
+            start_q, start_kv = end_q, end_kv
+        return output
+
     def _run_sdpa_forward_decode(
         self,
         query: torch.Tensor,
@@ -69,11 +154,11 @@ class TestDecodeAttention(CustomTestCase):
         return output
 
     def _test_grouped_decode_attention_once(
-        self, B, H_Q, H_KV, D, D_V, is_cross_attn, dtype, device
+        self, B, H_Q, H_KV, D, D_V, sliding_window, sink, is_cross_attn, dtype, device
     ):
         # This represents the number of tokens already in the sequence
         seq_len = 1024
-        encoder_len = 10
+        encoder_len = 0 if sink else 10
         total_tokens = B * (seq_len + encoder_len)
         sm_scale = 1.0 / (D**0.5)
         logit_cap = 0.0
@@ -82,6 +167,7 @@ class TestDecodeAttention(CustomTestCase):
 
         # q represents the new token being generated, one per batch
         q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+        sinks = torch.rand(H_Q, dtype=dtype, device=device) * 10
 
         # k_buffer and v_buffer represent all previous tokens
         k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
@@ -135,22 +221,41 @@ class TestDecodeAttention(CustomTestCase):
             sm_scale,
             logit_cap,
             is_cross_attn,
+            sliding_window if sliding_window is not None else 0,
             encoder_lens,
+            sinks if sink else None,
         )
 
-        self._run_sdpa_forward_decode(
-            q,
-            o_grouped,
-            k_buffer,
-            v_buffer,
-            req_to_token,
-            b_req_idx,
-            b_seq_len,
-            scaling=sm_scale,
-            enable_gqa=enable_gqa,
-            encoder_lens=encoder_lens,
-            is_cross_attn=is_cross_attn,
-        )
+        if sink:
+            self._run_sdpa_forward_decode_sink(
+                q,
+                o_grouped,
+                k_buffer,
+                v_buffer,
+                req_to_token,
+                b_req_idx,
+                b_seq_len,
+                num_kv_heads=H_KV,
+                q_mult=H_Q // H_KV if enable_gqa else 1,
+                scaling=sm_scale,
+                sliding_window=sliding_window if sliding_window is not None else None,
+                attention_sinks=sinks,
+                enable_gqa=enable_gqa,
+            )
+        else:
+            self._run_sdpa_forward_decode(
+                q,
+                o_grouped,
+                k_buffer,
+                v_buffer,
+                req_to_token,
+                b_req_idx,
+                b_seq_len,
+                scaling=sm_scale,
+                enable_gqa=enable_gqa,
+                encoder_lens=encoder_lens,
+                is_cross_attn=is_cross_attn,
+            )
         cos_sim = torch.nn.functional.cosine_similarity(
             o.flatten(), o_grouped.flatten(), dim=0
         )
@@ -174,11 +279,26 @@ class TestDecodeAttention(CustomTestCase):
 
         for B, H_Q, H_KV, D, D_V in configs:
             for dtype in [torch.bfloat16, torch.float16]:
+                for sink in [True, False]:
+                    if D != D_V and sink:
+                        continue
+                    for sliding_window in [None, 10]:
+                        if sliding_window is not None and not sink:
+                            continue
+                        self._test_grouped_decode_attention_once(
+                            B,
+                            H_Q,
+                            H_KV,
+                            D,
+                            D_V,
+                            sliding_window,
+                            sink,
+                            False,
+                            dtype=dtype,
+                            device=device,
+                        )
                 self._test_grouped_decode_attention_once(
-                    B, H_Q, H_KV, D, D_V, False, dtype=dtype, device=device
-                )
-                self._test_grouped_decode_attention_once(
-                    B, H_Q, H_KV, D, D_V, True, dtype=dtype, device=device
+                    B, H_Q, H_KV, D, D_V, None, False, True, dtype=dtype, device=device
                 )
 
     def test_grouped_decode_attention(self):
