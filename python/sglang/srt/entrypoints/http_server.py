@@ -1470,7 +1470,7 @@ def _execute_server_warmup(
 
     # Send a warmup request
     if model_info["is_generation"]:
-        if is_vlm:
+        if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
         else:
             request_name = "/generate"
