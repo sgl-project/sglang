@@ -120,7 +120,9 @@ class SGLangFlashInferBenchIntegration:
             self.config = config
 
             # Actually enable tracing - this installs FlashInfer integrations!
-            self.tracing_runtime = enable_tracing(
+            from flashinfer_bench import enable_tracing as fib_enable_tracing
+
+            self.tracing_runtime = fib_enable_tracing(
                 dataset_path=self.dataset_path,
                 tracing_configs={"default": config},
             )
