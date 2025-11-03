@@ -194,7 +194,7 @@ class TopK(CustomOp):
     --top_k: The all number of top experts selected per token, including the fused shared expert(s).
     --num_fused_shared_experts: num of shared experts, can be activate both in TP or EP mode.
     --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
-    --fused_shared_experts_scaling_factor: scaling factor for fused shared experts.
+    --fused_shared_experts_scaling_factor: scaling factor for fused shared experts on AMD-platform.
     """
 
     def __init__(
@@ -841,7 +841,7 @@ def select_experts(
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
-                topk=num_routed_topk,
+                topk=num_routed_topk if _use_aiter else top_k,
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
@@ -856,7 +856,7 @@ def select_experts(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,
-                topk=num_routed_topk,
+                topk=num_routed_topk if _use_aiter else top_k,
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
@@ -875,7 +875,7 @@ def select_experts(
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
-            topk=num_routed_topk,
+            topk=num_routed_topk if _use_aiter else top_k,
             renormalize=renormalize,
             correction_bias=correction_bias,
         )
@@ -885,7 +885,7 @@ def select_experts(
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
-            topk=num_routed_topk,
+            topk=num_routed_topk if _use_aiter else top_k,
             renormalize=renormalize,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
@@ -899,12 +899,12 @@ def select_experts(
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
-            topk=num_routed_topk,
+            topk=num_routed_topk if _use_aiter else top_k,
             renormalize=renormalize,
         )
 
     # TODO: fused ops of shared experts in topk function itself when num_fused_shared_experts > 0.
-    if num_fused_shared_experts > 0:
+    if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
         scale_factor = (
             1.0

@@ -587,6 +587,7 @@ class DeepseekV2MoE(nn.Module):
             is_nextn=is_nextn,
         )
 
+        # scaling factor for fused shared experts on AMD-platform.
         fused_shared_experts_scaling_factor = None
         if self.moe_ep_size > 1 and self.num_fused_shared_experts > 0:
             # if enable_ep_moe tp_szie == ep_size, every gpu get shared experts gemm output
@@ -3013,25 +3014,19 @@ class DeepseekV2ForCausalLM(nn.Module):
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Config not support fused shared expert(s)."
-        elif (
-            disable_reason is None
-            and (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0))
-            and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
+        elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
+            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = (
                 "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= 94 can use shared experts fusion optimization."
             )
+        elif get_moe_expert_parallel_world_size() > 1 and (
+            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        ):
+            disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= 94 can use shared experts fusion optimization under expert parallelism."
         elif disable_reason is None and get_moe_a2a_backend().is_deepep():
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
-        # Deepseek V3/R1 default use fused shared expert in TP mode, but need to enable shared_expert_mode
-        # to used shared experts in EP moe mode
-        elif (
-            disable_reason is None
-            and get_moe_expert_parallel_world_size() > 1
-            and get_global_server_args().shared_expert_mode != "fused"
-        ):
-            disable_reason = "Deepseek V3/R1 not used fused shared experts in default ep moe mode unless shared_expert_mode=fused"
         elif self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
