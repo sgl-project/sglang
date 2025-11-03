@@ -366,6 +366,13 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+        elif "KimiLinearForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 72
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -590,14 +597,20 @@ class ModelConfig:
             return
 
         # Check if ModelOpt quantization is specified
-        modelopt_quantization_specified = self.quantization in [
+        _MODELOPT_QUANTIZATION_METHODS = [
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
         ]
+        modelopt_quantization_specified = (
+            self.quantization in _MODELOPT_QUANTIZATION_METHODS
+        )
 
         if not modelopt_quantization_specified:
-            raise ValueError("quantize_and_serve requires ModelOpt quantization")
+            raise ValueError(
+                "quantize_and_serve requires ModelOpt quantization (set with --quantization "
+                f"{{{', '.join(sorted(_MODELOPT_QUANTIZATION_METHODS))}}})"
+            )
 
         # quantize_and_serve is disabled due to compatibility issues
         raise NotImplementedError(
