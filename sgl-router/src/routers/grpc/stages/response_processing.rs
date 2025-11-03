@@ -1,26 +1,22 @@
-//! Response processing stage: Handles both streaming and non-streaming responses
-//!
-//! - For streaming: Spawns background task and returns SSE response (early exit)
-//! - For non-streaming: Collects all responses and builds final ChatCompletionResponse
+//! Response processing stage that delegates to endpoint-specific implementations
 
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
 
-use super::PipelineStage;
+use super::{
+    chat::ChatResponseProcessingStage, generate::GenerateResponseProcessingStage, PipelineStage,
+};
 use crate::routers::grpc::{
-    context::{FinalResponse, RequestContext, RequestType},
-    error, processing, streaming,
+    context::{RequestContext, RequestType},
+    processing, streaming, utils, error,
 };
 
-/// Response processing stage: Handles both streaming and non-streaming responses
-///
-/// - For streaming: Spawns background task and returns SSE response (early exit)
-/// - For non-streaming: Collects all responses and builds final ChatCompletionResponse
+/// Response processing stage (delegates to endpoint-specific implementations)
 pub struct ResponseProcessingStage {
-    processor: processing::ResponseProcessor,
-    streaming_processor: Arc<streaming::StreamingProcessor>,
+    chat_stage: ChatResponseProcessingStage,
+    generate_stage: GenerateResponseProcessingStage,
 }
 
 impl ResponseProcessingStage {
@@ -29,8 +25,8 @@ impl ResponseProcessingStage {
         streaming_processor: Arc<streaming::StreamingProcessor>,
     ) -> Self {
         Self {
-            processor,
-            streaming_processor,
+            chat_stage: ChatResponseProcessingStage::new(processor.clone(), streaming_processor.clone()),
+            generate_stage: GenerateResponseProcessingStage::new(processor, streaming_processor),
         }
     }
 }
@@ -38,10 +34,9 @@ impl ResponseProcessingStage {
 #[async_trait]
 impl PipelineStage for ResponseProcessingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        // Delegate to request-type specific processing
         match &ctx.input.request_type {
-            RequestType::Chat(_) => self.process_chat_response(ctx).await,
-            RequestType::Generate(_) => self.process_generate_response(ctx).await,
+            RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
+            RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
             RequestType::Responses(_) => Err(error::bad_request(
                 "Responses API processing must be handled by responses handler".to_string(),
             )),
@@ -50,135 +45,5 @@ impl PipelineStage for ResponseProcessingStage {
 
     fn name(&self) -> &'static str {
         "ResponseProcessing"
-    }
-}
-
-impl ResponseProcessingStage {
-    async fn process_chat_response(
-        &self,
-        ctx: &mut RequestContext,
-    ) -> Result<Option<Response>, Response> {
-        let is_streaming = ctx.is_streaming();
-
-        // Extract execution result
-        let execution_result = ctx
-            .state
-            .response
-            .execution_result
-            .take()
-            .ok_or_else(|| error::internal_error("No execution result"))?;
-
-        // Get dispatch metadata (needed by both streaming and non-streaming)
-        let dispatch = ctx
-            .state
-            .dispatch
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Dispatch metadata not set"))?
-            .clone();
-
-        if is_streaming {
-            // Streaming: Use StreamingProcessor and return SSE response (done)
-            return Ok(Some(
-                self.streaming_processor.clone().process_streaming_response(
-                    execution_result,
-                    ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
-                    dispatch,
-                ),
-            ));
-        }
-
-        // Non-streaming: Delegate to ResponseProcessor
-        let request_logprobs = match &ctx.input.request_type {
-            RequestType::Chat(req) => req.logprobs,
-            _ => false,
-        };
-
-        let chat_request = ctx.chat_request_arc();
-
-        let stop_decoder = ctx
-            .state
-            .response
-            .stop_decoder
-            .as_mut()
-            .ok_or_else(|| error::internal_error("Stop decoder not initialized"))?;
-
-        let response = self
-            .processor
-            .process_non_streaming_chat_response(
-                execution_result,
-                chat_request,
-                dispatch,
-                stop_decoder,
-                request_logprobs,
-            )
-            .await?;
-
-        // Store the final response
-        ctx.state.response.final_response = Some(FinalResponse::Chat(response));
-
-        Ok(None)
-    }
-
-    async fn process_generate_response(
-        &self,
-        ctx: &mut RequestContext,
-    ) -> Result<Option<Response>, Response> {
-        let start_time = Instant::now();
-        let is_streaming = ctx.is_streaming();
-
-        // Extract execution result
-        let execution_result = ctx
-            .state
-            .response
-            .execution_result
-            .take()
-            .ok_or_else(|| error::internal_error("No execution result"))?;
-
-        // Get dispatch metadata (needed by both streaming and non-streaming)
-        let dispatch = ctx
-            .state
-            .dispatch
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Dispatch metadata not set"))?
-            .clone();
-
-        if is_streaming {
-            // Streaming: Use StreamingProcessor and return SSE response (done)
-            return Ok(Some(
-                self.streaming_processor.clone().process_streaming_generate(
-                    execution_result,
-                    ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
-                    dispatch,
-                ),
-            ));
-        }
-
-        // Non-streaming: Delegate to ResponseProcessor
-        let request_logprobs = ctx.generate_request().return_logprob.unwrap_or(false);
-        let generate_request = ctx.generate_request_arc();
-
-        let stop_decoder = ctx
-            .state
-            .response
-            .stop_decoder
-            .as_mut()
-            .ok_or_else(|| error::internal_error("Stop decoder not initialized"))?;
-
-        let result_array = self
-            .processor
-            .process_non_streaming_generate_response(
-                execution_result,
-                generate_request,
-                dispatch,
-                stop_decoder,
-                request_logprobs,
-                start_time,
-            )
-            .await?;
-
-        // Store the final response
-        ctx.state.response.final_response = Some(FinalResponse::Generate(result_array));
-
-        Ok(None)
     }
 }

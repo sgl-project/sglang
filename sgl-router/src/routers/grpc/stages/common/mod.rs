@@ -8,6 +8,7 @@
 
 mod client_acquisition;
 mod dispatch_metadata;
+pub mod helpers;
 mod request_execution;
 mod worker_selection;
 

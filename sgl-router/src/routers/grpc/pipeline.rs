@@ -67,7 +67,7 @@ impl RequestPipeline {
         ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
-            Box::new(PreparationStage),
+            Box::new(PreparationStage::new()),
             Box::new(WorkerSelectionStage::new(
                 worker_registry,
                 policy_registry,
@@ -172,7 +172,7 @@ impl RequestPipeline {
         ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
-            Box::new(PreparationStage),
+            Box::new(PreparationStage::new()),
             Box::new(WorkerSelectionStage::new(
                 worker_registry,
                 policy_registry,
