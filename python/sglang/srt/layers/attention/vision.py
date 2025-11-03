@@ -30,7 +30,6 @@ if _is_npu:
     import torch_npu
 
 from sglang.srt.distributed import (
-    parallel_state,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
 )
