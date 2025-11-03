@@ -1102,8 +1102,14 @@ class FlashInferFP4MoE(FusedMoE):
             output2_scale_scalar=self.g2_alphas.data,
             num_experts=self.num_experts,
             top_k=topk_config.top_k,
-            n_group=topk_config.num_expert_group,
-            topk_group=topk_config.topk_group,
+            n_group=(
+                topk_config.num_expert_group
+                if topk_config.num_expert_group is not None
+                else 0
+            ),
+            topk_group=(
+                topk_config.topk_group if topk_config.topk_group is not None else 0
+            ),
             intermediate_size=self.intermediate_size_per_partition,
             local_expert_offset=self.moe_ep_rank * self.num_local_experts,
             local_num_experts=self.num_local_experts,

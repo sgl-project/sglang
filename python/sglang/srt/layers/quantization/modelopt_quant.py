@@ -1563,15 +1563,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
 
         if self.enable_flashinfer_cutlass_moe:
-            assert (
-                not moe_runner_config.apply_router_weight_on_input
-            ), "apply_router_weight_on_input is not supported for Flashinfer"
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             output_dtype = x.dtype
             x_sf = None
+            # Support applying router weights on input for topK==1
+            if moe_runner_config.apply_router_weight_on_input:
+                top_k = topk_output.topk_config.top_k
+                assert (
+                    top_k == 1
+                ), "apply_router_weight_on_input is only implemented for topK==1"
+                if x.shape[0] > 0:
+                    scale = topk_weights[:, :1].to(x.dtype)
+                    x = x * scale
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 from flashinfer import nvfp4_block_scale_interleave
 
