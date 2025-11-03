@@ -7,33 +7,29 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed.device_communicators.all_reduce_utils import (
-    SYMM_MEM_ALL_REDUCE_MAX_SIZES,
+    TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES,
 )
 from sglang.srt.utils import is_cuda, is_hip
 
 try:
     import torch.distributed._symmetric_memory as torch_symm_mem
 
-    symm_mem_available = True
+    _is_cuda = is_cuda()
+    _is_hip = is_hip()
+
+    torch_symm_mem_available = False
+    if _is_cuda:
+        torch_symm_mem_available = True
 except ImportError:
-    symm_mem_available = False
+    torch_symm_mem_available = False
 
 
 logger = logging.getLogger(__name__)
 
-_is_cuda = is_cuda()
-_is_hip = is_hip()
 
-symm_mem_is_available = False
-if _is_hip:
-    symm_mem_is_available = False
-if _is_cuda:
-    symm_mem_is_available = True
-
-
-class SymmMemCommunicator:
+class TorchSymmMemCommunicator:
     """
-    Thin wrapper around symmetric-memory collectives.
+    Thin wrapper around torch-symmetric-memory collectives.
 
     This communicator:
       - Validates device capability and world size.
@@ -62,7 +58,7 @@ class SymmMemCommunicator:
 
         self.disabled = True
 
-        if not symm_mem_available:
+        if not torch_symm_mem_available:
             return
 
         if isinstance(device, int):
@@ -77,19 +73,22 @@ class SymmMemCommunicator:
         self.device_capability = torch.cuda.get_device_capability(device)[0]
         if self.device_capability < 9:
             logger.warning(
-                "SymmMemCommunicator: Device capability %s not supported, "
+                "TorchSymmMemCommunicator: Device capability %s not supported, "
                 "communicator is not available.",
                 self.device_capability,
             )
             return
-        if self.world_size not in SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability]:
+        if (
+            self.world_size
+            not in TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability]
+        ):
             logger.warning(
-                "SymmMemCommunicator: World size %d not supported, "
+                "TorchSymmMemCommunicator: World size %d not supported, "
                 "communicator is not available.",
                 self.world_size,
             )
             return
-        self.max_size = SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability][
+        self.max_size = TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability][
             self.world_size
         ]
         self.buffer = torch_symm_mem.empty(
@@ -100,7 +99,7 @@ class SymmMemCommunicator:
         handle = torch_symm_mem.rendezvous(self.buffer, self.group.group_name)
         if handle.multicast_ptr == 0:
             logger.warning(
-                "SymmMemCommunicator: symmetric memory "
+                "TorchSymmMemCommunicator: torch symmetric memory "
                 "multicast operations are not supported."
             )
             self.buffer = None
@@ -108,7 +107,7 @@ class SymmMemCommunicator:
             return
         self.disabled = False
 
-    def should_symm_mem_allreduce(self, inp: torch.Tensor):
+    def should_torch_symm_mem_allreduce(self, inp: torch.Tensor):
         """
         Fast-path eligibility check for a given tensor.
 
@@ -135,7 +134,7 @@ class SymmMemCommunicator:
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> Optional[torch.Tensor]:
         """
-        Perform an in-place sum all-reduce via symmetric memory.
+        Perform an in-place sum all-reduce via torch symmetric memory.
 
         Args:
             inp: Input tensor on the target CUDA device (bfloat16).
