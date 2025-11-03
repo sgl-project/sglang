@@ -647,9 +647,7 @@ class NixlKVManager(CommonKVManager):
         return self.transfer_statuses[room].is_done()
 
     def _start_bootstrap_thread(self):
-        # self._bind_server_socket()
-        # already bound in CommonKVManager init
-        pass
+        
 
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""

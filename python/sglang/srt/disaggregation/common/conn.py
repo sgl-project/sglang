@@ -13,6 +13,7 @@ import requests
 import zmq
 from aiohttp import web
 
+from sglang.srt.utils.common import get_zmq_socket, get_zmq_socket_port
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -68,10 +69,15 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
-        self.server_socket = zmq.Context().socket(zmq.PULL)
-        if is_valid_ipv6_address(self.local_ip):
-            self.server_socket.setsockopt(zmq.IPV6, 1)
-        self.rank_port = self._bind_server_socket()
+
+        # create zmq server socket, and bind to a random port
+        self.server_socket: zmq.Socket = get_zmq_socket(
+            context=zmq.Context(), 
+            socket_type=zmq.PULL, 
+            endpoint=f"tcp://{maybe_wrap_ipv6_address(self.local_ip)}:*",
+            bind=True
+        )
+        self.rank_port = get_zmq_socket_port(self.server_socket)
         self.request_status: Dict[int, KVPoll] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -91,11 +97,6 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
-    def _bind_server_socket(self) -> int:
-        """auto choose random available port, then bind it and return it"""
-        addr = f"tcp://{maybe_wrap_ipv6_address(self.local_ip)}"
-        port = self.server_socket.bind_to_random_port(addr)
-        return port
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
