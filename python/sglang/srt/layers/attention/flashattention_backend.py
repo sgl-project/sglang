@@ -345,13 +345,14 @@ class FlashAttentionBackend(AttentionBackend):
                 q_dtype=model_runner.dtype,
                 max_bs=model_runner.server_args.max_running_requests,
                 page_size=self.page_size,
-                retrive_budget_per_seq=4096,
+                retrive_budget_per_seq=model_runner.server_args.sparse_token_budget,
                 device=model_runner.device,
                 async_retrive=True,
                 req_to_token=model_runner.req_to_token_pool.req_to_token,
                 max_seq_len=self.max_context_len,
                 stream_budget=(128, 256),
                 is_cuda_graph=not model_runner.server_args.disable_cuda_graph,
+                moving_average_factor=model_runner.server_args.sparse_moving_average_factor,
             )
         
             self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(manager_config)

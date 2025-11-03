@@ -26,6 +26,7 @@ class ManagerConfig:
         stream_budget: Tuple[int, int],
         is_cuda_graph: bool,
         decode_cuda_graph_metadata: Optional[dict] = None,
+        moving_average_factor: float = 0.4,
     ):
         self.keys = keys
         self.values = values
@@ -48,6 +49,7 @@ class ManagerConfig:
         ) // self.page_size
         self.head_num = self.keys[0].shape[1]
         self.head_dim = self.keys[0].shape[2]
+        self.moving_average_factor = moving_average_factor
 
 
 class RetriveQuery:
@@ -237,10 +239,9 @@ class CacheManager:
 
         bs = req_pool_indices.shape[0]
         pre_bs = self.retrived_query[layer_id].bs
-        moving_average_factor = 0.9
         moving_average_update(self.retrived_query[layer_id].query[:bs], query[:bs], 
                               req_pool_indices[:bs], self.retrived_query[layer_id].req_pool_indices[:pre_bs], 
-                              moving_average_factor)
+                              self.config.moving_average_factor)
         self.retrived_query[layer_id].req_pool_indices[:bs] = req_pool_indices
         self.retrived_query[layer_id].seq_lens[:bs] = seq_lens
         self.retrived_query[layer_id].updated = True

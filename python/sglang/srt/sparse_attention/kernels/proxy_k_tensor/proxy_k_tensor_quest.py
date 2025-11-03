@@ -145,10 +145,11 @@ def proxy_k_tensor_extend_kernel(
     NUM_HEAD: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     max_seq_len: tl.constexpr,
+    BLOCK_NUM: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
-    block_idx = tl.program_id(2)
+    block_inner_idx = tl.program_id(2)
 
     seq_len = tl.load(seq_lens_ptr + req_idx)
     prefix_len = tl.load(prefix_lens_ptr + req_idx)
@@ -156,58 +157,53 @@ def proxy_k_tensor_extend_kernel(
 
     extend_len = seq_len - prefix_len
 
-    page_offset = prefix_len + block_idx * PAGE_SIZE
-    if extend_len <= 0 or page_offset < prefix_len or page_offset >= seq_len:
+    if extend_len <= 0:
         return
-
-    page_offset = page_offset + tl.arange(0, PAGE_SIZE)
     
-    page_index_ptr = req_to_token_ptr + req_pool_idx * max_seq_len + page_offset
-    block_mask = page_offset < seq_len
+    for page_start in range(prefix_len+block_inner_idx*PAGE_SIZE, seq_len, BLOCK_NUM*PAGE_SIZE):
+        page_offset = page_start + tl.arange(0, PAGE_SIZE)
+        
+        page_index_ptr = req_to_token_ptr + req_pool_idx * max_seq_len + page_offset
+        block_mask = page_offset < seq_len
 
-    token_indices = tl.load(page_index_ptr, mask=block_mask, other=0)
+        token_indices = tl.load(page_index_ptr, mask=block_mask, other=0)
 
-    valid_mask = block_mask & (token_indices > 0)
-    head_dim_offset = tl.arange(0, HEAD_DIM)
+        valid_mask = block_mask & (token_indices > 0)
+        head_dim_offset = tl.arange(0, HEAD_DIM)
 
-    key_cache_offsets = (
-        token_indices[:, None] * NUM_HEAD * HEAD_DIM
-        + head_idx * HEAD_DIM
-        + head_dim_offset[None, :]
-    )
-    key_values = tl.load(
-        key_cache_ptr + key_cache_offsets, mask=valid_mask[:, None], other=0.0
-    )
-
-    masked_min_values = tl.where(valid_mask[:, None], key_values, float("inf"))
-    masked_max_values = tl.where(valid_mask[:, None], key_values, float("-inf"))
-
-    block_min = tl.min(masked_min_values, axis=0)
-    block_max = tl.max(masked_max_values, axis=0)
-
-    # proxy_k_tensor shape: [num_pages, 2, num_head, num_dim]
-    # 0: min, 1: max
-    first_token_in_page = (
-        tl.load(
-            req_to_token_ptr
-            + req_pool_idx * max_seq_len
-            + prefix_len
-            + block_idx * PAGE_SIZE
+        key_cache_offsets = (
+            token_indices[:, None] * NUM_HEAD * HEAD_DIM
+            + head_idx * HEAD_DIM
+            + head_dim_offset[None, :]
         )
-        // PAGE_SIZE
-    )
+        key_values = tl.load(
+            key_cache_ptr + key_cache_offsets, mask=valid_mask[:, None], other=0.0
+        )
 
-    save_offset = (
-        first_token_in_page * 2 * NUM_HEAD * HEAD_DIM
-        + head_idx * HEAD_DIM
-        + head_dim_offset
-    )
+        masked_min_values = tl.where(valid_mask[:, None], key_values, float("inf"))
+        masked_max_values = tl.where(valid_mask[:, None], key_values, float("-inf"))
 
-    # min_offset = page_idx * 2 * num_head * num_dim + head_idx * num_dim + dim_idx
-    # max_offset = page_idx * 2 * num_head * num_dim + num_head * num_dim + head_idx * num_dim + dim_idx
+        block_min = tl.min(masked_min_values, axis=0)
+        block_max = tl.max(masked_max_values, axis=0)
 
-    tl.store(proxy_k_tensor_ptr + save_offset, block_min)
-    tl.store(proxy_k_tensor_ptr + save_offset + NUM_HEAD * HEAD_DIM, block_max)
+        # proxy_k_tensor shape: [num_pages, 2, num_head, num_dim]
+        # 0: min, 1: max
+        first_token_in_page = (
+            tl.load(
+                req_to_token_ptr
+                + req_pool_idx * max_seq_len
+                + page_start
+            )
+            // PAGE_SIZE
+        )
+
+        save_offset = (
+            first_token_in_page * 2 * NUM_HEAD * HEAD_DIM
+            + head_idx * HEAD_DIM
+            + head_dim_offset
+        )
+        tl.store(proxy_k_tensor_ptr + save_offset, block_min)
+        tl.store(proxy_k_tensor_ptr + save_offset + NUM_HEAD * HEAD_DIM, block_max)
 
 
 def proxy_k_tensor_extend(
@@ -222,7 +218,8 @@ def proxy_k_tensor_extend(
     bs = seq_lens.shape[0]
     _, _, num_head, head_dim = proxy_k_tensor.shape
     max_seq_len = req_to_token.shape[1]
-    grid = (bs, num_head, triton.cdiv(max_seq_len, page_size))
+    BLOCK_NUM = 128
+    grid = (bs, num_head, triton.cdiv(max_seq_len, BLOCK_NUM))
     proxy_k_tensor_extend_kernel[grid](
         key_cache,
         seq_lens,
@@ -234,4 +231,5 @@ def proxy_k_tensor_extend(
         num_head,
         head_dim,
         max_seq_len,
+        BLOCK_NUM=BLOCK_NUM,
     )
