@@ -677,7 +677,8 @@ class Engine(EngineBase):
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
+    if "NCCL_CUMEM_ENABLE" not in os.environ:
+        os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if not server_args.enable_symm_mem:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
@@ -711,7 +712,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.4.1",
+            "0.5.0",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
