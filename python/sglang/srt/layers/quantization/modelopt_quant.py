@@ -1605,10 +1605,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 sm.tag(symm_output)
 
+            # FlashInfer CUTLASS expects token_final_scales (routing weights)
+            # to be float32. Ensure dtype to avoid capture-time mismatches.
             output = flashinfer_cutlass_fused_moe(
                 input=x,
                 token_selected_experts=topk_ids.to(torch.int),
-                token_final_scales=topk_weights,
+                token_final_scales=topk_weights.to(torch.float32),
                 fc1_expert_weights=layer.w13_weight.view(torch.long),
                 fc2_expert_weights=layer.w2_weight.view(torch.long),
                 output_dtype=output_dtype,
