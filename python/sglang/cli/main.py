@@ -9,6 +9,9 @@ from typing import Optional
 import filelock
 from huggingface_hub import hf_hub_download
 
+from sglang.cli.generate import generate
+from sglang.cli.serve import serve
+
 logger = logging.getLogger(__name__)
 
 temp_dir = tempfile.gettempdir()
@@ -157,18 +160,12 @@ def main():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
-    # serve subcommand
-    from sglang.cli.serve import serve
-
     serve_parser = subparsers.add_parser(
         "serve",
         help="Launch the SGLang server.",
         add_help=False,  # Defer help to the specific parser
     )
     serve_parser.set_defaults(func=serve)
-
-    # generate subcommand
-    from sglang.cli.generate import generate
 
     generate_parser = subparsers.add_parser(
         "generate",
