@@ -48,7 +48,7 @@ in the GitHub search bar.
 
 ## Video Input Support
 
-Some multimodal families can ingest short video clips. SGLang decodes the clip, samples a limited set of frames, and forwards them through the visual tower, so overall latency still depends on clip length.
+SGLang supports video input for Vision-Language Models (VLMs), enabling temporal reasoning tasks such as video question answering, captioning, and holistic scene understanding. Video clips are decoded, key frames are sampled, and the resulting tensors are batched together with the text prompt, allowing multimodal inference to integrate visual and linguistic context.
 
 | Model Family | Example Identifier | Video notes |
 |--------------|--------------------|-------------|
@@ -58,6 +58,36 @@ Some multimodal families can ingest short video clips. SGLang decodes the clip, 
 | **LLaVA video variants** (LLaVA-NeXT-Video, LLaVA-OneVision) | `lmms-lab/LLaVA-NeXT-Video-7B` | The processor routes video prompts to the LlavaVid video-enabled architecture, and the provided example shows how to query it with `sgl.video(...)` clips. |
 
 Use `sgl.video(path, num_frames)` when building prompts to attach clips from your SGLang programs.
+
+Example OpenAI-compatible request that sends a video clip:
+
+```python
+import requests
+
+url = "http://localhost:30000/v1/chat/completions"
+
+data = {
+    "model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What’s happening in this video?"},
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": "https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4"
+                    },
+                },
+            ],
+        }
+    ],
+    "max_tokens": 300,
+}
+
+response = requests.post(url, json=data)
+print(response.text)
+```
 
 ## Usage Notes
 
