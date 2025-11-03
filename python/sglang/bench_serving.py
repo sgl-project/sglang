@@ -2039,6 +2039,9 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
+    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
+    server_info = resp.json() if resp.status_code == 200 else None
+
     if (
         metrics.median_ttft_ms is not None
         and metrics.mean_itl_ms is not None
@@ -2055,6 +2058,8 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
+            # Information
+            "server_info": server_info,
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
