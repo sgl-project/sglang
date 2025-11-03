@@ -1,7 +1,7 @@
 //! Shared response processing logic for gRPC routers
 //!
 //! This module contains response processing functions that are shared between
-//! the regular router and PD router, eliminating ~1,200 lines of exact duplicates.
+//! the regular router and PD router.
 
 use std::{sync::Arc, time::Instant};
 

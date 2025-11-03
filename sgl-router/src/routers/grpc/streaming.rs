@@ -1,7 +1,6 @@
 //! Streaming response processor for gRPC routers
 //!
-//! This module contains shared streaming logic for both Regular and PD routers,
-//! eliminating ~600 lines of duplication.
+//! This module contains shared streaming logic for both Regular and PD router.
 
 use std::{collections::HashMap, io, sync::Arc, time::Instant};
 
