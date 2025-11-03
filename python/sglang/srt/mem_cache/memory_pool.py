@@ -33,7 +33,6 @@ KVCache actually holds the physical kv cache.
 
 import abc
 import logging
-import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -46,16 +45,11 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
+    init_custom_mem_pool,
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_cuda,
-    is_float4_e2m1fn_x2,
-    is_npu,
-    next_power_of_2,
-)
+from sglang.srt.utils import is_cuda, is_float4_e2m1fn_x2, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -167,36 +161,9 @@ class MambaPool:
         num_mamba_layers = len(cache_params.layers)
 
         # for disagg with nvlink
-        custom_mem_pool_type = os.getenv("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
-        if custom_mem_pool_type is not None:
-            # Handle boolean True as NVLINK
-            if custom_mem_pool_type.lower() == "true":
-                custom_mem_pool_type = "NVLINK"
-            self.enable_custom_mem_pool = (
-                custom_mem_pool_type in SUPPORTED_CUSTOM_MEM_POOL_TYPES
-            )
-        else:
-            self.enable_custom_mem_pool = False
-
-        if self.enable_custom_mem_pool:
-            # TODO(shangming): abstract custom allocator class for more backends
-            if custom_mem_pool_type == "NVLINK":
-                from mooncake.allocator import NVLinkAllocator
-
-                allocator = NVLinkAllocator.get_allocator(self.device)
-            elif custom_mem_pool_type == "BAREX":
-                from mooncake.allocator import BarexAllocator
-
-                allocator = BarexAllocator.get_allocator(self.device)
-            else:
-                # This should not happen due to the enable_custom_mem_pool check above
-                raise ValueError(
-                    f"Unsupported custom mem pool type: {custom_mem_pool_type}"
-                )
-
-            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
-        else:
-            self.custom_mem_pool = None
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = init_custom_mem_pool(
+            device=self.device
+        )
 
         self.is_kda_cache = isinstance(cache_params, KimiLinearCacheParams)
         with (
@@ -507,34 +474,9 @@ class KVCache(abc.ABC):
         self.layer_transfer_counter = None
 
         # for disagg with nvlink
-        custom_mem_pool_type = os.getenv("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
-        if custom_mem_pool_type is not None:
-            # Handle boolean True as NVLINK
-            if custom_mem_pool_type.lower() == "true":
-                custom_mem_pool_type = "NVLINK"
-            self.enable_custom_mem_pool = custom_mem_pool_type in SUPPORTED_CUSTOM_MEM_POOL_TYPES
-        else:
-            self.enable_custom_mem_pool = False
-
-        if self.enable_custom_mem_pool:
-            # TODO(shangming): abstract custom allocator class for more backends
-            if custom_mem_pool_type == "NVLINK":
-                from mooncake.allocator import NVLinkAllocator
-
-                allocator = NVLinkAllocator.get_allocator(self.device)
-            elif custom_mem_pool_type == "BAREX":
-                from mooncake.allocator import BarexAllocator
-
-                allocator = BarexAllocator.get_allocator(self.device)
-            else:
-                # This should not happen due to the enable_custom_mem_pool check above
-                raise ValueError(
-                    f"Unsupported custom mem pool type: {custom_mem_pool_type}"
-                )
-
-            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
-        else:
-            self.custom_mem_pool = None
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = init_custom_mem_pool(
+            device=self.device
+        )
 
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
@@ -1102,34 +1044,9 @@ class SWAKVPool(KVCache):
         assert not enable_kvcache_transpose
 
         # for disagg with nvlink
-        custom_mem_pool_type = os.getenv("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
-        if custom_mem_pool_type is not None:
-            # Handle boolean True as NVLINK
-            if custom_mem_pool_type.lower() == "true":
-                custom_mem_pool_type = "NVLINK"
-            self.enable_custom_mem_pool = custom_mem_pool_type in SUPPORTED_CUSTOM_MEM_POOL_TYPES
-        else:
-            self.enable_custom_mem_pool = False
-
-        if self.enable_custom_mem_pool:
-            # TODO(shangming): abstract custom allocator class for more backends
-            if custom_mem_pool_type == "NVLINK":
-                from mooncake.allocator import NVLinkAllocator
-
-                allocator = NVLinkAllocator.get_allocator(self.device)
-            elif custom_mem_pool_type == "BAREX":
-                from mooncake.allocator import BarexAllocator
-
-                allocator = BarexAllocator.get_allocator(self.device)
-            else:
-                # This should not happen due to the enable_custom_mem_pool check above
-                raise ValueError(
-                    f"Unsupported custom mem pool type: {custom_mem_pool_type}"
-                )
-
-            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
-        else:
-            self.custom_mem_pool = None
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = init_custom_mem_pool(
+            device=self.device
+        )
 
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,

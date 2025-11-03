@@ -29,13 +29,11 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.mem_cache.utils import check_custom_mem_pool_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import format_tcp_address, get_int_env_var, is_valid_ipv6_address
 
 logger = logging.getLogger(__name__)
-
-# Global constants for custom memory pool types
-SUPPORTED_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX"]
 
 
 class KVTransferError(Exception):
@@ -199,16 +197,9 @@ class MooncakeKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
             )
 
-            custom_mem_pool_type = os.getenv("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
-            if custom_mem_pool_type is not None:
-                # Handle boolean True as NVLINK
-                if custom_mem_pool_type.lower() == "true":
-                    custom_mem_pool_type = "NVLINK"
-                self.enable_custom_mem_pool = (
-                    custom_mem_pool_type in SUPPORTED_CUSTOM_MEM_POOL_TYPES
-                )
-            else:
-                self.enable_custom_mem_pool = False
+            self.enable_custom_mem_pool, custom_mem_pool_type = (
+                check_custom_mem_pool_enabled()
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
             self.session_pool = defaultdict(requests.Session)
