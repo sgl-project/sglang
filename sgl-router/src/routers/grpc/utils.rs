@@ -107,10 +107,7 @@ pub fn process_content_format(
 }
 
 /// Transform a single content field based on content format
-fn transform_content_field(
-    content_value: &mut Value,
-    content_format: ChatTemplateContentFormat,
-) {
+fn transform_content_field(content_value: &mut Value, content_format: ChatTemplateContentFormat) {
     let Some(content_array) = content_value.as_array() else {
         return; // Not multimodal, keep as-is
     };

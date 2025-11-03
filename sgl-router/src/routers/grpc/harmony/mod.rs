@@ -32,7 +32,7 @@
 pub mod builder;
 pub mod detector;
 pub mod parser;
-pub mod processing;
+pub mod processor;
 pub mod responses;
 pub mod stages;
 pub mod streaming;
@@ -42,7 +42,7 @@ pub mod types;
 pub use builder::HarmonyBuilder;
 pub use detector::HarmonyDetector;
 pub use parser::HarmonyParserAdapter;
-pub use processing::{HarmonyResponseProcessor, ResponsesIterationResult};
+pub use processor::{HarmonyResponseProcessor, ResponsesIterationResult};
 pub use responses::{
     serve_harmony_responses, serve_harmony_responses_stream, HarmonyResponsesContext,
 };

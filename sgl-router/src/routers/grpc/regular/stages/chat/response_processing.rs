@@ -11,7 +11,7 @@ use axum::response::Response;
 use crate::routers::grpc::{
     common::stages::PipelineStage,
     context::{FinalResponse, RequestContext},
-    regular::{processing, streaming},
+    regular::{processor, streaming},
     utils,
 };
 
@@ -19,13 +19,13 @@ use crate::routers::grpc::{
 ///
 /// Extracts chat-specific response processing logic from the old unified ResponseProcessingStage.
 pub struct ChatResponseProcessingStage {
-    processor: processing::ResponseProcessor,
+    processor: processor::ResponseProcessor,
     streaming_processor: Arc<streaming::StreamingProcessor>,
 }
 
 impl ChatResponseProcessingStage {
     pub fn new(
-        processor: processing::ResponseProcessor,
+        processor: processor::ResponseProcessor,
         streaming_processor: Arc<streaming::StreamingProcessor>,
     ) -> Self {
         Self {

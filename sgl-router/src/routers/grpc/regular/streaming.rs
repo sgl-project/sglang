@@ -16,7 +16,6 @@ use tokio::sync::{mpsc, mpsc::UnboundedSender};
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tracing::{debug, error, warn};
 
-use super::{context, utils};
 use crate::{
     grpc_client::proto,
     protocols::{
@@ -30,6 +29,7 @@ use crate::{
         generate::GenerateRequest,
     },
     reasoning_parser::ReasoningParser,
+    routers::grpc::{context, utils},
     tokenizer::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
         traits::Tokenizer,

@@ -9,7 +9,7 @@ use super::{chat::ChatResponseProcessingStage, generate::GenerateResponseProcess
 use crate::routers::grpc::{
     common::stages::PipelineStage,
     context::{RequestContext, RequestType},
-    regular::{processing, streaming},
+    regular::{processor, streaming},
     utils, error,
 };
 
@@ -21,11 +21,14 @@ pub struct ResponseProcessingStage {
 
 impl ResponseProcessingStage {
     pub fn new(
-        processor: processing::ResponseProcessor,
+        processor: processor::ResponseProcessor,
         streaming_processor: Arc<streaming::StreamingProcessor>,
     ) -> Self {
         Self {
-            chat_stage: ChatResponseProcessingStage::new(processor.clone(), streaming_processor.clone()),
+            chat_stage: ChatResponseProcessingStage::new(
+                processor.clone(),
+                streaming_processor.clone(),
+            ),
             generate_stage: GenerateResponseProcessingStage::new(processor, streaming_processor),
         }
     }

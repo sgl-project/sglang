@@ -5,7 +5,10 @@
 
 use axum::response::Response;
 
-use super::{context::ExecutionResult, proto, utils};
+use crate::{
+    grpc_client::proto,
+    routers::grpc::{context::ExecutionResult, utils},
+};
 
 /// Collect and merge responses from execution result
 ///

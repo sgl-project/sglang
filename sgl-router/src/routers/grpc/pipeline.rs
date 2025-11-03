@@ -12,7 +12,7 @@ use tracing::{debug, error};
 // Import common stages (used by all pipelines)
 use super::common::stages::*;
 // Import regular stages
-use super::regular::{processing, stages::*, error, streaming};
+use super::regular::{processor, stages::*, error, streaming};
 use super::{context::*, harmony, responses::BackgroundTaskInfo, utils};
 use crate::{
     core::WorkerRegistry,
@@ -51,7 +51,7 @@ impl RequestPipeline {
         configured_reasoning_parser: Option<String>,
     ) -> Self {
         // Create response processor
-        let processor = processing::ResponseProcessor::new(
+        let processor = processor::ResponseProcessor::new(
             tokenizer.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
@@ -156,7 +156,7 @@ impl RequestPipeline {
         configured_reasoning_parser: Option<String>,
     ) -> Self {
         // Create response processor
-        let processor = processing::ResponseProcessor::new(
+        let processor = processor::ResponseProcessor::new(
             tokenizer.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),

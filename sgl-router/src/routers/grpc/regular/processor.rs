@@ -9,10 +9,6 @@ use proto::generate_complete::MatchedStop;
 use serde_json::Value;
 use tracing::error;
 
-use super::{
-    context::{DispatchMetadata, ExecutionResult},
-    response_collection, response_formatting, utils, error
-};
 use crate::{
     grpc_client::proto,
     protocols::{
@@ -21,6 +17,11 @@ use crate::{
         generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
+    routers::grpc::{
+        common::{response_collection, response_formatting},
+        context::{DispatchMetadata, ExecutionResult},
+        utils,
+    },
     tokenizer::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
         traits::Tokenizer,
@@ -58,7 +59,6 @@ impl ResponseProcessor {
             configured_reasoning_parser,
         }
     }
-
 
     /// Process a single choice from GenerateComplete response
     #[allow(clippy::too_many_arguments)]

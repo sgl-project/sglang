@@ -63,14 +63,15 @@ impl PipelineStage for ChatRequestBuildingStage {
                     .clone(),
                 prep.tool_constraints.clone(),
             )
-            .map_err(|e| {
-                utils::bad_request_error(format!("Invalid request parameters: {}", e))
-            })?;
+            .map_err(|e| utils::bad_request_error(format!("Invalid request parameters: {}", e)))?;
 
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
             if let WorkerSelection::Dual { prefill, .. } = ctx.state.workers.as_ref().unwrap() {
-                super::super::common::helpers::inject_bootstrap_metadata(&mut proto_request, prefill);
+                crate::routers::grpc::common::stages::helpers::inject_bootstrap_metadata(
+                    &mut proto_request,
+                    prefill,
+                );
             }
         }
 

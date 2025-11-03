@@ -64,7 +64,10 @@ impl PipelineStage for GenerateRequestBuildingStage {
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
             if let WorkerSelection::Dual { prefill, .. } = ctx.state.workers.as_ref().unwrap() {
-                super::super::common::helpers::inject_bootstrap_metadata(&mut proto_request, prefill);
+                crate::routers::grpc::common::stages::helpers::inject_bootstrap_metadata(
+                    &mut proto_request,
+                    prefill,
+                );
             }
         }
 

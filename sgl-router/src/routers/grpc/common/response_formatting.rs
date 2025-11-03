@@ -10,9 +10,8 @@ use crate::{
         chat::{ChatChoice, ChatCompletionResponse},
         common::Usage,
     },
+    routers::grpc::context::DispatchMetadata,
 };
-
-use super::context::DispatchMetadata;
 
 /// Build usage information from collected gRPC responses
 ///

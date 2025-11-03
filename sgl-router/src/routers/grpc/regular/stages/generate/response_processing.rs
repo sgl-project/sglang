@@ -8,7 +8,7 @@ use axum::response::Response;
 use crate::routers::grpc::{
     common::stages::PipelineStage,
     context::{FinalResponse, RequestContext},
-    regular::{processing, streaming},
+    regular::{processor, streaming},
     utils,
 };
 
@@ -16,13 +16,13 @@ use crate::routers::grpc::{
 ///
 /// Extracts generate-specific response processing logic from the old unified ResponseProcessingStage.
 pub struct GenerateResponseProcessingStage {
-    processor: processing::ResponseProcessor,
+    processor: processor::ResponseProcessor,
     streaming_processor: Arc<streaming::StreamingProcessor>,
 }
 
 impl GenerateResponseProcessingStage {
     pub fn new(
-        processor: processing::ResponseProcessor,
+        processor: processor::ResponseProcessor,
         streaming_processor: Arc<streaming::StreamingProcessor>,
     ) -> Self {
         Self {

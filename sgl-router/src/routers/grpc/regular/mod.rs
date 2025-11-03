@@ -3,6 +3,6 @@
 //! This module contains all code specific to regular tokenizer-based models,
 //! including pipeline stages, response processing, and streaming.
 
-pub mod processing;
+pub mod processor;
 pub mod stages;
 pub mod streaming;

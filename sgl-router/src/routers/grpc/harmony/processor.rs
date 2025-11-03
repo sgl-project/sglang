@@ -17,8 +17,9 @@ use crate::{
         },
     },
     routers::grpc::{
+        common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
-        common::response_collection, common::response_formatting, utils, error,
+        utils, error,
     },
 };
 
@@ -33,7 +34,6 @@ impl HarmonyResponseProcessor {
     pub fn new() -> Self {
         Self
     }
-
 
     /// Process a non-streaming Harmony chat response
     pub async fn process_non_streaming_chat_response(
