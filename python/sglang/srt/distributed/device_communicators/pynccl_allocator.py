@@ -74,6 +74,18 @@ def get_nccl_mem_pool():
 
 
 class use_symmetric_memory:
+    """
+    Context manager for using symmetric memory with pynccl.
+
+    To Utilize the symmetric memory feature in NCCL, the buffers need to be allocated
+    by `ncclMemAlloc` and registered by `ncclCommWindowRegister`. Due to this, we introduce
+    this context manager. All tensors created under this context will be correctly
+    allocated and registered with a custom allocator.
+
+    In addition, developers need to manually tag the tensors that will be used as the input/output
+    of NCCL collectives with `tag(tensor)`.
+    """
+
     def __init__(self, group_coordinator: GroupCoordinator):
         self.enabled = is_symmetric_memory_enabled()
 
@@ -103,7 +115,9 @@ class use_symmetric_memory:
         self._mem_pool_ctx.__enter__()
 
         # Set the env var to pass this argument to the C functions.
-        os.environ["SGLANG_TMP_NCCL_COMM_VALUE"] = str(self.group_coordinator.pynccl_comm.comm.value)
+        os.environ["SGLANG_TMP_NCCL_COMM_VALUE"] = str(
+            self.group_coordinator.pynccl_comm.comm.value
+        )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -114,13 +128,10 @@ class use_symmetric_memory:
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
 
         if self.is_graph_capture:
-            torch._C._cuda_beginAllocateCurrentThreadToPool(
-                self.device, _graph_pool_id
-            )
+            torch._C._cuda_beginAllocateCurrentThreadToPool(self.device, _graph_pool_id)
 
     def tag(self, tensor: torch.Tensor):
         if not self.enabled:
             return
 
         tensor.symmetric_memory = True
-
