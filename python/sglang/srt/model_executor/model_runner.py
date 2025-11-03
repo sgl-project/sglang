@@ -1487,7 +1487,7 @@ class ModelRunner:
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig):
+        if isinstance(config, Qwen3NextConfig | JetNemotronConfig):
             return config
         return None
 
@@ -1499,15 +1499,8 @@ class ModelRunner:
         return None
 
     @property
-    def jet_block_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, JetNemotronConfig):
-            return config
-        return None
-
-    @property
     def mambaish_config(self):
-        return self.mamba2_config or self.hybrid_gdn_config or self.jet_block_config
+        return self.mamba2_config or self.hybrid_gdn_config
 
     def set_num_token_hybrid(self):
         if (
