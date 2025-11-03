@@ -142,14 +142,17 @@ class Glm4MoeMLP(nn.Module):
         self,
         x,
         forward_batch=None,
-        should_allreduce_fusion=False,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, skip_all_reduce=should_allreduce_fusion)
+        x, _ = self.down_proj(
+            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        )
         return x
 
 
@@ -442,58 +445,13 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-        if not self._enable_a2a_moe:
-            DUAL_STREAM_TOKEN_THRESHOLD = 1024
-            if (
-                self.alt_stream is not None
-                and self.num_fused_shared_experts == 0
-                and hidden_states.shape[0] > 0
-                and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
-            ):
-                return self.forward_normal_dual_stream(
-                    hidden_states, should_allreduce_fusion, use_reduce_scatter
-                )
-            else:
-                return self.forward_normal(
-                    hidden_states, should_allreduce_fusion, use_reduce_scatter
-                )
+
+        if not get_moe_a2a_backend().is_deepep():
+            return self.forward_normal(
+                hidden_states, should_allreduce_fusion, use_reduce_scatter
+            )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
-
-    def forward_normal_dual_stream(
-        self,
-        hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
-
-        current_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(hidden_states)
-
-        with torch.cuda.stream(self.alt_stream):
-            # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
-            final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda:
-                final_hidden_states *= self.routed_scaling_factor
-
-        current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-            final_hidden_states_out = torch.empty_like(final_hidden_states)
-
-        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-        final_hidden_states = final_hidden_states_out
-        sm.tag(final_hidden_states)
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        return final_hidden_states
 
     def forward_normal(
         self,
@@ -579,15 +537,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             state.router_logits = self.gate(state.hidden_states_mlp_input)
         else:
             state.router_logits = None
-
-    def op_shared_experts(self, state):
-        hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
-        if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, hidden_states_mlp_input
-        ):
-            state.shared_output = self.shared_experts(hidden_states_mlp_input)
-        else:
-            state.shared_output = None
 
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
@@ -760,6 +709,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -774,13 +724,95 @@ class Glm4MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
         )
 
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        hidden_states = self.mlp(
+            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+        )
+
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+
         return hidden_states, residual
+
+    def op_comm_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: Optional[int] = None,
+    ):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        )
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_comm_prepare_mlp(self, state):
+        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
+            self.layer_communicator.prepare_mlp(
+                state.pop("hidden_states_after_attn"),
+                state.pop("residual_after_input_ln"),
+                state.forward_batch,
+            )
+        )
+
+    def op_mlp(self, state):
+        hidden_states = state.pop("hidden_states_mlp_input")
+        if not (
+            enable_moe_dense_fully_dp()
+            and (not self.is_layer_sparse)
+            and hidden_states.shape[0] == 0
+        ):
+            state.hidden_states_mlp_output = self.mlp(
+                hidden_states, state.forward_batch
+            )
+        else:
+            state.hidden_states_mlp_output = hidden_states
+
+    def op_comm_postprocess_layer(self, state):
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            state.pop("hidden_states_mlp_output"),
+            state.pop("residual_after_comm_pre_mlp"),
+            state.forward_batch,
+        )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+
+        state.clear(
+            expect_keys={
+                "positions",
+                "forward_batch",
+                "tbo_subbatch_index",
+            }
+        )
+        return output
 
 
 class Glm4MoeModel(nn.Module):
