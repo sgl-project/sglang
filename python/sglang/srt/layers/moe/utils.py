@@ -51,7 +51,7 @@ class MoeRunnerBackend(Enum):
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
-    TRITON_KERNEL = "triton_kernel"
+    TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
@@ -67,8 +67,8 @@ class MoeRunnerBackend(Enum):
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON
 
-    def is_triton_kernel(self):
-        return self == MoeRunnerBackend.TRITON_KERNEL
+    def is_triton_kernels(self):
+        return self == MoeRunnerBackend.TRITON_KERNELS
 
     def is_flashinfer_trtllm(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM
@@ -152,7 +152,6 @@ def initialize_moe_config(server_args: ServerArgs):
 def get_moe_a2a_backend() -> MoeA2ABackend:
     global MOE_A2A_BACKEND
     if MOE_A2A_BACKEND is None:
-        logger.warning("MOE_A2A_BACKEND is not initialized, using default backend")
         MOE_A2A_BACKEND = MoeA2ABackend.NONE
     return MOE_A2A_BACKEND
 
