@@ -1431,8 +1431,8 @@ def launch_server(
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
-# Minimal 1x1 black PNG (base64)
-MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+# Minimal 2x2 black PNG (base64, 1x1 image would cause ambiguous in image channel dimension)
+MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEElEQVQImWNgYGD4z8DAAAQYAAH7u8WFAAAAAElFTkSuQmCC"
 
 
 def _execute_server_warmup(
