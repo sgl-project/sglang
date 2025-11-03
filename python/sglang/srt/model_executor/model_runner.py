@@ -722,7 +722,7 @@ class ModelRunner:
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             modelopt_config=modelopt_config,
         )
-        if self.device == "cpu":
+        if self.device == "cpu" and self.tp_size > 1:
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
             )

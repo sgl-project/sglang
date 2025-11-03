@@ -125,7 +125,7 @@ class GptOssSparseMoeBlock(nn.Module):
             extra_kwargs = {
                 # for moe gate_up_proj and down_proj and their bias loading
                 "use_weight_loader_fused": quant_config_name
-                != "mxfp4"
+                not in ["mxfp4", "gptq"],
             }
         self.experts = experts_type(
             num_experts=config.num_local_experts
@@ -990,12 +990,21 @@ class GptOssForCausalLM(nn.Module):
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
-        expert_params_mapping = FusedMoE.make_expert_params_mapping_fused(
-            ckpt_gate_up_proj_name="gate_up_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
-            ckpt_down_proj_bias_name="down_proj_bias",
-        )
+        if self.quant_config is not None and (self.quant_config.get_name() == "gptq"):
+            expert_params_mapping = (
+                FusedMoE.make_expert_params_mapping_fused_gptoss_gptq(
+                    num_experts=self.config.num_local_experts,
+                    ckpt_gate_up_proj_name="gate_up_projs",
+                    ckpt_down_proj_name="down_projs",
+                )
+            )
+        else:
+            expert_params_mapping = FusedMoE.make_expert_params_mapping_fused(
+                ckpt_gate_up_proj_name="gate_up_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
+                ckpt_down_proj_bias_name="down_proj_bias",
+            )
 
         params_dict = dict(self.named_parameters())
 
@@ -1037,27 +1046,45 @@ class GptOssForCausalLM(nn.Module):
                 break
             else:
                 for mapping in expert_params_mapping:
-                    param_name, weight_name, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    if name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    if "bias" not in name:
-                        loaded_weight = loaded_weight.transpose(-2, -1)
-                    if "w2_weight_bias" in name and get_moe_tensor_parallel_rank() != 0:
-                        loaded_weight = loaded_weight.zero_()
+                    if len(mapping) == 3:
+                        param_name, weight_name, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        if "bias" not in name:
+                            loaded_weight = loaded_weight.transpose(-2, -1)
+                        if "w2_weight_bias" in name and get_moe_tensor_parallel_rank() != 0:
+                            loaded_weight = loaded_weight.zero_()
 
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                    )
-                    break
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                        )
+                        break
+                    else:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                        break
                 else:
+                    if "router" in name:
+                        name = name.replace("router.router", "router")
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     if name not in params_dict:
