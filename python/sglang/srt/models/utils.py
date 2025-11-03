@@ -94,9 +94,7 @@ class AutoWeightsLoader:
             (weight_name.split(".", 1), weight_data)
             for weight_name, weight_data in weights
         )
-        for prefix, group in itertools.groupby(
-            weights_by_parts, key=lambda x: x[0][0]
-        ):
+        for prefix, group in itertools.groupby(weights_by_parts, key=lambda x: x[0][0]):
             yield (
                 prefix,
                 (
@@ -154,14 +152,10 @@ class AutoWeightsLoader:
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, weight_data)
-            logger.debug(
-                "Loaded weight %s with shape %s", weight_qualname, param.shape
-            )
+            logger.debug("Loaded weight %s with shape %s", weight_qualname, param.shape)
             yield weight_qualname
 
-    def _add_loadable_non_param_tensors(
-        self, module: nn.Module, child_params: dict
-    ):
+    def _add_loadable_non_param_tensors(self, module: nn.Module, child_params: dict):
         """Add tensor names not in model params (e.g., batchnorm statistics)."""
         if isinstance(
             module,
