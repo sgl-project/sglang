@@ -8,6 +8,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environs import envs
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens, get_local_dp_buffer
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -40,12 +41,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_str_env_var,
-    is_cuda,
-    next_power_of_2,
-)
+from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -90,19 +86,12 @@ logger = logging.getLogger(__name__)
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
-USE_CUTLASS_BACKEND_FOR_FP4_GEMM = get_bool_env_var(
-    "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM", "true"
-)
-USE_TRTLLM_BACKEND_FOR_FP4_GEMM = get_bool_env_var(
-    "SGLANG_USE_TRTLLM_BACKEND_FOR_FP4_GEMM", "false"
-)
+
 # TODO make it true by default when the DeepEP PR is merged
 CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "false"
 )
-FLASHINFER_FP4_GEMM_BACKEND = get_str_env_var(
-    "SGLANG_FLASHINFER_FP4_GEMM_BACKEND", ""
-)
+FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
@@ -1065,12 +1054,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
-
-        assert not (USE_CUTLASS_BACKEND_FOR_FP4_GEMM and USE_TRTLLM_BACKEND_FOR_FP4_GEMM), (
-            "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM and SGLANG_USE_TRTLLM_BACKEND_FOR_FP4_GEMM"
-            "cannot both be enabled at the same time."
-        )
-        if 
         out = fp4_gemm(
             x_fp4,
             w,
