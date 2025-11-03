@@ -39,6 +39,9 @@ if not (_is_npu or _is_hip):
     from sgl_kernel import silu_and_mul
 
 
+_MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
+
+
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile
@@ -214,6 +217,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         from sglang.srt.layers.moe.ep_moe.kernels import (
             silu_and_mul_masked_post_quant_fwd,
         )
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_8bit,
+        )
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -227,15 +233,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         hidden_states_device = running_state["hidden_states_device"]
 
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-            b, s_mn, s_k = hidden_states_scale.shape
-            assert (
-                s_mn % 4 == 0 and s_k % 4 == 0
-            ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
-
         # GroupGemm-0
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-            hidden_states_scale = _cast_to_e8m0_with_rounding_up(hidden_states_scale)
+            if hidden_states_scale.dtype != torch.int:
+                b, s_mn, s_k = hidden_states_scale.shape
+                assert (
+                    s_mn % 4 == 0 and s_k % 4 == 0
+                ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
+                hidden_states_scale = _cast_to_e8m0_with_rounding_up(
+                    hidden_states_scale
+                )
         else:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
@@ -257,33 +264,46 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states_scale)
 
         # Act
-        down_input = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2,
-            ),
-            device=hidden_states_device,
-            dtype=torch.float8_e4m3fn,
-        )
         scale_block_size = 128
-        down_input_scale = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2 // scale_block_size,
-            ),
-            device=hidden_states_device,
-            dtype=torch.float32,
-        )
-        silu_and_mul_masked_post_quant_fwd(
-            gateup_output,
-            down_input,
-            down_input_scale,
-            scale_block_size,
-            masked_m,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        )
+        if _MASKED_GEMM_FAST_ACT:
+            down_input, down_input_scale = sglang_per_token_group_quant_8bit(
+                x=gateup_output,
+                dst_dtype=torch.float8_e4m3fn,
+                group_size=scale_block_size,
+                masked_m=masked_m,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                fuse_silu_and_mul=True,
+                enable_v2=True,
+            )
+        else:
+            down_input = torch.empty(
+                (
+                    gateup_output.shape[0],
+                    gateup_output.shape[1],
+                    gateup_output.shape[2] // 2,
+                ),
+                device=hidden_states_device,
+                dtype=torch.float8_e4m3fn,
+            )
+            down_input_scale = torch.empty(
+                (
+                    gateup_output.shape[0],
+                    gateup_output.shape[1],
+                    gateup_output.shape[2] // 2 // scale_block_size,
+                ),
+                device=hidden_states_device,
+                dtype=torch.float32,
+            )
+            silu_and_mul_masked_post_quant_fwd(
+                gateup_output,
+                down_input,
+                down_input_scale,
+                scale_block_size,
+                masked_m,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
         del gateup_output
 
         # GroupGemm-1
