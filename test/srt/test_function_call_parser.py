@@ -2294,6 +2294,7 @@ class TestGlm4MoeDetector(unittest.TestCase):
         )
         check_single_todos(result, expected_output)
 
+
 class TestJsonArrayParser(unittest.TestCase):
     def setUp(self):
         # Create sample tools for testing
