@@ -204,9 +204,6 @@ async def create_video(
     return VideoResponse(**job)
 
 
-## 请求/响应模型已迁移至 protocol.py
-
-
 @router.get("", response_model=VideoListResponse)
 async def list_videos(
     after: Optional[str] = Query(None),
