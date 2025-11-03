@@ -38,8 +38,8 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.aliyun.com/pypi/simple/"
-          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn mirrors.aliyun.com"
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
           bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
@@ -65,7 +65,7 @@ jobs:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: linux-arm64-npu-2
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         part: [0, 1, 2]
     container:
@@ -80,8 +80,8 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.aliyun.com/pypi/simple/"
-          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn mirrors.aliyun.com"
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
           bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
@@ -118,8 +118,8 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.aliyun.com/pypi/simple/"
-          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn mirrors.aliyun.com"
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
           bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
@@ -144,6 +144,10 @@ jobs:
   per-commit-16-ascend-a3:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: linux-aarch64-a3-16
+    strategy:
+      fail-fast: true
+      matrix:
+        part: [0, 1]
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-a3-ubuntu22.04-py3.11
     steps:
@@ -156,8 +160,8 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.aliyun.com/pypi/simple/"
-          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn mirrors.aliyun.com"
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
           bash scripts/ci/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
@@ -177,4 +181,4 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-16-ascend-a3 --timeout-per-file 3600
+          python3 run_suite.py --suite per-commit-16-ascend-a3 --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
