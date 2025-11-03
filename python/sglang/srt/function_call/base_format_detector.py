@@ -8,6 +8,7 @@ from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -75,19 +76,21 @@ class BaseFormatDetector(ABC):
         results = []
         for act in action:
             name = act.get("name")
-            if name and name in tool_indices:
-                results.append(
-                    ToolCallItem(
-                        tool_index=-1,  # Caller should update this based on the actual tools array called
-                        name=name,
-                        parameters=json.dumps(
-                            act.get("parameters") or act.get("arguments", {}),
-                            ensure_ascii=False,
-                        ),
-                    )
-                )
-            else:
+            if not (name and name in tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
+                if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                    continue  # Skip unknown tools (default legacy behavior)
+
+            results.append(
+                ToolCallItem(
+                    tool_index=-1,  # Caller should update this based on the actual tools array called
+                    name=name,
+                    parameters=json.dumps(
+                        act.get("parameters") or act.get("arguments", {}),
+                        ensure_ascii=False,
+                    ),
+                )
+            )
 
         return results
 
