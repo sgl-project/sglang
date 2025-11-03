@@ -265,6 +265,14 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return default
 
 
+def get_str_env_var(name: str, default: str = "") -> str:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value
+
+
 def support_triton(backend: str) -> bool:
     return backend not in ["torch_native", "intel_amx", "ascend"]
 

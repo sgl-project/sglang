@@ -40,7 +40,12 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_str_env_var,
+    is_cuda,
+    next_power_of_2,
+)
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -95,7 +100,9 @@ USE_TRTLLM_BACKEND_FOR_FP4_GEMM = get_bool_env_var(
 CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "false"
 )
-
+FLASHINFER_FP4_GEMM_BACKEND = get_str_env_var(
+    "SGLANG_FLASHINFER_FP4_GEMM_BACKEND", ""
+)
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
@@ -990,7 +997,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.input_scale_inv = Parameter(
             (1 / input_scale_2).to(torch.float32), requires_grad=False
         )
-        if USE_TRTLLM_BACKEND_FOR_FP4_GEMM:
+        if FLASHINFER_FP4_GEMM_BACKEND == "trtllm":
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -1063,13 +1070,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM and SGLANG_USE_TRTLLM_BACKEND_FOR_FP4_GEMM"
             "cannot both be enabled at the same time."
         )
-        possible_backend = "auto"
-        if USE_TRTLLM_BACKEND_FOR_FP4_GEMM or USE_CUTLASS_BACKEND_FOR_FP4_GEMM:
-            possible_backend = (
-                "trtllm"
-                if USE_TRTLLM_BACKEND_FOR_FP4_GEMM
-                else "cutlass"
-            )
+        if 
         out = fp4_gemm(
             x_fp4,
             w,
@@ -1077,7 +1078,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             w_scale_interleaved,
             layer.alpha,
             output_dtype,
-            **(dict(backend=possible_backend)),
+            **(dict(backend=FLASHINFER_FP4_GEMM_BACKEND) if FLASHINFER_FP4_GEMM_BACKEND else dict()),
         )
         if bias is not None:
             out = out + bias
