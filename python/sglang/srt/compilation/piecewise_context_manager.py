@@ -4,6 +4,7 @@ from typing import Any, List, Optional
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+
 @dataclass
 class ForwardContext:
     def __init__(self):

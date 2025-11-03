@@ -1504,7 +1504,6 @@ class ModelRunner:
         # Determine the kv cache dtype
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
-            print(f"Quant config: {quant_config}")
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
             if (
                 isinstance(kv_cache_quant_algo, str)
