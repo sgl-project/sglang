@@ -83,7 +83,7 @@ def eval_mmmu(args):
         if "InternVL" in args.model_path:
             image = PIL.Image.open(sample["image_path"]).convert("RGB")
             pixel_values = image_to_pixel_values(
-                image, input_size=448, max_num=12, use_thumbnail=True, normalize=True
+                image, input_size=448, max_num=12, use_thumbnail=True
             )
             pixel_values = pixel_values.to(device="cuda", dtype=torch.bfloat16)
             contents = ""

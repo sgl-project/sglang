@@ -5,6 +5,7 @@ from decord import VideoReader
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
+from sglang.srt.multimodal.internvl_utils import video_reader_metadata
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -57,22 +58,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         Returns:
             tuple: A tuple containing processed frames and metadata
         """
-        video_fps = vr.get_avg_fps()
-        total_num_frames = len(vr)
-        duration = total_num_frames / video_fps if video_fps else 0
-
-        # Extract all frames
-        indices = list(range(total_num_frames))
-        frames = vr.get_batch(indices).asnumpy()
-
-        # Return metadata as dict so transformers can properly create VideoMetadata objects
-        metadata = {
-            "total_num_frames": int(total_num_frames),
-            "fps": float(video_fps),
-            "duration": float(duration),
-            "video_backend": "decord",
-            "frames_indices": indices,
-        }
+        frames = vr.get_batch(list(range(len(vr)))).asnumpy()
+        metadata = video_reader_metadata(vr)
 
         return frames, metadata
 

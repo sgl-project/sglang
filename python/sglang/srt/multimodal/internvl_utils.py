@@ -1,25 +1,14 @@
 # copy from https://huggingface.co/OpenGVLab/InternVL3-1B
+from typing import TYPE_CHECKING
+
 import torch
 import torchvision.transforms as T
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
+from transformers.video_utils import VideoMetadata
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
-def build_transform(input_size: int, *, normalize: bool) -> T.Compose:
-    compose_list = [
-        T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
-        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-        T.ToTensor(),
-    ]
-    if normalize:
-        MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
-        compose_list.append(T.Normalize(mean=MEAN, std=STD))
-
-    transform = T.Compose(compose_list)
-    return transform
+if TYPE_CHECKING:
+    from decord import VideoReader
 
 
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
@@ -89,6 +78,10 @@ def dynamic_preprocess(
     return processed_images
 
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
 def image_to_pixel_values(
     image: Image.Image,
     *,
@@ -96,9 +89,9 @@ def image_to_pixel_values(
     min_num_tiles: int = 1,
     max_num_tiles: int,
     use_thumbnail: bool,
-    normalize: bool,
+    mean: tuple[float, float, float] = IMAGENET_MEAN,
+    std: tuple[float, float, float] = IMAGENET_STD,
 ) -> torch.Tensor:
-    transform = build_transform(input_size=input_size, normalize=normalize)
     images = dynamic_preprocess(
         image,
         min_num=min_num_tiles,
@@ -106,6 +99,32 @@ def image_to_pixel_values(
         image_size=input_size,
         use_thumbnail=use_thumbnail,
     )
+    transform = T.Compose(
+        [
+            T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=mean, std=std),
+        ]
+    )
     pixel_values = [transform(image) for image in images]
     pixel_values = torch.stack(pixel_values)
     return pixel_values
+
+
+# adapted from https://github.com/huggingface/transformers/blob/369c99d0cea403b77bd0aef818527106453fd9fc/src/transformers/video_utils.py#L312
+def video_reader_metadata(vr: "VideoReader") -> VideoMetadata:
+    video_fps = vr.get_avg_fps()
+    total_num_frames = len(vr)
+    duration = total_num_frames / video_fps if video_fps else 0
+
+    indices = list(range(total_num_frames))
+
+    metadata = VideoMetadata(
+        total_num_frames=int(total_num_frames),
+        fps=float(video_fps),
+        duration=float(duration),
+        video_backend="decord",
+        frames_indices=indices,
+    )
+    return metadata

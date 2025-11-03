@@ -17,6 +17,7 @@ from transformers.utils import logging
 
 # from .configuration_radio import RADIOConfig  # todo afrimi  fix it!
 from sglang.srt.configs.nemotron_h import NemotronHConfig
+from sglang.srt.multimodal.internvl_utils import IMAGENET_MEAN, IMAGENET_STD
 
 logger = logging.get_logger(__name__)
 
@@ -29,7 +30,8 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         self,
         vision_config=None,
         llm_config=None,
-        force_image_size=None,
+        force_image_size: int = 512,
+        patch_size: int = 16,
         downsample_ratio=0.5,
         template=None,
         ps_version="v2",
@@ -38,6 +40,11 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         vit_hidden_size=1280,
         attn_implementation="flash_attention_2",
         video_pruning_rate: float = 0.0,
+        video_context_token: str = "<video>",
+        img_context_token: str = "<image>",
+        norm_mean: tuple[float, float, float] | list[float] = IMAGENET_MEAN,
+        norm_std: tuple[float, float, float] | list[float] = IMAGENET_STD,
+        use_thumbnail: bool = True,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -57,8 +64,22 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             self.llm_config = NemotronHConfig()
 
         # Assign configuration values
-        self.force_image_size = force_image_size
+        vision_image_size = getattr(self.vision_config, "image_size", force_image_size)
+        vision_patch_size = getattr(self.vision_config, "patch_size", patch_size)
+        self.image_size = int(
+            vision_image_size[0]
+            if isinstance(vision_image_size, list)
+            else vision_image_size
+        )
+        self.patch_size = int(
+            vision_patch_size[0]
+            if isinstance(vision_patch_size, list)
+            else vision_patch_size
+        )
+
         self.downsample_ratio = downsample_ratio
+        self.video_context_token = video_context_token
+        self.img_context_token = img_context_token
         self.template = template  # TODO move out of here and into the tokenizer
         self.ps_version = ps_version  # Pixel shuffle version
         self.image_tag_type = image_tag_type  # TODO: into the tokenizer too?
@@ -71,4 +92,9 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             self._attn_implementation is not None
             and "flash_attention" in self._attn_implementation
         )
+        self.norm_mean = tuple(norm_mean)
+        assert len(self.norm_mean) == 3, "norm_mean must be a tuple of 3 elements"
+        self.norm_std = tuple(norm_std)
+        assert len(self.norm_std) == 3, "norm_std must be a tuple of 3 elements"
+        self.use_thumbnail = use_thumbnail
         self.llm_config._attn_implementation = self._attn_implementation
