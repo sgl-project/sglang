@@ -6,6 +6,7 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+    DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,
     DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
     DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
@@ -81,7 +82,7 @@ class TestMoERunner(CustomTestCase):
             ],
         },
         "moe_runner_flashinfer_cutlass": {
-            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,  # requires model with modelopt_fp4 quantization
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,  # requires model with modelopt_fp4 quantization
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
