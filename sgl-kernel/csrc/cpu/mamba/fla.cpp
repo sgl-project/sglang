@@ -1061,8 +1061,10 @@ extern at::Tensor qwen3_next_l2norm_cpu(at::Tensor& input, double eps);
 // value: [B, T, HV, EV]
 // g: [B, T, HV] FP32
 // beta: [B, T, HV]
-// cu_seqlens: [N + 1] INT32
 // initial_state: [N, HV, EK, EV] FP32
+// output_final_state: bool
+// cu_seqlens: [N + 1] INT32
+// head_first: bool
 // use_qk_l2norm_in_kernel: bool
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
         at::Tensor& query,
@@ -1070,11 +1072,14 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
         at::Tensor& value,
         at::Tensor& g,
         at::Tensor& beta,
-        at::Tensor& cu_seqlens,
         at::Tensor& initial_state,
+        bool output_final_state,
+        at::Tensor& cu_seqlens,
+        bool head_first,
         bool use_qk_l2norm_in_kernel) {
     RECORD_FUNCTION("sgl-kernel::chunk_gated_delta_rule_cpu", std::vector<c10::IValue>({query, key, value, g, beta, initial_state}));
 
+    TORCH_CHECK(head_first == false, "chunk_gated_delta_rule_cpu does not support head first");
     TORCH_CHECK(query.dtype() == at::kBFloat16 && query.dtype() == key.dtype()
         && query.dtype() == value.dtype() && query.dtype() == beta.dtype());
     TORCH_CHECK(g.dtype() == at::kFloat && g.dtype() == initial_state.dtype());
@@ -1118,8 +1123,8 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
 
     at::Tensor output = at::empty_like(value, value.options()); // [B, T, HV, EV]
     at::Tensor final_state = initial_state.to(at::kFloat); // [N, HV, EK, EV]
-    at::Tensor query_ = query;
-    at::Tensor key_ = key;
+    at::Tensor query_ = query.contiguous();
+    at::Tensor key_ = key.contiguous();
     if (use_qk_l2norm_in_kernel) {
         query_ = qwen3_next_l2norm_cpu(query_, 1e-6);
         key_ = qwen3_next_l2norm_cpu(key_, 1e-6);
