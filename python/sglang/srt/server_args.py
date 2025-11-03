@@ -161,7 +161,6 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "cutlass",
-    "cutlass_fp8",
 ]
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
@@ -1380,14 +1379,16 @@ class ServerArgs:
 
         if get_bool_env_var("SGLANG_CUTLASS_MOE"):
             logger.warning(
-                "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass_fp8 and/or --speculative-moe-runner-backend=cutlass_fp8 instead"
+                "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
             )
-            self.moe_runner_backend = "cutlass_fp8"
-            self.speculative_moe_runner_backend = "cutlass_fp8"
-        if self.moe_runner_backend == "cutlass_fp8":
+            assert (
+                self.quantization == "fp8"
+            ), "cutlass MoE is only supported with fp8 quantization"
+            self.moe_runner_backend = "cutlass"
+        if self.moe_runner_backend == "cutlass" and self.quantization == "fp8":
             assert (
                 self.ep_size == 1
-            ), "cutlass_fp8 MoE is only supported with ep_size == 1"
+            ), "FP8 Cutlass MoE is only supported with ep_size == 1"
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
