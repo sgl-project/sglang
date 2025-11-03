@@ -979,15 +979,17 @@ class FlashInferFusedMoE(FusedMoE):
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
         # Matrix multiply.
-        with use_symmetric_memory(get_tp_group()) as sm:
-            final_hidden_states = self.quant_method.apply_with_router_logits(
-                layer=self,
-                dispatch_output=StandardDispatchOutput(
-                    hidden_states=hidden_states, topk_output=topk_output
-                ),
-            )
-            # We need to tag the tensors that will be used as the input of allreduce
-            sm.tag(final_hidden_states)
+        final_hidden_states = self.quant_method.apply_with_router_logits(
+            layer=self,
+            dispatch_output=StandardDispatchOutput(
+                hidden_states=hidden_states, topk_output=topk_output
+            ),
+        )
+
+        # NOTE for symmetric memory tagging:
+        # We do not create the context in this function.
+        # Instead, we create the context and tagging inside each FusedMoEMethodBase
+        # This can allow fine-grained tagging.
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
