@@ -1516,7 +1516,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q_lora = self.q_a_layernorm(q)
-            q = self.q_b_proj(q_lora)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q = self.q_b_proj(q_lora)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
 
             # NSA Indexer Call for MHA Path: only cache quantized keys, skip topk
             if self.use_nsa and _is_extend_without_speculative(forward_batch):
