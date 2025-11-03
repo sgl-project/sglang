@@ -177,6 +177,7 @@ class AiterAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
+
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
         spec_info = forward_batch.spec_info
@@ -617,6 +618,7 @@ class AiterAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
+
         if forward_mode.is_decode_or_idle():
             qo_indptr = None
             kv_last_page_len = None
@@ -856,35 +858,6 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
                 kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
-
-            if self.use_mla and _use_mla_ps_kernel:
-                qo_indptr = self.qo_indptr_[: bs + 1]
-                qo_indptr[1 : bs + 1] = torch.cumsum(
-                    self.cuda_graph_kv_last_page_len[:bs], dim=0
-                )
-
-                max_q_len = 1
-
-                nhead_kv = 1
-                page_size = 1
-
-                meta = get_mla_metadata_v1(
-                    qo_indptr,
-                    kv_indptr,
-                    self.num_head // nhead_kv,
-                    nhead_kv,
-                    True,
-                    self.work_metadata,
-                    self.work_info_set,
-                    self.work_indptr,
-                    self.reduce_indptr,
-                    self.reduce_final_map,
-                    self.reduce_partial_map,
-                    kv_granularity=max(page_size, 16),
-                    max_seqlen_qo=max_q_len,
-                    uni_seqlen_qo=max_q_len,
-                    fast_mode=True,
-                )
 
 
         elif forward_mode.is_target_verify():
@@ -1390,55 +1363,6 @@ class AiterAttnBackend(AttentionBackend):
             reduce_indptr = self.forward_metadata.reduce_indptr
             reduce_final_map = self.forward_metadata.reduce_final_map
             reduce_partial_map = self.forward_metadata.reduce_partial_map
-
-            #gpu = torch.cuda.current_device()
-            #device_properties = torch.cuda.get_device_properties(gpu)
-            #cu_num = device_properties.multi_processor_count
-
-            #nhead = layer.tp_q_head_num
-            #max_qo_tiles_per_batch = int(math.ceil(self.forward_metadata.max_q_len * nhead / 128))
-
-
-            #batch_size = forward_batch.batch_size
-
-            #work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
-            #work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
-            #work_info_set = torch.empty(
-            #    [batch_size * max_qo_tiles_per_batch * cu_num, 8],
-            #    dtype=torch.int32,
-            #    device="cuda",
-            #).fill_(-1)
-
-            #reduce_indptr = torch.empty(
-            #    [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
-            #)
-            #reduce_final_map = torch.empty(
-            #    [batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
-            #)
-            #reduce_partial_map = torch.empty(
-            #    [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
-            #)
-
-            #page_size = 1
-            #nhead_kv = 1
-
-            #meta = get_mla_metadata_v1(
-            #    self.forward_metadata.qo_indptr,
-            #    self.forward_metadata.kv_indptr,
-            #    nhead // nhead_kv,
-            #    nhead_kv,
-            #    True,
-            #    work_meta_data,
-            #    work_info_set,
-            #    work_indptr,
-            #    reduce_indptr,
-            #    reduce_final_map,
-            #    reduce_partial_map,
-            #    kv_granularity=max(page_size, 16),
-            #    max_seqlen_qo=self.forward_metadata.max_q_len,
-            #    uni_seqlen_qo=self.forward_metadata.max_q_len,
-            #    fast_mode=True,
-            #)
 
             if self.kv_cache_dtype == fp8_dtype:
                 q_input, q_scale = scaled_fp8_quant(
