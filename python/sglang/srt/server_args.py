@@ -3555,6 +3555,20 @@ class ServerArgs:
             help="The timeout for each multi-modal request in seconds.",
         )
 
+        # For checkpoint decryption
+        parser.add_argument(
+            "--decrypted-config-file",
+            type=str,
+            default=ServerArgs.decrypted_config_file,
+            help="The path of the decrypted config file.",
+        )
+        parser.add_argument(
+            "--decrypted-draft-config-file",
+            type=str,
+            default=ServerArgs.decrypted_draft_config_file,
+            help="The path of the decrypted draft config file.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
