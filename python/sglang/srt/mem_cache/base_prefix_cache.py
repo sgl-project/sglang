@@ -56,7 +56,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     )
 
     def init_metrics_collector(self):
-        self.metrics_collector = RadixCacheMetricsCollector(self.__class__.__name__)
+        self.metrics_collector = RadixCacheMetricsCollector(
+            labels={"cache_type": self.__class__.__name__}
+        )
 
     @abstractmethod
     def reset(self):
