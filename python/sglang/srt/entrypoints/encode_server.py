@@ -13,6 +13,7 @@ from transformers.image_utils import load_images
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -26,31 +27,29 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_zmq_socket
+from sglang.srt.utils import get_local_ip_auto, get_zmq_socket
 
 
 class EmbeddingData:
-    def __init__(self, req_id, num_parts, part_idx, mm_embedding):
+    def __init__(self, req_id, num_parts, part_idx, embedding_len):
         self.req_id = req_id
         self.num_parts = num_parts
         self.part_idx = part_idx
-        self.embedding = mm_embedding
-        self.embedding_dict = dict()
-        self.embedding_dict[part_idx] = mm_embedding
+        self.embedding_len = embedding_len
+
+        # aggregated data
+        self.ready_list = [i == self.part_idx for i in range(self.num_parts)]
+        self.embedding_len_tot = self.embedding_len
 
     def add(self, embedding_data):
         assert self.req_id == embedding_data.req_id
-        assert embedding_data.part_idx not in self.embedding_dict
-        self.embedding_dict[embedding_data.part_idx] = embedding_data.embedding
-
-    def get(self):
-        assert len(self.embedding_dict) == self.num_parts
-        agg_data = [self.embedding_dict[i] for i in range(self.num_parts)]
-        return torch.concatenate(agg_data)
+        assert not self.ready_list[embedding_data.part_idx]
+        self.ready_list[embedding_data.part_idx] = True
+        self.embedding_len_tot += embedding_data.embedding_len
 
     @property
     def ready(self):
-        return len(self.embedding_dict) == self.num_parts
+        return sum(self.ready_list) == self.num_parts
 
 
 class ImageEncoder:
@@ -81,6 +80,8 @@ class ImageEncoder:
         else:
             dist_init_method = f"tcp://127.0.0.1:{port_args.nccl_port}"
 
+        self.gpu_id = 0
+
         init_distributed_environment(
             world_size=1, rank=0, distributed_init_method=dist_init_method
         )
@@ -90,13 +91,22 @@ class ImageEncoder:
         self.model = get_model(
             model_config=self.model_config,
             load_config=self.load_config,
-            device_config=DeviceConfig(),
+            device_config=DeviceConfig(device="cuda", gpu_id=self.gpu_id),
+        )
+
+        self.local_ip = get_local_ip_auto()
+
+        self.engine = MooncakeTransferEngine(
+            hostname=self.local_ip,
+            gpu_id=self.gpu_id,
         )
 
         self.context = zmq.asyncio.Context(2)
         self.send_to_prefill_sockets = dict()
 
-    async def encode(self, mm_items):
+        self.embedding_to_send = dict()
+
+    async def encode(self, mm_items) -> torch.Tensor:
         images = load_images(mm_items)
 
         # Qwen-specific: resize images
@@ -114,7 +124,21 @@ class ImageEncoder:
         mm_embedding = self.model.get_image_feature([mm_item])
         return mm_embedding
 
-    def send(self, send_data, prefill_ip):
+    def send(
+        self,
+        session_id,
+        peer_buffer_address,
+        embedding: torch.Tensor,
+        meta_data: EmbeddingData,
+        prefill_ip,
+    ):
+        self.engine.register(embedding.data_ptr(), embedding.nbytes)
+        self.engine.transfer_sync(
+            session_id, embedding.data_ptr(), peer_buffer_address, embedding.nbytes
+        )
+        self.engine.deregister(embedding.data_ptr())
+
+        # Send ack
         if prefill_ip in self.send_to_prefill_sockets:
             socket = self.send_to_prefill_sockets[prefill_ip]
         else:
@@ -125,19 +149,38 @@ class ImageEncoder:
                 False,
             )
             self.send_to_prefill_sockets[prefill_ip] = socket
-        socket.send_pyobj(send_data)
+        socket.send_pyobj(meta_data)
 
     @torch.inference_mode()
-    async def step(self, request_data):
-        mm_embeddings = await self.encode(request_data["mm_items"])
-        send_data = EmbeddingData(
-            request_data["req_id"],
-            request_data["num_parts"],
-            request_data["part_idx"],
-            mm_embeddings,
-        )
-        self.send(send_data, request_data["bootstrap_host"])
-        del send_data
+    async def step(self, request_data: dict):
+        if "mm_items" in request_data:
+            mm_embedding = await self.encode(request_data["mm_items"])
+            meta_data = EmbeddingData(
+                request_data["req_id"],
+                request_data["num_parts"],
+                request_data["part_idx"],
+                mm_embedding.shape[0],
+            )
+            self.embedding_to_send[meta_data.req_id] = (mm_embedding, meta_data)
+            del request_data["mm_items"]
+            request_data.update(
+                {
+                    "embedding_size": mm_embedding.nbytes,
+                    "embedding_len": mm_embedding.shape[0],
+                }
+            )
+            return request_data
+        else:
+            mm_embedding, meta_data = self.embedding_to_send[request_data["req_id"]]
+            self.send(
+                request_data["session_id"],
+                request_data["buffer_address"],
+                mm_embedding,
+                meta_data,
+                request_data["bootstrap_host"],
+            )
+            del self.embedding_to_send[request_data["req_id"]]
+            return None
 
 
 app = FastAPI()
@@ -152,5 +195,5 @@ def launch_server(server_args: ServerArgs):
 
 @app.post("/encode")
 async def handle_encode_request(request_data: dict):
-    await encoder.step(request_data)
-    return ORJSONResponse(content=None)
+    ret_data = await encoder.step(request_data)
+    return ORJSONResponse(content=ret_data)
