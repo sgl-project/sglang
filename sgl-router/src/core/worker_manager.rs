@@ -5,7 +5,7 @@
 
 use axum::response::{IntoResponse, Response};
 use futures::future;
-use http::{HeaderMap, Method, StatusCode};
+use http::{Method, StatusCode};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
