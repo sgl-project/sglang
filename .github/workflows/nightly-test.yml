@@ -121,3 +121,73 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly-1-gpu
+
+  nightly-test-4-gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 4-gpu-h100
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-4-gpu
+
+  nightly-test-8-gpu-h200:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-h200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-8-gpu-h200
+
+  nightly-test-8-gpu-h20:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-h20
+    env:
+      SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-8-gpu-h20
+
+  nightly-test-4-gpu-b200:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 4-gpu-b200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-4-gpu-b200
