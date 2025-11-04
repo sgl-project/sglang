@@ -81,6 +81,20 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
 
 This tool requires pre-generated topk_ids files and supports both TP and EP modes:
 
+Edit the code file (such as srt/models/deepseek_v2.py) in the Python site package and add the logic for saving topk_ids:
+
+```python
+# import get_tensor_model_parallel_rank
+# DeepseekV2MoE::forward_normal
+if hidden_states.shape[0] >= 4096 and get_tensor_model_parallel_rank() == 0:
+    topk_ids_dir = xxxx
+    if not hasattr(self, "save_idx"):
+        self.save_idx = 0
+    if self.save_idx <= 1:
+        torch.save(topk_output.topk_ids, f"{topk_ids_dir}/topk_idx_layer{self.layer_id}_idx{self.save_idx}.pt")
+    self.save_idx += 1
+```
+
 ```bash
 # TP Mode: Tune separate kernels with TP=4
 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py \
