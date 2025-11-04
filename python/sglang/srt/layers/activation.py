@@ -148,6 +148,10 @@ class NewGELU(CustomOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         # TODO: Implement the CUDA kernel for NewGELU in sgl-kernel
         return self.forward_native(x)
+    
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        # TODO: Implement the NPU kernel for NewGELU in sgl-kernel
+        return self.forward_native(x)
 
 
 class ReLU2(nn.Module):
