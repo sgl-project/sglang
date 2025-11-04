@@ -68,7 +68,6 @@ pub struct PyOracleConfig {
 impl std::fmt::Debug for PyOracleConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PyOracleConfig")
-            .field("wallet_path", &self.wallet_path)
             .field("connect_descriptor", &"<redacted>")
             .field("username", &self.username)
             .field("password", &"<redacted>")
