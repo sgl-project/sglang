@@ -184,7 +184,7 @@ async def preprocess_video(
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
     video_np = vr.get_batch(idx).asnumpy()
-    video = torch.from_numpy(video_np)
+    video = torch.from_numpy(video_np).pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
     nframes, _, height, width = video.shape
     min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
@@ -216,13 +216,13 @@ async def preprocess_video(
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
-
     smart_resize_time = time.perf_counter()
     video = torchvision.transforms.functional.resize(
         video,
         [resized_height, resized_width],
         interpolation=InterpolationMode.BILINEAR,
     )
+    video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,
@@ -231,7 +231,7 @@ async def preprocess_video(
         "video_backend": "torchvision",
     }
     torchvision_resize_time = time.perf_counter()
-    logger.info(
+    logger.debug(
         f"[preprocess_video Perf], "
         f"get_batch_time: {(get_batch_time - entry_time) * 1000:.2f} ms, "
         f"smart_resize_time: {(smart_resize_time - get_batch_time) * 1000:.2f} ms, "
@@ -308,10 +308,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         video_metadata = None
         if base_output.videos:
-            video_results = await asyncio.gather(
-                *[preprocess_video(video) for video in base_output.videos]
-            )
-            base_output.videos, video_metadata = map(list, zip(*video_results))
+            videos_processed = [
+                await preprocess_video(video) for video in base_output.videos
+            ]
+            base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
         preprocess_time = time.perf_counter()
 
@@ -367,9 +367,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             ),
         )
         mrope_positions = mrope_positions.squeeze(1)
-
         get_rope_index_time = time.perf_counter()
-
         logger.debug(
             f"[QwenVLProcessor Perf] {rid=}, "
             f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
