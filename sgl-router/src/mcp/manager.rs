@@ -1,13 +1,7 @@
-//! Refactored MCP Manager - Single flat structure for all MCP operations
+//! MCP client management and orchestration.
 //!
-//! This replaces the previous hierarchy:
-//! - McpManager (wrapper for static/dynamic distinction)
-//! - McpClientManager (manages multiple clients)
-//! - McpClient (actual client)
-//!
-//! New flat structure:
-//! - McpManager (single component handling all MCP concerns)
-//! - McpClient (actual client to one server)
+//! Manages both static MCP servers (from config) and dynamic MCP servers (from requests).
+//! Static clients are never evicted; dynamic clients use LRU eviction via connection pool.
 
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
@@ -40,68 +34,47 @@ use crate::mcp::{
 /// Type alias for MCP client
 type McpClient = RunningService<RoleClient, ()>;
 
-/// Unified MCP Manager - handles all MCP operations
-///
-/// This single component manages:
-/// - Client connections (both static and dynamic)
-/// - Tool inventory and caching
-/// - Connection pooling
-/// - Background refresh
-/// - Tool/prompt/resource operations
 pub struct McpManager {
-    /// All MCP clients (static + dynamic)
-    /// Key: server_name for static, server_url for dynamic
-    /// Using DashMap for concurrent access
-    clients: Arc<DashMap<String, Arc<McpClient>>>,
-
-    /// Track which servers are static (from config)
-    /// Using DashMap for thread-safe mutation during workflow registration
-    static_servers: Arc<DashMap<String, ()>>,
-
-    /// Shared tool inventory with TTL and caching
+    static_clients: Arc<DashMap<String, Arc<McpClient>>>,
     inventory: Arc<ToolInventory>,
-
-    /// Connection pool for dynamic servers (TTL-based cleanup)
     connection_pool: Arc<McpConnectionPool>,
-
-    /// Original config for static servers (kept for potential future use)
     _config: McpConfig,
 }
 
 impl McpManager {
-    /// Create a new MCP manager with custom TTLs
-    pub async fn new(
-        config: McpConfig,
-        tool_ttl: Duration,
-        pool_idle_ttl: Duration,
-        pool_max_connections: usize,
-    ) -> McpResult<Self> {
-        // Create shared inventory
-        let inventory = Arc::new(ToolInventory::new(tool_ttl));
+    const MAX_DYNAMIC_CLIENTS: usize = 200;
 
-        // Create connection pool
-        let connection_pool = Arc::new(McpConnectionPool::with_config(
-            pool_idle_ttl,
-            pool_max_connections,
-        ));
+    pub async fn new(config: McpConfig, pool_max_connections: usize) -> McpResult<Self> {
+        let inventory = Arc::new(ToolInventory::new());
 
-        // Create manager structure
-        let clients = Arc::new(DashMap::new());
-        let static_servers = Arc::new(DashMap::new());
+        let mut connection_pool =
+            McpConnectionPool::with_full_config(pool_max_connections, config.proxy.clone());
+
+        let inventory_clone = Arc::clone(&inventory);
+        connection_pool.set_eviction_callback(move |server_key: &str| {
+            debug!(
+                "LRU evicted dynamic server '{}' - clearing tools from inventory",
+                server_key
+            );
+            inventory_clone.clear_server_tools(server_key);
+        });
+
+        let connection_pool = Arc::new(connection_pool);
+
+        // Create storage for static clients
+        let static_clients = Arc::new(DashMap::new());
 
         // Get global proxy config for all servers
         let global_proxy = config.proxy.as_ref();
 
         // Connect to all static servers from config
         for server_config in &config.servers {
-            static_servers.insert(server_config.name.clone(), ());
-
             match Self::connect_server(server_config, global_proxy).await {
                 Ok(client) => {
                     let client_arc = Arc::new(client);
                     // Load inventory for this server
                     Self::load_server_inventory(&inventory, &server_config.name, &client_arc).await;
-                    clients.insert(server_config.name.clone(), client_arc);
+                    static_clients.insert(server_config.name.clone(), client_arc);
                     info!("Connected to static server '{}'", server_config.name);
                 }
                 Err(e) => {
@@ -113,52 +86,40 @@ impl McpManager {
             }
         }
 
-        if static_servers.is_empty() || clients.is_empty() {
+        if static_clients.is_empty() {
             warn!("No static MCP servers connected");
         }
 
         Ok(Self {
-            clients,
-            static_servers,
+            static_clients,
             inventory,
             connection_pool,
             _config: config,
         })
     }
 
-    /// Create with default settings (300s TTL, 300s idle, 100 max connections)
     pub async fn with_defaults(config: McpConfig) -> McpResult<Self> {
-        Self::new(
-            config,
-            Duration::from_secs(300),
-            Duration::from_secs(300),
-            100,
-        )
-        .await
+        Self::new(config, Self::MAX_DYNAMIC_CLIENTS).await
     }
 
-    // ========================================================================
-    // Client Management
-    // ========================================================================
-
-    /// Get a client by server name (static or dynamic)
     pub async fn get_client(&self, server_name: &str) -> Option<Arc<McpClient>> {
-        self.clients.get(server_name).map(|e| Arc::clone(e.value()))
+        if let Some(client) = self.static_clients.get(server_name) {
+            return Some(Arc::clone(client.value()));
+        }
+        self.connection_pool.get(server_name)
     }
 
-    /// Get or create a dynamic client from server config
     pub async fn get_or_create_client(
         &self,
         server_config: McpServerConfig,
     ) -> McpResult<Arc<McpClient>> {
-        // Check if client already exists
-        let server_key = Self::server_key(&server_config);
+        let server_name = server_config.name.clone();
 
-        if let Some(client) = self.clients.get(&server_key) {
+        if let Some(client) = self.static_clients.get(&server_name) {
             return Ok(Arc::clone(client.value()));
         }
 
-        // Client doesn't exist, create new one via connection pool
+        let server_key = Self::server_key(&server_config);
         let client = self
             .connection_pool
             .get_or_create(
@@ -170,46 +131,26 @@ impl McpManager {
             )
             .await?;
 
-        // Store in clients map
-        self.clients.insert(server_key, Arc::clone(&client));
-
+        self.inventory.clear_server_tools(&server_key);
+        Self::load_server_inventory(&self.inventory, &server_key, &client).await;
         Ok(client)
     }
 
-    /// List all static server names
     pub fn list_static_servers(&self) -> Vec<String> {
-        self.static_servers
+        self.static_clients
             .iter()
             .map(|e| e.key().clone())
             .collect()
     }
 
-    /// Check if a server is static
     pub fn is_static_server(&self, server_name: &str) -> bool {
-        self.static_servers.contains_key(server_name)
+        self.static_clients.contains_key(server_name)
     }
 
-    /// Register a static server (called by workflow system)
-    ///
-    /// This method registers a static MCP server that was configured and connected
-    /// via the workflow system. Static servers are never removed during runtime.
-    ///
-    /// # Arguments
-    /// * `name` - Unique server name (from config)
-    /// * `client` - Connected MCP client
     pub fn register_static_server(&self, name: String, client: Arc<McpClient>) {
-        // Insert into clients map
-        self.clients.insert(name.clone(), client);
-
-        // Mark as static server (for background refresh and stats)
-        self.static_servers.insert(name.clone(), ());
-
+        self.static_clients.insert(name.clone(), client);
         info!("Registered static MCP server: {}", name);
     }
-
-    // ========================================================================
-    // Tool Operations (delegate to clients via inventory)
-    // ========================================================================
 
     /// List all available tools from all servers
     pub fn list_tools(&self) -> Vec<Tool> {
@@ -267,10 +208,6 @@ impl McpManager {
             .map(|(_server_name, tool_info)| tool_info)
     }
 
-    // ========================================================================
-    // Prompt Operations
-    // ========================================================================
-
     /// Get a prompt by name
     pub async fn get_prompt(
         &self,
@@ -310,10 +247,6 @@ impl McpManager {
             .collect()
     }
 
-    // ========================================================================
-    // Resource Operations
-    // ========================================================================
-
     /// Read a resource by URI
     pub async fn read_resource(&self, uri: &str) -> McpResult<ReadResourceResult> {
         // Get server that owns this resource
@@ -348,10 +281,6 @@ impl McpManager {
             .collect()
     }
 
-    // ========================================================================
-    // Inventory Management
-    // ========================================================================
-
     /// Refresh inventory for a specific server
     pub async fn refresh_server_inventory(&self, server_name: &str) -> McpResult<()> {
         let client = self
@@ -365,7 +294,8 @@ impl McpManager {
         Ok(())
     }
 
-    /// Start background refresh for all static servers
+    /// Start background refresh for ALL servers (static + dynamic)
+    /// Refreshes every 10-15 minutes to keep tool inventory up-to-date
     pub fn spawn_background_refresh_all(
         self: Arc<Self>,
         refresh_interval: Duration,
@@ -377,17 +307,24 @@ impl McpManager {
             loop {
                 interval.tick().await;
 
-                let server_names = self.list_static_servers();
+                // Get all static server keys
+                // Note: Dynamic clients in the connection pool are refreshed on-demand
+                // when they are accessed via get_or_create_client()
+                let server_keys: Vec<String> = self
+                    .static_clients
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .collect();
 
-                if !server_names.is_empty() {
+                if !server_keys.is_empty() {
                     debug!(
                         "Background refresh: Refreshing {} static server(s)",
-                        server_names.len()
+                        server_keys.len()
                     );
 
-                    for server_name in server_names {
-                        if let Err(e) = self.refresh_server_inventory(&server_name).await {
-                            warn!("Background refresh failed for '{}': {}", server_name, e);
+                    for server_key in server_keys {
+                        if let Err(e) = self.refresh_server_inventory(&server_key).await {
+                            warn!("Background refresh failed for '{}': {}", server_key, e);
                         }
                     }
 
@@ -396,10 +333,6 @@ impl McpManager {
             }
         })
     }
-
-    // ========================================================================
-    // Additional Tool/Prompt/Resource Methods
-    // ========================================================================
 
     /// Check if a tool exists
     pub fn has_tool(&self, name: &str) -> bool {
@@ -462,41 +395,56 @@ impl McpManager {
             .map_err(|e| McpError::ToolExecution(format!("Failed to unsubscribe: {}", e)))
     }
 
-    /// List all connected servers
+    /// List all connected servers (static + dynamic)
     pub fn list_servers(&self) -> Vec<String> {
-        self.clients.iter().map(|e| e.key().clone()).collect()
+        let mut servers = Vec::new();
+
+        // Add static servers
+        servers.extend(self.static_clients.iter().map(|e| e.key().clone()));
+
+        // Add dynamic servers from connection pool
+        servers.extend(self.connection_pool.list_server_keys());
+
+        servers
     }
 
     /// Disconnect from all servers (for cleanup)
     pub async fn shutdown(&self) {
-        let keys: Vec<String> = self.clients.iter().map(|e| e.key().clone()).collect();
-
-        for name in keys {
-            if let Some((_, client)) = self.clients.remove(&name) {
+        // Shutdown static servers
+        let static_keys: Vec<String> = self
+            .static_clients
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        for name in static_keys {
+            if let Some((_key, client)) = self.static_clients.remove(&name) {
                 // Try to unwrap Arc to call cancel
                 match Arc::try_unwrap(client) {
                     Ok(client) => {
                         if let Err(e) = client.cancel().await {
-                            warn!("Error disconnecting from '{}': {}", name, e);
+                            warn!("Error disconnecting from static server '{}': {}", name, e);
                         }
                     }
                     Err(_) => {
-                        warn!("Could not shutdown '{}': client still in use", name);
+                        warn!(
+                            "Could not shutdown static server '{}': client still in use",
+                            name
+                        );
                     }
                 }
             }
         }
-    }
 
-    // ========================================================================
-    // Statistics and Accessors
-    // ========================================================================
+        // Clear dynamic clients from connection pool
+        // The pool will handle cleanup on drop
+        self.connection_pool.clear();
+    }
 
     /// Get statistics about the manager
     pub fn stats(&self) -> McpManagerStats {
         let (tools, prompts, resources) = self.inventory.counts();
         McpManagerStats {
-            static_server_count: self.static_servers.len(),
+            static_server_count: self.static_clients.len(),
             pool_stats: self.connection_pool.stats(),
             tool_count: tools,
             prompt_count: prompts,
@@ -525,44 +473,41 @@ impl McpManager {
     /// It discovers all tools, prompts, and resources from the client and caches them in the inventory.
     pub async fn load_server_inventory(
         inventory: &Arc<ToolInventory>,
-        server_name: &str,
+        server_key: &str,
         client: &Arc<McpClient>,
     ) {
         // Tools
         match client.peer().list_all_tools().await {
             Ok(ts) => {
-                info!("Discovered {} tools from '{}'", ts.len(), server_name);
+                info!("Discovered {} tools from '{}'", ts.len(), server_key);
                 for t in ts {
-                    inventory.insert_tool(t.name.to_string(), server_name.to_string(), t);
+                    inventory.insert_tool(t.name.to_string(), server_key.to_string(), t);
                 }
             }
-            Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
+            Err(e) => warn!("Failed to list tools from '{}': {}", server_key, e),
         }
 
         // Prompts
         match client.peer().list_all_prompts().await {
             Ok(ps) => {
-                info!("Discovered {} prompts from '{}'", ps.len(), server_name);
+                info!("Discovered {} prompts from '{}'", ps.len(), server_key);
                 for p in ps {
-                    inventory.insert_prompt(p.name.clone(), server_name.to_string(), p);
+                    inventory.insert_prompt(p.name.clone(), server_key.to_string(), p);
                 }
             }
-            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
+            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_key, e),
         }
 
         // Resources
         match client.peer().list_all_resources().await {
             Ok(rs) => {
-                info!("Discovered {} resources from '{}'", rs.len(), server_name);
+                info!("Discovered {} resources from '{}'", rs.len(), server_key);
                 for r in rs {
-                    inventory.insert_resource(r.uri.clone(), server_name.to_string(), r.raw);
+                    inventory.insert_resource(r.uri.clone(), server_key.to_string(), r.raw);
                 }
             }
-            Err(e) => debug!("No resources or failed to list on '{}': {}", server_name, e),
+            Err(e) => debug!("No resources or failed to list on '{}': {}", server_key, e),
         }
-
-        // Mark server as refreshed
-        inventory.mark_refreshed(server_name);
     }
 
     /// Discover and cache tools/prompts/resources for a connected server (internal wrapper)
@@ -602,9 +547,6 @@ impl McpManager {
             }
             Err(e) => debug!("No resources or failed to list on '{}': {}", server_name, e),
         }
-
-        // Mark server as refreshed
-        self.inventory.mark_refreshed(server_name);
     }
 
     // ========================================================================
@@ -834,14 +776,7 @@ mod tests {
             inventory: Default::default(),
         };
 
-        let manager = McpManager::new(
-            config,
-            Duration::from_secs(300),
-            Duration::from_secs(300),
-            100,
-        )
-        .await
-        .unwrap();
+        let manager = McpManager::new(config, 100).await.unwrap();
         assert_eq!(manager.list_static_servers().len(), 0);
     }
 }
