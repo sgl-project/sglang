@@ -11,6 +11,8 @@ class TestLogParser(CustomTestCase):
 [2025-11-03 14:31:10 DP6 TP6 EP6] Decode batch, #running-req: 251, #token: 2811200, token usage: 1.00, cuda graph: True, gen throughput (token/s): 2055.94, #queue-req: 655,
 '''
         df = log_parser.parse(lines)
+
+        print(df)
         print(df.to_dicts())
 
         expect_rows = ['TODO']
