@@ -1077,36 +1077,46 @@ impl HarmonyStreamingProcessor {
         Self::process_decode_stream(grpc_stream, emitter, tx, ToolCallMode::Function).await
     }
 
-    /// Process streaming chunks from dual streams - MCP loop
-    async fn process_responses_dual_stream_mcp(
+    /// Process streaming chunks from dual streams (common implementation)
+    async fn process_responses_dual_stream(
         mut prefill_stream: AbortOnDropStream,
         decode_stream: AbortOnDropStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        mode: ToolCallMode,
     ) -> Result<ResponsesIterationResult, String> {
+        // Phase 1: Process prefill stream (collect metadata, no output)
         while let Some(result) = prefill_stream.next().await {
             let _response = result.map_err(|e| format!("Prefill stream error: {}", e))?;
         }
-        let result =
-            Self::process_decode_stream(decode_stream, emitter, tx, ToolCallMode::Mcp).await;
+
+        // Phase 2: Process decode stream using common helper
+        let result = Self::process_decode_stream(decode_stream, emitter, tx, mode).await;
+
+        // Mark prefill stream as completed AFTER decode completes successfully
+        // This ensures that if client disconnects during decode, BOTH streams send abort
         prefill_stream.mark_completed();
         result
     }
 
-    /// Process streaming chunks from dual streams - Function tools
-    async fn process_responses_dual_stream_function(
-        mut prefill_stream: AbortOnDropStream,
+    /// Process streaming chunks from dual streams - MCP loop
+    async fn process_responses_dual_stream_mcp(
+        prefill_stream: AbortOnDropStream,
         decode_stream: AbortOnDropStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<ResponsesIterationResult, String> {
-        while let Some(result) = prefill_stream.next().await {
-            let _response = result.map_err(|e| format!("Prefill stream error: {}", e))?;
-        }
-        let result =
-            Self::process_decode_stream(decode_stream, emitter, tx, ToolCallMode::Function).await;
-        prefill_stream.mark_completed();
-        result
+        Self::process_responses_dual_stream(prefill_stream, decode_stream, emitter, tx, ToolCallMode::Mcp).await
+    }
+
+    /// Process streaming chunks from dual streams - Function tools
+    async fn process_responses_dual_stream_function(
+        prefill_stream: AbortOnDropStream,
+        decode_stream: AbortOnDropStream,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<ResponsesIterationResult, String> {
+        Self::process_responses_dual_stream(prefill_stream, decode_stream, emitter, tx, ToolCallMode::Function).await
     }
 
     /// Build SSE response from receiver
