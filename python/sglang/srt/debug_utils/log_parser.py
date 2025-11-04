@@ -1,6 +1,6 @@
 _PATTERN_DECODE = (
     r"(\(SGLangEngine pid=(?P<pid>\d+)(?:,\s*ip=(?P<ip>[\d\.]+))?\))?\s+"
-    r"\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+    r"\[(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
     r"(?:\s+DP(?P<dp_rank>\d+))?"
     r"(?:\s+TP(?P<tp_rank>\d+))?"
     r"(?:\s+PP(?P<pp_rank>\d+))?"
@@ -24,7 +24,7 @@ def parse(lines):
     df = df.filter(pl.col('gen_throughput').is_not_null())
 
     df = df.with_columns(
-        pl.col("ts").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S"),
+        pl.col("time").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S"),
         *[
             pl.col(c).cast(pl.Int64)
             for c in [
