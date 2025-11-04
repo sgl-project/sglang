@@ -33,7 +33,7 @@ from sglang.srt.configs import (
     FalconH1Config,
     JetNemotronConfig,
     KimiLinearConfig,
-    NemotronHConfig,
+    NemotronHConfig, 
     Qwen3NextConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
@@ -1397,6 +1397,13 @@ class ModelRunner:
         return None
 
     @property
+    def jet_nemotron_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, JetNemotronConfig):
+            return config
+        return None
+
+    @property
     def kimi_linear_config(self):
         config = self.model_config.hf_config
         if isinstance(config, KimiLinearConfig):
@@ -1405,7 +1412,7 @@ class ModelRunner:
 
     @property
     def mambaish_config(self):
-        return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
+        return self.mamba2_config or self.hybrid_gdn_config or self.jet_nemotron_config or self.kimi_linear_config
 
     def set_num_token_hybrid(self):
         if (
@@ -1686,6 +1693,7 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(

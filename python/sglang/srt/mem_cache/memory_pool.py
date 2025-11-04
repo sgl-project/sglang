@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, Mamba2CacheParams
+from sglang.srt.configs.jet_nemotron import JetNemotronStateShape
 from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -150,6 +151,7 @@ class MambaPool:
         cache_params: Union["Mamba2CacheParams", "KimiLinearCacheParams"],
         device: str,
         speculative_num_draft_tokens: Optional[int] = None,
+        speculative_eagle_topk: Optional[int] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -166,6 +168,7 @@ class MambaPool:
         )
 
         self.is_kda_cache = isinstance(cache_params, KimiLinearCacheParams)
+        self.is_jet_nemotron_cache = isinstance(cache_params.shape, JetNemotronStateShape)
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.enable_custom_mem_pool
@@ -210,8 +213,18 @@ class MambaPool:
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
-
-                if self.is_kda_cache:
+                if self.is_jet_nemotron_cache and speculative_eagle_topk == 1:
+                    intermediate_conv_window_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            size + 1,
+                            speculative_num_draft_tokens + conv_state_shape[1] - 2,
+                            conv_state_shape[0],
+                        ),
+                        dtype=conv_dtype,
+                        device="cuda",
+                    ) 
+                elif self.is_kda_cache:
                     intermediate_conv_window_cache = [
                         torch.zeros(
                             size=(
@@ -228,16 +241,16 @@ class MambaPool:
                     ]
                 else:
                     intermediate_conv_window_cache = torch.zeros(
-                        size=(
-                            num_mamba_layers,
-                            size + 1,
-                            speculative_num_draft_tokens,
-                            conv_state_shape[0],
-                            conv_state_shape[1],
-                        ),
-                        dtype=conv_dtype,
-                        device="cuda",
-                    )
+                            size=(
+                                num_mamba_layers,
+                                size + 1,
+                                speculative_num_draft_tokens,
+                                conv_state_shape[0],
+                                conv_state_shape[1],
+                            ),
+                            dtype=conv_dtype,
+                            device="cuda",
+                        )
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -350,6 +363,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_memory_saver: bool,
         cache_params: Union["Mamba2CacheParams", "KimiLinearCacheParams"],
         speculative_num_draft_tokens: int = None,
+        speculative_eagle_topk: int = None,
     ):
         super().__init__(
             size=size,
@@ -362,6 +376,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             cache_params=cache_params,
             device=device,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
         )
 
     def _init_mamba_pool(
@@ -370,12 +385,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         cache_params: Union["Mamba2CacheParams", "KimiLinearCacheParams"],
         device: str,
         speculative_num_draft_tokens: int = None,
+        speculative_eagle_topk: int = None,
     ):
         self.mamba_pool = MambaPool(
             size=size,
             cache_params=cache_params,
             device=device,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(cache_params.layers)}
 

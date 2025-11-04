@@ -13,21 +13,20 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
+# Modified
 
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Optional, Tuple, Callable
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
-
 from transformers.activations import ACT2FN
 
-from .dconv_fwdbwd import dynamic_conv_triton_autograd
-from .dconv_fwd_cache import dynamic_conv_triton_cache
+from .dconv_fwd_cache_varlen import dynamic_conv_triton_cache_varlen
+from .dconv_speculative_step import causal_conv_step_triton_speculative, causal_dynamic_conv1d_update
 from .dconv_step import causal_conv_step_triton
 
 
@@ -42,8 +41,8 @@ class DynamicShortConvolution(nn.Module):
         kernel_size: int,
         generator_input_size: Optional[int] = None,
         generator_reduction: Optional[int] = None,
-        generator_activation: str = 'silu',
-        activation: Optional[str] = 'silu',
+        generator_activation: str = "silu",
+        activation: Optional[str] = "silu",
         static_conv_init: Callable = None,
         use_fast_conv1d: bool = True,
         implementation: str = "naive",
@@ -51,25 +50,50 @@ class DynamicShortConvolution(nn.Module):
         super().__init__()
 
         self.hidden_size = hidden_size
-        self.generator_input_size = hidden_size if generator_input_size is None else generator_input_size
-        self.generator_hidden_size = hidden_size if generator_reduction is None else (hidden_size // generator_reduction)
+        self.generator_input_size = (
+            hidden_size if generator_input_size is None else generator_input_size
+        )
+        self.generator_hidden_size = (
+            hidden_size
+            if generator_reduction is None
+            else (hidden_size // generator_reduction)
+        )
         self.kernel_size = kernel_size
         self.activation = None
         self.use_fast_conv1d = use_fast_conv1d
         self.implementation = implementation
 
         if activation is not None:
-            assert activation in ['silu', 'swish'], f"Activation `{activation}` not supported yet."
+            assert activation in [
+                "silu",
+                "swish",
+            ], f"Activation `{activation}` not supported yet."
             self.activation = activation
-        
+
         self.static_conv_init = static_conv_init
-        
+
         self.kernel_generator = nn.Sequential(
-            OrderedDict([
-                ("w1", nn.Linear(self.generator_input_size, self.generator_hidden_size, bias=False)),
-                ("act", ACT2FN[generator_activation]),
-                ("w2", nn.Linear(self.generator_hidden_size, self.hidden_size * self.kernel_size, bias=True)),
-            ])
+            OrderedDict(
+                [
+                    (
+                        "w1",
+                        nn.Linear(
+                            self.generator_input_size,
+                            self.generator_hidden_size,
+                            bias=False,
+                        ),
+                    ),
+                    ("act", ACT2FN[generator_activation]),
+                    (
+                        "w2",
+                        nn.Linear(
+                            self.generator_hidden_size,
+                            self.hidden_size * self.kernel_size,
+                            bias=True,
+                        ),
+                    ),
+                ]
+            )
         )
         self._init_kernel_generator()
 
@@ -82,7 +106,7 @@ class DynamicShortConvolution(nn.Module):
                 layer.weight.data.zero_()
                 if layer.bias is not None:
                     layer.bias.data.zero_()
-        
+
         if self.static_conv_init is not None:
             # init for static_bias
             self.static_conv_init(self.kernel_generator.w2.bias)
@@ -90,9 +114,11 @@ class DynamicShortConvolution(nn.Module):
     def get_kernel(self, x: torch.Tensor) -> torch.Tensor:
         flat_kernels = self.kernel_generator(x)
         if flat_kernels.dim() == 3:
-            kernels = rearrange(flat_kernels, 'b t (d w) -> b t d w', w=self.kernel_size)
+            kernels = rearrange(
+                flat_kernels, "b t (d w) -> b t d w", w=self.kernel_size
+            )
         elif flat_kernels.dim() == 2:
-            kernels = rearrange(flat_kernels, 'b (d w) -> b d w', w=self.kernel_size)
+            kernels = rearrange(flat_kernels, "b (d w) -> b d w", w=self.kernel_size)
         else:
             raise ValueError(f"Invalid kernel shape: {flat_kernels.shape}")
         return kernels
@@ -105,13 +131,21 @@ class DynamicShortConvolution(nn.Module):
         output_final_state: bool = False,
         cu_seqlens: Optional[torch.LongTensor] = None,
         generator_input: Optional[torch.Tensor] = None,
+        cache_indices: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
+        intermediate_conv_window: Optional[torch.Tensor] = None,
+        retrieve_next_token: Optional[torch.Tensor] = None,
+        retrieve_next_sibling: Optional[torch.Tensor] = None,
+        retrieve_parent_token: Optional[torch.Tensor] = None,
+        is_topk1: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x (`torch.Tensor`):
                 Tensor of shape `[B, T, D]`.
-                If `seq_idx` is provided, `B` must be 1.
+                If `seq_idx` is provided, shape `[T, D]`.
             mask (`Optional[torch.Tensor]`):
                 Attention mask dealing with padded positions.
             cache (`Optional[torch.Tensor]`):
@@ -122,6 +156,24 @@ class DynamicShortConvolution(nn.Module):
             cu_seqlens (Optional[torch.LongTensor]):
                 Cumulative sequence lengths for each batch. Used for varlen. Default: `None`.
                 Shape: [B+1]
+            cache_indices (`Optional[torch.Tensor]`):
+                Indices of the cache for each sequence. Shape: [B].
+            seq_idx (`Optional[torch.Tensor]`):
+                Indices of the sequence for each token. Shape: [T].
+            has_initial_state (`Optional[torch.Tensor]`):
+                Whether the initial state is provided. Shape: [B].
+            intermediate_conv_window (`Optional[torch.Tensor]`):
+                Shape `[N, W-2+speculative_num_draft_tokens, D]`
+                If provided, the intermediate conv window is updated **inplace** and cache_indices must be provided.
+                Cache is used but not updated. Used for speculative decoding verification.
+            retrieve_next_token (`Optional[torch.Tensor]`):
+                Shape `[N, NP2_T]`, retrieve the next token for each token in the sequence.
+            retrieve_next_sibling (`Optional[torch.Tensor]`):
+                Shape `[N, NP2_T]`, retrieve the next sibling token for each token in the sequence.
+            retrieve_parent_token (`Optional[torch.Tensor]`):
+                Shape `[N, NP2_T]`, retrieve the parent token for each token in the sequence.
+            is_topk1 (`Optional[bool]`):
+                Whether to use topk1 mode. Default: `False`.
 
         Returns:
             Tensor of shape `[B, T, D]`.
@@ -131,133 +183,108 @@ class DynamicShortConvolution(nn.Module):
         x: [B, T, D]
         return: [B, T, D]
         """
-        
-        assert cu_seqlens is None, "cu_seqlens not supported yet."
-        
-        B, T, D, W = *x.shape, self.kernel_size
-        N = B
+        if cu_seqlens is not None:
+            assert cache is not None, "Cache must be provided for varlen mode."
+            B = len(cu_seqlens) - 1
+            T, _ = x.shape
+            W = self.kernel_size
+            input_dtype = x.dtype
 
-        input_dtype = x.dtype
+            out = dynamic_conv_triton_cache_varlen(
+                x,
+                self.get_kernel(generator_input),
+                cu_seqlens,
+                cache,
+                cache_indices,
+                has_initial_state,
+                seq_idx,
+            )
+            if self.activation is not None:
+                out = ACT2FN[self.activation](out)
+            out = out.to(input_dtype)
+            if output_final_state:
+                for i in range(B):
+                    start_idx = cu_seqlens[i].item()
+                    end_idx = cu_seqlens[i + 1].item()
+                    cache_idx = cache_indices[i].item()
+                    if end_idx - start_idx >= W - 1:
+                        cache[cache_idx, :, 1:] = x[
+                            end_idx - W + 1 : end_idx
+                        ].transpose(0, 1)
+                    else:
+                        num_beginning = W - 1 - (end_idx - start_idx)
+                        if has_initial_state[i].item():
+                            cache[cache_idx, :, 1 : num_beginning + 1] = cache[
+                                cache_idx, :, -num_beginning:
+                            ]
+                        cache[cache_idx, :, num_beginning + 1 :] = x[
+                            start_idx:end_idx
+                        ].transpose(0, 1)
+
+            return out, cache
+
+        B, T, _, W = *x.shape, self.kernel_size
+
+        if intermediate_conv_window is not None:
+            if is_topk1:
+                assert (
+                    W - 2 + T == intermediate_conv_window.shape[1]
+                ), f"Shape mismatch between intermediate_conv_window ({intermediate_conv_window.shape}) and x ({x.shape})"
+                assert (
+                    cache_indices is not None
+                ), "cache_indices must be provided for intermediate_conv_window"
+                intermediate_conv_window[cache_indices, : W - 2] = intermediate_conv_window[
+                    cache_indices, 1 : W - 1
+                ]
+                out = causal_conv_step_triton_speculative(
+                    x,
+                    cache,
+                    self.get_kernel(generator_input),
+                    cache_indices,
+                    intermediate_conv_window,
+                )
+                if self.activation is not None:
+                    out = ACT2FN[self.activation](out)
+                return out
+            else:
+                out = causal_dynamic_conv1d_update(
+                    x=x.transpose(1, 2).contiguous(),
+                    conv_state=cache,
+                    weight=self.get_kernel(generator_input),
+                    bias=None,
+                    # activation=self.activation,
+                    cache_seqlens=None,
+                    conv_state_indices=cache_indices,
+                    num_accepted_tokens=None,
+                    intermediate_conv_window=intermediate_conv_window,
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                ).transpose(1, 2).contiguous()
+                out = ACT2FN[self.activation](out)
+                return out
 
         if mask is not None:
             x = x.mul_(mask.unsqueeze(-1))
 
-        implementation = self.implementation
-        if implementation == "triton" and not self.training:
-            implementation = "triton_cache"
-
         # during the decoding phase, we assume the batch is composed of sequences of length 1
-        if cache is not None and B * T == N:
-            assert T == 1
-            if implementation in ["naive", "triton_training"]:
-                x, cache = self._step_naive(x, cache, cu_seqlens, generator_input=generator_input)
-            elif implementation in ["triton", "triton_cache", "triton_decoding"]:
-                x, cache = self._step_triton(x, cache, cu_seqlens, generator_input=generator_input)
-            else:
-                raise ValueError(f"Unknown implementation: {implementation}")
-            return x, cache
-
-        if output_final_state:
-            new_cache = rearrange(x[..., -min(W, T):, :], 'n w d -> n d w')
-        else:
-            new_cache = None
-        
-        if implementation in ["naive", "triton_decoding"]:
-            x = self._forward_naive(x, generator_input=generator_input)  # [B, T, D]
-        elif implementation in ["triton", "triton_training"]:
-            assert cache is None, "Cache not supported in pure triton mode. Please set model.eval() or use triton_cache mode."
-            x = self._forward_triton(x, generator_input=generator_input)
-        elif implementation == "triton_cache":
-            x = self._forward_triton_cache(x, generator_input=generator_input, cache=cache)
-        else:
-            raise ValueError(f"Unknown implementation: {implementation}")
-
-        if self.activation is not None:
-            x = ACT2FN[self.activation](x)
-        
-        x = x.to(input_dtype)
-        if output_final_state:
-            if cache is None:
-                cache = x.new_zeros(N, D, W)
-            cache[:, :, -min(W, T):].copy_(new_cache)
-
+        assert T == 1
+        x, cache = self._step_triton(x, cache, generator_input=generator_input)
         return x, cache
 
-    def _forward_naive(self, x: torch.Tensor, generator_input: Optional[torch.Tensor] = None) -> torch.Tensor:
-        W = self.kernel_size
-        generator_input = x if generator_input is None else generator_input
-        kernels = self.get_kernel(generator_input)
-        x = F.pad(x.transpose(1, 2), (W - 1, 0))  # [B, D, T+W-1]
-        x = x.unfold(dimension=2, size=W, step=1)  # [B, D, T, W]
-        x = x.permute(0, 2, 1, 3)  # [B, T, D, W]
-        x = (x * kernels).sum(dim=-1)  # [B, T, D]
-        return x
-
-    def _forward_triton(self, x: torch.Tensor, generator_input: Optional[torch.Tensor] = None) -> torch.Tensor:
-        generator_input = x if generator_input is None else generator_input
-        kernels = self.get_kernel(generator_input)
-        output_triton = dynamic_conv_triton_autograd(x, kernels)
-        return output_triton
-
-    @torch.no_grad
-    def _forward_triton_cache(self, x: torch.Tensor, generator_input: Optional[torch.Tensor] = None, cache: Optional[torch.Tensor] = None) -> torch.Tensor:
-        generator_input = x if generator_input is None else generator_input
-        assert not self.training, "Triton implementation is only available in eval mode."
-        # cache: [B, D, T(W)]
-        CHUNK_SIZE = 2048
-        n_chunk = (x.shape[1] + CHUNK_SIZE - 1) // CHUNK_SIZE
-        output_triton = torch.zeros_like(x)
-        if cache is not None:
-            cache = rearrange(cache, "b d t -> b t d")  # [B, T(W), D]
-        for i in range(n_chunk):
-            start = i * CHUNK_SIZE
-            end = min((i + 1) * CHUNK_SIZE, x.shape[1])
-            kernels = self.get_kernel(generator_input[:, start:end])
-            out = dynamic_conv_triton_cache(x[:, start:end], kernels, cache=cache)
-            output_triton[:, i*CHUNK_SIZE:end, :] = out
-            cache = x[:, end-self.kernel_size:end, :]
-        return output_triton
-
-    def _step_naive(
-        self,
-        x: torch.Tensor,
-        cache: torch.Tensor,
-        cu_seqlens: Optional[torch.LongTensor] = None,
-        generator_input: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert x.shape[1] == 1, "x must be of shape [B, 1, D]"
-        shape = x.shape
-        generator_input = x if generator_input is None else generator_input
-        x = x.squeeze(1)
-        generator_input = generator_input.squeeze(1) # Shape [B, D]
-        B, D, W = *x.shape, self.kernel_size
-
-        # we follow the fast mode that updates the cache in-place
-        cache.copy_(cache.roll(shifts=-1, dims=-1))
-        cache[:, :, -1] = x # [B, D, T(W)]
-        
-        kernels = self.get_kernel(generator_input) # [B, D, W]
-        x = torch.sum(cache * kernels, dim=-1)
-        
-        if self.activation is not None:
-            x = ACT2FN[self.activation](x)
-        
-        return x.view(shape), cache
-    
     def _step_triton(
         self,
         x: torch.Tensor,
         cache: torch.Tensor,
-        cu_seqlens: Optional[torch.LongTensor] = None,
-        generator_input: Optional[torch.Tensor] = None
+        generator_input: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # --- Triton Implementation ---
         assert x.shape[1] == 1, "x must be of shape [B, 1, D]"
-        shape = x.shape # Keep original shape [B, 1, D] for return
+        shape = x.shape  # Keep original shape [B, 1, D] for return
         generator_input = x if generator_input is None else generator_input
 
         # 1. Generate kernels
-        kernels_triton = self.get_kernel(generator_input.squeeze(1)) # [B, D, W]
+        kernels_triton = self.get_kernel(generator_input.squeeze(1))  # [B, D, W]
 
         # 2. Call Triton kernel without activation
         x_out_triton = causal_conv_step_triton(
@@ -265,7 +292,7 @@ class DynamicShortConvolution(nn.Module):
             cache,
             kernels_triton,
         )
-        
+
         # Apply activation (if any) after kernel execution
         if self.activation is not None:
             x_out_triton = ACT2FN[self.activation](x_out_triton)
