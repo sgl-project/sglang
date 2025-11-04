@@ -26,10 +26,10 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool,
     create_accept_length_filter,
     create_extend_after_decode_spec_info,
+    fast_topk,
     filter_finished_cache_loc_kernel,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
-    fast_topk,
 )
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
@@ -616,10 +616,10 @@ class EagleDraftInput(SpecInput):
             )
             pt += extend_len
 
-    def prepare_draft_root(
-        self, logits_output: LogitsProcessorOutput, topk: int
-    ):
-        logprobs = torch.nn.functional.log_softmax(logits_output.next_token_logits, dim=-1)
+    def prepare_draft_root(self, logits_output: LogitsProcessorOutput, topk: int):
+        logprobs = torch.nn.functional.log_softmax(
+            logits_output.next_token_logits, dim=-1
+        )
         self.topk_logp, self.topk_index = fast_topk(logprobs, topk, dim=-1)
         self.hidden_states = logits_output.hidden_states
 

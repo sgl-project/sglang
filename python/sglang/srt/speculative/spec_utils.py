@@ -397,23 +397,27 @@ def select_top_k_tokens(
 ):
     if i == 0:
         # The first step after extend
-        input_ids = topk_index.flatten() # conventionally downstream models expects flatten ids
-        hidden_states = hidden_states.repeat_interleave(topk, dim=0) # shape: (b, topk)
+        input_ids = (
+            topk_index.flatten()
+        )  # conventionally downstream models expects flatten ids
+        hidden_states = hidden_states.repeat_interleave(topk, dim=0)  # shape: (b, topk)
         # assert scores is None
-        scores = topk_logp # shape: (b, topk)
+        scores = topk_logp  # shape: (b, topk)
         init_parents = torch.arange(-1, topk, dtype=torch.long, device="cuda")
         bs = topk_logp.shape[0]
         tree_info = (
-            topk_logp.unsqueeze(1), # shape: (b, 1, topk), root is the single parent
-            topk_index, # shape: (b, topk)
-            init_parents.unsqueeze(0).repeat(bs, 1) # shape: (b, topk)
+            topk_logp.unsqueeze(1),  # shape: (b, 1, topk), root is the single parent
+            topk_index,  # shape: (b, topk)
+            init_parents.unsqueeze(0).repeat(bs, 1),  # shape: (b, topk)
         )
     else:
         # The later decode steps
-        topk_logp = topk_logp.reshape(-1, topk, topk) # restore batched shape
-        topk_index = topk_index.reshape(-1, topk**2) # flatten batched shape
+        topk_logp = topk_logp.reshape(-1, topk, topk)  # restore batched shape
+        topk_index = topk_index.reshape(-1, topk**2)  # flatten batched shape
 
-        expand_scores = scores.unsqueeze(-1) + topk_logp # update path scores, shape: (b, topk, topk)
+        expand_scores = (
+            scores.unsqueeze(-1) + topk_logp
+        )  # update path scores, shape: (b, topk, topk)
         scores, topk_cs_index = fast_topk(
             expand_scores.flatten(start_dim=1), topk, dim=-1
         )  # both outputs are of shape (b, topk)
@@ -426,7 +430,9 @@ def select_top_k_tokens(
         if hidden_states.shape[0] > topk:
             # batched
             bs = topk_logp.shape[0]
-            offset = torch.arange(0, bs * topk, step=topk, device="cuda").repeat_interleave(topk)
+            offset = torch.arange(
+                0, bs * topk, step=topk, device="cuda"
+            ).repeat_interleave(topk)
             hidden_states = hidden_states[selected_input_index + offset, :]
         else:
             # single

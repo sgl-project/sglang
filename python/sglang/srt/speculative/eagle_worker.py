@@ -788,7 +788,9 @@ class EAGLEWorker(TpModelWorker):
             )
 
             self._detect_nan_if_needed(logits_output)
-            logprobs = torch.nn.functional.log_softmax(logits_output.next_token_logits, dim=-1)
+            logprobs = torch.nn.functional.log_softmax(
+                logits_output.next_token_logits, dim=-1
+            )
             topk_logp, topk_index = fast_topk(logprobs, self.topk, dim=-1)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
