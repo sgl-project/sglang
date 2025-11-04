@@ -10,7 +10,7 @@ use crate::{
     protocols::{chat::ChatCompletionRequest, common::InputIds, generate::GenerateRequest},
     routers::grpc::{
         context::{PreparationOutput, RequestContext, RequestType},
-        utils,
+        error, utils,
     },
     tokenizer::traits::Tokenizer,
 };
@@ -56,7 +56,7 @@ impl PreparationStage {
             match utils::process_chat_messages(&body_ref, &*ctx.components.tokenizer) {
                 Ok(msgs) => msgs,
                 Err(e) => {
-                    return Err(utils::bad_request_error(e));
+                    return Err(error::bad_request(e));
                 }
             };
 
@@ -64,10 +64,7 @@ impl PreparationStage {
         let encoding = match ctx.components.tokenizer.encode(&processed_messages.text) {
             Ok(encoding) => encoding,
             Err(e) => {
-                return Err(utils::internal_error_message(format!(
-                    "Tokenization failed: {}",
-                    e
-                )));
+                return Err(error::internal_error(format!("Tokenization failed: {}", e)));
             }
         };
 
@@ -75,9 +72,8 @@ impl PreparationStage {
 
         // Step 4: Build tool constraints if needed
         let tool_call_constraint = if let Some(tools) = body_ref.tools.as_ref() {
-            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model).map_err(
-                |e| utils::bad_request_error(format!("Invalid tool configuration: {}", e)),
-            )?
+            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
+                .map_err(|e| error::bad_request(format!("Invalid tool configuration: {}", e)))?
         } else {
             None
         };
@@ -124,7 +120,7 @@ impl PreparationStage {
         let (original_text, token_ids) = match self.resolve_generate_input(ctx, request) {
             Ok(res) => res,
             Err(msg) => {
-                return Err(utils::bad_request_error(msg));
+                return Err(error::bad_request(msg));
             }
         };
 
