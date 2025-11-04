@@ -237,8 +237,11 @@ impl WorkerManager {
         }
     }
 
-    pub async fn get_engine_metrics() -> Response {
-        let engine_responses = match Self::fan_out_simple_request(None, "metrics", Method::GET).await
+    pub async fn get_engine_metrics(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+    ) -> Response {
+        let engine_responses = match Self::fan_out_simple_request(worker_registry, client, "metrics", Method::GET).await
         {
             Ok(x) => x,
             Err(e) => return e,
@@ -261,8 +264,8 @@ impl WorkerManager {
     }
 
     async fn fan_out_simple_request(
-        client: &reqwest::Client,
         worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
         endpoint: &str,
         method: Method,
     ) -> Result<Vec<(String, String)>, Response> {

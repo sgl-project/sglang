@@ -116,7 +116,7 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
-    WorkerManager::get_engine_metrics().await
+    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client).await
 }
 
 async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
