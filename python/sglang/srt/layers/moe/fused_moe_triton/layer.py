@@ -970,6 +970,9 @@ class FlashInferFusedMoE(FusedMoE):
         assert self.num_fused_shared_experts == 0, (
             "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
         )
+        assert self.moe_runner_config.is_gated, (
+            "Only gated MoEs are supported for flashinfer blockscale fp8 moe"
+        )
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
@@ -1036,6 +1039,10 @@ class FlashInferFP4MoE(FusedMoE):
             topk_output: TopKOutput object with Bypassed format
         """
         assert isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+
+        assert self.moe_runner_config.is_gated, (
+            "Only gated MoEs are supported for flashinfer fp4 moe"
+        )
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
