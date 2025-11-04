@@ -344,7 +344,7 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-        elif batch.is_eagle_v2:
+        elif batch.is_v2_eagle or batch.is_v2_standalone:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
         self.num_generated_tokens += len(batch.reqs)
@@ -371,7 +371,7 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
-            elif batch.is_eagle_v2:
+            elif batch.is_v2_eagle or batch.is_v2_standalone:
                 # Only v2 eagle's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)

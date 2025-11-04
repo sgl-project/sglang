@@ -1961,7 +1961,8 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm == "EAGLE"
+                (self.speculative_algorithm == "EAGLE"
+                or self.speculative_algorithm == "STANDALONE")
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
