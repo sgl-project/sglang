@@ -28,6 +28,7 @@ dependencies = [
   "fastapi",
   "flashinfer_python==0.4.1",
   "gguf",
+  "kvpress",
   "hf_transfer",
   "huggingface_hub",
   "interegular",
