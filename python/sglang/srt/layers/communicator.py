@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -94,38 +95,112 @@ class ScatterMode(Enum):
         return ScatterMode.TP_ATTN_FULL
 
 
-def support_attn_input_tp_scattered(q_lora_rank, is_nsa):
-    return (
-        _is_cuda
-        and q_lora_rank is not None
-        and not is_nsa
-        and get_tensor_model_parallel_world_size() > 1
-        and not is_dp_attention_enabled()
-        and not get_moe_a2a_backend().is_deepep()
-        and not enable_moe_dense_fully_dp()
-    )
+class AttentionInputs:
+
+    def __init__(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        qkv_latent_func: Callable,
+    ):
+        self.hidden_states_local = hidden_states
+        self.forward_batch = forward_batch
+        self.qkv_latent_func = qkv_latent_func
+        self.hidden_states_ = None
+        self.qkv_latent_ = None
+
+    def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
+        tp_group = get_tp_group()
+        sum_seq_len = forward_batch.input_ids.shape[0]
+        tp_size = tp_group.world_size
+
+        output = hidden_states.new_empty((sum_seq_len, hidden_states.shape[-1]))
+        tp_group.all_gather(
+            hidden_states, output_tensor_list=list(output.tensor_split(tp_size))
+        )
+        return output
+
+    def fetch_qkv_latent(self):
+        if self.qkv_latent_ is not None:
+            return self.qkv_latent_
+        assert self.qkv_latent_func is not None
+        self.qkv_latent_ = self.qkv_latent_func(
+            self.hidden_states_local, self.forward_batch
+        )
+        if get_attn_tp_context().input_scattered:
+            self.qkv_latent_ = self.tp_all_gather_hidden_states(
+                self.qkv_latent_, self.forward_batch
+            )
+        return self.qkv_latent_
+
+    def fetch_hidden_states(self):
+        if self.hidden_states_ is not None:
+            return self.hidden_states_
+        self.hidden_states_ = self.hidden_states_local
+        if get_attn_tp_context().input_scattered:
+            self.hidden_states_ = self.tp_all_gather_hidden_states(
+                self.hidden_states_, self.forward_batch
+            )
+        return self.hidden_states_
 
 
-def use_attn_input_tp_scattered(forward_batch: ForwardBatch):
-    return (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_target_verify()
-        and not forward_batch.forward_mode.is_draft_extend()
-        and forward_batch.input_ids is not None
-        and not forward_batch.can_run_tbo
-    )
+class AttnTpContext:
+    def __init__(self):
+        self.allow_input_scattered = False
+        self.input_scattered_ = False
+        self.attn_inputs_: Optional[AttentionInputs] = None
+
+    def init_context(self, q_lora_rank, is_nsa):
+        self.allow_input_scattered = (
+            _is_cuda
+            and q_lora_rank is not None
+            and not is_nsa
+            and get_tensor_model_parallel_world_size() > 1
+            and not is_dp_attention_enabled()
+            and not get_moe_a2a_backend().is_deepep()
+            and not enable_moe_dense_fully_dp()
+        )
+
+    def use_input_scattered(self, forward_batch: ForwardBatch):
+        return (
+            self.allow_input_scattered
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend()
+            and forward_batch.input_ids is not None
+            and not forward_batch.can_run_tbo
+        )
+
+    @property
+    def input_scattered(self):
+        return self.input_scattered_
+
+    def set_attn_inputs(self, attn_inputs: AttentionInputs):
+        self.attn_inputs_ = attn_inputs
+
+    def fetch_qkv_latent(self):
+        assert self.attn_inputs_ is not None
+        return self.attn_inputs_.fetch_qkv_latent()
+
+    def fetch_hidden_states(self):
+        assert self.attn_inputs_ is not None
+        return self.attn_inputs_.fetch_hidden_states()
+
+    @contextmanager
+    def maybe_input_scattered(self, forward_batch: ForwardBatch):
+        flag = self.use_input_scattered(forward_batch)
+        old_flag = self.input_scattered
+        self.input_scattered_ = flag
+        yield
+        self.input_scattered_ = old_flag
+        self.attn_inputs_ = None
 
 
-def tp_all_gather_hidden_states(hidden_states, forward_batch):
-    tp_group = get_tp_group()
-    sum_seq_len = forward_batch.input_ids.shape[0]
-    tp_size = tp_group.world_size
+ATTN_TP_CONTEXT = AttnTpContext()
 
-    output = hidden_states.new_empty((sum_seq_len, hidden_states.shape[-1]))
-    tp_group.all_gather(
-        hidden_states, output_tensor_list=list(output.tensor_split(tp_size))
-    )
-    return output
+
+def get_attn_tp_context():
+    return ATTN_TP_CONTEXT
 
 
 @dataclass
@@ -143,46 +218,6 @@ class _LayerModeComputationContext:
             is_previous_layer_sparse=None,
             num_layers=self.num_layers,
         )
-
-
-class AttentionInputs:
-
-    def __init__(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        qkv_latent_func: Callable,
-    ):
-        self.hidden_states_local = hidden_states
-        self.forward_batch = forward_batch
-        self.qkv_latent_func = qkv_latent_func
-        self.hidden_states_ = None
-        self.qkv_latent_ = None
-
-    @property
-    def qkv_latent(self):
-        if self.qkv_latent_ is not None:
-            return self.qkv_latent_
-        assert self.qkv_latent_func is not None
-        self.qkv_latent_ = self.qkv_latent_func(
-            self.hidden_states_local, self.forward_batch
-        )
-        if self.forward_batch.attn_input_tp_scattered:
-            self.qkv_latent_ = tp_all_gather_hidden_states(
-                self.qkv_latent_, self.forward_batch
-            )
-        return self.qkv_latent_
-
-    @property
-    def hidden_states(self):
-        if self.hidden_states_ is not None:
-            return self.hidden_states_
-        self.hidden_states_ = self.hidden_states_local
-        if self.forward_batch.attn_input_tp_scattered:
-            self.hidden_states_ = tp_all_gather_hidden_states(
-                self.hidden_states_, self.forward_batch
-            )
-        return self.hidden_states_
 
 
 @dataclass
@@ -330,7 +365,7 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         quant_format: str = "",
     ):
-        if forward_batch.attn_input_tp_scattered:
+        if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
                 residual,
@@ -419,9 +454,10 @@ class LayerCommunicator:
             context=self._context,
         )
         if self.qkv_latent_func is not None:
-            hidden_states = AttentionInputs(
+            attn_inputs = AttentionInputs(
                 hidden_states, forward_batch, self.qkv_latent_func
             )
+            get_attn_tp_context().set_attn_inputs(attn_inputs)
         return hidden_states, residual
 
     def _tp_reduce_scatter(
@@ -483,7 +519,7 @@ class LayerCommunicator:
             and forward_batch.dp_padding_mode.is_max_len()
         ):
             return True
-        if forward_batch.attn_input_tp_scattered and not self.is_last_layer:
+        if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True
         return False
 
@@ -497,7 +533,7 @@ class LayerCommunicator:
         ):
             return False
 
-        if forward_batch.attn_input_tp_scattered:
+        if get_attn_tp_context().input_scattered:
             return False
 
         batch_size = (
@@ -681,7 +717,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
-        if forward_batch.attn_input_tp_scattered:
+        if get_attn_tp_context().input_scattered:
             return CommunicateWithAllReduceAndLayerNormFn._tp_all_reduce_with_scattered_residual(
                 hidden_states,
                 residual,
