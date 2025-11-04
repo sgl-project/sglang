@@ -1,4 +1,4 @@
-use sglang_router_rs::metrics_aggregator::{aggregate_metrics, MetricPack};
+use sglang_router_rs::core::metrics_aggregator::{aggregate_metrics, MetricPack};
 
 #[test]
 fn test_aggregate_simple() {
