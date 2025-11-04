@@ -3,18 +3,16 @@
 //! This module defines the RequestPipeline orchestrator that coordinates
 //! the execution of pipeline stages from request preparation to response delivery.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::response::{IntoResponse, Response};
-use tokio::sync::RwLock;
-use tracing::{debug, error};
+use tracing::error;
 
 use super::{
     common::stages::*,
     context::*,
     error, harmony,
     regular::{processor, stages::*, streaming},
-    responses::BackgroundTaskInfo,
 };
 use crate::{
     core::WorkerRegistry,
@@ -284,21 +282,16 @@ impl RequestPipeline {
 
     /// Execute chat pipeline for responses endpoint
     ///
-    /// TODO: The support for background tasks is not scalable. Consider replacing this with
-    /// a better design in the future.
-    /// Used by ALL non-streaming /v1/responses requests (both sync and background modes).
-    /// Uses the same 7 pipeline stages as execute_chat(), with three differences:
+    /// Used by ALL non-streaming /v1/responses requests.
+    /// Uses the same 7 pipeline stages as execute_chat(), with two differences:
     /// 1. Returns Result<ChatCompletionResponse, Response> for tool_loop composition
     /// 2. Disallows streaming (responses endpoint uses different SSE format)
-    /// 3. Injects hooks for background task cancellation (only active when response_id provided)
     pub async fn execute_chat_for_responses(
         &self,
         request: Arc<ChatCompletionRequest>,
         headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
-        response_id: Option<String>,
-        background_tasks: Option<Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>>,
     ) -> Result<ChatCompletionResponse, Response> {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
 
@@ -312,39 +305,6 @@ impl RequestPipeline {
                     ));
                 }
                 Ok(None) => {
-                    let stage_name = stage.name();
-
-                    // After ClientAcquisitionStage, store client for background task cancellation
-                    if stage_name == "ClientAcquisition" {
-                        if let (Some(ref clients), Some(ref resp_id), Some(ref tasks)) =
-                            (&ctx.state.clients, &response_id, &background_tasks)
-                        {
-                            let client_to_store = match clients {
-                                ClientSelection::Single { client } => client.clone(),
-                                ClientSelection::Dual { decode, .. } => decode.clone(),
-                            };
-
-                            if let Some(task_info) = tasks.write().await.get_mut(resp_id.as_str()) {
-                                *task_info.client.write().await = Some(client_to_store);
-                                debug!("Stored client for response_id: {}", resp_id);
-                            }
-                        }
-                    }
-
-                    // After DispatchMetadataStage, store grpc_request_id for background task cancellation
-                    if stage_name == "DispatchMetadata" {
-                        if let (Some(ref dispatch), Some(ref resp_id), Some(ref tasks)) =
-                            (&ctx.state.dispatch, &response_id, &background_tasks)
-                        {
-                            let grpc_request_id = dispatch.request_id.clone();
-
-                            if let Some(task_info) = tasks.write().await.get_mut(resp_id.as_str()) {
-                                task_info.grpc_request_id = grpc_request_id.clone();
-                                debug!("Stored grpc_request_id for response_id: {}", resp_id);
-                            }
-                        }
-                    }
-
                     // Continue to next stage
                     continue;
                 }

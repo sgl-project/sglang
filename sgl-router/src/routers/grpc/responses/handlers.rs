@@ -9,18 +9,19 @@
 //! # Architecture
 //!
 //! This module orchestrates all request handling for the /v1/responses endpoint.
-//! It supports three execution modes:
+//! It supports two execution modes:
 //!
 //! 1. **Synchronous** - Returns complete response immediately
-//! 2. **Background** - Returns queued response, executes in background task
-//! 3. **Streaming** - Returns SSE stream with real-time events
+//! 2. **Streaming** - Returns SSE stream with real-time events
+//!
+//! Note: Background mode is no longer supported. Requests with background=true
+//! will be rejected with a 400 error.
 //!
 //! # Request Flow
 //!
 //! ```text
 //! route_responses()
 //!   ├─► route_responses_sync()       → route_responses_internal()
-//!   ├─► route_responses_background() → spawn(route_responses_internal())
 //!   └─► route_responses_streaming()  → convert_chat_stream_to_responses_stream()
 //!
 //! route_responses_internal()
@@ -31,10 +32,7 @@
 //!       └─► pipeline.execute_chat_for_responses()
 //! ```
 
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Arc;
 
 use axum::{
     body::Body,
@@ -44,7 +42,7 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::json;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -54,7 +52,6 @@ use super::{
     conversions,
     streaming::ResponseStreamEventEmitter,
     tool_loop::{execute_tool_loop, execute_tool_loop_streaming},
-    types::BackgroundTaskInfo,
 };
 use crate::{
     data_connector::{
@@ -157,19 +154,17 @@ pub async fn route_responses(
             .into_response();
     }
 
-    // 3. Check for incompatible parameter combinations
-    let is_streaming = request.stream.unwrap_or(false);
+    // 3. Reject background mode (no longer supported)
     let is_background = request.background.unwrap_or(false);
-
-    if is_streaming && is_background {
+    if is_background {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({
                 "error": {
-                    "message": "Cannot use streaming with background mode. Please set either 'stream' or 'background' to false.",
+                    "message": "Background mode is not supported. Please set 'background' to false or omit it.",
                     "type": "invalid_request_error",
-                    "param": serde_json::Value::Null,
-                    "code": "incompatible_parameters"
+                    "param": "background",
+                    "code": "unsupported_parameter"
                 }
             })),
         )
@@ -177,10 +172,9 @@ pub async fn route_responses(
     }
 
     // 4. Route based on execution mode
+    let is_streaming = request.stream.unwrap_or(false);
     if is_streaming {
         route_responses_streaming(ctx, request, headers, model_id).await
-    } else if is_background {
-        route_responses_background(ctx, request, headers, model_id).await
     } else {
         route_responses_sync(ctx, request, headers, model_id, None).await
     }
@@ -285,128 +279,6 @@ async fn route_responses_internal(
     }
 
     Ok(responses_response)
-}
-
-// ============================================================================
-// Background Mode Execution
-// ============================================================================
-
-/// Execute responses request in background mode
-#[allow(clippy::too_many_arguments)]
-async fn route_responses_background(
-    ctx: &super::context::ResponsesContext,
-    request: Arc<ResponsesRequest>,
-    headers: Option<http::HeaderMap>,
-    model_id: Option<String>,
-) -> Response {
-    // Generate response_id for background tracking
-    let response_id = format!("resp_{}", Uuid::new_v4());
-
-    // Get current timestamp
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    // Create queued response
-    let queued_response = ResponsesResponse {
-        id: response_id.clone(),
-        object: "response".to_string(),
-        created_at,
-        status: ResponseStatus::Queued,
-        error: None,
-        incomplete_details: None,
-        instructions: request.instructions.clone(),
-        max_output_tokens: request.max_output_tokens,
-        model: request.model.clone(),
-        output: Vec::new(),
-        parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
-        previous_response_id: request.previous_response_id.clone(),
-        reasoning: None,
-        store: request.store.unwrap_or(true),
-        temperature: request.temperature,
-        text: None,
-        tool_choice: "auto".to_string(),
-        tools: request.tools.clone().unwrap_or_default(),
-        top_p: request.top_p,
-        truncation: None,
-        usage: None,
-        user: None,
-        safety_identifier: request.user.clone(),
-        metadata: request.metadata.clone().unwrap_or_default(),
-    };
-
-    // Persist queued response to storage
-    if let Ok(response_json) = serde_json::to_value(&queued_response) {
-        if let Err(e) = persist_conversation_items(
-            ctx.conversation_storage.clone(),
-            ctx.conversation_item_storage.clone(),
-            ctx.response_storage.clone(),
-            &response_json,
-            &request,
-        )
-        .await
-        {
-            warn!("Failed to persist queued response: {}", e);
-        }
-    }
-
-    // Spawn background task
-    let ctx_clone = ctx.clone();
-    let request_clone = request.clone();
-    let headers_clone = headers.clone();
-    let model_id_clone = model_id.clone();
-    let response_id_clone = response_id.clone();
-
-    let handle = tokio::task::spawn(async move {
-        // Execute synchronously (set background=false to prevent recursion)
-        let mut background_request = (*request_clone).clone();
-        background_request.background = Some(false);
-
-        match route_responses_internal(
-            &ctx_clone,
-            Arc::new(background_request),
-            headers_clone,
-            model_id_clone,
-            Some(response_id_clone.clone()),
-        )
-        .await
-        {
-            Ok(_) => {
-                debug!(
-                    "Background response {} completed successfully",
-                    response_id_clone
-                );
-            }
-            Err(response) => {
-                warn!(
-                    "Background response {} failed with status {}",
-                    response_id_clone,
-                    response.status()
-                );
-            }
-        }
-
-        // Clean up task handle when done
-        ctx_clone
-            .background_tasks
-            .write()
-            .await
-            .remove(&response_id_clone);
-    });
-
-    // Store task info for cancellation support
-    ctx.background_tasks.write().await.insert(
-        response_id.clone(),
-        BackgroundTaskInfo {
-            handle,
-            grpc_request_id: String::new(), // Will be populated by pipeline at DispatchMetadataStage
-            client: Arc::new(RwLock::new(None)),
-        },
-    );
-
-    // Return queued response immediately
-    axum::Json(queued_response).into_response()
 }
 
 // ============================================================================
@@ -879,8 +751,6 @@ async fn execute_without_mcp(
             headers,
             model_id,
             ctx.components.clone(),
-            response_id.clone(),
-            Some(ctx.background_tasks.clone()),
         )
         .await?; // Preserve the Response error as-is
 

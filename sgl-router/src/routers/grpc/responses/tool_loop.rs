@@ -267,8 +267,6 @@ pub(super) async fn execute_tool_loop(
                 headers.clone(),
                 model_id.clone(),
                 ctx.components.clone(),
-                response_id.clone(),
-                Some(ctx.background_tasks.clone()),
             )
             .await?;
 
