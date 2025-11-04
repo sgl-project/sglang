@@ -304,6 +304,7 @@ suites = {
         TestFile("test_int4_kernel.py"),
         TestFile("test_int8_kernel.py"),
         TestFile("test_intel_amx_attention_backend.py"),
+        TestFile("test_constrained_decoding.py"),
         TestFile("test_json_mode.py"),
         TestFile("test_kv_events.py"),
         TestFile("test_large_max_new_tokens.py"),
