@@ -51,7 +51,7 @@ impl HAServerHandler {
             state,
             self_name: self_name.to_string(),
             _self_addr: self_addr,
-            signal_tx: signal_tx,
+            signal_tx,
         }
     }
 
@@ -187,7 +187,7 @@ impl HAServerBuilder {
                 self.state.clone(),
                 &self.self_name,
                 self.self_addr,
-                self.init_peer.clone(),
+                self.init_peer,
                 signal_rx,
             ),
             HAServerHandler::new(
@@ -217,11 +217,11 @@ impl HAServer {
         signal_rx: tokio::sync::watch::Receiver<()>,
     ) -> Self {
         HAServer {
-            state: state,
+            state,
             self_name: self_name.to_string(),
-            self_addr: self_addr,
-            init_peer: init_peer,
-            signal_rx: signal_rx,
+            self_addr,
+            init_peer,
+            signal_rx,
         }
     }
 
@@ -361,7 +361,7 @@ pub async fn try_ping(
             tonic::Status::unavailable("Failed to connect to peer")
         })?;
 
-    let ping_message = GossipMessage { payload: payload };
+    let ping_message = GossipMessage { payload };
     let response = client.ping_server(Request::new(ping_message)).await?;
 
     Ok(response.into_inner())
