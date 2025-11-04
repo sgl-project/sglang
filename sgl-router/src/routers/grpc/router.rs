@@ -1,5 +1,3 @@
-// gRPC Router Implementation
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,13 +10,14 @@ use axum::{
 use tracing::debug;
 
 use super::{
+    common::responses::handlers::{cancel_response_impl, get_response_impl},
     context::SharedComponents,
     harmony::{
         serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector,
         HarmonyResponsesContext,
     },
     pipeline::RequestPipeline,
-    responses,
+    regular::responses,
 };
 use crate::{
     app_context::AppContext,
@@ -43,9 +42,7 @@ pub struct GrpcRouter {
     pipeline: RequestPipeline,
     harmony_pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
-    // Responses context (bundles all /v1/responses dependencies: storage, MCP, background_tasks)
     responses_context: responses::ResponsesContext,
-    // Harmony responses context (uses harmony pipeline)
     harmony_responses_context: responses::ResponsesContext,
 }
 
@@ -156,7 +153,6 @@ impl GrpcRouter {
             &self.pipeline
         };
 
-        // Use selected pipeline for ALL requests (streaming and non-streaming)
         pipeline
             .execute_chat(
                 Arc::new(body.clone()),
@@ -176,7 +172,6 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing generate request for model: {:?}", model_id);
 
-        // Use pipeline for ALL requests (streaming and non-streaming)
         self.pipeline
             .execute_generate(
                 Arc::new(body.clone()),
@@ -187,35 +182,51 @@ impl GrpcRouter {
             .await
     }
 
-    /// Main route_responses implementation (pipeline-based for Harmony)
+    /// Main route_responses implementation
+    ///
+    /// Routes to either Harmony or regular responses implementation based on model detection
     async fn route_responses_impl(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
+        // Choose implementation based on Harmony model detection
+        let is_harmony = HarmonyDetector::is_harmony_model(&body.model);
+
         debug!(
-            "Processing Harmony responses request for model: {:?}, streaming: {:?}",
-            model_id, body.stream
+            "Processing responses request for model: {:?}, using_harmony={}",
+            model_id, is_harmony
         );
 
-        // Create HarmonyResponsesContext from existing responses context
-        let harmony_ctx = HarmonyResponsesContext::new(
-            Arc::new(self.harmony_pipeline.clone()),
-            self.shared_components.clone(),
-            self.harmony_responses_context.mcp_manager.clone(),
-            self.harmony_responses_context.response_storage.clone(),
-        );
+        if is_harmony {
+            debug!(
+                "Processing Harmony responses request for model: {:?}, streaming: {:?}",
+                model_id, body.stream
+            );
+            let harmony_ctx = HarmonyResponsesContext::new(
+                Arc::new(self.harmony_pipeline.clone()),
+                self.shared_components.clone(),
+                self.harmony_responses_context.mcp_manager.clone(),
+                self.harmony_responses_context.response_storage.clone(),
+            );
 
-        // Check if streaming is requested
-        if body.stream.unwrap_or(false) {
-            serve_harmony_responses_stream(&harmony_ctx, body.clone()).await
-        } else {
-            // Use non-streaming version for standard JSON responses
-            match serve_harmony_responses(&harmony_ctx, body.clone()).await {
-                Ok(response) => axum::Json(response).into_response(),
-                Err(error_response) => error_response,
+            if body.stream.unwrap_or(false) {
+                serve_harmony_responses_stream(&harmony_ctx, body.clone()).await
+            } else {
+                match serve_harmony_responses(&harmony_ctx, body.clone()).await {
+                    Ok(response) => axum::Json(response).into_response(),
+                    Err(error_response) => error_response,
+                }
             }
+        } else {
+            responses::route_responses(
+                &self.responses_context,
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+            )
+            .await
         }
     }
 }
@@ -236,7 +247,6 @@ impl RouterTrait for GrpcRouter {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // TODO: Implement actual generation test for gRPC
         (
             StatusCode::NOT_IMPLEMENTED,
             "Health generate not yet implemented for gRPC",
@@ -289,27 +299,7 @@ impl RouterTrait for GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Choose implementation based on Harmony model detection
-        let is_harmony = HarmonyDetector::is_harmony_model(&body.model);
-
-        debug!(
-            "Processing responses request for model: {:?}, using_harmony={}",
-            model_id, is_harmony
-        );
-
-        if is_harmony {
-            // Use pipeline-based implementation for Harmony models
-            self.route_responses_impl(headers, body, model_id).await
-        } else {
-            // Use legacy responses module for non-Harmony models
-            responses::route_responses(
-                &self.responses_context,
-                Arc::new(body.clone()),
-                headers.cloned(),
-                model_id.map(|s| s.to_string()),
-            )
-            .await
-        }
+        self.route_responses_impl(headers, body, model_id).await
     }
 
     async fn get_response(
@@ -318,11 +308,11 @@ impl RouterTrait for GrpcRouter {
         response_id: &str,
         _params: &ResponsesGetParams,
     ) -> Response {
-        responses::get_response_impl(&self.responses_context, response_id).await
+        get_response_impl(&self.responses_context, response_id).await
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        responses::cancel_response_impl(&self.responses_context, response_id).await
+        cancel_response_impl(&self.responses_context, response_id).await
     }
 
     async fn route_embeddings(

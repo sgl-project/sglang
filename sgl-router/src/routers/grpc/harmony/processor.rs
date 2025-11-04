@@ -17,8 +17,9 @@ use crate::{
         },
     },
     routers::grpc::{
+        common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
-        error, utils,
+        error,
     },
 };
 
@@ -34,28 +35,6 @@ impl HarmonyResponseProcessor {
         Self
     }
 
-    /// Collect responses from ExecutionResult (similar to regular processor)
-    async fn collect_responses(
-        execution_result: ExecutionResult,
-    ) -> Result<Vec<proto::GenerateComplete>, Response> {
-        match execution_result {
-            ExecutionResult::Single { mut stream } => {
-                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
-                stream.mark_completed();
-                Ok(responses)
-            }
-            ExecutionResult::Dual { prefill, decode } => {
-                // For Harmony we currently rely only on decode stream for outputs
-                let mut decode_stream = *decode;
-                let responses =
-                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
-                prefill.mark_completed();
-                decode_stream.mark_completed();
-                Ok(responses)
-            }
-        }
-    }
-
     /// Process a non-streaming Harmony chat response
     pub async fn process_non_streaming_chat_response(
         &self,
@@ -64,7 +43,7 @@ impl HarmonyResponseProcessor {
         dispatch: DispatchMetadata,
     ) -> Result<ChatCompletionResponse, Response> {
         // Collect all completed responses (one per choice)
-        let all_responses = Self::collect_responses(execution_result).await?;
+        let all_responses = response_collection::collect_responses(execution_result, false).await?;
         if all_responses.is_empty() {
             return Err(error::internal_error("No responses from server"));
         }
@@ -117,28 +96,15 @@ impl HarmonyResponseProcessor {
         }
 
         // Build usage from proto fields
-        let prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
-        let completion_tokens: u32 = all_responses
-            .iter()
-            .map(|r| r.completion_tokens as u32)
-            .sum();
-        let usage = Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-            completion_tokens_details: None,
-        };
+        let usage = response_formatting::build_usage(&all_responses);
 
         // Final ChatCompletionResponse
-        let response = ChatCompletionResponse {
-            id: dispatch.request_id.clone(),
-            object: "chat.completion".to_string(),
-            created: dispatch.created,
-            model: chat_request.model.clone(),
+        let response = response_formatting::build_chat_response(
             choices,
-            usage: Some(usage),
-            system_fingerprint: dispatch.weight_version.clone(),
-        };
+            &dispatch,
+            chat_request.model.clone(),
+            usage,
+        );
 
         Ok(response)
     }
@@ -191,7 +157,7 @@ impl HarmonyResponseProcessor {
         dispatch: DispatchMetadata,
     ) -> Result<ResponsesIterationResult, Response> {
         // Collect all completed responses
-        let all_responses = Self::collect_responses(execution_result).await?;
+        let all_responses = response_collection::collect_responses(execution_result, false).await?;
         if all_responses.is_empty() {
             return Err(error::internal_error("No responses from server"));
         }
@@ -280,14 +246,7 @@ impl HarmonyResponseProcessor {
         }
 
         // Build usage
-        let prompt_tokens = complete.prompt_tokens as u32;
-        let completion_tokens = complete.completion_tokens as u32;
-        let usage = Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-            completion_tokens_details: None,
-        };
+        let usage = response_formatting::build_usage(std::slice::from_ref(complete));
 
         // Build ResponsesResponse with all required fields
         let response = ResponsesResponse {
@@ -316,9 +275,9 @@ impl HarmonyResponseProcessor {
             top_p: responses_request.top_p,
             truncation: None,
             usage: Some(ResponsesUsage::Modern(ResponseUsage {
-                input_tokens: prompt_tokens,
-                output_tokens: completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
                 input_tokens_details: None,
                 output_tokens_details: None,
             })),
