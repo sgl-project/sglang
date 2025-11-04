@@ -58,10 +58,16 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         super().__init__()
         embed_dim = config.d_model
         self.embed_dim = config.d_model
+        head_size = None
+        projection_size = embed_dim
+        if _is_cpu and hasattr(config, "origin_encoder_attention_heads"):
+            head_size = embed_dim // config.origin_encoder_attention_heads
+            projection_size = config.encoder_attention_heads * head_size
         self.self_attn = VisionAttention(
             embed_dim=embed_dim,
             num_heads=config.encoder_attention_heads,
-            projection_size=embed_dim,
+            head_dim=head_size,
+            projection_size=projection_size,
             use_qkv_parallel=True,
             rotary_embed="normal",
             proj_bias=True,

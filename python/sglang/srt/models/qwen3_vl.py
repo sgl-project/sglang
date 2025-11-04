@@ -275,7 +275,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        if _is_cpu:
+        if _is_cpu and hasattr(vision_config, "original_num_heads"):
             head_dim = self.hidden_size // vision_config.original_num_heads
         else:
             head_dim = self.hidden_size // self.num_heads
