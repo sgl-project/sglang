@@ -20,7 +20,7 @@ class TestLogParser(CustomTestCase):
         print(df)
         print(df.write_json())
 
-        assert len(df) == len(lines.strip.splitlines()), f"{len(df)=}"
+        assert len(df) == len(lines.strip().splitlines()), f"{len(df)=}"
         self.assertEqual(df.to_dicts(), expect_rows)
 
 
