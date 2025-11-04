@@ -5,6 +5,10 @@ set -euxo pipefail
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
 
+# Detect system architecture
+ARCH=$(uname -m)
+echo "Detected architecture: ${ARCH}"
+
 if [ "$CU_VERSION" = "cu130" ]; then
     NVRTC_SPEC="nvidia-cuda-nvrtc"
 else
@@ -19,12 +23,25 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 # Clear torch compilation cache
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 rm -rf /root/.cache/flashinfer
+pip3 uninstall flashinfer-python flashinfer-cubin flashinfer-jit-cache || true
 
 # Install apt packages
-apt install -y git libnuma-dev
+apt install -y git libnuma-dev libssl-dev pkg-config
+
+# Check if protoc of correct architecture is already installed
+if command -v protoc >/dev/null 2>&1; then
+    if protoc --version >/dev/null 2>&1; then
+        echo "protoc already installed: $(protoc --version)"
+    else
+        echo "protoc found but not runnable, reinstalling..."
+        INSTALL_PROTOC=1
+    fi
+else
+    INSTALL_PROTOC=1
+fi
 
 # Install protoc for router build (gRPC protobuf compilation)
-if ! command -v protoc &> /dev/null; then
+if [ "${INSTALL_PROTOC:-0}" = "1" ]; then
     echo "Installing protoc..."
     if command -v apt-get &> /dev/null; then
         # Ubuntu/Debian
@@ -37,9 +54,16 @@ if ! command -v protoc &> /dev/null; then
     fi
 
     cd /tmp
-    wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip
-    unzip protoc-32.0-linux-x86_64.zip -d /usr/local
-    rm protoc-32.0-linux-x86_64.zip
+    # Determine protoc architecture
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        PROTOC_ARCH="aarch_64"
+    else
+        PROTOC_ARCH="x86_64"
+    fi
+    PROTOC_ZIP="protoc-32.0-linux-${PROTOC_ARCH}.zip"
+    wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/${PROTOC_ZIP}
+    unzip -o ${PROTOC_ZIP} -d /usr/local
+    rm ${PROTOC_ZIP}
     protoc --version
     cd -
 else
@@ -52,12 +76,10 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     # so we can only use pip with `--break-system-packages`
     PIP_CMD="pip"
     PIP_INSTALL_SUFFIX="--break-system-packages"
+    $PIP_CMD install --upgrade pip
 
     # Clean up existing installations
-    $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
-
-    # Install the main package
-    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
+    $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
@@ -65,26 +87,17 @@ else
     export UV_SYSTEM_PYTHON=true
 
     PIP_CMD="uv pip"
-    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
+    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --prerelease allow"
 
     # Clean up existing installations
-    $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
-
-    # Install the main package without deps
-    $PIP_CMD install -e "python[dev]" --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
-
-    # Install flashinfer-python 0.4.1 dependency that requires prerelease (This should be removed when flashinfer fixes this issue)
-    $PIP_CMD install flashinfer-python==0.4.1 --prerelease=allow $PIP_INSTALL_SUFFIX
-
-    # Install the main package
-    $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --upgrade
+    $PIP_CMD uninstall sgl-kernel sglang || true
 fi
 
-# Install OpenSSL development libraries for router build
-apt install -y libssl-dev pkg-config
+# Install the main package
+$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 # Install router for pd-disagg test
-$PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
+$PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
 # Install sgl-kernel
 SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
@@ -93,7 +106,13 @@ echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNE
 
 if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     ls -alh sgl-kernel/dist
-    $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    # Determine wheel architecture
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        WHEEL_ARCH="aarch64"
+    else
+        WHEEL_ARCH="x86_64"
+    fi
+    $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
 else
     $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
 fi
@@ -101,7 +120,7 @@ fi
 # Show current packages
 $PIP_CMD list
 
-$PIP_CMD install mooncake-transfer-engine==0.3.6.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.7.post2 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU

@@ -9,7 +9,7 @@ use validator::Validate;
 
 // Import shared types from common module
 use super::common::{
-    default_model, default_true, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo,
+    default_model, default_true, ChatLogProbs, Function, GenerationRequest, PromptTokenUsageInfo,
     StringOrArray, ToolChoice, UsageInfo,
 };
 
@@ -22,8 +22,10 @@ pub struct ResponseTool {
     #[serde(rename = "type")]
     pub r#type: ResponseToolType,
     // Function tool fields (used when type == "function")
+    // In Responses API, function fields are flattened at the top level
+    #[serde(flatten)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub function: Option<crate::protocols::common::Function>,
+    pub function: Option<Function>,
     // MCP-specific fields (used when type == "mcp")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
@@ -123,15 +125,16 @@ pub enum ResponseInputOutputItem {
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
         summary: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
         content: Vec<ResponseReasoningContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
-    #[serde(rename = "function_tool_call")]
+    #[serde(rename = "function_call")]
     FunctionToolCall {
         id: String,
+        call_id: String,
         name: String,
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,6 +144,7 @@ pub enum ResponseInputOutputItem {
     },
     #[serde(rename = "function_call_output")]
     FunctionCallOutput {
+        id: Option<String>,
         call_id: String,
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,15 +211,15 @@ pub enum ResponseOutputItem {
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
         summary: Vec<String>,
         content: Vec<ResponseReasoningContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
-    #[serde(rename = "function_tool_call")]
+    #[serde(rename = "function_call")]
     FunctionToolCall {
         id: String,
+        call_id: String,
         name: String,
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -247,9 +251,10 @@ pub enum ResponseOutputItem {
 // Configuration Enums
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceTier {
+    #[default]
     Auto,
     Default,
     Flex,
@@ -257,23 +262,12 @@ pub enum ServiceTier {
     Priority,
 }
 
-impl Default for ServiceTier {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Truncation {
     Auto,
+    #[default]
     Disabled,
-}
-
-impl Default for Truncation {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -857,6 +851,10 @@ pub struct ResponsesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
+    /// Safety identifier for content moderation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+
     /// Additional metadata
     #[serde(default)]
     pub metadata: HashMap<String, Value>,
@@ -921,6 +919,7 @@ impl ResponseOutputItem {
     /// Create a new function tool call output item
     pub fn new_function_tool_call(
         id: String,
+        call_id: String,
         name: String,
         arguments: String,
         output: Option<String>,
@@ -928,6 +927,7 @@ impl ResponseOutputItem {
     ) -> Self {
         Self::FunctionToolCall {
             id,
+            call_id,
             name,
             arguments,
             output,
