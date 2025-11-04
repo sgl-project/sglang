@@ -1,8 +1,9 @@
 _PATTERN_DECODE = (
-    r"(\(SGLangEngine pid=(?P<pid>\d+)(?:,\s*ip=(?P<ip>[\d\.]+))?\))?\s+"
+    r"(\(\w+ pid=(?P<pid>\d+)(?:,\s*ip=(?P<ip>[\d\.]+))?\))?\s*"
     r"\[(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
     r"(?:\s+DP(?P<dp_rank>\d+))?"
     r"(?:\s+TP(?P<tp_rank>\d+))?"
+    r"(?:\s+EP(?P<ep_rank>\d+))?"
     r"(?:\s+PP(?P<pp_rank>\d+))?"
     r"\]\s+"
     r"Decode batch( \[\d+\])?,\s+"
@@ -31,6 +32,7 @@ def parse(lines):
                 ("pid", pl.Int64),
                 ("dp_rank", pl.Int64),
                 ("tp_rank", pl.Int64),
+                ("ep_rank", pl.Int64),
                 ("pp_rank", pl.Int64),
                 ("num_running_req", pl.Int64),
                 ("num_token", pl.Int64),
