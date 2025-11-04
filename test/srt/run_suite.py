@@ -431,10 +431,11 @@ def _sanity_check_suites(suites):
     )
 
     missing_files = sorted(list(disk_files - suite_files))
+    missing_text = '\n'.join(f'TestFile("{x}"),' for x in missing_files)
     assert len(missing_files) == 0, (
         f"Some test files are not in test suite. "
-        f"If this is intentional, please add to `not_in_ci` section. "
-        f"{missing_files=}"
+        f"If this is intentional, please add the following to `not_in_ci` section:\n"
+        f"{missing_text}"
     )
 
 
