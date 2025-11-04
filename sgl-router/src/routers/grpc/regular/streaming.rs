@@ -1,7 +1,6 @@
 //! Streaming response processor for gRPC routers
 //!
-//! This module contains shared streaming logic for both Regular and PD routers,
-//! eliminating ~600 lines of duplication.
+//! This module contains shared streaming logic for both Regular and PD router.
 
 use std::{collections::HashMap, io, sync::Arc, time::Instant};
 
@@ -17,9 +16,8 @@ use tokio::sync::{mpsc, mpsc::UnboundedSender};
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tracing::{debug, error, warn};
 
-use super::{context, utils};
 use crate::{
-    grpc_client::proto,
+    grpc_client::{proto, sglang_scheduler::AbortOnDropStream},
     protocols::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
@@ -30,20 +28,21 @@ use crate::{
         },
         generate::GenerateRequest,
     },
-    reasoning_parser::ReasoningParser,
+    reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser},
+    routers::grpc::{context, utils},
     tokenizer::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
         traits::Tokenizer,
     },
-    tool_parser::ToolParser,
+    tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser},
 };
 
 /// Shared streaming processor for both single and dual dispatch modes
 #[derive(Clone)]
 pub struct StreamingProcessor {
     tokenizer: Arc<dyn Tokenizer>,
-    tool_parser_factory: crate::tool_parser::ParserFactory,
-    reasoning_parser_factory: crate::reasoning_parser::ParserFactory,
+    tool_parser_factory: ToolParserFactory,
+    reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
 }
@@ -51,8 +50,8 @@ pub struct StreamingProcessor {
 impl StreamingProcessor {
     pub fn new(
         tokenizer: Arc<dyn Tokenizer>,
-        tool_parser_factory: crate::tool_parser::ParserFactory,
-        reasoning_parser_factory: crate::reasoning_parser::ParserFactory,
+        tool_parser_factory: ToolParserFactory,
+        reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {
@@ -161,7 +160,7 @@ impl StreamingProcessor {
     /// Process streaming chunks from a single stream (Regular mode)
     pub async fn process_streaming_chunks(
         &self,
-        mut grpc_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+        mut grpc_stream: AbortOnDropStream,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
@@ -576,8 +575,8 @@ impl StreamingProcessor {
     /// Process dual streaming chunks (prefill + decode) - PD mode
     pub async fn process_dual_streaming_chunks(
         &self,
-        mut prefill_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
-        decode_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+        mut prefill_stream: AbortOnDropStream,
+        decode_stream: AbortOnDropStream,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
@@ -696,7 +695,7 @@ impl StreamingProcessor {
     /// Process streaming chunks for generate endpoint (no tool/reasoning parsing)
     async fn process_generate_streaming(
         tokenizer: Arc<dyn Tokenizer>,
-        mut stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+        mut stream: AbortOnDropStream,
         request_id: String,
         weight_version: String,
         _include_logprobs: bool,
@@ -800,8 +799,8 @@ impl StreamingProcessor {
     /// Process dual streaming for generate endpoint (PD mode with logprobs support)
     async fn process_generate_streaming_dual(
         tokenizer: Arc<dyn Tokenizer>,
-        mut prefill_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
-        decode_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+        mut prefill_stream: AbortOnDropStream,
+        decode_stream: AbortOnDropStream,
         request_id: String,
         weight_version: String,
         return_logprob: bool,
@@ -857,7 +856,7 @@ impl StreamingProcessor {
     /// Process generate streaming with optional input_logprobs
     async fn process_generate_streaming_with_input_logprobs(
         tokenizer: Arc<dyn Tokenizer>,
-        mut stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+        mut stream: AbortOnDropStream,
         request_id: String,
         weight_version: String,
         _include_logprobs: bool,
@@ -1051,7 +1050,7 @@ impl StreamingProcessor {
             };
 
             match parse_result {
-                Ok(crate::reasoning_parser::ParserResult {
+                Ok(ParserResult {
                     reasoning_text,
                     normal_text,
                 }) => {
@@ -1122,7 +1121,7 @@ impl StreamingProcessor {
             let mut parser = pooled_parser.lock().await;
 
             match parser.parse_incremental(delta, tools).await {
-                Ok(crate::tool_parser::StreamingParseResult { normal_text, calls }) => {
+                Ok(StreamingParseResult { normal_text, calls }) => {
                     // Emit normal text if present
                     if !normal_text.is_empty() {
                         chunks.push(ChatCompletionStreamResponse {
