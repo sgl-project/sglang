@@ -6,7 +6,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::routers::grpc::{
-    common::stages::PipelineStage,
+    common::stages::{helpers, PipelineStage},
     context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
     error,
 };
@@ -106,10 +106,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
             if let Some(WorkerSelection::Dual { prefill, .. }) = ctx.state.workers.as_ref() {
-                crate::routers::grpc::common::stages::helpers::inject_bootstrap_metadata(
-                    &mut proto_request,
-                    prefill,
-                );
+                helpers::inject_bootstrap_metadata(&mut proto_request, prefill);
             }
         }
 

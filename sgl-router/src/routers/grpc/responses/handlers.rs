@@ -58,13 +58,16 @@ use super::{
 };
 use crate::{
     data_connector::{
-        ConversationId, ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage,
+        self, ConversationId, ConversationItemStorage, ConversationStorage, ResponseId,
+        ResponseStorage,
     },
     protocols::{
-        chat::ChatCompletionStreamResponse,
+        chat::{self, ChatCompletionStreamResponse},
+        common,
         responses::{
-            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-            ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+            self, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+            ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
+            ResponsesUsage,
         },
     },
     routers::{
@@ -470,7 +473,7 @@ async fn route_responses_streaming(
 #[allow(clippy::too_many_arguments)]
 async fn convert_chat_stream_to_responses_stream(
     ctx: &super::context::ResponsesContext,
-    chat_request: Arc<crate::protocols::chat::ChatCompletionRequest>,
+    chat_request: Arc<chat::ChatCompletionRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
     original_request: &ResponsesRequest,
@@ -557,7 +560,7 @@ async fn convert_chat_stream_to_responses_stream(
 async fn process_and_transform_sse_stream(
     body: Body,
     original_request: ResponsesRequest,
-    _chat_request: Arc<crate::protocols::chat::ChatCompletionRequest>,
+    _chat_request: Arc<chat::ChatCompletionRequest>,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -673,7 +676,7 @@ struct StreamingResponseAccumulator {
 
     // Completion state
     finish_reason: Option<String>,
-    usage: Option<crate::protocols::common::Usage>,
+    usage: Option<common::Usage>,
 
     // Original request for final response construction
     original_request: ResponsesRequest,
@@ -789,11 +792,9 @@ impl StreamingResponseAccumulator {
             output.push(ResponseOutputItem::Reasoning {
                 id: format!("reasoning_{}", self.response_id),
                 summary: vec![],
-                content: vec![
-                    crate::protocols::responses::ResponseReasoningContent::ReasoningText {
-                        text: self.reasoning_buffer,
-                    },
-                ],
+                content: vec![ResponseReasoningContent::ReasoningText {
+                    text: self.reasoning_buffer,
+                }],
                 status: Some("completed".to_string()),
             });
         }
@@ -811,7 +812,7 @@ impl StreamingResponseAccumulator {
 
         // Convert usage
         let usage = self.usage.as_ref().map(|u| {
-            let usage_info = crate::protocols::common::UsageInfo {
+            let usage_info = common::UsageInfo {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
@@ -973,9 +974,9 @@ async fn load_conversation_history(
 
         // Load conversation history
         const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
-        let params = crate::data_connector::ListParams {
+        let params = data_connector::ListParams {
             limit: MAX_CONVERSATION_HISTORY_ITEMS,
-            order: crate::data_connector::SortOrder::Asc,
+            order: data_connector::SortOrder::Asc,
             after: None,
         };
 
@@ -1014,8 +1015,7 @@ async fn load_conversation_history(
                     ResponseInput::Items(current_items) => {
                         // Process all item types, converting SimpleInputMessage to Message
                         for item in current_items.iter() {
-                            let normalized =
-                                crate::protocols::responses::normalize_input_item(item);
+                            let normalized = responses::normalize_input_item(item);
                             items.push(normalized);
                         }
                     }
@@ -1050,7 +1050,7 @@ async fn load_conversation_history(
             ResponseInput::Items(current_items) => {
                 // Process all item types, converting SimpleInputMessage to Message
                 for item in current_items.iter() {
-                    let normalized = crate::protocols::responses::normalize_input_item(item);
+                    let normalized = responses::normalize_input_item(item);
                     items.push(normalized);
                 }
             }

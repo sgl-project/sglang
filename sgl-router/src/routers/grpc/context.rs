@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::{
     core::Worker,
-    grpc_client::{proto, SglangSchedulerClient},
+    grpc_client::{proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         generate::{GenerateRequest, GenerateResponse},
@@ -431,8 +431,6 @@ impl ClientSelection {
 // ============================================================================
 // Execution and Response Types
 // ============================================================================
-
-use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
 
 /// Result of request execution (streams from workers)
 /// Uses AbortOnDropStream to automatically abort on cancellation

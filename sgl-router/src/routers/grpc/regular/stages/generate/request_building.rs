@@ -5,7 +5,7 @@ use axum::response::Response;
 use uuid::Uuid;
 
 use crate::routers::grpc::{
-    common::stages::PipelineStage,
+    common::stages::{helpers, PipelineStage},
     context::{ClientSelection, RequestContext, WorkerSelection},
     error,
 };
@@ -64,10 +64,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
             if let WorkerSelection::Dual { prefill, .. } = ctx.state.workers.as_ref().unwrap() {
-                crate::routers::grpc::common::stages::helpers::inject_bootstrap_metadata(
-                    &mut proto_request,
-                    prefill,
-                );
+                helpers::inject_bootstrap_metadata(&mut proto_request, prefill);
             }
         }
 

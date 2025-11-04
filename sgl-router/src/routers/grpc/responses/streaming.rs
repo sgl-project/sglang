@@ -7,7 +7,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::protocols::chat::ChatCompletionStreamResponse;
+use crate::{mcp, protocols::chat::ChatCompletionStreamResponse};
 
 pub enum OutputItemType {
     Message,
@@ -248,7 +248,7 @@ impl ResponseStreamEventEmitter {
     pub fn emit_mcp_list_tools_completed(
         &mut self,
         output_index: usize,
-        tools: &[crate::mcp::Tool],
+        tools: &[mcp::Tool],
     ) -> serde_json::Value {
         let tool_items: Vec<_> = tools
             .iter()
