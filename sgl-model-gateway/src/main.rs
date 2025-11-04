@@ -546,7 +546,8 @@ struct CliArgs {
     disable_audit_logging: bool,
 
     // ==================== HA Server ====================
-    ha_enable: bool,
+    #[arg(long, default_value_t = false)]
+    enable_ha: bool,
 
     #[arg(long)]
     ha_server_name: Option<String>,
@@ -1000,7 +1001,7 @@ impl CliArgs {
         };
 
         // ==================== HA Server ====================
-        let ha_server_config = if self.ha_enable {
+        let ha_server_config = if self.enable_ha {
             let self_name = if let Some(name) = &self.ha_server_name {
                 name.to_string()
             } else {

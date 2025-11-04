@@ -135,6 +135,12 @@ class RouterArgs:
     jwt_audience: Optional[str] = None
     jwt_jwks_uri: Optional[str] = None
     jwt_role_mapping: Dict[str, str] = dataclasses.field(default_factory=dict)
+    # HA configuration
+    enable_ha: bool = False
+    ha_server_name: Optional[str] = None
+    ha_host: str = "0.0.0.0"
+    ha_port: int = 39527
+    peer_urls: List[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(
@@ -770,6 +776,36 @@ class RouterArgs:
             type=str,
             default="localhost:4317",
             help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
+        )
+        parser.add_argument(
+            f"--{prefix}enable-ha",
+            action="store_true",
+            help="Enable HA (High Availability) mode",
+        )
+        parser.add_argument(
+            f"--{prefix}ha-server-name",
+            type=str,
+            default=None,
+            help="Name of the HA server",
+        )
+        parser.add_argument(
+            f"--{prefix}ha-host",
+            type=str,
+            default="0.0.0.0",
+            help="Host address of the HA server",
+        )
+        parser.add_argument(
+            f"--{prefix}ha-port",
+            type=int,
+            default=39527,
+            help="Port of the HA server",
+        )
+        parser.add_argument(
+            f"--{prefix}peer-urls",
+            type=str,
+            nargs="*",
+            default=[],
+            help="URLs of the peer nodes in the HA cluster",
         )
 
         # Control plane authentication
