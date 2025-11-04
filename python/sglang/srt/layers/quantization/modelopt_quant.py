@@ -8,7 +8,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.environs import envs
+from sglang.srt.environ import envs
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
