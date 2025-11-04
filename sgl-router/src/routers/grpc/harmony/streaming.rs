@@ -31,8 +31,8 @@ use crate::{
         responses::{ResponseStatus, ResponseUsage, ResponsesResponse, ResponsesUsage},
     },
     routers::grpc::{
+        common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
         context,
-        responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
     },
 };
 /// Processor for streaming Harmony responses

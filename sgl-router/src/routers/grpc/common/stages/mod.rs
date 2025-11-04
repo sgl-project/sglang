@@ -1,16 +1,15 @@
-//! Pipeline stages for gRPC router request processing
+//! Common pipeline stages shared across all endpoints and model types
 //!
-//! This module defines the core pipeline abstraction and individual processing stages
-//! that transform a RequestContext through its lifecycle.
+//! These stages are endpoint-agnostic and model-agnostic:
+//! - Worker selection
+//! - Client acquisition
+//! - Dispatch metadata generation
+//! - Request execution
 
 use async_trait::async_trait;
 use axum::response::Response;
 
 use crate::routers::grpc::context::RequestContext;
-
-// ============================================================================
-// Pipeline Trait
-// ============================================================================
 
 /// Trait for pipeline stages that process requests
 #[async_trait]
@@ -27,26 +26,14 @@ pub trait PipelineStage: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-// ============================================================================
-// Stage Modules
-// ============================================================================
-
 mod client_acquisition;
 mod dispatch_metadata;
-mod preparation;
-mod request_building;
+pub mod helpers;
 mod request_execution;
-mod response_processing;
 mod worker_selection;
 
-// ============================================================================
-// Public Exports
-// ============================================================================
-
+// Export stage implementations
 pub use client_acquisition::ClientAcquisitionStage;
 pub use dispatch_metadata::DispatchMetadataStage;
-pub use preparation::PreparationStage;
-pub use request_building::RequestBuildingStage;
 pub use request_execution::{ExecutionMode, RequestExecutionStage};
-pub use response_processing::ResponseProcessingStage;
 pub use worker_selection::{WorkerSelectionMode, WorkerSelectionStage};
