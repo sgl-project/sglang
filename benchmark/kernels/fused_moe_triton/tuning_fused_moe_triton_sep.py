@@ -14,6 +14,7 @@ import triton.language as tl
 from common_utils import (
     BenchmarkConfig,
     get_configs_compute_bound,
+    get_default_batch_sizes,
     get_model_config,
     sort_config,
     validate_ep_tp_mode,
@@ -519,26 +520,7 @@ def main(args: argparse.Namespace):
 
     topk_ids_dir = args.topk_ids_dir
     if args.batch_size is None:
-        batch_sizes = [
-            1,
-            2,
-            4,
-            8,
-            16,
-            24,
-            32,
-            48,
-            64,
-            96,
-            128,
-            256,
-            512,
-            1024,
-            1536,
-            2048,
-            3072,
-            4096,
-        ]
+        batch_sizes = get_default_batch_sizes()
         batch_sizes.reverse()
     else:
         batch_sizes = [args.batch_size]

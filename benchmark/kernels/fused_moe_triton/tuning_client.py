@@ -13,7 +13,7 @@ if hidden_states.shape[0] >= 4096 and get_tensor_model_parallel_rank() == 0:
     if not hasattr(self, "save_idx"):
         self.save_idx = 0
     if self.save_idx <= 1:
-        torch.save(topk_output.topk_ids, f"{topk_ids_dir}/topk_idx_layer{self.layer_id}_idx{self.save_idx}.pt")
+        torch.save(topk_output.topk_ids, f"{topk_ids_dir}/topk_ids_layer{self.layer_id}_idx{self.save_idx}.pt")
     self.save_idx += 1
 """
 

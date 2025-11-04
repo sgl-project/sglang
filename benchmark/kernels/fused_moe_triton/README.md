@@ -91,8 +91,13 @@ if hidden_states.shape[0] >= 4096 and get_tensor_model_parallel_rank() == 0:
     if not hasattr(self, "save_idx"):
         self.save_idx = 0
     if self.save_idx <= 1:
-        torch.save(topk_output.topk_ids, f"{topk_ids_dir}/topk_idx_layer{self.layer_id}_idx{self.save_idx}.pt")
+        torch.save(topk_output.topk_ids, f"{topk_ids_dir}/topk_ids_layer{self.layer_id}_idx{self.save_idx}.pt")
     self.save_idx += 1
+```
+
+Launch sglang server and send request using `benchmark/kernels/fused_moe_triton/tuning_client.py`
+```bash
+python benchmark/kernels/fused_moe_triton/tuning_client.py --port 8000
 ```
 
 ```bash
@@ -125,6 +130,7 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py \
     --model deepseek-ai/DeepSeek-V3-0324 \
     --tp-size 4 \
     --batch-size 1024 \
+    --dtype fp8_w8a8 \
     --configs 128 256 128 16 8 4 \
     --topk-ids-dir /path/to/topk_ids
 ```
