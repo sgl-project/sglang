@@ -1106,7 +1106,14 @@ impl HarmonyStreamingProcessor {
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<ResponsesIterationResult, String> {
-        Self::process_responses_dual_stream(prefill_stream, decode_stream, emitter, tx, ToolCallMode::Mcp).await
+        Self::process_responses_dual_stream(
+            prefill_stream,
+            decode_stream,
+            emitter,
+            tx,
+            ToolCallMode::Mcp,
+        )
+        .await
     }
 
     /// Process streaming chunks from dual streams - Function tools
@@ -1116,7 +1123,14 @@ impl HarmonyStreamingProcessor {
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<ResponsesIterationResult, String> {
-        Self::process_responses_dual_stream(prefill_stream, decode_stream, emitter, tx, ToolCallMode::Function).await
+        Self::process_responses_dual_stream(
+            prefill_stream,
+            decode_stream,
+            emitter,
+            tx,
+            ToolCallMode::Function,
+        )
+        .await
     }
 
     /// Build SSE response from receiver
