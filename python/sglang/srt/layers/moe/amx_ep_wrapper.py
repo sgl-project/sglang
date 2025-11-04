@@ -1,0 +1,366 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+AMX Expert Parallelism Wrapper for MoE layers.
+
+This module provides a generic wrapper that enables CPU-GPU expert parallelism
+for any MoE quantization method. It coordinates parallel execution of GPU experts
+(using any quantization method) and CPU experts (using AMX instructions).
+"""
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
+
+import torch
+
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.utils import get_compiler_backend
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe import MoeRunnerConfig
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
+    from sglang.srt.server_args import ServerArgs
+
+try:
+    from kt_kernel import AMXMoEWrapper
+
+    KTRANSFORMERS_AVAILABLE = True
+except ImportError:
+    KTRANSFORMERS_AVAILABLE = False
+
+
+@dataclass
+class AMXConfig:
+    """Configuration for AMX CPU expert computation.
+
+    Args:
+        layer_idx: Layer index in the model
+        num_gpu_experts: Number of experts to run on GPU
+        cpuinfer_threads: Number of CPU inference threads
+        threadpool_count: Number of thread pools for AMX computation
+        amx_weight_path: Path to AMX quantized weights
+        chunked_prefill_size: Chunk size for prefill computation
+        amx_method: AMX computation method (e.g., "int4")
+    """
+
+    layer_idx: int
+    num_gpu_experts: int
+    cpuinfer_threads: int
+    threadpool_count: int
+    amx_weight_path: str
+    chunked_prefill_size: int
+    amx_method: str
+
+
+def create_amx_config_from_server_args(
+    server_args: "ServerArgs", layer_idx: int
+) -> Optional[AMXConfig]:
+    """Create AMXConfig from ServerArgs if AMX is configured.
+
+    Args:
+        server_args: Global server arguments
+        layer_idx: Layer index in the model
+
+    Returns:
+        AMXConfig if AMX is configured, None otherwise
+    """
+    if server_args.kt_amx_weight_path is None:
+        return None
+
+    return AMXConfig(
+        layer_idx=layer_idx,
+        num_gpu_experts=server_args.kt_num_gpu_experts,
+        cpuinfer_threads=server_args.kt_cpuinfer,
+        threadpool_count=server_args.kt_threadpool_count,
+        amx_weight_path=server_args.kt_amx_weight_path,
+        chunked_prefill_size=server_args.chunked_prefill_size,
+        amx_method=server_args.kt_amx_method,
+    )
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
+    """Mask CPU expert IDs by setting them to -1.
+
+    This function masks expert IDs that should be computed on CPU (IDs >= num_gpu_experts)
+    so they won't be computed on GPU. The masked IDs are set to -1, which causes the
+    GPU MoE kernel to skip those experts.
+
+    Args:
+        topk_ids: Tensor of shape [num_tokens, top_k] containing expert IDs
+        num_gpu_experts: Number of experts that should run on GPU (experts 0 to num_gpu_experts-1)
+
+    Returns:
+        Modified topk_ids tensor with CPU expert IDs masked as -1
+    """
+    topk_ids = topk_ids.clone()
+    topk_ids[topk_ids >= num_gpu_experts] = -1
+    return topk_ids
+
+
+class AMXEPWrapperMethod(FusedMoEMethodBase):
+    """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
+
+    This wrapper coordinates parallel execution of:
+    - GPU experts (0 to num_gpu_experts-1) using any quantization method
+    - CPU experts (num_gpu_experts to total_experts-1) using AMX instructions
+
+    The wrapper implements the submit-compute-sync pattern:
+    1. Submit CPU expert computation (non-blocking)
+    2. Execute GPU expert computation in parallel
+    3. Synchronize and merge CPU+GPU results
+
+    Example:
+        # Wrap any GPU method with AMX CPU expert support
+        gpu_method = CompressedTensorsWNA16MoEMethod(quant_config, prefix)
+        amx_config = AMXConfig(layer_idx=0, num_gpu_experts=4, ...)
+        method = AMXEPWrapperMethod(gpu_method, amx_config)
+    """
+
+    def __init__(
+        self,
+        gpu_method: FusedMoEMethodBase,
+        amx_config: AMXConfig,
+    ):
+        """Initialize the AMX EP wrapper.
+
+        Args:
+            gpu_method: The quantization method to use for GPU experts
+            amx_config: Configuration for AMX CPU expert computation
+        """
+        if not KTRANSFORMERS_AVAILABLE:
+            raise ImportError(
+                "kt_kernel is not installed. To use AMX EP wrapper, please install kt_kernel."
+            )
+
+        self.gpu_method = gpu_method
+        self.amx_config = amx_config
+        self.num_gpu_experts = amx_config.num_gpu_experts
+        self.override_num_local_experts = True
+        self.gpu_method.num_gpu_experts = self.num_gpu_experts
+        self.tp_rank = get_tensor_model_parallel_rank()
+
+        # AMX wrapper will be initialized in create_weights
+        self.amx_wrapper: Optional[AMXMoEWrapper] = None
+
+        # Store parameters needed for AMX initialization
+        self._layer_params = None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """Create weights for both GPU and CPU experts.
+
+        Args:
+            layer: The MoE layer module
+            num_experts: Total number of experts (GPU + CPU)
+            hidden_size: Hidden dimension size
+            intermediate_size_per_partition: Intermediate size per TP partition
+            params_dtype: Data type for parameters
+            **extra_weight_attrs: Additional weight attributes
+        """
+        self.global_num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.intermediate_size_per_partition = intermediate_size_per_partition
+
+        # Extract required parameters from extra_weight_attrs
+        num_experts_per_tok = extra_weight_attrs.get("top_k")
+        intermediate_size_full = extra_weight_attrs.get("intermediate_size_full")
+
+        # 1. Create weights for GPU experts using the wrapped method
+        # GPU experts: 0 to num_gpu_experts-1
+        self.gpu_method.create_weights(
+            layer=layer,
+            num_experts=self.num_gpu_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs,
+        )
+
+        # 2. Initialize AMX wrapper for CPU experts
+        # CPU experts: num_gpu_experts to num_experts-1
+        if self.tp_rank == 0:
+            self.amx_wrapper = AMXMoEWrapper(
+                layer_idx=self.amx_config.layer_idx,
+                num_experts=num_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                hidden_size=hidden_size,
+                moe_intermediate_size=intermediate_size_full,
+                num_gpu_experts=self.num_gpu_experts,
+                cpuinfer_threads=self.amx_config.cpuinfer_threads,
+                threadpool_count=self.amx_config.threadpool_count,
+                amx_weight_path=self.amx_config.amx_weight_path,
+                chunked_prefill_size=self.amx_config.chunked_prefill_size,
+                amx_method=self.amx_config.amx_method,
+            )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Process weights after loading from checkpoint.
+
+        Args:
+            layer: The MoE layer module
+        """
+        # 1. Process GPU weights
+        if hasattr(self.gpu_method, "process_weights_after_loading"):
+            self.gpu_method.process_weights_after_loading(layer)
+
+        # 2. Load CPU weights using AMX wrapper
+        if self.tp_rank == 0 and self.amx_wrapper is not None:
+            torch.cuda.synchronize()
+
+            # Get expert location metadata for CPU expert mapping
+            from sglang.srt.eplb.expert_location_dispatch import (
+                get_global_expert_location_metadata,
+            )
+
+            physical_to_logical_map_cpu = (
+                get_global_expert_location_metadata()
+                .physical_to_logical_map_cpu[self.amx_config.layer_idx]
+                .contiguous()
+            )
+            self.amx_wrapper.load_weights(physical_to_logical_map_cpu)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        """Create MoE runner for computation.
+
+        Args:
+            layer: The MoE layer module
+            moe_runner_config: Configuration for MoE runner
+        """
+        self.moe_runner_config = moe_runner_config
+        if self.override_num_local_experts:
+            moe_runner_config.num_local_experts = self.num_gpu_experts
+        # Delegate to GPU method to create its runner
+        self.gpu_method.create_moe_runner(layer, moe_runner_config)
+
+    def submit(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> None:
+        """Submit CPU expert computation asynchronously (non-blocking).
+
+        This method submits the CPU expert computation to AMX without waiting
+        for completion, allowing GPU computation to proceed in parallel.
+
+        Args:
+            layer: The MoE layer module
+            dispatch_output: Dispatched tokens and routing information
+        """
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        if self.tp_rank != 0 or self.amx_wrapper is None:
+            return
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+
+        # Submit forward task to AMX (non-blocking)
+        self.amx_wrapper.submit_forward(
+            x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
+        )
+
+    def sync(self, x: torch.Tensor) -> torch.Tensor:
+        """Synchronize and retrieve CPU expert computation results.
+
+        This method waits for the CPU computation to complete and returns the results.
+
+        Args:
+            x: Reference tensor for shape and device information
+
+        Returns:
+            CPU expert computation results
+        """
+        if self.tp_rank != 0 or self.amx_wrapper is None:
+            return torch.zeros_like(x)
+
+        # Wait for CPU computation and retrieve results
+        return self.amx_wrapper.sync_forward(
+            x, torch.cuda.current_stream(x.device).cuda_stream
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
+        """Execute hybrid CPU+GPU MoE forward pass with parallelism.
+
+        This is the main computation method that coordinates:
+        1. Submit CPU expert computation (non-blocking)
+        2. Execute GPU expert computation in parallel
+        3. Synchronize CPU results and merge with GPU results
+
+        Args:
+            layer: The MoE layer module
+            dispatch_output: Dispatched tokens and routing information
+
+        Returns:
+            Combined computation results from CPU and GPU experts
+        """
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        # Step 1: Submit CPU expert computation (non-blocking)
+        if self.tp_rank == 0:
+            self.submit(layer, dispatch_output)
+
+        # Step 2: Prepare GPU computation by masking CPU expert IDs
+        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
+        topk_ids = topk_output.topk_ids
+        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+
+        # Create modified dispatch output for GPU computation
+        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
+        masked_dispatch_output = dispatch_output._replace(
+            topk_output=masked_topk_output
+        )
+
+        # Step 3: Execute GPU expert computation (any quantization method)
+        # This runs in parallel with CPU computation
+        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+
+        # Step 4: Synchronize CPU results and merge with GPU results
+        output = gpu_combine_input.hidden_states
+        if self.tp_rank == 0:
+            cpu_output = self.sync(x)
+            output = output + cpu_output
+
+        return StandardCombineInput(hidden_states=output)
+
+    def __getattr__(self, name: str):
+        """Delegate attribute access to the wrapped GPU method.
+
+        This allows the wrapper to transparently expose attributes and methods
+        from the wrapped GPU quantization method.
+
+        Args:
+            name: Attribute name
+
+        Returns:
+            Attribute value from gpu_method
+        """
+        # Avoid infinite recursion for internal attributes
+        if name in ("gpu_method", "amx_wrapper", "amx_config"):
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
+
+        return getattr(self.gpu_method, name)
