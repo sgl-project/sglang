@@ -15,7 +15,7 @@ python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruc
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 --input-len 256 --profile
 ## run with CUDA profiler (nsys):
-nsys profile --force-overwrite=true -o bench_one_batch python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 --input-len 256 --profile --profiler_activities CUDA_PROFILER
+nsys profile --force-overwrite=true -o bench_one_batch python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 --input-len 256 --profile --profile-activities CUDA_PROFILER
 # Usage (correctness test):
 python -m sglang.bench_one_batch --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
 
@@ -98,12 +98,12 @@ profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
 ]
 
 
-def start_profile(profiler_activities, profile_record_shapes=False, rank_print=print):
+def start_profile(profile_activities, profile_record_shapes=False, rank_print=print):
     """
-    Abstracted function to start profiling based on profiler_activities.
+    Abstracted function to start profiling based on profile_activities.
     Returns profiler object (or None).
     """
-    if "CUDA_PROFILER" in profiler_activities:
+    if "CUDA_PROFILER" in profile_activities:
         try:
             torch.cuda.cudart().cudaProfilerStart()
             rank_print("CUDA Profiler started (nsys will begin capturing)")
@@ -112,9 +112,9 @@ def start_profile(profiler_activities, profile_record_shapes=False, rank_print=p
         return None
     else:
         activities = []
-        if "CPU" in profiler_activities:
+        if "CPU" in profile_activities:
             activities.append(torch.profiler.ProfilerActivity.CPU)
-        if "GPU" in profiler_activities:
+        if "GPU" in profile_activities:
             activities.append(torch.profiler.ProfilerActivity.CUDA)
         if activities:
             profiler = torch.profiler.profile(
@@ -129,17 +129,17 @@ def start_profile(profiler_activities, profile_record_shapes=False, rank_print=p
 
 def stop_profile(
     profiler,
-    profiler_activities,
+    profile_activities,
     rank_print=print,
     save_trace=False,
     trace_filename=None,
     stage=None,
 ):
     """
-    Abstracted function to stop profiling based on profiler_activities.
+    Abstracted function to stop profiling based on profile_activities.
     Optionally saves trace results and prints completion messages.
     """
-    if "CUDA_PROFILER" in profiler_activities:
+    if "CUDA_PROFILER" in profile_activities:
         try:
             torch.cuda.cudart().cudaProfilerStop()
             rank_print("CUDA Profiler stopped (nsys should dump traces)")
@@ -156,7 +156,7 @@ def stop_profile(
                 rank_print(
                     f"torch profiler chrome trace {stage_desc} saved to {trace_filename}"
                 )
-        if "CUDA_PROFILER" in profiler_activities:
+        if "CUDA_PROFILER" in profile_activities:
             rank_print(f"CUDA profiler trace for {stage} completed")
 
 
@@ -174,7 +174,7 @@ class BenchArgs:
     log_decode_step: int = 0
     profile: bool = False
     profile_record_shapes: bool = False
-    profiler_activities: Tuple[str] = ("CPU", "GPU")
+    profile_activities: Tuple[str] = ("CPU", "GPU")
     profile_stage: str = "all"
     profile_filename_prefix: str = "profile"
 
@@ -211,7 +211,7 @@ class BenchArgs:
             help="Record tensor shapes in profiling results.",
         )
         parser.add_argument(
-            "--profiler_activities",
+            "--profile-activities",
             type=str,
             nargs="+",
             default=["CPU", "GPU"],
@@ -507,7 +507,7 @@ def latency_test_run_once(
     log_decode_step,
     profile,
     profile_record_shapes,
-    profiler_activities,
+    profile_activities,
     profile_filename_prefix,
     profile_stage,
     tp_rank,
@@ -535,7 +535,7 @@ def latency_test_run_once(
     enable_profile_prefill = profile and profile_stage in ["all", "prefill"]
     if enable_profile_prefill:
         profiler = start_profile(
-            profiler_activities,
+            profile_activities,
             profile_record_shapes=profile_record_shapes,
             rank_print=rank_print,
         )
@@ -552,7 +552,7 @@ def latency_test_run_once(
         )
         stop_profile(
             profiler,
-            profiler_activities,
+            profile_activities,
             rank_print=rank_print,
             save_trace=True,
             trace_filename=trace_filename,
@@ -575,7 +575,7 @@ def latency_test_run_once(
         profiler = None
         if enable_profile_decode and i == profile_step_of_interest:
             profiler = start_profile(
-                profiler_activities,
+                profile_activities,
                 profile_record_shapes=profile_record_shapes,
                 rank_print=rank_print,
             )
@@ -591,7 +591,7 @@ def latency_test_run_once(
             )
             stop_profile(
                 profiler,
-                profiler_activities,
+                profile_activities,
                 rank_print=rank_print,
                 save_trace=True,
                 trace_filename=trace_filename,
@@ -666,7 +666,7 @@ def latency_test(
         log_decode_step=0,
         profile=False,
         profile_record_shapes=False,
-        profiler_activities=("CPU", "GPU"),
+        profile_activities=("CPU", "GPU"),
         profile_filename_prefix="",
         profile_stage="all",
         tp_rank=tp_rank,
@@ -716,7 +716,7 @@ def latency_test(
             bench_args.log_decode_step,
             bench_args.profile if tp_rank == 0 else None,
             bench_args.profile_record_shapes if tp_rank == 0 else None,
-            bench_args.profiler_activities,
+            bench_args.profile_activities,
             bench_args.profile_filename_prefix,
             bench_args.profile_stage,
             tp_rank,
