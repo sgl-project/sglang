@@ -380,13 +380,14 @@ async fn process_and_transform_sse_stream(
 
     // Emit initial response.created and response.in_progress events
     let event = event_emitter.emit_created();
-    if event_emitter.send_event(&event, &tx).is_err() {
-        return Err("Failed to send response.created event".to_string());
-    }
+    event_emitter
+        .send_event(&event, &tx)
+        .map_err(|_| "Failed to send response.created event".to_string())?;
+
     let event = event_emitter.emit_in_progress();
-    if event_emitter.send_event(&event, &tx).is_err() {
-        return Err("Failed to send response.in_progress event".to_string());
-    }
+    event_emitter
+        .send_event(&event, &tx)
+        .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
     // Convert body to data stream
     let mut stream = body.into_data_stream();
