@@ -10,7 +10,10 @@ use axum::{
 use tracing::debug;
 
 use super::{
-    common::responses::handlers::{cancel_response_impl, get_response_impl},
+    common::responses::{
+        handlers::{cancel_response_impl, get_response_impl},
+        utils::validate_worker_availability,
+    },
     context::SharedComponents,
     harmony::{
         serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector,
@@ -191,13 +194,17 @@ impl GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
+        // 0. Fast worker validation (fail-fast before expensive operations)
+        let requested_model: Option<&str> = model_id.or(Some(body.model.as_str()));
+
+        if let Some(error_response) = requested_model
+            .and_then(|model| validate_worker_availability(&self.worker_registry, model))
+        {
+            return error_response;
+        }
+
         // Choose implementation based on Harmony model detection
         let is_harmony = HarmonyDetector::is_harmony_model(&body.model);
-
-        debug!(
-            "Processing responses request for model: {:?}, using_harmony={}",
-            model_id, is_harmony
-        );
 
         if is_harmony {
             debug!(

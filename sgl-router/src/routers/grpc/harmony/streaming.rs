@@ -35,6 +35,71 @@ use crate::{
         context,
     },
 };
+
+/// Mode for tool call event emission
+#[derive(Debug, Clone, Copy)]
+enum ToolCallMode {
+    /// MCP tool calls (emit .in_progress and .completed events)
+    Mcp,
+    /// Function tool calls (no status events, only arguments streaming)
+    Function,
+}
+
+impl ToolCallMode {
+    /// Get the output item type for this mode
+    fn output_item_type(&self) -> OutputItemType {
+        match self {
+            Self::Mcp => OutputItemType::McpCall,
+            Self::Function => OutputItemType::FunctionCall,
+        }
+    }
+
+    /// Get the type string for JSON output
+    fn type_str(&self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp_call",
+            Self::Function => "function_call",
+        }
+    }
+
+    /// Whether this mode emits status events (.in_progress, .completed)
+    fn emits_status_events(&self) -> bool {
+        matches!(self, Self::Mcp)
+    }
+
+    /// Emit arguments delta event
+    fn emit_arguments_delta(
+        &self,
+        emitter: &mut ResponseStreamEventEmitter,
+        output_index: usize,
+        item_id: &str,
+        delta: &str,
+    ) -> serde_json::Value {
+        match self {
+            Self::Mcp => emitter.emit_mcp_call_arguments_delta(output_index, item_id, delta),
+            Self::Function => {
+                emitter.emit_function_call_arguments_delta(output_index, item_id, delta)
+            }
+        }
+    }
+
+    /// Emit arguments done event
+    fn emit_arguments_done(
+        &self,
+        emitter: &mut ResponseStreamEventEmitter,
+        output_index: usize,
+        item_id: &str,
+        arguments: &str,
+    ) -> serde_json::Value {
+        match self {
+            Self::Mcp => emitter.emit_mcp_call_arguments_done(output_index, item_id, arguments),
+            Self::Function => {
+                emitter.emit_function_call_arguments_done(output_index, item_id, arguments)
+            }
+        }
+    }
+}
+
 /// Processor for streaming Harmony responses
 ///
 /// Returns an SSE stream that parses Harmony tokens incrementally and
@@ -531,14 +596,14 @@ impl HarmonyStreamingProcessor {
         Ok(())
     }
 
-    /// Common decode stream processing logic for both single and dual stream modes
+    /// Decode stream processing for tool loops
     ///
-    /// This helper function contains the shared logic for processing the decode stream,
-    /// parsing Harmony tokens, emitting SSE events, and tracking state.
-    async fn process_decode_stream_common(
+    /// Emits tool call events based on the mode (MCP or Function).
+    async fn process_decode_stream(
         mut decode_stream: AbortOnDropStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        mode: ToolCallMode,
     ) -> Result<ResponsesIterationResult, String> {
         // Initialize Harmony parser for this iteration
         let mut parser =
@@ -555,12 +620,14 @@ impl HarmonyStreamingProcessor {
         let mut message_item_id: Option<String> = None;
         let mut has_emitted_content_part_added = false;
 
-        // MCP tool call tracking (call_index -> (output_index, item_id))
-        let mut mcp_call_tracking: HashMap<usize, (usize, String)> = HashMap::new();
+        // Tool call tracking (call_index -> (output_index, item_id))
+        let mut tool_call_tracking: HashMap<usize, (usize, String)> = HashMap::new();
 
         // Metadata from Complete message
         let mut finish_reason = String::from("stop");
         let mut matched_stop: Option<serde_json::Value> = None;
+        let mut prompt_tokens: u32 = 0;
+        let mut completion_tokens: u32 = 0;
 
         // Process stream
         let mut chunk_count = 0;
@@ -646,29 +713,53 @@ impl HarmonyStreamingProcessor {
                             }
                         }
 
-                        // Commentary channel → MCP tool call streaming
+                        // Commentary channel → Tool call streaming
                         if let Some(tc_delta) = &delta.commentary_delta {
                             let call_index = tc_delta.index;
 
                             // Check if this is a new tool call (has id and name)
                             if tc_delta.id.is_some() {
-                                // NEW MCP CALL: Allocate output item and emit in_progress
+                                // NEW TOOL CALL: Allocate output item
                                 let (output_index, item_id) =
-                                    emitter.allocate_output_index(OutputItemType::McpCall);
+                                    emitter.allocate_output_index(mode.output_item_type());
 
                                 // Store tracking info
-                                mcp_call_tracking
+                                tool_call_tracking
                                     .insert(call_index, (output_index, item_id.clone()));
 
-                                // Emit mcp_call.in_progress
-                                let event =
-                                    emitter.emit_mcp_call_in_progress(output_index, &item_id);
+                                // Get tool name
+                                let tool_name = tc_delta
+                                    .function
+                                    .as_ref()
+                                    .and_then(|f| f.name.as_ref())
+                                    .map(|n| n.as_str())
+                                    .unwrap_or("");
+
+                                // Emit output_item.added wrapper event
+                                let call_id = tc_delta.id.as_ref().unwrap();
+                                let item = json!({
+                                    "id": item_id,
+                                    "type": mode.type_str(),
+                                    "name": tool_name,
+                                    "call_id": call_id,
+                                    "arguments": "",
+                                    "status": "in_progress"
+                                });
+                                let event = emitter.emit_output_item_added(output_index, &item);
                                 emitter.send_event_best_effort(&event, tx);
 
-                                // If we have function name, emit initial mcp_call_arguments.delta
+                                // Emit status event if mode supports it (MCP only)
+                                if mode.emits_status_events() {
+                                    let event =
+                                        emitter.emit_mcp_call_in_progress(output_index, &item_id);
+                                    emitter.send_event_best_effort(&event, tx);
+                                }
+
+                                // If we have function name, emit initial arguments delta
                                 if let Some(func) = &tc_delta.function {
                                     if func.name.is_some() {
-                                        let event = emitter.emit_mcp_call_arguments_delta(
+                                        let event = mode.emit_arguments_delta(
+                                            emitter,
                                             output_index,
                                             &item_id,
                                             "",
@@ -677,9 +768,9 @@ impl HarmonyStreamingProcessor {
                                     }
                                 }
                             } else {
-                                // CONTINUING MCP CALL: Emit arguments delta
+                                // CONTINUING TOOL CALL: Emit arguments delta
                                 if let Some((output_index, item_id)) =
-                                    mcp_call_tracking.get(&call_index)
+                                    tool_call_tracking.get(&call_index)
                                 {
                                     if let Some(args) = tc_delta
                                         .function
@@ -687,7 +778,8 @@ impl HarmonyStreamingProcessor {
                                         .and_then(|f| f.arguments.as_ref())
                                         .filter(|a| !a.is_empty())
                                     {
-                                        let event = emitter.emit_mcp_call_arguments_delta(
+                                        let event = mode.emit_arguments_delta(
+                                            emitter,
                                             *output_index,
                                             item_id,
                                             args,
@@ -704,12 +796,14 @@ impl HarmonyStreamingProcessor {
                     finish_reason = complete.finish_reason.clone();
                     matched_stop = complete.matched_stop.as_ref().map(|m| match m {
                         MatchedTokenId(id) => {
-                            serde_json::json!(id)
+                            json!(id)
                         }
                         MatchedStopStr(s) => {
-                            serde_json::json!(s)
+                            json!(s)
                         }
                     });
+                    prompt_tokens = complete.prompt_tokens as u32;
+                    completion_tokens = complete.completion_tokens as u32;
 
                     // Finalize parser and get complete output
                     let final_output = parser
@@ -719,23 +813,42 @@ impl HarmonyStreamingProcessor {
                     // Store finalized tool calls
                     accumulated_tool_calls = final_output.commentary.clone();
 
-                    // Complete all MCP tool calls if we have commentary
+                    // Complete all tool calls if we have commentary
                     if let Some(ref tool_calls) = accumulated_tool_calls {
                         for (call_idx, tool_call) in tool_calls.iter().enumerate() {
-                            if let Some((output_index, item_id)) = mcp_call_tracking.get(&call_idx)
+                            if let Some((output_index, item_id)) = tool_call_tracking.get(&call_idx)
                             {
-                                // Emit mcp_call_arguments.done with final arguments
+                                let tool_name = &tool_call.function.name;
+
+                                // Emit arguments done with final arguments
                                 let args_str =
                                     tool_call.function.arguments.as_deref().unwrap_or("");
-                                let event = emitter.emit_mcp_call_arguments_done(
+
+                                let event = mode.emit_arguments_done(
+                                    emitter,
                                     *output_index,
                                     item_id,
                                     args_str,
                                 );
                                 emitter.send_event_best_effort(&event, tx);
 
-                                // Emit mcp_call.completed
-                                let event = emitter.emit_mcp_call_completed(*output_index, item_id);
+                                // Emit status event if mode supports it (MCP only)
+                                if mode.emits_status_events() {
+                                    let event =
+                                        emitter.emit_mcp_call_completed(*output_index, item_id);
+                                    emitter.send_event_best_effort(&event, tx);
+                                }
+
+                                // Emit output_item.done wrapper event
+                                let item = json!({
+                                    "id": item_id,
+                                    "type": mode.type_str(),
+                                    "name": tool_name,
+                                    "call_id": &tool_call.id,
+                                    "arguments": args_str,
+                                    "status": "completed"
+                                });
+                                let event = emitter.emit_output_item_done(*output_index, &item);
                                 emitter.send_event_best_effort(&event, tx);
 
                                 // Mark output item as completed
@@ -811,19 +924,21 @@ impl HarmonyStreamingProcessor {
                 final_text_extracted.len()
             );
 
-            // Complete any pending MCP tool calls with data from completed messages
+            // Complete any pending tool calls with data from completed messages
             if let Some(ref tool_calls) = accumulated_tool_calls {
                 for (call_idx, tool_call) in tool_calls.iter().enumerate() {
-                    if let Some((output_index, item_id)) = mcp_call_tracking.get(&call_idx) {
-                        // Emit mcp_call_arguments.done with final arguments
+                    if let Some((output_index, item_id)) = tool_call_tracking.get(&call_idx) {
+                        // Emit arguments done with final arguments
                         let args_str = tool_call.function.arguments.as_deref().unwrap_or("");
                         let event =
-                            emitter.emit_mcp_call_arguments_done(*output_index, item_id, args_str);
+                            mode.emit_arguments_done(emitter, *output_index, item_id, args_str);
                         emitter.send_event_best_effort(&event, tx);
 
-                        // Emit mcp_call.completed
-                        let event = emitter.emit_mcp_call_completed(*output_index, item_id);
-                        emitter.send_event_best_effort(&event, tx);
+                        // Emit status event if mode supports it (MCP only)
+                        if mode.emits_status_events() {
+                            let event = emitter.emit_mcp_call_completed(*output_index, item_id);
+                            emitter.send_event_best_effort(&event, tx);
+                        }
                     }
                 }
             }
@@ -848,6 +963,13 @@ impl HarmonyStreamingProcessor {
                     tool_calls,
                     analysis: analysis_content,
                     partial_text: accumulated_final_text,
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                        completion_tokens_details: None,
+                    },
+                    request_id: emitter.response_id.clone(),
                 });
             }
         }
@@ -857,7 +979,7 @@ impl HarmonyStreamingProcessor {
         // Return a placeholder Completed result (caller ignores these fields in streaming mode)
         Ok(ResponsesIterationResult::Completed {
             response: Box::new(ResponsesResponse {
-                id: String::new(),
+                id: emitter.response_id.clone(),
                 object: "response".to_string(),
                 created_at: 0,
                 status: ResponseStatus::Completed,
@@ -881,74 +1003,134 @@ impl HarmonyStreamingProcessor {
                 safety_identifier: None,
                 metadata: HashMap::new(),
                 usage: Some(ResponsesUsage::Modern(ResponseUsage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    total_tokens: 0,
+                    input_tokens: prompt_tokens,
+                    output_tokens: completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
                     input_tokens_details: None,
                     output_tokens_details: None,
                 })),
             }),
             usage: Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
                 completion_tokens_details: None,
             },
         })
     }
 
-    /// Process streaming chunks for Responses API iteration
+    /// Process streaming chunks for Responses API iteration - MCP loop
     ///
-    /// Returns ResponsesIterationResult indicating whether tool calls were found
-    /// (requiring MCP loop continuation) or if the iteration is complete.
-    pub async fn process_responses_iteration_stream(
+    /// Emits mcp_call.* events for all tool calls
+    pub async fn process_responses_iteration_stream_mcp(
         execution_result: context::ExecutionResult,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<ResponsesIterationResult, String> {
         match execution_result {
             context::ExecutionResult::Single { stream } => {
-                debug!("Processing Responses API single stream mode");
-                Self::process_responses_single_stream(stream, emitter, tx).await
+                debug!("Processing Responses API single stream mode (MCP)");
+                Self::process_responses_single_stream_mcp(stream, emitter, tx).await
             }
             context::ExecutionResult::Dual { prefill, decode } => {
-                debug!("Processing Responses API dual stream mode");
-                Self::process_responses_dual_stream(prefill, *decode, emitter, tx).await
+                debug!("Processing Responses API dual stream mode (MCP)");
+                Self::process_responses_dual_stream_mcp(prefill, *decode, emitter, tx).await
             }
         }
     }
 
-    /// Process streaming chunks from a single stream (Responses API)
-    async fn process_responses_single_stream(
+    /// Process streaming chunks for Responses API iteration - Function tools
+    ///
+    /// Emits function_call_arguments.* events for all tool calls
+    pub async fn process_responses_iteration_stream_function(
+        execution_result: context::ExecutionResult,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<ResponsesIterationResult, String> {
+        match execution_result {
+            context::ExecutionResult::Single { stream } => {
+                debug!("Processing Responses API single stream mode (Function)");
+                Self::process_responses_single_stream_function(stream, emitter, tx).await
+            }
+            context::ExecutionResult::Dual { prefill, decode } => {
+                debug!("Processing Responses API dual stream mode (Function)");
+                Self::process_responses_dual_stream_function(prefill, *decode, emitter, tx).await
+            }
+        }
+    }
+
+    /// Process streaming chunks from a single stream - MCP loop
+    async fn process_responses_single_stream_mcp(
         grpc_stream: AbortOnDropStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<ResponsesIterationResult, String> {
-        // Delegate to common helper
-        Self::process_decode_stream_common(grpc_stream, emitter, tx).await
+        Self::process_decode_stream(grpc_stream, emitter, tx, ToolCallMode::Mcp).await
     }
 
-    /// Process streaming chunks from dual streams (Responses API)
+    /// Process streaming chunks from a single stream - Function tools
+    async fn process_responses_single_stream_function(
+        grpc_stream: AbortOnDropStream,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<ResponsesIterationResult, String> {
+        Self::process_decode_stream(grpc_stream, emitter, tx, ToolCallMode::Function).await
+    }
+
+    /// Process streaming chunks from dual streams (common implementation)
     async fn process_responses_dual_stream(
         mut prefill_stream: AbortOnDropStream,
         decode_stream: AbortOnDropStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        mode: ToolCallMode,
     ) -> Result<ResponsesIterationResult, String> {
         // Phase 1: Process prefill stream (collect metadata, no output)
         while let Some(result) = prefill_stream.next().await {
             let _response = result.map_err(|e| format!("Prefill stream error: {}", e))?;
-            // No-op for prefill in Responses API (just metadata collection)
         }
 
         // Phase 2: Process decode stream using common helper
-        let result = Self::process_decode_stream_common(decode_stream, emitter, tx).await;
+        let result = Self::process_decode_stream(decode_stream, emitter, tx, mode).await;
 
         // Mark prefill stream as completed AFTER decode completes successfully
         // This ensures that if client disconnects during decode, BOTH streams send abort
         prefill_stream.mark_completed();
-
         result
+    }
+
+    /// Process streaming chunks from dual streams - MCP loop
+    async fn process_responses_dual_stream_mcp(
+        prefill_stream: AbortOnDropStream,
+        decode_stream: AbortOnDropStream,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<ResponsesIterationResult, String> {
+        Self::process_responses_dual_stream(
+            prefill_stream,
+            decode_stream,
+            emitter,
+            tx,
+            ToolCallMode::Mcp,
+        )
+        .await
+    }
+
+    /// Process streaming chunks from dual streams - Function tools
+    async fn process_responses_dual_stream_function(
+        prefill_stream: AbortOnDropStream,
+        decode_stream: AbortOnDropStream,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<ResponsesIterationResult, String> {
+        Self::process_responses_dual_stream(
+            prefill_stream,
+            decode_stream,
+            emitter,
+            tx,
+            ToolCallMode::Function,
+        )
+        .await
     }
 
     /// Build SSE response from receiver
