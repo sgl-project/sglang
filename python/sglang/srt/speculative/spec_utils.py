@@ -408,7 +408,7 @@ def select_top_k_tokens(
         tree_info = (
             topk_logp.unsqueeze(1),  # shape: (b, 1, topk), root is the single parent
             topk_index,  # shape: (b, topk)
-            init_parents.unsqueeze(0).repeat(bs, 1),  # shape: (b, topk)
+            init_parents.unsqueeze(0).repeat(bs, 1),  # shape: (b, topk + 1)
         )
     else:
         # The later decode steps
