@@ -1053,8 +1053,8 @@ class FlashInferFP4MoE(FusedMoE):
             symm_output = torch.empty(
                 hs_fp4.shape[0],
                 hs_fp4.shape[1] * 2,
-                dtype=hs_fp4.dtype,
-                device=hs_fp4.device,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
             )
             sm.tag(symm_output)
 
