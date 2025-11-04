@@ -282,7 +282,7 @@ impl AppContextBuilder {
             .with_workflow_engine()
             .with_mcp_manager(&router_config)
             .await?
-            .with_wasm_manager(&router_config)
+            .with_wasm_manager(&router_config)?
             .router_config(router_config))
     }
 
@@ -518,15 +518,16 @@ impl AppContextBuilder {
     }
 
     /// Create wasm manager if enabled in config
-    fn with_wasm_manager(mut self, config: &RouterConfig) -> Self {
+    fn with_wasm_manager(mut self, config: &RouterConfig) -> Result<Self, String> {
         self.wasm_manager = if config.enable_wasm {
             Some(Arc::new(
-                WasmModuleManager::new(WasmRuntimeConfig::default()).unwrap(),
+                WasmModuleManager::new(WasmRuntimeConfig::default())
+                    .map_err(|e| format!("Failed to initialize WASM module manager: {}", e))?,
             ))
         } else {
             None
         };
-        self
+        Ok(self)
     }
 }
 
