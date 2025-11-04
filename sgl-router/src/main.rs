@@ -322,7 +322,7 @@ struct CliArgs {
     mcp_config_path: Option<String>,
 
     #[arg(long, default_value_t = false)]
-    ha_enable: bool,
+    enable_ha: bool,
 
     #[arg(long)]
     ha_server_name: Option<String>,
@@ -645,7 +645,7 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
-        let ha_server_config = if self.ha_enable {
+        let ha_server_config = if self.enable_ha {
             let self_name = if let Some(name) = &self.ha_server_name {
                 name.to_string()
             } else {

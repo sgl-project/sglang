@@ -213,6 +213,11 @@ struct Router {
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
+    enable_ha: bool,
+    ha_server_name: Option<String>,
+    ha_host: String,
+    ha_port: u16,
+    peer_urls: Vec<String>,
 }
 
 impl Router {
@@ -450,6 +455,11 @@ impl Router {
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
+        enable_ha = false,
+        ha_server_name = None,
+        ha_host = String::from("0.0.0.0"),
+        ha_port = 39527,
+        peer_urls = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -523,6 +533,11 @@ impl Router {
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
+        enable_ha: bool,
+        ha_server_name: Option<String>,
+        ha_host: String,
+        ha_port: u16,
+        peer_urls: Vec<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -610,6 +625,11 @@ impl Router {
             client_cert_path,
             client_key_path,
             ca_cert_paths,
+            enable_ha,
+            ha_server_name,
+            ha_host,
+            ha_port,
+            peer_urls,
         })
     }
 
