@@ -325,11 +325,6 @@ pub async fn serve_harmony_responses(
                     "Tool calls found in commentary channel"
                 );
 
-                // TODO: Streaming support - emit intermediate chunks
-                // if let Some(tx) = &ctx.stream_tx {
-                //     emit_intermediate_chunks(tx, &analysis, &partial_text, iteration_count).await?;
-                // }
-
                 // Execute MCP tools via MCP manager
                 // If tools don't exist, call_tool() will return error naturally
                 let tool_results = if let Some(ref mut tracking) = mcp_tracking {
@@ -378,7 +373,6 @@ pub async fn serve_harmony_responses(
                 }
 
                 // No tool calls - this is the final response
-                // TODO: Accumulate usage across all iterations if needed
                 return Ok(*response);
             }
         }
@@ -758,8 +752,7 @@ async fn execute_mcp_tools(
 
                 // Extract content from MCP result
                 let output = if let Some(content) = mcp_result.content.first() {
-                    // TODO: Handle different content types (text, image, resource)
-                    // For now, serialize the entire content item
+                    // Serialize the entire content item
                     to_value(content)
                         .unwrap_or_else(|_| json!({"error": "Failed to serialize tool result"}))
                 } else {
