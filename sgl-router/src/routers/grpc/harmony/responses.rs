@@ -260,7 +260,10 @@ async fn execute_with_mcp_loop(
     mut current_request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
     let mut iteration_count = 0;
-    let mut mcp_tracking = McpCallTracking::new("sglang-mcp".to_string());
+
+    // Extract server_label from request tools
+    let server_label = extract_mcp_server_label(current_request.tools.as_deref());
+    let mut mcp_tracking = McpCallTracking::new(server_label.clone());
 
     // Extract user's max_tool_calls limit (if set)
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
@@ -540,8 +543,11 @@ async fn execute_mcp_tool_loop_streaming(
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) {
+    // Extract server_label from request tools
+    let server_label = extract_mcp_server_label(current_request.tools.as_deref());
+
     // Initialize MCP call tracking
-    let mut mcp_tracking = McpCallTracking::new("sglang-mcp".to_string());
+    let mut mcp_tracking = McpCallTracking::new(server_label.clone());
 
     // Extract user's max_tool_calls limit (if set)
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
@@ -580,7 +586,7 @@ async fn execute_mcp_tool_loop_streaming(
     let item = json!({
         "id": item_id,
         "type": "mcp_list_tools",
-        "server_label": "sglang-mcp",
+        "server_label": server_label,
         "status": "in_progress",
         "tools": []
     });
@@ -605,7 +611,7 @@ async fn execute_mcp_tool_loop_streaming(
     let item_done = json!({
         "id": item_id,
         "type": "mcp_list_tools",
-        "server_label": "sglang-mcp",
+        "server_label": server_label,
         "status": "completed",
         "tools": tool_items
     });
@@ -1295,6 +1301,32 @@ fn inject_mcp_metadata(
 
     // 2. Append all mcp_call items at the end
     response.output.extend(mcp_call_items);
+}
+
+/// Extract MCP server label from request tools
+///
+/// Searches for the first MCP tool in the tools array and returns its server_label.
+/// Falls back to "sglang-mcp" if no MCP tool with server_label is found.
+///
+/// # Arguments
+///
+/// * `tools` - Optional slice of ResponseTool from the request
+///
+/// # Returns
+///
+/// Server label string (from MCP tool or default "sglang-mcp")
+fn extract_mcp_server_label(tools: Option<&[ResponseTool]>) -> String {
+    tools
+        .and_then(|tools| {
+            tools.iter().find_map(|tool| {
+                if matches!(tool.r#type, ResponseToolType::Mcp) {
+                    tool.server_label.clone()
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| "sglang-mcp".to_string())
 }
 
 /// Load previous conversation messages from storage
