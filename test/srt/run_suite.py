@@ -1,6 +1,7 @@
 import argparse
 import glob
 from dataclasses import dataclass
+from pathlib import Path
 
 from sglang.test.test_utils import run_unittest_files
 
@@ -212,6 +213,9 @@ suites = {
         TestFile("test_deepseek_v3_deterministic.py", 240),
     ],
     "nightly-8-gpu": [],
+    "__not_in_ci__": [
+        # TODO
+    ],
 }
 
 # Add AMD tests
@@ -418,6 +422,22 @@ def auto_partition(files, rank, size):
     return [files[i] for i in indices]
 
 
+def _sanity_check_suites(suites):
+    dir_base = Path(__file__).parent
+    disk_files = set([str(x.relative_to(dir_base)) for x in dir_base.glob("**/*.py")])
+
+    suite_files = set(
+        [test_file.name for _, suite in suites.items() for test_file in suite]
+    )
+
+    missing_files = sorted(list(disk_files - suite_files))
+    assert len(missing_files) == 0, (
+        f"Some test files are not in test suite. "
+        f"If this is intentional, please add to `not_in_ci` section. "
+        f"{missing_files=}"
+    )
+
+
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument(
@@ -457,6 +477,8 @@ if __name__ == "__main__":
     )
     args = arg_parser.parse_args()
     print(f"{args=}")
+
+    _sanity_check_suites(suites)
 
     if args.suite == "all":
         files = glob.glob("**/test_*.py", recursive=True)
