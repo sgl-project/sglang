@@ -24,7 +24,7 @@ class TorchNativeAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         pass
-    
+
     def scaled_dot_product_attention_with_softcapping(
         self,
         query,
