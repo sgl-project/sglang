@@ -134,9 +134,6 @@ class SymmetricMemoryContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not self.enabled:
-            return
-
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
 
         if self.is_graph_capture:
