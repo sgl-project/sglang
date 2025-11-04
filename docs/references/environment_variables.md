@@ -67,7 +67,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_FORCE_FP8_MARLIN` | Force using FP8 MARLIN kernels even if other FP8 kernels are available | `false` |
 | `SGLANG_ENABLE_FLASHINFER_GEMM` | Use flashinfer kernels when running blockwise fp8 GEMM on Blackwell GPUs | `false` |
 | `SGLANG_SUPPORT_CUTLASS_BLOCK_FP8` | Use Cutlass kernels when running blockwise fp8 GEMM on Hopper or Blackwell GPUs | `false` |
-| `SGLANG_CUTLASS_MOE` | Use Cutlass FP8 MoE kernel on Blackwell GPUs | `false` |
+| `SGLANG_CUTLASS_MOE` (deprecated) | Use Cutlass FP8 MoE kernel on Blackwell GPUs (deprecated, use --moe-runner-backend=cutlass) | `false` |
 
 
 ## Distributed Computing
@@ -108,3 +108,9 @@ SGLang supports various environment variables that can be used to configure its 
 | --- | --- | --- |
 | `SGLANG_WAIT_WEIGHTS_READY_TIMEOUT` | Timeout period for waiting on weights | `120` |
 | `SGLANG_DISABLE_OUTLINES_DISK_CACHE` | Disable Outlines disk cache | `true` |
+
+## Function Calling / Tool Use
+
+| Environment Variable | Description | Default Value |
+| --- | --- | --- |
+| `SGLANG_TOOL_STRICT_LEVEL` | Controls the strictness level of tool call parsing and validation. <br>**Level 0**: Off - No strict validation <br>**Level 1**: Function strict - Enables structural tag constraints for all tools (even if none have `strict=True` set) <br>**Level 2**: Parameter strict - Enforces strict parameter validation for all tools, treating them as if they all have `strict=True` set | `0` |
