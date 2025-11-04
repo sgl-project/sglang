@@ -17,9 +17,13 @@ wit_bindgen::generate!({
     world: "sgl-router",
 });
 
-use exports::sgl::router::middleware_on_request::Guest as OnRequestGuest;
-use exports::sgl::router::middleware_on_response::Guest as OnResponseGuest;
-use sgl::router::middleware_types::{Request, Response, Action};
+use std::cell::RefCell;
+
+use exports::sgl::router::{
+    middleware_on_request::Guest as OnRequestGuest,
+    middleware_on_response::Guest as OnResponseGuest,
+};
+use sgl::router::middleware_types::{Action, Request, Response};
 
 /// Main middleware implementation
 struct Middleware;
@@ -51,12 +55,14 @@ impl RateLimitState {
     // Check if identifier has exceeded rate limit
     fn check_limit(&mut self, identifier: &str, current_time_ms: u64) -> bool {
         self.cleanup(current_time_ms);
-        
+
         // Count requests in current window for this identifier
-        let count = self.requests
+        let count = self
+            .requests
             .iter()
             .filter(|(id, timestamp)| {
-                id == identifier && *timestamp > current_time_ms.saturating_sub(RATE_LIMIT_WINDOW_MS)
+                id == identifier
+                    && *timestamp > current_time_ms.saturating_sub(RATE_LIMIT_WINDOW_MS)
             })
             .count() as u64;
 
@@ -65,24 +71,28 @@ impl RateLimitState {
         }
 
         // Add new request
-        self.requests.push((identifier.to_string(), current_time_ms));
+        self.requests
+            .push((identifier.to_string(), current_time_ms));
         true // Within limit
     }
 }
 
-// Global state (per WASM instance)
-// Note: In a multi-threaded environment, this would need synchronization
-// For simplicity, we assume single-threaded execution per instance
-static mut RATE_LIMIT_STATE: Option<RateLimitState> = None;
+// Thread-local state (per WASM instance thread)
+// Using thread_local! is safer than static mut as it avoids unsafe blocks
+// and provides separate state for each thread automatically
+thread_local! {
+    static RATE_LIMIT_STATE: RefCell<RateLimitState> = RefCell::new(RateLimitState::new());
+}
 
 fn get_identifier(req: &Request) -> String {
     // Helper function to find header value
-    let find_header_value = |headers: &[sgl::router::middleware_types::Header], name: &str| -> Option<String> {
-        headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case(name))
-            .map(|h| h.value.clone())
-    };
+    let find_header_value =
+        |headers: &[sgl::router::middleware_types::Header], name: &str| -> Option<String> {
+            headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case(name))
+                .map(|h| h.value.clone())
+        };
 
     // Prefer API Key as identifier (more stable than IP)
     if let Some(auth_header) = find_header_value(&req.headers, "authorization") {
@@ -120,23 +130,17 @@ impl OnRequestGuest for Middleware {
         let identifier = get_identifier(&req);
         let current_time_ms = req.now_epoch_ms;
 
-        // Initialize state if needed (unsafe but necessary for static mut)
-        // In production, consider passing state through host function
-        unsafe {
-            if RATE_LIMIT_STATE.is_none() {
-                RATE_LIMIT_STATE = Some(RateLimitState::new());
+        // Access thread-local state safely without unsafe blocks
+        // Each thread gets its own RateLimitState instance
+        RATE_LIMIT_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if !state.check_limit(&identifier, current_time_ms) {
+                // Rate limit exceeded
+                return Action::Reject(429);
             }
-
-            if let Some(ref mut state) = RATE_LIMIT_STATE {
-                if !state.check_limit(&identifier, current_time_ms) {
-                    // Rate limit exceeded
-                    return Action::Reject(429);
-                }
-            }
-        }
-
-        // Within rate limit, continue processing
-        Action::Continue
+            // Within rate limit, continue processing
+            Action::Continue
+        })
     }
 }
 
@@ -149,4 +153,3 @@ impl OnResponseGuest for Middleware {
 
 // Export the component
 export!(Middleware);
-
