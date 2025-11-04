@@ -1672,7 +1672,11 @@ def calculate_metrics(
             retokenized_output_lens.append(retokenized_output_len)
             if i < len(input_requests) and isinstance(input_requests[i], dict):
                 # For Mooncake dataset, use the prompt_len from output (which is set correctly)
-                prompt_len = outputs[i].prompt_len if outputs[i].prompt_len > 0 else input_requests[i].get('input_length', 0)
+                prompt_len = (
+                    outputs[i].prompt_len
+                    if outputs[i].prompt_len > 0
+                    else input_requests[i].get("input_length", 0)
+                )
                 total_input += prompt_len
                 total_input_text += prompt_len
                 total_input_vision += 0
