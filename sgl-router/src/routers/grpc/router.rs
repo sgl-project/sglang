@@ -9,7 +9,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde_json::json;
 use tracing::debug;
 
 use super::{
@@ -188,35 +187,57 @@ impl GrpcRouter {
             .await
     }
 
-    /// Main route_responses implementation (pipeline-based for Harmony)
+    /// Main route_responses implementation
+    ///
+    /// Routes to either Harmony or regular responses implementation based on model detection
     async fn route_responses_impl(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
+        // Choose implementation based on Harmony model detection
+        let is_harmony = HarmonyDetector::is_harmony_model(&body.model);
+
         debug!(
-            "Processing Harmony responses request for model: {:?}, streaming: {:?}",
-            model_id, body.stream
+            "Processing responses request for model: {:?}, using_harmony={}",
+            model_id, is_harmony
         );
 
-        // Create HarmonyResponsesContext from existing responses context
-        let harmony_ctx = HarmonyResponsesContext::new(
-            Arc::new(self.harmony_pipeline.clone()),
-            self.shared_components.clone(),
-            self.harmony_responses_context.mcp_manager.clone(),
-            self.harmony_responses_context.response_storage.clone(),
-        );
+        if is_harmony {
+            // Use pipeline-based implementation for Harmony models
+            debug!(
+                "Processing Harmony responses request for model: {:?}, streaming: {:?}",
+                model_id, body.stream
+            );
 
-        // Check if streaming is requested
-        if body.stream.unwrap_or(false) {
-            serve_harmony_responses_stream(&harmony_ctx, body.clone()).await
-        } else {
-            // Use non-streaming version for standard JSON responses
-            match serve_harmony_responses(&harmony_ctx, body.clone()).await {
-                Ok(response) => axum::Json(response).into_response(),
-                Err(error_response) => error_response,
+            // Create HarmonyResponsesContext from existing responses context
+            let harmony_ctx = HarmonyResponsesContext::new(
+                Arc::new(self.harmony_pipeline.clone()),
+                self.shared_components.clone(),
+                self.harmony_responses_context.mcp_manager.clone(),
+                self.harmony_responses_context.response_storage.clone(),
+            );
+
+            // Check if streaming is requested
+            if body.stream.unwrap_or(false) {
+                serve_harmony_responses_stream(&harmony_ctx, body.clone()).await
+            } else {
+                // Use non-streaming version for standard JSON responses
+                match serve_harmony_responses(&harmony_ctx, body.clone()).await {
+                    Ok(response) => axum::Json(response).into_response(),
+                    Err(error_response) => error_response,
+                }
             }
+        } else {
+            // Use regular responses module for non-Harmony models
+            responses::route_responses(
+                &self.responses_context,
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+            )
+            .await
         }
     }
 }
@@ -290,27 +311,7 @@ impl RouterTrait for GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Choose implementation based on Harmony model detection
-        let is_harmony = HarmonyDetector::is_harmony_model(&body.model);
-
-        debug!(
-            "Processing responses request for model: {:?}, using_harmony={}",
-            model_id, is_harmony
-        );
-
-        if is_harmony {
-            // Use pipeline-based implementation for Harmony models
-            self.route_responses_impl(headers, body, model_id).await
-        } else {
-            // Use legacy responses module for non-Harmony models
-            responses::route_responses(
-                &self.responses_context,
-                Arc::new(body.clone()),
-                headers.cloned(),
-                model_id.map(|s| s.to_string()),
-            )
-            .await
-        }
+        self.route_responses_impl(headers, body, model_id).await
     }
 
     async fn get_response(

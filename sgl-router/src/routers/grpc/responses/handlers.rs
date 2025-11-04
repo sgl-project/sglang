@@ -286,7 +286,6 @@ async fn route_responses_internal(
 // ============================================================================
 
 /// Execute streaming responses request
-#[allow(clippy::too_many_arguments)]
 async fn route_responses_streaming(
     ctx: &super::context::ResponsesContext,
     request: Arc<ResponsesRequest>,
@@ -342,7 +341,6 @@ async fn route_responses_streaming(
 /// 3. Converts ChatCompletionStreamResponse → ResponsesResponse delta
 /// 4. Accumulates response state for final persistence
 /// 5. Emits transformed SSE events in responses format
-#[allow(clippy::too_many_arguments)]
 async fn convert_chat_stream_to_responses_stream(
     ctx: &super::context::ResponsesContext,
     chat_request: Arc<chat::ChatCompletionRequest>,

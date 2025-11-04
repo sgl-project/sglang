@@ -331,26 +331,6 @@ impl RequestPipeline {
         }
     }
 
-    /// Execute Responses API pipeline
-    ///
-    /// TODO: Implement Responses API native execution
-    /// This is a stub to allow compilation. The actual implementation should:
-    /// 1. Support multi-turn MCP loop orchestration
-    /// 2. Handle tool call execution and result injection
-    /// 3. Emit proper SSE events for streaming mode
-    /// 4. Store responses in data connector
-    ///
-    /// For now, this returns an error indicating the feature is not implemented.
-    pub async fn execute_responses(
-        &self,
-        _request: Arc<crate::protocols::responses::ResponsesRequest>,
-        _headers: Option<http::HeaderMap>,
-        _model_id: Option<String>,
-        _components: Arc<SharedComponents>,
-    ) -> Response {
-        error::internal_error("Responses API execution not yet implemented")
-    }
-
     /// Execute Harmony Responses API request through all pipeline stages
     ///
     /// This method runs a single iteration of the Responses API request,
