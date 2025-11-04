@@ -278,7 +278,7 @@ class Llama4UnfoldConvolution(nn.Module):
         self.unfold = torch.nn.Unfold(kernel_size=kernel_size, stride=config.patch_size)
         params = {
             "input_size": config.num_channels * kernel_size[0] * kernel_size[1],
-            "output_size": config.original_hidden_size if hasattr(config, "original_hidden_size") else config.hidden_size,
+            "output_size": config.hidden_size,
             "bias": False,
             "quant_config": quant_config,
             "prefix": f"{prefix}.linear",
@@ -955,7 +955,10 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         param = params_dict[name]
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, loaded_weight)
+        if weight_loader == default_weight_loader:
+            weight_loader(param, loaded_weight, name)
+        else:
+            weight_loader(param, loaded_weight)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
