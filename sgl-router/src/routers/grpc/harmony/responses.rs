@@ -61,10 +61,10 @@ use crate::{
     routers::{
         grpc::{
             context::SharedComponents,
+            error,
             harmony::processor::ResponsesIterationResult,
             pipeline::RequestPipeline,
             responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
-            utils,
         },
         openai::mcp::ensure_request_mcp_client,
     },
@@ -285,7 +285,7 @@ pub async fn serve_harmony_responses(
 
         // Safety check: prevent infinite loops
         if iteration_count > MAX_TOOL_ITERATIONS {
-            return Err(utils::internal_error_message(format!(
+            return Err(error::internal_error(format!(
                 "Maximum tool iterations ({}) exceeded",
                 MAX_TOOL_ITERATIONS
             )));
@@ -333,7 +333,7 @@ pub async fn serve_harmony_responses(
                     execute_mcp_tools(&ctx.mcp_manager, &tool_calls, tracking).await?
                 } else {
                     // Should never happen (we only get tool_calls when has_mcp_tools=true)
-                    return Err(utils::internal_error_static(
+                    return Err(error::internal_error(
                         "Tool calls found but MCP tracking not initialized",
                     ));
                 };
@@ -734,7 +734,7 @@ async fn execute_mcp_tools(
         // Parse tool arguments from JSON string
         let args_str = tool_call.function.arguments.as_deref().unwrap_or("{}");
         let args: JsonValue = serde_json::from_str(args_str).map_err(|e| {
-            utils::internal_error_message(format!(
+            error::internal_error(format!(
                 "Invalid tool arguments JSON for tool '{}': {}",
                 tool_call.function.name, e
             ))
@@ -1111,7 +1111,7 @@ async fn load_previous_messages(
         .get_response_chain(&prev_id, None)
         .await
         .map_err(|e| {
-            utils::internal_error_message(format!(
+            error::internal_error(format!(
                 "Failed to load previous response chain for {}: {}",
                 prev_id_str, e
             ))
