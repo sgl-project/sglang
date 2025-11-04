@@ -615,7 +615,7 @@ impl HarmonyStreamingProcessor {
         let mut accumulated_tool_calls: Option<Vec<ToolCall>> = None;
 
         // Track which items we've started
-        let mut reasoning_output_index: Option<usize> = None;
+        let mut has_emitted_reasoning = false;
         let mut message_output_index: Option<usize> = None;
         let mut message_item_id: Option<String> = None;
         let mut has_emitted_content_part_added = false;
@@ -646,18 +646,14 @@ impl HarmonyStreamingProcessor {
                     if let Some(delta) = delta_result {
                         // Analysis channel → Reasoning item (wrapper events only, emitted once)
                         if let Some(_analysis_text) = &delta.analysis_delta {
-                            if reasoning_output_index.is_none() {
-                                // Allocate reasoning item and emit wrapper events
-                                let (output_index, _item_id) =
-                                    emitter.allocate_output_index(OutputItemType::Reasoning);
-                                reasoning_output_index = Some(output_index);
-
+                            if !has_emitted_reasoning {
                                 // Emit reasoning item (added + done in one call)
                                 // Note: reasoning_content will be provided at finalize
                                 emitter
                                     .emit_reasoning_item(tx, None)
                                     .map_err(|e| format!("Failed to emit reasoning item: {}", e))?;
 
+                                has_emitted_reasoning = true;
                                 has_analysis = true;
                             }
                         }
