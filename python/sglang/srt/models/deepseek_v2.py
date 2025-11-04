@@ -640,6 +640,7 @@ class DeepseekV2MoE(nn.Module):
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    or get_moe_a2a_backend().is_mori()
                     else {}
                 ),
             )
@@ -686,7 +687,9 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            get_moe_a2a_backend().is_deepep() or
+            get_moe_a2a_backend().is_mooncake() or
+            get_moe_a2a_backend().is_mori()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -882,10 +885,14 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
+    # NOTE: We need to change the func name because it supports deepep and mori both.
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         shared_output = None
+        is_deepep = get_moe_a2a_backend().is_deepep()
+        is_mori = get_moe_a2a_backend().is_mori()
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
@@ -894,9 +901,15 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
+                num_token_non_padded=(
+                    forward_batch.num_token_non_padded if is_deepep else None
+                ),
+                expert_location_dispatch_info=(
+                    ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    )
+                    if is_deepep
+                    else None
                 ),
             )
         else:
@@ -929,8 +942,8 @@ class DeepseekV2MoE(nn.Module):
             if self.experts.should_fuse_routed_scaling_factor_in_topk:
                 x.add_(final_hidden_states)
             else:
-                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
+                if not self.experts.should_fuse_routed_scaling_factor_in_topk():
+                    final_hidden_states *= self.routed_scaling_factor
         else:
             if not self.experts.should_fuse_routed_scaling_factor_in_topk:
                 final_hidden_states *= self.routed_scaling_factor

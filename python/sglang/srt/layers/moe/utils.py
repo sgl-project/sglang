@@ -25,6 +25,7 @@ class MoeA2ABackend(Enum):
 
     NONE = "none"
     DEEPEP = "deepep"
+    MORI = "mori"
     MOONCAKE = "mooncake"
 
     @classmethod
@@ -41,6 +42,9 @@ class MoeA2ABackend(Enum):
 
     def is_deepep(self):
         return self == MoeA2ABackend.DEEPEP
+
+    def is_mori(self):
+        return self == MoeA2ABackend.MORI
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
@@ -117,6 +121,37 @@ class DeepEPMode(Enum):
         return self == DeepEPMode.AUTO
 
 
+class MoRIEPMode(Enum):
+
+    NORMAL = "normal"
+    LOW_LATENCY = "low_latency"
+    AUTO = "auto"
+
+    def enable_normal(self) -> bool:
+        return self in [MoRIEPMode.NORMAL, MoRIEPMode.AUTO]
+
+    def enable_low_latency(self) -> bool:
+        return self in [MoRIEPMode.LOW_LATENCY, MoRIEPMode.AUTO]
+
+    def resolve(self, is_extend_in_batch: bool) -> MoRIEPMode:
+        if self != MoRIEPMode.AUTO:
+            return self
+
+        if is_extend_in_batch:
+            return MoRIEPMode.NORMAL
+        else:
+            return MoRIEPMode.LOW_LATENCY
+
+    def is_normal(self) -> bool:
+        return self == MoRIEPMode.NORMAL
+
+    def is_low_latency(self) -> bool:
+        return self == MoRIEPMode.LOW_LATENCY
+
+    def is_auto(self) -> bool:
+        return self == MoRIEPMode.AUTO
+
+
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 DEEPEP_MODE: Optional[DeepEPMode] = None
@@ -125,6 +160,8 @@ IS_SBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
+MORIEP_MODE: Optional[MoRIEPMode] = None
+MORIEP_CONFIG: Optional[str] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -132,6 +169,8 @@ def initialize_moe_config(server_args: ServerArgs):
     global MOE_RUNNER_BACKEND
     global DEEPEP_MODE
     global DEEPEP_CONFIG
+    global MORIEP_MODE
+    global MORIEP_CONFIG
     global IS_TBO_ENABLED
     global IS_SBO_ENABLED
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
@@ -141,6 +180,8 @@ def initialize_moe_config(server_args: ServerArgs):
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
+    MORIEP_MODE = MoRIEPMode(server_args.moriep_mode)
+    MORIEP_CONFIG = ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     IS_SBO_ENABLED = server_args.enable_single_batch_overlap
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
@@ -181,6 +222,14 @@ def get_deepep_config() -> str:
         logger.warning("DEEPEP_CONFIG is not initialized, using default config")
         DEEPEP_CONFIG = ""
     return DEEPEP_CONFIG
+
+
+def get_moriep_mode() -> MoRIEPMode:
+    global MORIEP_MODE
+    if MORIEP_MODE is None:
+        logger.warning("MORIEP_MODE is not initialized, using auto mode")
+        MORIEP_MODE = MoRIEPMode.AUTO
+    return MORIEP_MODE
 
 
 def is_tbo_enabled() -> bool:
