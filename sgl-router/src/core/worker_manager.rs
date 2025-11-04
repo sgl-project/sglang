@@ -262,10 +262,11 @@ impl WorkerManager {
 
     async fn fan_out_simple_request(
         client: &reqwest::Client,
+        worker_registry: &WorkerRegistry,
         endpoint: &str,
         method: Method,
     ) -> Result<Vec<(String, String)>, Response> {
-        let workers = self.worker_registry.get_all();
+        let workers = worker_registry.get_all();
         if workers.is_empty() {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
         }
