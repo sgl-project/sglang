@@ -499,7 +499,11 @@ def main(args: argparse.Namespace):
     validate_ep_tp_mode(args.ep_size, args.tp_size)
 
     model_config = get_model_config(
-        args.model, args.tp_size, args.ep_size, args.disable_shared_experts_fusion
+        args.model,
+        args.tp_size,
+        args.ep_size,
+        args.disable_shared_experts_fusion,
+        args.topk_ids_dir,
     )
 
     E = model_config["num_experts"]
@@ -534,7 +538,6 @@ def main(args: argparse.Namespace):
             2048,
             3072,
             4096,
-            8192,
         ]
         batch_sizes.reverse()
     else:
