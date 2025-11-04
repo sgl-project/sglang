@@ -1,60 +1,12 @@
-"""
-python3 -m unittest test_ebnf_constrained.TestEBNFConstrained.test_ebnf_generate_email
-python3 -m unittest test_ebnf_constrained.TestEBNFConstrained.test_ebnf_generate_greeting
-python3 -m unittest test_ebnf_constrained.TestEBNFConstrained.test_ebnf_generate_all_optional_function_params
-python3 -m unittest test_ebnf_constrained.TestEBNFConstrainedLLGuidance.test_ebnf_generate_email
-python3 -m unittest test_ebnf_constrained.TestEBNFConstrainedLLGuidance.test_ebnf_generate_greeting
-python3 -m unittest test_ebnf_constrained.TestEBNFConstrainedLLGuidance.test_ebnf_generate_all_optional_function_params
-"""
-
 import json
-import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
 
+class TestEBNFConstrainedMinxin:
+    ebnf_grammar = 'root ::= "test"'  # Default grammar
 
-def setup_class(cls, backend: str, disable_overlap: bool):
-    cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-    cls.base_url = DEFAULT_URL_FOR_TEST
-    cls.ebnf_grammar = 'root ::= "test"'  # Default grammar
-
-    other_args = [
-        "--max-running-requests",
-        "10",
-        "--grammar-backend",
-        backend,
-    ]
-
-    if disable_overlap:
-        other_args += ["--disable-overlap-schedule"]
-
-    cls.process = popen_launch_server(
-        cls.model,
-        cls.base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
-    )
-
-
-class TestEBNFConstrained(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, "xgrammar", disable_overlap=False)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def run_decode(
+    def _run_decode_ebnf(
         self,
         ebnf,
         expected_patterns,
@@ -110,7 +62,7 @@ class TestEBNFConstrained(CustomTestCase):
         allowed_patterns = [r"^user@example\.com$"]
         prompt = "Generate an email address:"
 
-        self.run_decode(
+        self._run_decode_ebnf(
             ebnf=self.__class__.ebnf_grammar,
             expected_patterns=allowed_patterns,
             prompt=prompt,
@@ -122,7 +74,7 @@ class TestEBNFConstrained(CustomTestCase):
         allowed_patterns = [r"^(Hello|Hi|Hey)$"]
         prompt = "Generate a greeting:"
 
-        self.run_decode(
+        self._run_decode_ebnf(
             ebnf=self.__class__.ebnf_grammar,
             expected_patterns=allowed_patterns,
             prompt=prompt,
@@ -137,7 +89,7 @@ class TestEBNFConstrained(CustomTestCase):
         allowed_patterns = [r"^\d{3}$"]
         prompt = "Generate a three-digit number:"
 
-        self.run_decode(
+        self._run_decode_ebnf(
             ebnf=self.__class__.ebnf_grammar,
             expected_patterns=allowed_patterns,
             prompt=prompt,
@@ -154,7 +106,7 @@ class TestEBNFConstrained(CustomTestCase):
         allowed_patterns = [r"^\(\d{3}\) \d{3}-\d{4}$"]
         prompt = "Generate a phone number:"
 
-        self.run_decode(
+        self._run_decode_ebnf(
             ebnf=self.__class__.ebnf_grammar,
             expected_patterns=allowed_patterns,
             prompt=prompt,
@@ -173,7 +125,7 @@ class TestEBNFConstrained(CustomTestCase):
         allowed_patterns = [r"^2024-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"]
         prompt = "Generate a date in YYYY-MM-DD format:"
 
-        self.run_decode(
+        self._run_decode_ebnf(
             ebnf=self.__class__.ebnf_grammar,
             expected_patterns=allowed_patterns,
             prompt=prompt,
@@ -188,7 +140,7 @@ class TestEBNFConstrained(CustomTestCase):
         allowed_patterns = [r"^#[0-9A-F]{6}$"]
         prompt = "Generate a hex color code:"
 
-        self.run_decode(
+        self._run_decode_ebnf(
             ebnf=self.__class__.ebnf_grammar,
             expected_patterns=allowed_patterns,
             prompt=prompt,
@@ -212,7 +164,7 @@ class TestEBNFConstrained(CustomTestCase):
         ]
         prompt = "Generate a simple JSON with name, age, and city:"
 
-        self.run_decode(
+        self._run_decode_ebnf(
             ebnf=self.__class__.ebnf_grammar,
             expected_patterns=allowed_patterns,
             prompt=prompt,
@@ -232,7 +184,7 @@ class TestEBNFConstrained(CustomTestCase):
         ]
         prompt = "Generate a log entry:"
 
-        self.run_decode(
+        self._run_decode_ebnf(
             ebnf=self.__class__.ebnf_grammar,
             expected_patterns=allowed_patterns,
             prompt=prompt,
@@ -264,19 +216,9 @@ class TestEBNFConstrained(CustomTestCase):
         ]
         prompt = "Configure the service with optional settings:"
 
-        self.run_decode(
+        self._run_decode_ebnf(
             ebnf=self.__class__.ebnf_grammar,
             expected_patterns=allowed_patterns,
             prompt=prompt,
             n=5,
         )
-
-
-class TestEBNFConstrainedLLGuidance(TestEBNFConstrained):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, "llguidance", disable_overlap=False)
-
-
-if __name__ == "__main__":
-    unittest.main()
