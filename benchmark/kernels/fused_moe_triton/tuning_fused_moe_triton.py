@@ -166,24 +166,28 @@ def benchmark_config(
             run()
     torch.cuda.synchronize()
 
-    # Warmup
+    # Warmup 
     for _ in range(5):
         graph.replay()
     torch.cuda.synchronize()
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    # Flush L2 cache with 256 MB data
+    cache_flush = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
+    cache_flush.zero_()
+
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+
+    for i in range(num_iters):
+        prepare(i)
+        start_events[i].record()
+        graph.replay()
+        end_events[i].record()
+    torch.cuda.synchronize()
 
     latencies: List[float] = []
     for i in range(num_iters):
-        prepare(i)
-        torch.cuda.synchronize()
-
-        start_event.record()
-        graph.replay()
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
+        latencies.append(start_events[i].elapsed_time(end_events[i]))
     avg = sum(latencies) / (num_iters * 10) * 1000  # us
     graph.reset()
     return avg
