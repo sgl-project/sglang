@@ -528,7 +528,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
+        if get_moe_runner_backend().is_cutlass():
+            assert (
+                cutlass_fp8_supported()
+            ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
+            assert is_sm100_supported() or is_sm90_supported()
 
     def create_weights(
         self,
@@ -636,7 +641,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
-            if self._should_use_cutlass_fused_experts():
+            if get_moe_runner_backend().is_cutlass():
                 self._ensure_cutlass_buffers_initialized(layer)
 
         else:
@@ -1025,7 +1030,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        if self._should_use_cutlass_fused_experts():
+        if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             with use_symmetric_memory(get_tp_group()) as sm:
@@ -1121,22 +1126,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
         return self.runner.run(dispatch_output, quant_info)
-
-    def _should_use_cutlass_fused_experts(self) -> bool:
-        """Decide whether to use Cutlass FP8 fused-experts path based on moe runner backend,
-        with env var override via `SGLANG_CUTLASS_MOE`.
-        """
-        backend = get_moe_runner_backend()
-        env_force = get_bool_env_var("SGLANG_CUTLASS_MOE")
-        # TODO: remove env var in the future, it should be handled by moe runner backend
-        if env_force:
-            return True
-        return (
-            backend.is_flashinfer_cutlass()
-            and self.cutlass_fp8_supported
-            and self.block_quant
-            and (is_sm100_supported() or is_sm90_supported())
-        )
 
     def _ensure_cutlass_buffers_initialized(self, layer: Module) -> None:
         if getattr(self, "_cutlass_buffers_ready", False):

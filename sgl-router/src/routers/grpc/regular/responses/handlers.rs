@@ -9,18 +9,19 @@
 //! # Architecture
 //!
 //! This module orchestrates all request handling for the /v1/responses endpoint.
-//! It supports three execution modes:
+//! It supports two execution modes:
 //!
 //! 1. **Synchronous** - Returns complete response immediately
-//! 2. **Background** - Returns queued response, executes in background task
-//! 3. **Streaming** - Returns SSE stream with real-time events
+//! 2. **Streaming** - Returns SSE stream with real-time events
+//!
+//! Note: Background mode is no longer supported. Requests with background=true
+//! will be rejected with a 400 error.
 //!
 //! # Request Flow
 //!
 //! ```text
 //! route_responses()
 //!   ├─► route_responses_sync()       → route_responses_internal()
-//!   ├─► route_responses_background() → spawn(route_responses_internal())
 //!   └─► route_responses_streaming()  → convert_chat_stream_to_responses_stream()
 //!
 //! route_responses_internal()
@@ -31,10 +32,7 @@
 //!       └─► pipeline.execute_chat_for_responses()
 //! ```
 
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Arc;
 
 use axum::{
     body::Body,
@@ -44,38 +42,35 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::json;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 use validator::Validate;
 
 use super::{
     conversions,
-    streaming::ResponseStreamEventEmitter,
     tool_loop::{execute_tool_loop, execute_tool_loop_streaming},
-    types::BackgroundTaskInfo,
 };
 use crate::{
     data_connector::{
-        ConversationId, ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage,
+        self, ConversationId, ConversationItemStorage, ConversationStorage, ResponseId,
+        ResponseStorage,
     },
     protocols::{
-        chat::ChatCompletionStreamResponse,
+        chat::{self, ChatCompletionStreamResponse},
+        common,
         responses::{
-            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-            ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+            self, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+            ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
+            ResponsesUsage,
         },
     },
     routers::{
-        grpc::error,
+        grpc::{common::responses::streaming::ResponseStreamEventEmitter, error},
         openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
     },
 };
-
-// ============================================================================
-// Main Request Handler
-// ============================================================================
 
 /// Main handler for POST /v1/responses
 ///
@@ -154,19 +149,17 @@ pub async fn route_responses(
             .into_response();
     }
 
-    // 3. Check for incompatible parameter combinations
-    let is_streaming = request.stream.unwrap_or(false);
+    // 3. Reject background mode (no longer supported)
     let is_background = request.background.unwrap_or(false);
-
-    if is_streaming && is_background {
+    if is_background {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({
                 "error": {
-                    "message": "Cannot use streaming with background mode. Please set either 'stream' or 'background' to false.",
+                    "message": "Background mode is not supported. Please set 'background' to false or omit it.",
                     "type": "invalid_request_error",
-                    "param": serde_json::Value::Null,
-                    "code": "incompatible_parameters"
+                    "param": "background",
+                    "code": "unsupported_parameter"
                 }
             })),
         )
@@ -174,10 +167,9 @@ pub async fn route_responses(
     }
 
     // 4. Route based on execution mode
+    let is_streaming = request.stream.unwrap_or(false);
     if is_streaming {
         route_responses_streaming(ctx, request, headers, model_id).await
-    } else if is_background {
-        route_responses_background(ctx, request, headers, model_id).await
     } else {
         route_responses_sync(ctx, request, headers, model_id, None).await
     }
@@ -284,134 +276,7 @@ async fn route_responses_internal(
     Ok(responses_response)
 }
 
-// ============================================================================
-// Background Mode Execution
-// ============================================================================
-
-/// Execute responses request in background mode
-#[allow(clippy::too_many_arguments)]
-async fn route_responses_background(
-    ctx: &super::context::ResponsesContext,
-    request: Arc<ResponsesRequest>,
-    headers: Option<http::HeaderMap>,
-    model_id: Option<String>,
-) -> Response {
-    // Generate response_id for background tracking
-    let response_id = format!("resp_{}", Uuid::new_v4());
-
-    // Get current timestamp
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    // Create queued response
-    let queued_response = ResponsesResponse {
-        id: response_id.clone(),
-        object: "response".to_string(),
-        created_at,
-        status: ResponseStatus::Queued,
-        error: None,
-        incomplete_details: None,
-        instructions: request.instructions.clone(),
-        max_output_tokens: request.max_output_tokens,
-        model: request.model.clone(),
-        output: Vec::new(),
-        parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
-        previous_response_id: request.previous_response_id.clone(),
-        reasoning: None,
-        store: request.store.unwrap_or(true),
-        temperature: request.temperature,
-        text: None,
-        tool_choice: "auto".to_string(),
-        tools: request.tools.clone().unwrap_or_default(),
-        top_p: request.top_p,
-        truncation: None,
-        usage: None,
-        user: None,
-        safety_identifier: request.user.clone(),
-        metadata: request.metadata.clone().unwrap_or_default(),
-    };
-
-    // Persist queued response to storage
-    if let Ok(response_json) = serde_json::to_value(&queued_response) {
-        if let Err(e) = persist_conversation_items(
-            ctx.conversation_storage.clone(),
-            ctx.conversation_item_storage.clone(),
-            ctx.response_storage.clone(),
-            &response_json,
-            &request,
-        )
-        .await
-        {
-            warn!("Failed to persist queued response: {}", e);
-        }
-    }
-
-    // Spawn background task
-    let ctx_clone = ctx.clone();
-    let request_clone = request.clone();
-    let headers_clone = headers.clone();
-    let model_id_clone = model_id.clone();
-    let response_id_clone = response_id.clone();
-
-    let handle = tokio::task::spawn(async move {
-        // Execute synchronously (set background=false to prevent recursion)
-        let mut background_request = (*request_clone).clone();
-        background_request.background = Some(false);
-
-        match route_responses_internal(
-            &ctx_clone,
-            Arc::new(background_request),
-            headers_clone,
-            model_id_clone,
-            Some(response_id_clone.clone()),
-        )
-        .await
-        {
-            Ok(_) => {
-                debug!(
-                    "Background response {} completed successfully",
-                    response_id_clone
-                );
-            }
-            Err(response) => {
-                warn!(
-                    "Background response {} failed with status {}",
-                    response_id_clone,
-                    response.status()
-                );
-            }
-        }
-
-        // Clean up task handle when done
-        ctx_clone
-            .background_tasks
-            .write()
-            .await
-            .remove(&response_id_clone);
-    });
-
-    // Store task info for cancellation support
-    ctx.background_tasks.write().await.insert(
-        response_id.clone(),
-        BackgroundTaskInfo {
-            handle,
-            grpc_request_id: String::new(), // Will be populated by pipeline at DispatchMetadataStage
-            client: Arc::new(RwLock::new(None)),
-        },
-    );
-
-    // Return queued response immediately
-    axum::Json(queued_response).into_response()
-}
-
-// ============================================================================
-// Streaming Mode Execution
-// ============================================================================
-
 /// Execute streaming responses request
-#[allow(clippy::too_many_arguments)]
 async fn route_responses_streaming(
     ctx: &super::context::ResponsesContext,
     request: Arc<ResponsesRequest>,
@@ -467,10 +332,9 @@ async fn route_responses_streaming(
 /// 3. Converts ChatCompletionStreamResponse → ResponsesResponse delta
 /// 4. Accumulates response state for final persistence
 /// 5. Emits transformed SSE events in responses format
-#[allow(clippy::too_many_arguments)]
 async fn convert_chat_stream_to_responses_stream(
     ctx: &super::context::ResponsesContext,
-    chat_request: Arc<crate::protocols::chat::ChatCompletionRequest>,
+    chat_request: Arc<chat::ChatCompletionRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
     original_request: &ResponsesRequest,
@@ -557,7 +421,7 @@ async fn convert_chat_stream_to_responses_stream(
 async fn process_and_transform_sse_stream(
     body: Body,
     original_request: ResponsesRequest,
-    _chat_request: Arc<crate::protocols::chat::ChatCompletionRequest>,
+    _chat_request: Arc<chat::ChatCompletionRequest>,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -673,7 +537,7 @@ struct StreamingResponseAccumulator {
 
     // Completion state
     finish_reason: Option<String>,
-    usage: Option<crate::protocols::common::Usage>,
+    usage: Option<common::Usage>,
 
     // Original request for final response construction
     original_request: ResponsesRequest,
@@ -789,11 +653,9 @@ impl StreamingResponseAccumulator {
             output.push(ResponseOutputItem::Reasoning {
                 id: format!("reasoning_{}", self.response_id),
                 summary: vec![],
-                content: vec![
-                    crate::protocols::responses::ResponseReasoningContent::ReasoningText {
-                        text: self.reasoning_buffer,
-                    },
-                ],
+                content: vec![ResponseReasoningContent::ReasoningText {
+                    text: self.reasoning_buffer,
+                }],
                 status: Some("completed".to_string()),
             });
         }
@@ -811,7 +673,7 @@ impl StreamingResponseAccumulator {
 
         // Convert usage
         let usage = self.usage.as_ref().map(|u| {
-            let usage_info = crate::protocols::common::UsageInfo {
+            let usage_info = common::UsageInfo {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
@@ -878,8 +740,6 @@ async fn execute_without_mcp(
             headers,
             model_id,
             ctx.components.clone(),
-            response_id.clone(),
-            Some(ctx.background_tasks.clone()),
         )
         .await?; // Preserve the Response error as-is
 
@@ -973,9 +833,9 @@ async fn load_conversation_history(
 
         // Load conversation history
         const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
-        let params = crate::data_connector::ListParams {
+        let params = data_connector::ListParams {
             limit: MAX_CONVERSATION_HISTORY_ITEMS,
-            order: crate::data_connector::SortOrder::Asc,
+            order: data_connector::SortOrder::Asc,
             after: None,
         };
 
@@ -1014,8 +874,7 @@ async fn load_conversation_history(
                     ResponseInput::Items(current_items) => {
                         // Process all item types, converting SimpleInputMessage to Message
                         for item in current_items.iter() {
-                            let normalized =
-                                crate::protocols::responses::normalize_input_item(item);
+                            let normalized = responses::normalize_input_item(item);
                             items.push(normalized);
                         }
                     }
@@ -1050,7 +909,7 @@ async fn load_conversation_history(
             ResponseInput::Items(current_items) => {
                 // Process all item types, converting SimpleInputMessage to Message
                 for item in current_items.iter() {
-                    let normalized = crate::protocols::responses::normalize_input_item(item);
+                    let normalized = responses::normalize_input_item(item);
                     items.push(normalized);
                 }
             }
@@ -1060,195 +919,4 @@ async fn load_conversation_history(
     }
 
     Ok(modified_request)
-}
-
-// ============================================================================
-// GET Response Implementation
-// ============================================================================
-
-/// Implementation for GET /v1/responses/{response_id}
-pub async fn get_response_impl(
-    ctx: &super::context::ResponsesContext,
-    response_id: &str,
-) -> Response {
-    let resp_id = ResponseId::from(response_id);
-
-    // Retrieve response from storage
-    match ctx.response_storage.get_response(&resp_id).await {
-        Ok(Some(stored_response)) => axum::Json(stored_response.raw_response).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            axum::Json(json!({
-                "error": {
-                    "message": format!("Response with id '{}' not found", response_id),
-                    "type": "not_found_error",
-                    "code": "response_not_found"
-                }
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({
-                "error": {
-                    "message": format!("Failed to retrieve response: {}", e),
-                    "type": "internal_error"
-                }
-            })),
-        )
-            .into_response(),
-    }
-}
-
-// ============================================================================
-// CANCEL Response Implementation
-// ============================================================================
-
-/// Implementation for POST /v1/responses/{response_id}/cancel
-pub async fn cancel_response_impl(
-    ctx: &super::context::ResponsesContext,
-    response_id: &str,
-) -> Response {
-    let resp_id = ResponseId::from(response_id);
-
-    // Retrieve response from storage to check if it exists and get current status
-    match ctx.response_storage.get_response(&resp_id).await {
-        Ok(Some(stored_response)) => {
-            // Check current status - only queued or in_progress responses can be cancelled
-            let current_status = stored_response
-                .raw_response
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-
-            match current_status {
-                "queued" | "in_progress" => {
-                    // Attempt to abort the background task
-                    let mut tasks = ctx.background_tasks.write().await;
-                    if let Some(task_info) = tasks.remove(response_id) {
-                        // Abort the Rust task immediately
-                        task_info.handle.abort();
-
-                        // Abort the Python/scheduler request via gRPC (if client is available)
-                        let client_opt = task_info.client.read().await;
-                        if let Some(ref client) = *client_opt {
-                            if let Err(e) = client
-                                .abort_request(
-                                    task_info.grpc_request_id.clone(),
-                                    "User cancelled via API".to_string(),
-                                )
-                                .await
-                            {
-                                warn!(
-                                    "Failed to abort Python request {}: {}",
-                                    task_info.grpc_request_id, e
-                                );
-                            } else {
-                                debug!(
-                                    "Successfully aborted Python request: {}",
-                                    task_info.grpc_request_id
-                                );
-                            }
-                        } else {
-                            debug!("Client not yet available for abort, request may not have started yet");
-                        }
-
-                        // Task was found and aborted
-                        (
-                            StatusCode::OK,
-                            axum::Json(json!({
-                                "id": response_id,
-                                "status": "cancelled",
-                                "message": "Background task has been cancelled"
-                            })),
-                        )
-                            .into_response()
-                    } else {
-                        // Task handle not found but status is queued/in_progress
-                        // This can happen if: (1) task crashed, or (2) storage persistence failed
-                        error!(
-                            "Response {} has status '{}' but task handle is missing. Task may have crashed or storage update failed.",
-                            response_id, current_status
-                        );
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            axum::Json(json!({
-                                "error": {
-                                    "message": "Internal error: background task completed but failed to update status in storage",
-                                    "type": "internal_error",
-                                    "code": "status_update_failed"
-                                }
-                            })),
-                        )
-                            .into_response()
-                    }
-                }
-                "completed" => (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({
-                        "error": {
-                            "message": "Cannot cancel completed response",
-                            "type": "invalid_request_error",
-                            "code": "response_already_completed"
-                        }
-                    })),
-                )
-                    .into_response(),
-                "failed" => (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({
-                        "error": {
-                            "message": "Cannot cancel failed response",
-                            "type": "invalid_request_error",
-                            "code": "response_already_failed"
-                        }
-                    })),
-                )
-                    .into_response(),
-                "cancelled" => (
-                    StatusCode::OK,
-                    axum::Json(json!({
-                        "id": response_id,
-                        "status": "cancelled",
-                        "message": "Response was already cancelled"
-                    })),
-                )
-                    .into_response(),
-                _ => {
-                    // Unknown status
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        axum::Json(json!({
-                            "error": {
-                                "message": format!("Unknown response status: {}", current_status),
-                                "type": "internal_error"
-                            }
-                        })),
-                    )
-                        .into_response()
-                }
-            }
-        }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            axum::Json(json!({
-                "error": {
-                    "message": format!("Response with id '{}' not found", response_id),
-                    "type": "not_found_error",
-                    "code": "response_not_found"
-                }
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({
-                "error": {
-                    "message": format!("Failed to retrieve response: {}", e),
-                    "type": "internal_error"
-                }
-            })),
-        )
-            .into_response(),
-    }
 }
