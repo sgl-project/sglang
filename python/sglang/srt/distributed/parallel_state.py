@@ -343,7 +343,7 @@ class GroupCoordinator:
             TorchSymmMemCommunicator,
         )
 
-        self.is_symmetric_memory_enabled = is_symmetric_memory_enabled()
+        self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
         self.use_symmetric_memory = use_symmetric_memory
         if is_hip():
             from sglang.srt.distributed.device_communicators.quick_all_reduce import (
@@ -579,7 +579,7 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        if self.pynccl_comm is not None and self.is_symmetric_memory_enabled:
+        if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
             with self.pynccl_comm.change_state(
                 enable=True, stream=get_current_device_stream_fast()
             ):
@@ -661,10 +661,10 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
-            not pynccl_comm.disabled or self.is_symmetric_memory_enabled
+            not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
         ):
             with pynccl_comm.change_state(
-                enable=True, stream=torch.cuda.current_stream()
+                enable=True, stream=get_current_device_stream_fast()
             ):
                 pynccl_comm.reduce_scatter(output, input)
         else:
@@ -728,10 +728,10 @@ class GroupCoordinator:
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
-            not pynccl_comm.disabled or self.is_symmetric_memory_enabled
+            not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
         ):
             with pynccl_comm.change_state(
-                enable=True, stream=torch.cuda.current_stream()
+                enable=True, stream=get_current_device_stream_fast()
             ):
                 pynccl_comm.all_gather(output, input)
         else:
