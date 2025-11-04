@@ -44,6 +44,7 @@ class AMXConfig:
         amx_weight_path: Path to AMX quantized weights
         chunked_prefill_size: Chunk size for prefill computation
         amx_method: AMX computation method (e.g., "int4")
+        num_layers: Total number of layers in the model (optional)
     """
 
     layer_idx: int
@@ -52,7 +53,9 @@ class AMXConfig:
     threadpool_count: int
     amx_weight_path: str
     chunked_prefill_size: int
+    max_deferred_experts_per_token: int
     amx_method: str
+    num_layers: Optional[int] = None
 
 
 def create_amx_config_from_server_args(
@@ -70,6 +73,15 @@ def create_amx_config_from_server_args(
     if server_args.kt_amx_weight_path is None:
         return None
 
+    # Try to get num_layers from model config
+    num_layers = None
+    try:
+        hf_config = server_args.get_hf_config()
+        num_layers = getattr(hf_config, "num_hidden_layers", None)
+    except Exception:
+        # If we can't get the config, num_layers will be None
+        pass
+
     return AMXConfig(
         layer_idx=layer_idx,
         num_gpu_experts=server_args.kt_num_gpu_experts,
@@ -78,6 +90,8 @@ def create_amx_config_from_server_args(
         amx_weight_path=server_args.kt_amx_weight_path,
         chunked_prefill_size=server_args.chunked_prefill_size,
         amx_method=server_args.kt_amx_method,
+        max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
+        num_layers=num_layers,
     )
 
 
@@ -176,6 +190,14 @@ class AMXEPWrapperMethod(FusedMoEMethodBase):
         num_experts_per_tok = extra_weight_attrs.get("top_k")
         intermediate_size_full = extra_weight_attrs.get("intermediate_size_full")
 
+        layer_max_deferred = self.amx_config.max_deferred_experts_per_token or 0
+        if (
+            self.amx_config.max_deferred_experts_per_token is not None
+            and self.amx_config.num_layers is not None
+            and self.amx_config.layer_idx == self.amx_config.num_layers - 1
+        ):
+            layer_max_deferred = 0
+
         # 1. Create weights for GPU experts using the wrapped method
         # GPU experts: 0 to num_gpu_experts-1
         self.gpu_method.create_weights(
@@ -202,6 +224,7 @@ class AMXEPWrapperMethod(FusedMoEMethodBase):
                 amx_weight_path=self.amx_config.amx_weight_path,
                 chunked_prefill_size=self.amx_config.chunked_prefill_size,
                 amx_method=self.amx_config.amx_method,
+                max_deferred_experts_per_token=layer_max_deferred,
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

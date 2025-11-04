@@ -435,6 +435,7 @@ class ServerArgs:
     kt_cpuinfer: Optional[int] = None
     kt_threadpool_count: Optional[int] = None
     kt_num_gpu_experts: Optional[int] = None
+    kt_max_deferred_experts_per_token: Optional[int] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -2996,7 +2997,12 @@ class ServerArgs:
             type=int,
             help="[ktransformers parameter] The number of GPU experts.",
         )
-
+        parser.add_argument(
+            "--kt-max-deferred-experts-per-token",
+            type=int,
+            default=ServerArgs.kt_max_deferred_experts_per_token,
+            help="Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+        )
         # Double Sparsity
         parser.add_argument(
             "--enable-double-sparsity",
