@@ -200,6 +200,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -359,6 +362,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -386,6 +392,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
