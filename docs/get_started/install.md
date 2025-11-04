@@ -3,7 +3,7 @@
 You can install SGLang using one of the methods below.
 
 This page primarily applies to common NVIDIA GPU platforms.
-For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md).
+For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-10-13-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md).
 
 ## Method 1: With pip or uv
 
@@ -12,10 +12,11 @@ It is recommended to use uv for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install "sglang[all]>=0.5.3.post1"
+uv pip install "sglang" --prerelease=allow
 ```
 
 **Quick fixes to common problems**
+
 - If you encounter `OSError: CUDA_HOME environment variable is not set`. Please set it to your CUDA install root with either of the following solutions:
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
   2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
@@ -24,15 +25,16 @@ uv pip install "sglang[all]>=0.5.3.post1"
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.3.post1 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.4.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
 pip install --upgrade pip
-pip install -e "python[all]"
+pip install -e "python"
 ```
 
 **Quick fixes to common problems**
+
 - If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](../developer_guide/development_guide_using_docker.md#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
 
 ## Method 3: Using docker
@@ -50,6 +52,8 @@ docker run --gpus all \
     lmsysorg/sglang:latest \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 ```
+
+You can also find the nightly docker images [here](https://hub.docker.com/r/lmsysorg/sglang/tags?name=nightly).
 
 ## Method 4: Using Kubernetes
 
@@ -127,5 +131,3 @@ sky status --endpoint 30000 sglang
 
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
 - To reinstall flashinfer locally, use the following command: `pip3 install --upgrade flashinfer-python --force-reinstall --no-deps` and then delete the cache with `rm -rf ~/.cache/flashinfer`.
-- If you only need to use OpenAI API models with the frontend language, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
-- The language frontend operates independently of the backend runtime. You can install the frontend locally without needing a GPU, while the backend can be set up on a GPU-enabled machine. To install the frontend, run `pip install sglang`, and for the backend, use `pip install sglang[srt]`. `srt` is the abbreviation of SGLang runtime.

@@ -4,13 +4,13 @@
 //! implementation works correctly with real-world tokenizer files.
 
 mod common;
-use common::{ensure_tokenizer_cached, EXPECTED_HASHES, TEST_PROMPTS};
+use std::sync::Arc;
 
+use common::{ensure_tokenizer_cached, EXPECTED_HASHES, TEST_PROMPTS};
 use sglang_router_rs::tokenizer::{
     factory, huggingface::HuggingFaceTokenizer, sequence::Sequence, stop::*, stream::DecodeStream,
     traits::*,
 };
-use std::sync::Arc;
 
 const LONG_TEST_PROMPTS: [(&str, &str); 6] = [
     ("Tell me about the following text.", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat."),
@@ -318,6 +318,7 @@ fn test_thread_safety() {
 #[test]
 fn test_chat_template_discovery() {
     use std::fs;
+
     use tempfile::TempDir;
 
     // Create a temporary directory with test files
@@ -366,6 +367,7 @@ fn test_chat_template_discovery() {
 #[test]
 fn test_load_chat_template_from_local_file() {
     use std::fs;
+
     use tempfile::TempDir;
 
     // Test 1: Load tokenizer with explicit chat template path

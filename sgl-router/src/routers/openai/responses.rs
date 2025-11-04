@@ -1,12 +1,15 @@
 //! Response storage, patching, and extraction utilities
 
-use crate::data_connector::{ResponseId, StoredResponse};
-use crate::protocols::spec::{ResponseInput, ResponseToolType, ResponsesRequest};
-use serde_json::{json, Value};
 use std::collections::HashMap;
+
+use serde_json::{json, Value};
 use tracing::warn;
 
-use super::utils::event_types;
+use super::utils::{event_types, web_search_constants};
+use crate::{
+    data_connector::{ResponseId, StoredResponse},
+    protocols::responses::{ResponseToolType, ResponsesRequest},
+};
 
 // ============================================================================
 // Response Storage Operations
@@ -17,14 +20,11 @@ pub(super) fn build_stored_response(
     response_json: &Value,
     original_body: &ResponsesRequest,
 ) -> StoredResponse {
-    let input_text = match &original_body.input {
-        ResponseInput::Text(text) => text.clone(),
-        ResponseInput::Items(_) => "complex input".to_string(),
-    };
+    let mut stored_response = StoredResponse::new(None);
 
-    let output_text = extract_primary_output_text(response_json).unwrap_or_default();
-
-    let mut stored_response = StoredResponse::new(input_text, output_text, None);
+    // Initialize empty arrays - will be populated by persist_items_with_storages
+    stored_response.input = Value::Array(vec![]);
+    stored_response.output = Value::Array(vec![]);
 
     stored_response.instructions = response_json
         .get("instructions")
@@ -36,13 +36,11 @@ pub(super) fn build_stored_response(
         .get("model")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| original_body.model.clone());
+        .or_else(|| Some(original_body.model.clone()));
 
-    stored_response.user = response_json
-        .get("user")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| original_body.user.clone());
+    if let Some(safety_identifier) = original_body.user.clone() {
+        stored_response.safety_identifier = Some(safety_identifier);
+    }
 
     // Set conversation id from request if provided
     if let Some(conv_id) = original_body.conversation.clone() {
@@ -129,7 +127,10 @@ pub(super) fn patch_streaming_response_json(
             }
         }
 
-        obj.insert("store".to_string(), Value::Bool(original_body.store));
+        obj.insert(
+            "store".to_string(),
+            Value::Bool(original_body.store.unwrap_or(false)),
+        );
 
         if obj
             .get("model")
@@ -137,20 +138,28 @@ pub(super) fn patch_streaming_response_json(
             .map(|s| s.is_empty())
             .unwrap_or(true)
         {
-            if let Some(model) = &original_body.model {
-                obj.insert("model".to_string(), Value::String(model.clone()));
-            }
+            obj.insert(
+                "model".to_string(),
+                Value::String(original_body.model.clone()),
+            );
         }
 
-        if obj.get("user").map(|v| v.is_null()).unwrap_or(false) {
-            if let Some(user) = &original_body.user {
-                obj.insert("user".to_string(), Value::String(user.clone()));
+        if obj
+            .get("safety_identifier")
+            .map(|v| v.is_null())
+            .unwrap_or(false)
+        {
+            if let Some(safety_identifier) = &original_body.user {
+                obj.insert(
+                    "safety_identifier".to_string(),
+                    Value::String(safety_identifier.clone()),
+                );
             }
         }
 
         // Attach conversation id for client response if present (final aggregated JSON)
         if let Some(conv_id) = original_body.conversation.clone() {
-            obj.insert("conversation".to_string(), json!({"id": conv_id}));
+            obj.insert("conversation".to_string(), json!({ "id": conv_id }));
         }
     }
 }
@@ -205,7 +214,7 @@ pub(super) fn rewrite_streaming_block(
 
     let mut changed = false;
     if let Some(response_obj) = parsed.get_mut("response").and_then(|v| v.as_object_mut()) {
-        let desired_store = Value::Bool(original_body.store);
+        let desired_store = Value::Bool(original_body.store.unwrap_or(false));
         if response_obj.get("store") != Some(&desired_store) {
             response_obj.insert("store".to_string(), desired_store);
             changed = true;
@@ -228,7 +237,7 @@ pub(super) fn rewrite_streaming_block(
 
         // Attach conversation id into streaming event response content with ordering
         if let Some(conv_id) = original_body.conversation.clone() {
-            response_obj.insert("conversation".to_string(), json!({"id": conv_id}));
+            response_obj.insert("conversation".to_string(), json!({ "id": conv_id }));
             changed = true;
         }
     }
@@ -267,69 +276,68 @@ pub(super) fn rewrite_streaming_block(
 
 /// Mask function tools as MCP tools in response for client
 pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
-    let mcp_tool = original_body
-        .tools
-        .iter()
-        .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some());
-    let Some(t) = mcp_tool else {
-        return;
-    };
+    // Check for MCP tool
+    let mcp_tool = original_body.tools.as_ref().and_then(|tools| {
+        tools
+            .iter()
+            .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())
+    });
 
-    let mut m = serde_json::Map::new();
-    m.insert("type".to_string(), Value::String("mcp".to_string()));
-    if let Some(label) = &t.server_label {
-        m.insert("server_label".to_string(), Value::String(label.clone()));
+    // Check for web_search_preview tool
+    let has_web_search = original_body
+        .tools
+        .as_ref()
+        .map(|tools| crate::routers::openai::mcp::has_web_search_preview_tool(tools))
+        .unwrap_or(false);
+
+    // If neither MCP nor web_search_preview, return early
+    if mcp_tool.is_none() && !has_web_search {
+        return;
     }
-    if let Some(url) = &t.server_url {
-        m.insert("server_url".to_string(), Value::String(url.clone()));
+
+    let mut response_tools = Vec::new();
+
+    // Add MCP tool if present
+    if let Some(t) = mcp_tool {
+        let mut m = serde_json::Map::new();
+        m.insert("type".to_string(), Value::String("mcp".to_string()));
+        if let Some(label) = &t.server_label {
+            m.insert("server_label".to_string(), Value::String(label.clone()));
+        }
+        if let Some(url) = &t.server_url {
+            m.insert("server_url".to_string(), Value::String(url.clone()));
+        }
+        if let Some(desc) = &t.server_description {
+            m.insert(
+                "server_description".to_string(),
+                Value::String(desc.clone()),
+            );
+        }
+        if let Some(req) = &t.require_approval {
+            m.insert("require_approval".to_string(), Value::String(req.clone()));
+        }
+        if let Some(allowed) = &t.allowed_tools {
+            m.insert(
+                "allowed_tools".to_string(),
+                Value::Array(allowed.iter().map(|s| Value::String(s.clone())).collect()),
+            );
+        }
+        response_tools.push(Value::Object(m));
     }
-    if let Some(desc) = &t.server_description {
-        m.insert(
-            "server_description".to_string(),
-            Value::String(desc.clone()),
+
+    // Add web_search_preview tool if present
+    if has_web_search {
+        let mut ws = serde_json::Map::new();
+        ws.insert(
+            "type".to_string(),
+            Value::String(web_search_constants::WEB_SEARCH_PREVIEW_SERVER_NAME.to_string()),
         );
-    }
-    if let Some(req) = &t.require_approval {
-        m.insert("require_approval".to_string(), Value::String(req.clone()));
-    }
-    if let Some(allowed) = &t.allowed_tools {
-        m.insert(
-            "allowed_tools".to_string(),
-            Value::Array(allowed.iter().map(|s| Value::String(s.clone())).collect()),
-        );
+        response_tools.push(Value::Object(ws));
     }
 
     if let Some(obj) = resp.as_object_mut() {
-        obj.insert("tools".to_string(), Value::Array(vec![Value::Object(m)]));
+        obj.insert("tools".to_string(), Value::Array(response_tools));
         obj.entry("tool_choice")
             .or_insert(Value::String("auto".to_string()));
     }
-}
-
-// ============================================================================
-// Output Text Extraction
-// ============================================================================
-
-/// Extract primary output text from response JSON
-pub(super) fn extract_primary_output_text(response_json: &Value) -> Option<String> {
-    if let Some(items) = response_json.get("output").and_then(|v| v.as_array()) {
-        for item in items {
-            if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
-                for part in content {
-                    if part
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .map(|t| t == "output_text")
-                        .unwrap_or(false)
-                    {
-                        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                            return Some(text.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
 }

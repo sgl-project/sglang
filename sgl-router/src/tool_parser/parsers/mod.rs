@@ -3,32 +3,28 @@
 /// This module contains concrete parser implementations for various model-specific
 /// tool/function call formats.
 // Individual parser modules
-pub mod deepseek_parser;
-pub mod glm4_moe_parser;
-pub mod gpt_oss_harmony_parser;
-pub mod gpt_oss_parser;
-pub mod json_parser;
-pub mod kimik2_parser;
-pub mod llama_parser;
-pub mod mistral_parser;
-pub mod passthrough_parser;
-pub mod pythonic_parser;
-pub mod qwen_parser;
-pub mod step3_parser;
+pub mod deepseek;
+pub mod glm4_moe;
+pub mod json;
+pub mod kimik2;
+pub mod llama;
+pub mod mistral;
+pub mod passthrough;
+pub mod pythonic;
+pub mod qwen;
+pub mod step3;
 
 // Shared helpers and utilities
 pub mod helpers;
 
 // Re-export parser types for convenience
-pub use deepseek_parser::DeepSeekParser;
-pub use glm4_moe_parser::Glm4MoeParser;
-pub use gpt_oss_harmony_parser::GptOssHarmonyParser;
-pub use gpt_oss_parser::GptOssParser;
-pub use json_parser::JsonParser;
-pub use kimik2_parser::KimiK2Parser;
-pub use llama_parser::LlamaParser;
-pub use mistral_parser::MistralParser;
-pub use passthrough_parser::PassthroughParser;
-pub use pythonic_parser::PythonicParser;
-pub use qwen_parser::QwenParser;
-pub use step3_parser::Step3Parser;
+pub use deepseek::DeepSeekParser;
+pub use glm4_moe::Glm4MoeParser;
+pub use json::JsonParser;
+pub use kimik2::KimiK2Parser;
+pub use llama::LlamaParser;
+pub use mistral::MistralParser;
+pub use passthrough::PassthroughParser;
+pub use pythonic::PythonicParser;
+pub use qwen::QwenParser;
+pub use step3::Step3Parser;

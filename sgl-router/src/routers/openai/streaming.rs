@@ -7,11 +7,8 @@
 //! - MCP tool execution loops within streaming responses
 //! - Event transformation and output index remapping
 
-use crate::data_connector::{
-    SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
-};
-use crate::protocols::spec::{ResponseToolType, ResponsesRequest};
-use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
+use std::{borrow::Cow, io, sync::Arc};
+
 use axum::{
     body::Body,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
@@ -20,20 +17,29 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::{borrow::Cow, io, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
 // Import from sibling modules
 use super::conversations::persist_conversation_items;
-use super::mcp::{
-    build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-    mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming, send_mcp_list_tools_events,
-    McpLoopConfig, ToolLoopState,
+use super::{
+    mcp::{
+        build_resume_payload, ensure_request_mcp_client, execute_streaming_tool_calls,
+        inject_mcp_metadata_streaming, prepare_mcp_payload_for_streaming,
+        send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
+    },
+    responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
+    utils::{
+        event_types, web_search_constants, FunctionCallInProgress, OutputIndexMapper, StreamAction,
+        ToolContext,
+    },
 };
-use super::responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block};
-use super::utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction};
+use crate::{
+    data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
+    protocols::responses::{ResponseToolType, ResponsesRequest},
+    routers::header_utils::{apply_request_headers, preserve_response_headers},
+};
 
 // ============================================================================
 // Streaming Response Accumulator
@@ -550,6 +556,7 @@ pub(super) fn apply_event_transformations_inplace(
     server_label: &str,
     original_request: &ResponsesRequest,
     previous_response_id: Option<&str>,
+    tool_context: ToolContext,
 ) -> bool {
     let mut changed = false;
 
@@ -572,7 +579,7 @@ pub(super) fn apply_event_transformations_inplace(
             .get_mut("response")
             .and_then(|v| v.as_object_mut())
         {
-            let desired_store = Value::Bool(original_request.store);
+            let desired_store = Value::Bool(original_request.store.unwrap_or(false));
             if response_obj.get("store") != Some(&desired_store) {
                 response_obj.insert("store".to_string(), desired_store);
                 changed = true;
@@ -595,18 +602,35 @@ pub(super) fn apply_event_transformations_inplace(
 
             // Mask tools from function to MCP format (optimized without cloning)
             if response_obj.get("tools").is_some() {
-                let requested_mcp = original_request
-                    .tools
-                    .iter()
-                    .any(|t| matches!(t.r#type, ResponseToolType::Mcp));
+                // For web_search_preview, always use simplified tool format
+                if tool_context.is_web_search() {
+                    let web_search_tool =
+                        json!([{"type": web_search_constants::WEB_SEARCH_PREVIEW_SERVER_NAME}]);
+                    response_obj.insert("tools".to_string(), web_search_tool);
+                    response_obj
+                        .entry("tool_choice".to_string())
+                        .or_insert(Value::String("auto".to_string()));
+                    changed = true;
+                } else {
+                    // Regular MCP tools - only if requested
+                    let requested_mcp = original_request
+                        .tools
+                        .as_ref()
+                        .map(|tools| {
+                            tools
+                                .iter()
+                                .any(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                        })
+                        .unwrap_or(false);
 
-                if requested_mcp {
-                    if let Some(mcp_tools) = build_mcp_tools_value(original_request) {
-                        response_obj.insert("tools".to_string(), mcp_tools);
-                        response_obj
-                            .entry("tool_choice".to_string())
-                            .or_insert(Value::String("auto".to_string()));
-                        changed = true;
+                    if requested_mcp {
+                        if let Some(mcp_tools) = build_mcp_tools_value(original_request) {
+                            response_obj.insert("tools".to_string(), mcp_tools);
+                            response_obj
+                                .entry("tool_choice".to_string())
+                                .or_insert(Value::String("auto".to_string()));
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -621,13 +645,30 @@ pub(super) fn apply_event_transformations_inplace(
                     if item_type == event_types::ITEM_TYPE_FUNCTION_CALL
                         || item_type == event_types::ITEM_TYPE_FUNCTION_TOOL_CALL
                     {
-                        item["type"] = json!(event_types::ITEM_TYPE_MCP_CALL);
-                        item["server_label"] = json!(server_label);
+                        // Use web_search_call for web_search_preview, mcp_call for regular MCP
+                        if tool_context.is_web_search() {
+                            item["type"] = json!(event_types::ITEM_TYPE_WEB_SEARCH_CALL);
+                            // Don't include server_label for web_search_call
+                            // Remove internal implementation fields
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.remove("arguments");
+                                obj.remove("call_id");
+                                obj.remove("name");
+                            }
+                        } else {
+                            item["type"] = json!(event_types::ITEM_TYPE_MCP_CALL);
+                            item["server_label"] = json!(server_label);
+                        }
 
-                        // Transform ID from fc_* to mcp_*
+                        // Transform ID from fc_* to ws_* or mcp_*
                         if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
                             if let Some(stripped) = id.strip_prefix("fc_") {
-                                let new_id = format!("mcp_{}", stripped);
+                                let prefix = if tool_context.is_web_search() {
+                                    "ws"
+                                } else {
+                                    "mcp"
+                                };
+                                let new_id = format!("{}_{}", prefix, stripped);
                                 item["id"] = json!(new_id);
                             }
                         }
@@ -658,8 +699,8 @@ pub(super) fn apply_event_transformations_inplace(
 
 /// Helper to build MCP tools value
 fn build_mcp_tools_value(original_body: &ResponsesRequest) -> Option<Value> {
-    let mcp_tool = original_body
-        .tools
+    let tools = original_body.tools.as_ref()?;
+    let mcp_tool = tools
         .iter()
         .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
 
@@ -685,6 +726,7 @@ pub(super) fn forward_streaming_event(
     original_request: &ResponsesRequest,
     previous_response_id: Option<&str>,
     sequence_number: &mut u64,
+    tool_context: ToolContext,
 ) -> bool {
     // Skip individual function_call_arguments.delta events - we'll send them as one
     if event_name == Some(event_types::FUNCTION_CALL_ARGUMENTS_DELTA) {
@@ -749,37 +791,40 @@ pub(super) fn forward_streaming_event(
                 };
 
                 // Emit a synthetic MCP arguments delta event before the done event
-                let mut delta_event = json!({
-                    "type": event_types::MCP_CALL_ARGUMENTS_DELTA,
-                    "sequence_number": *sequence_number,
-                    "output_index": assigned_index,
-                    "item_id": mcp_item_id,
-                    "delta": arguments_value,
-                });
+                // Skip for web_search_preview - we don't expose tool call arguments
+                if !tool_context.is_web_search() {
+                    let mut delta_event = json!({
+                        "type": event_types::MCP_CALL_ARGUMENTS_DELTA,
+                        "sequence_number": *sequence_number,
+                        "output_index": assigned_index,
+                        "item_id": mcp_item_id,
+                        "delta": arguments_value,
+                    });
 
-                if let Some(obfuscation) = call.last_obfuscation.as_ref() {
-                    if let Some(obj) = delta_event.as_object_mut() {
-                        obj.insert(
-                            "obfuscation".to_string(),
-                            Value::String(obfuscation.clone()),
-                        );
+                    if let Some(obfuscation) = call.last_obfuscation.as_ref() {
+                        if let Some(obj) = delta_event.as_object_mut() {
+                            obj.insert(
+                                "obfuscation".to_string(),
+                                Value::String(obfuscation.clone()),
+                            );
+                        }
+                    } else if let Some(obfuscation) = parsed_data.get("obfuscation").cloned() {
+                        if let Some(obj) = delta_event.as_object_mut() {
+                            obj.insert("obfuscation".to_string(), obfuscation);
+                        }
                     }
-                } else if let Some(obfuscation) = parsed_data.get("obfuscation").cloned() {
-                    if let Some(obj) = delta_event.as_object_mut() {
-                        obj.insert("obfuscation".to_string(), obfuscation);
+
+                    let delta_block = format!(
+                        "event: {}\ndata: {}\n\n",
+                        event_types::MCP_CALL_ARGUMENTS_DELTA,
+                        delta_event
+                    );
+                    if tx.send(Ok(Bytes::from(delta_block))).is_err() {
+                        return false;
                     }
-                }
 
-                let delta_block = format!(
-                    "event: {}\ndata: {}\n\n",
-                    event_types::MCP_CALL_ARGUMENTS_DELTA,
-                    delta_event
-                );
-                if tx.send(Ok(Bytes::from(delta_block))).is_err() {
-                    return false;
+                    *sequence_number += 1;
                 }
-
-                *sequence_number += 1;
             }
         }
     }
@@ -805,6 +850,7 @@ pub(super) fn forward_streaming_event(
         server_label,
         original_request,
         previous_response_id,
+        tool_context,
     );
 
     if let Some(response_obj) = parsed_data
@@ -836,16 +882,24 @@ pub(super) fn forward_streaming_event(
     let mut final_block = String::new();
     if let Some(evt) = event_name {
         // Update event name for function_call_arguments events
-        if evt == event_types::FUNCTION_CALL_ARGUMENTS_DELTA {
+        // Skip for web_search_preview - we don't expose tool call arguments
+        if evt == event_types::FUNCTION_CALL_ARGUMENTS_DELTA && !tool_context.is_web_search() {
             final_block.push_str(&format!(
                 "event: {}\n",
                 event_types::MCP_CALL_ARGUMENTS_DELTA
             ));
-        } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE {
+        } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE && !tool_context.is_web_search()
+        {
             final_block.push_str(&format!(
                 "event: {}\n",
                 event_types::MCP_CALL_ARGUMENTS_DONE
             ));
+        } else if (evt == event_types::FUNCTION_CALL_ARGUMENTS_DELTA
+            || evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE)
+            && tool_context.is_web_search()
+        {
+            // Skip these events entirely for web_search_preview
+            return true;
         } else {
             final_block.push_str(&format!("event: {}\n", evt));
         }
@@ -857,29 +911,61 @@ pub(super) fn forward_streaming_event(
         return false;
     }
 
-    // After sending output_item.added for mcp_call, inject mcp_call.in_progress event
+    // After sending output_item.added for mcp_call/web_search_call, inject in_progress event
     if event_name == Some(event_types::OUTPUT_ITEM_ADDED) {
         if let Some(item) = parsed_data.get("item") {
-            if item.get("type").and_then(|v| v.as_str()) == Some(event_types::ITEM_TYPE_MCP_CALL) {
-                // Already transformed to mcp_call
+            let item_type = item.get("type").and_then(|v| v.as_str());
+
+            // Check if it's an mcp_call or web_search_call
+            let is_mcp_or_web_search = item_type == Some(event_types::ITEM_TYPE_MCP_CALL)
+                || item_type == Some(event_types::ITEM_TYPE_WEB_SEARCH_CALL);
+
+            if is_mcp_or_web_search {
                 if let (Some(item_id), Some(output_index)) = (
                     item.get("id").and_then(|v| v.as_str()),
                     parsed_data.get("output_index").and_then(|v| v.as_u64()),
                 ) {
+                    // Choose event type based on tool_context
+                    let in_progress_event_type = if tool_context.is_web_search() {
+                        event_types::WEB_SEARCH_CALL_IN_PROGRESS
+                    } else {
+                        event_types::MCP_CALL_IN_PROGRESS
+                    };
+
                     let in_progress_event = json!({
-                        "type": event_types::MCP_CALL_IN_PROGRESS,
+                        "type": in_progress_event_type,
                         "sequence_number": *sequence_number,
                         "output_index": output_index,
                         "item_id": item_id
                     });
                     *sequence_number += 1;
+
                     let in_progress_block = format!(
                         "event: {}\ndata: {}\n\n",
-                        event_types::MCP_CALL_IN_PROGRESS,
-                        in_progress_event
+                        in_progress_event_type, in_progress_event
                     );
                     if tx.send(Ok(Bytes::from(in_progress_block))).is_err() {
                         return false;
+                    }
+
+                    // For web_search_call, also send a "searching" event
+                    if tool_context.is_web_search() {
+                        let searching_event = json!({
+                            "type": event_types::WEB_SEARCH_CALL_SEARCHING,
+                            "sequence_number": *sequence_number,
+                            "output_index": output_index,
+                            "item_id": item_id
+                        });
+                        *sequence_number += 1;
+
+                        let searching_block = format!(
+                            "event: {}\ndata: {}\n\n",
+                            event_types::WEB_SEARCH_CALL_SEARCHING,
+                            searching_event
+                        );
+                        if tx.send(Ok(Bytes::from(searching_block))).is_err() {
+                            return false;
+                        }
                     }
                 }
             }
@@ -897,10 +983,11 @@ pub(super) fn send_final_response_event(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     sequence_number: &mut u64,
     state: &ToolLoopState,
-    active_mcp: Option<&Arc<crate::mcp::McpClientManager>>,
+    active_mcp: Option<&Arc<crate::mcp::McpManager>>,
     original_request: &ResponsesRequest,
     previous_response_id: Option<&str>,
     server_label: &str,
+    tool_context: ToolContext,
 ) -> bool {
     let mut final_response = match handler.snapshot_final_response() {
         Some(resp) => resp,
@@ -917,7 +1004,7 @@ pub(super) fn send_final_response_event(
     }
 
     if let Some(mcp) = active_mcp {
-        inject_mcp_metadata_streaming(&mut final_response, state, mcp, server_label);
+        inject_mcp_metadata_streaming(&mut final_response, state, mcp, server_label, tool_context);
     }
 
     mask_tools_as_mcp(&mut final_response, original_request);
@@ -951,9 +1038,9 @@ pub(super) fn send_final_response_event(
 pub(super) async fn handle_simple_streaming_passthrough(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     url: String,
     headers: Option<&HeaderMap>,
     payload: Value,
@@ -986,10 +1073,10 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
     if !status.is_success() {
         circuit_breaker.record_failure();
-        let error_body = match response.text().await {
-            Ok(body) => body,
-            Err(err) => format!("Failed to read upstream error body: {}", err),
-        };
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|err| format!("Failed to read upstream error body: {}", err));
         return (status_code, error_body).into_response();
     }
 
@@ -1000,7 +1087,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
 
-    let should_store = original_body.store;
+    let should_store = original_body.store.unwrap_or(false);
     let original_request = original_body.clone();
     let persist_needed = original_request.conversation.is_some();
     let previous_response_id = original_previous_response_id.clone();
@@ -1120,21 +1207,22 @@ pub(super) async fn handle_simple_streaming_passthrough(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_streaming_with_tool_interception(
     client: &reqwest::Client,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     url: String,
     headers: Option<&HeaderMap>,
     mut payload: Value,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<String>,
-    active_mcp: &Arc<crate::mcp::McpClientManager>,
+    active_mcp: &Arc<crate::mcp::McpManager>,
+    tool_context: ToolContext,
 ) -> Response {
     // Transform MCP tools to function tools in payload
-    prepare_mcp_payload_for_streaming(&mut payload, active_mcp);
+    prepare_mcp_payload_for_streaming(&mut payload, active_mcp, tool_context);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
-    let should_store = original_body.store;
+    let should_store = original_body.store.unwrap_or(false);
     let original_request = original_body.clone();
     let persist_needed = original_request.conversation.is_some();
     let previous_response_id = original_previous_response_id.clone();
@@ -1148,7 +1236,10 @@ pub(super) async fn handle_streaming_with_tool_interception(
     // Spawn the streaming loop task
     tokio::spawn(async move {
         let mut state = ToolLoopState::new(original_request.input.clone());
-        let loop_config = McpLoopConfig::default();
+        let loop_config = McpLoopConfig {
+            tool_context,
+            ..Default::default()
+        };
         let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
         let tools_json = payload_clone.get("tools").cloned().unwrap_or(json!([]));
         let base_payload = payload_clone.clone();
@@ -1161,9 +1252,13 @@ pub(super) async fn handle_streaming_with_tool_interception(
 
         let server_label = original_request
             .tools
-            .iter()
-            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-            .and_then(|t| t.server_label.as_deref())
+            .as_ref()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                    .and_then(|t| t.server_label.as_deref())
+            })
             .unwrap_or("mcp");
 
         loop {
@@ -1263,6 +1358,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                             &original_request,
                                             previous_response_id.as_deref(),
                                             &mut sequence_number,
+                                            loop_config.tool_context,
                                         ) {
                                             // Client disconnected
                                             return;
@@ -1278,7 +1374,10 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                                 == Some(event_types::RESPONSE_IN_PROGRESS)
                                             {
                                                 seen_in_progress = true;
-                                                if !mcp_list_tools_sent {
+                                                // Skip mcp_list_tools for web_search_preview
+                                                if !mcp_list_tools_sent
+                                                    && !loop_config.tool_context.is_web_search()
+                                                {
                                                     let list_tools_index =
                                                         handler.allocate_synthetic_output_index();
                                                     if !send_mcp_list_tools_events(
@@ -1311,6 +1410,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                         &original_request,
                                         previous_response_id.as_deref(),
                                         &mut sequence_number,
+                                        loop_config.tool_context,
                                     ) {
                                         // Client disconnected
                                         return;
@@ -1349,6 +1449,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     &original_request,
                     previous_response_id.as_deref(),
                     server_label,
+                    tool_context,
                 ) {
                     return;
                 }
@@ -1370,6 +1471,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                         &state,
                         &active_mcp_clone,
                         server_label,
+                        tool_context,
                     );
 
                     mask_tools_as_mcp(&mut response_json, &original_request);
@@ -1431,6 +1533,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                 &mut state,
                 server_label,
                 &mut sequence_number,
+                tool_context,
             )
             .await
             {
@@ -1477,19 +1580,31 @@ pub(super) async fn handle_streaming_with_tool_interception(
 pub(super) async fn handle_streaming_response(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,
-    mcp_manager: Option<&Arc<crate::mcp::McpClientManager>>,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Option<&Arc<crate::mcp::McpManager>>,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     url: String,
     headers: Option<&HeaderMap>,
     payload: Value,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<String>,
+    tool_context: ToolContext,
 ) -> Response {
     // Check if MCP is active for this request
-    let req_mcp_manager = mcp_manager_from_request_tools(&original_body.tools).await;
-    let active_mcp = req_mcp_manager.as_ref().or(mcp_manager);
+    // Ensure dynamic client is created if needed
+    if let (Some(manager), Some(ref tools)) = (mcp_manager, &original_body.tools) {
+        ensure_request_mcp_client(manager, tools.as_slice()).await;
+    }
+
+    // Use the tool loop if the manager has any tools available (static or dynamic).
+    let active_mcp = mcp_manager.and_then(|mgr| {
+        if mgr.list_tools().is_empty() {
+            None
+        } else {
+            Some(mgr)
+        }
+    });
 
     // If no MCP is active, use simple pass-through streaming
     if active_mcp.is_none() {
@@ -1522,6 +1637,7 @@ pub(super) async fn handle_streaming_response(
         original_body,
         original_previous_response_id,
         active_mcp,
+        tool_context,
     )
     .await
 }

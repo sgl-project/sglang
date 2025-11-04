@@ -81,7 +81,7 @@ class TestVLMModels(CustomTestCase):
         model = "openai_compatible"
         tp = 1
         tasks = "mmmu_val"
-        batch_size = 2
+        batch_size = 32
         log_suffix = "openai_compatible"
         os.makedirs(output_path, exist_ok=True)
 
@@ -145,6 +145,8 @@ class TestVLMModels(CustomTestCase):
             process_env = os.environ.copy()
             if custom_env:
                 process_env.update(custom_env)
+            # if test vlm with cuda_ipc feature, open this env_var
+            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
             # Prepare stdout/stderr redirection if needed
             stdout_file = None
@@ -179,7 +181,15 @@ class TestVLMModels(CustomTestCase):
             self.run_mmmu_eval(model.model, output_path)
 
             # Get the result file
-            result_file_path = glob.glob(f"{output_path}/*.json")[0]
+            # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories)
+            result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
+            if not result_files:
+                result_files = glob.glob(f"{output_path}/*.json")
+
+            if not result_files:
+                raise FileNotFoundError(f"No JSON result files found in {output_path}")
+
+            result_file_path = result_files[0]
 
             with open(result_file_path, "r") as f:
                 result = json.load(f)

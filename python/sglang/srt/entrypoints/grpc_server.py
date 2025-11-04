@@ -3,167 +3,42 @@ Standalone gRPC Server for SGLang - Fully separated from HTTP server.
 Uses GrpcRequestManager for orchestration without tokenization.
 """
 
-import argparse
 import asyncio
 import dataclasses
 import logging
 import multiprocessing as mp
 import os
 import signal
+import threading
 import time
 from concurrent import futures
-from typing import AsyncIterator, Dict, Optional, Tuple
+from typing import AsyncIterator, Dict, Optional
 
 import grpc
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
+from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
 import sglang
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
-from sglang.srt.entrypoints.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
-from sglang.srt.managers.data_parallel_controller import (
-    run_data_parallel_controller_process,
-)
+from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
+from sglang.srt.grpc.health_servicer import SGLangHealthServicer
+from sglang.srt.grpc.scheduler_launcher import launch_scheduler_process_only
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, prepare_model_and_tokenizer
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
-
-
-def _run_scheduler_with_signal_handling(*args, **kwargs):
-    """
-    Wrapper for run_scheduler_process that ignores SIGINT.
-
-    The scheduler process should not handle Ctrl+C - it should only terminate
-    when the parent gRPC server exits (via kill_itself_when_parent_died).
-    """
-    # Ignore SIGINT in this subprocess - let the parent handle it
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
-    # Now run the actual scheduler process
-    run_scheduler_process(*args, **kwargs)
-
-
-def _launch_scheduler_process_only(
-    server_args: ServerArgs,
-    port_args: Optional[PortArgs] = None,
-) -> Tuple[Dict, PortArgs, list]:
-    """
-    Launch only the scheduler process(es) without tokenizer/detokenizer.
-    Returns scheduler info, port args, and list of scheduler processes.
-    """
-    # Configure global environment
-    configure_logger(server_args)
-    server_args.check_server_args()
-
-    # Allocate ports for inter-process communications
-    if port_args is None:
-        port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
-
-    # Prepare model and tokenizer paths
-    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
-        server_args.model_path, server_args.tokenizer_path
-    )
-
-    scheduler_procs = []
-    if server_args.dp_size == 1:
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
-        scheduler_pipe_readers = []
-
-        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
-        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-        tp_rank_range = range(
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
-        )
-
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
-        )
-
-        for pp_rank in pp_rank_range:
-            for tp_rank in tp_rank_range:
-                reader, writer = mp.Pipe(duplex=False)
-                gpu_id = (
-                    server_args.base_gpu_id
-                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-                )
-                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-                proc = mp.Process(
-                    target=_run_scheduler_with_signal_handling,
-                    args=(
-                        server_args,
-                        port_args,
-                        gpu_id,
-                        tp_rank,
-                        moe_ep_rank,
-                        pp_rank,
-                        None,
-                        writer,
-                    ),
-                )
-
-                with memory_saver_adapter.configure_subprocess():
-                    proc.start()
-                scheduler_procs.append(proc)
-                scheduler_pipe_readers.append(reader)
-    else:
-        # Launch the data parallel controller
-        reader, writer = mp.Pipe(duplex=False)
-        scheduler_pipe_readers = [reader]
-        proc = mp.Process(
-            target=run_data_parallel_controller_process,
-            args=(server_args, port_args, writer),
-        )
-        proc.start()
-        scheduler_procs.append(proc)
-
-    # TODO(CatherineSue): handle cases for multi-node
-
-    # Wait for all scheduler processes to be ready
-    scheduler_infos = []
-    for i, reader in enumerate(scheduler_pipe_readers):
-        try:
-            data = reader.recv()
-        except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
-            scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise RuntimeError(f"Failed to initialize scheduler rank {i}")
-
-        if data.get("status") != "ready":
-            raise RuntimeError(
-                f"Scheduler rank {i} initialization failed: {data.get('error', 'Unknown error')}"
-            )
-        scheduler_infos.append(data)
-
-    logger.info(
-        f"All {len(scheduler_procs)} scheduler process(es) initialized successfully"
-    )
-
-    # Return the first scheduler's info (they should all be the same)
-    return scheduler_infos[0], port_args, scheduler_procs
 
 
 class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer):
@@ -178,6 +53,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         server_args: ServerArgs,
         model_info: Dict,
         scheduler_info: Dict,
+        health_servicer: Optional[SGLangHealthServicer] = None,
     ):
         """Initialize the standalone gRPC service."""
         self.request_manager = request_manager
@@ -185,6 +61,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.model_info = model_info
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
+        self.health_servicer = health_servicer
 
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
@@ -317,7 +194,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         Check the health of the inference server by sending a special request to generate one token.
         Similar to HTTP server's /health endpoint.
         """
-        logger.info("Receive health check request")
+        rid = f"HEALTH_CHECK_{time.time()}"
+        logger.info(f"Receive health check request: {rid}")
 
         if self.request_manager.gracefully_exit:
             logger.info(
@@ -328,7 +206,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
 
         # Create a special health check request
-        rid = f"HEALTH_CHECK_{time.time()}"
         sampling_params = SGLSamplingParams(max_new_tokens=1, temperature=0.0)
         sampling_params.normalize(tokenizer=None)
 
@@ -526,9 +403,20 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         bootstrap_port = None
         bootstrap_room = None
         if grpc_req.HasField("disaggregated_params"):
-            bootstrap_host = grpc_req.disaggregated_params.bootstrap_host or None
-            bootstrap_port = grpc_req.disaggregated_params.bootstrap_port or None
-            bootstrap_room = grpc_req.disaggregated_params.bootstrap_room or None
+            # Don't use 'or None' as it treats 0 as falsy
+            bootstrap_host = (
+                grpc_req.disaggregated_params.bootstrap_host
+                if grpc_req.disaggregated_params.bootstrap_host
+                else None
+            )
+            bootstrap_port = (
+                grpc_req.disaggregated_params.bootstrap_port
+                if grpc_req.disaggregated_params.bootstrap_port
+                else None
+            )
+            bootstrap_room = (
+                grpc_req.disaggregated_params.bootstrap_room
+            )  # Can be 0, don't use 'or None'
 
         # Create request
         return TokenizedGenerateReqInput(
@@ -800,6 +688,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Shutdown the service."""
         logger.info("Shutting down gRPC service")
 
+        # Mark health service as NOT_SERVING before shutdown
+        if self.health_servicer:
+            self.health_servicer.set_not_serving()
+
         # Shutdown request manager (handles its own tasks)
         await self.request_manager.shutdown()
 
@@ -822,7 +714,7 @@ async def serve_grpc(
 
     # Launch only the scheduler process(es) (no tokenizer/detokenizer needed for gRPC)
     logger.info("Launching scheduler process(es)...")
-    scheduler_info, port_args, scheduler_procs = _launch_scheduler_process_only(
+    scheduler_info, port_args, scheduler_procs = launch_scheduler_process_only(
         server_args=server_args,
     )
 
@@ -859,18 +751,27 @@ async def serve_grpc(
         ],
     )
 
-    # Add service
+    # Create standard health service (for Kubernetes probes)
+    health_servicer = SGLangHealthServicer(
+        request_manager=request_manager,
+        scheduler_info=scheduler_info,
+    )
+    health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
+
+    # Add SGLang service
     servicer = SGLangSchedulerServicer(
         request_manager=request_manager,
         server_args=server_args,
         model_info=model_info,
         scheduler_info=scheduler_info,
+        health_servicer=health_servicer,
     )
     sglang_scheduler_pb2_grpc.add_SglangSchedulerServicer_to_server(servicer, server)
 
     # Enable reflection
     SERVICE_NAMES = (
         sglang_scheduler_pb2.DESCRIPTOR.services_by_name["SglangScheduler"].full_name,
+        "grpc.health.v1.Health",
         reflection.SERVICE_NAME,
     )
     reflection.enable_server_reflection(SERVICE_NAMES, server)
@@ -881,6 +782,13 @@ async def serve_grpc(
 
     await server.start()
     logger.info(f"gRPC server listening on {listen_addr}")
+
+    # Start warmup in a separate thread
+    warmup_thread = threading.Thread(
+        target=_wait_and_warmup_grpc,
+        args=(server_args, None, health_servicer),
+    )
+    warmup_thread.start()
 
     # Handle shutdown signals
     loop = asyncio.get_running_loop()
@@ -904,6 +812,11 @@ async def serve_grpc(
         # Stop the gRPC server
         await server.stop(5.0)
 
+        # Wait for warmup thread to finish
+        if warmup_thread.is_alive():
+            logger.info("Waiting for warmup thread to finish...")
+            warmup_thread.join(timeout=5.0)
+
         # Terminate scheduler processes before exiting to avoid atexit hang
         # The scheduler processes have SIGINT ignored, so they won't get KeyboardInterrupt
         for i, proc in enumerate(scheduler_procs):
@@ -921,23 +834,173 @@ async def serve_grpc(
         logger.info("All scheduler processes terminated")
 
 
-def main():
-    """Main entry point for standalone gRPC server."""
-    # Fix CUDA multiprocessing issues - must be called before any CUDA operations
-    mp.set_start_method("spawn", force=True)
-
-    parser = argparse.ArgumentParser(description="SGLang Standalone gRPC Server")
-    ServerArgs.add_cli_args(parser)
-    args = parser.parse_args()
-    server_args = ServerArgs.from_cli_args(args)
-
-    # Run server
-    asyncio.run(
-        serve_grpc(
-            server_args=server_args,
+def _execute_grpc_server_warmup(
+    server_args: ServerArgs,
+    pipe_finish_writer: Optional[mp.connection.Connection],
+):
+    """Execute warmup for gRPC server by checking health and sending test request."""
+    try:
+        # Connect to the gRPC server
+        grpc_url = f"{server_args.host}:{server_args.port}"
+        channel = grpc.insecure_channel(
+            grpc_url,
+            options=[
+                ("grpc.max_send_message_length", 1024 * 1024 * 256),
+                ("grpc.max_receive_message_length", 1024 * 1024 * 256),
+            ],
         )
-    )
+        stub = sglang_scheduler_pb2_grpc.SglangSchedulerStub(channel)
+
+        # Wait until the server is launched (poll GetModelInfo)
+        success = False
+        last_error = None
+        for _ in range(120):
+            time.sleep(1)
+            try:
+                request = sglang_scheduler_pb2.GetModelInfoRequest()
+                response = stub.GetModelInfo(request, timeout=5)
+                success = True
+                break
+            except Exception as e:
+                last_error = str(e)
+                pass
+
+        if not success:
+            error_msg = f"gRPC server warmup failed: Could not connect to server after 120 seconds. Last error: {last_error}"
+            logger.error(error_msg)
+            if pipe_finish_writer is not None:
+                pipe_finish_writer.send(error_msg)
+            channel.close()
+            kill_process_tree(os.getpid())
+            return False
+
+        # Get model info to determine if it's generation or embedding
+        is_generation = response.is_generation
+
+        # Send a warmup request
+        logger.info("Sending warmup request to gRPC server...")
+        max_new_tokens = 8 if is_generation else 1
+
+        if is_generation:
+            warmup_request_kwargs = {
+                "request_id": f"WARMUP_{time.time()}",
+                "tokenized": sglang_scheduler_pb2.TokenizedInput(
+                    input_ids=[
+                        123,
+                        456,
+                        789,
+                        234,
+                        567,
+                        890,
+                        345,
+                    ],  # Random-looking but safe token IDs
+                    original_text="warmup request",
+                ),
+                "sampling_params": sglang_scheduler_pb2.SamplingParams(
+                    temperature=0.0,
+                    max_new_tokens=max_new_tokens,
+                ),
+                "stream": False,
+            }
+
+            # Set disaggregation params if needed
+            if server_args.disaggregation_mode != DisaggregationMode.NULL:
+                warmup_request_kwargs["disaggregated_params"] = (
+                    sglang_scheduler_pb2.DisaggregatedParams(
+                        bootstrap_host=FAKE_BOOTSTRAP_HOST,
+                        bootstrap_room=0,
+                    )
+                )
+
+            warmup_request = sglang_scheduler_pb2.GenerateRequest(
+                **warmup_request_kwargs
+            )
+
+            # Send the warmup request
+            try:
+                responses = list(stub.Generate(warmup_request, timeout=600))
+                # Check if we got a valid response
+                if responses and not responses[-1].HasField("error"):
+                    logger.info("gRPC warmup request completed successfully")
+                    success = True
+                else:
+                    error_msg = (
+                        responses[-1].error.message if responses else "No response"
+                    )
+                    logger.warning(f"gRPC warmup request returned error: {error_msg}")
+                    success = False
+            except Exception as e:
+                error_msg = f"gRPC warmup request failed: {e}"
+                logger.error(error_msg)
+                if pipe_finish_writer is not None:
+                    pipe_finish_writer.send(error_msg)
+                channel.close()
+                kill_process_tree(os.getpid())
+                return False
+        else:
+            # For embedding models
+            warmup_request = sglang_scheduler_pb2.EmbedRequest(
+                request_id=f"WARMUP_{time.time()}",
+                tokenized=sglang_scheduler_pb2.TokenizedInput(
+                    input_ids=[10, 11, 12],
+                    original_text="test embedding",
+                ),
+            )
+
+            try:
+                response = stub.Embed(warmup_request, timeout=600)
+                if not response.HasField("error"):
+                    logger.info("gRPC warmup request completed successfully")
+                    success = True
+                else:
+                    logger.warning(
+                        f"gRPC warmup request returned error: {response.error.message}"
+                    )
+                    success = False
+            except Exception as e:
+                error_msg = f"gRPC warmup request failed: {e}"
+                logger.error(error_msg)
+                if pipe_finish_writer is not None:
+                    pipe_finish_writer.send(error_msg)
+                channel.close()
+                kill_process_tree(os.getpid())
+                return False
+
+        channel.close()
+        return success
+
+    except Exception as e:
+        error_msg = (
+            f"gRPC warmup failed with exception: {e}\n{get_exception_traceback()}"
+        )
+        logger.error(error_msg)
+        if pipe_finish_writer is not None:
+            pipe_finish_writer.send(error_msg)
+        try:
+            channel.close()
+        except Exception:
+            pass
+        kill_process_tree(os.getpid())
+        return False
 
 
-if __name__ == "__main__":
-    main()
+def _wait_and_warmup_grpc(
+    server_args: ServerArgs,
+    pipe_finish_writer: Optional[mp.connection.Connection],
+    health_servicer: Optional[SGLangHealthServicer] = None,
+):
+    """Wait for gRPC server to be ready and execute warmup."""
+    if not server_args.skip_server_warmup:
+        if not _execute_grpc_server_warmup(server_args, pipe_finish_writer):
+            return
+    else:
+        logger.info("Skipping gRPC server warmup (skip_server_warmup=True)")
+
+    # Mark health service as SERVING after warmup completes
+    if health_servicer:
+        health_servicer.set_serving()
+
+    logger.info("The server is fired up and ready to roll!")
+
+    if pipe_finish_writer is not None:
+        pipe_finish_writer.send("ready")
