@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -23,6 +24,51 @@ class TorchNativeAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         pass
+    
+    def scaled_dot_product_attention_with_softcapping(
+        self,
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
+        enable_gqa=False,
+        logit_cap=0.0,
+        logit_capping_method="tanh",
+    ) -> torch.Tensor:
+        L, S = query.size(-2), key.size(-2)
+        scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+        attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+        if is_causal:
+            assert attn_mask is None
+            temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(
+                diagonal=0
+            )
+            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+            attn_bias.to(query.dtype)
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+            else:
+                attn_bias = attn_mask + attn_bias
+
+        if enable_gqa:
+            key = key.repeat_interleave(query.size(-3) // key.size(-3), -3)
+            value = value.repeat_interleave(query.size(-3) // value.size(-3), -3)
+
+        attn_weight = query @ key.transpose(-2, -1) * scale_factor
+
+        if logit_cap > 0:
+            if logit_capping_method == "tanh":
+                attn_weight = logit_cap * torch.tanh(attn_weight / logit_cap)
+
+        attn_weight += attn_bias
+        attn_weight = torch.softmax(attn_weight, dim=-1)
+        attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
+        return attn_weight @ value
 
     def _run_sdpa_forward_extend(
         self,
@@ -38,6 +84,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         scaling=None,
         enable_gqa=False,
         causal=False,
+        logit_cap: float = 0.0,
+        logit_capping_method: str = "tanh",
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -93,18 +141,34 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            per_req_out_redudant = (
-                scaled_dot_product_attention(
-                    per_req_query_redudant.unsqueeze(0),
-                    per_req_key.unsqueeze(0),
-                    per_req_value.unsqueeze(0),
-                    enable_gqa=enable_gqa,
-                    scale=scaling,
-                    is_causal=causal,
+            if logit_cap > 0:
+                per_req_out_redudant = (
+                    self.scaled_dot_product_attention_with_softcapping(
+                        per_req_query_redudant.unsqueeze(0),
+                        per_req_key.unsqueeze(0),
+                        per_req_value.unsqueeze(0),
+                        enable_gqa=enable_gqa,
+                        scale=scaling,
+                        is_causal=causal,
+                        logit_cap=logit_cap,
+                        logit_capping_method=logit_capping_method,
+                    )
+                    .squeeze(0)
+                    .movedim(query.dim() - 2, 0)
                 )
-                .squeeze(0)
-                .movedim(query.dim() - 2, 0)
-            )
+            else:
+                per_req_out_redudant = (
+                    scaled_dot_product_attention(
+                        per_req_query_redudant.unsqueeze(0),
+                        per_req_key.unsqueeze(0),
+                        per_req_value.unsqueeze(0),
+                        enable_gqa=enable_gqa,
+                        scale=scaling,
+                        is_causal=causal,
+                    )
+                    .squeeze(0)
+                    .movedim(query.dim() - 2, 0)
+                )
             output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q, start_kv = end_q, end_kv
         return output
@@ -121,6 +185,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         scaling=None,
         enable_gqa=False,
         causal=False,
+        logit_cap: float = 0.0,
+        logit_capping_method: str = "tanh",
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -162,18 +228,34 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            per_req_out = (
-                scaled_dot_product_attention(
-                    per_req_query.unsqueeze(0),
-                    per_req_key.unsqueeze(0),
-                    per_req_value.unsqueeze(0),
-                    enable_gqa=enable_gqa,
-                    scale=scaling,
-                    is_causal=causal,
+            if logit_cap > 0:
+                per_req_out = (
+                    self.scaled_dot_product_attention_with_softcapping(
+                        per_req_query.unsqueeze(0),
+                        per_req_key.unsqueeze(0),
+                        per_req_value.unsqueeze(0),
+                        enable_gqa=enable_gqa,
+                        scale=scaling,
+                        is_causal=causal,
+                        logit_cap=logit_cap,
+                        logit_capping_method=logit_capping_method,
+                    )
+                    .squeeze(0)
+                    .movedim(query.dim() - 2, 0)
                 )
-                .squeeze(0)
-                .movedim(query.dim() - 2, 0)
-            )
+            else:
+                per_req_out = (
+                    scaled_dot_product_attention(
+                        per_req_query.unsqueeze(0),
+                        per_req_key.unsqueeze(0),
+                        per_req_value.unsqueeze(0),
+                        enable_gqa=enable_gqa,
+                        scale=scaling,
+                        is_causal=causal,
+                    )
+                    .squeeze(0)
+                    .movedim(query.dim() - 2, 0)
+                )
             output[start_q:end_q, :, :] = per_req_out
             start_q, start_kv = end_q, end_kv
 

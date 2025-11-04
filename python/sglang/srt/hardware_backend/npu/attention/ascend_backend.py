@@ -681,7 +681,10 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             else:
-                if layer.qk_head_dim <= 128:
+                if layer.qk_head_dim <= 128 and layer.logit_cap == 0:
+                    """When logit_cap > 0, use torch native attention backend instead
+                    cause Ascend attn ops do not support soft-capping attention currently.
+                    """
                     query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
                     attn_output = torch.empty(
                         (query.shape[0], layer.tp_q_head_num * layer.v_head_dim),
@@ -735,6 +738,8 @@ class AscendAttnBackend(AttentionBackend):
                         scaling=layer.scaling,
                         enable_gqa=use_gqa,
                         causal=causal,
+                        logit_cap=layer.logit_cap,
+                        logit_capping_method=layer.logit_capping_method,
                     )
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             num_token_padding = q.shape[0]
@@ -1317,7 +1322,7 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
-            else:
+            elif layer.logit_cap == 0:
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 attn_output = torch.empty(
@@ -1336,6 +1341,33 @@ class AscendAttnBackend(AttentionBackend):
                     block_table=self.forward_metadata.block_tables,
                     context_lens=self.forward_metadata.seq_lens_cpu_int,
                     out=attn_output,
+                )
+            else:
+                if layer.qk_head_dim != layer.v_head_dim:
+                    attn_output = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                    )
+                else:
+                    attn_output = torch.empty_like(q)
+
+                use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
+                q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+                self.native_attn._run_sdpa_forward_decode(
+                    q_,
+                    o_,
+                    k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    forward_batch.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    scaling=layer.scaling,
+                    enable_gqa=use_gqa,
+                    causal=False,
+                    logit_cap=layer.logit_cap,
+                    logit_capping_method=layer.logit_capping_method,
                 )
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
