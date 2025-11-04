@@ -165,8 +165,7 @@ void downcast_fp8(
     at::Tensor& v_scale,
     at::Tensor& loc,
     int64_t mult,
-    int64_t offset,
-    int64_t cuda_stream);
+    int64_t offset);
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
@@ -468,8 +467,7 @@ void tree_speculative_sampling_target_only(
     at::Tensor draft_probs,
     double threshold_single = 1,
     double threshold_acc = 1,
-    bool deterministic = true,
-    int64_t cuda_stream = 0);
+    bool deterministic = true);
 
 void verify_tree_greedy(
     at::Tensor predicts,          // mutable
@@ -479,8 +477,7 @@ void verify_tree_greedy(
     at::Tensor retrive_index,
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
-    at::Tensor target_predict,
-    int64_t cuda_stream = 0);
+    at::Tensor target_predict);
 
 void reconstruct_indices_from_tree_mask(
     at::Tensor tree_mask,
@@ -662,6 +659,7 @@ void transfer_kv_all_layer_direct_lf_pf(
 /*
  * From csrc/memory
  */
+at::Tensor weak_ref_tensor(const at::Tensor& tensor);
 void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
 
 /*
