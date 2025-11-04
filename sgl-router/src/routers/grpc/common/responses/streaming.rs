@@ -327,7 +327,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_failed(
+    pub fn emit_mcp_call_failed(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -449,7 +449,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Process a chunk and emit appropriate events
-    pub(super) fn process_chunk(
+    pub fn process_chunk(
         &mut self,
         chunk: &ChatCompletionStreamResponse,
         tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,

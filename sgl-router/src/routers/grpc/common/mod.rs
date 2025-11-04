@@ -2,4 +2,5 @@
 
 pub mod response_collection;
 pub mod response_formatting;
+pub mod responses;
 pub mod stages;

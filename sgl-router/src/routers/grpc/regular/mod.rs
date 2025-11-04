@@ -4,5 +4,6 @@
 //! including pipeline stages, response processing, and streaming.
 
 pub mod processor;
+pub mod responses;
 pub mod stages;
 pub mod streaming;

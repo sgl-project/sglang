@@ -10,13 +10,14 @@ use axum::{
 use tracing::debug;
 
 use super::{
+    common::responses::handlers::{cancel_response_impl, get_response_impl},
     context::SharedComponents,
     harmony::{
         serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector,
         HarmonyResponsesContext,
     },
     pipeline::RequestPipeline,
-    responses,
+    regular::responses,
 };
 use crate::{
     app_context::AppContext,
@@ -307,11 +308,11 @@ impl RouterTrait for GrpcRouter {
         response_id: &str,
         _params: &ResponsesGetParams,
     ) -> Response {
-        responses::get_response_impl(&self.responses_context, response_id).await
+        get_response_impl(&self.responses_context, response_id).await
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        responses::cancel_response_impl(&self.responses_context, response_id).await
+        cancel_response_impl(&self.responses_context, response_id).await
     }
 
     async fn route_embeddings(

@@ -19,11 +19,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::{
-    super::error,
-    conversions,
-    streaming::{OutputItemType, ResponseStreamEventEmitter},
-};
+use super::conversions;
 use crate::{
     mcp::{self, McpManager},
     protocols::{
@@ -36,6 +32,10 @@ use crate::{
             ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest,
             ResponsesResponse,
         },
+    },
+    routers::grpc::{
+        common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
+        error,
     },
 };
 

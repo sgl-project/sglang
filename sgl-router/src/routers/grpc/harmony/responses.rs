@@ -63,11 +63,11 @@ use crate::{
     },
     routers::{
         grpc::{
+            common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
             context::SharedComponents,
             error,
             harmony::processor::ResponsesIterationResult,
             pipeline::RequestPipeline,
-            responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
         },
         openai::mcp::ensure_request_mcp_client,
     },

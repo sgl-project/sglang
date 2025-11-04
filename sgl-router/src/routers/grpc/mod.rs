@@ -9,7 +9,6 @@ pub mod harmony;
 pub mod pd_router;
 pub mod pipeline;
 pub mod regular;
-pub mod responses;
 pub mod router;
 pub mod utils;
 
