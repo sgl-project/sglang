@@ -727,31 +727,6 @@ impl RouterTrait for Router {
         self.proxy_get_request(req, "health_generate").await
     }
 
-    async fn get_engine_metrics(&self) -> Response {
-        let engine_responses = match self
-            .fan_out_simple_request(None, "metrics", Method::GET)
-            .await
-        {
-            Ok(x) => x,
-            Err(e) => return e,
-        };
-        let engine_responses = engine_responses
-            .into_iter()
-            .map(|(worker_base_url, metrics_text)| MetricPack {
-                labels: vec![("worker_addr".into(), worker_base_url)],
-                metrics_text,
-            })
-            .collect();
-        let text = match crate::core::metrics_aggregator::aggregate_metrics(engine_responses) {
-            Ok(x) => x,
-            Err(e) => {
-                let error_msg = format!("Failed to aggregate metrics: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response();
-            }
-        };
-        (StatusCode::OK, text).into_response()
-    }
-
     async fn get_server_info(&self, req: Request<Body>) -> Response {
         self.proxy_get_request(req, "get_server_info").await
     }

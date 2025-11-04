@@ -44,9 +44,6 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Route a health generate request
     async fn health_generate(&self, req: Request<Body>) -> Response;
 
-    /// Compute engine metrics
-    async fn get_engine_metrics(&self) -> Response;
-
     /// Get server information
     async fn get_server_info(&self, req: Request<Body>) -> Response;
 

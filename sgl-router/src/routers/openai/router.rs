@@ -379,14 +379,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         self
     }
 
-    async fn get_engine_metrics(&self) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Engine metrics is not yet implemented for OpenAIRouter",
-        )
-            .into_response()
-    }
-
     async fn health_generate(&self, _req: Request<Body>) -> Response {
         // Check all endpoints in parallel - only healthy if ALL are healthy
         if self.worker_urls.is_empty() {
