@@ -6,7 +6,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use axum::response::{IntoResponse, Response};
 use futures::future;
-use http::{Method, StatusCode};
+use http::{HeaderMap, Method, StatusCode};
 use serde_json::Value;
 use tokio::{
     sync::{watch, Mutex},
@@ -238,7 +238,7 @@ impl WorkerManager {
     }
 
     pub async fn get_engine_metrics() -> Response {
-        let engine_responses = match fan_out_simple_request(None, "metrics", Method::GET).await
+        let engine_responses = match Self::fan_out_simple_request(None, "metrics", Method::GET).await
         {
             Ok(x) => x,
             Err(e) => return e,
@@ -258,6 +258,62 @@ impl WorkerManager {
             }
         };
         (StatusCode::OK, text).into_response()
+    }
+
+    async fn fan_out_simple_request(
+        client: &reqwest::Client,
+        endpoint: &str,
+        method: Method,
+    ) -> Result<Vec<(String, String)>, Response> {
+        let workers = self.worker_registry.get_all();
+        if workers.is_empty() {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
+        }
+
+        let mut responses = vec![];
+        // May do parallel requests later
+        for worker in workers {
+            let worker_url = worker.url();
+            let worker_base_url = self.worker_base_url(worker_url);
+
+            let url = format!("{}/{}", worker_base_url, endpoint);
+            let mut request_builder = match method {
+                Method::GET => client.get(url),
+                Method::POST => client.post(url),
+                _ => {
+                    return Err((
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "Unsupported method for simple routing",
+                    )
+                        .into_response())
+                }
+            };
+
+            if let Some(api_key) = worker.api_key() {
+                request_builder =
+                    request_builder.header("Authorization", format!("Bearer {}", api_key));
+            }
+
+            match request_builder.send().await {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    match res.text().await {
+                        Ok(body_text) => {
+                            if status.is_success() {
+                                responses.push((worker_base_url, body_text));
+                            }
+                        }
+                        Err(e) => {
+                            warn!("fan_out_simple_request failed when reading text: {}", e)
+                        }
+                    }
+                }
+                Err(e) => warn!("fan_out_simple_request failed when sending: {}", e),
+            }
+        }
+
+        Ok(responses)
     }
 }
 
