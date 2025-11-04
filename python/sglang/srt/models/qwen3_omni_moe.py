@@ -43,7 +43,9 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
-from sglang.srt.utils import add_prefix, logger
+from sglang.srt.utils import add_prefix, is_cpu, logger
+
+_is_cpu = is_cpu()
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
@@ -63,7 +65,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             use_qkv_parallel=True,
             rotary_embed="normal",
             proj_bias=True,
-            qkv_backend="fa3",
+            qkv_backend="fa3" if not _is_cpu else "sdpa",
             softmax_in_single_precision=False,
             flatten_batch=True,
             quant_config=quant_config,
