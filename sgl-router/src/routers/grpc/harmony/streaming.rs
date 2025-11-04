@@ -834,7 +834,8 @@ impl HarmonyStreamingProcessor {
 
                                 // Emit status event if mode supports it (MCP only)
                                 if mode.emits_status_events() {
-                                    let event = emitter.emit_mcp_call_completed(*output_index, item_id);
+                                    let event =
+                                        emitter.emit_mcp_call_completed(*output_index, item_id);
                                     emitter.send_event_best_effort(&event, tx);
                                 }
 
@@ -1086,7 +1087,8 @@ impl HarmonyStreamingProcessor {
         while let Some(result) = prefill_stream.next().await {
             let _response = result.map_err(|e| format!("Prefill stream error: {}", e))?;
         }
-        let result = Self::process_decode_stream(decode_stream, emitter, tx, ToolCallMode::Mcp).await;
+        let result =
+            Self::process_decode_stream(decode_stream, emitter, tx, ToolCallMode::Mcp).await;
         prefill_stream.mark_completed();
         result
     }
@@ -1101,7 +1103,8 @@ impl HarmonyStreamingProcessor {
         while let Some(result) = prefill_stream.next().await {
             let _response = result.map_err(|e| format!("Prefill stream error: {}", e))?;
         }
-        let result = Self::process_decode_stream(decode_stream, emitter, tx, ToolCallMode::Function).await;
+        let result =
+            Self::process_decode_stream(decode_stream, emitter, tx, ToolCallMode::Function).await;
         prefill_stream.mark_completed();
         result
     }
