@@ -1,5 +1,18 @@
 from typing import List, Union
 
+using_decord = True
+try:
+    from decord import VideoReader
+except ImportError:
+    try:
+        from torchvision.io import VideoReader
+
+        using_decord = False
+    except ImportError:
+        raise ImportError(
+            "Neither 'decord' nor 'torchvision' is available. Please install at least one."
+        )
+
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
