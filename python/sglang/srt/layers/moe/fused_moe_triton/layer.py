@@ -1049,13 +1049,7 @@ class FlashInferFP4MoE(FusedMoE):
         router_logits = router_logits.to(torch.float32)
 
         with use_symmetric_memory(get_tp_group()) as sm:
-            # Two fp4 values are packed into one uint8 value. So, the output shape is 2x the input shape.
-            symm_output = torch.empty(
-                hs_fp4.shape[0],
-                hs_fp4.shape[1] * 2,
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
+            symm_output = torch.empty_like(hidden_states)
             sm.tag(symm_output)
 
         result = trtllm_fp4_block_scale_moe(
