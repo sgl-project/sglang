@@ -6,8 +6,8 @@ _PATTERN_DECODE = (
     r"(?:\s+PP(?P<pp_rank>\d+))?"
     r"\]\s+"
     r"Decode batch( \[\d+\])?,\s+"
-    r"#running-req:\s*(?P<running_req>\d+),\s+"
-    r"#token:\s*(?P<token>\d+),\s+"
+    r"#running-req:\s*(?P<num_running_req>\d+),\s+"
+    r"#token:\s*(?P<num_token>\d+),\s+"
     r"token usage:\s*(?P<token_usage>[0-9.]+),\s+"
     r".*?"
     r"gen throughput \(token/s\):\s*(?P<gen_throughput>[0-9.]+),\s+"
@@ -32,8 +32,8 @@ def parse(lines):
                 ("dp_rank", pl.Int64),
                 ("tp_rank", pl.Int64),
                 ("pp_rank", pl.Int64),
-                ("running_req", pl.Int64),
-                ("token", pl.Int64),
+                ("num_running_req", pl.Int64),
+                ("num_token", pl.Int64),
                 ("token_usage", pl.Float64),
                 ("gen_throughput", pl.Float64),
                 ("queue_req", pl.Int64),
