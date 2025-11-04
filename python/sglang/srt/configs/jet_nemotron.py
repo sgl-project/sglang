@@ -23,8 +23,10 @@ class JetNemotronConfig(PretrainedConfig):
     model_type: str = "jet_nemotron"
 
     efficient_attention_config: dict[str, dict[str, Any]]
+    hidden_act: str
     hidden_size: int
     initializer_range: float
+    intermediate_size: int
     layer_types: list[str]
     max_position_embeddings: int
     num_attention_heads: int

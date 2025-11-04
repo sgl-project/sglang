@@ -5,6 +5,7 @@ from typing import cast
 import einops
 import torch
 import torch.nn as nn
+import transformers.activations
 
 from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
 from sglang.srt.layers.attention.fla.fused_recurrent import (
@@ -25,7 +26,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
+from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.utils import add_prefix
 
 
@@ -120,11 +121,13 @@ class DynamicShortConvolution(nn.Module):
             self._continuous_to_seqs(kernels, seq_lens=seq_lens)
         )  # (batch_size, max_seq_len, hidden_size, kernel_size)
 
-        out = torch.einsum("b l d k, b l d k -> b l d", x, kernels)
+        out = (x * kernels).sum(dim=-1)  # (batch_size, max_seq_len, hidden_size)
 
         out = self._batch_to_continuous(
             out, seq_lens=seq_lens
         )  # (cu_seq_len, hidden_size)
+
+        out = nn.functional.silu(out)
 
         return out, new_conv_state
 
@@ -162,9 +165,8 @@ class JetBlock(nn.Module):
     def __init__(
         self,
         config: JetNemotronConfig,
-        layer_id: int = 0,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
+        *,
+        layer_id: int,
     ) -> None:
         super().__init__()
 
@@ -372,6 +374,25 @@ class JetNemotronAttention(nn.Module):
         return output
 
 
+class JetNemotronMLP(nn.Module):
+    def __init__(self, config: JetNemotronConfig):
+        super().__init__()
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.act_fn = transformers.activations.get_activation(config.hidden_act)
+
+    def forward(self, hidden_state):
+        gate = self.gate_proj(hidden_state)
+        up = self.up_proj(hidden_state)
+        activated = self.act_fn(gate)
+        combined = activated * up
+        return self.down_proj(combined)
+
+
 class JetNemotronDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -396,20 +417,12 @@ class JetNemotronDecoderLayer(nn.Module):
                 self.self_attn = JetBlock(
                     config,
                     layer_id=layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix("self_attn", prefix),
                 )
 
             case _:
                 raise NotImplementedError
 
-        self.mlp = Qwen2MLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
-        )
+        self.mlp = JetNemotronMLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
