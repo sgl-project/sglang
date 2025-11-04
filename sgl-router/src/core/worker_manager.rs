@@ -3,20 +3,20 @@
 //! Handles all aspects of worker lifecycle including discovery, initialization,
 //! runtime management, and health monitoring.
 
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
 use axum::response::{IntoResponse, Response};
 use futures::future;
 use http::{Method, StatusCode};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
 
-use crate::core::metrics_aggregator::MetricPack;
 use crate::{
-    core::{ConnectionMode, WorkerRegistry, WorkerType},
+    core::{metrics_aggregator::MetricPack, ConnectionMode, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
