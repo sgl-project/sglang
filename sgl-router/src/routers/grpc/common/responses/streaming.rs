@@ -2,9 +2,11 @@
 
 use std::collections::HashMap;
 
+use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
 use crate::{mcp, protocols::chat::ChatCompletionStreamResponse};
@@ -582,4 +584,40 @@ impl ResponseStreamEventEmitter {
             }
         }
     }
+
+    /// Emit an error event
+    ///
+    /// Creates and sends an error event with the given error message.
+    /// Uses OpenAI's error event format.
+    /// Use this for terminal errors that should abort the streaming response.
+    pub fn emit_error(
+        &mut self,
+        error_msg: &str,
+        error_code: Option<&str>,
+        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    ) {
+        let event = json!({
+            "type": "error",
+            "code": error_code.unwrap_or("internal_error"),
+            "message": error_msg,
+            "param": null,
+            "sequence_number": self.next_sequence()
+        });
+        let sse_data = format!("data: {}\n\n", serde_json::to_string(&event).unwrap());
+        let _ = tx.send(Ok(Bytes::from(sse_data)));
+    }
+}
+
+/// Build a Server-Sent Events (SSE) response
+///
+/// Creates a Response with proper SSE headers and streaming body.
+pub fn build_sse_response(rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>) -> Response {
+    let stream = UnboundedReceiverStream::new(rx);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }
