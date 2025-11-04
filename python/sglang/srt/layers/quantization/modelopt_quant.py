@@ -1605,7 +1605,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # The x might be packed in the case of fp4. So, use the output dim of the
                 # weight of the second GEMM.
                 symm_output = torch.empty(
-                    x.shape[0], layer.w2_weight.shape[1], dtype=output_dtype, device=x.device
+                    x.shape[0],
+                    layer.w2_weight.shape[1],
+                    dtype=output_dtype,
+                    device=x.device,
                 )
                 sm.tag(symm_output)
 

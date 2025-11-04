@@ -1051,7 +1051,10 @@ class FlashInferFP4MoE(FusedMoE):
         with use_symmetric_memory(get_tp_group()) as sm:
             # Two fp4 values are packed into one uint8 value. So, the output shape is 2x the input shape.
             symm_output = torch.empty(
-                hs_fp4.shape[0], hs_fp4.shape[1] * 2, dtype=hs_fp4.dtype, device=hs_fp4.device
+                hs_fp4.shape[0],
+                hs_fp4.shape[1] * 2,
+                dtype=hs_fp4.dtype,
+                device=hs_fp4.device,
             )
             sm.tag(symm_output)
 
