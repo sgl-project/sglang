@@ -13,6 +13,7 @@ use crate::{
     },
     routers::grpc::{
         context::{PreparationOutput, RequestContext, RequestType},
+        error,
         stages::PipelineStage,
         utils,
     },
@@ -56,7 +57,7 @@ impl PipelineStage for HarmonyPreparationStage {
             let request_arc = ctx.responses_request_arc();
             self.prepare_responses(ctx, &request_arc).await?;
         } else {
-            return Err(utils::bad_request_error(
+            return Err(error::bad_request(
                 "Only Chat and Responses requests supported in Harmony pipeline".to_string(),
             ));
         }
@@ -78,7 +79,7 @@ impl HarmonyPreparationStage {
     ) -> Result<Option<Response>, Response> {
         // Validate - reject logprobs
         if request.logprobs {
-            return Err(utils::bad_request_error(
+            return Err(error::bad_request(
                 "logprobs are not supported for Harmony models".to_string(),
             ));
         }
@@ -97,7 +98,7 @@ impl HarmonyPreparationStage {
         let build_output = self
             .builder
             .build_from_chat(&body_ref)
-            .map_err(|e| utils::bad_request_error(format!("Harmony build failed: {}", e)))?;
+            .map_err(|e| error::bad_request(format!("Harmony build failed: {}", e)))?;
 
         // Step 4: Store results
         ctx.state.preparation = Some(PreparationOutput {
@@ -132,7 +133,7 @@ impl HarmonyPreparationStage {
         let build_output = self
             .builder
             .build_from_responses(request)
-            .map_err(|e| utils::bad_request_error(format!("Harmony build failed: {}", e)))?;
+            .map_err(|e| error::bad_request(format!("Harmony build failed: {}", e)))?;
 
         // Store results in preparation output
         ctx.state.preparation = Some(PreparationOutput {
@@ -202,7 +203,7 @@ impl HarmonyPreparationStage {
 
         // Validate specific function exists
         if specific_function.is_some() && tools_to_use.is_empty() {
-            return Err(Box::new(utils::bad_request_error(format!(
+            return Err(Box::new(error::bad_request(format!(
                 "Tool '{}' not found in tools list",
                 specific_function.unwrap()
             ))));
@@ -236,7 +237,7 @@ impl HarmonyPreparationStage {
         });
 
         serde_json::to_string(&structural_tag).map_err(|e| {
-            Box::new(utils::internal_error_message(format!(
+            Box::new(error::internal_error(format!(
                 "Failed to serialize structural tag: {}",
                 e
             )))
