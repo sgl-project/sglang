@@ -358,73 +358,6 @@ impl Router {
             .unwrap_or_else(|| (StatusCode::BAD_GATEWAY, "No worker response").into_response())
     }
 
-    // NOTE: temporarily have code duplication with `route_simple_request` since that one will be refactored
-    async fn fan_out_simple_request(
-        &self,
-        headers: Option<&HeaderMap>,
-        endpoint: &str,
-        method: Method,
-    ) -> Result<Vec<(String, String)>, Response> {
-        let workers = self.worker_registry.get_all();
-        if workers.is_empty() {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
-        }
-
-        let mut responses = vec![];
-        // May do parallel requests later
-        for worker in workers {
-            let worker_url = worker.url();
-            let worker_base_url = self.worker_base_url(worker_url);
-
-            let url = format!("{}/{}", worker_base_url, endpoint);
-            let mut request_builder = match method {
-                Method::GET => self.client.get(url),
-                Method::POST => self.client.post(url),
-                _ => {
-                    return Err((
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        "Unsupported method for simple routing",
-                    )
-                        .into_response())
-                }
-            };
-
-            if let Some(api_key) = worker.api_key() {
-                request_builder =
-                    request_builder.header("Authorization", format!("Bearer {}", api_key));
-            }
-
-            if let Some(hdrs) = headers {
-                for (name, value) in hdrs {
-                    let name_lc = name.as_str().to_lowercase();
-                    if name_lc != "content-type" && name_lc != "content-length" {
-                        request_builder = request_builder.header(name, value);
-                    }
-                }
-            }
-
-            match request_builder.send().await {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match res.text().await {
-                        Ok(body_text) => {
-                            if status.is_success() {
-                                responses.push((worker_base_url, body_text));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("fan_out_simple_request failed when reading text: {}", e)
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("fan_out_simple_request failed when sending: {}", e),
-            }
-        }
-
-        Ok(responses)
-    }
-
     // Route a GET request with provided headers to a specific endpoint
     async fn route_get_request(&self, headers: Option<&HeaderMap>, endpoint: &str) -> Response {
         self.route_simple_request(headers, endpoint, Method::GET)
@@ -714,7 +647,6 @@ impl Router {
     }
 }
 
-use crate::core::metrics_aggregator::MetricPack;
 use async_trait::async_trait;
 
 #[async_trait]
