@@ -12,23 +12,30 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
+use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::{
-    super::error,
-    conversions,
-    streaming::{OutputItemType, ResponseStreamEventEmitter},
-};
-use crate::protocols::{
-    chat::ChatCompletionResponse,
-    common::{Tool, ToolChoice, ToolChoiceValue},
-    responses::{
-        McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-        ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest, ResponsesResponse,
+use super::conversions;
+use crate::{
+    mcp::{self, McpManager},
+    protocols::{
+        chat::{
+            ChatChoice, ChatCompletionMessage, ChatCompletionResponse, ChatCompletionStreamResponse,
+        },
+        common::{Function, FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
+        responses::{
+            self, McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
+            ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest,
+            ResponsesResponse,
+        },
+    },
+    routers::grpc::{
+        common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
+        error,
     },
 };
 
@@ -155,10 +162,7 @@ fn generate_mcp_id(prefix: &str) -> String {
 }
 
 /// Build mcp_list_tools output item
-fn build_mcp_list_tools_item(
-    mcp: &Arc<crate::mcp::McpManager>,
-    server_label: &str,
-) -> ResponseOutputItem {
+fn build_mcp_list_tools_item(mcp: &Arc<McpManager>, server_label: &str) -> ResponseOutputItem {
     let tools = mcp.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
@@ -263,8 +267,6 @@ pub(super) async fn execute_tool_loop(
                 headers.clone(),
                 model_id.clone(),
                 ctx.components.clone(),
-                response_id.clone(),
-                Some(ctx.background_tasks.clone()),
             )
             .await?;
 
@@ -358,10 +360,9 @@ pub(super) async fn execute_tool_loop(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
-                ResponseInput::Items(items) => items
-                    .iter()
-                    .map(crate::protocols::responses::normalize_input_item)
-                    .collect(),
+                ResponseInput::Items(items) => {
+                    items.iter().map(responses::normalize_input_item).collect()
+                }
             };
 
             // Append all conversation history (function calls and outputs)
@@ -830,10 +831,9 @@ async fn execute_tool_loop_streaming_internal(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
-                ResponseInput::Items(items) => items
-                    .iter()
-                    .map(crate::protocols::responses::normalize_input_item)
-                    .collect(),
+                ResponseInput::Items(items) => {
+                    items.iter().map(responses::normalize_input_item).collect()
+                }
             };
 
             input_items.extend_from_slice(&state.conversation_history);
@@ -911,13 +911,13 @@ async fn execute_tool_loop_streaming_internal(
 }
 
 /// Convert MCP tools to Chat API tool format
-fn convert_mcp_tools_to_chat_tools(mcp_tools: &[crate::mcp::Tool]) -> Vec<Tool> {
+fn convert_mcp_tools_to_chat_tools(mcp_tools: &[mcp::Tool]) -> Vec<Tool> {
     use serde_json::Value;
     mcp_tools
         .iter()
         .map(|tool_info| Tool {
             tool_type: "function".to_string(),
-            function: crate::protocols::common::Function {
+            function: Function {
                 name: tool_info.name.to_string(),
                 description: tool_info.description.as_ref().map(|d| d.to_string()),
                 parameters: Value::Object((*tool_info.input_schema).clone()),
@@ -933,10 +933,6 @@ async fn convert_and_accumulate_stream(
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<ChatCompletionResponse, String> {
-    use futures_util::StreamExt;
-
-    use crate::protocols::chat::ChatCompletionStreamResponse;
-
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
 
@@ -971,7 +967,7 @@ struct ChatResponseAccumulator {
     id: String,
     model: String,
     content: String,
-    tool_calls: HashMap<usize, crate::protocols::common::ToolCall>,
+    tool_calls: HashMap<usize, ToolCall>,
     finish_reason: Option<String>,
 }
 
@@ -986,7 +982,7 @@ impl ChatResponseAccumulator {
         }
     }
 
-    fn process_chunk(&mut self, chunk: &crate::protocols::chat::ChatCompletionStreamResponse) {
+    fn process_chunk(&mut self, chunk: &ChatCompletionStreamResponse) {
         if !chunk.id.is_empty() {
             self.id = chunk.id.clone();
         }
@@ -1004,15 +1000,13 @@ impl ChatResponseAccumulator {
             if let Some(tool_call_deltas) = &choice.delta.tool_calls {
                 for delta in tool_call_deltas {
                     let index = delta.index as usize;
-                    let entry = self.tool_calls.entry(index).or_insert_with(|| {
-                        crate::protocols::common::ToolCall {
-                            id: String::new(),
-                            tool_type: "function".to_string(),
-                            function: crate::protocols::common::FunctionCallResponse {
-                                name: String::new(),
-                                arguments: Some(String::new()),
-                            },
-                        }
+                    let entry = self.tool_calls.entry(index).or_insert_with(|| ToolCall {
+                        id: String::new(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCallResponse {
+                            name: String::new(),
+                            arguments: Some(String::new()),
+                        },
                     });
 
                     if let Some(id) = &delta.id {
@@ -1048,9 +1042,9 @@ impl ChatResponseAccumulator {
             object: "chat.completion".to_string(),
             created: chrono::Utc::now().timestamp() as u64,
             model: self.model,
-            choices: vec![crate::protocols::chat::ChatChoice {
+            choices: vec![ChatChoice {
                 index: 0,
-                message: crate::protocols::chat::ChatCompletionMessage {
+                message: ChatCompletionMessage {
                     role: "assistant".to_string(),
                     content: if self.content.is_empty() {
                         None
