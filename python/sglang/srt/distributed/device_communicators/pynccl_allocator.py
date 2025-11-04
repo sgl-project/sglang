@@ -8,9 +8,28 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.server_args import get_global_server_args
 
 nccl_allocator_source = """
-#include <nccl.h>
+
+#include <cuda_runtime.h>
 
 extern "C" {
+
+// copy from https://github.com/NVIDIA/nccl/blob/master/src/nccl.h.in
+typedef enum { ncclSuccess                 =  0,
+               ncclUnhandledCudaError      =  1,
+               ncclSystemError             =  2,
+               ncclInternalError           =  3,
+               ncclInvalidArgument         =  4,
+               ncclInvalidUsage            =  5,
+               ncclRemoteError             =  6,
+               ncclInProgress              =  7,
+               ncclNumResults              =  8 } ncclResult_t;
+typedef struct ncclComm* ncclComm_t;
+typedef struct ncclWindow_vidmem* ncclWindow_t;
+ncclResult_t  ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, ncclWindow_t* win, int winFlags);
+#define NCCL_WIN_COLL_SYMMETRIC 0x01
+
+ncclResult_t  ncclMemAlloc(void** ptr, size_t size);
+ncclResult_t  ncclMemFree(void *ptr);
 
 void* nccl_alloc_plug(size_t size, int device, void* stream) {
   void* ptr;
