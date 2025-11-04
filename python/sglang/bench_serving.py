@@ -1670,9 +1670,23 @@ def calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
-            total_input += input_requests[i].prompt_len
-            total_input_text += input_requests[i].text_prompt_len
-            total_input_vision += input_requests[i].vision_prompt_len
+            if i < len(input_requests) and isinstance(input_requests[i], dict):
+                # For Mooncake dataset, use the prompt_len from output (which is set correctly)
+                prompt_len = outputs[i].prompt_len if outputs[i].prompt_len > 0 else input_requests[i].get('input_length', 0)
+                total_input += prompt_len
+                total_input_text += prompt_len
+                total_input_vision += 0
+            elif i < len(input_requests):
+                total_input += input_requests[i].prompt_len
+                total_input_text += input_requests[i].text_prompt_len
+                total_input_vision += input_requests[i].vision_prompt_len
+            else:
+                # For cases where outputs > input_requests (e.g., multi-round Mooncake)
+                # Use the prompt_len from the output directly
+                prompt_len = outputs[i].prompt_len
+                total_input += prompt_len
+                total_input_text += prompt_len
+                total_input_vision += 0
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
