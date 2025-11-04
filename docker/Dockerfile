@@ -10,7 +10,7 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
 
-ARG SGL_KERNEL_VERSION=0.3.16.post4
+ARG SGL_KERNEL_VERSION=0.3.16.post5
 ARG GDRCOPY_VERSION=2.5.1
 ARG NVSHMEM_VERSION=3.4.5
 
@@ -196,7 +196,7 @@ fi
 # Python tools
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     datamodel_code_generator \
-    mooncake-transfer-engine==0.3.6.post1 \
+    mooncake-transfer-engine==0.3.7.post1 \
     pre-commit \
     pytest \
     black \

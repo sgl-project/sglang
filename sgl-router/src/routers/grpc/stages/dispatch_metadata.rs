@@ -8,7 +8,7 @@ use axum::response::Response;
 use super::PipelineStage;
 use crate::routers::grpc::{
     context::{DispatchMetadata, RequestContext, RequestType, WorkerSelection},
-    utils,
+    error,
 };
 
 /// Dispatch metadata stage: Prepare metadata for dispatch
@@ -21,7 +21,7 @@ impl PipelineStage for DispatchMetadataStage {
             .state
             .proto_request
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Proto request not built"))?;
+            .ok_or_else(|| error::internal_error("Proto request not built"))?;
 
         let request_id = proto_request.request_id.clone();
         let model = match &ctx.input.request_type {
