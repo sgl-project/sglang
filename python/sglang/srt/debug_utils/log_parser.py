@@ -19,9 +19,9 @@ def parse(lines):
     import polars as pl
 
     df = pl.DataFrame(dict(line=lines.splitlines()))
-    df = df.with_columns(info=pl.col('line').str.extract_groups(_PATTERN_DECODE))
-    df = df.unnest('info')
-    df = df.filter(pl.col('gen_throughput').is_not_null())
+    df = df.with_columns(info=pl.col("line").str.extract_groups(_PATTERN_DECODE))
+    df = df.unnest("info")
+    df = df.filter(pl.col("gen_throughput").is_not_null())
 
     df = df.with_columns(
         pl.col("time").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S"),
