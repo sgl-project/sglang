@@ -154,12 +154,19 @@ class MambaPool:
         size: int,
         cache_params: Union["Mamba2CacheParams", "KimiLinearCacheParams"],
         device: str,
+        enable_memory_saver: bool,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
+        self.size = size
+        self.device = device
+        self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
         num_mamba_layers = len(cache_params.layers)
 
         # for disagg with nvlink
@@ -174,9 +181,8 @@ class MambaPool:
             self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
         else:
             self.custom_mem_pool = None
-
         self.is_kda_cache = isinstance(cache_params, KimiLinearCacheParams)
-        with (
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.enable_custom_mem_pool
             else nullcontext()
@@ -270,11 +276,6 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
-            self.size = size
-            self.device = device
-            self.free_slots = torch.arange(
-                self.size, dtype=torch.int64, device=self.device
-            )
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
 
@@ -369,6 +370,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
+        self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
             size=mamba_size,
             cache_params=cache_params,
@@ -387,6 +389,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             size=size,
             cache_params=cache_params,
             device=device,
+            enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(cache_params.layers)}
@@ -867,6 +870,7 @@ class HybridLinearKVPool(KVCache):
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
+        enable_memory_saver: bool,
         mamba_pool: MambaPool,
         # TODO: refactor mla related args
         use_mla: bool = False,
@@ -899,7 +903,7 @@ class HybridLinearKVPool(KVCache):
                 head_dim=head_dim,
                 layer_num=self.full_layer_nums,
                 device=device,
-                enable_memory_saver=False,
+                enable_memory_saver=enable_memory_saver,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -1303,9 +1307,11 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
         self.nsa_kv_cache_store_fp8 = use_nsa and dtype == torch.float8_e4m3fn
-        # TODO do not hardcode
+        assert not (
+            self.nsa_kv_cache_store_fp8 and override_kv_cache_dim is None
+        ), "override_kv_cache_dim must be provided when using NSA with FP8 kv cache storage"
         self.kv_cache_dim = (
-            656
+            override_kv_cache_dim
             if self.use_nsa and self.nsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
@@ -1577,6 +1583,18 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
+        assert (
+            kv_lora_rank % self.quant_block_size == 0
+        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {self.quant_block_size}"
+
+        # Calculate override_kv_cache_dim for FP8 storage:
+        # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+        override_dim = (
+            kv_lora_rank
+            + kv_lora_rank // self.quant_block_size * 4
+            + qk_rope_head_dim * dtype.itemsize
+        )
+
         super().__init__(
             size,
             page_size,
@@ -1589,6 +1607,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             start_layer,
             end_layer,
             use_nsa=True,
+            override_kv_cache_dim=override_dim,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32

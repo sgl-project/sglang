@@ -162,6 +162,8 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
 ]
 
+MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -198,6 +200,10 @@ def add_radix_supported_deterministic_attention_backend_choices(choices):
 
 def add_radix_eviction_policy_choices(choices):
     RADIX_EVICTION_POLICY_CHOICES.extend(choices)
+
+
+def add_mamba_ssm_dtype_choices(choices):
+    MAMBA_SSM_DTYPE_CHOICES.extend(choices)
 
 
 @dataclasses.dataclass
@@ -545,6 +551,10 @@ class ServerArgs:
     # For Multi-Modal
     mm_max_concurrent_calls: int = 32
     mm_per_request_timeout: float = 10.0
+
+    # For checkpoint decryption
+    decrypted_config_file: Optional[str] = None
+    decrypted_draft_config_file: Optional[str] = None
 
     def __post_init__(self):
         """
@@ -2902,7 +2912,7 @@ class ServerArgs:
             "--mamba-ssm-dtype",
             type=str,
             default=ServerArgs.mamba_ssm_dtype,
-            choices=["float32", "bfloat16"],
+            choices=MAMBA_SSM_DTYPE_CHOICES,
             help="The data type of the SSM states in mamba cache.",
         )
         parser.add_argument(
@@ -3168,7 +3178,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-torch-symm-mem",
             action="store_true",
-            help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM10 supports world size 6, 8.",
+            help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -3543,6 +3553,20 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mm_per_request_timeout,
             help="The timeout for each multi-modal request in seconds.",
+        )
+
+        # For checkpoint decryption
+        parser.add_argument(
+            "--decrypted-config-file",
+            type=str,
+            default=ServerArgs.decrypted_config_file,
+            help="The path of the decrypted config file.",
+        )
+        parser.add_argument(
+            "--decrypted-draft-config-file",
+            type=str,
+            default=ServerArgs.decrypted_draft_config_file,
+            help="The path of the decrypted draft config file.",
         )
 
     @classmethod

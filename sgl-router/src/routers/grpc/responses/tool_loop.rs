@@ -19,6 +19,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
+    super::error,
     conversions,
     streaming::{OutputItemType, ResponseStreamEventEmitter},
 };
@@ -247,12 +248,8 @@ pub(super) async fn execute_tool_loop(
 
     loop {
         // Convert to chat request
-        let mut chat_request = conversions::responses_to_chat(&current_request).map_err(|e| {
-            crate::routers::grpc::utils::bad_request_error(format!(
-                "Failed to convert request: {}",
-                e
-            ))
-        })?;
+        let mut chat_request = conversions::responses_to_chat(&current_request)
+            .map_err(|e| error::bad_request(format!("Failed to convert request: {}", e)))?;
 
         // Add MCP tools to chat request so LLM knows about them
         chat_request.tools = Some(chat_tools.clone());
@@ -301,10 +298,7 @@ pub(super) async fn execute_tool_loop(
                     response_id.clone(),
                 )
                 .map_err(|e| {
-                    crate::routers::grpc::utils::internal_error_message(format!(
-                        "Failed to convert to responses format: {}",
-                        e
-                    ))
+                    error::internal_error(format!("Failed to convert to responses format: {}", e))
                 })?;
 
                 // Mark as completed but with incomplete details
@@ -423,10 +417,7 @@ pub(super) async fn execute_tool_loop(
                 response_id.clone(),
             )
             .map_err(|e| {
-                crate::routers::grpc::utils::internal_error_message(format!(
-                    "Failed to convert to responses format: {}",
-                    e
-                ))
+                error::internal_error(format!("Failed to convert to responses format: {}", e))
             })?;
 
             // Inject MCP metadata into output

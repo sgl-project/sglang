@@ -18,7 +18,7 @@ use crate::{
     },
     routers::grpc::{
         context::{DispatchMetadata, ExecutionResult},
-        utils,
+        error, utils,
     },
 };
 
@@ -66,7 +66,7 @@ impl HarmonyResponseProcessor {
         // Collect all completed responses (one per choice)
         let all_responses = Self::collect_responses(execution_result).await?;
         if all_responses.is_empty() {
-            return Err(utils::internal_error_static("No responses from server"));
+            return Err(error::internal_error("No responses from server"));
         }
 
         // Build choices by parsing output with HarmonyParserAdapter
@@ -84,7 +84,7 @@ impl HarmonyResponseProcessor {
 
             // Parse Harmony channels with HarmonyParserAdapter
             let mut parser = HarmonyParserAdapter::new().map_err(|e| {
-                utils::internal_error_message(format!("Failed to create Harmony parser: {}", e))
+                error::internal_error(format!("Failed to create Harmony parser: {}", e))
             })?;
 
             // Parse Harmony channels with finish_reason and matched_stop
@@ -94,9 +94,7 @@ impl HarmonyResponseProcessor {
                     complete.finish_reason.clone(),
                     matched_stop.clone(),
                 )
-                .map_err(|e| {
-                    utils::internal_error_message(format!("Harmony parsing failed: {}", e))
-                })?;
+                .map_err(|e| error::internal_error(format!("Harmony parsing failed: {}", e)))?;
 
             // Build response message (assistant)
             let message = ChatCompletionMessage {
@@ -195,17 +193,17 @@ impl HarmonyResponseProcessor {
         // Collect all completed responses
         let all_responses = Self::collect_responses(execution_result).await?;
         if all_responses.is_empty() {
-            return Err(utils::internal_error_static("No responses from server"));
+            return Err(error::internal_error("No responses from server"));
         }
 
         // For Responses API, we only process the first response (n=1)
         let complete = all_responses
             .first()
-            .ok_or_else(|| utils::internal_error_static("No complete response"))?;
+            .ok_or_else(|| error::internal_error("No complete response"))?;
 
         // Parse Harmony channels
         let mut parser = HarmonyParserAdapter::new().map_err(|e| {
-            utils::internal_error_message(format!("Failed to create Harmony parser: {}", e))
+            error::internal_error(format!("Failed to create Harmony parser: {}", e))
         })?;
 
         // Convert matched_stop from proto to JSON
@@ -224,7 +222,7 @@ impl HarmonyResponseProcessor {
                 complete.finish_reason.clone(),
                 matched_stop,
             )
-            .map_err(|e| utils::internal_error_message(format!("Harmony parsing failed: {}", e)))?;
+            .map_err(|e| error::internal_error(format!("Harmony parsing failed: {}", e)))?;
 
         // VALIDATION: Check if model incorrectly generated Tool role messages
         // This happens when the model copies the format of tool result messages
