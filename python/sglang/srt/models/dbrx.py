@@ -33,9 +33,13 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -48,7 +52,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, set_weight_attrs
 
 
 class DbrxRouter(nn.Module):
@@ -100,6 +104,16 @@ class DbrxExperts(nn.Module):
         self.top_k = config.ffn_config.moe_top_k
         self.d_model = config.d_model
         self.intermediate_size = config.ffn_config.ffn_hidden_size // self.tp_size
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
+        if quant_config is None:
+            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
+                self.use_triton_kernels
+            )
+        else:
+            self.quant_method: Optional[QuantizeMethodBase] = (
+                quant_config.get_quant_method(self, prefix)
+            )
+        assert self.quant_method is not None
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -111,33 +125,39 @@ class DbrxExperts(nn.Module):
             renormalize=True,
         )
         self.moe_runner_config = MoeRunnerConfig(inplace=True)
-        self.ws = nn.Parameter(
+        if is_npu():
+            devices = "npu"
+        elif is_cuda():
+            devices = "cuda"
+        else:
+            devices = "cpu"
+        self.w13_weight = nn.Parameter(
             torch.empty(
                 self.num_total_experts,
                 2 * self.intermediate_size,
                 self.d_model,
-                device="cuda",
+                device=devices,
                 dtype=self.params_dtype,
             )
         )
-        self.w2s = nn.Parameter(
+        self.w2_weight = nn.Parameter(
             torch.empty(
                 self.num_total_experts,
                 self.d_model,
                 self.intermediate_size,
-                device="cuda",
+                device=devices,
                 dtype=self.params_dtype,
             )
         )
 
         set_weight_attrs(
-            self.ws,
+            self.w13_weight,
             {
                 "weight_loader": self.weight_loader,
             },
         )
         set_weight_attrs(
-            self.w2s,
+            self.w2_weight,
             {
                 "weight_loader": self.weight_loader,
             },
@@ -177,12 +197,11 @@ class DbrxExperts(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe(
-            hidden_states,
-            self.ws,
-            self.w2s,
-            topk_output,
-            self.moe_runner_config,
+        final_hidden_states = self.quant_method.apply(
+            x=hidden_states,
+            layer=self,
+            topk_output=topk_output,
+            moe_runner_config=self.moe_runner_config,
         )
 
         if self.tp_size > 1:
@@ -431,7 +450,7 @@ class DbrxForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = [
             (
-                "ws" if weight_name in ["w1", "v1"] else "w2s",
+                "w13_weight" if weight_name in ["w1", "v1"] else "w2_weight",
                 f"experts.mlp.{weight_name}",
             )
             for weight_name in ["w1", "v1", "w2"]
