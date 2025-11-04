@@ -14,7 +14,7 @@ class TestLogParser(CustomTestCase):
         df = log_parser.parse(lines)
 
         print(df)
-        print(json.dumps(df.to_dicts()))
+        print(df.write_json())
 
         expect_rows = ['TODO']
         self.assertEqual(df.to_dicts(), expect_rows)
