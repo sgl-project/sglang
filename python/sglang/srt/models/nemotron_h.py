@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     get_moe_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -58,8 +59,11 @@ from sglang.srt.model_loader.weight_utils import (
     replace_prefix,
     replace_substrings,
 )
-from sglang.srt.utils import add_prefix, make_layers_non_pp
+from sglang.srt.utils import add_prefix, is_cuda, make_layers_non_pp
 from sglang.utils import logger
+
+
+_is_cuda = is_cuda()
 
 
 class NemotronHMLP(nn.Module):
@@ -98,6 +102,16 @@ class NemotronHMLP(nn.Module):
         return x
 
 
+_alt_stream = None
+
+
+def _get_or_create_alt_stream(device_module):
+    global _alt_stream
+    if _alt_stream is None:
+        _alt_stream = device_module.Stream()
+    return _alt_stream
+
+
 class NemotronHMoE(nn.Module):
     def __init__(
         self,
@@ -110,6 +124,7 @@ class NemotronHMoE(nn.Module):
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
+        self.device_module = torch.get_device_module()
 
         self.ep_group = get_moe_ep_group().device_group
         self.ep_rank = self.ep_group.rank()
@@ -163,11 +178,20 @@ class NemotronHMoE(nn.Module):
         else:
             self.shared_experts = None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+    def _forward_core(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if _is_cuda:
+            return self._forward_core_shared_routed_overlap(hidden_states)
+        else:
+            return self._forward_core_normal(hidden_states)
 
-        # router_logits: (num_tokens, n_experts)
+    def _forward_core_normal(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # router_scores: [num_tokens, num_experts]
         router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
@@ -175,6 +199,33 @@ class NemotronHMoE(nn.Module):
             shared_output = None
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
+        return final_hidden_states, shared_output
+
+    def _forward_core_shared_routed_overlap(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        alt_stream = _get_or_create_alt_stream(self.device_module)
+
+        alt_stream.wait_stream(self.device_module.current_stream())
+
+        if self.shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+        else:
+            shared_output = None
+
+        with self.device_module.stream(alt_stream):
+            # router_scores: [num_tokens, num_experts]
+            router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+        self.device_module.current_stream().wait_stream(alt_stream)
+
+        return final_hidden_states, shared_output
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        final_hidden_states, shared_output = self._forward_core(hidden_states)
 
         # Fix FP16 overflow
         if hidden_states.dtype != torch.float16:
@@ -185,6 +236,10 @@ class NemotronHMoE(nn.Module):
 
         if shared_output is not None:
             final_hidden_states += shared_output
+
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
