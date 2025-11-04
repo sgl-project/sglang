@@ -4,11 +4,10 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
-import torch.nn.functional as F
 from einops import rearrange
-from torch import nn
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.utils import add_prefix, align, is_cuda, is_hip, is_npu
 
 if is_cuda():
@@ -83,24 +82,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
-class V32LayerNorm(nn.Module):
-    """
-    Layer Normalization.
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor):
-        return F.layer_norm(
-            x.float(), (self.dim,), self.weight, self.bias, self.eps
-        ).type_as(x)
-
-
 class Indexer(CustomOp):
     def __init__(
         self,
@@ -164,7 +145,7 @@ class Indexer(CustomOp):
                 bias=False,
                 prefix=add_prefix("weights_proj", prefix),
             )
-        self.k_norm = V32LayerNorm(self.head_dim)
+        self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,

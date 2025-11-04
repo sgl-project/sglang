@@ -43,6 +43,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
+    get_current_device_stream_fast,
     get_int_env_var,
     get_local_ip_auto,
     is_cpu,
@@ -466,7 +467,7 @@ class GroupCoordinator:
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
-        curr_stream = self.device_module.current_stream()
+        curr_stream = get_current_device_stream_fast()
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
@@ -500,7 +501,7 @@ class GroupCoordinator:
                 maybe_pynccl_context = nullcontext()
             else:
                 maybe_pynccl_context = pynccl_comm.change_state(
-                    enable=True, stream=torch.get_device_module().current_stream()
+                    enable=True, stream=get_current_device_stream_fast()
                 )
 
             pymscclpp_comm = self.pymscclpp_comm
@@ -551,13 +552,9 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        if (
-            self.pynccl_comm is not None
-            and hasattr(input_, "symmetric_memory")
-            and input_.symmetric_memory
-        ):
+        if self.pynccl_comm is not None and getattr(input_, "symmetric_memory", False):
             with self.pynccl_comm.change_state(
-                enable=True, stream=torch.get_device_module().current_stream()
+                enable=True, stream=get_current_device_stream_fast()
             ):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
@@ -658,7 +655,7 @@ class GroupCoordinator:
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(
-            enable=True, stream=torch.get_device_module().current_stream()
+            enable=True, stream=get_current_device_stream_fast()
         ):
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
@@ -784,7 +781,7 @@ class GroupCoordinator:
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(
-            enable=True, stream=torch.get_device_module().current_stream()
+            enable=True, stream=get_current_device_stream_fast()
         ):
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
