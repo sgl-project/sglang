@@ -1216,12 +1216,9 @@ class NativeSparseAttnBackend(AttentionBackend):
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
-        # Determine FA version: FA3 for SM90, FA4 for SM100 (B200)
-        device_sm = (
-            torch.cuda.get_device_capability()[0] * 10
-            + torch.cuda.get_device_capability()[1]
-        )
-        fa_version = 4 if device_sm == 100 else 3
+        # Determine FA version: FA3 for SM90 (Hopper), FA4 for SM100+ (Blackwell and beyond)
+        device_sm_major = torch.cuda.get_device_capability()[0]
+        fa_version = 4 if device_sm_major >= 10 else 3
 
         return_lse = getattr(forward_batch, "mha_return_lse", False)
 

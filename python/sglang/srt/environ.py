@@ -176,6 +176,9 @@ class Envs:
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
 
+    # NSA (Native Sparse Attention)
+    SGLANG_NSA_SEQ_LEN_THRESHOLD = EnvInt(2048)
+
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
 

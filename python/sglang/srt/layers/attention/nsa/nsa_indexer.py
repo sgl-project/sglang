@@ -261,6 +261,64 @@ class Indexer(CustomOp):
 
         return query, key, weights
 
+    def _construct_attention_indices(
+        self,
+        metadata: BaseIndexerMetadata,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Construct attention indices [0, 1, ..., visible_len-1, -1, ...]"""
+        seq_lens_expanded = metadata.get_seqlens_expanded()
+
+        row = torch.arange(self.index_topk, device=device, dtype=torch.int32).unsqueeze(
+            0
+        )
+        lens = seq_lens_expanded.to(device=device, dtype=torch.int32).unsqueeze(1)
+        valid = row < lens
+        indices_local = torch.where(valid, row, torch.full_like(row, -1))
+
+        from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
+
+        method = getattr(metadata, "topk_transform_method", None)
+
+        if method == TopkTransformMethod.PAGED:
+            page_table_64 = (
+                metadata.attn_metadata.page_table_1
+                if hasattr(metadata, "attn_metadata")
+                and hasattr(metadata.attn_metadata, "page_table_1")
+                else metadata.get_page_table_64()
+            )
+            extend_lens_cpu = (
+                getattr(metadata.attn_metadata, "nsa_extend_seq_lens_list", None)
+                if hasattr(metadata, "attn_metadata")
+                else None
+            )
+
+            from sglang.srt.layers.attention.nsa.transform_index import (
+                transform_index_page_table_prefill,
+            )
+
+            return transform_index_page_table_prefill(
+                page_table=page_table_64,
+                topk_indices=indices_local,
+                extend_lens_cpu=extend_lens_cpu,
+                page_size=64,
+            )
+
+        elif method == TopkTransformMethod.RAGGED:
+            off = (
+                getattr(metadata.attn_metadata, "topk_indices_offset", None)
+                if hasattr(metadata, "attn_metadata")
+                else None
+            )
+            if off is not None:
+                off = off.to(device=device, dtype=torch.int32)
+                if off.ndim == 1:
+                    off = off.unsqueeze(1)
+                mask = indices_local != -1
+                return torch.where(mask, indices_local + off, indices_local)
+
+        return indices_local
+
     def _get_k_bf16(
         self,
         x: torch.Tensor,
@@ -268,53 +326,20 @@ class Indexer(CustomOp):
         enable_dual_stream: bool,
     ):
         # Compute only key, skip query and weights (weights is discarded if fused)
-        if enable_dual_stream:
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-
-            with torch.cuda.stream(self.alt_stream):
-                with deep_gemm_wrapper.configure_deep_gemm_num_sms(
-                    self.half_device_sm_count
-                ):
-                    if self.fuse_wk_and_weights_proj:
-                        key, _ = self.fused_wk_and_weights_proj(x)[0].split(
-                            [self.head_dim, self.n_heads], dim=-1
-                        )
-                    else:
-                        key, _ = self.wk(x)
-                    key = self.k_norm(key)
-
-                    k_rope, _ = torch.split(
-                        key,
-                        [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                        dim=-1,
-                    )
-
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            if self.fuse_wk_and_weights_proj:
-                key, _ = self.fused_wk_and_weights_proj(x)[0].split(
-                    [self.head_dim, self.n_heads], dim=-1
-                )
-            else:
-                key, _ = self.wk(x)
-            key = self.k_norm(key)
-            k_rope, _ = torch.split(
-                key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        if self.fuse_wk_and_weights_proj:
+            key, _ = self.fused_wk_and_weights_proj(x)[0].split(
+                [self.head_dim, self.n_heads], dim=-1
             )
+        else:
+            key, _ = self.wk(x)
+        key = self.k_norm(key)
+        k_rope, _ = torch.split(
+            key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
 
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
         key[..., : self.rope_head_dim] = k_rope
-
-        if enable_dual_stream:
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-
-            with torch.cuda.stream(self.alt_stream):
-                key = rotate_activation(key)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            key = rotate_activation(key)
+        key = rotate_activation(key)
 
         return key
 
@@ -459,19 +484,12 @@ class Indexer(CustomOp):
         layer_id: int,
         act_quant,
         enable_dual_stream: bool,
-    ) -> None:
+        metadata: BaseIndexerMetadata,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
-
-        if enable_dual_stream:
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-
-            with torch.cuda.stream(self.alt_stream):
-                k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
@@ -482,7 +500,12 @@ class Indexer(CustomOp):
             index_k_scale=k_scale,
         )
 
-        return None
+        # MHA doesn't need topk_indices, early return for efficiency
+        if not return_indices:
+            return None
+
+        # MLA: construct return_indices
+        return self._construct_attention_indices(metadata, x.device)
 
     def forward_indexer(
         self,
@@ -574,7 +597,7 @@ class Indexer(CustomOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
-        skip_topk_computation: bool = False,
+        return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         if is_hip():
             from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
@@ -600,10 +623,26 @@ class Indexer(CustomOp):
         if metadata is None:
             return None
 
-        # Optimization: fast path for k-only computation
-        if skip_topk_computation:
+        # Determine if should skip topk based on sequence length
+        from sglang.srt.environ import envs
+
+        should_skip = False
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            if forward_batch.seq_lens_cpu is not None:
+                max_kv_len = forward_batch.seq_lens_cpu.max().item()
+                should_skip = max_kv_len <= envs.SGLANG_NSA_SEQ_LEN_THRESHOLD.value
+
+        # Optimization: fast path when skipping topk computation
+        if should_skip:
             return self._forward_cuda_k_only(
-                x, positions, forward_batch, layer_id, act_quant, enable_dual_stream
+                x,
+                positions,
+                forward_batch,
+                layer_id,
+                act_quant,
+                enable_dual_stream,
+                metadata,
+                return_indices,
             )
 
         query, key, weights = self._get_q_k_bf16(
@@ -679,7 +718,6 @@ class Indexer(CustomOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
-        skip_topk_computation: bool = False,  # Keep signature consistent; Can be supported in the future
     ) -> torch.Tensor:
         import custom_ops  # noqa: F401
         import torch_npu

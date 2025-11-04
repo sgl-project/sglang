@@ -415,16 +415,16 @@ def handle_attention_nsa(attn, forward_batch):
         return AttnForwardMethod.MLA
 
     if _is_extend_without_speculative(forward_batch):
-        NSA_THRESHOLD = getattr(attn, "nsa_seq_len_threshold", 2048)
+        NSA_THRESHOLD = envs.SGLANG_NSA_SEQ_LEN_THRESHOLD.value
 
         assert forward_batch.seq_lens_cpu is not None
         max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
         # B200 (SM100) is temporarily disabled for MHA due to FA4 accuracy issues
         # Currently only H200 (SM90) with FA3 is allowed to use MHA path
-        is_supported_gpu = _device_sm == 90
+        is_hopper = _device_sm == 90
 
-        if max_kv_len <= NSA_THRESHOLD and is_supported_gpu:
+        if max_kv_len <= NSA_THRESHOLD and is_hopper:
             # NSA backend uses varlen kernel which supports MHA_ONE_SHOT
             # Check if total sequence length fits in chunk capacity
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
@@ -1175,8 +1175,6 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         self.use_nsa = is_deepseek_nsa(config)
         if self.use_nsa:
-            # MHA/MLA selection threshold: MHA for short (<2048), MLA+NSA for long sequences
-            self.nsa_seq_len_threshold = getattr(config, "nsa_seq_len_threshold", 2048)
             self.indexer = Indexer(
                 hidden_size=hidden_size,
                 index_n_heads=get_nsa_index_n_heads(config),
@@ -1520,7 +1518,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 -1, self.num_local_heads, self.qk_head_dim
             )
 
-            # NSA Indexer Call for MHA Path: only cache quantized keys, skip topk
+            # NSA Indexer: cache quantized keys, auto-skip topk for short sequences
             if self.use_nsa and _is_extend_without_speculative(forward_batch):
                 _ = self.indexer(
                     x=hidden_states,
@@ -1528,7 +1526,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     positions=positions,
                     forward_batch=forward_batch,
                     layer_id=self.layer_id,
-                    skip_topk_computation=True,  # MHA path doesn't need topk results
+                    return_indices=False,
                 )
         else:
             q = self.q_proj(hidden_states)[0].view(
