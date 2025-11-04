@@ -2386,6 +2386,12 @@ class Scheduler(
                 - self.tree_cache.swa_evictable_size()
             )
             num_tokens = max(num_tokens_full, num_tokens_swa)
+        elif self.is_hybrid_gdn:
+            num_tokens = (
+                self.max_total_num_tokens
+                - self.token_to_kv_pool_allocator.available_size()
+                - self.tree_cache.full_evictable_size()
+            )
         else:
             num_tokens = (
                 self.max_total_num_tokens

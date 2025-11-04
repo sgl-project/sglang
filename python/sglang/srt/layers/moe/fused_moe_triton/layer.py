@@ -14,6 +14,9 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
@@ -55,11 +58,6 @@ from sglang.srt.utils import (
 if is_flashinfer_available():
     from flashinfer import RoutingMethodType, fp4_quantize
 
-_is_hip = is_hip()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
-
-
 # Try to import FP4 TRTLLM function if flashinfer is available
 trtllm_fp4_block_scale_moe = None
 if should_use_flashinfer_trtllm_moe():
@@ -67,6 +65,10 @@ if should_use_flashinfer_trtllm_moe():
         from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
     except ImportError:
         trtllm_fp4_block_scale_moe = None
+
+_is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -839,12 +841,16 @@ class FusedMoE(torch.nn.Module):
             dispatch_output=dispatch_output,
             **kwargs,
         )
-        final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
-        # TODO: should we add some conditions here?
-        final_hidden_states = final_hidden_states[
-            ..., :origin_hidden_states_dim
-        ].contiguous()
+        with use_symmetric_memory(get_tp_group()) as sm:
+            final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
+
+            # TODO: should we add some conditions here?
+            final_hidden_states = final_hidden_states[
+                ..., :origin_hidden_states_dim
+            ].contiguous()
+
+            sm.tag(final_hidden_states)
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -980,6 +986,11 @@ class FlashInferFusedMoE(FusedMoE):
             ),
         )
 
+        # NOTE for symmetric memory tagging:
+        # We do not create the context in this function.
+        # Instead, we create the context and tagging inside each FusedMoEMethodBase
+        # This can allow fine-grained tagging.
+
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -1040,6 +1051,10 @@ class FlashInferFP4MoE(FusedMoE):
 
         router_logits = router_logits.to(torch.float32)
 
+        with use_symmetric_memory(get_tp_group()) as sm:
+            symm_output = torch.empty_like(hidden_states)
+            sm.tag(symm_output)
+
         result = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=topk_config.correction_bias.to(hidden_states.dtype),
@@ -1072,6 +1087,7 @@ class FlashInferFP4MoE(FusedMoE):
             tile_tokens_dim=None,
             routing_method_type=RoutingMethodType.DeepSeekV3,
             do_finalize=True,
+            output=symm_output,
         )[0]
 
         return result
