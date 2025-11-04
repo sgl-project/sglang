@@ -40,6 +40,7 @@ def get_model_config(
     tp_size: int,
     ep_size: int = 1,
     disable_shared_experts_fusion: bool = False,
+    topk_ids_dir: str = None,
 ) -> Dict:
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
@@ -80,11 +81,15 @@ def get_model_config(
             if architecture == "DeepseekV3ForCausalLM"
             else config.n_routed_experts
         )
-        topk = config.num_experts_per_tok
+        topk = config.num_experts_per_tok + (
+            0 if disable_shared_experts_fusion or topk_ids_dir is None else 1
+        )
         intermediate_size = config.moe_intermediate_size
     elif architecture == "Llama4ForConditionalGeneration":
         E = config.num_local_experts + (0 if disable_shared_experts_fusion else 1)
-        topk = config.num_experts_per_tok
+        topk = config.num_experts_per_tok + (
+            0 if disable_shared_experts_fusion or topk_ids_dir is None else 1
+        )
         intermediate_size = config.intermediate_size
     elif architecture in [
         "Grok1ForCausalLM",

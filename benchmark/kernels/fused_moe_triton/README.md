@@ -81,6 +81,25 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
 
 This tool requires pre-generated topk_ids files and supports both TP and EP modes:
 
+Edit the code file (such as srt/models/deepseek_v2.py) in the Python site package and add the logic for saving topk_ids:
+
+```python
+# import get_tensor_model_parallel_rank
+# DeepseekV2MoE::forward_normal
+if hidden_states.shape[0] >= 4096 and get_tensor_model_parallel_rank() == 0:
+    topk_ids_dir = xxxx
+    if not hasattr(self, "save_idx"):
+        self.save_idx = 0
+    if self.save_idx <= 1:
+        torch.save(topk_output.topk_ids, f"{topk_ids_dir}/topk_ids_layer{self.layer_id}_idx{self.save_idx}.pt")
+    self.save_idx += 1
+```
+
+Launch sglang server and send request using `benchmark/kernels/fused_moe_triton/tuning_client.py`
+```bash
+python benchmark/kernels/fused_moe_triton/tuning_client.py --port 8000
+```
+
 ```bash
 # TP Mode: Tune separate kernels with TP=4
 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py \
@@ -111,6 +130,7 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py \
     --model deepseek-ai/DeepSeek-V3-0324 \
     --tp-size 4 \
     --batch-size 1024 \
+    --dtype fp8_w8a8 \
     --configs 128 256 128 16 8 4 \
     --topk-ids-dir /path/to/topk_ids
 ```
