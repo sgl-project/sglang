@@ -85,33 +85,6 @@ pub async fn route_responses(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
 ) -> Response {
-    // 0. Fast worker validation (fail-fast before expensive operations)
-    let requested_model: Option<&str> = model_id.as_deref().or(Some(request.model.as_str()));
-
-    if let Some(model) = requested_model {
-        // Check if any workers support this model
-        let available_models = ctx.worker_registry.get_models();
-
-        if !available_models.contains(&model.to_string()) {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(json!({
-                    "error": {
-                        "message": format!(
-                            "No workers available for model '{}'. Available models: {}",
-                            model,
-                            available_models.join(", ")
-                        ),
-                        "type": "service_unavailable",
-                        "param": "model",
-                        "code": "no_available_workers"
-                    }
-                })),
-            )
-                .into_response();
-        }
-    }
-
     // 1. Validate request (includes conversation ID format)
     if let Err(validation_errors) = request.validate() {
         // Extract the first error message for conversation field

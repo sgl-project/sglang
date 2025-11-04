@@ -2,9 +2,14 @@
 
 use std::sync::Arc;
 
-use axum::response::Response;
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use serde_json::json;
 
 use crate::{
+    core::WorkerRegistry,
     mcp::McpManager,
     protocols::responses::{ResponseTool, ResponseToolType},
     routers::{grpc::error, openai::mcp::ensure_request_mcp_client},
@@ -14,12 +19,6 @@ use crate::{
 ///
 /// Checks if request declares MCP tools, and if so, validates that
 /// the MCP client can be created and connected.
-///
-/// # Returns
-///
-/// * `Ok(true)` - MCP tools present and connection succeeded
-/// * `Ok(false)` - No MCP tools declared
-/// * `Err(Response)` - MCP tools declared but connection failed (424 error)
 pub async fn ensure_mcp_connection(
     mcp_manager: &Arc<McpManager>,
     tools: Option<&[ResponseTool]>,
@@ -45,4 +44,35 @@ pub async fn ensure_mcp_connection(
     }
 
     Ok(has_mcp_tools)
+}
+
+/// Validate that workers are available for the requested model
+pub fn validate_worker_availability(
+    worker_registry: &Arc<WorkerRegistry>,
+    model: &str,
+) -> Option<Response> {
+    let available_models = worker_registry.get_models();
+
+    if !available_models.contains(&model.to_string()) {
+        return Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({
+                    "error": {
+                        "message": format!(
+                            "No workers available for model '{}'. Available models: {}",
+                            model,
+                            available_models.join(", ")
+                        ),
+                        "type": "service_unavailable",
+                        "param": "model",
+                        "code": "no_available_workers"
+                    }
+                })),
+            )
+                .into_response(),
+        );
+    }
+
+    None
 }
