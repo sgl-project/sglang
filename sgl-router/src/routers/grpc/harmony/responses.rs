@@ -618,20 +618,21 @@ async fn execute_mcp_tool_loop_streaming(
             }
         };
 
-        // Process stream with token-level streaming
-        let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
-            execution_result,
-            emitter,
-            tx,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(err_msg) => {
-                emitter.emit_error(&err_msg, Some("processing_error"), tx);
-                return;
-            }
-        };
+        // Process stream with token-level streaming (MCP path - emits mcp_call.* events)
+        let iteration_result =
+            match HarmonyStreamingProcessor::process_responses_iteration_stream_mcp(
+                execution_result,
+                emitter,
+                tx,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(err_msg) => {
+                    emitter.emit_error(&err_msg, Some("processing_error"), tx);
+                    return;
+                }
+            };
 
         // Handle iteration result (tool calls or completion)
         match iteration_result {
@@ -736,10 +737,13 @@ async fn execute_without_mcp_streaming(
         }
     };
 
-    // Process stream (emits all output items during streaming)
-    if let Err(err_msg) =
-        HarmonyStreamingProcessor::process_responses_iteration_stream(execution_result, emitter, tx)
-            .await
+    // Process stream (emits all output items during streaming - function tool path emits function_call_arguments.* events)
+    if let Err(err_msg) = HarmonyStreamingProcessor::process_responses_iteration_stream_function(
+        execution_result,
+        emitter,
+        tx,
+    )
+    .await
     {
         emitter.emit_error(&err_msg, Some("processing_error"), tx);
         return;

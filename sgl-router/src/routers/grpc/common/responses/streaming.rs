@@ -15,6 +15,7 @@ pub enum OutputItemType {
     Message,
     McpListTools,
     McpCall,
+    FunctionCall,
     Reasoning,
 }
 
@@ -345,6 +346,40 @@ impl ResponseStreamEventEmitter {
     }
 
     // ========================================================================
+    // Function Call Event Emission Methods
+    // ========================================================================
+
+    pub fn emit_function_call_arguments_delta(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+        delta: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "delta": delta
+        })
+    }
+
+    pub fn emit_function_call_arguments_done(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+        arguments: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": "response.function_call_arguments.done",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "arguments": arguments
+        })
+    }
+
+    // ========================================================================
     // Output Item Wrapper Events
     // ========================================================================
 
@@ -389,6 +424,7 @@ impl ResponseStreamEventEmitter {
         let id_prefix = match &item_type {
             OutputItemType::McpListTools => "mcpl",
             OutputItemType::McpCall => "mcp",
+            OutputItemType::FunctionCall => "fc",
             OutputItemType::Message => "msg",
             OutputItemType::Reasoning => "rs",
         };
