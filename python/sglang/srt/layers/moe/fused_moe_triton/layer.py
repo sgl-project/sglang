@@ -494,7 +494,7 @@ class FusedMoE(torch.nn.Module):
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
-            not expert_id
+            expert_id is None
             and self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
