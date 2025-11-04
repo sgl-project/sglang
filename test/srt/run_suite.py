@@ -16,7 +16,7 @@ class TestFile:
 suites = {
     "per-commit-1-gpu": [
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
-        TestFile("function_call/test_json_schema_constraint.py", 30),
+        TestFile("function_call/test_json_schema_constraint.py", 1),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_eagle.py", 150),
         TestFile("hicache/test_hicache_mla.py", 127),
@@ -367,7 +367,7 @@ suites = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_amd = {
     "per-commit-amd": [
-        TestFile("function_call/test_json_schema_constraint.py", 30),
+        TestFile("function_call/test_json_schema_constraint.py", 1),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
