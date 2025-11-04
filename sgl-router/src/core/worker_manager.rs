@@ -237,10 +237,8 @@ impl WorkerManager {
         }
     }
 
-    pub async fn get_engine_metrics(&self) -> Response {
-        let engine_responses = match self
-            .fan_out_simple_request(None, "metrics", Method::GET)
-            .await
+    pub async fn get_engine_metrics() -> Response {
+        let engine_responses = match fan_out_simple_request(None, "metrics", Method::GET).await
         {
             Ok(x) => x,
             Err(e) => return e,
