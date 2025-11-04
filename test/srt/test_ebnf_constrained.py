@@ -22,33 +22,32 @@ from sglang.test.test_utils import (
 )
 
 
-def setup_class(cls, backend: str, disable_overlap: bool):
-    cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-    cls.base_url = DEFAULT_URL_FOR_TEST
-    cls.ebnf_grammar = 'root ::= "test"'  # Default grammar
-
-    other_args = [
-        "--max-running-requests",
-        "10",
-        "--grammar-backend",
-        backend,
-    ]
-
-    if disable_overlap:
-        other_args += ["--disable-overlap-schedule"]
-
-    cls.process = popen_launch_server(
-        cls.model,
-        cls.base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
-    )
-
-
 class TestEBNFConstrained(CustomTestCase):
+    backend = "xgrammar"
+    disable_overlap = False
+
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, "xgrammar", disable_overlap=False)
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.ebnf_grammar = 'root ::= "test"'  # Default grammar
+
+        launch_args = [
+            "--max-running-requests",
+            "10",
+            "--grammar-backend",
+            cls.backend,
+        ]
+
+        if cls.disable_overlap:
+            launch_args += ["--disable-overlap-schedule"]
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=launch_args,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -273,9 +272,8 @@ class TestEBNFConstrained(CustomTestCase):
 
 
 class TestEBNFConstrainedLLGuidance(TestEBNFConstrained):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, "llguidance", disable_overlap=False)
+    backend = "llguidance"
+    disable_overlap = False
 
 
 if __name__ == "__main__":
