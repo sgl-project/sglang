@@ -11,7 +11,7 @@ _PATTERN_DECODE = (
     r"token usage:\s*(?P<token_usage>[0-9.]+),\s+"
     r".*?"
     r"gen throughput \(token/s\):\s*(?P<gen_throughput>[0-9.]+),\s+"
-    r"#queue-req:\s*(?P<queue>\d+),"
+    r"#queue-req:\s*(?P<queue_req>\d+),"
 )
 
 
@@ -26,19 +26,19 @@ def parse(lines):
     df = df.with_columns(
         pl.col("time").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S"),
         *[
-            pl.col(c).cast(pl.Int64)
-            for c in [
-                "pid",
-                "dp_rank",
-                "tp_rank",
-                "pp_rank",
-                "running_req",
-                "token",
-                "token_usage",
-                "gen_throughput",
-                "queue",
+            pl.col(col).cast(dtype)
+            for col, dtype in [
+                ("pid", pl.Int64),
+                ("dp_rank", pl.Int64),
+                ("tp_rank", pl.Int64),
+                ("pp_rank", pl.Int64),
+                ("running_req", pl.Int64),
+                ("token", pl.Int64),
+                ("token_usage", pl.Float64),
+                ("gen_throughput", pl.Float64),
+                ("queue_req", pl.Int64),
             ]
-            if c in df.columns
+            if col in df.columns
         ],
     )
     return df
