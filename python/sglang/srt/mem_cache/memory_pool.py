@@ -42,10 +42,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.disaggregation.mooncake.utils import init_mooncake_custom_mem_pool
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
-    init_custom_mem_pool,
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
@@ -158,8 +158,8 @@ class MambaPool:
         num_mamba_layers = len(cache_params.layers)
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool, self.custom_mem_pool, _ = init_custom_mem_pool(
-            device=self.device
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+            init_mooncake_custom_mem_pool(device=self.device)
         )
 
         self.is_kda_cache = isinstance(cache_params, KimiLinearCacheParams)
@@ -471,8 +471,8 @@ class KVCache(abc.ABC):
         self.layer_transfer_counter = None
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool, self.custom_mem_pool, _ = init_custom_mem_pool(
-            device=self.device
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+            init_mooncake_custom_mem_pool(device=self.device)
         )
 
     def _finalize_allocation_log(self, num_tokens: int):
@@ -1041,8 +1041,8 @@ class SWAKVPool(KVCache):
         assert not enable_kvcache_transpose
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool, self.custom_mem_pool, _ = init_custom_mem_pool(
-            device=self.device
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+            init_mooncake_custom_mem_pool(device=self.device)
         )
 
         self.swa_kv_pool = token_to_kv_pool_class(
