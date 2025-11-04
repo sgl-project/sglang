@@ -86,36 +86,6 @@ impl WasmComponentOutput {
     }
 }
 
-/// Helper trait for converting from WIT types to component input
-pub trait ToComponentInput {
-    fn to_component_input(self) -> WasmComponentInput;
-}
-
-/// Helper trait for converting from component output to WIT types
-pub trait FromComponentOutput {
-    fn from_component_output(output: &WasmComponentOutput) -> Option<&Self>;
-}
-
-impl ToComponentInput for middleware_types::Request {
-    fn to_component_input(self) -> WasmComponentInput {
-        WasmComponentInput::MiddlewareRequest(self)
-    }
-}
-
-impl ToComponentInput for middleware_types::Response {
-    fn to_component_input(self) -> WasmComponentInput {
-        WasmComponentInput::MiddlewareResponse(self)
-    }
-}
-
-impl FromComponentOutput for middleware_types::Action {
-    fn from_component_output(output: &WasmComponentOutput) -> Option<&Self> {
-        match output {
-            WasmComponentOutput::MiddlewareAction(action) => Some(action),
-        }
-    }
-}
-
 pub struct WasiState {
     pub ctx: WasiCtx,
     pub table: ResourceTable,

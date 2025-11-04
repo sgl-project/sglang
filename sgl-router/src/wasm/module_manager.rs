@@ -85,7 +85,7 @@ impl WasmModuleManager {
         Ok(hasher.finalize().into())
     }
 
-    fn validate_module_descriptor(&self, descriptor: WasmModuleDescriptor) -> Result<()> {
+    fn validate_module_descriptor(&self, descriptor: &WasmModuleDescriptor) -> Result<()> {
         if descriptor.name.is_empty() {
             return Err(WasmModuleError::InvalidDescriptor(
                 "Module name cannot be empty".to_string(),
@@ -109,7 +109,7 @@ impl WasmModuleManager {
 
     pub fn add_module(&self, descriptor: WasmModuleDescriptor) -> Result<Uuid> {
         // validate the module descriptor
-        self.validate_module_descriptor(descriptor.clone())?;
+        self.validate_module_descriptor(&descriptor)?;
 
         // calculate the sha256 hash of the module file
         let sha256_hash = self.calculate_sha256_hash(&descriptor.file_path)?;
