@@ -148,7 +148,10 @@ pub async fn route_responses(
     if is_streaming {
         route_responses_streaming(ctx, request, headers, model_id).await
     } else {
-        route_responses_sync(ctx, request, headers, model_id, None).await
+        // Generate response ID for synchronous execution
+        // TODO: we may remove this when we have builder pattern for responses
+        let response_id = Some(format!("resp_{}", Uuid::new_v4()));
+        route_responses_sync(ctx, request, headers, model_id, response_id).await
     }
 }
 
