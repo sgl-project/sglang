@@ -1331,6 +1331,17 @@ async def sagemaker_chat_completions(
     )
 
 
+@app.post("/embedding_bootstrap")
+async def embedding_bootstrap(request_data: dict):
+    buffer_address = await _global_state.tokenizer_manager.allocate_embedding_buffer(
+        request_data["req_id"], request_data["embedding_length"]
+    )
+    session_id = _global_state.tokenizer_manager.embeddings_engine.session_id
+    return ORJSONResponse(
+        content={"session_id": session_id, "buffer_address": buffer_address}
+    )
+
+
 ## Vertex AI API
 @app.post(os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate"))
 async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Request):

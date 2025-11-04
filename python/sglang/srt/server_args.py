@@ -2258,7 +2258,7 @@ class ServerArgs:
             "--embedding-port",
             type=int,
             default=54213,
-            help="The port for multimodal embedding transmission.",
+            help="The port for transmitting embedding metadata.",
         )
 
         # Quantization and data type

@@ -40,6 +40,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -102,6 +103,7 @@ from sglang.srt.utils import (
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
+    get_local_ip_auto,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -319,8 +321,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.recv_from_encoder = get_zmq_socket(
                 context, zmq.PULL, f"tcp://*:{server_args.embedding_port}", True
             )
-            self.received_embeddings = dict()
+            self.received_metadata = dict()
             self.embeddings_lock = asyncio.Lock()
+            self.embeddings_engine = MooncakeTransferEngine(
+                get_local_ip_auto(),
+                gpu_id=0,
+            )
+            self.embeddings_buffer = dict()
 
         # Request states
         self._chosen_loop = None
@@ -566,6 +573,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         return "batch_strings"
 
+    async def allocate_embedding_buffer(self, req_id, embedding_length):
+        embeddings = torch.zeros(
+            (embedding_length, self.model_config.hidden_size),
+            dtype=self.model_config.dtype,
+        )
+        self.embeddings_engine.register(
+            embeddings.data_ptr(),
+            embeddings.nbytes,
+        )
+        self.embeddings_buffer[req_id] = embeddings
+        return embeddings.data_ptr()
+
     def _prepare_tokenizer_input(
         self, texts: Union[str, List[str]], input_format: str
     ) -> Union[List[str], List[List[str]]]:
@@ -735,16 +754,22 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # Use async lock to avoid race condition
                 async with self.embeddings_lock:
                     while (
-                        obj.bootstrap_room not in self.received_embeddings
-                        or not self.received_embeddings[obj.bootstrap_room].ready
+                        obj.bootstrap_room not in self.received_metadata
+                        or not self.received_metadata[obj.bootstrap_room].ready
                     ):
                         await self.handle_embedding()
                     for mm_item in mm_inputs["mm_items"]:
                         if mm_item.modality == Modality.IMAGE:
-                            mm_item.precomputed_embeddings = self.received_embeddings[
+                            mm_item.precomputed_embeddings = self.embeddings_buffer[
                                 obj.bootstrap_room
-                            ].get()
-                    del self.received_embeddings[obj.bootstrap_room]
+                            ]
+                            self.embeddings_engine.deregister(
+                                mm_item.precomputed_embeddings.data_ptr()
+                            )
+                            break
+                    del self.received_metadata[obj.bootstrap_room]
+                    del self.embeddings_buffer[obj.bootstrap_room]
+
         else:
             mm_inputs = None
 
@@ -1570,10 +1595,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
     async def handle_embedding(self):
         recv_obj = await self.recv_from_encoder.recv_pyobj()
-        if recv_obj.req_id not in self.received_embeddings:
-            self.received_embeddings[recv_obj.req_id] = recv_obj
+        if recv_obj.req_id not in self.received_metadata:
+            self.received_metadata[recv_obj.req_id] = recv_obj
         else:
-            self.received_embeddings[recv_obj.req_id].add(recv_obj)
+            self.received_metadata[recv_obj.req_id].add(recv_obj)
 
     def _add_metric_if_present(
         self,

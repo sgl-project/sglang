@@ -99,8 +99,7 @@ class MiniLoadBalancer:
             )
 
         if router_args.e_disaggregation and len(router_args.decode_urls) != 0:
-            logger.warning("The E disaggregation mode doesn't require decode server")
-            router_args.decode_urls = []
+            raise ValueError("The E disaggregation mode doesn't require decode server")
 
     def start(self):
         global lb
@@ -123,7 +122,17 @@ class MiniLoadBalancer:
             decode_url,
         )
 
-    async def encode(self, request_data, encode_urls, endpoint):
+    async def embedding_bootstrap(self, session, prefill_url, req_id, embedding_length):
+        response = await session.post(
+            f"{prefill_url}/embedding_bootstrap",
+            json={"req_id": req_id, "embedding_length": embedding_length},
+        )
+        response_json = await response.json()
+        session_id = response_json["session_id"]
+        buffer_address = response_json["buffer_address"]
+        return session_id, buffer_address
+
+    async def encode(self, request_data, encode_urls, endpoint, prefill_url):
         messages = request_data.get("messages")
         if messages is None or len(encode_urls) == 0:
             return
@@ -139,6 +148,7 @@ class MiniLoadBalancer:
         if len(img_list) == 0:
             return
 
+        req_id = request_data.get("bootstrap_room")
         # Split mm_items
         encode_requests = []
         random.shuffle(self.encode_idx)
@@ -157,19 +167,19 @@ class MiniLoadBalancer:
                     "mm_items": img_list[cum_num_items : cum_num_items + assigned_num],
                     "num_parts": num_parts,
                     "part_idx": cum_idx,
-                    "req_id": request_data.get("bootstrap_room"),
-                    "bootstrap_host": request_data.get("bootstrap_host"),
+                    "req_id": req_id,
                 }
             )
             cum_idx += 1
             cum_num_items += assigned_num
 
-        # Send encode requests
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=self.timeout
             )  # Add timeout for request reliability
         ) as session:
+            # Send encode requests
+
             tasks = [
                 session.post(
                     f"{encode_urls[encode_request['encoder_idx']]}/{endpoint}",
@@ -178,7 +188,46 @@ class MiniLoadBalancer:
                 for encode_request in encode_requests
             ]
 
-            await asyncio.gather(*tasks)
+            responses = await asyncio.gather(*tasks)
+            response_json_list_unsort = [
+                await response.json() for response in responses
+            ]
+
+            # Send bootstrap info
+
+            embedding_size_list_sort = [None for _ in range(num_parts)]
+            embedding_length_tot = 0
+            response_json_list_sort = [None for _ in range(num_parts)]
+            for response_json in response_json_list_unsort:
+                idx = response_json["part_idx"]
+                embedding_size_list_sort[idx] = response_json["embedding_size"]
+                embedding_length_tot += response_json["embedding_len"]
+                response_json_list_sort[idx] = response_json
+
+            offset = 0
+            metadata_tasks = []
+            prefill_ip = request_data["bootstrap_host"]
+            session_id, buffer_address = await self.embedding_bootstrap(
+                session, prefill_url, req_id, embedding_length_tot
+            )
+            for idx in range(len(tasks)):
+                response_json = response_json_list_sort[idx]
+                buffer_address_adjust = offset + buffer_address
+                response_json.update(
+                    {
+                        "session_id": session_id,
+                        "buffer_address": buffer_address_adjust,
+                        "bootstrap_host": prefill_ip,
+                    }
+                )
+                metadata_tasks.append(
+                    session.post(
+                        f"{encode_urls[response_json["encoder_idx"]]}/{endpoint}",
+                        json=response_json,
+                    )
+                )
+                offset += embedding_size_list_sort[idx]
+            await asyncio.gather(*metadata_tasks)
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
@@ -515,10 +564,14 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
             "bootstrap_host": hostname,
         }
     )
-    asyncio.create_task(lb.encode(encode_request, lb.encode_urls, "encode"))
+    asyncio.create_task(
+        lb.encode(encode_request, lb.encode_urls, "encode", prefill_server)
+    )
 
     modified_request = encode_request.copy()
-    modified_request.update({"bootstrap_port": bootstrap_port})
+    modified_request.update(
+        {"bootstrap_port": bootstrap_port, "encode_urls": lb.encode_urls}
+    )
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
