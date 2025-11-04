@@ -3,23 +3,23 @@
 //! Handles all aspects of worker lifecycle including discovery, initialization,
 //! runtime management, and health monitoring.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
 use axum::response::{IntoResponse, Response};
 use futures::future;
 use http::{HeaderMap, Method, StatusCode};
 use serde_json::Value;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
 
+use crate::core::metrics_aggregator::MetricPack;
 use crate::{
     core::{ConnectionMode, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
-use crate::core::metrics_aggregator::MetricPack;
 
 /// Unified worker management
 pub struct WorkerManager;
@@ -241,11 +241,13 @@ impl WorkerManager {
         worker_registry: &WorkerRegistry,
         client: &reqwest::Client,
     ) -> Response {
-        let engine_responses = match Self::fan_out_simple_request(worker_registry, client, "metrics", Method::GET).await
-        {
-            Ok(x) => x,
-            Err(e) => return e,
-        };
+        let engine_responses =
+            match Self::fan_out_simple_request(worker_registry, client, "metrics", Method::GET)
+                .await
+            {
+                Ok(x) => x,
+                Err(e) => return e,
+            };
         let engine_responses = engine_responses
             .into_iter()
             .map(|(worker_base_url, metrics_text)| MetricPack {
