@@ -11,6 +11,7 @@
 pub mod circuit_breaker;
 pub mod error;
 pub mod job_queue;
+pub mod metrics_aggregator;
 pub mod retry;
 pub mod token_bucket;
 pub mod worker;
@@ -18,8 +19,6 @@ pub mod worker_builder;
 pub mod worker_manager;
 pub mod worker_registry;
 pub mod workflow;
-
-pub mod metrics_aggregator;
 
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
