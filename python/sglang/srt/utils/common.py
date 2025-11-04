@@ -56,7 +56,6 @@ from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -93,9 +92,6 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +134,7 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
@@ -153,6 +150,12 @@ def is_host_cpu_x86() -> bool:
 
 def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
+
+
+def is_float4_e2m1fn_x2(dtype) -> bool:
+    """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
+    target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    return is_cuda() and dtype == target_dtype
 
 
 def get_cuda_version():
@@ -191,7 +194,16 @@ is_hopper_with_cuda_12_3 = lambda: _check(9)
 def is_blackwell():
     if not is_cuda():
         return False
-    return torch.cuda.get_device_capability()[0] == 10
+    return torch.cuda.get_device_capability()[0] in [10, 12]
+
+
+@lru_cache(maxsize=1)
+def is_blackwell_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
+    return (torch.cuda.get_device_capability(device)[0] in [10, 12]) and (
+        torch.version.cuda >= "12.8"
+    )
 
 
 @lru_cache(maxsize=1)
@@ -291,6 +303,7 @@ def xpu_has_xmx_support():
     return False
 
 
+@lru_cache(maxsize=1)
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
@@ -1105,9 +1118,9 @@ def add_api_key_middleware(app, api_key: str):
     async def authentication(request, call_next):
         if request.method == "OPTIONS":
             return await call_next(request)
-        if request.url.path.startswith("/health"):
-            return await call_next(request)
-        if request.url.path.startswith("/metrics"):
+        if request.url.path.startswith("/health") or request.url.path.startswith(
+            "/metrics"
+        ):
             return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
@@ -1233,42 +1246,34 @@ def point_to_point_pyobj(
     dst: int = 1,
 ):
     """Send data from src to dst in group using DeviceToDevice communication."""
-
+    device = torch.get_device_module().current_device()
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor(
-                [0], dtype=torch.long, device=torch.cuda.current_device()
-            )
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.send(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            ).cuda(
-                device=torch.cuda.current_device()
+            ).to(
+                device=device
             )  # Move to GPU
-            tensor_size = torch.tensor(
-                [size], dtype=torch.long, device=torch.cuda.current_device()
-            )
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             dist.send(tensor_size, dst=dst, group=group)
             dist.send(tensor_data, dst=dst, group=group)
         return data
 
     elif rank == dst:
-        tensor_size = torch.tensor(
-            [0], dtype=torch.long, device=torch.cuda.current_device()
-        )
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
         dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(
-            size, dtype=torch.uint8, device=torch.cuda.current_device()
-        )
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.recv(tensor_data, src=src, group=group)
 
         serialized_data = bytes(
@@ -2099,78 +2104,78 @@ class MultiprocessingSerializer:
             # Decode base64 string to bytes
             data = pybase64.b64decode(data, validate=True)
 
-        class SafeUnpickler(pickle.Unpickler):
-            ALLOWED_MODULE_PREFIXES = {
-                # --- Python types ---
-                "builtins.",
-                "collections.",
-                "copyreg.",
-                "functools.",
-                "itertools.",
-                "operator.",
-                "types.",
-                "weakref.",
-                # --- PyTorch types ---
-                "torch.",
-                "torch._tensor.",
-                "torch.storage.",
-                "torch.nn.parameter.",
-                "torch.autograd.function.",
-                # --- torch distributed ---
-                "torch.distributed.",
-                "torch.distributed._shard.",
-                "torch.distributed._composable.",
-                "torch._C._distributed_c10d.",
-                "torch._C._distributed_fsdp.",
-                "torch.distributed.optim.",
-                # --- multiprocessing ---
-                "multiprocessing.resource_sharer.",
-                "multiprocessing.reduction.",
-                "pickletools.",
-                # --- PEFT / LoRA ---
-                "peft.",
-                "transformers.",
-                "huggingface_hub.",
-                # --- SGLang & Unitest ---
-                "sglang.srt.weight_sync.tensor_bucket.",
-                "sglang.srt.model_executor.model_runner.",
-                "sglang.srt.layers.",
-                "sglang.srt.utils.",
-            }
-
-            DENY_CLASSES = {
-                ("builtins", "eval"),
-                ("builtins", "exec"),
-                ("builtins", "compile"),
-                ("os", "system"),
-                ("subprocess", "Popen"),
-                ("subprocess", "run"),
-                ("codecs", "decode"),
-                ("types", "CodeType"),
-                ("types", "FunctionType"),
-            }
-
-            def find_class(self, module, name):
-                # Block deterministic attacks
-                if (module, name) in self.DENY_CLASSES:
-                    raise RuntimeError(
-                        f"Blocked unsafe class loading ({module}.{name}), "
-                        f"to prevent exploitation of CVE-2025-10164"
-                    )
-                # Allowlist of safe-to-load modules.
-                if any(
-                    (module + ".").startswith(prefix)
-                    for prefix in self.ALLOWED_MODULE_PREFIXES
-                ):
-                    return super().find_class(module, name)
-
-                # Block everything else. (Potential attack surface)
-                raise RuntimeError(
-                    f"Blocked unsafe class loading ({module}.{name}), "
-                    f"to prevent exploitation of CVE-2025-10164"
-                )
-
         return SafeUnpickler(io.BytesIO(data)).load()
+
+
+class SafeUnpickler(pickle.Unpickler):
+    ALLOWED_MODULE_PREFIXES = {
+        # --- Python types ---
+        "builtins.",
+        "collections.",
+        "copyreg.",
+        "functools.",
+        "itertools.",
+        "operator.",
+        "types.",
+        "weakref.",
+        # --- PyTorch types ---
+        "torch.",
+        "torch._tensor.",
+        "torch.storage.",
+        "torch.nn.parameter.",
+        "torch.autograd.function.",
+        # --- torch distributed ---
+        "torch.distributed.",
+        "torch.distributed._shard.",
+        "torch.distributed._composable.",
+        "torch._C._distributed_c10d.",
+        "torch._C._distributed_fsdp.",
+        "torch.distributed.optim.",
+        # --- multiprocessing ---
+        "multiprocessing.resource_sharer.",
+        "multiprocessing.reduction.",
+        "pickletools.",
+        # --- PEFT / LoRA ---
+        "peft.",
+        "transformers.",
+        "huggingface_hub.",
+        # --- SGLang & Unitest ---
+        "sglang.srt.weight_sync.tensor_bucket.",
+        "sglang.srt.model_executor.model_runner.",
+        "sglang.srt.layers.",
+        "sglang.srt.utils.",
+    }
+
+    DENY_CLASSES = {
+        ("builtins", "eval"),
+        ("builtins", "exec"),
+        ("builtins", "compile"),
+        ("os", "system"),
+        ("subprocess", "Popen"),
+        ("subprocess", "run"),
+        ("codecs", "decode"),
+        ("types", "CodeType"),
+        ("types", "FunctionType"),
+    }
+
+    def find_class(self, module, name):
+        # Block deterministic attacks
+        if (module, name) in self.DENY_CLASSES:
+            raise RuntimeError(
+                f"Blocked unsafe class loading ({module}.{name}), "
+                f"to prevent exploitation of CVE-2025-10164"
+            )
+        # Allowlist of safe-to-load modules.
+        if any(
+            (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
+        ):
+            return super().find_class(module, name)
+
+        # Block everything else. (Potential attack surface)
+        raise RuntimeError(
+            f"Blocked unsafe class loading ({module}.{name}), "
+            f"to prevent exploitation of CVE-2025-10164"
+        )
 
 
 def debug_timing(func):
@@ -2353,16 +2358,24 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     )
     server = uvicorn.Server(config=config)
 
-    try:
-        loop = asyncio.get_running_loop()
-        logger.info(
-            f"Dummy health check server scheduled on existing loop at {host}:{port}"
-        )
-        loop.create_task(server.serve())
+    # Run server in a background daemon thread with its own event loop
+    # This prevents blocking the main thread while still serving health checks
+    def run_server():
+        try:
+            asyncio.run(server.serve())
+        except Exception as e:
+            logger.error(f"Dummy health check server failed to start: {e}")
+            raise
+        finally:
+            logger.info(f"Dummy health check server stopped at {host}:{port}")
 
-    except RuntimeError:
-        logger.info(f"Starting dummy health check server at {host}:{port}")
-        server.run()
+    thread = threading.Thread(
+        target=run_server, daemon=True, name="health-check-server"
+    )
+    thread.start()
+    logger.info(
+        f"Dummy health check server started in background thread at {host}:{port}"
+    )
 
 
 def create_checksum(directory: str):
@@ -2373,7 +2386,9 @@ def set_cuda_arch():
     if is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
-        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
+            f"{arch}{'a' if capability[0] >= 9 else ''}"
+        )
 
 
 def next_power_of_2(n: int):
@@ -2623,17 +2638,12 @@ def get_local_ip_auto(fallback: str = None) -> str:
     raise ValueError("Can not get local ip")
 
 
-def is_page_size_one(server_args):
-    return server_args.page_size == 1
-
-
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk == 1
-        and is_page_size_one(server_args)
+        server_args.speculative_eagle_topk == 1
+        and (server_args.page_size == 1 or server_args.page_size is None)
     )
 
 
@@ -3113,12 +3123,16 @@ def apply_module_patch(target_module, target_function, wrappers):
         setattr(original_module, target_function, candidate)
 
     for key, value in sys.modules.copy().items():
-        if (
-            target_function is not None
-            and hasattr(value, target_function)
-            and id(getattr(value, target_function)) == original_function_id
-        ):
-            setattr(value, target_function, candidate)
+        try:
+            if (
+                target_function is not None
+                and hasattr(value, target_function)
+                and id(getattr(value, target_function)) == original_function_id
+            ):
+                setattr(value, target_function, candidate)
+        except ImportError as e:
+            # Ignore some modules reporting ImportError when calling hasattr
+            logger.warning(f"Ignore {value} reports ImportError with:\n{str(e)}")
 
 
 def parse_module_path(module_path, function_name, create_dummy):
@@ -3570,6 +3584,34 @@ def cached_triton_kernel(key_fn=None):
     """
 
     def decorator(fn):
-        return CachedKernel(fn, key_fn)
+        if envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.get():
+            logger.debug(
+                f"{envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.name} = True. Using custom triton kernel cache."
+            )
+            return CachedKernel(fn, key_fn)
+        else:
+            # Fallback to the native triton cache.
+            logger.debug(
+                f"{envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.name} = False. Using native triton kernel cache."
+            )
+            return fn
 
     return decorator
+
+
+# Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
+def calc_diff(x, y):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
+
+
+cached_device_index = -1
+
+
+def get_current_device_stream_fast():
+    global cached_device_index
+    if cached_device_index == -1:
+        cached_device_index = torch.get_device_module().current_device()
+    return torch.get_device_module().current_stream(cached_device_index)

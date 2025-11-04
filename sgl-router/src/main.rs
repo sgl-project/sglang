@@ -315,6 +315,9 @@ struct CliArgs {
 
     #[arg(long)]
     tool_call_parser: Option<String>,
+
+    #[arg(long)]
+    mcp_config_path: Option<String>,
 }
 
 enum OracleConnectSource {
@@ -594,6 +597,7 @@ impl CliArgs {
             .maybe_oracle(oracle)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
+            .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)

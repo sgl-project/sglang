@@ -11,7 +11,6 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -131,23 +130,6 @@ class DeepEPMoE(FusedMoE):
             )
             # the last one is invalid rank_id
             self.expert_mask[:-1] = 1
-        elif not _is_npu:
-            self.w13_weight_fp8 = (
-                self.w13_weight,
-                (
-                    self.w13_weight_scale_inv
-                    if self.use_block_quant or self.use_w4afp8
-                    else self.w13_weight_scale
-                ),
-            )
-            self.w2_weight_fp8 = (
-                self.w2_weight,
-                (
-                    self.w2_weight_scale_inv
-                    if self.use_block_quant or self.use_w4afp8
-                    else self.w2_weight_scale
-                ),
-            )
 
     def forward(
         self,
@@ -235,7 +217,6 @@ class DeepEPMoE(FusedMoE):
             hidden_states=output,
             topk_ids=dispatch_output.topk_ids,
             topk_weights=dispatch_output.topk_weights,
-            overlap_args=down_gemm_overlap_args,
         )
 
     def combine(
@@ -523,7 +504,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         except:
             pass
 
-    if should_use_flashinfer_trtllm_moe() and quant_config is not None:
+    if get_moe_runner_backend().is_flashinfer_trtllm() and quant_config is not None:
         # FIXME: FlashInferFusedMoE only supports fp8 quant now
         return FlashInferFusedMoE
     if get_moe_runner_backend().is_flashinfer_cutlass():

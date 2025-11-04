@@ -248,7 +248,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## Speculative decoding
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--enable-beta-spec` | Description not provided in server_args.py | `False` | bool flag (set to enable) |
 | `--speculative-algorithm` | Speculative algorithm. | `None` | `EAGLE`, `EAGLE3`, `NEXTN`, `STANDALONE`, `NGRAM` |
 | `--speculative-draft-model-path`<br>`--speculative-draft-model` | The path of the draft model weights. This can be a local folder or a Hugging Face repo ID. | `None` | Type: str |
 | `--speculative-draft-model-revision` | The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version. | `None` | Type: str |
@@ -259,6 +258,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-accept-threshold-acc` | The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc). | `1.0` | Type: float |
 | `--speculative-token-map` | The path of the draft model's small vocab table. | `None` | Type: str |
 | `--speculative-attention-mode` | Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'. | `prefill` | `prefill`, `decode` |
+| `--speculative-moe-runner-backend` | MOE backend for EAGLE speculative decoding, see --moe-runner-backend for options. Same as moe runner backend if unset. | None |
 
 ## Ngram speculative decoding
 | Argument | Description | Defaults | Options |
