@@ -983,8 +983,9 @@ class ServerArgs:
                 "fa3",
                 "aiter",
                 "triton",
+                "ascend",
                 "trtllm_mha",
-            }, "fa3, aiter, triton, or trtllm_mha is required for Llama4 model"
+            }, "fa3, aiter, triton, ascend, or trtllm_mha is required for Llama4 model"
             if is_sm100_supported() and self.attention_backend is None:
                 self.attention_backend = "trtllm_mha"
                 logger.warning(
