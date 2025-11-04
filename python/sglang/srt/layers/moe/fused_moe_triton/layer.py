@@ -842,7 +842,9 @@ class FusedMoE(torch.nn.Module):
             **kwargs,
         )
 
-        with use_symmetric_memory(get_tp_group()):
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
             # TODO: should we add some conditions here?

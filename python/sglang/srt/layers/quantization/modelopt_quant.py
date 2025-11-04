@@ -667,7 +667,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 None if correction_bias is None else correction_bias.to(torch.bfloat16)
             )
 
-            with use_symmetric_memory(get_tp_group()):
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
                 # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
                 # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
                 # so we put the whole function under the ``use_symmetric_memory`` context manager.
