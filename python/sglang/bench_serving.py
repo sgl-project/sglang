@@ -25,6 +25,7 @@ import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
@@ -614,7 +615,10 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
-            async with session.post(url=api_url) as response:
+            body = {
+                "activities": getattr(args, "profile_activities", []),
+            }
+            async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -1014,7 +1018,7 @@ async def get_mooncake_request_over_time(
 def sample_mmmu_requests(
     num_requests: int,
     processor: AutoProcessor | AutoTokenizer,
-    backend: str,
+    backend: str = "sglang",
     fixed_output_len: Optional[int] = None,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
@@ -1369,7 +1373,10 @@ def create_mm_data_row(
         )["input_ids"].numel()
     except Exception:
         # Fallback: just tokenize the text prompt directly
-        text_prompt_len = len(processor.tokenizer.encode(text_prompt))
+        tokenizer_to_use = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
 
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
@@ -1481,9 +1488,15 @@ def sample_image_requests(
     return dataset
 
 
+@lru_cache(maxsize=1)
+def get_available_tokens(tokenizer):
+    """Get all available token ids from the tokenizer vocabulary."""
+    return list(tokenizer.get_vocab().values())
+
+
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
+    all_available_tokens = get_available_tokens(tokenizer)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
@@ -2026,6 +2039,9 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
+    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
+    server_info = resp.json() if resp.status_code == 200 else None
+
     if (
         metrics.median_ttft_ms is not None
         and metrics.mean_itl_ms is not None
@@ -2042,6 +2058,8 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
+            # Information
+            "server_info": server_info,
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -2159,6 +2177,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
 
+    if not hasattr(args, "served_model_name"):
+        args.served_model_name = None
+
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -2272,7 +2293,7 @@ def run_benchmark(args_: argparse.Namespace):
 
     # Read dataset
     backend = args.backend
-    model_id = args.model
+    model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
@@ -2370,6 +2391,11 @@ if __name__ == "__main__":
         "--model",
         type=str,
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        help="The name of the model as served by the serving service. If not set, this defaults to the value of --model.",
     )
     parser.add_argument(
         "--tokenizer",
@@ -2508,6 +2534,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    # TODO unify all these
+    parser.add_argument(
+        "--profile-activities",
+        type=str,
+        nargs="+",
+        default=["CPU", "GPU"],
+        choices=["CPU", "GPU", "CUDA_PROFILER"],
     )
     parser.add_argument(
         "--lora-name",
