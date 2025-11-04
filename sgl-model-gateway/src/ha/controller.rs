@@ -32,7 +32,7 @@ impl HAController {
             state,
             self_name: self_name.to_string(),
             self_addr,
-            init_peer: init_peer,
+            init_peer,
         }
     }
 
@@ -45,17 +45,13 @@ impl HAController {
         loop {
             log::info!("Round {} Status:{:?}", cnt, read_state.read());
             let peer = if cnt == 0 {
-                if let Some(init_peer) = self.init_peer {
-                    Some(NodeState {
+                self.init_peer.map(|init_peer| NodeState {
                         name: "init_peer".to_string(),
                         address: init_peer.to_string(),
                         status: NodeStatus::Suspected as i32,
                         version: 1,
                         metadata: HashMap::new(),
                     })
-                } else {
-                    None
-                }
             } else {
                 let mut map = init_state.read().clone();
                 map.retain(|k, v| {
@@ -144,7 +140,7 @@ impl HAController {
                         peer_addr
                     );
                     if try_ping(
-                        &node,
+                        node,
                         Some(gossip_message::Payload::PingReq(PingReq {
                             node: Some(peer.clone()),
                         })),

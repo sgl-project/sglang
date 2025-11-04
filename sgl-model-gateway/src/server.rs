@@ -704,15 +704,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         metrics::start_prometheus(prometheus_config.clone());
     }
 
-    let ha_handler = if let Some(ha_server_config) = &config.ha_server_config {
-        Some(ha_run!(
+    let ha_handler = config.ha_server_config.as_ref().map(|ha_server_config| ha_run!(
             ha_server_config.self_name,
             ha_server_config.self_addr,
             ha_server_config.init_peer
-        ))
-    } else {
-        None
-    };
+        ));
 
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",

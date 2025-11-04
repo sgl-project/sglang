@@ -1019,7 +1019,7 @@ impl CliArgs {
                 format!("{}:{}", self.ha_host, self.ha_port).parse::<std::net::SocketAddr>()
             {
                 Some(HAServerConfig {
-                    self_name: self_name,
+                    self_name,
                     self_addr: addr,
                     init_peer: peer,
                 })

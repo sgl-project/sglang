@@ -26,7 +26,7 @@ impl GossipService {
     pub fn new(state: ClusterState, self_addr: SocketAddr, self_name: &str) -> Self {
         Self {
             state,
-            self_addr: self_addr,
+            self_addr,
             self_name: self_name.to_string(),
         }
     }
