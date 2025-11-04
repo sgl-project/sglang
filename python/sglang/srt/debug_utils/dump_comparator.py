@@ -1,10 +1,9 @@
 import argparse
 import functools
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Callable, List
+from typing import Callable, Dict, List, Optional
 
 import einops
 import polars as pl
@@ -105,7 +104,7 @@ def check_tensor_pair(
     diff_threshold: float = 1e-3,
     name="",
     baseline_token_slice=None,
-    tensor_dim_desc: Optional["TensorDimDesc"]=None,
+    tensor_dim_desc: Optional["TensorDimDesc"] = None,
 ):
     x_baseline = _load_object(path_baseline)
     x_target = _load_object(path_target)
@@ -270,9 +269,11 @@ class LocationInfo:
     baseline_forward_pass_id: int
     baseline_token_slice: slice
 
+
 def _get_location_info_of_target_pass_id() -> Dict[int, LocationInfo]:
     """Customization endpoint."""
     return {}
+
 
 @dataclass
 class TensorDimDesc:
@@ -280,10 +281,10 @@ class TensorDimDesc:
     target_desc: str
     baseline_cropper: Optional[Callable[[torch.Tensor], torch.Tensor]]
 
+
 def _get_tensor_dim_descs() -> List[TensorDimDesc]:
     """Customization endpoint."""
     return []
-
 
 
 if __name__ == "__main__":
