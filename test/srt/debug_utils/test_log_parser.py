@@ -1,3 +1,4 @@
+import json
 import unittest
 from sglang.test.test_utils import CustomTestCase
 from sglang.srt.debug_utils import log_parser
@@ -13,7 +14,7 @@ class TestLogParser(CustomTestCase):
         df = log_parser.parse(lines)
 
         print(df)
-        print(df.to_dicts())
+        print(json.dumps(df.to_dicts()))
 
         expect_rows = ['TODO']
         self.assertEqual(df.to_dicts(), expect_rows)
