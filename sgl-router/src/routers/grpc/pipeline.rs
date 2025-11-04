@@ -11,7 +11,7 @@ use tracing::{debug, error};
 
 // Import all stage types from the stages module
 use super::stages::*;
-use super::{context::*, harmony, processing, responses::BackgroundTaskInfo, streaming, utils};
+use super::{context::*, error, harmony, processing, responses::BackgroundTaskInfo, streaming};
 use crate::{
     core::WorkerRegistry,
     policies::PolicyRegistry,
@@ -228,9 +228,9 @@ impl RequestPipeline {
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => axum::Json(response).into_response(),
             Some(FinalResponse::Generate(_)) => {
-                utils::internal_error_static("Internal error: wrong response type")
+                error::internal_error("Internal error: wrong response type")
             }
-            None => utils::internal_error_static("No response produced"),
+            None => error::internal_error("No response produced"),
         }
     }
 
@@ -272,9 +272,9 @@ impl RequestPipeline {
         match ctx.state.response.final_response {
             Some(FinalResponse::Generate(response)) => axum::Json(response).into_response(),
             Some(FinalResponse::Chat(_)) => {
-                utils::internal_error_static("Internal error: wrong response type")
+                error::internal_error("Internal error: wrong response type")
             }
-            None => utils::internal_error_static("No response produced"),
+            None => error::internal_error("No response produced"),
         }
     }
 
@@ -303,7 +303,7 @@ impl RequestPipeline {
             match stage.execute(&mut ctx).await {
                 Ok(Some(_response)) => {
                     // Streaming not supported for responses sync mode
-                    return Err(utils::bad_request_error(
+                    return Err(error::bad_request(
                         "Streaming is not supported in this context".to_string(),
                     ));
                 }
@@ -360,10 +360,10 @@ impl RequestPipeline {
         // Extract final response
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => Ok(response),
-            Some(FinalResponse::Generate(_)) => Err(utils::internal_error_static(
-                "Internal error: wrong response type",
-            )),
-            None => Err(utils::internal_error_static("No response produced")),
+            Some(FinalResponse::Generate(_)) => {
+                Err(error::internal_error("Internal error: wrong response type"))
+            }
+            None => Err(error::internal_error("No response produced")),
         }
     }
 
@@ -384,7 +384,7 @@ impl RequestPipeline {
         _model_id: Option<String>,
         _components: Arc<SharedComponents>,
     ) -> Response {
-        utils::internal_error_static("Responses API execution not yet implemented")
+        error::internal_error("Responses API execution not yet implemented")
     }
 
     /// Execute Harmony Responses API request through all pipeline stages
@@ -451,7 +451,7 @@ impl RequestPipeline {
             .responses_iteration_result
             .take()
             .ok_or_else(|| {
-                utils::internal_error_static("No ResponsesIterationResult produced by pipeline")
+                error::internal_error("No ResponsesIterationResult produced by pipeline")
             })
     }
 
@@ -501,6 +501,6 @@ impl RequestPipeline {
             .response
             .execution_result
             .take()
-            .ok_or_else(|| utils::internal_error_static("No ExecutionResult produced by pipeline"))
+            .ok_or_else(|| error::internal_error("No ExecutionResult produced by pipeline"))
     }
 }

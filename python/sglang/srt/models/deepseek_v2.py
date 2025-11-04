@@ -39,11 +39,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    parallel_state,
     tensor_model_parallel_all_reduce,
-)
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -751,21 +747,14 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
-            if isinstance(
+            final_hidden_states = self.experts(hidden_states, topk_output)
+            if not _is_cuda or isinstance(
                 self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
             ):
-                topk_output.topk_weights.mul_(self.routed_scaling_factor)
-            final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-            final_hidden_states_out = torch.empty_like(final_hidden_states)
-
-        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-        final_hidden_states = final_hidden_states_out
-        sm.tag(final_hidden_states)
+        final_hidden_states += shared_output
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -824,11 +813,8 @@ class DeepseekV2MoE(nn.Module):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
-            with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-                final_hidden_states_out = torch.empty_like(final_hidden_states)
-            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-            final_hidden_states = final_hidden_states_out
-            sm.tag(final_hidden_states)
+            final_hidden_states += shared_output
+
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -1075,6 +1061,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         layer_id: int = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        skip_rope: bool = False,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1182,23 +1169,26 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
-        self.rotary_emb = get_rope_wrapper(
-            qk_rope_head_dim,
-            rotary_dim=qk_rope_head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            is_neox_style=False,
-            device=get_global_server_args().device,
-        )
+        if not skip_rope:
+            self.rotary_emb = get_rope_wrapper(
+                qk_rope_head_dim,
+                rotary_dim=qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+                is_neox_style=False,
+                device=get_global_server_args().device,
+            )
 
-        if rope_scaling:
-            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-            scaling_factor = rope_scaling["factor"]
-            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-            self.scaling = self.scaling * mscale * mscale
+            if rope_scaling:
+                mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+                scaling_factor = rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
+            else:
+                self.rotary_emb.forward = self.rotary_emb.forward_native
         else:
-            self.rotary_emb.forward = self.rotary_emb.forward_native
+            self.rotary_emb = None
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
@@ -1487,7 +1477,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         latent_cache = latent_cache.unsqueeze(1)
         kv_a = self.kv_a_layernorm(kv_a)
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        if self.rotary_emb is not None:
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
@@ -1646,8 +1637,10 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if not self._fuse_rope_for_trtllm_mla(forward_batch) and (
-            not _use_aiter or not _is_gfx95_supported or self.use_nsa
+        if (
+            self.rotary_emb is not None
+            and (not self._fuse_rope_for_trtllm_mla(forward_batch))
+            and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
