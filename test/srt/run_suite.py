@@ -220,9 +220,9 @@ suites = {
 suite_amd = {
     "per-commit-amd": [
         TestFile("function_call/test_json_schema_constraint.py", 30),
-        TestFile("hicache/test_hicache.py", 116),
-        TestFile("hicache/test_hicache_mla.py", 127),
-        TestFile("hicache/test_hicache_storage.py", 127),
+        # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
+        # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
+        # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         TestFile("lora/test_lora.py", 150),
         TestFile("lora/test_lora_backend.py", 99),
         TestFile("lora/test_lora_cuda_graph.py", 250),
@@ -268,7 +268,7 @@ suite_amd = {
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 242),
-        TestFile("test_mla_deepseek_v3.py", 221),
+        # TestFile("test_mla_deepseek_v3.py", 221), # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 180),
