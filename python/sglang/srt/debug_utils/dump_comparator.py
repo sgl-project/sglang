@@ -88,90 +88,6 @@ def main(args):
         print()
 
 
-# TODO allow configure via command line
-def _get_location_info_of_target_pass_id():
-    prefill_num_tokens = int(os.environ.get("ARG_PREFILL_NUM_TOKENS", "91"))
-    start_target_forward_pass_id = int(
-        os.environ.get("ARG_START_TARGET_FORWARD_PASS_ID", "5")
-    )
-    baseline_forward_pass_id = int(os.environ.get("ARG_BASELINE_FORWARD_PASS_ID", "1"))
-    location_info_mode = os.environ.get("ARG_LOCATION_INFO_MODE", "normal")
-
-    match location_info_mode:
-        case "normal":
-            return {
-                start_target_forward_pass_id
-                + i: dict(
-                    baseline_forward_pass_id=baseline_forward_pass_id,
-                    baseline_token_slice=(
-                        slice(0, prefill_num_tokens)
-                        if i == 0
-                        else slice(prefill_num_tokens + i - 1, prefill_num_tokens + i)
-                    ),
-                )
-                for i in range(2)
-            }
-        case "compute_logprobs":
-            return {
-                start_target_forward_pass_id
-                + i: dict(
-                    # it is another system
-                    baseline_forward_pass_id=0,
-                    baseline_token_slice=slice(
-                        prefill_num_tokens + i - 1, prefill_num_tokens + i
-                    ),
-                )
-                for i in range(2)
-            }
-
-
-# TODO allow configure via command line
-def _get_tensor_dim_descs():
-    return [
-        dict(
-            pattern="hidden_states|residual|logits",
-            baseline_desc="1 num_tokens hidden",
-            target_desc="num_tokens hidden",
-        ),
-        dict(
-            pattern="input_ids|position",
-            baseline_desc="1 num_tokens",
-            target_desc="num_tokens",
-        ),
-        dict(
-            pattern="(attn__(q_before_norm|k_before_norm))|attn_output",
-            baseline_desc="1 num_tokens num_heads head_dim",
-            target_desc="num_tokens (num_heads head_dim)",
-        ),
-        dict(
-            pattern="attn__(q|k|v)",
-            baseline_desc="1 num_heads num_tokens head_dim",
-            target_desc="num_tokens (num_heads head_dim)",
-        ),
-        dict(
-            pattern="rope__(sin|cos)",
-            baseline_desc="1 num_tokens head_dim",
-            target_desc="num_tokens head_dim",
-            baseline_cropper=lambda x: x[:, :64],
-        ),
-        dict(
-            pattern="rope__(input_q|input_k|output_q|output_k)",
-            baseline_desc="1 num_heads num_tokens head_dim",
-            target_desc="num_tokens (num_heads head_dim)",
-        ),
-        dict(
-            pattern="rmsnorm.*hidden.*mode=(q|k)",
-            baseline_desc="1 num_tokens num_heads head_dim",
-            target_desc="(num_tokens num_heads) head_dim",
-        ),
-        dict(
-            pattern="rmsnorm.*hidden",
-            baseline_desc="1 num_tokens head_dim",
-            target_desc="num_tokens head_dim",
-        ),
-    ]
-
-
 def _split_einops_pattern(pattern):
     return re.findall(r"\([^()]*\)|\S+", pattern)
 
@@ -333,17 +249,29 @@ def _calc_rel_diff(x: torch.Tensor, y: torch.Tensor):
     return 1 - sim
 
 
-def _comparison_preprocessor(x_baseline, x_target, name):
-    # can insert arbitrary adhoc postprocessing logic here
-    return x_baseline, x_target
-
-
 def _load_object(path):
     x = torch.load(path, weights_only=False)
     if not isinstance(x, torch.Tensor):
         print(f"Skip load {path} since {type(x)=} is not a Tensor ({x=})")
         return None
     return x.cuda()
+
+
+# TODO may make customization endpoints configurable via args pointing to code file
+def _comparison_preprocessor(x_baseline, x_target, name):
+    """Customization endpoint. Can insert arbitrary adhoc postprocessing logic here."""
+    return x_baseline, x_target
+
+
+def _get_location_info_of_target_pass_id():
+    """Customization endpoint."""
+    return {}
+
+
+def _get_tensor_dim_descs():
+    """Customization endpoint."""
+    return []
+
 
 
 if __name__ == "__main__":
