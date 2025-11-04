@@ -19,7 +19,7 @@ https://huggingface.co/FreedomIntelligence/openPangu-Embedded-7B-V1.1.
 
 The model is architecturally a decoder-only transformer that is largely
 compatible with LLaMA style blocks (RMSNorm + rotary attention +
-SwiGLU MLP). The key differences compared to some LLaMA variants are:
+SwiGLU MLP).  The key differences compared to some LLaMA variants are:
 
 * Attention and projection layers keep bias terms enabled (`config.bias=True`).
 * RoPE uses the large base value shipped with the official checkpoints
@@ -43,14 +43,6 @@ from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 class PanguEmbeddedModel(LlamaModel):
     """Thin wrapper that reuses the optimized LLaMA block composition."""
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(config, quant_config=quant_config, prefix=prefix)
-
 
 class PanguEmbeddedForCausalLM(LlamaForCausalLM):
     """Pangu Embedded decoder-only language model.
@@ -67,7 +59,7 @@ class PanguEmbeddedForCausalLM(LlamaForCausalLM):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-    ):
+    ) -> PanguEmbeddedModel:
         return PanguEmbeddedModel(config, quant_config=quant_config, prefix=prefix)
 
 
