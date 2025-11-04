@@ -19,6 +19,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
+    super::error,
     conversions,
     streaming::{OutputItemType, ResponseStreamEventEmitter},
 };
@@ -124,6 +125,7 @@ impl ToolLoopState {
         self.conversation_history
             .push(ResponseInputOutputItem::FunctionToolCall {
                 id: call_id.clone(),
+                call_id: call_id.clone(),
                 name: tool_name.clone(),
                 arguments: args_json_str.clone(),
                 output: Some(output_str.clone()),
@@ -160,19 +162,16 @@ fn build_mcp_list_tools_item(
     let tools = mcp.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
-        .map(|t| McpToolInfo {
-            name: t.name.clone(),
-            description: Some(t.description.clone()),
-            input_schema: t.parameters.clone().unwrap_or_else(|| {
-                json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                })
-            }),
-            annotations: Some(json!({
-                "read_only": false
-            })),
+        .map(|t| {
+            use serde_json::Value;
+            McpToolInfo {
+                name: t.name.to_string(),
+                description: t.description.as_ref().map(|d| d.to_string()),
+                input_schema: Value::Object((*t.input_schema).clone()),
+                annotations: Some(json!({
+                    "read_only": false
+                })),
+            }
         })
         .collect();
 
@@ -249,12 +248,8 @@ pub(super) async fn execute_tool_loop(
 
     loop {
         // Convert to chat request
-        let mut chat_request = conversions::responses_to_chat(&current_request).map_err(|e| {
-            crate::routers::grpc::utils::bad_request_error(format!(
-                "Failed to convert request: {}",
-                e
-            ))
-        })?;
+        let mut chat_request = conversions::responses_to_chat(&current_request)
+            .map_err(|e| error::bad_request(format!("Failed to convert request: {}", e)))?;
 
         // Add MCP tools to chat request so LLM knows about them
         chat_request.tools = Some(chat_tools.clone());
@@ -303,10 +298,7 @@ pub(super) async fn execute_tool_loop(
                     response_id.clone(),
                 )
                 .map_err(|e| {
-                    crate::routers::grpc::utils::internal_error_message(format!(
-                        "Failed to convert to responses format: {}",
-                        e
-                    ))
+                    error::internal_error(format!("Failed to convert to responses format: {}", e))
                 })?;
 
                 // Mark as completed but with incomplete details
@@ -425,10 +417,7 @@ pub(super) async fn execute_tool_loop(
                 response_id.clone(),
             )
             .map_err(|e| {
-                crate::routers::grpc::utils::internal_error_message(format!(
-                    "Failed to convert to responses format: {}",
-                    e
-                ))
+                error::internal_error(format!("Failed to convert to responses format: {}", e))
             })?;
 
             // Inject MCP metadata into output
@@ -593,14 +582,11 @@ async fn execute_tool_loop_streaming_internal(
             let tool_items: Vec<_> = mcp_tools
                 .iter()
                 .map(|t| {
+                    use serde_json::Value;
                     json!({
                         "name": t.name,
                         "description": t.description,
-                        "input_schema": t.parameters.clone().unwrap_or_else(|| json!({
-                            "type": "object",
-                            "properties": {},
-                            "required": []
-                        }))
+                        "input_schema": Value::Object((*t.input_schema).clone())
                     })
                 })
                 .collect();
@@ -925,21 +911,16 @@ async fn execute_tool_loop_streaming_internal(
 }
 
 /// Convert MCP tools to Chat API tool format
-fn convert_mcp_tools_to_chat_tools(mcp_tools: &[crate::mcp::ToolInfo]) -> Vec<Tool> {
+fn convert_mcp_tools_to_chat_tools(mcp_tools: &[crate::mcp::Tool]) -> Vec<Tool> {
+    use serde_json::Value;
     mcp_tools
         .iter()
         .map(|tool_info| Tool {
             tool_type: "function".to_string(),
             function: crate::protocols::common::Function {
-                name: tool_info.name.clone(),
-                description: Some(tool_info.description.clone()),
-                parameters: tool_info.parameters.clone().unwrap_or_else(|| {
-                    json!({
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    })
-                }),
+                name: tool_info.name.to_string(),
+                description: tool_info.description.as_ref().map(|d| d.to_string()),
+                parameters: Value::Object((*tool_info.input_schema).clone()),
                 strict: None,
             },
         })

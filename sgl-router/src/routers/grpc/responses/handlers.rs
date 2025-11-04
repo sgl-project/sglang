@@ -48,6 +48,7 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
+use validator::Validate;
 
 use super::{
     conversions,
@@ -66,7 +67,10 @@ use crate::{
             ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
-    routers::openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
+    routers::{
+        grpc::error,
+        openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
+    },
 };
 
 // ============================================================================
@@ -109,7 +113,32 @@ pub async fn route_responses(
         }
     }
 
-    // 1. Validate mutually exclusive parameters
+    // 1. Validate request (includes conversation ID format)
+    if let Err(validation_errors) = request.validate() {
+        // Extract the first error message for conversation field
+        let error_message = validation_errors
+            .field_errors()
+            .get("conversation")
+            .and_then(|errors| errors.first())
+            .and_then(|error| error.message.as_ref())
+            .map(|msg| msg.to_string())
+            .unwrap_or_else(|| "Invalid request parameters".to_string());
+
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": {
+                    "message": error_message,
+                    "type": "invalid_request_error",
+                    "param": "conversation",
+                    "code": "invalid_value"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    // 2. Validate mutually exclusive parameters
     if request.previous_response_id.is_some() && request.conversation.is_some() {
         return (
             StatusCode::BAD_REQUEST,
@@ -125,7 +154,7 @@ pub async fn route_responses(
             .into_response();
     }
 
-    // 2. Check for incompatible parameter combinations
+    // 3. Check for incompatible parameter combinations
     let is_streaming = request.stream.unwrap_or(false);
     let is_background = request.background.unwrap_or(false);
 
@@ -144,7 +173,7 @@ pub async fn route_responses(
             .into_response();
     }
 
-    // 3. Route based on execution mode
+    // 4. Route based on execution mode
     if is_streaming {
         route_responses_streaming(ctx, request, headers, model_id).await
     } else if is_background {
@@ -299,7 +328,8 @@ async fn route_responses_background(
         top_p: request.top_p,
         truncation: None,
         usage: None,
-        user: request.user.clone(),
+        user: None,
+        safety_identifier: request.user.clone(),
         metadata: request.metadata.clone().unwrap_or_default(),
     };
 
@@ -694,6 +724,7 @@ impl StreamingResponseAccumulator {
                     while self.tool_calls.len() <= index {
                         self.tool_calls.push(ResponseOutputItem::FunctionToolCall {
                             id: String::new(),
+                            call_id: String::new(),
                             name: String::new(),
                             arguments: String::new(),
                             output: None,
@@ -816,6 +847,7 @@ impl StreamingResponseAccumulator {
             truncation: None,
             usage,
             user: None,
+            safety_identifier: self.original_request.user.clone(),
             metadata: self.original_request.metadata.clone().unwrap_or_default(),
         }
     }
@@ -834,11 +866,9 @@ async fn execute_without_mcp(
     model_id: Option<String>,
     response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
-    use crate::routers::grpc::utils;
-
     // Convert ResponsesRequest → ChatCompletionRequest
     let chat_request = conversions::responses_to_chat(modified_request)
-        .map_err(|e| utils::bad_request_error(format!("Failed to convert request: {}", e)))?;
+        .map_err(|e| error::bad_request(format!("Failed to convert request: {}", e)))?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
     let chat_response = ctx
@@ -854,9 +884,8 @@ async fn execute_without_mcp(
         .await?; // Preserve the Response error as-is
 
     // Convert ChatCompletionResponse → ResponsesResponse
-    conversions::chat_to_responses(&chat_response, original_request, response_id).map_err(|e| {
-        utils::internal_error_message(format!("Failed to convert to responses format: {}", e))
-    })
+    conversions::chat_to_responses(&chat_response, original_request, response_id)
+        .map_err(|e| error::internal_error(format!("Failed to convert to responses format: {}", e)))
 }
 
 /// Load conversation history and response chains, returning modified request
@@ -928,33 +957,18 @@ async fn load_conversation_history(
     if let Some(ref conv_id_str) = request.conversation {
         let conv_id = ConversationId::from(conv_id_str.as_str());
 
-        // Auto-create conversation if it doesn't exist (OpenAI behavior)
-        if let Ok(None) = ctx.conversation_storage.get_conversation(&conv_id).await {
-            debug!(
-                "Creating new conversation with user-provided ID: {}",
+        // Check if conversation exists - return error if not found
+        let conversation = ctx
+            .conversation_storage
+            .get_conversation(&conv_id)
+            .await
+            .map_err(|e| error::internal_error(format!("Failed to check conversation: {}", e)))?;
+
+        if conversation.is_none() {
+            return Err(error::not_found(format!(
+                "Conversation '{}' not found. Please create the conversation first using the conversations API.",
                 conv_id_str
-            );
-
-            // Convert HashMap to JsonMap for metadata
-            let metadata = request.metadata.as_ref().map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<serde_json::Map<String, serde_json::Value>>()
-            });
-
-            let new_conv = crate::data_connector::NewConversation {
-                id: Some(conv_id.clone()), // Use user-provided conversation ID
-                metadata,
-            };
-            ctx.conversation_storage
-                .create_conversation(new_conv)
-                .await
-                .map_err(|e| {
-                    crate::routers::grpc::utils::internal_error_message(format!(
-                        "Failed to create conversation: {}",
-                        e
-                    ))
-                })?;
+            )));
         }
 
         // Load conversation history
