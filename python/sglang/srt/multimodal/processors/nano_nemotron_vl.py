@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -51,29 +52,38 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         self.norm_mean = hf_config.norm_mean
         self.norm_std = hf_config.norm_std
         self.use_thumbnail = hf_config.use_thumbnail
-        self.max_num_tiles = DEFAULT_NUM_TILES
 
-    def preprocess_image(self, image: Image.Image) -> torch.Tensor:
+    def preprocess_image(
+        self, image: Image.Image, *, max_num_tiles: int = DEFAULT_NUM_TILES
+    ) -> torch.Tensor:
         return image_to_pixel_values(
             image,
             input_size=self.image_size,
-            max_num_tiles=self.max_num_tiles,
+            max_num_tiles=max_num_tiles,
             use_thumbnail=self.use_thumbnail,
             mean=self.norm_mean,
             std=self.norm_std,
         ).to(dtype=torch.bfloat16)
 
+    def select_frames(
+        self, video: "VideoReader", num_frames: int = 32
+    ):  # TODO: allow num frames to be configurable
+        total_frames = len(video)
+        return np.linspace(0, total_frames - 1, num_frames, dtype=int)
+
     def preprocess_video(self, video: "VideoReader"):
-        assert self.max_num_tiles == 1, "Video modality always uses one tile"
-        frames_tensors = []
-        for frame in video:
-            frames_tensors.append(
-                self.preprocess_image(Image.fromarray(frame.asnumpy(), mode="RGB"))
-            )
+        frames = self.select_frames(video)
+        video_array = video.get_batch(frames).asnumpy()
+        assert isinstance(video_array, np.ndarray), "Video array must be a numpy array"
+        frames_tensors = [
+            self.preprocess_image(Image.fromarray(frame, mode="RGB"), max_num_tiles=1)
+            for frame in video_array
+        ]
+        processed_video = torch.cat(frames_tensors, dim=0)
         fps = video.get_avg_fps()
         assert isinstance(fps, float), "FPS must be a float"
-        timestamps = [i / fps for i in range(len(video))]
-        return torch.cat(frames_tensors), timestamps
+        timestamps = [frame / fps for frame in frames]
+        return processed_video, timestamps
 
     def enhance_input_text(self, input_text: str, context_token: str, seqs: list[str]):
         placeholder = "<<TEMP_PLACEHOLDER>>"
@@ -94,15 +104,18 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         return concatenated_images, input_text
 
     def produce_video_feature(self, videos: "list[VideoReader]", input_text: str):
-        preprocessed_videos, timestamps = zip(
-            *[self.preprocess_video(video) for video in videos]
-        )
-        seqs = [
-            f"Frame {i + 1} sampled at {timestamp:.2f} seconds: {self.IMG_START_TOKEN}{self.VIDEO_CONTEXT_TOKEN * self.num_image_token}{self.IMG_END_TOKEN}"
-            for i, timestamp in enumerate(timestamps)
-        ]
+        preprocessed_videos = []
+        for video in videos:
+            preprocessed_video, timestamps = self.preprocess_video(video)
+            preprocessed_videos.append(preprocessed_video)
+            seqs = [
+                f"Frame {i + 1} sampled at {timestamp:.2f} seconds: {self.IMG_START_TOKEN}{self.VIDEO_CONTEXT_TOKEN * self.num_image_token}{self.IMG_END_TOKEN}"
+                for i, timestamp in enumerate(timestamps)
+            ]
+            input_text = self.enhance_input_text(
+                input_text, self.VIDEO_CONTEXT_TOKEN, seqs
+            )
         concatenated_videos = torch.cat(preprocessed_videos, dim=0)
-        input_text = self.enhance_input_text(input_text, self.VIDEO_CONTEXT_TOKEN, seqs)
         return concatenated_videos, input_text
 
     async def process_mm_data_async(
