@@ -483,7 +483,7 @@ class CudaGraphRunner:
             for stream_group in self.stream_groups:
                 decode_stream_groups.append(stream_group[1])
         else:
-            decode_stream_groups.append(torch.cuda.Stream())
+            decode_stream_groups.append(None)
         num_stream = len(decode_stream_groups)
         for stream_idx in range(num_stream):
             with freeze_gc(
