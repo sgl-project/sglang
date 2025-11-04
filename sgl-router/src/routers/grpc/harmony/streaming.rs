@@ -561,6 +561,8 @@ impl HarmonyStreamingProcessor {
         // Metadata from Complete message
         let mut finish_reason = String::from("stop");
         let mut matched_stop: Option<serde_json::Value> = None;
+        let mut prompt_tokens: u32 = 0;
+        let mut completion_tokens: u32 = 0;
 
         // Process stream
         let mut chunk_count = 0;
@@ -704,12 +706,14 @@ impl HarmonyStreamingProcessor {
                     finish_reason = complete.finish_reason.clone();
                     matched_stop = complete.matched_stop.as_ref().map(|m| match m {
                         MatchedTokenId(id) => {
-                            serde_json::json!(id)
+                            json!(id)
                         }
                         MatchedStopStr(s) => {
-                            serde_json::json!(s)
+                            json!(s)
                         }
                     });
+                    prompt_tokens = complete.prompt_tokens as u32;
+                    completion_tokens = complete.completion_tokens as u32;
 
                     // Finalize parser and get complete output
                     let final_output = parser
@@ -848,6 +852,13 @@ impl HarmonyStreamingProcessor {
                     tool_calls,
                     analysis: analysis_content,
                     partial_text: accumulated_final_text,
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                        completion_tokens_details: None,
+                    },
+                    request_id: emitter.response_id.clone(),
                 });
             }
         }
@@ -857,7 +868,7 @@ impl HarmonyStreamingProcessor {
         // Return a placeholder Completed result (caller ignores these fields in streaming mode)
         Ok(ResponsesIterationResult::Completed {
             response: Box::new(ResponsesResponse {
-                id: String::new(),
+                id: emitter.response_id.clone(),
                 object: "response".to_string(),
                 created_at: 0,
                 status: ResponseStatus::Completed,
@@ -881,17 +892,17 @@ impl HarmonyStreamingProcessor {
                 safety_identifier: None,
                 metadata: HashMap::new(),
                 usage: Some(ResponsesUsage::Modern(ResponseUsage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    total_tokens: 0,
+                    input_tokens: prompt_tokens,
+                    output_tokens: completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
                     input_tokens_details: None,
                     output_tokens_details: None,
                 })),
             }),
             usage: Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
                 completion_tokens_details: None,
             },
         })
