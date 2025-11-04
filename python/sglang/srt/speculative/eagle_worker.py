@@ -1009,7 +1009,7 @@ class EAGLEWorker(TpModelWorker):
         assert forward_batch.spec_info is batch.spec_info
 
         # Prepare for decoding
-        forward_batch.spec_info.prepare_for_decode(logits_output, self.topk)
+        forward_batch.spec_info.prepare_draft_root(logits_output, self.topk)
 
         has_finished, unfinished_req_index = False, []
         for i, req in enumerate(batch.reqs):
@@ -1100,7 +1100,7 @@ class EAGLEWorker(TpModelWorker):
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             )
-            forward_batch.spec_info.prepare_for_decode(logits_output, self.topk)
+            forward_batch.spec_info.prepare_draft_root(logits_output, self.topk)
 
         self._detect_nan_if_needed(logits_output)
 

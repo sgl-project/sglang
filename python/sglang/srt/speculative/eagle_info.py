@@ -616,7 +616,7 @@ class EagleDraftInput(SpecInput):
             )
             pt += extend_len
 
-    def prepare_for_decode(
+    def prepare_draft_root(
         self, logits_output: LogitsProcessorOutput, topk: int
     ):
         logprobs = torch.nn.functional.log_softmax(logits_output.next_token_logits, dim=-1)
