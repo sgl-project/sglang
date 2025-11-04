@@ -1,4 +1,6 @@
-import kvpress
+# Code adapted from https://github.com/NVIDIA/kvpress
+# To integrate with SGLang, the hooks of the base class have to be modified
+# And all the subclasses of compression methods should inherit from the modified base
 
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
