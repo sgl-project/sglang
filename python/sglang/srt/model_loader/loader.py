@@ -1006,12 +1006,13 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         
         This method:
         1. Preserves critical module attributes (RoPE caches, workspace, etc.)
-        2. Resets parameters to pre-quantization state
-        3. Restores weight loader functions
-        4. Loads updated weights
-        5. Re-quantizes weights using FAST PATH (skips expensive operations)
-        6. Copies quantized weights back to original memory locations
-        7. Restores preserved module attributes
+        2. Determines which parameters will be updated
+        3. Resets ONLY updated parameters to pre-quantization state
+        4. Restores weight loader functions for updated parameters
+        5. Loads updated weights
+        6. Re-quantizes weights using FAST PATH (skips expensive operations)
+        7. Copies quantized weights back to original memory locations
+        8. Restores preserved module attributes
         
         Args:
             model: The model to reload weights into
@@ -1037,58 +1038,107 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         # Preserve non-tensor attributes as-is
                         preserved_attributes[preserve_key] = attr_value
 
-        # Step 2: Save current parameter data (quantized state)
-        # Don't keep references to old data to avoid memory leak
+        # Step 2: Determine which parameters will be updated by peeking at weights
+        # Convert weights to list so we can iterate multiple times
+        weights_list = list(weights)
+        updated_param_names = set()
+        
+        # Use the model's weight loading logic to determine updated params
+        # This matches what the actual load will do
+        for name, _ in weights_list:
+            # Apply the same filtering logic as _load_weights_impl
+            from sglang.srt.layers.utils import get_layer_id
+            
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(model, "start_layer")
+                and (
+                    layer_id < model.start_layer
+                    or layer_id >= model.end_layer
+                )
+            ):
+                continue
+            
+            if "rotary_emb.inv_freq" in name or "projector" in name:
+                continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                continue
+            if hasattr(model, 'config') and model.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
+            
+            # Handle stacked params mapping
+            stacked_mapping = {
+                "q_proj": "qkv_proj",
+                "k_proj": "qkv_proj", 
+                "v_proj": "qkv_proj",
+                "gate_proj": "gate_up_proj",
+                "up_proj": "gate_up_proj",
+            }
+            
+            param_name = name
+            for weight_name, param_name_mapped in stacked_mapping.items():
+                if weight_name in name:
+                    param_name = name.replace(weight_name, param_name_mapped)
+                    break
+            
+            updated_param_names.add(param_name)
+        
+        logger.info(f"Identified {len(updated_param_names)} parameters to update")
+
+        # Step 3: Save current parameter data (quantized state) - ONLY for updated params
         existing_params = dict(model.named_parameters())
         current_param_data = {}
-        for name, p in existing_params.items():
-            # Just save the shape/dtype info, not the actual data tensor
-            # This avoids keeping references to large tensors
-            current_param_data[name] = {
-                'data': p.data,
-                'shape': p.data.shape,
-                'dtype': p.data.dtype,
-                'device': p.data.device,
-            }
-
-        # Step 3: Reset parameters to pre-quantization state
-        for name, rebuild_info in model.original_weights_rebuild_keys.items():
+        for name in updated_param_names:
             if name in existing_params:
-                existing_params[name].data = torch.empty(
+                p = existing_params[name]
+                current_param_data[name] = {
+                    'data': p.data,
+                    'shape': p.data.shape,
+                    'dtype': p.data.dtype,
+                    'device': p.data.device,
+                }
+
+        # Step 4: Reset parameters to pre-quantization state - ONLY updated parameters
+        for name, rebuild_info in model.original_weights_rebuild_keys.items():
+            if name in updated_param_names and name in existing_params:
+                # Clone and create strided view to preserve memory layout
+                existing_params[name].data = torch.as_strided(
+                    existing_params[name].data.clone(),
                     rebuild_info["shape"],
-                    dtype=rebuild_info["dtype"],
-                    device=existing_params[name].device,
+                    rebuild_info["stride"],
                 )
 
-        # Step 4: Restore weight loader functions
-        # Always restore, even if attribute exists, to ensure correct binding after parameter reset
+        # Step 5: Restore weight loader functions - ONLY for updated parameters
         for k, loader_dict in model.recorded_loader.items():
             for param_name, loader in loader_dict.items():
-                if param_name in existing_params:
+                # Only rebind if parameter will be updated AND doesn't have the attribute
+                if param_name in updated_param_names and param_name in existing_params:
                     param = existing_params[param_name]
-                    # Bind method to parameter if it's a function
-                    if callable(loader):
-                        # If the loader is already a bound method (to a module, not the parameter),
-                        # keep it as is. Only rebind if it's an unbound function or needs rebinding to param.
-                        if hasattr(loader, "__self__"):
-                            # Already bound (likely to the module), keep as is
-                            setattr(param, k, loader)
+                    if not hasattr(param, k):
+                        # Bind method to parameter if it's a function
+                        if callable(loader):
+                            # If the loader is already a bound method (to a module, not the parameter),
+                            # keep it as is. Only rebind if it's an unbound function or needs rebinding to param.
+                            if hasattr(loader, "__self__"):
+                                # Already bound (likely to the module), keep as is
+                                setattr(param, k, loader)
+                            else:
+                                # Unbound function, bind to parameter
+                                setattr(
+                                    param,
+                                    k,
+                                    QuantizedRLModelLoader._bond_method_to_cls(
+                                        loader, param
+                                    ),
+                                )
                         else:
-                            # Unbound function, bind to parameter
-                            setattr(
-                                param,
-                                k,
-                                QuantizedRLModelLoader._bond_method_to_cls(
-                                    loader, param
-                                ),
-                            )
-                    else:
-                        setattr(param, k, loader)
+                            setattr(param, k, loader)
 
-        # Step 5: Load updated weights (this will call the weight loaders)
-        updated_params = first_time_load_weights(weights)
+        # Step 6: Load updated weights (this will call the weight loaders)
+        updated_params = first_time_load_weights(iter(weights_list))
 
-        # Step 6: FAST PATH re-quantization - selectively process weights
+        # Step 7: FAST PATH re-quantization - selectively process weights
         # Skip expensive operations that don't need to be repeated on reload
         target_device = next(model.parameters()).device
         quant_type = getattr(model, "quantized_rl_quant_type", None)
@@ -1097,13 +1147,17 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             model, target_device, quant_type
         )
 
-        # Step 7: Copy quantized weights back to original memory locations
+        # Step 8: Copy quantized weights back to original memory locations - ONLY updated params
         params_copied = 0
-        for name, p in model.named_parameters():
+        for name in updated_param_names:
             if name not in current_param_data:
-                logger.warning(f"New parameter {name} appeared during reload")
+                continue
+            
+            if name not in existing_params:
+                logger.warning(f"Parameter {name} disappeared during reload")
                 continue
 
+            p = existing_params[name]
             old_info = current_param_data[name]
             old_data = old_info['data']
 
@@ -1119,21 +1173,20 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 )
                 continue
 
-            # Copy to original location if this parameter was updated
-            if name in updated_params:
-                try:
-                    # Create strided view matching original layout
-                    strided_data = torch.as_strided(
-                        p.data, old_data.shape, old_data.stride()
-                    )
-                    old_data.copy_(strided_data)
-                    params_copied += 1
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to copy parameter {name} to original location: {e}"
-                    )
-                    # Fall back to direct clone
-                    old_data = p.data.clone()
+            # Copy to original location
+            try:
+                # Create strided view matching original layout
+                strided_data = torch.as_strided(
+                    p.data, old_data.shape, old_data.stride()
+                )
+                old_data.copy_(strided_data)
+                params_copied += 1
+            except Exception as e:
+                logger.warning(
+                    f"Failed to copy parameter {name} to original location: {e}"
+                )
+                # Fall back to direct copy
+                old_data.copy_(p.data)
 
             # Restore original data pointer
             p.data = old_data
@@ -1144,7 +1197,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         gc.collect()
         torch.cuda.empty_cache()
 
-        # Step 8: Restore preserved module attributes
+        # Step 9: Restore preserved module attributes
         if preserved_attributes:
             for module_name, module in model.named_modules():
                 for attr_name in QuantizedRLModelLoader.PRESERVED_MODULE_ATTRIBUTES:
