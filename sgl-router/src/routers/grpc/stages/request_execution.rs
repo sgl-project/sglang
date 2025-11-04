@@ -5,12 +5,14 @@ use axum::response::Response;
 
 use super::PipelineStage;
 use crate::{
-    grpc_client::proto,
+    grpc_client::{proto, sglang_scheduler::AbortOnDropStream},
     routers::grpc::{
         context::{ClientSelection, ExecutionResult, RequestContext},
-        utils,
+        error,
     },
 };
+
+type StreamResult = Result<AbortOnDropStream, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Request execution stage: Execute gRPC requests (single or dual dispatch)
 pub struct RequestExecutionStage {
@@ -37,13 +39,13 @@ impl PipelineStage for RequestExecutionStage {
             .state
             .proto_request
             .take()
-            .ok_or_else(|| utils::internal_error_static("Proto request not built"))?;
+            .ok_or_else(|| error::internal_error("Proto request not built"))?;
 
         let clients = ctx
             .state
             .clients
             .as_mut()
-            .ok_or_else(|| utils::internal_error_static("Client acquisition not completed"))?;
+            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
 
         let result = match self.mode {
             ExecutionMode::Single => self.execute_single(proto_request, clients).await?,
@@ -70,11 +72,12 @@ impl RequestExecutionStage {
     ) -> Result<ExecutionResult, Response> {
         let client = clients
             .single_mut()
-            .ok_or_else(|| utils::internal_error_static("Expected single client but got dual"))?;
+            .ok_or_else(|| error::internal_error("Expected single client but got dual"))?;
 
-        let stream = client.generate(proto_request).await.map_err(|e| {
-            utils::internal_error_message(format!("Failed to start generation: {}", e))
-        })?;
+        let stream = client
+            .generate(proto_request)
+            .await
+            .map_err(|e| error::internal_error(format!("Failed to start generation: {}", e)))?;
 
         Ok(ExecutionResult::Single { stream })
     }
@@ -86,12 +89,12 @@ impl RequestExecutionStage {
     ) -> Result<ExecutionResult, Response> {
         let (prefill_client, decode_client) = clients
             .dual_mut()
-            .ok_or_else(|| utils::internal_error_static("Expected dual clients but got single"))?;
+            .ok_or_else(|| error::internal_error("Expected dual clients but got single"))?;
 
         let prefill_request = proto_request.clone();
         let decode_request = proto_request;
 
-        let (prefill_result, decode_result) = tokio::join!(
+        let (prefill_result, decode_result): (StreamResult, StreamResult) = tokio::join!(
             prefill_client.generate(prefill_request),
             decode_client.generate(decode_request)
         );
@@ -100,7 +103,7 @@ impl RequestExecutionStage {
         let prefill_stream = match prefill_result {
             Ok(s) => s,
             Err(e) => {
-                return Err(utils::internal_error_message(format!(
+                return Err(error::internal_error(format!(
                     "Prefill worker failed to start: {}",
                     e
                 )));
@@ -111,7 +114,7 @@ impl RequestExecutionStage {
         let decode_stream = match decode_result {
             Ok(s) => s,
             Err(e) => {
-                return Err(utils::internal_error_message(format!(
+                return Err(error::internal_error(format!(
                     "Decode worker failed to start: {}",
                     e
                 )));

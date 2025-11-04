@@ -196,7 +196,7 @@ fi
 # Python tools
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     datamodel_code_generator \
-    mooncake-transfer-engine==0.3.6.post1 \
+    mooncake-transfer-engine==0.3.7.post1 \
     pre-commit \
     pytest \
     black \
