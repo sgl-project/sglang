@@ -389,42 +389,47 @@ def create_accept_length_filter(
 @torch.compile(dynamic=True)
 def select_top_k_tokens(
     i: int,
-    topk_p: torch.Tensor,
+    topk_logp: torch.Tensor,
     topk_index: torch.Tensor,
     hidden_states: torch.Tensor,
-    scores: torch.Tensor,
+    scores: None | torch.Tensor,
     topk: int,
 ):
     if i == 0:
         # The first step after extend
-        input_ids = topk_index.flatten()
-        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
-        scores = topk_p  # shape: (b, topk)
-
+        input_ids = topk_index.flatten() # conventionally downstream models expects flatten ids
+        hidden_states = hidden_states.repeat_interleave(topk, dim=0) # shape: (b, topk)
+        # assert scores is None
+        scores = topk_logp # shape: (b, topk)
+        init_parents = torch.arange(-1, topk, dtype=torch.long, device="cuda")
+        bs = topk_logp.shape[0]
         tree_info = (
-            topk_p.unsqueeze(1),  # shape: (b, 1, topk)
-            topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device="cuda")
-            .unsqueeze(0)
-            .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
+            topk_logp.unsqueeze(1), # shape: (b, 1, topk), root is the single parent
+            topk_index, # shape: (b, topk)
+            init_parents.unsqueeze(0).repeat(bs, 1) # shape: (b, topk)
         )
     else:
         # The later decode steps
-        expand_scores = torch.mul(
-            scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
-        )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
-        topk_cs_p, topk_cs_index = fast_topk(
-            expand_scores.flatten(start_dim=1), topk, dim=-1
-        )  # (b, topk)
-        scores = topk_cs_p  # shape: (b, topk)
+        topk_logp = topk_logp.reshape(-1, topk, topk) # restore batched shape
+        topk_index = topk_index.reshape(-1, topk**2) # flatten batched shape
 
-        topk_index = topk_index.reshape(-1, topk**2)
+        expand_scores = scores.unsqueeze(-1) + topk_logp # update path scores, shape: (b, topk, topk)
+        scores, topk_cs_index = fast_topk(
+            expand_scores.flatten(start_dim=1), topk, dim=-1
+        )  # both outputs are of shape (b, topk)
+
+        # flatten input_ids to be passed to the downstream draft model
         input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
 
-        if hidden_states.shape[0] > 0:
-            selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-                0, hidden_states.shape[0], step=topk, device="cuda"
-            ).repeat_interleave(topk)
+        # select corresponding candidates by their rows
+        selected_input_index = topk_cs_index.flatten() // topk
+        if hidden_states.shape[0] > topk:
+            # batched
+            bs = topk_logp.shape[0]
+            offset = torch.arange(0, bs * topk, step=topk, device="cuda").repeat_interleave(topk)
+            hidden_states = hidden_states[selected_input_index + offset, :]
+        else:
+            # single
             hidden_states = hidden_states[selected_input_index, :]
 
         tree_info = (

@@ -733,8 +733,8 @@ class EAGLEWorker(TpModelWorker):
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         out_cache_loc = forward_batch.out_cache_loc
-        topk_p, topk_index, hidden_states = (
-            spec_info.topk_p,
+        topk_logp, topk_index, hidden_states = (
+            spec_info.topk_logp,
             spec_info.topk_index,
             spec_info.hidden_states,
         )
@@ -757,7 +757,7 @@ class EAGLEWorker(TpModelWorker):
         scores = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
+                i, topk_logp, topk_index, hidden_states, scores, self.topk
             )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
@@ -786,9 +786,10 @@ class EAGLEWorker(TpModelWorker):
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             )
+
             self._detect_nan_if_needed(logits_output)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            logprobs = torch.nn.functional.log_softmax(logits_output.next_token_logits, dim=-1)
+            topk_logp, topk_index = fast_topk(logprobs, self.topk, dim=-1)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -1006,7 +1007,10 @@ class EAGLEWorker(TpModelWorker):
         self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+
+        # Prepare for decoding
+        forward_batch.spec_info.prepare_for_decode(logits_output, self.topk)
+
         has_finished, unfinished_req_index = False, []
         for i, req in enumerate(batch.reqs):
             if req.finished():
@@ -1017,7 +1021,7 @@ class EAGLEWorker(TpModelWorker):
             unfinished_index_device = torch.tensor(
                 unfinished_req_index,
                 dtype=torch.int64,
-                device=batch.spec_info.topk_p.device,
+                device=batch.spec_info.topk_logp.device,
             )
             batch.spec_info.filter_batch(
                 unfinished_index_device, has_been_filtered=False
@@ -1082,8 +1086,8 @@ class EAGLEWorker(TpModelWorker):
             logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                 forward_batch
             )
-            forward_batch.spec_info.topk_p, forward_batch.spec_info.topk_index = (
-                logits_output.topk_p,
+            forward_batch.spec_info.topk_logp, forward_batch.spec_info.topk_index = (
+                logits_output.topk_logp,
                 logits_output.topk_index,
             )
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
@@ -1096,7 +1100,7 @@ class EAGLEWorker(TpModelWorker):
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             )
-            self.capture_for_decode(logits_output, forward_batch.spec_info)
+            forward_batch.spec_info.prepare_for_decode(logits_output, self.topk)
 
         self._detect_nan_if_needed(logits_output)
 
@@ -1110,13 +1114,6 @@ class EAGLEWorker(TpModelWorker):
         batch.req_pool_indices = req_pool_indices_backup
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
-
-    def capture_for_decode(
-        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
-    ):
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
-        draft_input.hidden_states = logits_output.hidden_states
 
     def _detect_nan_if_needed(self, logits_output: LogitsProcessorOutput):
         if self.enable_nan_detection:

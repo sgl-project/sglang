@@ -131,10 +131,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
             b = len(self.reqs)
             topk = server_args.speculative_eagle_topk
-            topk_p = torch.stack(
+            topk_logp = torch.stack(
                 [
                     torch.as_tensor(
-                        req.output_topk_p[:topk],
+                        req.output_topk_logp[:topk],
                         device=self.device,
                         dtype=torch.float32,
                     )
@@ -161,7 +161,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             from sglang.srt.speculative.eagle_info import EagleDraftInput
 
             spec_info = EagleDraftInput(
-                topk_p=topk_p,
+                topk_logp=topk_logp,
                 topk_index=topk_index,
                 hidden_states=hidden_states,
                 verified_id=self.output_ids,

@@ -29,6 +29,7 @@ from sglang.srt.speculative.spec_utils import (
     filter_finished_cache_loc_kernel,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
+    fast_topk,
 )
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
@@ -566,7 +567,7 @@ class EagleVerifyInput(SpecInput):
 class EagleDraftInput(SpecInput):
     # The inputs for decode
     # shape: (b, topk)
-    topk_p: torch.Tensor = None
+    topk_logp: torch.Tensor = None
     topk_index: torch.Tensor = None
     # shape: (b, hidden_size)
     hidden_states: torch.Tensor = None
@@ -615,6 +616,13 @@ class EagleDraftInput(SpecInput):
             )
             pt += extend_len
 
+    def prepare_for_decode(
+        self, logits_output: LogitsProcessorOutput, topk: int
+    ):
+        logprobs = torch.nn.functional.log_softmax(logits_output.next_token_logits, dim=-1)
+        self.topk_logp, self.topk_index = fast_topk(logprobs, topk, dim=-1)
+        self.hidden_states = logits_output.hidden_states
+
     @classmethod
     def create_idle_input(
         cls,
@@ -627,7 +635,7 @@ class EagleDraftInput(SpecInput):
         return cls(
             verified_id=torch.empty((0,), device=device, dtype=torch.int32),
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
-            topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
+            topk_logp=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
             accept_length=torch.empty((0,), device=device, dtype=torch.int32),
@@ -701,17 +709,17 @@ class EagleDraftInput(SpecInput):
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
-            if len(new_indices) != len(self.topk_p):
+            if len(new_indices) != len(self.topk_logp):
                 logger.warning(
-                    f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
+                    f"length of new_indices: {len(new_indices)} != length of topk_logp: {len(self.topk_logp)}, this should not happen"
                 )
-            self.topk_p = self.topk_p[: len(new_indices)]
+            self.topk_logp = self.topk_logp[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
-            self.topk_p = self.topk_p[new_indices]
+            self.topk_logp = self.topk_logp[new_indices]
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
@@ -720,7 +728,7 @@ class EagleDraftInput(SpecInput):
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id
-            self.topk_p = spec_info.topk_p
+            self.topk_logp = spec_info.topk_logp
             self.topk_index = spec_info.topk_index
             return
         if spec_info.hidden_states is None:
@@ -729,7 +737,7 @@ class EagleDraftInput(SpecInput):
             [self.hidden_states, spec_info.hidden_states], axis=0
         )
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
-        self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
+        self.topk_logp = torch.cat([self.topk_logp, spec_info.topk_logp])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
 
 
