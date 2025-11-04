@@ -25,6 +25,9 @@ def parse(lines):
     df = df.with_columns(
         pl.col("pid").cast(pl.Int64),
         pl.col("ts").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S"),
+        pl.col("dp").cast(pl.Int64),
+        pl.col("tp").cast(pl.Int64),
+        pl.col("pp").cast(pl.Int64),
         pl.col("running").cast(pl.Int64),
         pl.col("token").cast(pl.Int64),
         pl.col("token_usage").cast(pl.Float64),
