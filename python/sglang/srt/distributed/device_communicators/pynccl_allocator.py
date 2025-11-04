@@ -6,7 +6,6 @@ import torch
 from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.server_args import get_global_server_args
 
 nccl_allocator_source = """
 
@@ -61,6 +60,9 @@ _cur_device = None
 
 
 def is_symmetric_memory_enabled():
+    # Import here to avoid circular import
+    from sglang.srt.server_args import get_global_server_args
+
     return get_global_server_args().enable_symm_mem
 
 
