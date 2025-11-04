@@ -9,11 +9,11 @@
 
 use crate::protocols::{
     chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, UserMessageContent},
-    common::{FunctionCallResponse, StreamOptions, Tool, ToolCall, UsageInfo},
+    common::{FunctionCallResponse, StreamOptions, ToolCall, UsageInfo},
     responses::{
         ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-        ResponseReasoningContent::ReasoningText, ResponseStatus, ResponseTool, ResponseToolType,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage, StringOrContentParts,
+        ResponseReasoningContent::ReasoningText, ResponseStatus, ResponsesRequest,
+        ResponsesResponse, ResponsesUsage, StringOrContentParts,
     },
 };
 
@@ -206,11 +206,6 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
     // 3. Build ChatCompletionRequest
     let is_streaming = req.stream.unwrap_or(false);
 
-    // Convert function tools if present (filter out MCP tools)
-    let chat_tools = req.tools.as_ref().map(|response_tools| {
-        convert_response_tools_to_chat_tools(response_tools)
-    }).filter(|tools| !tools.is_empty());
-
     Ok(ChatCompletionRequest {
         messages,
         model: if req.model.is_empty() {
@@ -231,9 +226,10 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
         parallel_tool_calls: req.parallel_tool_calls,
         top_logprobs: req.top_logprobs,
         top_p: req.top_p,
-        skip_special_tokens: true,
-        tools: chat_tools,
-        tool_choice: req.tool_choice.clone(),
+        skip_special_tokens: true, // Always skip special tokens // TODO: except for gpt-oss
+        // Note: tools and tool_choice will be handled separately for MCP transformation
+        tools: None,       // Will be set by caller if needed
+        tool_choice: None, // Will be set by caller if needed
         ..Default::default()
     })
 }
@@ -367,27 +363,6 @@ pub fn chat_to_responses(
         safety_identifier: original_req.user.clone(),
         metadata: original_req.metadata.clone().unwrap_or_default(),
     })
-}
-
-/// Convert ResponseTools to Chat API tools
-///
-/// Converts function tools from Responses API format to Chat API format.
-/// MCP tools are filtered out (they should be handled separately via MCP loop).
-pub fn convert_response_tools_to_chat_tools(response_tools: &[ResponseTool]) -> Vec<Tool> {
-    response_tools
-        .iter()
-        .filter_map(|rt| {
-            // Only convert function tools (not MCP, web_search, etc.)
-            if matches!(rt.r#type, ResponseToolType::Function) {
-                rt.function.as_ref().map(|func| Tool {
-                    tool_type: "function".to_string(),
-                    function: func.clone(),
-                })
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
