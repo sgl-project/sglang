@@ -38,7 +38,9 @@ def init_mooncake_custom_mem_pool(
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
-    enable_custom_mem_pool, custom_mem_pool_type = check_mooncake_custom_mem_pool_enabled()
+    enable_custom_mem_pool, custom_mem_pool_type = (
+        check_mooncake_custom_mem_pool_enabled()
+    )
 
     custom_mem_pool = None
 
@@ -98,7 +100,9 @@ def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
         # Handle boolean True as NVLINK
         if custom_mem_pool_type.lower() == "true":
             custom_mem_pool_type = "NVLINK"
-        enable_custom_mem_pool = custom_mem_pool_type in SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES
+        enable_custom_mem_pool = (
+            custom_mem_pool_type in SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES
+        )
     else:
         enable_custom_mem_pool = False
         custom_mem_pool_type = None
