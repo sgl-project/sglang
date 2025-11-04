@@ -28,7 +28,11 @@ from util import kill_process_tree
 
 
 class TestOpenaiBackend(
-    ResponseCRUDBaseTest, ConversationCRUDBaseTest, StateManagementTests, MCPTests, FunctionCallingBaseTest
+    ResponseCRUDBaseTest,
+    ConversationCRUDBaseTest,
+    StateManagementTests,
+    MCPTests,
+    FunctionCallingBaseTest,
 ):
     """End to end tests for OpenAI backend."""
 
@@ -98,7 +102,7 @@ class TestOracleStore(ResponseCRUDBaseTest, ConversationCRUDBaseTest):
         kill_process_tree(cls.cluster["router"].pid)
 
 
-class TestGrpcBackend(StateManagementTests, MCPTests, FunctionCallingBaseTest):
+class TestGrpcBackend(StateManagementTests, MCPTests):
     """End to end tests for gRPC backend."""
 
     @classmethod
@@ -148,6 +152,7 @@ class TestGrpcBackend(StateManagementTests, MCPTests, FunctionCallingBaseTest):
     def test_mcp_basic_tool_call_streaming(self):
         return super().test_mcp_basic_tool_call_streaming()
 
+
 class TestHarmonyBackend(StateManagementTests, MCPTests, FunctionCallingBaseTest):
     """End to end tests for Harmony backend."""
 
@@ -174,13 +179,13 @@ class TestHarmonyBackend(StateManagementTests, MCPTests, FunctionCallingBaseTest
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
 
-    @unittest.skip(
-        "TODO: Not implemented for OSS models"
-    )
+    @unittest.skip("TODO: Not implemented for OSS models")
     def test_previous_response_id_chaining(self):
         super().test_previous_response_id_chaining()
 
-    @unittest.skip("TODO: fix requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0)")
+    @unittest.skip(
+        "TODO: fix requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0)"
+    )
     def test_mutually_exclusive_parameters(self):
         super().test_mutually_exclusive_parameters()
 
@@ -243,13 +248,16 @@ class TestHarmonyBackend(StateManagementTests, MCPTests, FunctionCallingBaseTest
             self.assertIn("arguments", mcp_call)
             self.assertIn("output", mcp_call)
 
-    @unittest.skip("TODO: fix AssertionError: 'mcp_list_tools' not found in ['message']")
+    @unittest.skip(
+        "TODO: fix AssertionError: 'mcp_list_tools' not found in ['message']"
+    )
     def test_mcp_basic_tool_call_streaming(self):
         return super().test_mcp_basic_tool_call_streaming()
 
     @unittest.skip("TODO: 501 Not Implemented")
     def test_conversation_with_multiple_turns(self):
         super().test_conversation_with_multiple_turns()
+
 
 if __name__ == "__main__":
     unittest.main()

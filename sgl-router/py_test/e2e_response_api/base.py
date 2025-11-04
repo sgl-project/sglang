@@ -544,7 +544,9 @@ class FunctionCallingBaseTest(ResponseAPIBaseTest):
         self.assertGreater(len(output), 0)
 
         # Check for function_call in output
-        function_calls = [item for item in output if item.get("type") == "function_call"]
+        function_calls = [
+            item for item in output if item.get("type") == "function_call"
+        ]
         self.assertGreater(
             len(function_calls), 0, "Response should contain at least one function_call"
         )

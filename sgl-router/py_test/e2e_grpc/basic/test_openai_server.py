@@ -23,10 +23,10 @@ _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_workers_and_router
 from util import (
+    DEFAULT_GPT_OSS_MODEL_PATH,
     DEFAULT_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    DEFAULT_GPT_OSS_MODEL_PATH,
     CustomTestCase,
     get_tokenizer,
     kill_process_tree,
@@ -318,7 +318,7 @@ class TestOpenAIServerGptOss(TestOpenAIServer):
 
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
-    
+
     def test_chat_completion(self):
         for parallel_sample_num in [1, 2]:
             self.run_chat_completion(None, parallel_sample_num)
@@ -326,7 +326,7 @@ class TestOpenAIServerGptOss(TestOpenAIServer):
     def test_chat_completion_stream(self):
         for parallel_sample_num in [1, 2]:
             self.run_chat_completion_stream(None, parallel_sample_num)
-    
+
     @unittest.skip("Skipping for OSS models")
     def test_regex(self):
         super().test_regex()
@@ -338,6 +338,7 @@ class TestOpenAIServerGptOss(TestOpenAIServer):
     @unittest.skip("Skipping for OSS models")
     def test_penalty(self):
         super().test_penalty()
+
 
 if __name__ == "__main__":
     unittest.main()
