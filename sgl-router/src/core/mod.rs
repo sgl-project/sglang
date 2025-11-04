@@ -19,6 +19,8 @@ pub mod worker_manager;
 pub mod worker_registry;
 pub mod workflow;
 
+pub mod metrics_aggregator;
+
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
 };

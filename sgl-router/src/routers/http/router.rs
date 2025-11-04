@@ -714,7 +714,7 @@ impl Router {
     }
 }
 
-use crate::metrics_aggregator::MetricPack;
+use crate::core::metrics_aggregator::MetricPack;
 use async_trait::async_trait;
 
 #[async_trait]
@@ -742,7 +742,7 @@ impl RouterTrait for Router {
                 metrics_text,
             })
             .collect();
-        let text = match crate::metrics_aggregator::aggregate_metrics(engine_responses) {
+        let text = match crate::core::metrics_aggregator::aggregate_metrics(engine_responses) {
             Ok(x) => x,
             Err(e) => {
                 let error_msg = format!("Failed to aggregate metrics: {}", e);
