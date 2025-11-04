@@ -4,8 +4,9 @@
 //! runtime management, and health monitoring.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
-
+use axum::response::{IntoResponse, Response};
 use futures::future;
+use http::{Method, StatusCode};
 use serde_json::Value;
 use tokio::{
     sync::{watch, Mutex},
@@ -18,6 +19,7 @@ use crate::{
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
+use crate::core::metrics_aggregator::MetricPack;
 
 /// Unified worker management
 pub struct WorkerManager;
@@ -233,6 +235,31 @@ impl WorkerManager {
             successful,
             failed,
         }
+    }
+
+    pub async fn get_engine_metrics(&self) -> Response {
+        let engine_responses = match self
+            .fan_out_simple_request(None, "metrics", Method::GET)
+            .await
+        {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        let engine_responses = engine_responses
+            .into_iter()
+            .map(|(worker_base_url, metrics_text)| MetricPack {
+                labels: vec![("worker_addr".into(), worker_base_url)],
+                metrics_text,
+            })
+            .collect();
+        let text = match crate::core::metrics_aggregator::aggregate_metrics(engine_responses) {
+            Ok(x) => x,
+            Err(e) => {
+                let error_msg = format!("Failed to aggregate metrics: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response();
+            }
+        };
+        (StatusCode::OK, text).into_response()
     }
 }
 
