@@ -11,7 +11,7 @@ use axum::response::Response;
 use super::PipelineStage;
 use crate::routers::grpc::{
     context::{FinalResponse, RequestContext, RequestType},
-    processing, streaming, utils,
+    error, processing, streaming,
 };
 
 /// Response processing stage: Handles both streaming and non-streaming responses
@@ -42,7 +42,7 @@ impl PipelineStage for ResponseProcessingStage {
         match &ctx.input.request_type {
             RequestType::Chat(_) => self.process_chat_response(ctx).await,
             RequestType::Generate(_) => self.process_generate_response(ctx).await,
-            RequestType::Responses(_) => Err(utils::bad_request_error(
+            RequestType::Responses(_) => Err(error::bad_request(
                 "Responses API processing must be handled by responses handler".to_string(),
             )),
         }
@@ -66,14 +66,14 @@ impl ResponseProcessingStage {
             .response
             .execution_result
             .take()
-            .ok_or_else(|| utils::internal_error_static("No execution result"))?;
+            .ok_or_else(|| error::internal_error("No execution result"))?;
 
         // Get dispatch metadata (needed by both streaming and non-streaming)
         let dispatch = ctx
             .state
             .dispatch
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?
+            .ok_or_else(|| error::internal_error("Dispatch metadata not set"))?
             .clone();
 
         if is_streaming {
@@ -100,7 +100,7 @@ impl ResponseProcessingStage {
             .response
             .stop_decoder
             .as_mut()
-            .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
+            .ok_or_else(|| error::internal_error("Stop decoder not initialized"))?;
 
         let response = self
             .processor
@@ -132,14 +132,14 @@ impl ResponseProcessingStage {
             .response
             .execution_result
             .take()
-            .ok_or_else(|| utils::internal_error_static("No execution result"))?;
+            .ok_or_else(|| error::internal_error("No execution result"))?;
 
         // Get dispatch metadata (needed by both streaming and non-streaming)
         let dispatch = ctx
             .state
             .dispatch
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?
+            .ok_or_else(|| error::internal_error("Dispatch metadata not set"))?
             .clone();
 
         if is_streaming {
@@ -162,7 +162,7 @@ impl ResponseProcessingStage {
             .response
             .stop_decoder
             .as_mut()
-            .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
+            .ok_or_else(|| error::internal_error("Stop decoder not initialized"))?;
 
         let result_array = self
             .processor

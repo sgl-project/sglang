@@ -12,7 +12,7 @@ use crate::{
     policies::PolicyRegistry,
     routers::grpc::{
         context::{RequestContext, WorkerSelection},
-        utils,
+        error,
     },
 };
 
@@ -51,7 +51,7 @@ impl PipelineStage for WorkerSelectionStage {
             .state
             .preparation
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Preparation stage not completed"))?;
+            .ok_or_else(|| error::internal_error("Preparation stage not completed"))?;
 
         // For Harmony, use selection_text produced during Harmony encoding
         // Otherwise, use original_text from regular preparation
@@ -66,7 +66,7 @@ impl PipelineStage for WorkerSelectionStage {
                 match self.select_single_worker(ctx.input.model_id.as_deref(), text) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
-                        return Err(utils::service_unavailable_error(format!(
+                        return Err(error::service_unavailable(format!(
                             "No available workers for model: {:?}",
                             ctx.input.model_id
                         )));
@@ -77,7 +77,7 @@ impl PipelineStage for WorkerSelectionStage {
                 match self.select_pd_pair(ctx.input.model_id.as_deref(), text) {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
-                        return Err(utils::service_unavailable_error(format!(
+                        return Err(error::service_unavailable(format!(
                             "No available PD worker pairs for model: {:?}",
                             ctx.input.model_id
                         )));
