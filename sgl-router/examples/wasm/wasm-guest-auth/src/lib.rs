@@ -35,26 +35,16 @@ impl OnRequestGuest for Middleware {
         // API Key Authentication
         // Check for API key in Authorization header for /api routes
         if req.path.starts_with("/api") || req.path.starts_with("/v1") {
-            let auth_header = find_header_value(&req.headers, "authorization");
-            let api_key = auth_header
+            let api_key = find_header_value(&req.headers, "authorization")
                 .and_then(|h| {
-                    if h.starts_with("Bearer ") {
-                        Some(h[7..].to_string())
-                    } else if h.starts_with("ApiKey ") {
-                        Some(h[7..].to_string())
-                    } else {
-                        None
-                    }
+                    h.strip_prefix("Bearer ")
+                        .or_else(|| h.strip_prefix("ApiKey "))
+                        .map(|s| s.to_string())
                 })
                 .or_else(|| find_header_value(&req.headers, "x-api-key"));
 
-            if let Some(key) = api_key {
-                if key != EXPECTED_API_KEY {
-                    // Invalid API key - reject with 401 Unauthorized
-                    return Action::Reject(401);
-                }
-            } else {
-                // Missing API key - reject with 401 Unauthorized
+            // Reject if API key is missing or invalid
+            if api_key.as_deref() != Some(EXPECTED_API_KEY) {
                 return Action::Reject(401);
             }
         }
