@@ -181,6 +181,7 @@ suites = {
     ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
         # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12533
         # TestFile("test_deepseek_v3_cutedsl_4gpu.py", 3600),
     ],
