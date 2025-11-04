@@ -52,6 +52,8 @@ from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+if _is_cpu and _is_cpu_amx_available:
+    import sgl_kernel  # noqa: F401
 
 
 class DeepseekMLP(nn.Module):
@@ -102,11 +104,9 @@ class DeepseekMoE(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        layer_id=None,
     ):
         super().__init__()
         self.config = config
-        self.layer_id = layer_id
         self.rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.n_routed_experts = config.n_routed_experts
@@ -334,7 +334,6 @@ class DeepseekDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                layer_id=layer_id,
             )
         else:
             self.mlp = DeepseekMLP(
