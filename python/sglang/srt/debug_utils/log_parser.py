@@ -1,7 +1,7 @@
 _PATTERN_DECODE = (
     r"\(SGLangEngine pid=(?P<pid>\d+)(?:,\s*ip=(?P<ip>[\d\.]+))?\)\s+"
     r"\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\s+TP\d+)?\]\s+"
-    r"Decode batch \[(?P<batch>\d+)\],\s+"
+    r"Decode batch( \[\d+\])?,\s+"
     r"#running-req:\s*(?P<running>\d+),\s+"
     r"#token:\s*(?P<token>\d+),\s+"
     r"token usage:\s*(?P<token_usage>[0-9.]+),\s+"
