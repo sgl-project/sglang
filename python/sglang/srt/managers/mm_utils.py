@@ -13,13 +13,14 @@ from torch import nn
 
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
+    CudaIpcTensorTransportProxy,
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
-    global_server_args_dict,
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
 
@@ -77,7 +78,6 @@ class TransportProxyTensor(torch.Tensor):
             "tensor_data": None,
             "ipc_extra": None,
         }
-
         transport_mode = self._metadata.get("transport_mode", "default")
 
         if transport_mode == "cuda_ipc" and self.is_cuda:
@@ -91,6 +91,7 @@ class TransportProxyTensor(torch.Tensor):
                     "dtype": self.dtype,
                     "stride": self.stride(),
                     "device_index": self.device.index,
+                    "storage_offset": self.storage_offset(),
                 }
                 state["tensor_data"] = None
             except Exception as e:
@@ -113,12 +114,13 @@ class TransportProxyTensor(torch.Tensor):
 
         if transport_mode == "cuda_ipc" and state["ipc_extra"] is not None:
             ipc_extra = state["ipc_extra"]
-            handle, shape, dtype, stride, source_device_index = (
+            handle, shape, dtype, stride, source_device_index, s_offset = (
                 ipc_extra["handle"],
                 ipc_extra["shape"],
                 ipc_extra["dtype"],
                 ipc_extra["stride"],
                 ipc_extra["device_index"],
+                ipc_extra["storage_offset"],
             )
 
             try:
@@ -127,7 +129,7 @@ class TransportProxyTensor(torch.Tensor):
                     storage = torch.UntypedStorage._new_shared_cuda(*handle)
                     reconstructed_tensor = torch.empty(
                         0, dtype=dtype, device=target_device
-                    ).set_(storage, storage_offset=0, size=shape, stride=stride)
+                    ).set_(storage, storage_offset=s_offset, size=shape, stride=stride)
                     self.set_(reconstructed_tensor)
             except Exception as e:
                 print(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
@@ -280,7 +282,6 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
             input_ids_tensor[input_ids_tensor == token_id] = pad_value
 
         ret_input_ids = input_ids_tensor.tolist()
-
         return ret_input_ids
 
 
@@ -428,7 +429,7 @@ def _adjust_embedding_length(
             f"tokens from multimodal embeddings."
         )
         if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-            chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
+            chunked_prefill_size = get_global_server_args().chunked_prefill_size
             if chunked_prefill_size != -1:
                 logger.warning(
                     "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
@@ -507,7 +508,7 @@ def embed_mm_inputs(
         Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
-    use_deepstack: bool = False,
+    use_deepstack: Dict[Modality, bool] = {},
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -533,7 +534,9 @@ def embed_mm_inputs(
     for mm_inputs in mm_inputs_list:
         item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
 
-    embeddings, masks, deepstack_embeddings = [], [], []
+    # deepstack_embeddings: per-modality
+    modalities, embeddings, masks, deepstack_embeddings = [], [], [], []
+
     # 2. Get multimodal embedding separately
     # Try get mm embedding if any
     for modality in Modality.all():
@@ -549,7 +552,8 @@ def embed_mm_inputs(
             # "image", "video", etc
             modality_id = modality.name.lower()
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
-        if len(items) != 0 and embedder is not None:
+        if len(items) != 0:
+            assert embedder is not None, f"no embedding method found for {modality}"
             placeholder_tensor = torch.as_tensor(
                 [item.pad_value for item in items],
                 device=input_ids.device,
@@ -580,11 +584,12 @@ def embed_mm_inputs(
                 items_offset_list=items_offsets,
             )
 
-            if use_deepstack and embedding is not None:
+            if use_deepstack.get(modality, None) and embedding is not None:
                 embedding, deepstack_embedding = (
                     multimodal_model.separate_deepstack_embeds(embedding)
                 )
                 deepstack_embeddings += [deepstack_embedding]
+            modalities += [modality]
             embeddings += [embedding]
             masks += [mask]
 
@@ -597,17 +602,14 @@ def embed_mm_inputs(
     input_ids.clamp_(min=0, max=vocab_size - 1)
     inputs_embeds = input_embedding(input_ids)
 
-    # 4. scatter embeddings into input embedding
-
     # deepstack embedding
     if use_deepstack:
-        num_deepstack_embeddings = (
-            len(multimodal_model.deepstack_visual_indexes) if use_deepstack else 0
-        )
+        num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
+
         deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
             inputs_embeds.shape[-1] * num_deepstack_embeddings,
         )
-
+        # a zero-filled embedding, with the same length of inputs_embeds, but different hidden_size
         input_deepstack_embeds = torch.zeros(
             deepstack_embedding_shape,
             device=inputs_embeds.device,
@@ -616,14 +618,16 @@ def embed_mm_inputs(
 
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
-    for i, embedding, mask in zip(range(len(embeddings)), embeddings, masks):
+    # 4. scatter embeddings into input embedding
+    for i, modality, embedding, mask in zip(
+        range(len(embeddings)), modalities, embeddings, masks
+    ):
         if embedding is None or mask is None:
             continue
         # in-place update
         indices = torch.where(mask.squeeze(dim=-1))[0]
         inputs_embeds[indices] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
-
-        if use_deepstack:
+        if use_deepstack.get(modality, None):
             input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
                 inputs_embeds.device, inputs_embeds.dtype
             )
@@ -640,7 +644,7 @@ def general_mm_embed_routine(
         Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
-    use_deepstack: bool = False,
+    use_deepstack: Dict[Modality, bool] = {},
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -652,7 +656,7 @@ def general_mm_embed_routine(
         language_model: Base language model to use
         data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
         placeholder_tokens: Token IDs for multimodal placeholders
-        use_deepstack: Whether to use deepstack embeddings
+        use_deepstack: Whether to use deepstack embeddings for each modality, default False
         **kwargs: Additional arguments passed to language model
 
     Returns:
@@ -809,4 +813,7 @@ def hash_feature(f):
         return data_hash(arr_bytes)
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
+    elif isinstance(f, CudaIpcTensorTransportProxy):
+        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
+        return tensor_hash([reconstruct_t])
     return data_hash(f)

@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
@@ -163,6 +164,17 @@ class OpenAIServingChat(OpenAIServingBase):
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
+        # Resolve LoRA adapter from model parameter or explicit lora_path
+        lora_path = self._resolve_lora_path(request.model, request.lora_path)
+        if lora_path:
+            first_adapter = (
+                lora_path
+                if isinstance(lora_path, str)
+                else next((a for a in lora_path if a), None)
+            )
+            if first_adapter:
+                self._validate_lora_enabled(first_adapter)
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -175,7 +187,7 @@ class OpenAIServingChat(OpenAIServingBase):
             stream=request.stream,
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
-            lora_path=request.lora_path,
+            lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
@@ -184,6 +196,7 @@ class OpenAIServingChat(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             custom_labels=custom_labels,
+            custom_logit_processor=request.custom_logit_processor,
         )
 
         return adapted_request, request
@@ -285,7 +298,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if "arguments" in item["function"] and isinstance(
                         item["function"]["arguments"], str
                     ):
-                        item["function"]["arguments"] = json.loads(
+                        item["function"]["arguments"] = orjson.loads(
                             item["function"]["arguments"]
                         )
 
@@ -522,6 +535,17 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
+
+                        # Add usage stats if continuous_usage_stats is enabled
+                        if (
+                            request.stream_options
+                            and request.stream_options.continuous_usage_stats
+                        ):
+                            chunk.usage = UsageProcessor.calculate_token_usage(
+                                prompt_tokens=prompt_tokens.get(index, 0),
+                                completion_tokens=completion_tokens.get(index, 0),
+                            )
+
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle tool calls
@@ -566,6 +590,17 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
+
+                        # Add usage stats if continuous_usage_stats is enabled
+                        if (
+                            request.stream_options
+                            and request.stream_options.continuous_usage_stats
+                        ):
+                            chunk.usage = UsageProcessor.calculate_token_usage(
+                                prompt_tokens=prompt_tokens.get(index, 0),
+                                completion_tokens=completion_tokens.get(index, 0),
+                            )
+
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
             # Send finish_reason chunks for each index that completed
@@ -860,7 +895,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason["matched"] = None
             try:
                 # For required tool choice, we expect a JSON array of tool calls
-                tool_call_data = json.loads(text)
+                tool_call_data = orjson.loads(text)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
                     # Create a ToolCallItem from the JSON data
@@ -1043,6 +1078,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
+
+            # Add usage stats if continuous_usage_stats is enabled
+            if request.stream_options and request.stream_options.continuous_usage_stats:
+                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                chunk.usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+
             yield f"data: {chunk.model_dump_json()}\n\n"
 
         # Yield tool calls
@@ -1083,6 +1128,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
+
+            # Add usage stats if continuous_usage_stats is enabled
+            if request.stream_options and request.stream_options.continuous_usage_stats:
+                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                chunk.usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+
             yield f"data: {chunk.model_dump_json()}\n\n"
 
     def _check_for_unstreamed_tool_args(
