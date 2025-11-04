@@ -166,7 +166,7 @@ def benchmark_config(
             run()
     torch.cuda.synchronize()
 
-    # Warmup 
+    # Warmup
     for _ in range(5):
         graph.replay()
     torch.cuda.synchronize()
