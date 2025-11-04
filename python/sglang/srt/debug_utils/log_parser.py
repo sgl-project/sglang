@@ -6,7 +6,7 @@ _PATTERN_DECODE = (
     r"(?:\s+PP(?P<pp>\d+))?"
     r"\]\s+"
     r"Decode batch( \[\d+\])?,\s+"
-    r"#running-req:\s*(?P<running>\d+),\s+"
+    r"#running-req:\s*(?P<running_req>\d+),\s+"
     r"#token:\s*(?P<token>\d+),\s+"
     r"token usage:\s*(?P<token_usage>[0-9.]+),\s+"
     r".*?"
@@ -22,16 +22,23 @@ def parse(lines):
     df = df.with_columns(info=pl.col('line').str.extract_groups(_PATTERN_DECODE))
     df = df.unnest('info')
     df = df.filter(pl.col('throughput').is_not_null())
+
     df = df.with_columns(
-        pl.col("pid").cast(pl.Int64),
         pl.col("ts").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S"),
-        pl.col("dp").cast(pl.Int64),
-        pl.col("tp").cast(pl.Int64),
-        pl.col("pp").cast(pl.Int64),
-        pl.col("running").cast(pl.Int64),
-        pl.col("token").cast(pl.Int64),
-        pl.col("token_usage").cast(pl.Float64),
-        pl.col("throughput").cast(pl.Float64),
-        pl.col("queue").cast(pl.Int64),
+        *[
+            pl.col(c).cast(pl.Int64)
+            for c in [
+                "pid",
+                "dp",
+                "tp",
+                "pp",
+                "running_req",
+                "token",
+                "token_usage",
+                "throughput",
+                "queue",
+            ]
+            if c in df.columns
+        ],
     )
     return df
