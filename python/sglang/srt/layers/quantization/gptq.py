@@ -843,12 +843,16 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         self.is_k_full = (not self.quant_config.desc_act) or layer.moe_tp_size == 1
 
         if self.quant_config.group_size != -1:
-            scales_size13 = (hidden_size + self.quant_config.group_size - 1) // self.quant_config.group_size
+            scales_size13 = (
+                hidden_size + self.quant_config.group_size - 1
+            ) // self.quant_config.group_size
             if self.quant_config.desc_act:
                 w2_scales_size = intermediate_size_per_partition
             else:
                 w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
-            scales_size2 = (w2_scales_size + self.quant_config.group_size - 1) // self.quant_config.group_size
+            scales_size2 = (
+                w2_scales_size + self.quant_config.group_size - 1
+            ) // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
             scales_size13 = 1

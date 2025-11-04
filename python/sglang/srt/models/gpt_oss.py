@@ -1057,7 +1057,10 @@ class GptOssForCausalLM(nn.Module):
                         weight_loader = param.weight_loader
                         if "bias" not in name:
                             loaded_weight = loaded_weight.transpose(-2, -1)
-                        if "w2_weight_bias" in name and get_moe_tensor_parallel_rank() != 0:
+                        if (
+                            "w2_weight_bias" in name
+                            and get_moe_tensor_parallel_rank() != 0
+                        ):
                             loaded_weight = loaded_weight.zero_()
 
                         weight_loader(
