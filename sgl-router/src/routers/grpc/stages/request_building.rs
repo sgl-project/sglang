@@ -15,7 +15,7 @@ use crate::{
     grpc_client::proto,
     routers::grpc::{
         context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
-        utils,
+        error,
     },
 };
 
@@ -37,13 +37,13 @@ impl PipelineStage for RequestBuildingStage {
             .state
             .preparation
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Preparation not completed"))?;
+            .ok_or_else(|| error::internal_error("Preparation not completed"))?;
 
         let clients = ctx
             .state
             .clients
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Client acquisition not completed"))?;
+            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
 
         // Get client for building request (use prefill client if PD mode)
         let builder_client = match clients {
@@ -69,9 +69,7 @@ impl PipelineStage for RequestBuildingStage {
                             .clone(),
                         prep.tool_constraints.clone(),
                     )
-                    .map_err(|e| {
-                        utils::bad_request_error(format!("Invalid request parameters: {}", e))
-                    })?
+                    .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?
             }
             RequestType::Generate(request) => {
                 let request_id = request
@@ -86,7 +84,7 @@ impl PipelineStage for RequestBuildingStage {
                         prep.original_text.clone(),
                         prep.token_ids.clone(),
                     )
-                    .map_err(utils::bad_request_error)?
+                    .map_err(error::bad_request)?
             }
             RequestType::Responses(_request) => {
                 // Responses API builds request during the MCP loop
