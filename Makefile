@@ -16,7 +16,7 @@ format: check-deps ## Format modified Python files using isort and black
 	@echo "Formatting modified Python files..."
 	git diff --name-only --diff-filter=M | grep '\.py$$' | xargs -I {} sh -c 'isort {} && black {}'
 
-FILES_TO_UPDATE = docker/Dockerfile.rocm \
+FILES_TO_UPDATE = docker/rocm.Dockerfile \
                  python/pyproject.toml \
                  python/pyproject_other.toml \
                  python/sglang/version.py \

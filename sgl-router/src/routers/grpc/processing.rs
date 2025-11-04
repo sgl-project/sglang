@@ -11,7 +11,7 @@ use tracing::error;
 
 use super::{
     context::{DispatchMetadata, ExecutionResult},
-    utils,
+    error, utils,
 };
 use crate::{
     grpc_client::proto,
@@ -104,13 +104,13 @@ impl ResponseProcessor {
         };
 
         if all_responses.is_empty() {
-            return Err(utils::internal_error_static("No responses from server"));
+            return Err(error::internal_error("No responses from server"));
         }
 
         Ok(all_responses)
     }
 
-    /// Process a single choice from GenerateComplete response (EXACT COPY from router.rs:1573-1725)
+    /// Process a single choice from GenerateComplete response
     #[allow(clippy::too_many_arguments)]
     pub async fn process_single_choice(
         &self,
@@ -193,6 +193,8 @@ impl ResponseProcessor {
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,
                     &original_request.tool_choice,
+                    &original_request.model,
+                    history_tool_calls_count,
                 );
             } else if tool_parser_available {
                 (tool_calls, processed_text) = self
@@ -330,7 +332,7 @@ impl ResponseProcessor {
             {
                 Ok(choice) => choices.push(choice),
                 Err(e) => {
-                    return Err(utils::internal_error_message(format!(
+                    return Err(error::internal_error(format!(
                         "Failed to process choice {}: {}",
                         index, e
                     )));
@@ -365,7 +367,7 @@ impl ResponseProcessor {
         Ok(response)
     }
 
-    /// Parse tool calls using model-specific parser (EXACT COPY from router.rs:296-361)
+    /// Parse tool calls using model-specific parser
     pub async fn parse_tool_calls(
         &self,
         processed_text: &str,
@@ -445,7 +447,7 @@ impl ResponseProcessor {
             let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
                 Ok(outputs) => outputs,
                 Err(e) => {
-                    return Err(utils::internal_error_message(format!(
+                    return Err(error::internal_error(format!(
                         "Failed to process tokens: {}",
                         e
                     )))

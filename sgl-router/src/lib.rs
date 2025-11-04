@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+pub mod app_context;
 pub mod config;
 pub mod logging;
 use std::collections::HashMap;
@@ -204,9 +205,13 @@ struct Router {
     tokenizer_cache_l1_max_memory: usize,
     reasoning_parser: Option<String>,
     tool_call_parser: Option<String>,
+    mcp_config_path: Option<String>,
     backend: BackendType,
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
+    ca_cert_paths: Vec<String>,
 }
 
 impl Router {
@@ -302,7 +307,7 @@ impl Router {
             None
         };
 
-        let builder = config::RouterConfig::builder()
+        config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
             .host(&self.host)
@@ -356,12 +361,17 @@ impl Router {
             .maybe_oracle(oracle)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
+            .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
-            .igw(self.enable_igw);
-
-        builder.build()
+            .igw(self.enable_igw)
+            .maybe_client_cert_and_key(
+                self.client_cert_path.as_ref(),
+                self.client_key_path.as_ref(),
+            )
+            .add_ca_certificates(self.ca_cert_paths.clone())
+            .build()
     }
 }
 
@@ -432,9 +442,13 @@ impl Router {
         tokenizer_cache_l1_max_memory = 52428800,
         reasoning_parser = None,
         tool_call_parser = None,
+        mcp_config_path = None,
         backend = BackendType::Sglang,
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
+        client_cert_path = None,
+        client_key_path = None,
+        ca_cert_paths = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -501,9 +515,13 @@ impl Router {
         tokenizer_cache_l1_max_memory: usize,
         reasoning_parser: Option<String>,
         tool_call_parser: Option<String>,
+        mcp_config_path: Option<String>,
         backend: BackendType,
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
+        client_cert_path: Option<String>,
+        client_key_path: Option<String>,
+        ca_cert_paths: Vec<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -584,9 +602,13 @@ impl Router {
             tokenizer_cache_l1_max_memory,
             reasoning_parser,
             tool_call_parser,
+            mcp_config_path,
             backend,
             history_backend,
             oracle_config,
+            client_cert_path,
+            client_key_path,
+            ca_cert_paths,
         })
     }
 
