@@ -1,8 +1,10 @@
 import unittest
+from sglang.test.test_utils import CustomTestCase
 
 
-def test_log_parser():
-    TODO
+class TestLogParser(CustomTestCase):
+    def test_log_parser(self):
+        TODO
 
 
 if __name__ == "__main__":
