@@ -12,7 +12,6 @@ except ImportError:
         raise ImportError(
             "Neither 'decord' nor 'torchvision' is available. Please install at least one."
         )
-from transformers.video_utils import VideoMetadata
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
