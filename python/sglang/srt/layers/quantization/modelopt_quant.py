@@ -8,6 +8,9 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens, get_local_dp_buffer
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -41,6 +44,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
+from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -51,7 +55,12 @@ if TYPE_CHECKING:
     from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
 try:
-    from flashinfer import fp4_quantize
+    if is_sm120_supported():
+        from flashinfer import fp4_quantize
+    else:
+        from sgl_kernel import scaled_fp4_quant as fp4_quantize
+
+    from flashinfer import fp4_quantize as fp4_quantize_flashinfer
 except ImportError:
     fp4_quantize = None
 
@@ -653,29 +662,37 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 None if correction_bias is None else correction_bias.to(torch.bfloat16)
             )
 
-            output = trtllm_fp8_per_tensor_scale_moe(
-                routing_logits=routing_logits_cast,
-                routing_bias=routing_bias_cast,
-                hidden_states=x_fp8,
-                gemm1_weights=layer.w13_weight,
-                output1_scales_scalar=layer.output1_scales_scalar,
-                output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
-                gemm2_weights=layer.w2_weight,
-                output2_scales_scalar=layer.output2_scales_scalar,
-                num_experts=layer.num_experts,
-                top_k=topk_config.top_k,
-                n_group=0,
-                topk_group=0,
-                intermediate_size=layer.w2_weight.shape[2],
-                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-                local_num_experts=layer.num_local_experts,
-                routed_scaling_factor=(
-                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
-                ),
-                use_routing_scales_on_input=use_routing_scales_on_input,
-                tile_tokens_dim=8,  # TODO(brayden): use the FI tile calculation
-                routing_method_type=routing_method_type,
-            )
+            with use_symmetric_memory(get_tp_group()) as sm:
+                # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
+                # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
+                # so we put the whole function under the ``use_symmetric_memory`` context manager.
+                # If the bug is fixed, we can only put the output tensor allocation under the context manager.
+                output = trtllm_fp8_per_tensor_scale_moe(
+                    routing_logits=routing_logits_cast,
+                    routing_bias=routing_bias_cast,
+                    hidden_states=x_fp8,
+                    gemm1_weights=layer.w13_weight,
+                    output1_scales_scalar=layer.output1_scales_scalar,
+                    output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
+                    gemm2_weights=layer.w2_weight,
+                    output2_scales_scalar=layer.output2_scales_scalar,
+                    num_experts=layer.num_experts,
+                    top_k=topk_config.top_k,
+                    n_group=0,
+                    topk_group=0,
+                    intermediate_size=layer.w2_weight.shape[2],
+                    local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                    local_num_experts=layer.num_local_experts,
+                    routed_scaling_factor=(
+                        routed_scaling_factor
+                        if routed_scaling_factor is not None
+                        else 1.0
+                    ),
+                    use_routing_scales_on_input=use_routing_scales_on_input,
+                    tile_tokens_dim=None,
+                    routing_method_type=routing_method_type,
+                )
+                sm.tag(output)
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -1567,7 +1584,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
                 # Quantize before comm, swizzle after.
                 if x.shape[0] > 0:
-                    x, x_sf = fp4_quantize(
+                    x, x_sf = fp4_quantize_flashinfer(
                         x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
                     )
                 else:
@@ -1580,6 +1597,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
                 )
                 x_sf = nvfp4_block_scale_interleave(x_sf)
+
+            with use_symmetric_memory(get_tp_group()) as sm:
+                symm_output = torch.empty(
+                    x.shape[0], x.shape[1], dtype=output_dtype, device=x.device
+                )
+                sm.tag(symm_output)
 
             output = flashinfer_cutlass_fused_moe(
                 input=x,
@@ -1602,6 +1625,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                output=symm_output,
             )[0]
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 output, global_output = get_local_dp_buffer(), output
