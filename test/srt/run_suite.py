@@ -424,7 +424,11 @@ def auto_partition(files, rank, size):
 
 def _sanity_check_suites(suites):
     dir_base = Path(__file__).parent
-    disk_files = set([str(x.relative_to(dir_base)) for x in dir_base.glob("**/*.py")])
+    disk_files = set([
+        str(x.relative_to(dir_base))
+        for x in dir_base.glob("**/*.py")
+        if x.name.startswith("test_")
+    ])
 
     suite_files = set(
         [test_file.name for _, suite in suites.items() for test_file in suite]
