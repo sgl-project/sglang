@@ -53,8 +53,11 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     is_cuda,
+    is_npu,
     next_power_of_2,
 )
+
+_is_npu = is_npu()
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -205,7 +208,7 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if self.server_args.disable_cuda_graph or _is_npu:
             return
 
         # Capture draft
@@ -691,19 +694,45 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-        # QQ: can be optimized
         if self.target_worker.model_runner.hybrid_gdn_config is not None:
-            # res.draft_input.accept_length is on GPU but may be empty for last verify?
             accepted_length = (
                 torch.tensor(
                     res.accept_length_per_req_cpu,
                     device=logits_output.hidden_states.device,
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                 )
                 + 1
             )
+
+            # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
+            # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
+            if spec_info.topk > 1 and res.accepted_indices.shape[0] > 0:
+                # accepted_indices=[0,2,3,4,5,7,9,10,11], accepted_length=[4, 3, 2], cumulative_accepted_lengths=[4, 7, 9]
+                # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
+                # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
+                # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+                cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
+                req_start_positions = torch.cat(
+                    [
+                        torch.zeros(
+                            1,
+                            dtype=cumulative_accepted_lengths.dtype,
+                            device=cumulative_accepted_lengths.device,
+                        ),
+                        cumulative_accepted_lengths[:-1],
+                    ]
+                )
+                first_token_indices_per_req = res.accepted_indices[req_start_positions]
+                last_token_indices_per_req = res.accepted_indices[
+                    cumulative_accepted_lengths - 1
+                ]
+                max_relative_indices_per_req = (
+                    last_token_indices_per_req - first_token_indices_per_req
+                )
+            else:
+                max_relative_indices_per_req = accepted_length - 1
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                accepted_length, self.target_worker.model_runner.model
+                max_relative_indices_per_req, self.target_worker.model_runner.model
             )
 
         if batch.return_logprob:
@@ -945,7 +974,7 @@ class EAGLEWorker(TpModelWorker):
         draft_input.hidden_states = logits_output.hidden_states
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
