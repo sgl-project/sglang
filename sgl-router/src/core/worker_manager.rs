@@ -274,10 +274,9 @@ impl WorkerManager {
         let mut responses = vec![];
         // May do parallel requests later
         for worker in workers {
-            let worker_url = worker.url();
-            let worker_base_url = self.worker_base_url(worker_url);
+            let worker_url = worker.url().to_string();
 
-            let url = format!("{}/{}", worker_base_url, endpoint);
+            let url = format!("{}/{}", worker_url, endpoint);
             let mut request_builder = match method {
                 Method::GET => client.get(url),
                 Method::POST => client.post(url),
@@ -302,7 +301,7 @@ impl WorkerManager {
                     match res.text().await {
                         Ok(body_text) => {
                             if status.is_success() {
-                                responses.push((worker_base_url, body_text));
+                                responses.push((worker_url, body_text));
                             }
                         }
                         Err(e) => {
