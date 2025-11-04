@@ -67,7 +67,10 @@ use crate::{
             ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
-    routers::openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
+    routers::{
+        grpc::error,
+        openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
+    },
 };
 
 // ============================================================================
@@ -863,11 +866,9 @@ async fn execute_without_mcp(
     model_id: Option<String>,
     response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
-    use crate::routers::grpc::utils;
-
     // Convert ResponsesRequest → ChatCompletionRequest
     let chat_request = conversions::responses_to_chat(modified_request)
-        .map_err(|e| utils::bad_request_error(format!("Failed to convert request: {}", e)))?;
+        .map_err(|e| error::bad_request(format!("Failed to convert request: {}", e)))?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
     let chat_response = ctx
@@ -883,9 +884,8 @@ async fn execute_without_mcp(
         .await?; // Preserve the Response error as-is
 
     // Convert ChatCompletionResponse → ResponsesResponse
-    conversions::chat_to_responses(&chat_response, original_request, response_id).map_err(|e| {
-        utils::internal_error_message(format!("Failed to convert to responses format: {}", e))
-    })
+    conversions::chat_to_responses(&chat_response, original_request, response_id)
+        .map_err(|e| error::internal_error(format!("Failed to convert to responses format: {}", e)))
 }
 
 /// Load conversation history and response chains, returning modified request
@@ -962,15 +962,10 @@ async fn load_conversation_history(
             .conversation_storage
             .get_conversation(&conv_id)
             .await
-            .map_err(|e| {
-                crate::routers::grpc::utils::internal_error_message(format!(
-                    "Failed to check conversation: {}",
-                    e
-                ))
-            })?;
+            .map_err(|e| error::internal_error(format!("Failed to check conversation: {}", e)))?;
 
         if conversation.is_none() {
-            return Err(crate::routers::grpc::utils::bad_request_error(format!(
+            return Err(error::not_found(format!(
                 "Conversation '{}' not found. Please create the conversation first using the conversations API.",
                 conv_id_str
             )));

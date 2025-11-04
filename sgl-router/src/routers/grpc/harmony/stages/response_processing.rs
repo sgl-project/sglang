@@ -8,8 +8,8 @@ use axum::response::Response;
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
 use crate::routers::grpc::{
     context::{FinalResponse, RequestContext, RequestType},
+    error,
     stages::PipelineStage,
-    utils,
 };
 
 /// Harmony Response Processing stage: Parse and format Harmony responses
@@ -51,14 +51,14 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                     .response
                     .execution_result
                     .take()
-                    .ok_or_else(|| utils::internal_error_static("No execution result"))?;
+                    .ok_or_else(|| error::internal_error("No execution result"))?;
 
                 let dispatch = ctx
                     .state
                     .dispatch
                     .as_ref()
                     .cloned()
-                    .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
+                    .ok_or_else(|| error::internal_error("Dispatch metadata not set"))?;
 
                 // For streaming, delegate to streaming processor and return SSE response
                 if is_streaming {
@@ -97,14 +97,14 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                     .response
                     .execution_result
                     .take()
-                    .ok_or_else(|| utils::internal_error_static("No execution result"))?;
+                    .ok_or_else(|| error::internal_error("No execution result"))?;
 
                 let dispatch = ctx
                     .state
                     .dispatch
                     .as_ref()
                     .cloned()
-                    .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
+                    .ok_or_else(|| error::internal_error("Dispatch metadata not set"))?;
 
                 let responses_request = ctx.responses_request_arc();
                 let iteration_result = self
@@ -115,7 +115,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                 ctx.state.response.responses_iteration_result = Some(iteration_result);
                 Ok(None)
             }
-            RequestType::Generate(_) => Err(utils::internal_error_static(
+            RequestType::Generate(_) => Err(error::internal_error(
                 "Generate requests not supported in Harmony pipeline",
             )),
         }

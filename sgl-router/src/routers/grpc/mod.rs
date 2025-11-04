@@ -3,6 +3,7 @@
 use crate::{grpc_client::proto, protocols::common::StringOrArray};
 
 pub mod context;
+pub mod error;
 pub mod harmony;
 pub mod pd_router;
 pub mod pipeline;
