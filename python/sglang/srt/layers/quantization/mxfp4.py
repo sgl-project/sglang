@@ -641,7 +641,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             router_logits = topk_output.router_logits
 
             with use_symmetric_memory(get_tp_group()) as sm:
-                symm_output = torch.empty_like(x)
+                # The x might be packed in the case of fp4. So, use the output dim of the
+                # weight of the second GEMM.
+                symm_output = torch.empty(
+                    x.shape[0], layer.w2_weight.shape[1], dtype=x.dtype, device=x.device
+                )
                 sm.tag(symm_output)
 
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
