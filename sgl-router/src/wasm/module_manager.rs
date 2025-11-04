@@ -332,6 +332,37 @@ impl WasmModuleManager {
             self.max_execution_time_ms.load(Ordering::Relaxed),
         )
     }
+
+    /// Execute a WASM module for a given attach point
+    /// Returns the Action if successful, or None if execution failed
+    ///
+    /// This is a convenience method that wraps execute_module_wit and handles
+    /// error logging automatically.
+    pub async fn execute_module_for_attach_point(
+        &self,
+        module: &WasmModule,
+        attach_point: WasmModuleAttachPoint,
+        input: WasmComponentInput,
+    ) -> Option<crate::wasm::spec::sgl::router::middleware_types::Action> {
+        use tracing::error;
+
+        let action_result = self
+            .execute_module_wit(module.module_uuid, attach_point, input)
+            .await;
+
+        match action_result {
+            Ok(output) => match output {
+                WasmComponentOutput::MiddlewareAction(action) => Some(action),
+            },
+            Err(e) => {
+                error!(
+                    "Failed to execute WASM module {}: {}",
+                    module.module_meta.name, e
+                );
+                None
+            }
+        }
+    }
 }
 
 impl Default for WasmModuleManager {

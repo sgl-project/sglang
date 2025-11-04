@@ -26,7 +26,12 @@ use crate::{
     server::AppState,
     wasm::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
-        spec::sgl::router::middleware_types::Action,
+        spec::{
+            apply_modify_action_to_headers, build_wit_headers_from_axum_headers,
+            sgl::router::middleware_types::{
+                Action, Request as WitRequest, Response as WitResponse,
+            },
+        },
         types::WasmComponentInput,
     },
 };
@@ -620,17 +625,8 @@ pub async fn wasm_middleware(
 
     for module in modules_on_request {
         // Build WIT request from collected data
-        let mut wit_headers = Vec::new();
-        for (name, value) in headers.iter() {
-            if let Ok(value_str) = value.to_str() {
-                wit_headers.push(crate::wasm::spec::sgl::router::middleware_types::Header {
-                    name: name.as_str().to_string(),
-                    value: value_str.to_string(),
-                });
-            }
-        }
-
-        let wit_request = crate::wasm::spec::sgl::router::middleware_types::Request {
+        let wit_headers = build_wit_headers_from_axum_headers(&headers);
+        let wit_request = WitRequest {
             method: method.to_string(),
             path: uri.path().to_string(),
             query: uri.query().unwrap_or("").to_string(),
@@ -644,26 +640,16 @@ pub async fn wasm_middleware(
         };
 
         // Execute WASM component
-        let action_result = wasm_manager
-            .execute_module_wit(
-                module.module_uuid,
+        let action = match wasm_manager
+            .execute_module_for_attach_point(
+                &module,
                 on_request_attach_point.clone(),
                 WasmComponentInput::MiddlewareRequest(wit_request),
             )
-            .await;
-
-        let action = match action_result {
-            Ok(output) => match output {
-                crate::wasm::types::WasmComponentOutput::MiddlewareAction(action) => action,
-            },
-            Err(e) => {
-                error!(
-                    "Failed to execute WASM module {}: {}",
-                    module.module_meta.name, e
-                );
-                // Continue to next module on error
-                continue;
-            }
+            .await
+        {
+            Some(action) => action,
+            None => continue, // Continue to next module on error
         };
 
         // Process action
@@ -677,30 +663,7 @@ pub async fn wasm_middleware(
             }
             Action::Modify(modify) => {
                 // Apply modifications to headers and body
-                // Apply headers_set
-                for header in modify.headers_set {
-                    if let (Ok(name), Ok(value)) = (
-                        header.name.parse::<header::HeaderName>(),
-                        header.value.parse::<HeaderValue>(),
-                    ) {
-                        headers.insert(name, value);
-                    }
-                }
-                // Apply headers_add
-                for header in modify.headers_add {
-                    if let (Ok(name), Ok(value)) = (
-                        header.name.parse::<header::HeaderName>(),
-                        header.value.parse::<HeaderValue>(),
-                    ) {
-                        headers.append(name, value);
-                    }
-                }
-                // Apply headers_remove
-                for name_str in modify.headers_remove {
-                    if let Ok(name) = name_str.parse::<header::HeaderName>() {
-                        headers.remove(name);
-                    }
-                }
+                apply_modify_action_to_headers(&mut headers, &modify);
                 // Apply body_replace
                 if let Some(body_bytes) = modify.body_replace {
                     modified_body = body_bytes;
@@ -750,43 +713,24 @@ pub async fn wasm_middleware(
     // Process each OnResponse module
     for module in modules_on_response {
         // Build WIT response from collected data
-        let mut wit_headers = Vec::new();
-        for (name, value) in headers.iter() {
-            if let Ok(value_str) = value.to_str() {
-                wit_headers.push(crate::wasm::spec::sgl::router::middleware_types::Header {
-                    name: name.as_str().to_string(),
-                    value: value_str.to_string(),
-                });
-            }
-        }
-
-        let wit_response = crate::wasm::spec::sgl::router::middleware_types::Response {
+        let wit_headers = build_wit_headers_from_axum_headers(&headers);
+        let wit_response = WitResponse {
             status: status.as_u16(),
             headers: wit_headers,
             body: body_bytes.clone(),
         };
 
         // Execute WASM component
-        let action_result = wasm_manager
-            .execute_module_wit(
-                module.module_uuid,
+        let action = match wasm_manager
+            .execute_module_for_attach_point(
+                &module,
                 on_response_attach_point.clone(),
                 WasmComponentInput::MiddlewareResponse(wit_response),
             )
-            .await;
-
-        let action = match action_result {
-            Ok(output) => match output {
-                crate::wasm::types::WasmComponentOutput::MiddlewareAction(action) => action,
-            },
-            Err(e) => {
-                error!(
-                    "Failed to execute WASM module {}: {}",
-                    module.module_meta.name, e
-                );
-                // Continue to next module on error
-                continue;
-            }
+            .await
+        {
+            Some(action) => action,
+            None => continue, // Continue to next module on error
         };
 
         // Process action - apply modifications incrementally
@@ -812,27 +756,7 @@ pub async fn wasm_middleware(
                     status = StatusCode::from_u16(new_status).unwrap_or(status);
                 }
                 // Apply headers modifications
-                for header in modify.headers_set {
-                    if let (Ok(name), Ok(value)) = (
-                        header.name.parse::<header::HeaderName>(),
-                        header.value.parse::<HeaderValue>(),
-                    ) {
-                        headers.insert(name, value);
-                    }
-                }
-                for header in modify.headers_add {
-                    if let (Ok(name), Ok(value)) = (
-                        header.name.parse::<header::HeaderName>(),
-                        header.value.parse::<HeaderValue>(),
-                    ) {
-                        headers.append(name, value);
-                    }
-                }
-                for name_str in modify.headers_remove {
-                    if let Ok(name) = name_str.parse::<header::HeaderName>() {
-                        headers.remove(name);
-                    }
-                }
+                apply_modify_action_to_headers(&mut headers, &modify);
                 // Apply body_replace
                 if let Some(new_body) = modify.body_replace {
                     body_bytes = new_body;
