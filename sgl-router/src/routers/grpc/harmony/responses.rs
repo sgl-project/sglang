@@ -262,6 +262,9 @@ async fn execute_with_mcp_loop(
     let mut iteration_count = 0;
     let mut mcp_tracking = McpCallTracking::new("sglang-mcp".to_string());
 
+    // Extract user's max_tool_calls limit (if set)
+    let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
+
     // Add static MCP tools from inventory to the request
     let mcp_tools = ctx.mcp_manager.list_tools();
     if !mcp_tools.is_empty() {
@@ -312,15 +315,55 @@ async fn execute_with_mcp_loop(
                 tool_calls,
                 analysis,
                 partial_text,
-                usage: _,
-                request_id: _,
+                usage,
+                request_id,
             } => {
                 debug!(
                     tool_call_count = tool_calls.len(),
                     has_analysis = analysis.is_some(),
                     partial_text_len = partial_text.len(),
-                    "Tool calls found - executing MCP tools"
+                    "Tool calls found - checking limits before executing MCP tools"
                 );
+
+                // Check combined limit (user's max_tool_calls vs safety limit)
+                let effective_limit = match max_tool_calls {
+                    Some(user_max) => user_max.min(MAX_TOOL_ITERATIONS),
+                    None => MAX_TOOL_ITERATIONS,
+                };
+
+                // Check if we would exceed the limit with these new tool calls
+                let total_calls_after = mcp_tracking.total_calls() + tool_calls.len();
+                if total_calls_after > effective_limit {
+                    warn!(
+                        current_calls = mcp_tracking.total_calls(),
+                        new_calls = tool_calls.len(),
+                        total_after = total_calls_after,
+                        effective_limit = effective_limit,
+                        user_max = ?max_tool_calls,
+                        "Reached tool call limit - returning incomplete response"
+                    );
+
+                    // Build response with incomplete status
+                    let mut response = build_function_tool_response(
+                        tool_calls,
+                        analysis,
+                        partial_text,
+                        usage,
+                        request_id,
+                        Arc::new(current_request),
+                    );
+
+                    // Mark as completed with incomplete_details
+                    response.status = ResponseStatus::Completed;
+                    response.incomplete_details = Some(json!({ "reason": "max_tool_calls" }));
+
+                    // Inject MCP metadata if any calls were executed
+                    if mcp_tracking.total_calls() > 0 {
+                        inject_mcp_metadata(&mut response, &mcp_tracking, &ctx.mcp_manager);
+                    }
+
+                    return Ok(response);
+                }
 
                 // Execute MCP tools
                 let tool_results =
@@ -506,6 +549,9 @@ async fn execute_mcp_tool_loop_streaming(
     // Initialize MCP call tracking
     let mut mcp_tracking = McpCallTracking::new("sglang-mcp".to_string());
 
+    // Extract user's max_tool_calls limit (if set)
+    let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
+
     // Add static MCP tools from inventory
     let mcp_tools = ctx.mcp_manager.list_tools();
     if !mcp_tools.is_empty() {
@@ -640,15 +686,46 @@ async fn execute_mcp_tool_loop_streaming(
                 tool_calls,
                 analysis,
                 partial_text,
-                usage: _,
+                usage,
                 request_id: _,
             } => {
                 debug!(
                     tool_call_count = tool_calls.len(),
                     has_analysis = analysis.is_some(),
                     partial_text_len = partial_text.len(),
-                    "MCP tool calls found in commentary channel"
+                    "MCP tool calls found in commentary channel - checking limits"
                 );
+
+                // Check combined limit (user's max_tool_calls vs safety limit)
+                let effective_limit = match max_tool_calls {
+                    Some(user_max) => user_max.min(MAX_TOOL_ITERATIONS),
+                    None => MAX_TOOL_ITERATIONS,
+                };
+
+                // Check if we would exceed the limit with these new tool calls
+                let total_calls_after = mcp_tracking.total_calls() + tool_calls.len();
+                if total_calls_after > effective_limit {
+                    warn!(
+                        current_calls = mcp_tracking.total_calls(),
+                        new_calls = tool_calls.len(),
+                        total_after = total_calls_after,
+                        effective_limit = effective_limit,
+                        user_max = ?max_tool_calls,
+                        "Reached tool call limit in streaming - emitting completion with incomplete_details"
+                    );
+
+                    // Emit response.completed with incomplete_details and usage
+                    let incomplete_details = json!({ "reason": "max_tool_calls" });
+                    let usage_json = json!({
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens,
+                        "total_tokens": usage.total_tokens,
+                        "incomplete_details": incomplete_details,
+                    });
+                    let event = emitter.emit_completed(Some(&usage_json));
+                    emitter.send_event_best_effort(&event, tx);
+                    return;
+                }
 
                 // Execute MCP tools and continue loop
                 let tool_results =
