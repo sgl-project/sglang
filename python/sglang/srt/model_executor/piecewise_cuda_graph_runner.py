@@ -253,7 +253,9 @@ class PiecewiseCudaGraphRunner:
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
-        with set_forward_context(forward_batch, self.attention_layers, self.quant_config):
+        with set_forward_context(
+            forward_batch, self.attention_layers, self.quant_config
+        ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -389,7 +391,9 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
-            with set_forward_context(forward_batch, self.attention_layers, self.quant_config):
+            with set_forward_context(
+                forward_batch, self.attention_layers, self.quant_config
+            ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
@@ -485,7 +489,9 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.tp_group.ca_comm.disabled = True
         static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
         # Replay
-        with set_forward_context(static_forward_batch, self.attention_layers, self.quant_config):
+        with set_forward_context(
+            static_forward_batch, self.attention_layers, self.quant_config
+        ):
             with set_compiled(True):
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,

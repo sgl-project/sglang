@@ -31,7 +31,9 @@ def get_forward_context() -> Optional[ForwardContext]:
 
 
 @contextmanager
-def set_forward_context(forward_batch: ForwardBatch, attention_layers: List[Any], quant_config: Any):
+def set_forward_context(
+    forward_batch: ForwardBatch, attention_layers: List[Any], quant_config: Any
+):
     global _forward_context
     prev_forward_context = _forward_context
     _forward_context = ForwardContext()

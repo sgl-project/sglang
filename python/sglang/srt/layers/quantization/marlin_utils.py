@@ -557,7 +557,6 @@ def apply_awq_marlin_linear(
         dtype=input.dtype,
     )
 
-    # print(f"Quant type: {quant_type}")
     forward_context = get_forward_context()
     if forward_context is None:
         output = gptq_marlin_gemm(
@@ -896,6 +895,7 @@ def unified_apply_gptq_marlin_gemm(
         is_zp_float=is_zp_float,
     )
 
+
 def fake_unified_apply_gptq_marlin_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -910,7 +910,9 @@ def fake_unified_apply_gptq_marlin_gemm(
     use_fp32_reduce: bool,
     is_zp_float: bool,
 ) -> torch.Tensor:
-    return input.new_empty((input.shape[0], output_size_per_partition), dtype=input.dtype)
+    return input.new_empty(
+        (input.shape[0], output_size_per_partition), dtype=input.dtype
+    )
 
 
 direct_register_custom_op(
@@ -940,9 +942,9 @@ def unified_apply_gptq_marlin_gemm_with_wtype(
     # Reconstruct ScalarType from id
     wtype = None
     for attr_name in dir(scalar_types):
-        if not attr_name.startswith('_'):
+        if not attr_name.startswith("_"):
             st = getattr(scalar_types, attr_name)
-            if hasattr(st, 'id') and st.id == wtype_id:
+            if hasattr(st, "id") and st.id == wtype_id:
                 wtype = st
                 break
     return gptq_marlin_gemm(
@@ -982,7 +984,9 @@ def fake_unified_apply_gptq_marlin_gemm_with_wtype(
     use_fp32_reduce: bool,
     is_zp_float: bool,
 ) -> torch.Tensor:
-    return input.new_empty((input.shape[0], output_size_per_partition), dtype=input.dtype)
+    return input.new_empty(
+        (input.shape[0], output_size_per_partition), dtype=input.dtype
+    )
 
 
 direct_register_custom_op(
