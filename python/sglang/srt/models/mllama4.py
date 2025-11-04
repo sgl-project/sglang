@@ -278,7 +278,7 @@ class Llama4UnfoldConvolution(nn.Module):
         self.unfold = torch.nn.Unfold(kernel_size=kernel_size, stride=config.patch_size)
         params = {
             "input_size": config.num_channels * kernel_size[0] * kernel_size[1],
-            "output_size": config.hidden_size,
+            "output_size": config.original_hidden_size if hasattr(config, "original_hidden_size") else config.hidden_size,
             "bias": False,
             "quant_config": quant_config,
             "prefix": f"{prefix}.linear",
@@ -346,7 +346,8 @@ class Llama4VisionModel(nn.Module):
         self.num_channels = config.num_channels
 
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
-        self.scale = config.hidden_size**-0.5
+        orig_hidden_size = config.original_hidden_size if hasattr(config, "original_hidden_size") else self.hidden_size
+        self.scale = orig_hidden_size**-0.5
 
         self.patch_embedding = Llama4UnfoldConvolution(
             config,
@@ -354,7 +355,7 @@ class Llama4VisionModel(nn.Module):
             prefix=f"{prefix}.patch_embedding",
         )
 
-        orig_hidden_size = config.original_hidden_size if hasattr(config, "original_hidden_size") else self.hidden_size
+        
         self.class_embedding = nn.Parameter(self.scale * torch.randn(orig_hidden_size))
         self.positional_embedding_vlm = nn.Parameter(
             self.scale * torch.randn(self.num_patches, orig_hidden_size)

@@ -306,7 +306,8 @@ class MllamaVisionModel(nn.Module):
         self.intermediate_layers_indices = config.intermediate_layers_indices
 
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
-        self.scale = config.hidden_size**-0.5
+        orig_hidden_size = config.original_hidden_size if hasattr(config, "original_hidden_size") else self.hidden_size
+        self.scale = orig_hidden_size**-0.5
 
         self.patch_embedding = ColumnParallelConv2dPatch(
             in_channels=config.num_channels,
@@ -316,7 +317,7 @@ class MllamaVisionModel(nn.Module):
             bias=False,
         )
 
-        self.class_embedding = nn.Parameter(self.scale * torch.randn(self.hidden_size))
+        self.class_embedding = nn.Parameter(self.scale * torch.randn(orig_hidden_size))
         self.gated_positional_embedding = MllamaPrecomputedPositionEmbedding(config)
 
         self.pre_tile_positional_embedding = MllamaPrecomputedAspectRatioEmbedding(
@@ -327,8 +328,8 @@ class MllamaVisionModel(nn.Module):
         )
 
         # layer norms
-        self.layernorm_pre = nn.LayerNorm(self.hidden_size)
-        self.layernorm_post = nn.LayerNorm(self.hidden_size)
+        self.layernorm_pre = nn.LayerNorm(orig_hidden_size)
+        self.layernorm_post = nn.LayerNorm(orig_hidden_size)
 
         # encoders
         self.transformer = MllamaVisionEncoder(
