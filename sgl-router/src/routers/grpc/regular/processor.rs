@@ -29,10 +29,6 @@ use crate::{
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
-// ============================================================================
-// Response Processor - Main Entry Point
-// ============================================================================
-
 /// Unified response processor for both routers
 #[derive(Clone)]
 pub struct ResponseProcessor {
@@ -101,7 +97,6 @@ impl ResponseProcessor {
         let mut reasoning_text: Option<String> = None;
         let mut processed_text = final_text;
 
-        // Check if reasoning parsing is enabled and parser is available
         if original_request.separate_reasoning && reasoning_parser_available {
             let pooled_parser = utils::get_reasoning_parser(
                 &self.reasoning_parser_factory,

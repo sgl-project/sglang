@@ -59,7 +59,6 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         };
 
         // Build gRPC request using token_ids directly (Harmony encoding already handled message rendering)
-        // Use a placeholder for original_text; Harmony uses input_ids for tokenization
         let placeholder_processed_text = "[harmony]".to_string();
 
         let mut proto_request = match &ctx.input.request_type {

@@ -11,10 +11,6 @@ use axum::response::Response;
 
 use crate::routers::grpc::context::RequestContext;
 
-// ============================================================================
-// Pipeline Trait
-// ============================================================================
-
 /// Trait for pipeline stages that process requests
 #[async_trait]
 pub trait PipelineStage: Send + Sync {
@@ -29,10 +25,6 @@ pub trait PipelineStage: Send + Sync {
     /// Stage name for logging
     fn name(&self) -> &'static str;
 }
-
-// ============================================================================
-// Stage Modules
-// ============================================================================
 
 mod client_acquisition;
 mod dispatch_metadata;

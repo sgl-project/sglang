@@ -26,10 +26,6 @@ use crate::{
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
-// ============================================================================
-// Pipeline Orchestrator
-// ============================================================================
-
 /// Generic request pipeline for all request types
 ///
 /// Orchestrates all stages from request preparation to response delivery.
@@ -50,7 +46,6 @@ impl RequestPipeline {
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {
-        // Create response processor
         let processor = processor::ResponseProcessor::new(
             tokenizer.clone(),
             tool_parser_factory.clone(),
@@ -59,7 +54,6 @@ impl RequestPipeline {
             configured_reasoning_parser.clone(),
         );
 
-        // Create streaming processor
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             tokenizer,
             tool_parser_factory,
@@ -155,7 +149,6 @@ impl RequestPipeline {
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {
-        // Create response processor
         let processor = processor::ResponseProcessor::new(
             tokenizer.clone(),
             tool_parser_factory.clone(),
@@ -164,7 +157,6 @@ impl RequestPipeline {
             configured_reasoning_parser.clone(),
         );
 
-        // Create streaming processor
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             tokenizer,
             tool_parser_factory,
@@ -202,7 +194,6 @@ impl RequestPipeline {
     ) -> Response {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
 
-        // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
@@ -210,7 +201,6 @@ impl RequestPipeline {
                     return response;
                 }
                 Ok(None) => {
-                    // Continue to next stage
                     continue;
                 }
                 Err(response) => {
@@ -226,7 +216,6 @@ impl RequestPipeline {
             }
         }
 
-        // Extract final response
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => axum::Json(response).into_response(),
             Some(FinalResponse::Generate(_)) => {
@@ -246,7 +235,6 @@ impl RequestPipeline {
     ) -> Response {
         let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
 
-        // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
@@ -254,7 +242,6 @@ impl RequestPipeline {
                     return response;
                 }
                 Ok(None) => {
-                    // Continue to next stage
                     continue;
                 }
                 Err(response) => {
@@ -270,7 +257,6 @@ impl RequestPipeline {
             }
         }
 
-        // Extract final response
         match ctx.state.response.final_response {
             Some(FinalResponse::Generate(response)) => axum::Json(response).into_response(),
             Some(FinalResponse::Chat(_)) => {
@@ -295,7 +281,6 @@ impl RequestPipeline {
     ) -> Result<ChatCompletionResponse, Response> {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
 
-        // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(_response)) => {
@@ -305,7 +290,6 @@ impl RequestPipeline {
                     ));
                 }
                 Ok(None) => {
-                    // Continue to next stage
                     continue;
                 }
                 Err(response) => {
@@ -321,7 +305,6 @@ impl RequestPipeline {
             }
         }
 
-        // Extract final response
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => Ok(response),
             Some(FinalResponse::Generate(_)) => {
@@ -359,7 +342,6 @@ impl RequestPipeline {
             harmony_ctx.components.clone(),
         );
 
-        // Execute each pipeline stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
@@ -372,7 +354,6 @@ impl RequestPipeline {
                     return Err(response);
                 }
                 Ok(None) => {
-                    // Stage completed successfully, continue to next stage
                     continue;
                 }
                 Err(response) => {
@@ -416,7 +397,6 @@ impl RequestPipeline {
             harmony_ctx.components.clone(),
         );
 
-        // Execute pipeline stages up to dispatch (which creates the stream)
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {

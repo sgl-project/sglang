@@ -30,10 +30,6 @@ struct OutputItemState {
     status: ItemStatus,
 }
 
-// ============================================================================
-// Streaming Event Emitter
-// ============================================================================
-
 /// OpenAI-compatible event emitter for /v1/responses streaming
 ///
 /// Manages state and sequence numbers to emit proper event types:
@@ -66,7 +62,7 @@ pub struct ResponseStreamEventEmitter {
     has_emitted_content_part_added: bool,
     // MCP call tracking
     mcp_call_accumulated_args: HashMap<String, String>,
-    // Output item tracking (NEW)
+    // Output item tracking
     output_items: Vec<OutputItemState>,
     next_output_index: usize,
     current_message_output_index: Option<usize>, // Tracks output_index of current message

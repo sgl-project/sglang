@@ -22,23 +22,14 @@ use crate::{
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
-// ============================================================================
-// Core Context Types
-// ============================================================================
-
 /// Main request processing context
 ///
 /// This is the single source of truth for all request state as it flows
 /// through the pipeline stages. Uses Rust's type system to enforce proper
 /// stage ordering at compile time.
 pub struct RequestContext {
-    // === Input (Immutable) ===
     pub input: RequestInput,
-
-    // === Shared Components (Immutable References) ===
     pub components: Arc<SharedComponents>,
-
-    // === Processing State (Mutable, evolves through pipeline) ===
     pub state: ProcessingState,
 }
 
@@ -85,10 +76,6 @@ pub struct ProcessingState {
     // Stage 6: Response processing state
     pub response: ResponseState,
 }
-
-// ============================================================================
-// Stage-Specific Output Types
-// ============================================================================
 
 /// Output from preparation stage (Step 1)
 pub struct PreparationOutput {
@@ -200,10 +187,6 @@ pub struct StreamingState {
         HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn crate::tool_parser::ToolParser>>>>,
     pub has_tool_calls: HashMap<u32, bool>,
 }
-
-// ============================================================================
-// Context Builders
-// ============================================================================
 
 impl RequestContext {
     /// Create context for chat completion request
@@ -323,14 +306,6 @@ impl RequestContext {
     }
 }
 
-// ============================================================================
-// Default Implementations
-// ============================================================================
-
-// ============================================================================
-// Helper Methods
-// ============================================================================
-
 impl WorkerSelection {
     pub fn is_dual(&self) -> bool {
         matches!(self, Self::Dual { .. })
@@ -427,10 +402,6 @@ impl ClientSelection {
         }
     }
 }
-
-// ============================================================================
-// Execution and Response Types
-// ============================================================================
 
 /// Result of request execution (streams from workers)
 /// Uses AbortOnDropStream to automatically abort on cancellation

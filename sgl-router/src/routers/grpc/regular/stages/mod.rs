@@ -8,12 +8,6 @@ mod preparation;
 mod request_building;
 mod response_processing;
 
-// ============================================================================
-// Public Exports
-// ============================================================================
-
-// Export endpoint-aware stages (used by pipeline.rs)
-// Export endpoint-specific stages (available for direct use if needed)
 pub use chat::{ChatPreparationStage, ChatRequestBuildingStage, ChatResponseProcessingStage};
 pub use generate::{
     GeneratePreparationStage, GenerateRequestBuildingStage, GenerateResponseProcessingStage,

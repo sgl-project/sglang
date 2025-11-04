@@ -73,10 +73,6 @@ use crate::{
     },
 };
 
-// ============================================================================
-// Main Request Handler
-// ============================================================================
-
 /// Main handler for POST /v1/responses
 ///
 /// Validates request, determines execution mode (sync/async/streaming), and delegates
@@ -280,10 +276,6 @@ async fn route_responses_internal(
 
     Ok(responses_response)
 }
-
-// ============================================================================
-// Streaming Mode Execution
-// ============================================================================
 
 /// Execute streaming responses request
 async fn route_responses_streaming(

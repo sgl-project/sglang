@@ -1,5 +1,3 @@
-// gRPC Router Implementation
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -43,9 +41,7 @@ pub struct GrpcRouter {
     pipeline: RequestPipeline,
     harmony_pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
-    // Responses context (bundles all /v1/responses dependencies: storage, MCP, background_tasks)
     responses_context: responses::ResponsesContext,
-    // Harmony responses context (uses harmony pipeline)
     harmony_responses_context: responses::ResponsesContext,
 }
 
@@ -156,7 +152,6 @@ impl GrpcRouter {
             &self.pipeline
         };
 
-        // Use selected pipeline for ALL requests (streaming and non-streaming)
         pipeline
             .execute_chat(
                 Arc::new(body.clone()),
@@ -176,7 +171,6 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing generate request for model: {:?}", model_id);
 
-        // Use pipeline for ALL requests (streaming and non-streaming)
         self.pipeline
             .execute_generate(
                 Arc::new(body.clone()),
@@ -205,13 +199,10 @@ impl GrpcRouter {
         );
 
         if is_harmony {
-            // Use pipeline-based implementation for Harmony models
             debug!(
                 "Processing Harmony responses request for model: {:?}, streaming: {:?}",
                 model_id, body.stream
             );
-
-            // Create HarmonyResponsesContext from existing responses context
             let harmony_ctx = HarmonyResponsesContext::new(
                 Arc::new(self.harmony_pipeline.clone()),
                 self.shared_components.clone(),
@@ -219,18 +210,15 @@ impl GrpcRouter {
                 self.harmony_responses_context.response_storage.clone(),
             );
 
-            // Check if streaming is requested
             if body.stream.unwrap_or(false) {
                 serve_harmony_responses_stream(&harmony_ctx, body.clone()).await
             } else {
-                // Use non-streaming version for standard JSON responses
                 match serve_harmony_responses(&harmony_ctx, body.clone()).await {
                     Ok(response) => axum::Json(response).into_response(),
                     Err(error_response) => error_response,
                 }
             }
         } else {
-            // Use regular responses module for non-Harmony models
             responses::route_responses(
                 &self.responses_context,
                 Arc::new(body.clone()),
@@ -258,7 +246,6 @@ impl RouterTrait for GrpcRouter {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // TODO: Implement actual generation test for gRPC
         (
             StatusCode::NOT_IMPLEMENTED,
             "Health generate not yet implemented for gRPC",

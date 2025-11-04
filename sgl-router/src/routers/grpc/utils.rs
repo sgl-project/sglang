@@ -53,18 +53,15 @@ pub async fn get_grpc_client_from_worker(
 /// Per Transformers docs, tool call arguments in assistant messages should be dicts
 fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
     for msg in messages {
-        // Early return if not assistant message
         let role = msg.get("role").and_then(|v| v.as_str());
         if role != Some("assistant") {
             continue;
         }
 
-        // Early return if no tool_calls
         let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) else {
             continue;
         };
 
-        // Process each tool call's arguments
         for call in tool_calls {
             let Some(function) = call.get_mut("function") else {
                 continue;
