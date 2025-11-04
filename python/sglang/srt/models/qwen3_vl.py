@@ -635,7 +635,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         )
 
         if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
