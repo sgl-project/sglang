@@ -164,6 +164,8 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid:
                 self.stats.swa_token_usage = swa_token_usage
+            if self.is_hybrid_gdn:
+                self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.cache_hit_rate = cache_hit_rate
@@ -306,6 +308,8 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid:
                 self.stats.swa_token_usage = swa_token_usage
+            if self.is_hybrid_gdn:
+                self.stats.mamba_usage = mamba_usage
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
