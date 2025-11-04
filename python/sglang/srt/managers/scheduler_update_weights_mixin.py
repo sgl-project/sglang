@@ -133,7 +133,6 @@ class SchedulerUpdateWeightsMixin:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.cuda.synchronize()
-        torch.distributed.barrier(group=self.tp_cpu_group)
 
         return ReleaseMemoryOccupationReqOutput()
 
