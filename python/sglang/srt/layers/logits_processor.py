@@ -26,6 +26,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather,
@@ -46,12 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_int_env_var,
-    is_npu,
-    use_intel_amx_backend,
-)
+from sglang.srt.utils import is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -263,13 +259,9 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         # enable chunked logprobs processing
-        self.enable_logprobs_chunk = get_bool_env_var(
-            "SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"
-        )
+        self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.value
         # chunk size for logprobs processing
-        self.logprobs_chunk_size = get_int_env_var(
-            "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE", 2048
-        )
+        self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.value
 
     def compute_logprobs_for_multi_item_scoring(
         self,
