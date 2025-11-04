@@ -9,6 +9,7 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsQuantInfo
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -56,6 +57,8 @@ class TestFusedMOE(CustomTestCase):
         topk,
         return_per_expert: bool = False,
     ):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
         B, D = a.shape
         a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
         out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)

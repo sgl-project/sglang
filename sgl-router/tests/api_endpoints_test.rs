@@ -11,10 +11,10 @@ use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType
 use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::{
+    app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::Job,
     routers::{RouterFactory, RouterTrait},
-    server::AppContext,
 };
 use tower::ServiceExt;
 
@@ -66,13 +66,22 @@ impl TestContext {
         }
 
         // Update config with worker URLs if not already set
-        if let RoutingMode::Regular {
-            worker_urls: ref mut urls,
-        } = config.mode
-        {
-            if urls.is_empty() {
-                *urls = worker_urls.clone();
+        match &mut config.mode {
+            RoutingMode::Regular {
+                worker_urls: ref mut urls,
+            } => {
+                if urls.is_empty() {
+                    *urls = worker_urls.clone();
+                }
             }
+            RoutingMode::OpenAI {
+                worker_urls: ref mut urls,
+            } => {
+                if urls.is_empty() {
+                    *urls = worker_urls.clone();
+                }
+            }
+            _ => {} // PrefillDecode mode has its own setup
         }
 
         let client = Client::builder()
@@ -81,7 +90,7 @@ impl TestContext {
             .unwrap();
 
         // Create app context
-        let app_context = common::create_test_context(config.clone());
+        let app_context = common::create_test_context(config.clone()).await;
 
         // Submit worker initialization job (same as real server does)
         if !worker_urls.is_empty() {
@@ -212,7 +221,6 @@ mod health_tests {
         let resp = app.oneshot(req).await.unwrap();
         // With no workers, readiness should return SERVICE_UNAVAILABLE
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-
         ctx.shutdown().await;
     }
 
@@ -967,7 +975,7 @@ mod responses_endpoint_tests {
     }
 
     #[tokio::test]
-    async fn test_v1_responses_delete_and_list_not_implemented() {
+    async fn test_v1_responses_delete_not_implemented() {
         let ctx = TestContext::new(vec![MockWorkerConfig {
             port: 18954,
             worker_type: WorkerType::Regular,
@@ -979,7 +987,7 @@ mod responses_endpoint_tests {
 
         let app = ctx.create_app().await;
 
-        // Use an arbitrary id for delete/list
+        // Test DELETE is not implemented
         let resp_id = "resp-test-123";
 
         let req = Request::builder()
@@ -990,13 +998,74 @@ mod responses_endpoint_tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
 
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_input_items() {
+        // This test uses OpenAI mode because the input_items endpoint
+        // is only implemented in OpenAIRouter and reads from storage (no workers needed)
+        let config = RouterConfig::builder()
+            .openai_mode(vec!["http://dummy.local".to_string()]) // Dummy URL (won't be called)
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3002)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_size(0)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+
+        let ctx = TestContext::new_with_config(
+            config,
+            vec![], // No workers needed
+        )
+        .await;
+
+        let app = ctx.create_app().await;
+
+        // Directly store a response in the storage to test the retrieval endpoint
+        use sglang_router_rs::data_connector::{ResponseId, StoredResponse};
+        let mut stored_response = StoredResponse::new(None);
+        stored_response.id = ResponseId::from("resp_test_input_items");
+        stored_response.input = json!([
+            {"id": "item_1", "content": "hello", "role": "user"},
+            {"id": "item_2", "content": "hi there", "role": "assistant"}
+        ]);
+        stored_response.output = json!([
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "test response"}]}
+        ]);
+
+        ctx.app_context
+            .response_storage
+            .store_response(stored_response)
+            .await
+            .expect("Failed to store response");
+
+        // Fetch input_items for the created response
         let req = Request::builder()
             .method("GET")
-            .uri(format!("/v1/responses/{}/input", resp_id))
+            .uri("/v1/responses/resp_test_input_items/input_items")
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let items_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify response structure
+        assert_eq!(items_json["object"], "list");
+        assert!(items_json["data"].is_array());
+
+        // Should have 2 input items
+        let items = items_json["data"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
 
         ctx.shutdown().await;
     }
@@ -1469,7 +1538,7 @@ mod pd_mode_tests {
             .build_unchecked();
 
         // Create app context
-        let app_context = common::create_test_context(config);
+        let app_context = common::create_test_context(config).await;
 
         // Create router - this might fail due to health check issues
         let router_result = RouterFactory::create_router(&app_context).await;

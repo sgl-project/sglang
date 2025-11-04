@@ -150,9 +150,9 @@ class ResponseAPIBaseTest(CustomTestCase):
         """Cancel response by ID via POST /v1/responses/{response_id}/cancel."""
         return self.make_request(f"/v1/responses/{response_id}/cancel", "POST", {})
 
-    def get_response_input(self, response_id: str) -> requests.Response:
-        """Get response input items via GET /v1/responses/{response_id}/input."""
-        return self.make_request(f"/v1/responses/{response_id}/input", "GET")
+    def get_response_input_items(self, response_id: str) -> requests.Response:
+        """Get response input items via GET /v1/responses/{response_id}/input_items."""
+        return self.make_request(f"/v1/responses/{response_id}/input_items", "GET")
 
     def create_conversation(self, metadata: Optional[dict] = None) -> requests.Response:
         """Create conversation via POST /v1/conversations."""
@@ -359,13 +359,11 @@ class ResponseCRUDBaseTest(ResponseAPIBaseTest):
         self.assertEqual(get_data["id"], response_id)
         self.assertEqual(get_data["status"], "completed")
 
-        input_resp = self.get_response_input(get_data["id"])
-        # change not merge yet
-        self.assertEqual(input_resp.status_code, 501)
-        # self.assertEqual(input_resp.status_code, 200)
-        # input_data = input_resp.json()
-        # self.assertIn("data", input_data)
-        # self.assertGreater(len(input_data["data"]), 0)
+        input_resp = self.get_response_input_items(get_data["id"])
+        self.assertEqual(input_resp.status_code, 200)
+        input_data = input_resp.json()
+        self.assertIn("data", input_data)
+        self.assertGreater(len(input_data["data"]), 0)
 
     @unittest.skip("TODO: Add delete response feature")
     def test_delete_response(self):
