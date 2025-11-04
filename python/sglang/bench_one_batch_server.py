@@ -16,6 +16,7 @@ import argparse
 import dataclasses
 import itertools
 import json
+import logging
 import multiprocessing
 import os
 import random
@@ -25,8 +26,10 @@ from typing import List, Optional, Tuple
 import numpy as np
 import requests
 from pydantic import BaseModel
+from transformers import AutoProcessor, PreTrainedTokenizer
 
 from sglang.bench_serving import (
+    get_processor,
     get_tokenizer,
     sample_mmmu_requests,
     sample_random_requests,
@@ -36,6 +39,8 @@ from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
+
+logger = logging.getLogger(__name__)
 
 
 class ProfileLinks(BaseModel):
@@ -104,8 +109,14 @@ Note: To view the traces through perfetto-ui, please:
             if self.profile_links.extend or self.profile_links.decode:
                 # Create a combined link or use the first available one
                 trace_files = [self.profile_links.extend, self.profile_links.decode]
+                if any(trace_file is None for trace_file in trace_files):
+                    logger.error("Some trace files are None", f"{trace_files=}")
                 trace_files_relay_links = [
-                    f"[trace]({get_perfetto_relay_link_from_trace_file(trace_file)})"
+                    (
+                        f"[trace]({get_perfetto_relay_link_from_trace_file(trace_file)})"
+                        if trace_file
+                        else "N/A"
+                    )
                     for trace_file in trace_files
                 ]
 
@@ -114,30 +125,29 @@ Note: To view the traces through perfetto-ui, please:
         # Build the row
         return f"| {self.batch_size} | {self.input_len} | {self.latency:.2f} | {self.input_throughput:.2f} | {self.output_throughput:.2f} | {accept_length} | {itl:.2f} | {input_cost:.2f} | {output_cost:.2f} | {profile_link} |\n"
 
-    @classmethod
-    def generate_markdown_report(
-        cls, trace_dir, results: List["BenchmarkResult"]
-    ) -> str:
-        """Generate a markdown report from a list of BenchmarkResult object from a single run."""
-        import os
 
-        summary = f"### {results[0].model_path}\n"
+def generate_markdown_report(trace_dir, results: List["BenchmarkResult"]) -> str:
+    """Generate a markdown report from a list of BenchmarkResult object from a single run."""
+    import os
 
-        # summary += (
-        #     f"Input lens: {result.input_len}. Output lens: {result.output_len}.\n"
-        # )
-        summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile (extend) | profile (decode)|\n"
-        summary += "| ---------- | --------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ | --------------- | -------------- |\n"
+    summary = f"### {results[0].model_path}\n"
 
-        # all results should share the same isl & osl
-        for result in results:
-            base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
-            relay_base = os.getenv("PERFETTO_RELAY_URL", "").rstrip("/")
-            relay_base = "https://docs.sglang.ai/ci-data/pages/perfetto_relay.html"
-            # base_url = "https://github.com/sgl-project/ci-data/traces"
-            summary += result.to_markdown_row(trace_dir, base_url, relay_base)
+    # summary += (
+    #     f"Input lens: {result.input_len}. Output lens: {result.output_len}.\n"
+    # )
+    summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile (extend) | profile (decode)|\n"
+    summary += "| ---------- | --------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ | --------------- | -------------- |\n"
 
-        return summary
+    # all results should share the same isl & osl
+    for result in results:
+        base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
+        relay_base = os.getenv(
+            "PERFETTO_RELAY_URL",
+            "",
+        ).rstrip("/")
+        summary += result.to_markdown_row(trace_dir, base_url, relay_base)
+
+    return summary
 
 
 @dataclasses.dataclass
@@ -288,7 +298,7 @@ def run_one_case(
     input_len_step_percentage: float,
     run_name: str,
     result_filename: str,
-    tokenizer,
+    tokenizer: PreTrainedTokenizer | AutoProcessor,
     dataset_name="",
     profile: bool = False,
     profile_steps: int = 3,
@@ -302,9 +312,8 @@ def run_one_case(
     if dataset_name == "mmmu":
         input_requests = sample_mmmu_requests(
             num_requests=batch_size,
-            tokenizer=tokenizer,
+            processor=tokenizer,
             fixed_output_len=output_len,
-            apply_chat_template=True,
             random_sample=False,
         )
     elif dataset_name == "random":
@@ -364,6 +373,8 @@ def run_one_case(
     if dataset_name == "mmmu":
         # vlm
         input_ids = []
+        # for vlms, tokenizer is an instance of AutoProcessor
+        tokenizer = tokenizer.tokenizer
         for input_req in input_requests:
             input_ids += [tokenizer.encode(input_req.prompt)]
         payload["image_data"] = [req.image_data for req in input_requests]
@@ -609,7 +620,12 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         tokenizer_path = server_info["tokenizer_path"]
     elif "prefill" in server_info:
         tokenizer_path = server_info["prefill"][0]["tokenizer_path"]
-    tokenizer = get_tokenizer(tokenizer_path)
+
+    if bench_args.dataset_name == "mmmu":
+        # mmmu implies this is a MLLM
+        tokenizer = get_processor(tokenizer_path)
+    else:
+        tokenizer = get_tokenizer(tokenizer_path)
 
     # warmup
     if not bench_args.skip_warmup:

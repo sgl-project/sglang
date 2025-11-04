@@ -34,7 +34,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     log_info_on_rank0,
@@ -43,6 +42,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 
 logger = logging.getLogger(__name__)
 

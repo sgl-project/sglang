@@ -6,10 +6,8 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers.activations import ACT2FN
 
 from sglang.srt.configs import DotsOCRConfig
-from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead

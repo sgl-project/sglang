@@ -5,7 +5,7 @@ from typing import Iterable, Optional, Set, Tuple
 
 import torch
 
-from sglang.srt.hf_transformers_utils import AutoConfig
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 
 @dataclass

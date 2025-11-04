@@ -3,27 +3,46 @@
 //! Tests for malformed input, edge cases, and error recovery
 
 use sglang_router_rs::tool_parser::{
-    JsonParser, MistralParser, ParseState, ParserRegistry, PythonicParser, QwenParser,
-    StreamResult, ToolParser,
+    JsonParser, MistralParser, PythonicParser, QwenParser, ToolParser,
 };
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_empty_input() {
-    let registry = ParserRegistry::new();
-    let parsers = vec!["json", "mistral", "qwen", "pythonic", "llama"];
+    // Test that all parsers handle empty input correctly
+    let json_parser = JsonParser::new();
+    let (_normal_text, tools) = json_parser.parse_complete("").await.unwrap();
+    assert_eq!(
+        tools.len(),
+        0,
+        "JSON parser should return empty for empty input"
+    );
 
-    for parser_name in parsers {
-        let parser = registry
-            .get_parser(&format!("test-{}", parser_name))
-            .unwrap();
-        let (_normal_text, tools) = parser.parse_complete("").await.unwrap();
-        assert_eq!(
-            tools.len(),
-            0,
-            "Parser {} should return empty for empty input",
-            parser_name
-        );
-    }
+    let mistral_parser = MistralParser::new();
+    let (_normal_text, tools) = mistral_parser.parse_complete("").await.unwrap();
+    assert_eq!(
+        tools.len(),
+        0,
+        "Mistral parser should return empty for empty input"
+    );
+
+    let qwen_parser = QwenParser::new();
+    let (_normal_text, tools) = qwen_parser.parse_complete("").await.unwrap();
+    assert_eq!(
+        tools.len(),
+        0,
+        "Qwen parser should return empty for empty input"
+    );
+
+    let pythonic_parser = PythonicParser::new();
+    let (_normal_text, tools) = pythonic_parser.parse_complete("").await.unwrap();
+    assert_eq!(
+        tools.len(),
+        0,
+        "Pythonic parser should return empty for empty input"
+    );
 }
 
 #[tokio::test]
@@ -277,38 +296,39 @@ async fn test_null_and_boolean_values() {
 
 #[tokio::test]
 async fn test_partial_token_at_buffer_boundary() {
-    let parser = QwenParser::new();
-    let mut state = ParseState::new();
+    let mut parser = QwenParser::new();
+
+    let tools = create_test_tools();
 
     // Send exactly "<tool" which is a 5-character prefix of "<tool_call>\n"
-    let result = parser.parse_incremental("<tool", &mut state).await.unwrap();
-    assert!(matches!(result, StreamResult::Incomplete));
-    assert_eq!(state.buffer, "<tool");
+    let result = parser.parse_incremental("<tool", &tools).await.unwrap();
+    assert!(
+        result.calls.is_empty(),
+        "Should be incomplete for partial tag"
+    );
 
     // Complete the token
     let result = parser
         .parse_incremental(
             "_call>\n{\"name\": \"test\", \"arguments\": {}}\n</tool_call>",
-            &mut state,
+            &tools,
         )
         .await
         .unwrap();
 
     // Should successfully parse after completing
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "test");
-        }
-        _ => {
-            // In Phase 2 simplified streaming, might get Incomplete
-            // The important thing is it didn't fail to recognize the partial token
+    if !result.calls.is_empty() {
+        if let Some(name) = &result.calls[0].name {
+            assert_eq!(name, "test");
         }
     }
 }
 
 #[tokio::test]
 async fn test_exact_prefix_lengths() {
-    let parser = QwenParser::new();
+    let mut parser = QwenParser::new();
+
+    let tools = create_test_tools();
 
     let test_cases = vec![
         ("<", 1),            // 1-char prefix
@@ -319,18 +339,13 @@ async fn test_exact_prefix_lengths() {
     ];
 
     for (prefix, expected_len) in test_cases {
-        let mut state = ParseState::new();
-        let result = parser.parse_incremental(prefix, &mut state).await.unwrap();
+        let result = parser.parse_incremental(prefix, &tools).await.unwrap();
         assert!(
-            matches!(result, StreamResult::Incomplete),
+            result.calls.is_empty(),
             "Prefix '{}' (len {}) should be incomplete",
             prefix,
             expected_len
         );
-        assert_eq!(
-            state.buffer, prefix,
-            "Buffer should contain the prefix '{}'",
-            prefix
-        );
+        // Buffer is now internal to parser - can't assert on it
     }
 }

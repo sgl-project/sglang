@@ -22,8 +22,8 @@ The radix tree data structure for managing the KV cache.
 import heapq
 import time
 from collections import defaultdict
-from functools import partial
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
+from functools import lru_cache, partial
+from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -34,7 +34,14 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
-from sglang.srt.mem_cache.evict_policy import EvictionStrategy, LFUStrategy, LRUStrategy
+from sglang.srt.mem_cache.evict_policy import (
+    EvictionStrategy,
+    FIFOStrategy,
+    FILOStrategy,
+    LFUStrategy,
+    LRUStrategy,
+    MRUStrategy,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
@@ -76,6 +83,7 @@ class TreeNode:
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
+        self.creation_time = time.monotonic()
 
         self.hit_count = 0
         # indicating the node is locked to protect from eviction
@@ -113,6 +121,13 @@ class TreeNode:
         if self.hash_value is None or len(self.hash_value) == 0:
             return None
         return self.hash_value[-1]
+
+    @lru_cache(maxsize=1)
+    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
+        if node is None or node.hash_value is None:
+            return []
+
+        return node.get_prefix_hash_values(node.parent) + node.hash_value
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
@@ -209,9 +224,15 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = LRUStrategy()
         elif eviction_policy.lower() == "lfu":
             self.eviction_strategy: EvictionStrategy = LFUStrategy()
+        elif eviction_policy.lower() == "fifo":
+            self.eviction_strategy: EvictionStrategy = FIFOStrategy()
+        elif eviction_policy.lower() == "mru":
+            self.eviction_strategy: EvictionStrategy = MRUStrategy()
+        elif eviction_policy.lower() == "filo":
+            self.eviction_strategy: EvictionStrategy = FILOStrategy()
         else:
             raise ValueError(
-                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu'."
+                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'."
             )
         self.reset()
 
@@ -267,7 +288,7 @@ class RadixCache(BasePrefixCache):
         """
         key.token_ids = self.key_convert_fn(key.token_ids)
 
-        if self.disable or len(key) == 0:
+        def empty_match_result():
             return MatchResult(
                 device_indices=torch.empty(
                     (0,),
@@ -278,9 +299,15 @@ class RadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
+        if self.disable or len(key) == 0:
+            return empty_match_result()
+
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
+
+        if len(key) == 0:
+            return empty_match_result()
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
@@ -308,18 +335,20 @@ class RadixCache(BasePrefixCache):
 
         return self._insert_helper(self.root_node, key, value)
 
-    def cache_finished_req(self, req: Req):
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
+        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.origin_input_ids) + len(req.output_ids) - 1
+                req.req_pool_idx, :all_token_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
-        all_token_len = len(token_ids)
+        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
+        # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
+        # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :all_token_len
@@ -330,12 +359,9 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
             )
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
             page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
-            if self.is_eagle:
-                self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         page_aligned_token_len = (
             page_aligned_len + 1 if self.is_eagle else page_aligned_len
@@ -343,15 +369,27 @@ class RadixCache(BasePrefixCache):
 
         old_prefix_len = len(req.prefix_indices)
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
-            # prefix_indices attached partial part (for page_size > 1) and one unmatched token (for EAGLE)
+            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(
-            RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
-            page_aligned_kv_indices,
-        )
-        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
+        if is_insert:
+            new_prefix_len = self.insert(
+                RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
+                page_aligned_kv_indices,
+            )
+            # Free the duplicates that were already in the tree
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:new_prefix_len]
+            )
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:page_aligned_len]
+            )
+
+        # free the unaligned tail
+        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -364,7 +402,8 @@ class RadixCache(BasePrefixCache):
 
         token_ids = req.fill_ids
         all_token_len = len(token_ids)
-        # The actual kv len for EAGLE is len(token_ids), since EAGLE uses bigram key
+        # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
+        # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :all_token_len
@@ -387,7 +426,8 @@ class RadixCache(BasePrefixCache):
 
         old_prefix_len = len(req.prefix_indices)
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
-            # prefix_indices attached partial part (for page_size > 1) and one unmatched token (for EAGLE)
+            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
 
         # Radix Cache takes one ref in memory pool
@@ -475,9 +515,9 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
-                self.evictable_size_ -= len(node.value)
-                self.protected_size_ += len(node.value)
-                delta -= len(node.value)
+                self.evictable_size_ -= len(node.key)
+                self.protected_size_ += len(node.key)
+                delta -= len(node.key)
             node.lock_ref += 1
             node = node.parent
         return delta
@@ -489,10 +529,14 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
-                self.evictable_size_ += len(node.value)
-                self.protected_size_ -= len(node.value)
-                delta += len(node.value)
+                self.evictable_size_ += len(node.key)
+                self.protected_size_ -= len(node.key)
+                delta += len(node.key)
             node.lock_ref -= 1
+            if node.parent is None:
+                assert (
+                    node is self.root_node
+                ), f"This request holds the node from another tree"
             node = node.parent
         return delta
 
@@ -589,7 +633,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
-            self.evictable_size_ += len(value)
+            self.evictable_size_ += len(key)
             self._record_store_event(new_node)
         return total_prefix_length
 

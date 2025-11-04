@@ -1,9 +1,12 @@
-use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use super::worker::{
-    BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
+use std::collections::HashMap;
+
+use super::{
+    circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+    worker::{
+        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
+    },
 };
 use crate::grpc_client::SglangSchedulerClient;
-use std::collections::HashMap;
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
@@ -100,7 +103,36 @@ impl BasicWorkerBuilder {
             atomic::{AtomicBool, AtomicUsize},
             Arc,
         };
-        use tokio::sync::{Mutex, RwLock};
+
+        use tokio::sync::RwLock;
+
+        let bootstrap_host = match url::Url::parse(&self.url) {
+            Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+            Err(_) if !self.url.contains("://") => {
+                match url::Url::parse(&format!("http://{}", self.url)) {
+                    Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+                    Err(_) => {
+                        tracing::warn!(
+                            "Failed to parse URL '{}', defaulting to localhost",
+                            self.url
+                        );
+                        "localhost".to_string()
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Failed to parse URL '{}', defaulting to localhost",
+                    self.url
+                );
+                "localhost".to_string()
+            }
+        };
+
+        let bootstrap_port = match self.worker_type {
+            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
 
         let metadata = WorkerMetadata {
             url: self.url.clone(),
@@ -109,11 +141,11 @@ impl BasicWorkerBuilder {
             connection_mode: self.connection_mode,
             labels: self.labels,
             health_config: self.health_config,
+            bootstrap_host,
+            bootstrap_port,
         };
 
-        let grpc_client = Arc::new(RwLock::new(
-            self.grpc_client.map(|client| Arc::new(Mutex::new(client))),
-        ));
+        let grpc_client = Arc::new(RwLock::new(self.grpc_client.map(Arc::new)));
 
         BasicWorker {
             metadata,
@@ -252,9 +284,10 @@ impl DPAwareWorkerBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::core::worker::Worker;
-    use std::time::Duration;
 
     #[test]
     fn test_basic_worker_builder_minimal() {

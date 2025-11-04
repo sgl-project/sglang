@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
@@ -10,8 +10,9 @@ import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:
@@ -583,7 +584,9 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
-        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+            include_draft_extend_v2=True
+        ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
@@ -593,10 +596,9 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
-            ):
+            if any(
+                forward_batch.extend_prefix_lens_cpu
+            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -705,7 +707,9 @@ class FlashAttentionBackend(AttentionBackend):
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
-        causal = not layer.is_cross_attention
+        causal = True
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            causal = False
 
         # Check if we should use local attention
         use_local_attn = (
@@ -754,7 +758,6 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use Flash Attention for prefill
         if not self.use_mla:
-            assert self.fa_impl_ver in [3], "Only FA3 support here"
             # Do multi-head attention
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
@@ -824,11 +827,11 @@ class FlashAttentionBackend(AttentionBackend):
             if (
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
+                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
-                    assert not global_server_args_dict["disable_chunked_prefix_cache"]
+                    assert not get_global_server_args().disable_chunked_prefix_cache
                     # MHA for chunked prefix kv cache when running model with MLA
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
@@ -853,14 +856,24 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
+                    cu_seqlens_k = (
+                        metadata.cu_seqlens_q
+                        if not forward_batch.mha_one_shot
+                        else metadata.cu_seqlens_k
+                    )
+                    max_seqlen_k = (
+                        metadata.max_seq_len_q
+                        if not forward_batch.mha_one_shot
+                        else metadata.max_seq_len_k
+                    )
                     output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
                         cu_seqlens_q=metadata.cu_seqlens_q,
-                        cu_seqlens_k=metadata.cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
                         max_seqlen_q=metadata.max_seq_len_q,
-                        max_seqlen_k=metadata.max_seq_len_q,
+                        max_seqlen_k=max_seqlen_k,
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
@@ -1006,7 +1019,9 @@ class FlashAttentionBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1
             else (-1, -1)
         )
-        causal = not layer.is_cross_attention
+        causal = True
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            causal = False
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
@@ -2316,7 +2331,7 @@ class FlashAttentionMultiStepBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends = []
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 FlashAttentionBackend(
                     model_runner,
@@ -2331,7 +2346,7 @@ class FlashAttentionMultiStepBackend:
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
     def init_forward_metadata_capture_cuda_graph(

@@ -1,5 +1,8 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, trace};
 
