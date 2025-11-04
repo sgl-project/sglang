@@ -404,7 +404,6 @@ class TokenizerCommunicatorMixin:
             results = await self.update_weights_from_distributed_communicator(obj)
             success, message = _Communicator.merge_results(results)
 
-        # Update weight version if provided and weights update was successful
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -458,7 +457,6 @@ class TokenizerCommunicatorMixin:
             result = (await self.update_weights_from_tensor_communicator(obj))[0]
             success, message = result.success, result.message
 
-        # Update weight version if provided and weights update was successful
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -487,7 +485,6 @@ class TokenizerCommunicatorMixin:
             logger.error(error_msg)
             success, message = False, error_msg
 
-        # Update weight version if provided and weights update was successful
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
