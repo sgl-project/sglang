@@ -154,6 +154,7 @@ def test_topk_transform_ragged_kernel(bs: int, k: int, seq_len: int) -> None:
     # bs: # of q tokens
     score = torch.randn(bs, MAX_SEQ_LEN, dtype=torch.float32, device="cuda")
     # kv_len
+    ks = torch.zeros((bs,), dtype=torch.int32, device="cuda")
     lengths = torch.full((bs,), seq_len, dtype=torch.int32, device="cuda")
     topk_indices_offset = torch.randint(
         0, 1024, (bs,), dtype=torch.int32, device="cuda"
@@ -170,6 +171,7 @@ def test_topk_transform_ragged_kernel(bs: int, k: int, seq_len: int) -> None:
         lengths=lengths,
         topk_indices_offset=topk_indices_offset,
         topk=k,
+        row_starts=ks,
     )
 
     # sort and compare

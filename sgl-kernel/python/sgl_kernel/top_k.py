@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 
@@ -11,13 +13,29 @@ def fast_topk(values, topk, dim):
         return torch.topk(values, topk, dim=dim)
 
 
-def fast_topk_v2(score: torch.Tensor, lengths: torch.Tensor, topk: int) -> torch.Tensor:
+def fast_topk_v2(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Get the topk indices of the score tensor.
+    Args:
+        score: The score tensor of shape (B, L)
+        lengths: The lengths tensor of shape (B)
+        topk: The number of topk indices to get
+        row_starts: The start index of each row in the score tensor of shape (B).
+        For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]] of the score tensor.
+    Returns:
+        The topk indices tensor of shape (B, topk)
+    """
     assert (
         topk == 2048
     ), "fast_topk_v2 is only optimized for deepseek v3.2 model, where topk=2048"
     assert score.dim() == 2
     topk_indices = score.new_empty((score.size(0), topk), dtype=torch.int32)
-    torch.ops.sgl_kernel.fast_topk(score, topk_indices, lengths)
+    torch.ops.sgl_kernel.fast_topk(score, topk_indices, lengths, row_starts)
     return topk_indices
 
 
@@ -27,9 +45,19 @@ def fast_topk_transform_fused(
     page_table_size_1: torch.Tensor,  # NOTE: page size should be 1
     cu_seqlens_q: torch.Tensor,
     topk: int,
+    row_starts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Transform topk indices to indices to the page table (page_size = 1)
+    Args:
+        score: The score tensor of shape (B, L)
+        lengths: The lengths tensor of shape (B)
+        page_table_size_1: The page table tensor of shape (Batch, topk)
+        cu_seqlens_q: The cumulative sequence lengths tensor of shape (Batch + 1)
+        topk: The number of topk indices to get
+        row_starts: The start index of each row in the score tensor of shape (B). For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]] of the score tensor. It's only used for prefill where the kv cache is ragged.
+    Returns:
+        The topk indices tensor of shape (B, topk)
     """
     assert (
         topk == 2048
@@ -38,7 +66,7 @@ def fast_topk_transform_fused(
     src_page_table = page_table_size_1
     dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_topk_transform_fused(
-        score, lengths, dst_page_table, src_page_table, cu_seqlens_q
+        score, lengths, dst_page_table, src_page_table, cu_seqlens_q, row_starts
     )
     return dst_page_table
 
@@ -48,16 +76,25 @@ def fast_topk_transform_ragged_fused(
     lengths: torch.Tensor,
     topk_indices_offset: torch.Tensor,  # ragged kv
     topk: int,
+    row_starts: torch.Tensor,
 ) -> torch.Tensor:
     """
     Transform topk indices to indices to ragged kv (non-paged)
+    Args:
+        score: The score tensor of shape (B, L)
+        lengths: The lengths tensor of shape (B)
+        topk_indices_offset: The offset of topk indices in ragged kv, prefill only, of shape (B)
+        topk: The number of topk indices to get
+        row_starts: The start index of each row in the score tensor of shape (B). For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]] of the score tensor. It's required because this function is for prefill only.
+    Returns:
+        The topk indices tensor of shape (B, topk)
     """
     assert (
         topk == 2048
-    ), "fast_topk_transform_fused_ragged is only optimized for deepseek v3.2 model, where topk=2048"
+    ), "fast_topk_transform_ragged_fused is only optimized for deepseek v3.2 model, where topk=2048"
     assert score.dim() == 2
     topk_indices_ragged = score.new_empty((score.shape[0], topk), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_topk_transform_ragged_fused(
-        score, lengths, topk_indices_ragged, topk_indices_offset
+        score, lengths, topk_indices_ragged, topk_indices_offset, row_starts
     )
     return topk_indices_ragged
