@@ -17,28 +17,21 @@ from sglang.test.test_utils import (
 )
 
 
-def setup_class(cls, backend: str):
-    cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-    cls.base_url = DEFAULT_URL_FOR_TEST
-    other_args = [
-        "--max-running-requests",
-        "10",
-        "--grammar-backend",
-        backend,
-    ]
-
-    cls.process = popen_launch_server(
-        cls.model,
-        cls.base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
-    )
-
-
 class TestJSONConstrained(CustomTestCase, TestJSONConstrainedMixin):
+    backend = "xgrammar"
+
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, backend="xgrammar")
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        launch_args = ["--max-running-requests", "10", "--grammar-backend", cls.backend]
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=launch_args,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -46,15 +39,11 @@ class TestJSONConstrained(CustomTestCase, TestJSONConstrainedMixin):
 
 
 class TestJSONConstrainedOutlinesBackend(TestJSONConstrained):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, backend="outlines")
+    backend = "outlines"
 
 
 class TestJSONConstrainedLLGuidanceBackend(TestJSONConstrained):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, backend="llguidance")
+    backend = "llguidance"
 
 
 if __name__ == "__main__":
