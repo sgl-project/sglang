@@ -338,7 +338,7 @@ class Scheduler(
 
         # Draft workers are looked up via `SpeculativeAlgorithm` registry; new
         # algorithms should register their factory instead of patching this code.
-        if self.spec_algorithm.name in {"EAGLE", "EAGLE3"}:
+        if self.spec_algorithm.name in {"EAGLE", "EAGLE3", "STANDALONE"}:
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
         self.draft_worker = self.spec_algorithm.create_draft_worker(
             **draft_worker_kwargs
@@ -2036,7 +2036,7 @@ class Scheduler(
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
 
-                if batch.is_v2_eagle:
+                if batch.is_v2_eagle or batch.is_v2_standalone:
                     # FIXME(lsyin): tmp code for eagle v2
                     # We only keep future indices for next draft input
 

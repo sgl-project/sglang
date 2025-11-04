@@ -1611,11 +1611,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME: finally deprecate is_v2_eagle
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
+    @property
+    def is_v2_standalone(self):
+        return self.enable_overlap and self.spec_algorithm.is_standalone()
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.is_v2_eagle:
+        if self.is_v2_eagle or self.is_v2_standalone:
             # TODO(spec-v2): all v2 spec should go through this path
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
@@ -1677,7 +1681,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += bs
 
     def maybe_wait_verify_done(self):
-        if self.is_v2_eagle:
+        if self.is_v2_eagle or self.is_v2_standalone:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
