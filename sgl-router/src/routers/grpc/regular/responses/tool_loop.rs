@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+use serde_json::Value;
 
 use axum::{
     body::Body,
@@ -912,7 +913,6 @@ async fn execute_tool_loop_streaming_internal(
 
 /// Convert MCP tools to Chat API tool format
 fn convert_mcp_tools_to_chat_tools(mcp_tools: &[mcp::Tool]) -> Vec<Tool> {
-    use serde_json::Value;
     mcp_tools
         .iter()
         .map(|tool_info| Tool {
