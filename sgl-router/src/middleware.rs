@@ -614,9 +614,12 @@ pub async fn wasm_middleware(
         Ok(bytes) => bytes.to_vec(),
         Err(e) => {
             error!("Failed to read request body: {}", e);
-            return Ok(next
-                .run(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await);
+            // Create a minimal request with empty body for error recovery
+            let error_request = Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap_or_else(|_| Request::new(Body::empty()));
+            return Ok(next.run(error_request).await);
         }
     };
 
@@ -635,7 +638,11 @@ pub async fn wasm_middleware(
             request_id: request_id.clone(),
             now_epoch_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_else(|_| {
+                    // Fallback to 0 if system time is before UNIX_EPOCH
+                    // This should never happen in practice, but provides a safe fallback
+                    Duration::from_millis(0)
+                })
                 .as_millis() as u64,
         };
 
@@ -703,10 +710,12 @@ pub async fn wasm_middleware(
         Ok(bytes) => bytes.to_vec(),
         Err(e) => {
             error!("Failed to read response body: {}", e);
-            return Ok(Response::builder()
+            // Create a minimal response with empty body for error recovery
+            let error_response = Response::builder()
                 .status(status)
                 .body(Body::empty())
-                .unwrap());
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+            return Ok(error_response);
         }
     };
 
