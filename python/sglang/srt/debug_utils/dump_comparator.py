@@ -2,7 +2,9 @@ import argparse
 import functools
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, Optional, Callable, List
 
 import einops
 import polars as pl
@@ -38,13 +40,13 @@ def main(args):
             location_info = location_info_of_target_pass_id.get(row["forward_pass_id"])
             if location_info is None:
                 continue
-            baseline_forward_pass_id = location_info["baseline_forward_pass_id"]
-            baseline_token_slice = location_info["baseline_token_slice"]
+            baseline_forward_pass_id = location_info.baseline_forward_pass_id
+            baseline_token_slice = location_info.baseline_token_slice
         else:
             baseline_forward_pass_id = (
                 row["forward_pass_id"] - args.start_id + args.baseline_start_id
             )
-            baseline_token_slice = baseline_cropper = None
+            baseline_token_slice = None
 
         tensor_dim_desc = None
         if tensor_dim_descs is not None:
@@ -103,7 +105,7 @@ def check_tensor_pair(
     diff_threshold: float = 1e-3,
     name="",
     baseline_token_slice=None,
-    tensor_dim_desc=None,
+    tensor_dim_desc: Optional["TensorDimDesc"]=None,
 ):
     x_baseline = _load_object(path_baseline)
     x_target = _load_object(path_target)
@@ -116,15 +118,15 @@ def check_tensor_pair(
 
     if tensor_dim_desc is not None:
         if (s := baseline_token_slice) is not None:
-            dim = _get_einops_dim_index(tensor_dim_desc["baseline_desc"], "num_tokens")
+            dim = _get_einops_dim_index(tensor_dim_desc.baseline_desc, "num_tokens")
             x_baseline = x_baseline.narrow(
                 dim=dim, start=s.start, length=s.stop - s.start
             )
         x_baseline = einops.rearrange(
             x_baseline,
-            tensor_dim_desc["baseline_desc"] + " -> " + tensor_dim_desc["target_desc"],
+            tensor_dim_desc.baseline_desc + " -> " + tensor_dim_desc.target_desc,
         )
-        if (f := tensor_dim_desc.get("baseline_cropper")) is not None:
+        if (f := tensor_dim_desc.baseline_cropper) is not None:
             print("Apply baseline_cropper")
             x_baseline = f(x_baseline)
 
@@ -263,12 +265,22 @@ def _comparison_preprocessor(x_baseline, x_target, name):
     return x_baseline, x_target
 
 
-def _get_location_info_of_target_pass_id():
+@dataclass
+class LocationInfo:
+    baseline_forward_pass_id: int
+    baseline_token_slice: slice
+
+def _get_location_info_of_target_pass_id() -> Dict[int, LocationInfo]:
     """Customization endpoint."""
     return {}
 
+@dataclass
+class TensorDimDesc:
+    baseline_desc: str
+    target_desc: str
+    baseline_cropper: Optional[Callable[[torch.Tensor], torch.Tensor]]
 
-def _get_tensor_dim_descs():
+def _get_tensor_dim_descs() -> List[TensorDimDesc]:
     """Customization endpoint."""
     return []
 
