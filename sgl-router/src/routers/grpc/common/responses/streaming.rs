@@ -2,17 +2,20 @@
 
 use std::collections::HashMap;
 
+use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
-use crate::protocols::chat::ChatCompletionStreamResponse;
+use crate::{mcp, protocols::chat::ChatCompletionStreamResponse};
 
-pub(super) enum OutputItemType {
+pub enum OutputItemType {
     Message,
     McpListTools,
     McpCall,
+    FunctionCall,
     Reasoning,
 }
 
@@ -29,10 +32,6 @@ struct OutputItemState {
     output_index: usize,
     status: ItemStatus,
 }
-
-// ============================================================================
-// Streaming Event Emitter
-// ============================================================================
 
 /// OpenAI-compatible event emitter for /v1/responses streaming
 ///
@@ -53,9 +52,9 @@ struct OutputItemState {
 /// - response.mcp_call_arguments.done
 /// - response.mcp_call.completed
 /// - response.mcp_call.failed
-pub(super) struct ResponseStreamEventEmitter {
+pub struct ResponseStreamEventEmitter {
     sequence_number: u64,
-    response_id: String,
+    pub response_id: String,
     model: String,
     created_at: u64,
     message_id: String,
@@ -66,7 +65,7 @@ pub(super) struct ResponseStreamEventEmitter {
     has_emitted_content_part_added: bool,
     // MCP call tracking
     mcp_call_accumulated_args: HashMap<String, String>,
-    // Output item tracking (NEW)
+    // Output item tracking
     output_items: Vec<OutputItemState>,
     next_output_index: usize,
     current_message_output_index: Option<usize>, // Tracks output_index of current message
@@ -74,7 +73,7 @@ pub(super) struct ResponseStreamEventEmitter {
 }
 
 impl ResponseStreamEventEmitter {
-    pub(super) fn new(response_id: String, model: String, created_at: u64) -> Self {
+    pub fn new(response_id: String, model: String, created_at: u64) -> Self {
         let message_id = format!("msg_{}", Uuid::new_v4());
 
         Self {
@@ -102,7 +101,7 @@ impl ResponseStreamEventEmitter {
         seq
     }
 
-    pub(super) fn emit_created(&mut self) -> serde_json::Value {
+    pub fn emit_created(&mut self) -> serde_json::Value {
         self.has_emitted_created = true;
         json!({
             "type": "response.created",
@@ -118,7 +117,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_in_progress(&mut self) -> serde_json::Value {
+    pub fn emit_in_progress(&mut self) -> serde_json::Value {
         self.has_emitted_in_progress = true;
         json!({
             "type": "response.in_progress",
@@ -131,7 +130,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_content_part_added(
+    pub fn emit_content_part_added(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -151,7 +150,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_text_delta(
+    pub fn emit_text_delta(
         &mut self,
         delta: &str,
         output_index: usize,
@@ -169,7 +168,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_text_done(
+    pub fn emit_text_done(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -185,7 +184,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_content_part_done(
+    pub fn emit_content_part_done(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -204,10 +203,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_completed(
-        &mut self,
-        usage: Option<&serde_json::Value>,
-    ) -> serde_json::Value {
+    pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
         let mut response = json!({
             "type": "response.completed",
             "sequence_number": self.next_sequence(),
@@ -240,10 +236,7 @@ impl ResponseStreamEventEmitter {
     // MCP Event Emission Methods
     // ========================================================================
 
-    pub(super) fn emit_mcp_list_tools_in_progress(
-        &mut self,
-        output_index: usize,
-    ) -> serde_json::Value {
+    pub fn emit_mcp_list_tools_in_progress(&mut self, output_index: usize) -> serde_json::Value {
         json!({
             "type": "response.mcp_list_tools.in_progress",
             "sequence_number": self.next_sequence(),
@@ -251,10 +244,10 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_list_tools_completed(
+    pub fn emit_mcp_list_tools_completed(
         &mut self,
         output_index: usize,
-        tools: &[crate::mcp::Tool],
+        tools: &[mcp::Tool],
     ) -> serde_json::Value {
         let tool_items: Vec<_> = tools
             .iter()
@@ -275,7 +268,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_in_progress(
+    pub fn emit_mcp_call_in_progress(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -288,7 +281,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_arguments_delta(
+    pub fn emit_mcp_call_arguments_delta(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -309,7 +302,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_arguments_done(
+    pub fn emit_mcp_call_arguments_done(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -324,7 +317,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_completed(
+    pub fn emit_mcp_call_completed(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -337,7 +330,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_failed(
+    pub fn emit_mcp_call_failed(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -353,11 +346,45 @@ impl ResponseStreamEventEmitter {
     }
 
     // ========================================================================
+    // Function Call Event Emission Methods
+    // ========================================================================
+
+    pub fn emit_function_call_arguments_delta(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+        delta: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "delta": delta
+        })
+    }
+
+    pub fn emit_function_call_arguments_done(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+        arguments: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": "response.function_call_arguments.done",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "arguments": arguments
+        })
+    }
+
+    // ========================================================================
     // Output Item Wrapper Events
     // ========================================================================
 
     /// Emit response.output_item.added event
-    pub(super) fn emit_output_item_added(
+    pub fn emit_output_item_added(
         &mut self,
         output_index: usize,
         item: &serde_json::Value,
@@ -371,7 +398,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Emit response.output_item.done event
-    pub(super) fn emit_output_item_done(
+    pub fn emit_output_item_done(
         &mut self,
         output_index: usize,
         item: &serde_json::Value,
@@ -390,13 +417,14 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Allocate next output index and track item
-    pub(super) fn allocate_output_index(&mut self, item_type: OutputItemType) -> (usize, String) {
+    pub fn allocate_output_index(&mut self, item_type: OutputItemType) -> (usize, String) {
         let index = self.next_output_index;
         self.next_output_index += 1;
 
         let id_prefix = match &item_type {
             OutputItemType::McpListTools => "mcpl",
             OutputItemType::McpCall => "mcp",
+            OutputItemType::FunctionCall => "fc",
             OutputItemType::Message => "msg",
             OutputItemType::Reasoning => "rs",
         };
@@ -412,7 +440,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Mark output item as completed
-    pub(super) fn complete_output_item(&mut self, output_index: usize) {
+    pub fn complete_output_item(&mut self, output_index: usize) {
         if let Some(item) = self
             .output_items
             .iter_mut()
@@ -426,7 +454,7 @@ impl ResponseStreamEventEmitter {
     ///
     /// Reasoning items in OpenAI format are simple placeholders emitted between tool iterations.
     /// They don't have streaming content - just wrapper events with empty/null content.
-    pub(super) fn emit_reasoning_item(
+    pub fn emit_reasoning_item(
         &mut self,
         tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
         reasoning_content: Option<String>,
@@ -459,7 +487,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Process a chunk and emit appropriate events
-    pub(super) fn process_chunk(
+    pub fn process_chunk(
         &mut self,
         chunk: &ChatCompletionStreamResponse,
         tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
@@ -550,7 +578,7 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
-    pub(super) fn send_event(
+    pub fn send_event(
         &self,
         event: &serde_json::Value,
         tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
@@ -558,13 +586,74 @@ impl ResponseStreamEventEmitter {
         let event_json = serde_json::to_string(event)
             .map_err(|e| format!("Failed to serialize event: {}", e))?;
 
-        if tx
-            .send(Ok(Bytes::from(format!("data: {}\n\n", event_json))))
-            .is_err()
-        {
+        // Extract event type from the JSON for SSE event field
+        let event_type = event
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("message");
+
+        // Format as SSE with event: field
+        let sse_message = format!("event: {}\ndata: {}\n\n", event_type, event_json);
+
+        if tx.send(Ok(Bytes::from(sse_message))).is_err() {
             return Err("Client disconnected".to_string());
         }
 
         Ok(())
     }
+
+    /// Send event and log any errors (typically client disconnect)
+    ///
+    /// This is a convenience method for streaming scenarios where client
+    /// disconnection is expected and should be logged but not fail the operation.
+    /// Returns true if sent successfully, false if client disconnected.
+    pub fn send_event_best_effort(
+        &self,
+        event: &serde_json::Value,
+        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    ) -> bool {
+        match self.send_event(event, tx) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!("Failed to send event (likely client disconnect): {}", e);
+                false
+            }
+        }
+    }
+
+    /// Emit an error event
+    ///
+    /// Creates and sends an error event with the given error message.
+    /// Uses OpenAI's error event format.
+    /// Use this for terminal errors that should abort the streaming response.
+    pub fn emit_error(
+        &mut self,
+        error_msg: &str,
+        error_code: Option<&str>,
+        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    ) {
+        let event = json!({
+            "type": "error",
+            "code": error_code.unwrap_or("internal_error"),
+            "message": error_msg,
+            "param": null,
+            "sequence_number": self.next_sequence()
+        });
+        let sse_data = format!("data: {}\n\n", serde_json::to_string(&event).unwrap());
+        let _ = tx.send(Ok(Bytes::from(sse_data)));
+    }
+}
+
+/// Build a Server-Sent Events (SSE) response
+///
+/// Creates a Response with proper SSE headers and streaming body.
+pub fn build_sse_response(rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>) -> Response {
+    let stream = UnboundedReceiverStream::new(rx);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }

@@ -12,7 +12,8 @@ use crate::protocols::{
     common::{FunctionCallResponse, StreamOptions, ToolCall, UsageInfo},
     responses::{
         ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-        ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+        ResponseReasoningContent::ReasoningText, ResponseStatus, ResponsesRequest,
+        ResponsesResponse, ResponsesUsage, StringOrContentParts,
     },
 };
 
@@ -50,7 +51,6 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                 match item {
                     ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
                         // Convert SimpleInputMessage to chat message
-                        use crate::protocols::responses::StringOrContentParts;
                         let text = match content {
                             StringOrContentParts::String(s) => s.clone(),
                             StringOrContentParts::Array(parts) => {
@@ -170,9 +170,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                         let reasoning_text = content
                             .iter()
                             .map(|c| match c {
-                                crate::protocols::responses::ResponseReasoningContent::ReasoningText { text } => {
-                                    text.as_str()
-                                }
+                                ReasoningText { text } => text.as_str(),
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
@@ -182,6 +180,17 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                             name: None,
                             tool_calls: None,
                             reasoning_content: Some(reasoning_text),
+                        });
+                    }
+                    ResponseInputOutputItem::FunctionCallOutput {
+                        call_id, output, ..
+                    } => {
+                        // Function call output - add as tool message
+                        // Note: The function name is looked up from prev_outputs in Harmony path
+                        // For Chat path, we just use the call_id
+                        messages.push(ChatMessage::Tool {
+                            content: output.clone(),
+                            tool_call_id: call_id.clone(),
                         });
                     }
                 }
@@ -217,7 +226,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
         parallel_tool_calls: req.parallel_tool_calls,
         top_logprobs: req.top_logprobs,
         top_p: req.top_p,
-        skip_special_tokens: true, // Always skip special tokens // TODO: except for gpt-oss
+        skip_special_tokens: true,
         // Note: tools and tool_choice will be handled separately for MCP transformation
         tools: None,       // Will be set by caller if needed
         tool_choice: None, // Will be set by caller if needed
@@ -282,11 +291,9 @@ pub fn chat_to_responses(
             output.push(ResponseOutputItem::Reasoning {
                 id: format!("reasoning_{}", chat_resp.id),
                 summary: vec![],
-                content: vec![
-                    crate::protocols::responses::ResponseReasoningContent::ReasoningText {
-                        text: reasoning.clone(),
-                    },
-                ],
+                content: vec![ReasoningText {
+                    text: reasoning.clone(),
+                }],
                 status: Some("completed".to_string()),
             });
         }
@@ -297,6 +304,7 @@ pub fn chat_to_responses(
         for tool_call in tool_calls {
             output.push(ResponseOutputItem::FunctionToolCall {
                 id: tool_call.id.clone(),
+                call_id: tool_call.id.clone(),
                 name: tool_call.function.name.clone(),
                 arguments: tool_call.function.arguments.clone().unwrap_or_default(),
                 output: None, // Tool hasn't been executed yet
@@ -351,7 +359,8 @@ pub fn chat_to_responses(
         top_p: original_req.top_p,
         truncation: None,
         usage,
-        user: None, // No user field in chat response
+        user: None,
+        safety_identifier: original_req.user.clone(),
         metadata: original_req.metadata.clone().unwrap_or_default(),
     })
 }
