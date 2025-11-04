@@ -248,7 +248,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## Speculative decoding
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--enable-beta-spec` | Description not provided in server_args.py | `False` | bool flag (set to enable) |
 | `--speculative-algorithm` | Speculative algorithm. | `None` | `EAGLE`, `EAGLE3`, `NEXTN`, `STANDALONE`, `NGRAM` |
 | `--speculative-draft-model-path`<br>`--speculative-draft-model` | The path of the draft model weights. This can be a local folder or a Hugging Face repo ID. | `None` | Type: str |
 | `--speculative-draft-model-revision` | The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version. | `None` | Type: str |
