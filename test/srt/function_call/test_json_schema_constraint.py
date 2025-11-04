@@ -2,7 +2,6 @@
 Tests for JSON schema constraint functionality used by JsonArrayParser
 """
 
-import json
 import unittest
 
 import jsonschema
