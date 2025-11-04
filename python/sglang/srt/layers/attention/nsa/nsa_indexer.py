@@ -281,7 +281,7 @@ class Indexer(CustomOp):
         method = getattr(metadata, "topk_transform_method", None)
 
         if method == TopkTransformMethod.PAGED:
-            page_table_64 = (
+            page_table_1 = (
                 metadata.attn_metadata.page_table_1
                 if hasattr(metadata, "attn_metadata")
                 and hasattr(metadata.attn_metadata, "page_table_1")
@@ -298,10 +298,10 @@ class Indexer(CustomOp):
             )
 
             return transform_index_page_table_prefill(
-                page_table=page_table_64,
+                page_table=page_table_1,
                 topk_indices=indices_local,
                 extend_lens_cpu=extend_lens_cpu,
-                page_size=64,
+                page_size=1,
             )
 
         elif method == TopkTransformMethod.RAGGED:
