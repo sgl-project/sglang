@@ -12,10 +12,9 @@ use crate::{
         responses::ResponsesRequest,
     },
     routers::grpc::{
+        common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext, RequestType},
-        error,
-        stages::PipelineStage,
-        utils,
+        error, utils,
     },
 };
 

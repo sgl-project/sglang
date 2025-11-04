@@ -23,7 +23,6 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
@@ -60,7 +59,7 @@ if is_flashinfer_available():
 
 # Try to import FP4 TRTLLM function if flashinfer is available
 trtllm_fp4_block_scale_moe = None
-if should_use_flashinfer_trtllm_moe():
+if get_moe_runner_backend().is_flashinfer_trtllm():
     try:
         from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
     except ImportError:
@@ -234,7 +233,7 @@ class FusedMoE(torch.nn.Module):
             self.quant_method, ModelOptNvFp4FusedMoEMethod
         ) or (
             isinstance(self.quant_method, Fp8MoEMethod)
-            and self.quant_method._should_use_cutlass_fused_experts()
+            and get_moe_runner_backend().is_cutlass()
         )
 
     def _load_per_tensor_weight_scale(
@@ -593,7 +592,7 @@ class FusedMoE(torch.nn.Module):
             )
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if should_use_flashinfer_trtllm_moe() and (
+        if get_moe_runner_backend().is_flashinfer_trtllm() and (
             isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
             or isinstance(self.quant_method, Fp8MoEMethod)
         ):
@@ -961,10 +960,8 @@ class FusedMoE(torch.nn.Module):
 class FlashInferFusedMoE(FusedMoE):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.use_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        assert self.use_flashinfer_trtllm_moe
         assert (
             self.moe_runner_config.activation == "silu"
         ), "Only silu is supported for flashinfer blockscale fp8 moe"

@@ -7,7 +7,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::protocols::chat::ChatCompletionStreamResponse;
+use crate::{mcp, protocols::chat::ChatCompletionStreamResponse};
 
 pub enum OutputItemType {
     Message,
@@ -29,10 +29,6 @@ struct OutputItemState {
     output_index: usize,
     status: ItemStatus,
 }
-
-// ============================================================================
-// Streaming Event Emitter
-// ============================================================================
 
 /// OpenAI-compatible event emitter for /v1/responses streaming
 ///
@@ -66,7 +62,7 @@ pub struct ResponseStreamEventEmitter {
     has_emitted_content_part_added: bool,
     // MCP call tracking
     mcp_call_accumulated_args: HashMap<String, String>,
-    // Output item tracking (NEW)
+    // Output item tracking
     output_items: Vec<OutputItemState>,
     next_output_index: usize,
     current_message_output_index: Option<usize>, // Tracks output_index of current message
@@ -248,7 +244,7 @@ impl ResponseStreamEventEmitter {
     pub fn emit_mcp_list_tools_completed(
         &mut self,
         output_index: usize,
-        tools: &[crate::mcp::Tool],
+        tools: &[mcp::Tool],
     ) -> serde_json::Value {
         let tool_items: Vec<_> = tools
             .iter()
@@ -331,7 +327,7 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub(super) fn emit_mcp_call_failed(
+    pub fn emit_mcp_call_failed(
         &mut self,
         output_index: usize,
         item_id: &str,
@@ -453,7 +449,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// Process a chunk and emit appropriate events
-    pub(super) fn process_chunk(
+    pub fn process_chunk(
         &mut self,
         chunk: &ChatCompletionStreamResponse,
         tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,

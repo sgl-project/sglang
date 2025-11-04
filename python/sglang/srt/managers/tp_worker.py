@@ -311,6 +311,7 @@ class TpModelWorker(BaseTpWorker):
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
 
     @property
@@ -383,6 +384,7 @@ class TpModelWorker(BaseTpWorker):
 
             if (
                 self.enable_overlap
+                and not self.enable_spec
                 and model_worker_batch.sampling_info.grammars is not None
             ):
 

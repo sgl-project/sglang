@@ -37,12 +37,14 @@
 //! for complete architecture, rationale, and implementation details.
 
 use std::{
+    io,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{body::Body, http::StatusCode, response::Response};
-use serde_json::Value as JsonValue;
+use bytes::Bytes;
+use serde_json::{from_str, from_value, json, to_string, to_value, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
@@ -50,21 +52,22 @@ use uuid::Uuid;
 
 use crate::{
     data_connector::{ResponseId, ResponseStorage},
-    mcp::McpManager,
+    mcp::{self, McpManager},
     protocols::{
         common::{Function, ToolCall},
         responses::{
-            ResponseInput, ResponseInputOutputItem, ResponseTool, ResponseToolType,
+            McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
+            ResponseOutputItem, ResponseReasoningContent, ResponseTool, ResponseToolType,
             ResponsesRequest, ResponsesResponse, StringOrContentParts,
         },
     },
     routers::{
         grpc::{
+            common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
             context::SharedComponents,
             error,
             harmony::processor::ResponsesIterationResult,
             pipeline::RequestPipeline,
-            responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
         },
         openai::mcp::ensure_request_mcp_client,
     },
@@ -414,10 +417,6 @@ pub async fn serve_harmony_responses_stream(
         Err(err_response) => return err_response,
     };
 
-    use std::io;
-
-    use bytes::Bytes;
-
     // Create SSE channel
     let (tx, rx) = mpsc::unbounded_channel();
     let stream = UnboundedReceiverStream::new(rx);
@@ -444,7 +443,7 @@ pub async fn serve_harmony_responses_stream(
         // Helper to emit error and return
         let emit_error = |tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>, error_msg: &str| {
             // Create error event manually since emit_failed doesn't exist
-            let event = serde_json::json!({
+            let event = json!({
                 "type": "response.failed",
                 "response_id": response_id_for_error,
                 "error": {
@@ -452,7 +451,7 @@ pub async fn serve_harmony_responses_stream(
                     "type": "internal_error"
                 }
             });
-            let sse_data = format!("data: {}\n\n", serde_json::to_string(&event).unwrap());
+            let sse_data = format!("data: {}\n\n", to_string(&event).unwrap());
             let _ = tx.send(Ok(Bytes::from(sse_data)));
         };
 
@@ -517,7 +516,6 @@ pub async fn serve_harmony_responses_stream(
             let tool_items: Vec<_> = mcp_tools
                 .iter()
                 .map(|t| {
-                    use serde_json::{json, Value};
                     json!({
                         "name": t.name,
                         "description": t.description,
@@ -527,7 +525,7 @@ pub async fn serve_harmony_responses_stream(
                 .collect();
 
             // Emit output_item.added
-            let item = serde_json::json!({
+            let item = json!({
                 "id": item_id,
                 "type": "mcp_list_tools",
                 "server_label": "sglang-mcp",
@@ -552,7 +550,7 @@ pub async fn serve_harmony_responses_stream(
             }
 
             // Emit output_item.done
-            let item_done = serde_json::json!({
+            let item_done = json!({
                 "id": item_id,
                 "type": "mcp_list_tools",
                 "server_label": "sglang-mcp",
@@ -677,7 +675,7 @@ pub async fn serve_harmony_responses_stream(
                     );
 
                     // Emit response.completed with usage
-                    let usage_json = serde_json::json!({
+                    let usage_json = json!({
                         "prompt_tokens": usage.prompt_tokens,
                         "completion_tokens": usage.completion_tokens,
                         "total_tokens": usage.total_tokens,
@@ -733,7 +731,7 @@ async fn execute_mcp_tools(
 
         // Parse tool arguments from JSON string
         let args_str = tool_call.function.arguments.as_deref().unwrap_or("{}");
-        let args: JsonValue = serde_json::from_str(args_str).map_err(|e| {
+        let args: Value = from_str(args_str).map_err(|e| {
             error::internal_error(format!(
                 "Invalid tool arguments JSON for tool '{}': {}",
                 tool_call.function.name, e
@@ -741,8 +739,7 @@ async fn execute_mcp_tools(
         })?;
 
         // Execute tool via MCP manager
-        // Convert JsonValue to ToolArgs via Option<Map> (MCP manager expects this)
-        let args_map = if let JsonValue::Object(map) = args {
+        let args_map = if let Value::Object(map) = args {
             Some(map)
         } else {
             None
@@ -763,15 +760,14 @@ async fn execute_mcp_tools(
                 let output = if let Some(content) = mcp_result.content.first() {
                     // TODO: Handle different content types (text, image, resource)
                     // For now, serialize the entire content item
-                    serde_json::to_value(content).unwrap_or_else(
-                        |_| serde_json::json!({"error": "Failed to serialize tool result"}),
-                    )
+                    to_value(content)
+                        .unwrap_or_else(|_| json!({"error": "Failed to serialize tool result"}))
                 } else {
-                    serde_json::json!({"result": "success"})
+                    json!({"result": "success"})
                 };
 
                 let is_error = mcp_result.is_error.unwrap_or(false);
-                let output_str = serde_json::to_string(&output)
+                let output_str = to_string(&output)
                     .unwrap_or_else(|_| r#"{"error": "Failed to serialize output"}"#.to_string());
 
                 // Record this call in tracking
@@ -804,10 +800,10 @@ async fn execute_mcp_tools(
                 );
 
                 let error_msg = format!("Tool execution failed: {}", e);
-                let error_output = serde_json::json!({
+                let error_output = json!({
                     "error": error_msg.clone()
                 });
-                let error_output_str = serde_json::to_string(&error_output)
+                let error_output_str = to_string(&error_output)
                     .unwrap_or_else(|_| format!(r#"{{"error": "{}"}}"#, error_msg));
 
                 // Record failed call in tracking
@@ -859,12 +855,6 @@ fn build_next_request_with_tools(
     analysis: Option<String>,
     partial_text: String,
 ) -> Result<ResponsesRequest, Box<Response>> {
-    use uuid::Uuid;
-
-    use crate::protocols::responses::{
-        ResponseContentPart, ResponseInputOutputItem, ResponseReasoningContent,
-    };
-
     // Get current input items (or empty vec if Text variant)
     let mut items = match request.input {
         ResponseInput::Items(items) => items,
@@ -926,7 +916,7 @@ fn build_next_request_with_tools(
     // Add tool results
     for tool_result in tool_results {
         // Serialize tool output to string
-        let output_str = serde_json::to_string(&tool_result.output).unwrap_or_else(|e| {
+        let output_str = to_string(&tool_result.output).unwrap_or_else(|e| {
             format!("{{\"error\": \"Failed to serialize tool output: {}\"}}", e)
         });
 
@@ -967,7 +957,7 @@ struct ToolResult {
     tool_name: String,
 
     /// Tool output (JSON value)
-    output: JsonValue,
+    output: Value,
 
     /// Whether this is an error result
     is_error: bool,
@@ -985,11 +975,7 @@ struct ToolResult {
 /// # Returns
 ///
 /// Vector of ResponseTool entries in MCP format
-pub fn convert_mcp_tools_to_response_tools(mcp_tools: &[crate::mcp::Tool]) -> Vec<ResponseTool> {
-    use serde_json::Value;
-
-    use crate::protocols::responses::ResponseToolType;
-
+pub fn convert_mcp_tools_to_response_tools(mcp_tools: &[mcp::Tool]) -> Vec<ResponseTool> {
     mcp_tools
         .iter()
         .map(|tool_info| ResponseTool {
@@ -1027,11 +1013,6 @@ fn inject_mcp_metadata(
     tracking: &McpCallTracking,
     mcp_manager: &Arc<McpManager>,
 ) {
-    use serde_json::{json, Value};
-    use uuid::Uuid;
-
-    use crate::protocols::responses::{McpToolInfo, ResponseOutputItem};
-
     // Build mcp_list_tools item
     let tools = mcp_manager.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
@@ -1121,23 +1102,22 @@ async fn load_previous_messages(
     let mut history_items = Vec::new();
 
     // Helper to deserialize and collect items from a JSON array
-    let deserialize_items =
-        |arr: &serde_json::Value, item_type: &str| -> Vec<ResponseInputOutputItem> {
-            arr.as_array()
-                .into_iter()
-                .flat_map(|items| items.iter())
-                .filter_map(|item| {
-                    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
-                        .map_err(|e| {
-                            warn!(
-                                "Failed to deserialize stored {} item: {}. Item: {}",
-                                item_type, e, item
-                            );
-                        })
-                        .ok()
-                })
-                .collect()
-        };
+    let deserialize_items = |arr: &Value, item_type: &str| -> Vec<ResponseInputOutputItem> {
+        arr.as_array()
+            .into_iter()
+            .flat_map(|items| items.iter())
+            .filter_map(|item| {
+                from_value::<ResponseInputOutputItem>(item.clone())
+                    .map_err(|e| {
+                        warn!(
+                            "Failed to deserialize stored {} item: {}. Item: {}",
+                            item_type, e, item
+                        );
+                    })
+                    .ok()
+            })
+            .collect()
+    };
 
     for stored in chain.responses.iter() {
         history_items.extend(deserialize_items(&stored.input, "input"));
