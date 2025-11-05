@@ -221,6 +221,8 @@ class VisionSdpaAttention(nn.Module):
             del attn_weights, v
         else:
             # SDPA
+            if attention_mask.dim() == 3:
+                attention_mask = attention_mask.squeeze(0)  # [s, s]
             # [b, h, s, head_size]
             output = F.scaled_dot_product_attention(
                 q,
