@@ -22,6 +22,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.video_utils import VideoInput
 from sglang.utils import logger
 
 IMAGE_FACTOR = 28
@@ -214,7 +215,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
     async def preprocess_video(
         self,
-        vr,
+        video: VideoInput,
         image_factor: int = IMAGE_FACTOR,
     ) -> torch.Tensor:
         if self.video_executor is not None:
@@ -222,23 +223,34 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             return await loop.run_in_executor(
                 self.video_executor,
                 QwenVLImageProcessor.preprocess_video_task,
-                vr,
+                video,
                 image_factor,
             )
         else:
             return self.preprocess_video_task(
-                vr,
+                video,
                 image_factor,
             )
 
     # process video, qwen-specific
     @staticmethod
     def preprocess_video_task(
-        vr,
+        video_input: VideoInput,
         image_factor: int = IMAGE_FACTOR,
         # vr: VideoReader, image_factor: int = IMAGE_FACTOR
     ) -> torch.Tensor:
         entry_time = time.perf_counter()
+        import torch
+        from decord import VideoReader, cpu, gpu
+        try:
+            from decord.bridge import decord_bridge
+            ctx = gpu(0)
+            _ = decord_bridge.get_ctx_device(ctx)
+        except Exception:
+            ctx = cpu(0)
+
+        vr = VideoReader(video_input.path, ctx=ctx)
+
         ele = {}
         total_frames, video_fps = len(vr), vr.get_avg_fps()
         nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
@@ -326,6 +338,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             base_output.images = await asyncio.gather(*resize_tasks)
 
         video_metadata = None
+        # Now base_output.videos are List[VideoInput]
         if base_output.videos:
             videos_processed = [
                 await preprocess_video(video) for video in base_output.videos
