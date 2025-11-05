@@ -135,6 +135,8 @@ LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
+MM_TRANSFER_BACKEND_CHOICES = ["zmq", "mooncake"]
+
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
@@ -257,7 +259,8 @@ class ServerArgs:
     # Encode prefill disaggregation
     mm_only: bool = False
     language_only: bool = False
-    embedding_port: Optional[int] = None
+    embedding_port: Optional[int] = 54213
+    mm_transfer_backend: str = "zmq"
 
     # Quantization and data type
     dtype: str = "auto"
@@ -2257,8 +2260,15 @@ class ServerArgs:
         parser.add_argument(
             "--embedding-port",
             type=int,
-            default=54213,
+            default=ServerArgs.embedding_port,
             help="The port for transmitting embedding metadata.",
+        )
+        parser.add_argument(
+            "--mm-transfer-backend",
+            type=str,
+            default=ServerArgs.mm_transfer_backend,
+            choices=MM_TRANSFER_BACKEND_CHOICES,
+            help="The backend for encoder disaggregation transfer. Default is zmq.",
         )
 
         # Quantization and data type

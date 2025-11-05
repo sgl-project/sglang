@@ -321,14 +321,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.recv_from_encoder = get_zmq_socket(
                 context, zmq.PULL, f"tcp://*:{server_args.embedding_port}", True
             )
-            self.received_metadata = dict()
+            self.received_data = dict()
             self.embeddings_lock = asyncio.Lock()
-            self.embeddings_engine = MooncakeTransferEngine(
-                hostname=get_local_ip_auto(),
-                gpu_id=0,
-                ib_device=server_args.disaggregation_ib_device,
-            )
-            self.embeddings_buffer = dict()
+            if self.server_args.mm_transfer_backend == "mooncake":
+                self.embeddings_engine = MooncakeTransferEngine(
+                    hostname=get_local_ip_auto(),
+                    gpu_id=0,
+                    ib_device=server_args.disaggregation_ib_device,
+                )
+                self.embeddings_buffer = dict()
 
         # Request states
         self._chosen_loop = None
@@ -755,21 +756,26 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # Use async lock to avoid race condition
                 async with self.embeddings_lock:
                     while (
-                        obj.bootstrap_room not in self.received_metadata
-                        or not self.received_metadata[obj.bootstrap_room].ready
+                        obj.bootstrap_room not in self.received_data
+                        or not self.received_data[obj.bootstrap_room].ready
                     ):
                         await self.handle_embedding()
                     for mm_item in mm_inputs["mm_items"]:
                         if mm_item.modality == Modality.IMAGE:
-                            mm_item.precomputed_embeddings = self.embeddings_buffer[
-                                obj.bootstrap_room
-                            ]
-                            self.embeddings_engine.deregister(
-                                mm_item.precomputed_embeddings.data_ptr()
-                            )
-                            break
-                    del self.received_metadata[obj.bootstrap_room]
-                    del self.embeddings_buffer[obj.bootstrap_room]
+                            if self.server_args.mm_transfer_backend == "mooncake":
+                                mm_item.precomputed_embeddings = self.embeddings_buffer[
+                                    obj.bootstrap_room
+                                ]
+                                self.embeddings_engine.deregister(
+                                    mm_item.precomputed_embeddings.data_ptr()
+                                )
+                            elif self.server_args.mm_transfer_backend == "zmq":
+                                mm_item.precomputed_embeddings = self.received_data[
+                                    obj.bootstrap_room
+                                ].get()
+                    del self.received_data[obj.bootstrap_room]
+                    if self.server_args.mm_transfer_backend == "mooncake":
+                        del self.embeddings_buffer[obj.bootstrap_room]
 
         else:
             mm_inputs = None
@@ -1596,10 +1602,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
     async def handle_embedding(self):
         recv_obj = await self.recv_from_encoder.recv_pyobj()
-        if recv_obj.req_id not in self.received_metadata:
-            self.received_metadata[recv_obj.req_id] = recv_obj
+        if recv_obj.req_id not in self.received_data:
+            self.received_data[recv_obj.req_id] = recv_obj
         else:
-            self.received_metadata[recv_obj.req_id].add(recv_obj)
+            self.received_data[recv_obj.req_id].add(recv_obj)
 
     def _add_metric_if_present(
         self,

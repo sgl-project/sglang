@@ -138,7 +138,9 @@ class MiniLoadBalancer:
         buffer_address = response_json["buffer_address"]
         return session_id, buffer_address
 
-    async def encode(self, request_data, encode_urls, endpoint, prefill_url):
+    async def encode(
+        self, request_data, encode_urls, endpoint_encode, endpoint_send, prefill_url
+    ):
         messages = request_data.get("messages")
         if messages is None or len(encode_urls) == 0:
             return
@@ -155,6 +157,8 @@ class MiniLoadBalancer:
             return
 
         req_id = request_data.get("bootstrap_room")
+        prefill_host = request_data["bootstrap_host"]
+
         # Split mm_items
         encode_requests = []
         random.shuffle(self.encode_idx)
@@ -174,6 +178,7 @@ class MiniLoadBalancer:
                     "num_parts": num_parts,
                     "part_idx": cum_idx,
                     "req_id": req_id,
+                    "bootstrap_host": prefill_host,
                 }
             )
             cum_idx += 1
@@ -188,7 +193,7 @@ class MiniLoadBalancer:
 
             tasks = [
                 session.post(
-                    f"{encode_urls[encode_request['encoder_idx']]}/{endpoint}",
+                    f"{encode_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
                     json=encode_request,
                 )
                 for encode_request in encode_requests
@@ -199,7 +204,11 @@ class MiniLoadBalancer:
                 await response.json() for response in responses
             ]
 
-            # Send bootstrap info
+            # zmq backend: return is None
+            if None in response_json_list_unsort:
+                return
+
+            # mooncake backend: send bootstrap info
 
             embedding_size_list_sort = [None for _ in range(num_parts)]
             embedding_length_tot = 0
@@ -212,7 +221,6 @@ class MiniLoadBalancer:
 
             offset = 0
             metadata_tasks = []
-            prefill_ip = request_data["bootstrap_host"]
             session_id, buffer_address = await self.embedding_bootstrap(
                 session,
                 prefill_url,
@@ -227,13 +235,12 @@ class MiniLoadBalancer:
                     {
                         "session_id": session_id,
                         "buffer_address": buffer_address_adjust,
-                        "bootstrap_host": prefill_ip,
+                        "bootstrap_host": prefill_host,
                     }
                 )
-                encoder_idx = response_json["encoder_idx"]
                 metadata_tasks.append(
                     session.post(
-                        f"{encode_urls[encoder_idx]}/{endpoint}",
+                        f"{encode_urls[response_json['encoder_idx']]}/{endpoint_send}",
                         json=response_json,
                     )
                 )
@@ -576,7 +583,7 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
         }
     )
     asyncio.create_task(
-        lb.encode(encode_request, lb.encode_urls, "encode", prefill_server)
+        lb.encode(encode_request, lb.encode_urls, "encode", "send", prefill_server)
     )
 
     modified_request = encode_request.copy()
