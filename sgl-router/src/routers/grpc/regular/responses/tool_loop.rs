@@ -12,23 +12,31 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
-use serde_json::json;
+use futures_util::StreamExt;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::{
-    super::error,
-    conversions,
-    streaming::{OutputItemType, ResponseStreamEventEmitter},
-};
-use crate::protocols::{
-    chat::ChatCompletionResponse,
-    common::{Tool, ToolChoice, ToolChoiceValue},
-    responses::{
-        McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-        ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest, ResponsesResponse,
+use super::conversions;
+use crate::{
+    mcp::{self, McpManager},
+    protocols::{
+        chat::{
+            ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
+            ChatCompletionStreamResponse,
+        },
+        common::{Function, FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
+        responses::{
+            self, McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
+            ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest,
+            ResponsesResponse,
+        },
+    },
+    routers::grpc::{
+        common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
+        error,
     },
 };
 
@@ -57,6 +65,30 @@ fn extract_function_call_from_chat(
     }
 
     None
+}
+
+/// Merge function tools from request with MCP tools and set tool_choice based on iteration
+fn prepare_chat_tools_and_choice(
+    chat_request: &mut ChatCompletionRequest,
+    mcp_chat_tools: &[Tool],
+    iteration: usize,
+) {
+    // Merge function tools from request with MCP tools
+    let mut all_tools = chat_request.tools.clone().unwrap_or_default();
+    all_tools.extend(mcp_chat_tools.iter().cloned());
+    chat_request.tools = Some(all_tools);
+
+    // Set tool_choice based on iteration
+    // - Iteration 0: Use user's tool_choice or default to auto
+    // - Iteration 1+: Always use auto to avoid infinite loops
+    chat_request.tool_choice = if iteration == 0 {
+        chat_request
+            .tool_choice
+            .clone()
+            .or(Some(ToolChoice::Value(ToolChoiceValue::Auto)))
+    } else {
+        Some(ToolChoice::Value(ToolChoiceValue::Auto))
+    };
 }
 
 /// Extract all tool calls from chat response (for parallel tool call support)
@@ -155,23 +187,17 @@ fn generate_mcp_id(prefix: &str) -> String {
 }
 
 /// Build mcp_list_tools output item
-fn build_mcp_list_tools_item(
-    mcp: &Arc<crate::mcp::McpManager>,
-    server_label: &str,
-) -> ResponseOutputItem {
+fn build_mcp_list_tools_item(mcp: &Arc<McpManager>, server_label: &str) -> ResponseOutputItem {
     let tools = mcp.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
-        .map(|t| {
-            use serde_json::Value;
-            McpToolInfo {
-                name: t.name.to_string(),
-                description: t.description.as_ref().map(|d| d.to_string()),
-                input_schema: Value::Object((*t.input_schema).clone()),
-                annotations: Some(json!({
-                    "read_only": false
-                })),
-            }
+        .map(|t| McpToolInfo {
+            name: t.name.to_string(),
+            description: t.description.as_ref().map(|d| d.to_string()),
+            input_schema: Value::Object((*t.input_schema).clone()),
+            annotations: Some(json!({
+                "read_only": false
+            })),
         })
         .collect();
 
@@ -243,17 +269,19 @@ pub(super) async fn execute_tool_loop(
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_tools = ctx.mcp_manager.list_tools();
-    let chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
-    debug!("Converted {} MCP tools to chat format", chat_tools.len());
+    let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
+    debug!(
+        "Converted {} MCP tools to chat format",
+        mcp_chat_tools.len()
+    );
 
     loop {
         // Convert to chat request
         let mut chat_request = conversions::responses_to_chat(&current_request)
             .map_err(|e| error::bad_request(format!("Failed to convert request: {}", e)))?;
 
-        // Add MCP tools to chat request so LLM knows about them
-        chat_request.tools = Some(chat_tools.clone());
-        chat_request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+        // Prepare tools and tool_choice for this iteration
+        prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
 
         // Execute chat pipeline (errors already have proper HTTP status codes)
         let chat_response = ctx
@@ -263,8 +291,6 @@ pub(super) async fn execute_tool_loop(
                 headers.clone(),
                 model_id.clone(),
                 ctx.components.clone(),
-                response_id.clone(),
-                Some(ctx.background_tasks.clone()),
             )
             .await?;
 
@@ -358,10 +384,9 @@ pub(super) async fn execute_tool_loop(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
-                ResponseInput::Items(items) => items
-                    .iter()
-                    .map(crate::protocols::responses::normalize_input_item)
-                    .collect(),
+                ResponseInput::Items(items) => {
+                    items.iter().map(responses::normalize_input_item).collect()
+                }
             };
 
             // Append all conversation history (function calls and outputs)
@@ -544,6 +569,7 @@ async fn execute_tool_loop_streaming_internal(
         .unwrap()
         .as_secs();
     let mut emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
+    emitter.set_original_request(original_request.clone());
 
     // Emit initial response.created and response.in_progress events
     let event = emitter.emit_created();
@@ -553,10 +579,10 @@ async fn execute_tool_loop_streaming_internal(
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_tools = ctx.mcp_manager.list_tools();
-    let chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
+    let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
     debug!(
         "Streaming: Converted {} MCP tools to chat format",
-        chat_tools.len()
+        mcp_chat_tools.len()
     );
 
     // Flag to track if mcp_list_tools has been emitted
@@ -582,7 +608,6 @@ async fn execute_tool_loop_streaming_internal(
             let tool_items: Vec<_> = mcp_tools
                 .iter()
                 .map(|t| {
-                    use serde_json::Value;
                     json!({
                         "name": t.name,
                         "description": t.description,
@@ -633,9 +658,8 @@ async fn execute_tool_loop_streaming_internal(
         let mut chat_request = conversions::responses_to_chat(&current_request)
             .map_err(|e| format!("Failed to convert request: {}", e))?;
 
-        // Add MCP tools to chat request so LLM knows about them
-        chat_request.tools = Some(chat_tools.clone());
-        chat_request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+        // Prepare tools and tool_choice for this iteration (same logic as non-streaming)
+        prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
 
         // Execute chat streaming
         let response = ctx
@@ -830,10 +854,9 @@ async fn execute_tool_loop_streaming_internal(
                     content: vec![ResponseContentPart::InputText { text: text.clone() }],
                     status: Some("completed".to_string()),
                 }],
-                ResponseInput::Items(items) => items
-                    .iter()
-                    .map(crate::protocols::responses::normalize_input_item)
-                    .collect(),
+                ResponseInput::Items(items) => {
+                    items.iter().map(responses::normalize_input_item).collect()
+                }
             };
 
             input_items.extend_from_slice(&state.conversation_history);
@@ -896,8 +919,8 @@ async fn execute_tool_loop_streaming_internal(
         // Emit final response.completed event
         let usage_json = accumulated_response.usage.as_ref().map(|u| {
             json!({
-                "prompt_tokens": u.prompt_tokens,
-                "completion_tokens": u.completion_tokens,
+                "input_tokens": u.prompt_tokens,
+                "output_tokens": u.completion_tokens,
                 "total_tokens": u.total_tokens
             })
         });
@@ -911,13 +934,12 @@ async fn execute_tool_loop_streaming_internal(
 }
 
 /// Convert MCP tools to Chat API tool format
-fn convert_mcp_tools_to_chat_tools(mcp_tools: &[crate::mcp::Tool]) -> Vec<Tool> {
-    use serde_json::Value;
+fn convert_mcp_tools_to_chat_tools(mcp_tools: &[mcp::Tool]) -> Vec<Tool> {
     mcp_tools
         .iter()
         .map(|tool_info| Tool {
             tool_type: "function".to_string(),
-            function: crate::protocols::common::Function {
+            function: Function {
                 name: tool_info.name.to_string(),
                 description: tool_info.description.as_ref().map(|d| d.to_string()),
                 parameters: Value::Object((*tool_info.input_schema).clone()),
@@ -933,10 +955,6 @@ async fn convert_and_accumulate_stream(
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<ChatCompletionResponse, String> {
-    use futures_util::StreamExt;
-
-    use crate::protocols::chat::ChatCompletionStreamResponse;
-
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
 
@@ -971,7 +989,7 @@ struct ChatResponseAccumulator {
     id: String,
     model: String,
     content: String,
-    tool_calls: HashMap<usize, crate::protocols::common::ToolCall>,
+    tool_calls: HashMap<usize, ToolCall>,
     finish_reason: Option<String>,
 }
 
@@ -986,7 +1004,7 @@ impl ChatResponseAccumulator {
         }
     }
 
-    fn process_chunk(&mut self, chunk: &crate::protocols::chat::ChatCompletionStreamResponse) {
+    fn process_chunk(&mut self, chunk: &ChatCompletionStreamResponse) {
         if !chunk.id.is_empty() {
             self.id = chunk.id.clone();
         }
@@ -1004,15 +1022,13 @@ impl ChatResponseAccumulator {
             if let Some(tool_call_deltas) = &choice.delta.tool_calls {
                 for delta in tool_call_deltas {
                     let index = delta.index as usize;
-                    let entry = self.tool_calls.entry(index).or_insert_with(|| {
-                        crate::protocols::common::ToolCall {
-                            id: String::new(),
-                            tool_type: "function".to_string(),
-                            function: crate::protocols::common::FunctionCallResponse {
-                                name: String::new(),
-                                arguments: Some(String::new()),
-                            },
-                        }
+                    let entry = self.tool_calls.entry(index).or_insert_with(|| ToolCall {
+                        id: String::new(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCallResponse {
+                            name: String::new(),
+                            arguments: Some(String::new()),
+                        },
                     });
 
                     if let Some(id) = &delta.id {
@@ -1048,9 +1064,9 @@ impl ChatResponseAccumulator {
             object: "chat.completion".to_string(),
             created: chrono::Utc::now().timestamp() as u64,
             model: self.model,
-            choices: vec![crate::protocols::chat::ChatChoice {
+            choices: vec![ChatChoice {
                 index: 0,
-                message: crate::protocols::chat::ChatCompletionMessage {
+                message: ChatCompletionMessage {
                     role: "assistant".to_string(),
                     content: if self.content.is_empty() {
                         None
