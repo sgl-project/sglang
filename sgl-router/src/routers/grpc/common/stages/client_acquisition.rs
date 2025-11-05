@@ -6,7 +6,7 @@ use axum::response::Response;
 use super::PipelineStage;
 use crate::routers::grpc::{
     context::{ClientSelection, RequestContext, WorkerSelection},
-    utils,
+    error, utils,
 };
 
 /// Client acquisition stage: Get gRPC clients from selected workers
@@ -19,7 +19,7 @@ impl PipelineStage for ClientAcquisitionStage {
             .state
             .workers
             .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Worker selection not completed"))?;
+            .ok_or_else(|| error::internal_error("Worker selection not completed"))?;
 
         let clients = match workers {
             WorkerSelection::Single { worker } => {

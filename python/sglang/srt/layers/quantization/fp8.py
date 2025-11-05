@@ -28,7 +28,10 @@ except ImportError:
     apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
 
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
@@ -525,7 +528,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
+        if get_moe_runner_backend().is_cutlass():
+            assert (
+                cutlass_fp8_supported()
+            ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
+            assert is_sm100_supported() or is_sm90_supported()
 
     def create_weights(
         self,
@@ -633,7 +641,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
-            if self._should_use_cutlass_fused_experts():
+            if get_moe_runner_backend().is_cutlass():
                 self._ensure_cutlass_buffers_initialized(layer)
 
         else:
@@ -1022,8 +1030,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        if self._should_use_cutlass_fused_experts():
+        if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
+
+            with use_symmetric_memory(get_tp_group()) as sm:
+                symm_output = torch.empty_like(x)
+                sm.tag(symm_output)
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
             output = cutlass_fused_experts_fp8(
@@ -1048,6 +1060,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes1,
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
+                output=symm_output,
             )
             return StandardCombineInput(hidden_states=output)
 
@@ -1113,22 +1126,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
         return self.runner.run(dispatch_output, quant_info)
-
-    def _should_use_cutlass_fused_experts(self) -> bool:
-        """Decide whether to use Cutlass FP8 fused-experts path based on moe runner backend,
-        with env var override via `SGLANG_CUTLASS_MOE`.
-        """
-        backend = get_moe_runner_backend()
-        env_force = get_bool_env_var("SGLANG_CUTLASS_MOE")
-        # TODO: remove env var in the future, it should be handled by moe runner backend
-        if env_force:
-            return True
-        return (
-            backend.is_flashinfer_cutlass()
-            and self.cutlass_fp8_supported
-            and self.block_quant
-            and (is_sm100_supported() or is_sm90_supported())
-        )
 
     def _ensure_cutlass_buffers_initialized(self, layer: Module) -> None:
         if getattr(self, "_cutlass_buffers_ready", False):
@@ -1211,35 +1208,42 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer, "routing_method_type", RoutingMethodType.DeepSeekV3
         )
 
-        return trtllm_fp8_block_scale_moe(
-            routing_logits=(
-                router_logits.to(torch.float32)
-                if routing_method_type == RoutingMethodType.DeepSeekV3
-                else router_logits
-            ),
-            routing_bias=correction_bias,
-            hidden_states=a_q,
-            hidden_states_scale=a_sf_t,
-            gemm1_weights=layer.w13_weight,
-            gemm1_weights_scale=layer.w13_weight_scale_inv,
-            gemm2_weights=layer.w2_weight,
-            gemm2_weights_scale=layer.w2_weight_scale_inv,
-            num_experts=layer.num_experts,
-            top_k=topk_config.top_k,
-            n_group=topk_config.num_expert_group,
-            topk_group=topk_config.topk_group,
-            intermediate_size=layer.w2_weight.shape[2],
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-            local_num_experts=layer.num_local_experts,
-            routed_scaling_factor=(
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            ),
-            tile_tokens_dim=get_tile_tokens_dim(
-                x.shape[0], topk_config.top_k, layer.num_experts
-            ),
-            routing_method_type=routing_method_type,
-            use_shuffled_weight=False,
-        )
+        with use_symmetric_memory(get_tp_group()) as sm:
+            # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
+            # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
+            # so we put the whole function under the ``use_symmetric_memory`` context manager.
+            # If the bug is fixed, we can only put the output tensor allocation under the context manager.
+            output = trtllm_fp8_block_scale_moe(
+                routing_logits=(
+                    router_logits.to(torch.float32)
+                    if routing_method_type == RoutingMethodType.DeepSeekV3
+                    else router_logits
+                ),
+                routing_bias=correction_bias,
+                hidden_states=a_q,
+                hidden_states_scale=a_sf_t,
+                gemm1_weights=layer.w13_weight,
+                gemm1_weights_scale=layer.w13_weight_scale_inv,
+                gemm2_weights=layer.w2_weight,
+                gemm2_weights_scale=layer.w2_weight_scale_inv,
+                num_experts=layer.num_experts,
+                top_k=topk_config.top_k,
+                n_group=topk_config.num_expert_group,
+                topk_group=topk_config.topk_group,
+                intermediate_size=layer.w2_weight.shape[2],
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                local_num_experts=layer.num_local_experts,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                ),
+                tile_tokens_dim=get_tile_tokens_dim(
+                    x.shape[0], topk_config.top_k, layer.num_experts
+                ),
+                routing_method_type=routing_method_type,
+                use_shuffled_weight=False,
+            )
+            sm.tag(output)
+        return output
 
     def maybe_apply_hip_fused_experts(
         self,

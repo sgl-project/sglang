@@ -120,7 +120,7 @@ fi
 # Show current packages
 $PIP_CMD list
 
-$PIP_CMD install mooncake-transfer-engine==0.3.6.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.7.post2 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
