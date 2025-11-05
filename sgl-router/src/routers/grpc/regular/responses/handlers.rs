@@ -377,6 +377,7 @@ async fn process_and_transform_sse_stream(
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
+    event_emitter.set_original_request(original_request.clone());
 
     // Emit initial response.created and response.in_progress events
     let event = event_emitter.emit_created();
@@ -432,15 +433,15 @@ async fn process_and_transform_sse_stream(
     // Emit final response.completed event with accumulated usage
     let usage_json = accumulator.usage.as_ref().map(|u| {
         let mut usage_obj = json!({
-            "prompt_tokens": u.prompt_tokens,
-            "completion_tokens": u.completion_tokens,
+            "input_tokens": u.prompt_tokens,
+            "output_tokens": u.completion_tokens,
             "total_tokens": u.total_tokens
         });
 
         // Include reasoning_tokens if present
         if let Some(details) = &u.completion_tokens_details {
             if let Some(reasoning_tokens) = details.reasoning_tokens {
-                usage_obj["completion_tokens_details"] = json!({
+                usage_obj["output_tokens_details"] = json!({
                     "reasoning_tokens": reasoning_tokens
                 });
             }
