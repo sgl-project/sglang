@@ -21,11 +21,18 @@ use crate::{
         },
         generate::GenerateFinishReason,
     },
+    reasoning_parser::{
+        ParserFactory as ReasoningParserFactory, PooledParser as ReasoningPooledParser,
+        ReasoningParser,
+    },
     tokenizer::{
         cache::CachedTokenizer,
         chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
         traits::Tokenizer,
         HuggingFaceTokenizer,
+    },
+    tool_parser::{
+        ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
     },
 };
 
@@ -44,20 +51,17 @@ pub async fn get_grpc_client_from_worker(
 
 /// Process tool call arguments in messages
 /// Per Transformers docs, tool call arguments in assistant messages should be dicts
-pub fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
+fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
     for msg in messages {
-        // Early return if not assistant message
         let role = msg.get("role").and_then(|v| v.as_str());
         if role != Some("assistant") {
             continue;
         }
 
-        // Early return if no tool_calls
         let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) else {
             continue;
         };
 
-        // Process each tool call's arguments
         for call in tool_calls {
             let Some(function) = call.get_mut("function") else {
                 continue;
@@ -107,10 +111,7 @@ pub fn process_content_format(
 }
 
 /// Transform a single content field based on content format
-pub fn transform_content_field(
-    content_value: &mut Value,
-    content_format: ChatTemplateContentFormat,
-) {
+fn transform_content_field(content_value: &mut Value, content_format: ChatTemplateContentFormat) {
     let Some(content_array) = content_value.as_array() else {
         return; // Not multimodal, keep as-is
     };
@@ -209,7 +210,7 @@ pub fn generate_tool_constraints(
 
 /// Build JSON schema for required tool calls (array with minItems: 1)
 /// Includes $defs consolidation from all tools (matching Python's behavior)
-pub fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
+fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     // Build anyOf schemas for each tool
     let mut any_of_schemas = Vec::new();
     for tool in tools {
@@ -651,7 +652,7 @@ pub fn generate_tool_call_id(
 
 /// Check if a reasoning parser is available for the given model
 pub fn check_reasoning_parser_availability(
-    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&String>,
     model: &str,
 ) -> bool {
@@ -666,7 +667,7 @@ pub fn check_reasoning_parser_availability(
 
 /// Check if a tool parser is available for the given model
 pub fn check_tool_parser_availability(
-    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&String>,
     model: &str,
 ) -> bool {
@@ -683,10 +684,10 @@ pub fn check_tool_parser_availability(
 /// Otherwise, auto-detect based on the model name.
 /// Get a pooled reasoning parser (for non-streaming where state doesn't matter)
 pub fn get_reasoning_parser(
-    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> crate::reasoning_parser::PooledParser {
+) -> ReasoningPooledParser {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         reasoning_parser_factory
@@ -707,10 +708,10 @@ pub fn get_reasoning_parser(
 
 /// Create a fresh reasoning parser instance (for streaming where state isolation is needed)
 pub fn create_reasoning_parser(
-    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> Option<Box<dyn crate::reasoning_parser::ReasoningParser>> {
+) -> Option<Box<dyn ReasoningParser>> {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         reasoning_parser_factory
@@ -735,10 +736,10 @@ pub fn create_reasoning_parser(
 /// Otherwise, auto-detect based on the model name.
 /// Get a pooled tool parser (for non-streaming where state doesn't matter)
 pub fn get_tool_parser(
-    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> crate::tool_parser::PooledParser {
+) -> ToolPooledParser {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         tool_parser_factory
@@ -759,10 +760,10 @@ pub fn get_tool_parser(
 
 /// Create a fresh tool parser instance (for streaming where state isolation is needed)
 pub fn create_tool_parser(
-    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> Option<Box<dyn crate::tool_parser::ToolParser>> {
+) -> Option<Box<dyn ToolParser>> {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         tool_parser_factory
