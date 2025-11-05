@@ -230,9 +230,10 @@ class MiniLoadBalancer:
                         "bootstrap_host": prefill_ip,
                     }
                 )
+                encoder_idx = response_json["encoder_idx"]
                 metadata_tasks.append(
                     session.post(
-                        f"{encode_urls[response_json["encoder_idx"]]}/{endpoint}",
+                        f"{encode_urls[encoder_idx]}/{endpoint}",
                         json=response_json,
                     )
                 )

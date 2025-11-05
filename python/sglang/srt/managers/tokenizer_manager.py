@@ -324,8 +324,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.received_metadata = dict()
             self.embeddings_lock = asyncio.Lock()
             self.embeddings_engine = MooncakeTransferEngine(
-                get_local_ip_auto(),
+                hostname=get_local_ip_auto(),
                 gpu_id=0,
+                ib_device=server_args.disaggregation_ib_device,
             )
             self.embeddings_buffer = dict()
 
