@@ -426,14 +426,9 @@ def handle_attention_nsa(attn, forward_batch):
             # NSA backend uses varlen kernel which supports MHA_ONE_SHOT
             # Check if total sequence length fits in chunk capacity
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
+            # Use MHA_ONE_SHOT for best performance
             if sum_seq_lens <= forward_batch.get_max_chunk_capacity():
-                # Use MHA_ONE_SHOT for best performance (processes prefix and extended KV in one shot)
                 return AttnForwardMethod.MHA_ONE_SHOT
-            else:
-                # Fallback to MHA_CHUNKED_KV when total length exceeds capacity
-                return AttnForwardMethod.MHA_CHUNKED_KV
-        else:
-            return AttnForwardMethod.MLA
 
     return AttnForwardMethod.MLA
 
