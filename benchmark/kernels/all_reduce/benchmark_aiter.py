@@ -1,9 +1,9 @@
 """
 Benchmark SGLang vs Aiter custom all-reduce across message sizes.
 Usage:
-    torchrun --nproc_per_node=2 benchmark_custom_allreduce.py
-    torchrun --nproc_per_node=4 benchmark_custom_allreduce.py
-    torchrun --nproc_per_node=8 benchmark_custom_allreduce.py
+    torchrun --nproc_per_node=2 benchmark_aiter.py
+    torchrun --nproc_per_node=4 benchmark_aiter.py
+    torchrun --nproc_per_node=8 benchmark_aiter.py
 """
 
 import argparse
@@ -229,7 +229,9 @@ def main():
             print(f"SGLang CustomAllreduce import failed: {e}", file=sys.stderr)
 
     try:
-        from aiter.dist.custom_all_reduce import CustomAllreduce as AiterCustomAllreduce
+        from aiter.dist.device_communicators.custom_all_reduce import (
+            CustomAllreduce as AiterCustomAllreduce,
+        )
 
         HAVE_AITER = True
     except Exception as e:

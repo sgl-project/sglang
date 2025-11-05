@@ -19,7 +19,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_hip, log_info_on_rank0
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, log_info_on_rank0
 
 try:
     # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
@@ -420,9 +420,9 @@ class CustomAllreduce:
 
 def dispatch_custom_allreduce():
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled)."""
-    if is_hip():
+    if is_hip() and get_bool_env_var("USE_AITER_CAR", default="true"):
         try:
-            from aiter.dist.custom_all_reduce import (
+            from aiter.dist.device_communicators.custom_all_reduce import (
                 CustomAllreduce as AiterCustomAllreduce,
             )
 
