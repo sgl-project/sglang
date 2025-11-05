@@ -241,6 +241,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
                 expert_offsets,
                 problem_sizes1,
                 problem_sizes2,
+                enable_es=enable_es,
             )
 
             # Run Triton version (requires original shape weights, use inplace=False)
