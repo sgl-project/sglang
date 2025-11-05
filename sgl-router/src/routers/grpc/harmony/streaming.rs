@@ -733,7 +733,7 @@ impl HarmonyStreamingProcessor {
 
                                 // Emit output_item.added wrapper event
                                 let call_id = tc_delta.id.as_ref().unwrap();
-                                let item = json!({
+                                let mut item = json!({
                                     "id": item_id,
                                     "type": mode.type_str(),
                                     "name": tool_name,
@@ -741,6 +741,14 @@ impl HarmonyStreamingProcessor {
                                     "arguments": "",
                                     "status": "in_progress"
                                 });
+
+                                // Add server_label for MCP calls
+                                if mode.emits_status_events() {
+                                    if let Some(ref server_label) = emitter.mcp_server_label {
+                                        item["server_label"] = json!(server_label);
+                                    }
+                                }
+
                                 let event = emitter.emit_output_item_added(output_index, &item);
                                 emitter.send_event_best_effort(&event, tx);
 
@@ -836,7 +844,7 @@ impl HarmonyStreamingProcessor {
                                 }
 
                                 // Emit output_item.done wrapper event
-                                let item = json!({
+                                let mut item = json!({
                                     "id": item_id,
                                     "type": mode.type_str(),
                                     "name": tool_name,
@@ -844,11 +852,21 @@ impl HarmonyStreamingProcessor {
                                     "arguments": args_str,
                                     "status": "completed"
                                 });
-                                let event = emitter.emit_output_item_done(*output_index, &item);
-                                emitter.send_event_best_effort(&event, tx);
 
-                                // Mark output item as completed
+                                // Add server_label for MCP calls
+                                if mode.emits_status_events() {
+                                    // MCP mode - include server_label
+                                    if let Some(ref server_label) = emitter.mcp_server_label {
+                                        item["server_label"] = json!(server_label);
+                                    }
+                                }
+
+                                let event = emitter.emit_output_item_done(*output_index, &item);
+
+                                // Mark output item as completed before sending
                                 emitter.complete_output_item(*output_index);
+
+                                emitter.send_event_best_effort(&event, tx);
                             }
                         }
                     }
@@ -878,9 +896,11 @@ impl HarmonyStreamingProcessor {
                             }]
                         });
                         let event = emitter.emit_output_item_done(output_index, &item);
-                        emitter.send_event_best_effort(&event, tx);
 
+                        // Mark as completed before sending (so it's included in final output even if send fails)
                         emitter.complete_output_item(output_index);
+
+                        emitter.send_event_best_effort(&event, tx);
                     }
                 }
                 Some(proto::generate_response::Response::Error(err)) => {
@@ -939,7 +959,7 @@ impl HarmonyStreamingProcessor {
                         }
 
                         // Emit output_item.done wrapper event
-                        let item = json!({
+                        let mut item = json!({
                             "id": item_id,
                             "type": mode.type_str(),
                             "name": tool_name,
@@ -947,11 +967,20 @@ impl HarmonyStreamingProcessor {
                             "arguments": args_str,
                             "status": "completed"
                         });
-                        let event = emitter.emit_output_item_done(*output_index, &item);
-                        emitter.send_event_best_effort(&event, tx);
 
-                        // Mark output item as completed
+                        // Add server_label for MCP calls
+                        if mode.emits_status_events() {
+                            if let Some(ref server_label) = emitter.mcp_server_label {
+                                item["server_label"] = json!(server_label);
+                            }
+                        }
+
+                        let event = emitter.emit_output_item_done(*output_index, &item);
+
+                        // Mark output item as completed before sending
                         emitter.complete_output_item(*output_index);
+
+                        emitter.send_event_best_effort(&event, tx);
                     }
                 }
             }

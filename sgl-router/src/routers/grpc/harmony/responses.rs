@@ -546,6 +546,9 @@ async fn execute_mcp_tool_loop_streaming(
     // Extract server_label from request tools
     let server_label = extract_mcp_server_label(current_request.tools.as_deref());
 
+    // Set server label in emitter for MCP call items
+    emitter.set_mcp_server_label(server_label.clone());
+
     // Initialize MCP call tracking
     let mut mcp_tracking = McpCallTracking::new(server_label.clone());
 
@@ -582,6 +585,21 @@ async fn execute_mcp_tool_loop_streaming(
         })
         .collect();
 
+    // Build final item with completed status and tools
+    let item_done = json!({
+        "id": item_id,
+        "type": "mcp_list_tools",
+        "server_label": server_label,
+        "status": "completed",
+        "tools": tool_items
+    });
+
+    // Store the completed item data and mark as completed FIRST
+    // This ensures it appears in final response even if event sending fails
+    emitter.emit_output_item_done(output_index, &item_done);
+    emitter.complete_output_item(output_index);
+
+    // Now emit all the events (failures won't affect the stored data)
     // Emit output_item.added
     let item = json!({
         "id": item_id,
@@ -608,19 +626,10 @@ async fn execute_mcp_tool_loop_streaming(
     }
 
     // Emit output_item.done
-    let item_done = json!({
-        "id": item_id,
-        "type": "mcp_list_tools",
-        "server_label": server_label,
-        "status": "completed",
-        "tools": tool_items
-    });
     let event = emitter.emit_output_item_done(output_index, &item_done);
     if emitter.send_event(&event, tx).is_err() {
         return;
     }
-
-    emitter.complete_output_item(output_index);
 
     debug!(
         tool_count = mcp_tools.len(),
@@ -741,6 +750,10 @@ async fn execute_mcp_tool_loop_streaming(
                             return;
                         }
                     };
+
+                // Update mcp_call output items with execution results
+                // The items were created during streaming but didn't have output yet
+                emitter.update_mcp_call_outputs(&tool_results);
 
                 // Build next request with appended history
                 current_request = match build_next_request_with_tools(
@@ -1197,19 +1210,19 @@ fn build_next_request_with_tools(
 /// Tool execution result
 ///
 /// Contains the result of executing a single MCP tool.
-struct ToolResult {
+pub(crate) struct ToolResult {
     /// Tool call ID (for matching with request)
-    call_id: String,
+    pub(crate) call_id: String,
 
     /// Tool name
     #[allow(dead_code)] // Kept for documentation and future use
-    tool_name: String,
+    pub(crate) tool_name: String,
 
     /// Tool output (JSON value)
-    output: Value,
+    pub(crate) output: Value,
 
     /// Whether this is an error result
-    is_error: bool,
+    pub(crate) is_error: bool,
 }
 
 /// Convert MCP tools to Responses API tool format
