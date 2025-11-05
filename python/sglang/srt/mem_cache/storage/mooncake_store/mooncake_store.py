@@ -47,7 +47,6 @@ class MooncakeStoreConfig:
     local_hostname: str
     metadata_server: str
     global_segment_size: int
-    local_buffer_size: int
     protocol: str
     device_name: str
     master_server_address: str
@@ -70,8 +69,6 @@ class MooncakeStoreConfig:
             global_segment_size=_parse_global_segment_size(
                 config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            # Zero copy interface does not need local buffer
-            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
@@ -98,8 +95,6 @@ class MooncakeStoreConfig:
             global_segment_size=_parse_global_segment_size(
                 os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            # Zero copy interface does not need local buffer
-            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
             device_name=os.getenv("MOONCAKE_DEVICE", ""),
             master_server_address=os.getenv("MOONCAKE_MASTER"),
@@ -120,9 +115,6 @@ class MooncakeStoreConfig:
             metadata_server=extra_config.get("metadata_server", "P2PHANDSHAKE"),
             global_segment_size=_parse_global_segment_size(
                 extra_config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
-            ),
-            local_buffer_size=extra_config.get(
-                "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
             ),
             protocol=extra_config.get("protocol", "tcp"),
             device_name=extra_config.get("device_name", ""),
@@ -178,7 +170,6 @@ class MooncakeStore(HiCacheStorage):
             per_tp_global_segment_size = (
                 self.config.global_segment_size // tp_scale_factor
             )
-            per_tp_local_buffer_size = self.config.local_buffer_size // tp_scale_factor
 
             # Check if extra_backend_tag should be passed to MooncakeDistributedStore
             self.extra_backend_tag = None
@@ -194,15 +185,17 @@ class MooncakeStore(HiCacheStorage):
                 self.config.local_hostname,
                 self.config.metadata_server,
                 per_tp_global_segment_size,
-                per_tp_local_buffer_size,
+                DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
                 self.config.protocol,
                 self.config.device_name,
                 self.config.master_server_address,
             )
             if ret_code:
-                logger.error(f"failed to setup mooncake store, error code: {ret_code}")
+                raise RuntimeError(
+                    f"Failed to setup Mooncake store, error code: {ret_code}"
+                )
+            logger.info("Mooncake store setup successfully.")
 
-            logger.info("Connect to Mooncake store successfully.")
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
@@ -272,7 +265,10 @@ class MooncakeStore(HiCacheStorage):
             buffer_size = buffer.numel() * buffer.element_size()
             ret_code = self.store.register_buffer(buffer_ptr, buffer_size)
             if ret_code:
-                logger.error(f"failed to register buffer, error code: {ret_code}")
+                logger.error(f"Failed to register buffer, error code: {ret_code}")
+                raise RuntimeError(
+                    f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
+                )
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
