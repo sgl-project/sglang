@@ -67,7 +67,7 @@ ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="7c22adb0d2c1616e3cfefb2dc6bf01c23c3df768"
+ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
 
 ARG TILELANG_REPO="https://github.com/HaiShaw/tilelang.git"
 ARG TILELANG_BRANCH="dsv32-mi35x"
