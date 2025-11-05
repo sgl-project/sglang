@@ -106,6 +106,7 @@ class TestHybridDPTP(TestTP):
         super().test_gsm8k()
 
 
+@unittest.skip("covered in TestTBO")
 class TestNoGatherdBuffer(TestTP):
     extra_args = [
         "--tp",
