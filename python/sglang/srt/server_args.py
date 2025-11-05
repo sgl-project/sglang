@@ -437,6 +437,7 @@ class ServerArgs:
     kt_cpuinfer: Optional[int] = None
     kt_threadpool_count: Optional[int] = None
     kt_num_gpu_experts: Optional[int] = None
+    kt_max_deferred_experts_per_token: Optional[int] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -1329,6 +1330,21 @@ class ServerArgs:
             override_config,
         )
 
+        num_hidden_layers = None
+        if self.kt_max_deferred_experts_per_token is not None:
+            try:
+                model_config = self.get_model_config()
+                base_config = (
+                    getattr(model_config, "hf_text_config", None)
+                    or model_config.hf_config
+                )
+                num_hidden_layers = getattr(base_config, "num_hidden_layers", None)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to load model config for kt_max_deferred_experts_per_token: %s",
+                    exc,
+                )
+
         override_config(
             CompressedTensorsWNA16AMXEPMoEMethod,
             self.kt_num_gpu_experts,
@@ -1337,6 +1353,8 @@ class ServerArgs:
             self.kt_amx_weight_path,
             self.kt_amx_method,
             self.chunked_prefill_size,
+            self.kt_max_deferred_experts_per_token,
+            num_hidden_layers,
         )
 
     def _handle_data_parallelism(self):
@@ -3037,6 +3055,12 @@ class ServerArgs:
             "--kt-num-gpu-experts",
             type=int,
             help="[ktransformers parameter] The number of GPU experts.",
+        )
+        parser.add_argument(
+            "--kt-max-deferred-experts-per-token",
+            type=int,
+            default=ServerArgs.kt_max_deferred_experts_per_token,
+            help="Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         )
 
         # Double Sparsity
