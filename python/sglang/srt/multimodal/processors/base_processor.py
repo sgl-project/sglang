@@ -13,14 +13,7 @@ from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_npu,
-    load_audio,
-    load_image,
-    load_video,
-    logger,
-)
+from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     CudaIpcTensorTransportProxy,
@@ -28,8 +21,6 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 )
 
 _is_npu = is_npu()
-
-SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 
 @dataclasses.dataclass
@@ -224,7 +215,7 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
-        if SGL_USE_CUDA_IPC:
+        if self.server_args.keep_mm_feature_on_device:
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(MM_FEATURE_CACHE_SIZE)
 
     def process_mm_data(
@@ -271,13 +262,10 @@ class BaseMultimodalProcessor(ABC):
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if SGL_USE_CUDA_IPC:
-                    pass
-                else:
-                    if feature_name in result and isinstance(
-                        result[feature_name], torch.Tensor
-                    ):
-                        result[feature_name] = result[feature_name].to("cpu")
+                if feature_name in result and isinstance(
+                    result[feature_name], torch.Tensor
+                ):
+                    result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
@@ -687,11 +675,10 @@ class BaseMultimodalProcessor(ABC):
         solution for cuda-ipc memory-leak:
         1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
         2. if can not get a slice , transport normal tensor
-        3. copy tensor in scheduler and release it (use position mark)
-        4. copy
+        3. copy tensor in scheduler and notify tokenizerManager to recycle it (set sync-buffer)
         """
 
-        if SGL_USE_CUDA_IPC:
+        if self.server_args.keep_mm_feature_on_device:
             # post-process
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
