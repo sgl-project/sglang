@@ -12,15 +12,14 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.nsa.nsa_indexer import (
     BaseIndexerMetadata,
     Indexer,
-    V32LayerNorm,
     rotate_activation,
 )
-from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import is_cuda
 from sglang.test.test_utils import CustomTestCase
 
 # Global configuration for all indexer tests
@@ -238,11 +237,11 @@ class TestNSAIndexer(CustomTestCase):
         # Move indexer to CUDA device
         indexer = indexer.to(device=self.device)
 
-        # Convert linear layer weights to bfloat16 (but preserve V32LayerNorm's float32)
+        # Convert linear layer weights to bfloat16 (but preserve LayerNorm's float32)
         # Need to recursively convert LinearBase submodules (like ReplicatedLinear)
         for name, module in indexer.named_modules():
-            # Check for LinearBase (parent of ReplicatedLinear) but exclude V32LayerNorm
-            if isinstance(module, LinearBase) and not isinstance(module, V32LayerNorm):
+            # Check for LinearBase (parent of ReplicatedLinear) but exclude LayerNorm
+            if isinstance(module, LinearBase) and not isinstance(module, LayerNorm):
                 module.to(dtype=self.dtype)
 
         return indexer
@@ -260,7 +259,9 @@ class TestNSAIndexer(CustomTestCase):
 
             forward_batch = ForwardBatch(
                 batch_size=batch_size,
-                input_ids=torch.randint(0, 100, (batch_size, q_len), device=self.device),
+                input_ids=torch.randint(
+                    0, 100, (batch_size, q_len), device=self.device
+                ),
                 out_cache_loc=torch.arange(
                     batch_size * (total_len - q_len),
                     batch_size * total_len,
@@ -386,9 +387,7 @@ class TestNSAIndexer(CustomTestCase):
         def mock_paged_mqa_logits(q, kv, weights, *args, **kwargs):
             batch_size = q.shape[0]
             seq_len = 128
-            return torch.randn(
-                batch_size, seq_len, dtype=torch.float32, device="cuda"
-            )
+            return torch.randn(batch_size, seq_len, dtype=torch.float32, device="cuda")
 
         mock_deep_gemm.fp8_paged_mqa_logits.side_effect = mock_paged_mqa_logits
 
@@ -400,7 +399,10 @@ class TestNSAIndexer(CustomTestCase):
         # Create input tensors
         total_tokens = self.batch_size * self.seq_len
         hidden_states = torch.randn(
-            total_tokens, self.config["hidden_size"], dtype=self.dtype, device=self.device
+            total_tokens,
+            self.config["hidden_size"],
+            dtype=self.dtype,
+            device=self.device,
         )
         q_lora = torch.randn(
             total_tokens,
@@ -452,9 +454,7 @@ class TestNSAIndexer(CustomTestCase):
         def mock_paged_mqa_logits(q, kv, weights, *args, **kwargs):
             batch_size = q.shape[0]
             seq_len = 128
-            return torch.randn(
-                batch_size, seq_len, dtype=torch.float32, device="cuda"
-            )
+            return torch.randn(batch_size, seq_len, dtype=torch.float32, device="cuda")
 
         mock_deep_gemm.fp8_paged_mqa_logits.side_effect = mock_paged_mqa_logits
 
@@ -520,30 +520,6 @@ class TestNSAIndexer(CustomTestCase):
 
         with self.assertRaises(AssertionError):
             rotate_activation(x)
-
-    def test_v32_layer_norm(self):
-        """Test the V32LayerNorm module."""
-        dim = 128
-        layer_norm = V32LayerNorm(dim).to(self.device)
-
-        x = torch.randn(16, dim, dtype=self.dtype, device=self.device)
-        output = layer_norm(x)
-
-        self.assertEqual(output.shape, x.shape)
-        self.assertEqual(output.dtype, self.dtype)
-
-        # Check that output is normalized
-        output_float = output.float()
-        mean = output_float.mean(dim=-1, keepdim=True)
-        var = output_float.var(dim=-1, keepdim=True, unbiased=False)
-
-        # Mean should be close to 0, variance close to 1
-        # Using lenient tolerance due to bfloat16 precision and quantization effects
-        mean_close = torch.allclose(mean, torch.zeros_like(mean), atol=1e-3)
-        var_close = torch.allclose(var, torch.ones_like(var), atol=5e-2)  # More lenient for variance
-
-        self.assertTrue(mean_close, f"Mean not close to 0, max_abs_mean={mean.abs().max().item():.6f}")
-        self.assertTrue(var_close, f"Variance not close to 1, max_var_error={(var - 1.0).abs().max().item():.6f}")
 
     def test_indexer_metadata_interface(self):
         """Test the BaseIndexerMetadata interface implementation."""
