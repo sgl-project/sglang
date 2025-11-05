@@ -2,7 +2,6 @@ import asyncio
 import os
 import re
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
