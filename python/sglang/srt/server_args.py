@@ -1460,6 +1460,16 @@ class ServerArgs:
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
 
+        # Below are the only parameters currently supported on Ascend
+        if self.enable_hierarchical_cache and is_npu():
+            # FIXME(iforgetmyname) fix decode_attention_backend on ascend
+            self.decode_attention_backend = "ascend"
+            self.hicache_io_backend = "kernel_ascend"
+            if self.use_mla_backend():
+                self.hicache_mem_layout = "page_first_kv_split"
+            else:
+                self.hicache_mem_layout = "page_first_direct"
+
     def _handle_speculative_decoding(self):
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
@@ -2926,14 +2936,19 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-io-backend",
             type=str,
-            choices=["direct", "kernel"],
+            choices=["direct", "kernel", "kernel_ascend"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )
         parser.add_argument(
             "--hicache-mem-layout",
             type=str,
-            choices=["layer_first", "page_first", "page_first_direct"],
+            choices=[
+                "layer_first",
+                "page_first",
+                "page_first_direct",
+                "page_first_kv_split",
+            ],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
         )
