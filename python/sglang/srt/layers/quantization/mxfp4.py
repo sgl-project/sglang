@@ -22,6 +22,11 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
@@ -70,14 +75,14 @@ _is_hip = is_hip()
 if _is_hip:
     # import aiter
     try:
-        from aiter import ActivationType, QuantType, dtypes
+        from aiter import ActivationType, QuantType
         from aiter.fused_moe import fused_moe
         from aiter.ops.triton.quant import dynamic_mxfp4_quant
         from aiter.utility.fp4_utils import e8m0_shuffle
     except ImportError as err:
-        ActivationType = QuantType = dtypes = fused_moe = dynamic_mxfp4_quant = (
-            e8m0_shuffle
-        ) = err
+        ActivationType = QuantType = fused_moe = dynamic_mxfp4_quant = e8m0_shuffle = (
+            err
+        )
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -606,8 +611,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        moe_runner_config = self.moe_runner_config
-
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
@@ -630,7 +633,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
             else:
-                raise NotImplementedError
+                raise NotImplementedError()
 
             assert x_quant.shape[-1] == self.hidden_size
             assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -638,6 +641,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             top_k = topk_output.topk_config.top_k
             router_logits = topk_output.router_logits
 
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                symm_output = torch.empty_like(x)
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
                 None,  # routing_bias
@@ -666,6 +673,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 None,  # tile_tokens_dim
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
+                output=symm_output,
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
 

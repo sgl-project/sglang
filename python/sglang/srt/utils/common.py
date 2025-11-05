@@ -152,6 +152,12 @@ def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
 
+def is_float4_e2m1fn_x2(dtype) -> bool:
+    """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
+    target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    return is_cuda() and dtype == target_dtype
+
+
 def get_cuda_version():
     if torch.version.cuda:
         return tuple(map(int, torch.version.cuda.split(".")))
@@ -297,6 +303,7 @@ def xpu_has_xmx_support():
     return False
 
 
+@lru_cache(maxsize=1)
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
@@ -1239,42 +1246,34 @@ def point_to_point_pyobj(
     dst: int = 1,
 ):
     """Send data from src to dst in group using DeviceToDevice communication."""
-
+    device = torch.get_device_module().current_device()
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor(
-                [0], dtype=torch.long, device=torch.cuda.current_device()
-            )
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.send(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            ).cuda(
-                device=torch.cuda.current_device()
+            ).to(
+                device=device
             )  # Move to GPU
-            tensor_size = torch.tensor(
-                [size], dtype=torch.long, device=torch.cuda.current_device()
-            )
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             dist.send(tensor_size, dst=dst, group=group)
             dist.send(tensor_data, dst=dst, group=group)
         return data
 
     elif rank == dst:
-        tensor_size = torch.tensor(
-            [0], dtype=torch.long, device=torch.cuda.current_device()
-        )
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
         dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(
-            size, dtype=torch.uint8, device=torch.cuda.current_device()
-        )
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.recv(tensor_data, src=src, group=group)
 
         serialized_data = bytes(
@@ -2370,16 +2369,24 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     )
     server = uvicorn.Server(config=config)
 
-    try:
-        loop = asyncio.get_running_loop()
-        logger.info(
-            f"Dummy health check server scheduled on existing loop at {host}:{port}"
-        )
-        loop.create_task(server.serve())
+    # Run server in a background daemon thread with its own event loop
+    # This prevents blocking the main thread while still serving health checks
+    def run_server():
+        try:
+            asyncio.run(server.serve())
+        except Exception as e:
+            logger.error(f"Dummy health check server failed to start: {e}")
+            raise
+        finally:
+            logger.info(f"Dummy health check server stopped at {host}:{port}")
 
-    except RuntimeError:
-        logger.info(f"Starting dummy health check server at {host}:{port}")
-        server.run()
+    thread = threading.Thread(
+        target=run_server, daemon=True, name="health-check-server"
+    )
+    thread.start()
+    logger.info(
+        f"Dummy health check server started in background thread at {host}:{port}"
+    )
 
 
 def create_checksum(directory: str):
@@ -2390,7 +2397,9 @@ def set_cuda_arch():
     if is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
-        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
+            f"{arch}{'a' if capability[0] >= 9 else ''}"
+        )
 
 
 def next_power_of_2(n: int):
@@ -3125,12 +3134,16 @@ def apply_module_patch(target_module, target_function, wrappers):
         setattr(original_module, target_function, candidate)
 
     for key, value in sys.modules.copy().items():
-        if (
-            target_function is not None
-            and hasattr(value, target_function)
-            and id(getattr(value, target_function)) == original_function_id
-        ):
-            setattr(value, target_function, candidate)
+        try:
+            if (
+                target_function is not None
+                and hasattr(value, target_function)
+                and id(getattr(value, target_function)) == original_function_id
+            ):
+                setattr(value, target_function, candidate)
+        except ImportError as e:
+            # Ignore some modules reporting ImportError when calling hasattr
+            logger.warning(f"Ignore {value} reports ImportError with:\n{str(e)}")
 
 
 def parse_module_path(module_path, function_name, create_dummy):
@@ -3603,3 +3616,13 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+cached_device_index = -1
+
+
+def get_current_device_stream_fast():
+    global cached_device_index
+    if cached_device_index == -1:
+        cached_device_index = torch.get_device_module().current_device()
+    return torch.get_device_module().current_stream(cached_device_index)
