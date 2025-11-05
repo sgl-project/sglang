@@ -18,10 +18,7 @@ _TEST_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(_TEST_DIR))
 
 # Import local modules
-from mixins.basic_crud import (
-    ConversationCRUDBaseTest,
-    ResponseCRUDBaseTest,
-)
+from mixins.basic_crud import ConversationCRUDBaseTest, ResponseCRUDBaseTest
 from mixins.function_call import FunctionCallingBaseTest
 from mixins.mcp import MCPTests
 from mixins.state_management import StateManagementTests
