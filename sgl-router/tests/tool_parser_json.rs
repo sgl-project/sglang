@@ -159,3 +159,137 @@ async fn test_json_format_detection() {
     assert!(parser.has_tool_markers(r#"[{"name": "test"}]"#));
     assert!(!parser.has_tool_markers("plain text"));
 }
+
+// Streaming tests for JSON array format
+#[tokio::test]
+async fn test_json_array_streaming_required_mode() {
+    use sglang_router_rs::protocols::common::Tool;
+
+    // Test that simulates the exact streaming pattern from required mode
+    let mut parser = JsonParser::new();
+
+    // Define test tools
+    let tools = vec![Tool {
+        tool_type: "function".to_string(),
+        function: sglang_router_rs::protocols::common::Function {
+            name: "get_weather".to_string(),
+            description: Some("Get weather".to_string()),
+            parameters: serde_json::json!({}),
+            strict: None,
+        },
+    }];
+
+    // Simulate the EXACT chunks from the debug log
+    let chunks = vec![
+        "[{",
+        " \"",
+        "name",
+        "\":",
+        " \"",
+        "get",
+        "_weather",
+        "\",",
+        " \"",
+        "parameters",
+        "\":",
+        " {",
+        " \"",
+        "city",
+        "\":",
+        " \"",
+        "Paris",
+        "\"",
+        " }",
+        " }]",
+    ];
+
+    let mut all_results = Vec::new();
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        println!("Chunk: '{}' -> Calls: {}", chunk, result.calls.len());
+        all_results.extend(result.calls);
+    }
+
+    // We should have gotten tool call chunks
+    assert!(
+        !all_results.is_empty(),
+        "Should have emitted tool call chunks"
+    );
+
+    // Check that we got the function name
+    let has_name = all_results
+        .iter()
+        .any(|item| item.name.as_ref().is_some_and(|n| n == "get_weather"));
+    assert!(has_name, "Should have emitted function name");
+
+    // Check that we got the parameters
+    let has_params = all_results.iter().any(|item| !item.parameters.is_empty());
+    assert!(has_params, "Should have emitted parameters");
+}
+
+#[tokio::test]
+async fn test_json_array_multiple_tools_streaming() {
+    use sglang_router_rs::protocols::common::Tool;
+
+    // Test with multiple tools in array
+    let mut parser = JsonParser::new();
+
+    let tools = vec![
+        Tool {
+            tool_type: "function".to_string(),
+            function: sglang_router_rs::protocols::common::Function {
+                name: "get_weather".to_string(),
+                description: Some("Get weather".to_string()),
+                parameters: serde_json::json!({}),
+                strict: None,
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: sglang_router_rs::protocols::common::Function {
+                name: "get_news".to_string(),
+                description: Some("Get news".to_string()),
+                parameters: serde_json::json!({}),
+                strict: None,
+            },
+        },
+    ];
+
+    // Split into smaller, more realistic chunks
+    let chunks = vec![
+        "[{",
+        "\"name\":",
+        "\"get_weather\"",
+        ",\"parameters\":",
+        "{\"city\":",
+        "\"SF\"}",
+        "}",
+        ",",
+        "{\"name\":",
+        "\"get_news\"",
+        ",\"parameters\":",
+        "{\"topic\":",
+        "\"tech\"}",
+        "}]",
+    ];
+
+    let mut all_results = Vec::new();
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        println!("Chunk: '{}' -> Calls: {}", chunk, result.calls.len());
+        all_results.extend(result.calls);
+    }
+
+    // Should have gotten tool calls for both functions
+    let has_weather = all_results
+        .iter()
+        .any(|item| item.name.as_ref().is_some_and(|n| n == "get_weather"));
+    let has_news = all_results
+        .iter()
+        .any(|item| item.name.as_ref().is_some_and(|n| n == "get_news"));
+
+    assert!(has_weather, "Should have get_weather tool call");
+    assert!(has_news, "Should have get_news tool call");
+}

@@ -233,7 +233,7 @@ impl ToolParser for JsonParser {
         let start_idx = if let Some(bracket_pos) = current_text.find('[') {
             let brace_pos = current_text.find('{');
             match brace_pos {
-                Some(bp) if bp < bracket_pos => bp,
+                Some(bp) => bp,
                 _ => bracket_pos,
             }
         } else if let Some(brace_pos) = current_text.find('{') {
