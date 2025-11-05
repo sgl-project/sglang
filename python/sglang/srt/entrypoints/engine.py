@@ -31,8 +31,6 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
 
-from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
-
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -67,6 +65,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
@@ -513,6 +512,21 @@ class Engine(EngineBase):
             self.tokenizer_manager.update_weights_from_disk(obj, None)
         )
 
+    def update_weights_from_ipc(
+        self,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+    ):
+        """Update weights from IPC for checkpoint-engine integration."""
+        obj = UpdateWeightsFromIPCReqInput(
+            zmq_handles=zmq_handles,
+            flush_cache=flush_cache,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_ipc(obj, None)
+        )
+
     def get_weights_by_name(self, name: str, truncate_size: int = 100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
@@ -656,21 +670,6 @@ class Engine(EngineBase):
             apply_softmax=apply_softmax,
             item_first=item_first,
             request=None,
-        )
-
-    def update_weights_from_ipc(
-        self,
-        zmq_handles: Dict[str, str],
-        flush_cache: bool = True,
-    ):
-        """Update weights from IPC for checkpoint-engine integration."""
-        obj = UpdateWeightsFromIPCReqInput(
-            zmq_handles=zmq_handles,
-            flush_cache=flush_cache,
-        )
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_ipc(obj, None)
         )
 
 
@@ -881,14 +880,14 @@ def _launch_subprocesses(
     detoken_proc.start()
 
     # Init tokenizer manager first, as the bootstrap server is initialized here
-    if server_args.tokenizer_worker_num > 1:
-        # Launch multi-tokenizer router
-        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-        template_manager = None
-    else:
+    if server_args.tokenizer_worker_num == 1:
         tokenizer_manager, template_manager = _init_tokenizer_manager(
             server_args, port_args
         )
+    else:
+        # Launch multi-tokenizer router
+        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
+        template_manager = None
 
     # Wait for the model to finish loading
     scheduler_infos = []
@@ -911,7 +910,6 @@ def _launch_subprocesses(
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
-
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
 
     return tokenizer_manager, template_manager, scheduler_info, port_args
