@@ -27,6 +27,8 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
 )
+from sglang.srt.multimodal.processors.video_utils import make_video_input
+from sglang.srt.utils import is_npu, load_audio, load_image, logger
 
 _is_npu = is_npu()
 
@@ -183,9 +185,12 @@ class BaseMultimodalProcessor(ABC):
             mp_context=mp.get_context("fork"),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
+        mp_ctx_name = os.environ.get("SGLANG_MP_CTX", "spawn")
         self.video_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context("spawn"),
-            max_workers=int(os.environ.get("SGLANG_VIDEO_WORKERS", 32)),
+            mp_context=mp.get_context(mp_ctx_name),
+            max_workers=int(os.environ.get("SGLANG_VIDEO_WORKERS", 8)),
+            # initializer=_video_worker_init,
+            # initargs=(int(os.environ.get("SGLANG_VIDEO_GPU_ID", "0")),),
         )
 
         # Mapping from attribute names to modality types
@@ -411,13 +416,17 @@ class BaseMultimodalProcessor(ABC):
             ):
                 return data
         try:
+            if modality == Modality.VIDEO:
+                return make_video_input(
+                    data,
+                    frame_count_limit=frame_count_limit,
+                    request_timeout_env="REQUEST_TIMEOUT",
+                )
             if modality == Modality.IMAGE:
                 img, _ = load_image(data)
                 if discard_alpha_channel and img.mode != "RGB":
                     img = img.convert("RGB")
                 return img
-            elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
@@ -438,6 +447,7 @@ class BaseMultimodalProcessor(ABC):
         """
         load multimodal data parallelly using iterators.
         """
+        loop = asyncio.get_running_loop()
         futures = []
         task_info = []
 
@@ -470,7 +480,6 @@ class BaseMultimodalProcessor(ABC):
                             "Mismatch between image tokens and estimated frame counts."
                         )
 
-                loop = asyncio.get_running_loop()
                 fn = partial(
                     BaseMultimodalProcessor._load_single_item,
                     data,
