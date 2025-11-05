@@ -1,109 +1,25 @@
 """
-OpenAI backend tests for Response API.
+gRPC backend tests for Response API (including Harmony).
 
 Run with:
-    export OPENAI_API_KEY=your_key
-    python3 -m pytest py_test/e2e_response_api/test_openai_backend.py -v
-    python3 -m unittest e2e_response_api.test_openai_backend.TestOpenAIStateManagement
+    python3 -m pytest py_test/e2e_response_api/backends/test_grpc_backend.py -v
+    python3 -m unittest e2e_response_api.backends.test_grpc_backend.TestGrpcBackend
 """
 
-import os
 import sys
 import unittest
 from pathlib import Path
 
-# Add current directory for imports
-_TEST_DIR = Path(__file__).parent
+# Add e2e_response_api directory for imports
+_TEST_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(_TEST_DIR))
 
 # Import local modules
-from basic_crud import (
-    ConversationCRUDBaseTest,
-    FunctionCallingBaseTest,
-    ResponseCRUDBaseTest,
-)
-from mcp import MCPTests
-from router_fixtures import (
-    popen_launch_openai_xai_router,
-    popen_launch_workers_and_router,
-)
-from state_management import StateManagementTests
+from mixins.function_call import FunctionCallingBaseTest
+from mixins.mcp import MCPTests
+from mixins.state_management import StateManagementTests
+from router_fixtures import popen_launch_workers_and_router
 from util import kill_process_tree
-
-
-class TestOpenaiBackend(
-    ResponseCRUDBaseTest,
-    ConversationCRUDBaseTest,
-    StateManagementTests,
-    MCPTests,
-    FunctionCallingBaseTest,
-):
-    """End to end tests for OpenAI backend."""
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "gpt-5-nano"
-        cls.base_url_port = "http://127.0.0.1:30010"
-
-        cls.cluster = popen_launch_openai_xai_router(
-            backend="openai",
-            base_url=cls.base_url_port,
-            history_backend="memory",
-        )
-
-        cls.base_url = cls.cluster["base_url"]
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.cluster["router"].pid)
-
-
-class TestXaiBackend(StateManagementTests):
-    """End to end tests for XAI backend."""
-
-    api_key = os.environ.get("XAI_API_KEY")
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "grok-4-fast"
-        cls.base_url_port = "http://127.0.0.1:30023"
-
-        cls.cluster = popen_launch_openai_xai_router(
-            backend="xai",
-            base_url=cls.base_url_port,
-            history_backend="memory",
-        )
-
-        cls.base_url = cls.cluster["base_url"]
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.cluster["router"].pid)
-
-
-class TestOracleStore(ResponseCRUDBaseTest, ConversationCRUDBaseTest):
-    """End to end tests for Oracle database storage backend."""
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "gpt-5-nano"
-        cls.base_url_port = "http://127.0.0.1:30040"
-
-        cls.cluster = popen_launch_openai_xai_router(
-            backend="openai",
-            base_url=cls.base_url_port,
-            history_backend="oracle",
-        )
-
-        cls.base_url = cls.cluster["base_url"]
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.cluster["router"].pid)
 
 
 class TestGrpcBackend(StateManagementTests, MCPTests):
