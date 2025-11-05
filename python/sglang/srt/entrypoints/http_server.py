@@ -1449,12 +1449,14 @@ def _execute_server_warmup(
                     url = scheme + "://127.0.0.1:" + rest
                 else:
                     # fallback: just replace host naive
-                    logging.warning("Host is not formatted as http://host:port, check server args")
+                    logging.warning(
+                        "Host is not formatted as http://host:port, check server args"
+                    )
         except Exception:
             # If anything unexpected happens, do not sanitize
             pass
         return url
-    
+
     headers = {}
     url = sanitize_host_url(server_args.url())
     if server_args.api_key:
