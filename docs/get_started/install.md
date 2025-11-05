@@ -25,7 +25,7 @@ uv pip install "sglang" --prerelease=allow
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.4.post1 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.4.post3 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages

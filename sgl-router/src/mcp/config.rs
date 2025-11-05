@@ -1,12 +1,11 @@
+//! MCP configuration types and utilities.
+//!
+//! Defines configuration structures for MCP servers, transports, proxies, and inventory.
+
 use std::collections::HashMap;
 
-// Re-export rmcp types for convenient access
 pub use rmcp::model::{Prompt, RawResource, Tool};
 use serde::{Deserialize, Serialize};
-
-// ============================================================================
-// Configuration Structures
-// ============================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpConfig {

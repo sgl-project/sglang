@@ -376,6 +376,15 @@ def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
 
 def save_configs(
     configs: Dict[int, BenchmarkConfig],
+    filename: str,
+) -> None:
+    print(f"Writing best config to {filename}...")
+    with open(filename, "w") as f:
+        json.dump(configs, f, indent=4)
+        f.write("\n")
+
+
+def get_filename(
     num_experts: int,
     shard_intermediate_size: int,
     hidden_size: int,
@@ -404,87 +413,31 @@ def save_configs(
         per_channel_quant,
     )
 
-    print(f"Writing best config to {filename}...")
-    with open(filename, "w") as f:
-        json.dump(configs, f, indent=4)
-        f.write("\n")
+    return filename
 
 
 def main(args: argparse.Namespace):
     print(args)
 
-    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    if config.architectures[0] == "DbrxForCausalLM":
-        E = config.ffn_config.moe_num_experts
-        topk = config.ffn_config.moe_top_k
-        intermediate_size = config.ffn_config.ffn_hidden_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] == "JambaForCausalLM":
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in [
-        "Qwen2MoeForCausalLM",
-        "Qwen3MoeForCausalLM",
-        "Qwen3NextForCausalLM",
-    ]:
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
-        E = (
-            config.n_routed_experts + (0 if args.disable_shared_experts_fusion else 1)
-            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
-            else config.n_routed_experts
+    def _calculate_shard_intermediate_size(intermediate_size: int) -> int:
+        # In EP mode, use original intermediate_size; otherwise apply TP sharding
+        return (
+            intermediate_size
+            if args.ep_size > 1
+            else 2 * intermediate_size // args.tp_size
         )
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] == "Llama4ForConditionalGeneration":
-        E = config.text_config.num_local_experts + (
-            0 if args.disable_shared_experts_fusion else 1
-        )
-        topk = config.text_config.num_experts_per_tok
-        intermediate_size = config.text_config.intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in [
-        "Grok1ForCausalLM",
-        "Grok1ImgGen",
-        "Grok1AForCausalLM",
-    ]:
-        E = config.num_local_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in [
-        "BailingMoEForCausalLM",
-        "BailingMoeForCausalLM",
-        "BailingMoeV2ForCausalLM",
-    ]:
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in ["Glm4MoeForCausalLM"]:
-        E = config.n_routed_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    else:
-        # Default: Mixtral
-        E = config.num_local_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
-        shard_intermediate_size = 2 * intermediate_size // args.tp_size
 
-    hidden_size = getattr(config, "hidden_size", None) or config.text_config.hidden_size
-    dtype = config.torch_dtype
-    use_fp8_w8a8 = args.dtype == "fp8_w8a8"
-    use_int8_w8a8 = args.dtype == "int8_w8a8"
-    use_int8_w8a16 = args.dtype == "int8_w8a16"
-    per_channel_quant = args.per_channel_quant
+    # Check EP mode constraint: tp_size must be 1 when ep_size > 1
+    if args.ep_size > 1 and args.tp_size != 1:
+        raise ValueError(
+            f"When using Expert Parallelism (ep_size={args.ep_size}), "
+            f"tp_size must be set to 1, but got tp_size={args.tp_size}. "
+            f"Please set --tp-size 1 when using --ep-size > 1."
+        )
+
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+
+    # Determine block shape for quantization
     block_shape = None
     if (
         hasattr(config, "quantization_config")
@@ -492,6 +445,82 @@ def main(args: argparse.Namespace):
     ):
         block_shape = config.quantization_config["weight_block_size"]
         assert len(block_shape) == 2
+
+    architecture = config.architectures[0]
+    # replace config with text_config for encoder-decoder models after getting block_shape and architecture
+    if hasattr(config, "text_config"):
+        config = config.get_text_config()
+
+    if architecture == "DbrxForCausalLM":
+        E = config.ffn_config.moe_num_experts
+        topk = config.ffn_config.moe_top_k
+        intermediate_size = config.ffn_config.ffn_hidden_size
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
+    elif architecture == "JambaForCausalLM":
+        E = config.num_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.intermediate_size
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
+    elif architecture in [
+        "Qwen2MoeForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Qwen3NextForCausalLM",
+        "Qwen3VLMoeForConditionalGeneration",
+    ]:
+        E = config.num_experts // args.ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
+    elif architecture in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
+        E = (
+            config.n_routed_experts + (0 if args.disable_shared_experts_fusion else 1)
+            if architecture == "DeepseekV3ForCausalLM"
+            else config.n_routed_experts
+        )
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
+    elif architecture == "Llama4ForConditionalGeneration":
+        E = config.num_local_experts + (0 if args.disable_shared_experts_fusion else 1)
+        topk = config.num_experts_per_tok
+        intermediate_size = config.intermediate_size
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
+    elif architecture in [
+        "Grok1ForCausalLM",
+        "Grok1ImgGen",
+        "Grok1AForCausalLM",
+    ]:
+        E = config.num_local_experts // args.ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
+    elif architecture in [
+        "BailingMoEForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
+    ]:
+        E = config.num_experts // args.ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
+    elif architecture in ["Glm4MoeForCausalLM"]:
+        E = config.n_routed_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
+    else:
+        # Default: Mixtral
+        E = config.num_local_experts // args.ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.intermediate_size
+        shard_intermediate_size = _calculate_shard_intermediate_size(intermediate_size)
+
+    hidden_size = config.hidden_size
+    dtype = config.torch_dtype
+    use_fp8_w8a8 = args.dtype == "fp8_w8a8"
+    use_int8_w8a8 = args.dtype == "int8_w8a8"
+    use_int8_w8a16 = args.dtype == "int8_w8a16"
+    per_channel_quant = args.per_channel_quant
 
     if args.batch_size is None:
         batch_sizes = [
@@ -541,7 +570,22 @@ def main(args: argparse.Namespace):
                 for config in search_space
                 if block_k % config["BLOCK_SIZE_K"] == 0
             ]
-        print(f"Start tuning over {len(search_space)} configurations...")
+
+        filename = get_filename(
+            E,
+            shard_intermediate_size,
+            hidden_size,
+            topk,
+            dtype,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            per_channel_quant,
+            block_shape,
+        )
+        print(
+            f"Start tuning over {len(search_space)} configurations to create {filename}..."
+        )
 
         start = time.perf_counter()
         configs = _distribute(
@@ -569,16 +613,7 @@ def main(args: argparse.Namespace):
         }
         save_configs(
             best_configs,
-            E,
-            shard_intermediate_size,
-            hidden_size,
-            topk,
-            dtype,
-            use_fp8_w8a8,
-            use_int8_w8a8,
-            use_int8_w8a16,
-            per_channel_quant,
-            block_shape,
+            filename,
         )
         end = time.perf_counter()
         print(f"Tuning took {end - start:.2f} seconds")
@@ -614,6 +649,7 @@ if __name__ == "__main__":
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
     )
     parser.add_argument("--tp-size", "--tp", type=int, default=2)
+    parser.add_argument("--ep-size", "--ep", type=int, default=1)
     parser.add_argument(
         "--dtype",
         type=str,

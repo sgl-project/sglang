@@ -67,17 +67,26 @@ cargo build --release
 
 ### Python Package
 ```bash
-pip install setuptools-rust wheel build
-python -m build
-pip install dist/*.whl
+pip install maturin
 
-# Rebuild & reinstall in one step during development
-python -m build && pip install --force-reinstall dist/*.whl
+# Fast development mode (debug build, no wheel, instant)
+# Uses system OpenSSL (requires libssl-dev/openssl-devel)
+maturin develop
+
+# Production build (optimized, creates wheel)
+# Uses vendored OpenSSL (cross-platform compatibility)
+maturin build --release --features vendored-openssl
+pip install --force-reinstall dist/*.whl
+
+# Development build with system OpenSSL (faster)
+# Requires: apt install libssl-dev pkg-config (Ubuntu/Debian)
+#       or: yum install openssl-devel (RHEL/CentOS)
+maturin build --release
+pip install --force-reinstall dist/*.whl
 ```
-> **Note:** Editable installs (`pip install -e .`) are currently not supported; prefer wheel builds for development.
+> **Note:** Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
 
 ## Quick Start
-
 ### Regular HTTP Routing
 - **Rust binary**
   ```bash
@@ -562,20 +571,19 @@ curl -X POST "http://localhost:8080/add_worker?url=http://worker3:8000&api_key=w
 
 ## Development & Testing
 ```bash
-# Build Rust components
+# Build Rust components (debug mode, fast)
 cargo build
 
 # Run Rust tests
 cargo test
 
-# Build & install Python bindings
-python -m build
-pip install --force-reinstall dist/*.whl
+# Fast Python development (rebuilds and installs in debug mode)
+maturin develop
 
 # Run Python tests
 pytest
 ```
-When modifying runtime behavior, rebuild the wheel or run the binary directly. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
+For production builds, use `maturin build --release` to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
 
 ---
 
