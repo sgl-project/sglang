@@ -289,7 +289,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
-    mm_process_config: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    mm_process_config: Optional[Dict[str, Any]] = None
 
     # Logging
     log_level: str = "info"
@@ -660,6 +660,8 @@ class ServerArgs:
             self.device = get_device()
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
+        if self.mm_process_config is None:
+            self.mm_process_config = {}
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
@@ -2267,7 +2269,7 @@ class ServerArgs:
         parser.add_argument(
             "--mm-process-config",
             type=json.loads,
-            default=ServerArgs().mm_process_config,
+            default=ServerArgs.mm_process_config,
             help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
         )
 
