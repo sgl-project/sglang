@@ -411,7 +411,7 @@ def trace_req_start(
     bootstrap_room: Optional[int] = None,
     ts: Optional[int] = None,
     role: Optional[str] = "null",
-    trace_context: Optional[Dict[str, str]] = None,
+    external_trace_header: Optional[Dict[str, str]] = None,
 ):
     if not tracing_enabled:
         return
@@ -438,12 +438,14 @@ def trace_req_start(
     tracer = threads_info[pid].tracer
     if str(bootstrap_room) not in remote_trace_contexts:
         attrs = {"bootstrap_room": str(hex(bootstrap_room))}
-        trace_context = _trace_context_propagator.extract(trace_context)
+        external_trace_context = _trace_context_propagator.extract(
+            external_trace_header
+        )
         bootstrap_room_span = tracer.start_span(
             name=f"Bootstrap Room {hex(bootstrap_room)}",
             start_time=ts,
             attributes=attrs,
-            context=trace_context,
+            context=external_trace_context,
         )
         reqs_context[rid].bootstrap_room_span = bootstrap_room_span
         bootstrap_room_span_context = trace.set_span_in_context(bootstrap_room_span)

@@ -227,9 +227,6 @@ class GenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
-    # tracing context
-    trace_context: Optional[Dict] = None
-
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
