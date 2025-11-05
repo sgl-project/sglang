@@ -1450,16 +1450,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         # Validate weight scales
-        for name, weight_scale in [
-            ("w13", layer.w13_weight_scale),
-            ("w2", layer.w2_weight_scale),
-        ]:
-            assert (
-                weight_scale.shape[2] % 16 == 0
-            ), f"Expected {name}_weight_scale.dim(2) to be divisible by 16"
-            assert (
-                weight_scale.dtype == torch.float8_e4m3fn
-            ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
+        assert (
+            layer.w2_weight_scale.dtype == torch.float8_e4m3fn
+        ), "Weight Blockscale must be represented as FP8-E4M3"
 
         # Weight processing based on strategy
         if (
@@ -1573,15 +1566,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
 
         if self.enable_flashinfer_cutlass_moe:
-            assert (
-                not moe_runner_config.apply_router_weight_on_input
-            ), "apply_router_weight_on_input is not supported for Flashinfer"
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             output_dtype = x.dtype
             x_sf = None
+            # Support applying router weights on input for topK==1
+            if moe_runner_config.apply_router_weight_on_input:
+                top_k = topk_weights.shape[1]
+                assert (
+                    top_k == 1
+                ), "apply_router_weight_on_input is only implemented for topK==1"
+                if x.shape[0] > 0:
+                    scale = topk_weights[:, :1].to(x.dtype)
+                    x = x * scale
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 from flashinfer import nvfp4_block_scale_interleave
 
@@ -1596,9 +1595,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     x_sf = torch.zeros(
                         0, x_col // 16, dtype=torch.uint8, device=x.device
                     )
+
+                # Mirror vLLM: gather router outputs and activations together
                 topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
                     [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
                 )
+                # Align dtypes with FlashInfer expectations
+                topk_weights = topk_weights.to(torch.float32)
+                topk_ids = topk_ids.to(torch.int32)
                 x_sf = nvfp4_block_scale_interleave(x_sf)
 
             with use_symmetric_memory(get_tp_group()) as sm:
@@ -1615,7 +1619,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             output = flashinfer_cutlass_fused_moe(
                 input=x,
                 token_selected_experts=topk_ids.to(torch.int),
-                token_final_scales=topk_weights,
+                token_final_scales=topk_weights.to(torch.float32),
                 fc1_expert_weights=layer.w13_weight.view(torch.long),
                 fc2_expert_weights=layer.w2_weight.view(torch.long),
                 output_dtype=output_dtype,

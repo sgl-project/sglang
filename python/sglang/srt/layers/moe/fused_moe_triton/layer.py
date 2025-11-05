@@ -254,6 +254,19 @@ class FusedMoE(torch.nn.Module):
         elif shard_id == "w2":
             param_data[expert_id] = loaded_weight
 
+    def _load_w13_weight_scale(
+        self,
+        shard_dim: int,
+        loaded_weight: torch.Tensor,
+        param: torch.Tensor,
+        tp_rank: int,
+    ):
+        shard_size = param.shape[shard_dim]
+        loaded_weight = loaded_weight.narrow(
+            shard_dim, shard_size * tp_rank, shard_size
+        )
+        param.copy_(loaded_weight)
+
     def _load_model_weight_or_group_weight_scale(
         self,
         shard_dim: int,
@@ -480,7 +493,7 @@ class FusedMoE(torch.nn.Module):
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
-            not expert_id
+            expert_id is None
             and self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
@@ -666,7 +679,18 @@ class FusedMoE(torch.nn.Module):
                 else "weight_scale" in weight_name
             ) or "input_scale" in weight_name
 
-            if per_tensor_conditions:
+            if "w13_weight_scale" in weight_name:
+                loaded_weight_hidden_out = loaded_weight.shape[-2]
+                param_hidden_out = param.data.shape[-2] * self.moe_tp_size
+                if loaded_weight_hidden_out == param_hidden_out:
+                    self._load_w13_weight_scale(
+                        shard_dim=shard_dim,
+                        loaded_weight=loaded_weight,
+                        param=expert_data,
+                        tp_rank=tp_rank,
+                    )
+                    return
+            elif per_tensor_conditions:
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,
@@ -1075,8 +1099,14 @@ class FlashInferFP4MoE(FusedMoE):
             output2_scale_scalar=self.g2_alphas.data,
             num_experts=self.num_experts,
             top_k=topk_config.top_k,
-            n_group=topk_config.num_expert_group,
-            topk_group=topk_config.topk_group,
+            n_group=(
+                topk_config.num_expert_group
+                if topk_config.num_expert_group is not None
+                else 0
+            ),
+            topk_group=(
+                topk_config.topk_group if topk_config.topk_group is not None else 0
+            ),
             intermediate_size=self.intermediate_size_per_partition,
             local_expert_offset=self.moe_ep_rank * self.num_local_experts,
             local_num_experts=self.num_local_experts,
