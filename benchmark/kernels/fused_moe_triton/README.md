@@ -7,7 +7,7 @@ This directory contains benchmarking tools for MoE (Mixture of Experts) kernels.
 The tuning tools support both **Tensor Parallelism (TP)** and **Expert Parallelism (EP)** modes:
 
 - **TP Mode**: Traditional tensor parallelism where intermediate layers are sharded across GPUs
-- **EP Mode**: Expert parallelism where experts are distributed across GPUs (requires `--ep-size > 1` and `--tp-size 1`)
+- **EP Mode**: Expert parallelism where experts are distributed across GPUs. Can be combined with TP mode (e.g., `--tp-size 8 --ep-size 2`)
 - **MLLM Support**: Multi-modal Large Language Models with text encoders (e.g., Llama4, Qwen3VL)
 
 ### Tuning Tools
@@ -43,29 +43,29 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
 ```
 
 #### EP Mode Tuning (Expert Parallelism)
-**Note**: EP mode requires `--tp-size 1` and `--ep-size > 1`
+**Note**: EP mode can be used alone or combined with TP mode. When using both, ensure `tp_size` is divisible by `ep_size`.
 
 ```bash
-# Tune Mixtral-8x7B with EP=2 (distribute experts across 2 GPUs)
+# Tune Mixtral-8x7B with EP=2 only
 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
-    --tp-size 1 \
+    --tp-size 2 \
     --ep-size 2 \
     --tune
 
-# Tune Qwen2-57B with EP=4 and FP8
+# Tune Qwen2-57B with TP=8 and EP=4 (combined mode)
 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --model Qwen/Qwen2-57B-A14B-Instruct \
-    --tp-size 1 \
+    --tp-size 8 \
     --ep-size 4 \
     --dtype fp8_w8a8 \
     --tune
 
-# Tune Grok-1 with EP=8
+# Tune Grok-1 with TP=8 and EP=2
 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --model xai-org/grok-1 \
-    --tp-size 1 \
-    --ep-size 8 \
+    --tp-size 8 \
+    --ep-size 2 \
     --tune
 ```
 
@@ -108,18 +108,18 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py \
     --topk-ids-dir /path/to/topk_ids \
     --tune
 
-# EP Mode: Tune separate kernels with EP=2
+# EP Mode: Tune separate kernels with TP=4 and EP=2
 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
-    --tp-size 1 \
+    --tp-size 4 \
     --ep-size 2 \
     --topk-ids-dir /path/to/topk_ids \
     --tune
 
-# MLLM: Tune DeepSeek-V3 with separate kernels and EP mode
+# MLLM: Tune DeepSeek-V3 with separate kernels, TP=8 and EP=4
 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py \
     --model deepseek-ai/DeepSeek-V3-0324 \
-    --tp-size 1 \
+    --tp-size 8 \
     --ep-size 4 \
     --dtype fp8_w8a8 \
     --topk-ids-dir /path/to/topk_ids \
@@ -176,7 +176,7 @@ Move these files to `sglang/srt/layers/fused_moe_triton/configs/triton_version/`
 
 - `--model`: HuggingFace model name or local path
 - `--tp-size`: Tensor parallelism size (default: 2)
-- `--ep-size`: Expert parallelism size (default: 1, requires tp-size=1 when >1)
+- `--ep-size`: Expert parallelism size (default: 1, can be combined with TP mode, ensure tp_size is divisible by ep_size)
 - `--dtype`: Data type (`auto`, `fp8_w8a8`, `int8_w8a16`, `int8_w8a8`)
 - `--batch-size`: Specific batch size for tuning (optional)
 - `--tune`: Enable tuning mode
