@@ -68,8 +68,9 @@ jobs:
         include:
           - python-version: "3.10"
             cuda-version: "12.9"
-          - python-version: "3.10"
-            cuda-version: "13.0"
+          # Add back when CUDA 13.0 is supported on CI
+          # - python-version: "3.10"
+          #   cuda-version: "13.0"
     name: Build Wheel
     steps:
       - name: Cleanup
@@ -94,6 +95,41 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
+          path: sgl-kernel/dist/*
+
+  sgl-kernel-build-wheels-arm:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    runs-on: arm-kernel-build-node
+    strategy:
+      matrix:
+        include:
+          - python-version: "3.10"
+            cuda-version: "12.9"
+    name: Build Wheel Arm
+    steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf $GITHUB_WORKSPACE/* || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
+        run: |
+          cd sgl-kernel
+          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}-aarch64
           path: sgl-kernel/dist/*
 
   sgl-kernel-unit-test:
@@ -265,7 +301,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -286,7 +322,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 11
+          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 13
 
   unit-test-backend-2-gpu:
     needs: [check-changes, sgl-kernel-build-wheels]
@@ -784,6 +820,35 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
 
+  unit-test-backend-4-gpu-gb200:
+    needs: [check-changes, sgl-kernel-build-wheels-arm]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    runs-on: 4-gpu-gb200
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9-aarch64
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/ci_install_deepep.sh
+
+      - name: Run test
+        timeout-minutes: 45
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
+
   pr-test-finish:
     needs:
       [
@@ -808,6 +873,7 @@ jobs:
         unit-test-deepep-4-gpu,
         unit-test-deepep-8-gpu,
         unit-test-backend-4-gpu-b200,
+        unit-test-backend-4-gpu-gb200,
       ]
     if: always()
     runs-on: ubuntu-latest
