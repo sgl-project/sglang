@@ -167,8 +167,7 @@ jobs:
           export RUSTC_WRAPPER=sccache
           cd sgl-router
           pip install maturin
-          maturin build --release --out dist --features vendored-openssl --manylinux off
-          pip install --force-reinstall dist/*.whl
+          maturin develop --release --features vendored-openssl
 
 
       - name: Run Python unit tests
@@ -176,7 +175,7 @@ jobs:
           cd sgl-router
           source "$HOME/.cargo/env"
           pip install pytest pytest-cov pytest-xdist
-          maturin build --release --out dist --features vendored-openssl --manylinux off
+          pytest -q py_test/unit --cov=sglang_router --cov-report=term-missing --cov-fail-under=80
 
       - name: Run Python integration tests
         run: |
