@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-AMX Expert Parallelism Wrapper for MoE layers.
+KT Expert Parallelism Wrapper for MoE layers.
 
 This module provides a generic wrapper that enables CPU-GPU expert parallelism
 for any MoE quantization method. It coordinates parallel execution of GPU experts
-(using any quantization method) and CPU experts (using AMX instructions).
+(using any quantization method) and CPU experts (using AMX/AVX instructions).
 """
 
 from dataclasses import dataclass
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 try:
-    from kt_kernel import AMXMoEWrapper
+    from kt_kernel import KTMoEWrapper
 
     KTRANSFORMERS_AVAILABLE = True
 except ImportError:
@@ -40,10 +40,10 @@ class KTConfig:
         layer_idx: Layer index in the model
         num_gpu_experts: Number of experts to run on GPU
         cpuinfer_threads: Number of CPU inference threads
-        threadpool_count: Number of thread pools for AMX computation
-        amx_weight_path: Path to AMX quantized weights
+        threadpool_count: Number of thread pools for CPU computation
+        weight_path: Path to CPU quantized weights
         chunked_prefill_size: Chunk size for prefill computation
-        amx_method: AMX computation method (e.g., "int4")
+        method: CPU computation method (e.g., "int4")
         num_layers: Total number of layers in the model (optional)
     """
 
@@ -51,10 +51,10 @@ class KTConfig:
     num_gpu_experts: int
     cpuinfer_threads: int
     threadpool_count: int
-    amx_weight_path: str
+    weight_path: str
     chunked_prefill_size: int
     max_deferred_experts_per_token: int
-    amx_method: str
+    method: str
     num_layers: Optional[int] = None
 
 
@@ -70,7 +70,7 @@ def create_kt_config_from_server_args(
     Returns:
         KTConfig if KT is configured, None otherwise
     """
-    if server_args.kt_amx_weight_path is None:
+    if server_args.kt_weight_path is None:
         return None
 
     # Try to get num_layers from model config
@@ -87,9 +87,9 @@ def create_kt_config_from_server_args(
         num_gpu_experts=server_args.kt_num_gpu_experts,
         cpuinfer_threads=server_args.kt_cpuinfer,
         threadpool_count=server_args.kt_threadpool_count,
-        amx_weight_path=server_args.kt_amx_weight_path,
+        weight_path=server_args.kt_weight_path,
         chunked_prefill_size=server_args.chunked_prefill_size,
-        amx_method=server_args.kt_amx_method,
+        method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
     )
@@ -119,7 +119,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
     This wrapper coordinates parallel execution of:
     - GPU experts (0 to num_gpu_experts-1) using any quantization method
-    - CPU experts (num_gpu_experts to total_experts-1) using AMX instructions
+    - CPU experts (num_gpu_experts to total_experts-1) using AMX/AVX instructions
 
     The wrapper implements the submit-compute-sync pattern:
     1. Submit CPU expert computation (non-blocking)
@@ -127,7 +127,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
     3. Synchronize and merge CPU+GPU results
 
     Example:
-        # Wrap any GPU method with AMX CPU expert support
+        # Wrap any GPU method with AMX/AVX CPU expert support
         gpu_method = CompressedTensorsWNA16MoEMethod(quant_config, prefix)
         kt_config = KTConfig(layer_idx=0, num_gpu_experts=4, ...)
         method = KTEPWrapperMethod(gpu_method, kt_config)
@@ -138,11 +138,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         gpu_method: FusedMoEMethodBase,
         kt_config: KTConfig,
     ):
-        """Initialize the AMX EP wrapper.
+        """Initialize the KT EP wrapper.
 
         Args:
             gpu_method: The quantization method to use for GPU experts
-            kt_config: Configuration for AMX CPU expert computation
+            kt_config: Configuration for KT CPU expert computation
         """
         if not KTRANSFORMERS_AVAILABLE:
             raise ImportError(
@@ -156,10 +156,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        # AMX wrapper will be initialized in create_weights
-        self.amx_wrapper: Optional[AMXMoEWrapper] = None
+        # KT wrapper will be initialized in create_weights
+        self.wrapper: Optional[KTMoEWrapper] = None
 
-        # Store parameters needed for AMX initialization
+        # Store parameters needed for KT initialization
         self._layer_params = None
 
     def create_weights(
@@ -208,10 +208,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             **extra_weight_attrs,
         )
 
-        # 2. Initialize AMX wrapper for CPU experts
+        # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
-            self.amx_wrapper = AMXMoEWrapper(
+            self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
@@ -220,9 +220,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 num_gpu_experts=self.num_gpu_experts,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
-                amx_weight_path=self.kt_config.amx_weight_path,
+                weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
-                amx_method=self.kt_config.amx_method,
+                method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
             )
 
@@ -236,8 +236,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if hasattr(self.gpu_method, "process_weights_after_loading"):
             self.gpu_method.process_weights_after_loading(layer)
 
-        # 2. Load CPU weights using AMX wrapper
-        if self.tp_rank == 0 and self.amx_wrapper is not None:
+        # 2. Load CPU weights using KT wrapper
+        if self.tp_rank == 0 and self.wrapper is not None:
             torch.cuda.synchronize()
 
             # Get expert location metadata for CPU expert mapping
@@ -250,7 +250,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 .physical_to_logical_map_cpu[self.kt_config.layer_idx]
                 .contiguous()
             )
-            self.amx_wrapper.load_weights(physical_to_logical_map_cpu)
+            self.wrapper.load_weights(physical_to_logical_map_cpu)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -274,7 +274,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
     ) -> None:
         """Submit CPU expert computation asynchronously (non-blocking).
 
-        This method submits the CPU expert computation to AMX without waiting
+        This method submits the CPU expert computation to AMX/AVX without waiting
         for completion, allowing GPU computation to proceed in parallel.
 
         Args:
@@ -285,15 +285,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
-        if self.tp_rank != 0 or self.amx_wrapper is None:
+        if self.tp_rank != 0 or self.wrapper is None:
             return
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
 
-        # Submit forward task to AMX (non-blocking)
-        self.amx_wrapper.submit_forward(
+        # Submit forward task to CPU (non-blocking)
+        self.wrapper.submit_forward(
             x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
         )
 
@@ -308,11 +308,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Returns:
             CPU expert computation results
         """
-        if self.tp_rank != 0 or self.amx_wrapper is None:
+        if self.tp_rank != 0 or self.wrapper is None:
             return torch.zeros_like(x)
 
         # Wait for CPU computation and retrieve results
-        return self.amx_wrapper.sync_forward(
+        return self.wrapper.sync_forward(
             x, torch.cuda.current_stream(x.device).cuda_stream
         )
 
@@ -380,7 +380,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             Attribute value from gpu_method
         """
         # Avoid infinite recursion for internal attributes
-        if name in ("gpu_method", "amx_wrapper", "kt_config"):
+        if name in ("gpu_method", "wrapper", "kt_config"):
             raise AttributeError(
                 f"'{type(self).__name__}' object has no attribute '{name}'"
             )
