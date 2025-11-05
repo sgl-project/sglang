@@ -137,11 +137,11 @@ impl ResponseStreamEventEmitter {
                         // Add output field
                         let output_str = serde_json::to_string(&tool_result.output)
                             .unwrap_or_else(|_| "{}".to_string());
-                        item_data["output"] = serde_json::json!(output_str);
+                        item_data["output"] = json!(output_str);
 
                         // Update status based on success
                         if tool_result.is_error {
-                            item_data["status"] = serde_json::json!("failed");
+                            item_data["status"] = json!("failed");
                         }
                         break;
                     }
