@@ -1164,6 +1164,7 @@ class ServerArgs:
                 quantization_config is not None
                 and quantization_config.get("quant_method") == "mxfp4"
             )
+            self.disable_hybrid_swa_memory = True
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
