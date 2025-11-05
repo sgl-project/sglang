@@ -12,29 +12,38 @@
 # limitations under the License.
 # ==============================================================================
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
-from sglang.srt.layers.dp_attention import _DpGatheredBufferWrapper
+import sglang.srt.layers.dp_attention
 
 
 @torch.library.custom_op("sglang::_set_dp_buffer_len", mutates_args=())
 def _set_dp_buffer_len(
-    global_dp_buffer_len: Optional[int], num_tokens: Optional[int]
+    global_dp_buffer_len: Optional[int],
+    num_tokens: Optional[int],
+    is_max_len: bool,
+    global_num_tokens: Optional[List[int]] = None,
 ) -> None:
-    _DpGatheredBufferWrapper._global_dp_buffer_len = global_dp_buffer_len
-    _DpGatheredBufferWrapper._local_dp_buffer_len = num_tokens
+    sglang.srt.layers.dp_attention.set_dp_buffer_len(
+        global_dp_buffer_len, num_tokens, is_max_len, global_num_tokens
+    )
 
 
 @_set_dp_buffer_len.register_fake
-def _set_dp_buffer_len_register_fake(global_dp_buffer_len, num_tokens) -> None:
+def _set_dp_buffer_len_register_fake(
+    global_dp_buffer_len: Optional[int],
+    num_tokens: Optional[int],
+    is_max_len: bool,
+    global_num_tokens: Optional[List[int]] = None,
+) -> None:
     pass
 
 
 @torch.library.custom_op("sglang::_set_is_extend_in_batch", mutates_args=())
 def _set_is_extend_in_batch(is_extend_in_batch: bool) -> None:
-    _DpGatheredBufferWrapper.set_is_extend_in_batch(is_extend_in_batch)
+    sglang.srt.layers.dp_attention.set_is_extend_in_batch(is_extend_in_batch)
 
 
 @_set_is_extend_in_batch.register_fake

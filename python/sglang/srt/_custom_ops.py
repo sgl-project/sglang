@@ -4,15 +4,9 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import (
-    direct_register_custom_op,
-    is_hip,
-    is_hpu,
-    is_npu,
-)
+from sglang.srt.utils import direct_register_custom_op, is_hip, is_hpu, is_npu
 
 logger = logging.getLogger(__name__)
-
 
 
 import sglang.srt.utils
