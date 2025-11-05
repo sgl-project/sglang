@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -21,7 +22,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.device = model_runner.device
 
         self.num_head = (
-            model_runner.model_config.num_attention_heads // model_runner.tp_size
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
 
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]

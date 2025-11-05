@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -67,6 +68,52 @@ class TestIntelAMXAttnBackend(CustomTestCase):
                 self.assertGreater(metrics["score"], 0.45)
         finally:
             kill_process_tree(process.pid)
+
+
+class TestDPAttention(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--trust-remote-code",
+            "--disable-radix-cache",
+            "--attention-backend",
+            "intel_amx",
+            "--mem-fraction-static",
+            "0.1",
+            "--disable-overlap-schedule",
+            "--tp",
+            "2",
+            "--enable-dp-attention",
+            "--dp",
+            "2",
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_dp_attention_DP2TP2(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=32,
+            parallel=32,
+            max_new_tokens=512,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Eval accuracy of GSM8K: {metrics=}")
+
+        self.assertGreater(metrics["accuracy"], 0.7)
 
 
 if __name__ == "__main__":
