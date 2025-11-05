@@ -729,6 +729,8 @@ class RouterArgs:
                     f"Using --policy '{self.policy}' for prefill nodes "
                     f"and --decode-policy '{self.decode_policy}' for decode nodes."
                 )
+        if self.e_disaggregation or len(self.encode_urls):
+            raise ValueError("Currently, E disaggregation mode requires --min-lb")
 
     @staticmethod
     def _parse_selector(selector_list):
