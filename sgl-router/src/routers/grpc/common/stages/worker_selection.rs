@@ -109,7 +109,6 @@ impl WorkerSelectionStage {
             false, // get all workers, we'll filter by is_available() next
         );
 
-        // Filter by availability (health + circuit breaker)
         let available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
