@@ -7,14 +7,17 @@
 //! This allows the gRPC router to reuse the existing chat pipeline infrastructure
 //! without requiring Python backend changes.
 
-use crate::protocols::{
-    chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, UserMessageContent},
-    common::{FunctionCallResponse, StreamOptions, ToolCall, UsageInfo},
-    responses::{
-        ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-        ResponseReasoningContent::ReasoningText, ResponseStatus, ResponsesRequest,
-        ResponsesResponse, ResponsesUsage, StringOrContentParts,
+use crate::{
+    protocols::{
+        chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, UserMessageContent},
+        common::{FunctionCallResponse, StreamOptions, ToolCall, ToolChoice, UsageInfo},
+        responses::{
+            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+            ResponseReasoningContent::ReasoningText, ResponseStatus, ResponsesRequest,
+            ResponsesResponse, ResponsesUsage, StringOrContentParts,
+        },
     },
+    routers::grpc::common::responses::utils::extract_tools_from_response_tools,
 };
 
 /// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
@@ -23,7 +26,8 @@ use crate::protocols::{
 /// - `input` (text/items) → `messages` (chat messages)
 /// - `instructions` → system message (prepended)
 /// - `max_output_tokens` → `max_completion_tokens`
-/// - Tool-related fields are passed through
+/// - `tools` → function tools extracted from ResponseTools
+/// - `tool_choice` → passed through from request
 /// - Response-specific fields (previous_response_id, conversation) are handled by router
 pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, String> {
     let mut messages = Vec::new();
@@ -68,69 +72,13 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                             }
                         };
 
-                        match role.as_str() {
-                            "user" => {
-                                messages.push(ChatMessage::User {
-                                    content: UserMessageContent::Text(text),
-                                    name: None,
-                                });
-                            }
-                            "assistant" => {
-                                messages.push(ChatMessage::Assistant {
-                                    content: Some(text),
-                                    name: None,
-                                    tool_calls: None,
-                                    reasoning_content: None,
-                                });
-                            }
-                            "system" => {
-                                messages.push(ChatMessage::System {
-                                    content: text,
-                                    name: None,
-                                });
-                            }
-                            _ => {
-                                // Unknown role, treat as user message
-                                messages.push(ChatMessage::User {
-                                    content: UserMessageContent::Text(text),
-                                    name: None,
-                                });
-                            }
-                        }
+                        messages.push(role_to_chat_message(role.as_str(), text));
                     }
                     ResponseInputOutputItem::Message { role, content, .. } => {
                         // Extract text from content parts
                         let text = extract_text_from_content(content);
 
-                        match role.as_str() {
-                            "user" => {
-                                messages.push(ChatMessage::User {
-                                    content: UserMessageContent::Text(text),
-                                    name: None,
-                                });
-                            }
-                            "assistant" => {
-                                messages.push(ChatMessage::Assistant {
-                                    content: Some(text),
-                                    name: None,
-                                    tool_calls: None,
-                                    reasoning_content: None,
-                                });
-                            }
-                            "system" => {
-                                messages.push(ChatMessage::System {
-                                    content: text,
-                                    name: None,
-                                });
-                            }
-                            _ => {
-                                // Unknown role, treat as user message
-                                messages.push(ChatMessage::User {
-                                    content: UserMessageContent::Text(text),
-                                    name: None,
-                                });
-                            }
-                        }
+                        messages.push(role_to_chat_message(role.as_str(), text));
                     }
                     ResponseInputOutputItem::FunctionToolCall {
                         id,
@@ -203,7 +151,18 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
         return Err("Request must contain at least one message".to_string());
     }
 
-    // 3. Build ChatCompletionRequest
+    // 3. Extract function tools from ResponseTools
+    // Only function tools are extracted here (include_mcp: false).
+    // MCP tools are merged later by the tool loop (see tool_loop.rs:prepare_chat_tools_and_choice)
+    // before the chat pipeline, where tool_choice constraints are applied to ALL tools combined.
+    let function_tools = extract_tools_from_response_tools(req.tools.as_deref(), false);
+    let tools = if function_tools.is_empty() {
+        None
+    } else {
+        Some(function_tools)
+    };
+
+    // 4. Build ChatCompletionRequest
     let is_streaming = req.stream.unwrap_or(false);
 
     Ok(ChatCompletionRequest {
@@ -227,9 +186,8 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
         top_logprobs: req.top_logprobs,
         top_p: req.top_p,
         skip_special_tokens: true,
-        // Note: tools and tool_choice will be handled separately for MCP transformation
-        tools: None,       // Will be set by caller if needed
-        tool_choice: None, // Will be set by caller if needed
+        tools,
+        tool_choice: req.tool_choice.clone(),
         ..Default::default()
     })
 }
@@ -245,6 +203,33 @@ fn extract_text_from_content(content: &[ResponseContentPart]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// Convert role and text to ChatMessage
+fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
+    match role {
+        "user" => ChatMessage::User {
+            content: UserMessageContent::Text(text),
+            name: None,
+        },
+        "assistant" => ChatMessage::Assistant {
+            content: Some(text),
+            name: None,
+            tool_calls: None,
+            reasoning_content: None,
+        },
+        "system" => ChatMessage::System {
+            content: text,
+            name: None,
+        },
+        _ => {
+            // Unknown role, treat as user message
+            ChatMessage::User {
+                content: UserMessageContent::Text(text),
+                name: None,
+            }
+        }
+    }
 }
 
 /// Convert a ChatCompletionResponse to ResponsesResponse
@@ -354,7 +339,7 @@ pub fn chat_to_responses(
         store: original_req.store.unwrap_or(true),
         temperature: original_req.temperature,
         text: None,
-        tool_choice: "auto".to_string(), // TODO: Map from original request
+        tool_choice: ToolChoice::serialize_to_string(&original_req.tool_choice),
         tools: original_req.tools.clone().unwrap_or_default(),
         top_p: original_req.top_p,
         truncation: None,

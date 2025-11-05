@@ -25,8 +25,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  accuracy-test-1-gpu-amd:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Fail if the PR does not have the 'run-ci' label
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
+        run: |
+          echo "This pull request does not have the 'run-ci' label. Failing the workflow."
+          exit 1
+
+      - name: Fail if the PR is a draft
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+        run: |
+          echo "This pull request is a draft. Failing the workflow."
+          exit 1
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/**"
+              - "scripts/ci/**"
+              - "test/**"
+              - ".github/workflows/pr-test-amd.yml"
+            sgl_kernel:
+              - "sgl-kernel/**"
+
+  # =============================================== sgl-kernel ====================================================
+  sgl-kernel-unit-test-amd:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -45,21 +81,90 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        run: |
+          bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 14
+        run: |
+          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_align.py
+          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
+          docker exec -w /sglang-checkout/sgl-kernel/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
+          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
+          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
+          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
+
+  # =============================================== primary ====================================================
+
+  unit-test-frontend-amd:
+    needs: [check-changes]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi300-gpu-1]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 10
+        run: |
+          docker exec -w /sglang-checkout/test/lang ci_sglang python3 run_suite.py --suite per-commit
+
+  unit-test-backend-1-gpu-amd:
+    needs: [check-changes, unit-test-frontend-amd]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi300-gpu-1]
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
-      - name: Evaluate Accuracy
+      - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
-          bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
-          bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 12
 
-  accuracy-test-2-gpu-amd:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  unit-test-backend-2-gpu-amd:
+    needs: [check-changes]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
         runner: [linux-mi300-gpu-2]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -76,17 +181,20 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
-      - name: Evaluate accuracy (TP=2)
-        timeout-minutes: 60
+      - name: Run test
+        timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_moe_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-  mla-test-1-gpu-amd:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  unit-test-backend-8-gpu-amd:
+    needs: [check-changes, unit-test-backend-2-gpu-amd]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi300-gpu-8]
+        part: [0, 1, 2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -103,13 +211,15 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
-      - name: MLA TEST
-        timeout-minutes: 30
+      - name: Run test
+        timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 test_mla.py
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600
 
   performance-test-1-gpu-part-1-amd:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    needs: [check-changes]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -152,7 +262,9 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
 
   performance-test-1-gpu-part-2-amd:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    needs: [check-changes]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -188,8 +300,10 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
-  bench-test-2-gpu-amd:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  performance-test-2-gpu-amd:
+    needs: [check-changes, unit-test-backend-2-gpu-amd]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -235,13 +349,14 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
-  unit-test-backend-1-gpu-amd:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  accuracy-test-1-gpu-amd:
+    needs: [check-changes]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
         runner: [linux-mi300-gpu-1]
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -258,13 +373,17 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
-      - name: Run test
+      - name: Evaluate Accuracy
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 12
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
+          bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
 
-  unit-test-backend-2-gpu-amd:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  accuracy-test-2-gpu-amd:
+    needs: [check-changes, accuracy-test-1-gpu-amd]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -285,68 +404,53 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
-      - name: Run test
-        timeout-minutes: 40
+      - name: Evaluate accuracy (TP=2)
+        timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_moe_eval_accuracy_large.py
 
-  unit-test-backend-8-gpu-amd:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi300-gpu-8]
-        part: [0, 1]
-    runs-on: ${{matrix.runner}}
+  pr-test-amd-finish:
+    needs:
+      [
+        check-changes,
+
+        sgl-kernel-unit-test-amd,
+
+        unit-test-frontend-amd,
+        unit-test-backend-1-gpu-amd,
+        unit-test-backend-2-gpu-amd,
+        unit-test-backend-8-gpu-amd,
+        performance-test-1-gpu-part-1-amd,
+        performance-test-1-gpu-part-2-amd,
+        performance-test-2-gpu-amd,
+        accuracy-test-1-gpu-amd,
+        accuracy-test-2-gpu-amd,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 60
+      - name: Check all dependent job statuses
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
+          # Convert the 'needs' context to a JSON string
+          json_needs='${{ toJson(needs) }}'
 
-  unit-test-sgl-kernel-amd:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi300-gpu-1]
-    runs-on: ${{matrix.runner}}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+          # Get a list of all job names from the JSON keys
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+          for job in $job_names; do
+            # For each job, extract its result
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
 
-      - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
+            # Print the job name and its result
+            echo "$job: $result"
 
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd_ci_install_dependency.sh
+            # Check for failure or cancellation and exit if found
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
 
-      - name: Run test
-        timeout-minutes: 14
-        run: |
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_align.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
+          # If the loop completes, all jobs were successful
+          echo "All jobs completed successfully"
+          exit 0

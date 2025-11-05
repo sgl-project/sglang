@@ -58,7 +58,7 @@ use crate::{
     },
     protocols::{
         chat::{self, ChatCompletionStreamResponse},
-        common,
+        common::{self, ToolChoice},
         responses::{
             self, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
             ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
@@ -657,7 +657,7 @@ impl StreamingResponseAccumulator {
             store: self.original_request.store.unwrap_or(true),
             temperature: self.original_request.temperature,
             text: None,
-            tool_choice: "auto".to_string(),
+            tool_choice: ToolChoice::serialize_to_string(&self.original_request.tool_choice),
             tools: self.original_request.tools.clone().unwrap_or_default(),
             top_p: self.original_request.top_p,
             truncation: None,

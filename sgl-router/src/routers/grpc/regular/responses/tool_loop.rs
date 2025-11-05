@@ -13,7 +13,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
@@ -24,7 +24,8 @@ use crate::{
     mcp::{self, McpManager},
     protocols::{
         chat::{
-            ChatChoice, ChatCompletionMessage, ChatCompletionResponse, ChatCompletionStreamResponse,
+            ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
+            ChatCompletionStreamResponse,
         },
         common::{Function, FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
         responses::{
@@ -64,6 +65,30 @@ fn extract_function_call_from_chat(
     }
 
     None
+}
+
+/// Merge function tools from request with MCP tools and set tool_choice based on iteration
+fn prepare_chat_tools_and_choice(
+    chat_request: &mut ChatCompletionRequest,
+    mcp_chat_tools: &[Tool],
+    iteration: usize,
+) {
+    // Merge function tools from request with MCP tools
+    let mut all_tools = chat_request.tools.clone().unwrap_or_default();
+    all_tools.extend(mcp_chat_tools.iter().cloned());
+    chat_request.tools = Some(all_tools);
+
+    // Set tool_choice based on iteration
+    // - Iteration 0: Use user's tool_choice or default to auto
+    // - Iteration 1+: Always use auto to avoid infinite loops
+    chat_request.tool_choice = if iteration == 0 {
+        chat_request
+            .tool_choice
+            .clone()
+            .or(Some(ToolChoice::Value(ToolChoiceValue::Auto)))
+    } else {
+        Some(ToolChoice::Value(ToolChoiceValue::Auto))
+    };
 }
 
 /// Extract all tool calls from chat response (for parallel tool call support)
@@ -166,16 +191,13 @@ fn build_mcp_list_tools_item(mcp: &Arc<McpManager>, server_label: &str) -> Respo
     let tools = mcp.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
-        .map(|t| {
-            use serde_json::Value;
-            McpToolInfo {
-                name: t.name.to_string(),
-                description: t.description.as_ref().map(|d| d.to_string()),
-                input_schema: Value::Object((*t.input_schema).clone()),
-                annotations: Some(json!({
-                    "read_only": false
-                })),
-            }
+        .map(|t| McpToolInfo {
+            name: t.name.to_string(),
+            description: t.description.as_ref().map(|d| d.to_string()),
+            input_schema: Value::Object((*t.input_schema).clone()),
+            annotations: Some(json!({
+                "read_only": false
+            })),
         })
         .collect();
 
@@ -247,17 +269,19 @@ pub(super) async fn execute_tool_loop(
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_tools = ctx.mcp_manager.list_tools();
-    let chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
-    debug!("Converted {} MCP tools to chat format", chat_tools.len());
+    let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
+    debug!(
+        "Converted {} MCP tools to chat format",
+        mcp_chat_tools.len()
+    );
 
     loop {
         // Convert to chat request
         let mut chat_request = conversions::responses_to_chat(&current_request)
             .map_err(|e| error::bad_request(format!("Failed to convert request: {}", e)))?;
 
-        // Add MCP tools to chat request so LLM knows about them
-        chat_request.tools = Some(chat_tools.clone());
-        chat_request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+        // Prepare tools and tool_choice for this iteration
+        prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
 
         // Execute chat pipeline (errors already have proper HTTP status codes)
         let chat_response = ctx
@@ -555,10 +579,10 @@ async fn execute_tool_loop_streaming_internal(
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_tools = ctx.mcp_manager.list_tools();
-    let chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
+    let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
     debug!(
         "Streaming: Converted {} MCP tools to chat format",
-        chat_tools.len()
+        mcp_chat_tools.len()
     );
 
     // Flag to track if mcp_list_tools has been emitted
@@ -584,7 +608,6 @@ async fn execute_tool_loop_streaming_internal(
             let tool_items: Vec<_> = mcp_tools
                 .iter()
                 .map(|t| {
-                    use serde_json::Value;
                     json!({
                         "name": t.name,
                         "description": t.description,
@@ -635,9 +658,8 @@ async fn execute_tool_loop_streaming_internal(
         let mut chat_request = conversions::responses_to_chat(&current_request)
             .map_err(|e| format!("Failed to convert request: {}", e))?;
 
-        // Add MCP tools to chat request so LLM knows about them
-        chat_request.tools = Some(chat_tools.clone());
-        chat_request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+        // Prepare tools and tool_choice for this iteration (same logic as non-streaming)
+        prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
 
         // Execute chat streaming
         let response = ctx
@@ -913,7 +935,6 @@ async fn execute_tool_loop_streaming_internal(
 
 /// Convert MCP tools to Chat API tool format
 fn convert_mcp_tools_to_chat_tools(mcp_tools: &[mcp::Tool]) -> Vec<Tool> {
-    use serde_json::Value;
     mcp_tools
         .iter()
         .map(|tool_info| Tool {
