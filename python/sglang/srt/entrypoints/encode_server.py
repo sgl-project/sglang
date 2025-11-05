@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from typing import Optional
 
 import torch
@@ -29,27 +30,37 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket
 
+logger = logging.getLogger(__name__)
+
 
 class EmbeddingData:
-    def __init__(self, req_id, num_parts, part_idx, embedding_len):
+    def __init__(self, req_id, num_parts, part_idx, embedding=None):
         self.req_id = req_id
         self.num_parts = num_parts
         self.part_idx = part_idx
-        self.embedding_len = embedding_len
+        self.embedding = embedding
 
         # aggregated data
         self.ready_list = [i == self.part_idx for i in range(self.num_parts)]
-        self.embedding_len_tot = self.embedding_len
+        self.embedding_list = [
+            embedding if i == self.part_idx else None for i in range(self.num_parts)
+        ]
 
     def add(self, embedding_data):
         assert self.req_id == embedding_data.req_id
         assert not self.ready_list[embedding_data.part_idx]
         self.ready_list[embedding_data.part_idx] = True
-        self.embedding_len_tot += embedding_data.embedding_len
+        self.embedding_list[embedding_data.part_idx] = embedding_data.embedding
+
+    def get(self):
+        return torch.concatenate(self.embedding_list)
 
     @property
     def ready(self):
         return sum(self.ready_list) == self.num_parts
+
+    def __repr__(self):
+        return f"EmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx})"
 
 
 class ImageEncoder:
@@ -94,20 +105,23 @@ class ImageEncoder:
             device_config=DeviceConfig(device="cuda", gpu_id=self.gpu_id),
         )
 
-        self.local_ip = get_local_ip_auto()
+        logger.info(f"Using transfer backend: {self.server_args.mm_transfer_backend}")
 
-        self.engine = MooncakeTransferEngine(
-            hostname=self.local_ip,
-            gpu_id=self.gpu_id,
-            ib_device=server_args.disaggregation_ib_device,
-        )
+        if self.server_args.mm_transfer_backend == "mooncake":
+            self.local_ip = get_local_ip_auto()
+
+            self.engine = MooncakeTransferEngine(
+                hostname=self.local_ip,
+                gpu_id=self.gpu_id,
+                ib_device=server_args.disaggregation_ib_device,
+            )
 
         self.context = zmq.asyncio.Context(2)
         self.send_to_prefill_sockets = dict()
 
         self.embedding_to_send = dict()
 
-    async def encode(self, mm_items) -> torch.Tensor:
+    async def mm_encode(self, mm_items) -> torch.Tensor:
         images = load_images(mm_items)
 
         # Qwen-specific: resize images
@@ -123,68 +137,63 @@ class ImageEncoder:
         )
         mm_item.set("image_grid_thw", images_input["image_grid_thw"])
         mm_embedding = self.model.get_image_feature([mm_item])
-        if len(mm_embedding.shape) == 3:
+        if len(mm_embedding.shape) != 2:
             mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
         return mm_embedding
 
-    def send(
+    def mm_send(
         self,
-        session_id,
-        peer_buffer_address,
+        prefill_host,
         embedding: torch.Tensor,
-        meta_data: EmbeddingData,
-        prefill_ip,
+        mm_data: EmbeddingData,
+        session_id=None,
+        peer_buffer_address=None,
     ):
-        self.engine.register(embedding.data_ptr(), embedding.nbytes)
-        self.engine.transfer_sync(
-            session_id, embedding.data_ptr(), peer_buffer_address, embedding.nbytes
-        )
-        self.engine.deregister(embedding.data_ptr())
+        if self.server_args.mm_transfer_backend == "mooncake":
+            self.engine.register(embedding.data_ptr(), embedding.nbytes)
+            self.engine.transfer_sync(
+                session_id, embedding.data_ptr(), peer_buffer_address, embedding.nbytes
+            )
+            self.engine.deregister(embedding.data_ptr())
 
-        # Send ack
-        if prefill_ip in self.send_to_prefill_sockets:
-            socket = self.send_to_prefill_sockets[prefill_ip]
+            mm_data.embedding = None
+            mm_data.embedding_list[mm_data.part_idx] = None
+
+        # Send ack/data
+        if prefill_host in self.send_to_prefill_sockets:
+            socket = self.send_to_prefill_sockets[prefill_host]
         else:
             socket = get_zmq_socket(
                 self.context,
                 zmq.PUSH,
-                f"tcp://{prefill_ip}:{self.server_args.embedding_port}",
+                f"tcp://{prefill_host}:{self.server_args.embedding_port}",
                 False,
             )
-            self.send_to_prefill_sockets[prefill_ip] = socket
-        socket.send_pyobj(meta_data)
+            self.send_to_prefill_sockets[prefill_host] = socket
+        socket.send_pyobj(mm_data)
 
     @torch.inference_mode()
-    async def step(self, request_data: dict):
-        if "mm_items" in request_data:
-            mm_embedding = await self.encode(request_data["mm_items"])
-            meta_data = EmbeddingData(
-                request_data["req_id"],
-                request_data["num_parts"],
-                request_data["part_idx"],
-                mm_embedding.shape[0],
-            )
-            self.embedding_to_send[meta_data.req_id] = (mm_embedding, meta_data)
-            del request_data["mm_items"]
-            request_data.update(
-                {
-                    "embedding_size": mm_embedding.nbytes,
-                    "embedding_len": mm_embedding.shape[0],
-                    "embedding_dim": mm_embedding.shape[1],
-                }
-            )
-            return request_data
-        else:
-            mm_embedding, meta_data = self.embedding_to_send[request_data["req_id"]]
-            self.send(
-                request_data["session_id"],
-                request_data["buffer_address"],
-                mm_embedding,
-                meta_data,
-                request_data["bootstrap_host"],
-            )
-            del self.embedding_to_send[request_data["req_id"]]
-            return None
+    async def encode(self, mm_items, req_id, num_parts, part_idx):
+        mm_embedding = await self.mm_encode(mm_items)
+        mm_data = EmbeddingData(
+            req_id,
+            num_parts,
+            part_idx,
+            mm_embedding,
+        )
+        self.embedding_to_send[mm_data.req_id] = mm_data
+        return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
+
+    async def send(self, req_id, prefill_host, session_id=None, buffer_address=None):
+        mm_data: EmbeddingData = self.embedding_to_send[req_id]
+        self.mm_send(
+            prefill_host,
+            mm_data.embedding,
+            mm_data,
+            session_id,
+            buffer_address,
+        )
+        del self.embedding_to_send[req_id]
 
 
 app = FastAPI()
@@ -198,6 +207,37 @@ def launch_server(server_args: ServerArgs):
 
 
 @app.post("/encode")
-async def handle_encode_request(request_data: dict):
-    ret_data = await encoder.step(request_data)
-    return ORJSONResponse(content=ret_data)
+async def handle_encode_request(request: dict):
+    nbytes, embedding_len, embedding_dim = await encoder.encode(
+        mm_items=request["mm_items"],
+        req_id=request["req_id"],
+        num_parts=request["num_parts"],
+        part_idx=request["part_idx"],
+    )
+    if encoder.server_args.mm_transfer_backend == "mooncake":
+        del request["mm_items"]
+        request.update(
+            {
+                "embedding_size": nbytes,
+                "embedding_len": embedding_len,
+                "embedding_dim": embedding_dim,
+            }
+        )
+        return ORJSONResponse(content=request)
+    elif encoder.server_args.mm_transfer_backend == "zmq":
+        await encoder.send(
+            req_id=request["req_id"],
+            prefill_host=request["bootstrap_host"],
+        )
+        return ORJSONResponse(content=None)
+
+
+@app.post("/send")
+async def handle_send_request(request: dict):
+    await encoder.send(
+        req_id=request["req_id"],
+        prefill_host=request["bootstrap_host"],
+        session_id=request["session_id"],
+        buffer_address=request["buffer_address"],
+    )
+    return ORJSONResponse(content=None)
