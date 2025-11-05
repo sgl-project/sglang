@@ -183,6 +183,18 @@ impl Default for ToolChoice {
     }
 }
 
+impl ToolChoice {
+    /// Serialize tool_choice to string for ResponsesResponse
+    ///
+    /// Returns the JSON-serialized tool_choice or "auto" as default
+    pub fn serialize_to_string(tool_choice: &Option<ToolChoice>) -> String {
+        tool_choice
+            .as_ref()
+            .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
+            .unwrap_or_else(|| "auto".to_string())
+    }
+}
+
 /// Function choice specification for ToolChoice::Function
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionChoice {
@@ -190,11 +202,73 @@ pub struct FunctionChoice {
 }
 
 /// Tool reference for ToolChoice::AllowedTools
+///
+/// Represents a reference to a specific tool in the allowed_tools array.
+/// Different tool types have different required fields.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ToolReference {
-    #[serde(rename = "type")]
-    pub tool_type: String, // "function"
-    pub name: String,
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ToolReference {
+    /// Reference to a function tool
+    #[serde(rename = "function")]
+    Function { name: String },
+
+    /// Reference to an MCP tool
+    #[serde(rename = "mcp")]
+    Mcp {
+        server_label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+
+    /// File search hosted tool
+    #[serde(rename = "file_search")]
+    FileSearch,
+
+    /// Web search preview hosted tool
+    #[serde(rename = "web_search_preview")]
+    WebSearchPreview,
+
+    /// Computer use preview hosted tool
+    #[serde(rename = "computer_use_preview")]
+    ComputerUsePreview,
+
+    /// Code interpreter hosted tool
+    #[serde(rename = "code_interpreter")]
+    CodeInterpreter,
+
+    /// Image generation hosted tool
+    #[serde(rename = "image_generation")]
+    ImageGeneration,
+}
+
+impl ToolReference {
+    /// Get a unique identifier for this tool reference
+    pub fn identifier(&self) -> String {
+        match self {
+            ToolReference::Function { name } => format!("function:{}", name),
+            ToolReference::Mcp { server_label, name } => {
+                if let Some(n) = name {
+                    format!("mcp:{}:{}", server_label, n)
+                } else {
+                    format!("mcp:{}", server_label)
+                }
+            }
+            ToolReference::FileSearch => "file_search".to_string(),
+            ToolReference::WebSearchPreview => "web_search_preview".to_string(),
+            ToolReference::ComputerUsePreview => "computer_use_preview".to_string(),
+            ToolReference::CodeInterpreter => "code_interpreter".to_string(),
+            ToolReference::ImageGeneration => "image_generation".to_string(),
+        }
+    }
+
+    /// Get the tool name if this is a function tool
+    pub fn function_name(&self) -> Option<&str> {
+        match self {
+            ToolReference::Function { name } => Some(name.as_str()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
