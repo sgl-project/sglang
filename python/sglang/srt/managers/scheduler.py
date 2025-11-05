@@ -504,14 +504,14 @@ class Scheduler(
             else None
         )
 
+        # Init disaggregation
+        self.init_disaggregation()
+
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
         if self.enable_kv_cache_events:
             self.init_kv_events(server_args.kv_events_config)
-
-        # Init disaggregation
-        self.init_disaggregation()
 
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
