@@ -1307,14 +1307,6 @@ fn inject_mcp_metadata(
 ///
 /// Searches for the first MCP tool in the tools array and returns its server_label.
 /// Falls back to "sglang-mcp" if no MCP tool with server_label is found.
-///
-/// # Arguments
-///
-/// * `tools` - Optional slice of ResponseTool from the request
-///
-/// # Returns
-///
-/// Server label string (from MCP tool or default "sglang-mcp")
 fn extract_mcp_server_label(tools: Option<&[ResponseTool]>) -> String {
     tools
         .and_then(|tools| {
