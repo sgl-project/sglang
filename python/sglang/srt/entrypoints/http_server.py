@@ -1433,8 +1433,30 @@ def _execute_server_warmup(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
 ):
+    def sanitize_host_url(url):
+        # Sanitize host for warmup client calls: if server is bound to 0.0.0.0,
+        # use loopback (127.0.0.1) for internal HTTP requests. Using 0.0.0.0 as
+        # a client target can fail (and may be proxied) leading to warmup 502s.
+        url = server_args.url()
+        try:
+            if server_args.host in ("0.0.0.0"):
+                parsed = url.split(":")
+                # url is of form http://host:port
+                # the url to sanitize is http://0.0.0.0:port
+                # replace hostand keep the scheme and port
+                scheme, rest = parsed[0], parsed[-1]
+                if len(parsed) == 3:
+                    url = scheme + "://127.0.0.1:" + rest
+                else:
+                    # fallback: just replace host naive
+                    logging.warning("Host is not formatted as http://host:port, check server args")
+        except Exception:
+            # If anything unexpected happens, do not sanitize
+            pass
+        return url
+    
     headers = {}
-    url = server_args.url()
+    url = sanitize_host_url(server_args.url())
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
