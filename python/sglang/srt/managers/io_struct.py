@@ -1024,6 +1024,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
+    # Whether to recapture cuda graph after weight udpdate
+    recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
 
@@ -1230,7 +1232,7 @@ class AbortReq(BaseReq):
     abort_all: bool = False
     # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
-    abort_reason: Optional[str] = None
+    abort_message: Optional[str] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
@@ -1344,6 +1346,7 @@ class ExpertDistributionReqType(Enum):
     DUMP_RECORD = 3
 
 
+@dataclass
 class ExpertDistributionReq(BaseReq):
     action: ExpertDistributionReqType
 
@@ -1471,6 +1474,16 @@ class GetLoadReqOutput(BaseReq):
 @dataclass
 class WatchLoadUpdateReq(BaseReq):
     loads: List[GetLoadReqOutput]
+
+
+@dataclass
+class SetInjectDumpMetadataReqInput(BaseReq):
+    dump_metadata: Dict[str, Any]
+
+
+@dataclass
+class SetInjectDumpMetadataReqOutput(BaseReq):
+    success: bool
 
 
 @dataclass
