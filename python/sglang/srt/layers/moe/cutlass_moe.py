@@ -100,7 +100,7 @@ def cutlass_fused_experts_fp8(
         use_fp8_blockscale (bool, optional): Flag indicating usage of FP8 with
             block scaling. Currently, only `True` is supported. Defaults to `True`.
         output (torch.Tensor, optional): Output tensor. If not provided, a new tensor will be created.
-        enable_es (tuple(bool, bool)): Flag indicating usage of expert speicalization kernel for (up-projection, down-projection)
+        enable_es (tuple(bool, bool)): Flag indicating usage of expert specialization kernel for (up-projection, down-projection)
     Returns:
         torch.Tensor: The computed MoE layer output. Shape: `(m, k)`, dtype matches `a`.
 
