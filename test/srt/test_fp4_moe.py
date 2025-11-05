@@ -450,7 +450,6 @@ def test_flashinfer_fp4_moe_no_graph(
     check_moe(m, n, k, e, topk, dtype, flashinfer_moe_impl, flip_w13=True)
 
 
-
 if __name__ == "__main__":
     test_cutlass_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
     test_flashinfer_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
