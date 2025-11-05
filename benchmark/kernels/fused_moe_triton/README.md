@@ -60,13 +60,6 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --ep-size 4 \
     --dtype fp8_w8a8 \
     --tune
-
-# Tune Grok-1 with TP=8 and EP=2
-python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
-    --model xai-org/grok-1 \
-    --tp-size 8 \
-    --ep-size 2 \
-    --tune
 ```
 
 #### MLLM Model Tuning (Multi-modal)
