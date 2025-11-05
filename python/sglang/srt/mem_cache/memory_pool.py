@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams
+from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, Mamba2CacheParams
 from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -33,7 +33,7 @@ KVCache actually holds the physical kv cache.
 
 import abc
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -43,7 +43,18 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
+from sglang.srt.mem_cache.utils import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton,
+    set_mla_kv_scale_buffer_triton,
+)
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_float4_e2m1fn_x2,
+    is_npu,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -59,7 +70,9 @@ if _is_npu:
     import torch_npu
 
 
-def get_tensor_size_bytes(t: torch.Tensor):
+def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
+    if isinstance(t, list):
+        return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
 
 
@@ -116,10 +129,15 @@ class ReqToTokenPool:
 class MambaPool:
     @dataclass(frozen=True, kw_only=True)
     class State:
-        conv: torch.Tensor
+        conv: Union[torch.Tensor, List[torch.Tensor]]
         temporal: torch.Tensor
 
         def at_layer_idx(self, layer: int):
+            if isinstance(self.conv, list):
+                return type(self)(
+                    conv=[v[layer] for v in self.conv],
+                    temporal=self.temporal[layer],
+                )
             return type(self)(**{k: v[layer] for k, v in vars(self).items()})
 
         def mem_usage_bytes(self):
@@ -127,14 +145,14 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
+        intermediate_ssm: Union[torch.Tensor, List[torch.Tensor]]
         intermediate_conv_window: torch.Tensor
 
     def __init__(
         self,
         *,
         size: int,
-        cache_params: "Mamba2CacheParams",
+        cache_params: Union["Mamba2CacheParams", "KimiLinearCacheParams"],
         device: str,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
@@ -157,18 +175,29 @@ class MambaPool:
         else:
             self.custom_mem_pool = None
 
+        self.is_kda_cache = isinstance(cache_params, KimiLinearCacheParams)
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.enable_custom_mem_pool
             else nullcontext()
         ):
-            # assume conv_state = (dim, state_len)
-            assert conv_state_shape[0] > conv_state_shape[1]
-            conv_state = torch.zeros(
-                size=(num_mamba_layers, size + 1) + conv_state_shape,
-                dtype=conv_dtype,
-                device=device,
-            )
+            if self.is_kda_cache:
+                conv_state = [
+                    torch.zeros(
+                        size=(num_mamba_layers, size + 1) + conv_shape,
+                        dtype=conv_dtype,
+                        device=device,
+                    )
+                    for conv_shape in conv_state_shape
+                ]
+            else:
+                # assume conv_state = (dim, state_len)
+                assert conv_state_shape[0] > conv_state_shape[1]
+                conv_state = torch.zeros(
+                    size=(num_mamba_layers, size + 1) + conv_state_shape,
+                    dtype=conv_dtype,
+                    device=device,
+                )
             temporal_state = torch.zeros(
                 size=(num_mamba_layers, size + 1) + temporal_state_shape,
                 dtype=ssm_dtype,
@@ -191,17 +220,34 @@ class MambaPool:
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
-                intermediate_conv_window_cache = torch.zeros(
-                    size=(
-                        num_mamba_layers,
-                        size + 1,
-                        speculative_num_draft_tokens,
-                        conv_state_shape[0],
-                        conv_state_shape[1],
-                    ),
-                    dtype=conv_dtype,
-                    device="cuda",
-                )
+
+                if self.is_kda_cache:
+                    intermediate_conv_window_cache = [
+                        torch.zeros(
+                            size=(
+                                num_mamba_layers,
+                                size + 1,
+                                speculative_num_draft_tokens,
+                                conv_shape[0],
+                                conv_shape[1],
+                            ),
+                            dtype=conv_dtype,
+                            device="cuda",
+                        )
+                        for conv_shape in conv_state_shape
+                    ]
+                else:
+                    intermediate_conv_window_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            size + 1,
+                            speculative_num_draft_tokens,
+                            conv_state_shape[0],
+                            conv_state_shape[1],
+                        ),
+                        dtype=conv_dtype,
+                        device="cuda",
+                    )
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -255,15 +301,25 @@ class MambaPool:
         if free_index.numel() == 0:
             return
         self.free_slots = torch.cat((self.free_slots, free_index))
-        self.mamba_cache.conv[:, free_index] = self.mamba_cache.temporal[
-            :, free_index
-        ] = 0
+        if self.is_kda_cache:
+            for i in range(len(self.mamba_cache.conv)):
+                self.mamba_cache.conv[i][:, free_index] = 0
+        else:
+            self.mamba_cache.conv[:, free_index] = 0
+        self.mamba_cache.temporal[:, free_index] = 0
 
     def clear(self):
         self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
 
     def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
-        self.mamba_cache.conv[:, dst_index] = self.mamba_cache.conv[:, src_index]
+        if self.is_kda_cache:
+            for i in range(len(self.mamba_cache.conv)):
+                self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
+                    :, src_index
+                ]
+        else:
+            self.mamba_cache.conv[:, dst_index] = self.mamba_cache.conv[:, src_index]
+
         self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
             :, src_index
         ]
@@ -304,7 +360,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        cache_params: "Mamba2CacheParams",
+        cache_params: Union["Mamba2CacheParams", "KimiLinearCacheParams"],
         speculative_num_draft_tokens: int = None,
     ):
         super().__init__(
@@ -323,7 +379,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def _init_mamba_pool(
         self,
         size: int,
-        cache_params: "Mamba2CacheParams",
+        cache_params: Union["Mamba2CacheParams", "KimiLinearCacheParams"],
         device: str,
         speculative_num_draft_tokens: int = None,
     ):
@@ -509,6 +565,7 @@ class MHATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
     ):
         super().__init__(
@@ -527,7 +584,9 @@ class MHATokenToKVPool(KVCache):
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
-        self.alt_stream = self.device_module.Stream() if _is_cuda else None
+        self.alt_stream = (
+            self.device_module.Stream() if _is_cuda and enable_alt_stream else None
+        )
 
         if enable_kv_cache_copy:
             self._init_kv_copy_and_warmup()
@@ -809,6 +868,10 @@ class HybridLinearKVPool(KVCache):
         enable_kvcache_transpose: bool,
         device: str,
         mamba_pool: MambaPool,
+        # TODO: refactor mla related args
+        use_mla: bool = False,
+        kv_lora_rank: int = None,
+        qk_rope_head_dim: int = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -822,25 +885,42 @@ class HybridLinearKVPool(KVCache):
         self.mamba_pool = mamba_pool
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
-        if _is_npu:
-            TokenToKVPoolClass = AscendTokenToKVPool
+        self.use_mla = use_mla
+        if not use_mla:
+            if _is_npu:
+                TokenToKVPoolClass = AscendTokenToKVPool
+            else:
+                TokenToKVPoolClass = MHATokenToKVPool
+            self.full_kv_pool = TokenToKVPoolClass(
+                size=size,
+                page_size=self.page_size,
+                dtype=dtype,
+                head_num=head_num,
+                head_dim=head_dim,
+                layer_num=self.full_layer_nums,
+                device=device,
+                enable_memory_saver=False,
+            )
         else:
-            TokenToKVPoolClass = MHATokenToKVPool
-        self.full_kv_pool = TokenToKVPoolClass(
-            size=size,
-            page_size=self.page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            layer_num=self.full_layer_nums,
-            device=device,
-            enable_memory_saver=False,
-        )
+            TokenToKVPoolClass = MLATokenToKVPool
+            self.full_kv_pool = TokenToKVPoolClass(
+                size=size,
+                page_size=self.page_size,
+                dtype=dtype,
+                layer_num=self.full_layer_nums,
+                device=device,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                enable_memory_saver=False,
+            )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
-        k_size, v_size = self.get_kv_size_bytes()
-        self.mem_usage = (k_size + v_size) / GB
+        if use_mla:
+            self.mem_usage = self.get_kv_size_bytes() / GB
+        else:
+            k_size, v_size = self.get_kv_size_bytes()
+            self.mem_usage = (k_size + v_size) / GB
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
@@ -876,6 +956,21 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
 
+    @contextmanager
+    def _transfer_id_context(self, layer: RadixAttention):
+
+        @contextmanager
+        def _patch_layer_id(layer):
+            original_layer_id = layer.layer_id
+            layer.layer_id = self._transfer_full_attention_id(layer.layer_id)
+            try:
+                yield
+            finally:
+                layer.layer_id = original_layer_id
+
+        with _patch_layer_id(layer):
+            yield
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -886,18 +981,48 @@ class HybridLinearKVPool(KVCache):
         v_scale: float = 1.0,
     ):
         layer_id = self._transfer_full_attention_id(layer.layer_id)
-        self.full_kv_pool.set_kv_buffer(
-            None,
-            loc,
-            cache_k,
-            cache_v,
-            k_scale,
-            v_scale,
-            layer_id_override=layer_id,
-        )
+        if not self.use_mla:
+            self.full_kv_pool.set_kv_buffer(
+                None,
+                loc,
+                cache_k,
+                cache_v,
+                k_scale,
+                v_scale,
+                layer_id_override=layer_id,
+            )
+        else:
+            with self._transfer_id_context(layer):
+                self.full_kv_pool.set_kv_buffer(
+                    layer,
+                    loc,
+                    cache_k,
+                    cache_v,
+                )
 
     def get_v_head_dim(self):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
+        with self._transfer_id_context(layer):
+            self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
+        with self._transfer_id_context(layer):
+            return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
 
 
 class SWAKVPool(KVCache):
@@ -1147,131 +1272,6 @@ class AscendTokenToKVPool(MHATokenToKVPool):
         )
 
 
-@triton.jit
-def set_mla_kv_buffer_kernel(
-    kv_buffer_ptr,
-    cache_k_nope_ptr,
-    cache_k_rope_ptr,
-    loc_ptr,
-    buffer_stride: tl.constexpr,
-    nope_stride: tl.constexpr,
-    rope_stride: tl.constexpr,
-    nope_dim: tl.constexpr,
-    rope_dim: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    pid_loc = tl.program_id(0)
-    pid_blk = tl.program_id(1)
-
-    base = pid_blk * BLOCK
-    offs = base + tl.arange(0, BLOCK)
-    total_dim = nope_dim + rope_dim
-    mask = offs < total_dim
-
-    loc = tl.load(loc_ptr + pid_loc)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
-
-    if base + BLOCK <= nope_dim:
-        src = tl.load(
-            cache_k_nope_ptr + pid_loc * nope_stride + offs,
-            mask=mask,
-        )
-    else:
-        offs_rope = offs - nope_dim
-        src = tl.load(
-            cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
-            mask=mask,
-        )
-
-    tl.store(dst_ptr, src, mask=mask)
-
-
-def set_mla_kv_buffer_triton(
-    kv_buffer: torch.Tensor,
-    loc: torch.Tensor,
-    cache_k_nope: torch.Tensor,
-    cache_k_rope: torch.Tensor,
-):
-    nope_dim = cache_k_nope.shape[-1]
-    rope_dim = cache_k_rope.shape[-1]
-    total_dim = nope_dim + rope_dim
-    BLOCK = 128
-    n_loc = loc.numel()
-    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
-
-    set_mla_kv_buffer_kernel[grid](
-        kv_buffer,
-        cache_k_nope,
-        cache_k_rope,
-        loc,
-        kv_buffer.stride(0),
-        cache_k_nope.stride(0),
-        cache_k_rope.stride(0),
-        nope_dim,
-        rope_dim,
-        BLOCK=BLOCK,
-    )
-
-
-@triton.jit
-def get_mla_kv_buffer_kernel(
-    kv_buffer_ptr,
-    cache_k_nope_ptr,
-    cache_k_rope_ptr,
-    loc_ptr,
-    buffer_stride: tl.constexpr,
-    nope_stride: tl.constexpr,
-    rope_stride: tl.constexpr,
-    nope_dim: tl.constexpr,
-    rope_dim: tl.constexpr,
-):
-    pid_loc = tl.program_id(0)
-    loc = tl.load(loc_ptr + pid_loc)
-    loc_src_ptr = kv_buffer_ptr + loc * buffer_stride
-
-    nope_offs = tl.arange(0, nope_dim)
-    nope_src_ptr = loc_src_ptr + nope_offs
-    nope_src = tl.load(nope_src_ptr)
-
-    tl.store(
-        cache_k_nope_ptr + pid_loc * nope_stride + nope_offs,
-        nope_src,
-    )
-
-    rope_offs = tl.arange(0, rope_dim)
-    rope_src_ptr = loc_src_ptr + nope_dim + rope_offs
-    rope_src = tl.load(rope_src_ptr)
-    tl.store(
-        cache_k_rope_ptr + pid_loc * rope_stride + rope_offs,
-        rope_src,
-    )
-
-
-def get_mla_kv_buffer_triton(
-    kv_buffer: torch.Tensor,
-    loc: torch.Tensor,
-    cache_k_nope: torch.Tensor,
-    cache_k_rope: torch.Tensor,
-):
-    # The source data type will be implicitly converted to the target data type.
-    nope_dim = cache_k_nope.shape[-1]  # 512
-    rope_dim = cache_k_rope.shape[-1]  # 64
-    n_loc = loc.numel()
-    grid = (n_loc,)
-
-    get_mla_kv_buffer_kernel[grid](
-        kv_buffer,
-        cache_k_nope,
-        cache_k_rope,
-        loc,
-        kv_buffer.stride(0),
-        cache_k_nope.stride(0),
-        cache_k_rope.stride(0),
-        nope_dim,
-        rope_dim,
-    )
-
-
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -1303,9 +1303,11 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
         self.nsa_kv_cache_store_fp8 = use_nsa and dtype == torch.float8_e4m3fn
-        # TODO do not hardcode
+        assert not (
+            self.nsa_kv_cache_store_fp8 and override_kv_cache_dim is None
+        ), "override_kv_cache_dim must be provided when using NSA with FP8 kv cache storage"
         self.kv_cache_dim = (
-            656
+            override_kv_cache_dim
             if self.use_nsa and self.nsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
@@ -1316,15 +1318,41 @@ class MLATokenToKVPool(KVCache):
                 if self.custom_mem_pool
                 else nullcontext()
             ):
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.kv_buffer = [
-                    torch.zeros(
-                        (size + page_size, 1, self.kv_cache_dim),
-                        dtype=self.store_dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
+                if is_float4_e2m1fn_x2(self.dtype):
+                    m = size + page_size
+                    n = 1  # head_num
+                    k = self.kv_cache_dim  # head_dim
+
+                    scale_block_size = 16
+                    self.store_dtype = torch.uint8
+
+                    self.kv_buffer = [
+                        torch.zeros(
+                            (m, n, k // 2),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
+
+                    self.kv_scale_buffer = [
+                        torch.zeros(
+                            (m, k // scale_block_size),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
+                else:
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.kv_buffer = [
+                        torch.zeros(
+                            (size + page_size, 1, self.kv_cache_dim),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
 
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
@@ -1357,7 +1385,23 @@ class MLATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+            if is_float4_e2m1fn_x2(self.dtype):
+                cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(
+                    torch.uint8
+                )
+                cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
+
+                from sglang.srt.layers.quantization.kvfp4_tensor import (
+                    KVFP4QuantizeUtil,
+                )
+
+                cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+                    cache_k_nope_fp4, cache_k_nope_fp4_sf
+                )
+                return cache_k_nope_fp4_dequant
+            else:
+                return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+
         return self.kv_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
@@ -1383,11 +1427,29 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
         if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
+            if is_float4_e2m1fn_x2(self.dtype):
+                from sglang.srt.layers.quantization.kvfp4_tensor import (
+                    KVFP4QuantizeUtil,
+                )
+
+                cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
+                    cache_k
+                )
+            else:
+                cache_k = cache_k.to(self.dtype)
+
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
-                self.store_dtype
-            )
+            if is_float4_e2m1fn_x2(self.dtype):
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
+                    self.store_dtype
+                )
+                self.kv_scale_buffer[layer_id - self.start_layer][loc] = (
+                    cache_k_fp4_sf.view(self.store_dtype)
+                )
+            else:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+                    self.store_dtype
+                )
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
@@ -1409,18 +1471,44 @@ class MLATokenToKVPool(KVCache):
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
         else:
             if cache_k_nope.dtype != self.dtype:
-                cache_k_nope = cache_k_nope.to(self.dtype)
-                cache_k_rope = cache_k_rope.to(self.dtype)
+                if is_float4_e2m1fn_x2(self.dtype):
+                    from sglang.srt.layers.quantization.kvfp4_tensor import (
+                        KVFP4QuantizeUtil,
+                    )
+
+                    cache_k_nope_fp4, cache_k_nope_fp4_sf = (
+                        KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
+                    )
+                    cache_k_rope_fp4, cache_k_rope_fp4_sf = (
+                        KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
+                    )
+                else:
+                    cache_k_nope = cache_k_nope.to(self.dtype)
+                    cache_k_rope = cache_k_rope.to(self.dtype)
             if self.store_dtype != self.dtype:
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id - self.start_layer],
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-            )
+            if is_float4_e2m1fn_x2(self.dtype):
+                set_mla_kv_buffer_triton(
+                    self.kv_buffer[layer_id - self.start_layer],
+                    loc,
+                    cache_k_nope_fp4,
+                    cache_k_rope_fp4,
+                )
+                set_mla_kv_scale_buffer_triton(
+                    self.kv_scale_buffer[layer_id - self.start_layer],
+                    loc,
+                    cache_k_nope_fp4_sf,
+                    cache_k_rope_fp4_sf,
+                )
+            else:
+                set_mla_kv_buffer_triton(
+                    self.kv_buffer[layer_id - self.start_layer],
+                    loc,
+                    cache_k_nope,
+                    cache_k_rope,
+                )
 
     def get_mla_kv_buffer(
         self,
@@ -1476,6 +1564,7 @@ class MLATokenToKVPool(KVCache):
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
+    rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
         self,
@@ -1491,6 +1580,19 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
+        assert (
+            kv_lora_rank % self.quant_block_size == 0
+        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {self.quant_block_size}"
+
+        # Calculate override_kv_cache_dim for FP8 storage:
+        # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+        # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
+        override_dim = (
+            kv_lora_rank
+            + kv_lora_rank // self.quant_block_size * 4
+            + qk_rope_head_dim * self.rope_storage_dtype.itemsize
+        )
+
         super().__init__(
             size,
             page_size,
@@ -1503,6 +1605,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             start_layer,
             end_layer,
             use_nsa=True,
+            override_kv_cache_dim=override_dim,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32

@@ -147,7 +147,7 @@ docker run --rm \
    ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so && \
    ${PYTHON_ROOT_PATH}/bin/${TORCH_INSTALL} && \
    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core && \
-   export TORCH_CUDA_ARCH_LIST='8.0 8.9 9.0+PTX' && \
+   export FLASHINFER_CUDA_ARCH_LIST='8.0 8.9 9.0a 10.0a 12.0a' && \
    export CUDA_VERSION=${CUDA_VERSION} && \
    mkdir -p /usr/lib/${ARCH}-linux-gnu/ && \
    ln -s /usr/local/cuda-${CUDA_VERSION}/targets/${LIBCUDA_ARCH}-linux/lib/stubs/libcuda.so /usr/lib/${ARCH}-linux-gnu/libcuda.so && \

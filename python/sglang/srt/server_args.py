@@ -27,7 +27,7 @@ from typing import Dict, List, Literal, Optional, Union
 import orjson
 
 from sglang.srt.connector import ConnectorType
-from sglang.srt.environ import envs
+from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -36,6 +36,7 @@ from sglang.srt.utils.common import (
     SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
     cpu_has_amx_support,
+    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -162,6 +163,8 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
 ]
 
+MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -198,6 +201,10 @@ def add_radix_supported_deterministic_attention_backend_choices(choices):
 
 def add_radix_eviction_policy_choices(choices):
     RADIX_EVICTION_POLICY_CHOICES.extend(choices)
+
+
+def add_mamba_ssm_dtype_choices(choices):
+    MAMBA_SSM_DTYPE_CHOICES.extend(choices)
 
 
 @dataclasses.dataclass
@@ -371,6 +378,7 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
+    speculative_moe_runner_backend: Optional[str] = None
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -511,8 +519,8 @@ class ServerArgs:
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
-    # -1 mean dump all layers.
-    debug_tensor_dump_layers: int = -1
+    # None means dump all layers.
+    debug_tensor_dump_layers: Optional[List[int]] = None
     # TODO(guoyuhong): clean the old dumper code.
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
@@ -541,6 +549,14 @@ class ServerArgs:
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
     sm_group_num: int = 8
+
+    # For Multi-Modal
+    mm_max_concurrent_calls: int = 32
+    mm_per_request_timeout: float = 10.0
+
+    # For checkpoint decryption
+    decrypted_config_file: Optional[str] = None
+    decrypted_draft_config_file: Optional[str] = None
 
     def __post_init__(self):
         """
@@ -1024,6 +1040,11 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
+        elif model_arch in ["KimiLinearForCausalLM"]:
+            logger.warning(
+                f"Disabling Radix Cache for {model_arch} as it is not yet supported."
+            )
+            self.disable_radix_cache = True
 
         if is_deepseek_nsa(hf_config):
             if (
@@ -1195,9 +1216,9 @@ class ServerArgs:
                 )
                 self.page_size = 64
 
-            if self.kv_cache_dtype not in ["fp8_e4m3", "auto"]:
+            if self.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "auto"]:
                 raise ValueError(
-                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or auto."
+                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, or auto."
                 )
 
         if (
@@ -1359,6 +1380,19 @@ class ServerArgs:
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
+
+        if get_bool_env_var("SGLANG_CUTLASS_MOE"):
+            logger.warning(
+                "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
+            )
+            assert (
+                self.quantization == "fp8"
+            ), "cutlass MoE is only supported with fp8 quantization"
+            self.moe_runner_backend = "cutlass"
+        if self.moe_runner_backend == "cutlass" and self.quantization == "fp8":
+            assert (
+                self.ep_size == 1
+            ), "FP8 Cutlass MoE is only supported with ep_size == 1"
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
@@ -1677,6 +1711,9 @@ class ServerArgs:
         os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = (
             "1" if self.enable_deterministic_inference else "0"
         )
+        # Set the highest strict level for Kimi K2 tool calls
+        if self.tool_call_parser == "kimi_k2":
+            envs.SGLANG_TOOL_STRICT_LEVEL.set(ToolStrictLevel.PARAMETER)
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
@@ -1975,8 +2012,8 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+.',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
@@ -2700,6 +2737,13 @@ class ServerArgs:
             help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
             default=ServerArgs.speculative_attention_mode,
         )
+        parser.add_argument(
+            "--speculative-moe-runner-backend",
+            type=str,
+            choices=MOE_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.speculative_moe_runner_backend,
+            help="Choose the runner backend for MoE in speculative decoding.",
+        )
         # Ngram speculative decoding
         parser.add_argument(
             "--speculative-ngram-min-match-window-size",
@@ -2890,7 +2934,7 @@ class ServerArgs:
             "--mamba-ssm-dtype",
             type=str,
             default=ServerArgs.mamba_ssm_dtype,
-            choices=["float32", "bfloat16"],
+            choices=MAMBA_SSM_DTYPE_CHOICES,
             help="The data type of the SSM states in mamba cache.",
         )
         parser.add_argument(
@@ -3156,7 +3200,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-torch-symm-mem",
             action="store_true",
-            help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM10 supports world size 6, 8.",
+            help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -3380,8 +3424,8 @@ class ServerArgs:
         parser.add_argument(
             "--debug-tensor-dump-layers",
             type=int,
-            default=-1,
-            help="The layer number for dumping tensors.",
+            nargs="+",
+            help="The layer ids to dump. Dump all layers if not specified.",
         )
         parser.add_argument(
             "--debug-tensor-dump-input-file",
@@ -3517,6 +3561,34 @@ class ServerArgs:
             "--config",
             type=str,
             help="Read CLI options from a config file. Must be a YAML file with configuration options.",
+        )
+
+        # For Multi-Modal
+        parser.add_argument(
+            "--mm-max-concurrent-calls",
+            type=int,
+            default=ServerArgs.mm_max_concurrent_calls,
+            help="The max concurrent calls for async mm data processing.",
+        )
+        parser.add_argument(
+            "--mm-per-request-timeout",
+            type=int,
+            default=ServerArgs.mm_per_request_timeout,
+            help="The timeout for each multi-modal request in seconds.",
+        )
+
+        # For checkpoint decryption
+        parser.add_argument(
+            "--decrypted-config-file",
+            type=str,
+            default=ServerArgs.decrypted_config_file,
+            help="The path of the decrypted config file.",
+        )
+        parser.add_argument(
+            "--decrypted-draft-config-file",
+            type=str,
+            default=ServerArgs.decrypted_draft_config_file,
+            help="The path of the decrypted draft config file.",
         )
 
     @classmethod
@@ -3859,6 +3931,11 @@ _global_server_args: Optional[ServerArgs] = None
 
 
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
+    global _global_server_args
+    _global_server_args = server_args
+
+
+def set_global_server_args_for_tokenizer(server_args: ServerArgs):
     global _global_server_args
     _global_server_args = server_args
 

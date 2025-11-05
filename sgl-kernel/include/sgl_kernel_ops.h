@@ -152,7 +152,6 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor pos_ids,
     bool interleave,
     bool enable_pdl,
-    int64_t cuda_stream,
     const std::optional<at::Tensor>& v,
     const std::optional<at::Tensor>& k_buffer,
     const std::optional<at::Tensor>& v_buffer,
@@ -167,8 +166,7 @@ void downcast_fp8(
     at::Tensor& v_scale,
     at::Tensor& loc,
     int64_t mult,
-    int64_t offset,
-    int64_t cuda_stream);
+    int64_t offset);
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
@@ -253,8 +251,7 @@ void bmm_fp8(
     at::Tensor A_scale,
     at::Tensor B_scale,
     at::Tensor workspace_buffer,
-    int64_t cublas_handle,
-    int64_t cuda_stream);
+    int64_t cublas_handle);
 void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
@@ -471,8 +468,7 @@ void tree_speculative_sampling_target_only(
     at::Tensor draft_probs,
     double threshold_single = 1,
     double threshold_acc = 1,
-    bool deterministic = true,
-    int64_t cuda_stream = 0);
+    bool deterministic = true);
 
 void verify_tree_greedy(
     at::Tensor predicts,          // mutable
@@ -482,8 +478,7 @@ void verify_tree_greedy(
     at::Tensor retrive_index,
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
-    at::Tensor target_predict,
-    int64_t cuda_stream = 0);
+    at::Tensor target_predict);
 
 void reconstruct_indices_from_tree_mask(
     at::Tensor tree_mask,
@@ -665,6 +660,7 @@ void transfer_kv_all_layer_direct_lf_pf(
 /*
  * From csrc/memory
  */
+at::Tensor weak_ref_tensor(const at::Tensor& tensor);
 void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
 
 /*
