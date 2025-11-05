@@ -153,9 +153,7 @@ class TritonRunnerCore(MoeRunnerCore):
         routed_scaling_factor = self.config.routed_scaling_factor
         apply_router_weight_on_input = self.config.apply_router_weight_on_input
 
-        assert self.config.is_gated, (
-            "Only gated MoEs are supported for Triton runner"
-        )
+        assert self.config.is_gated, "Only gated MoEs are supported for Triton runner"
 
         M = hidden_states.shape[0]
         E, N, _ = w13.shape

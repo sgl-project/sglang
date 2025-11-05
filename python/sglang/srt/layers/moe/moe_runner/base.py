@@ -101,12 +101,12 @@ class FusedOpPool:
             raise ValueError(
                 f"Fused function for {a2a_backend_name} to {runner_backend_name} is already registered."
             )
-        assert MoeA2ABackend(a2a_backend_name), (
-            f"Invalid dispatch name: {a2a_backend_name}"
-        )
-        assert MoeRunnerBackend(runner_backend_name), (
-            f"Invalid runner name: {runner_backend_name}"
-        )
+        assert MoeA2ABackend(
+            a2a_backend_name
+        ), f"Invalid dispatch name: {a2a_backend_name}"
+        assert MoeRunnerBackend(
+            runner_backend_name
+        ), f"Invalid runner name: {runner_backend_name}"
         cls._fused_funcs[key] = fused_func
 
     @classmethod
@@ -183,9 +183,9 @@ class PermuteMethodPool:
         """
         key = (dispatch_output_format, runner_input_format)
         pre_permute_func = cls._pre_permute_methods.get(key)
-        assert pre_permute_func is not None, (
-            f"Pre-permute function for {dispatch_output_format} to {runner_input_format} is not registered"
-        )
+        assert (
+            pre_permute_func is not None
+        ), f"Pre-permute function for {dispatch_output_format} to {runner_input_format} is not registered"
         return pre_permute_func
 
     @classmethod
@@ -203,9 +203,9 @@ class PermuteMethodPool:
         """
         key = (runner_output_format, combine_input_format)
         post_permute_func = cls._post_permute_methods.get(key)
-        assert post_permute_func is not None, (
-            f"Post-permute function for {runner_output_format} to {combine_input_format} is not registered"
-        )
+        assert (
+            post_permute_func is not None
+        ), f"Post-permute function for {runner_output_format} to {combine_input_format} is not registered"
         return post_permute_func
 
 
