@@ -18,7 +18,7 @@ class AttentionCapabilities:
     """
     This class is used to store the capabilities of an attention backend to validate the runtime
     configuration and raise errors if the configuration is invalid or not supported.
-    In the future, all backends should be registered here instead of the current server args validation.
+    In the future, all backends should be registered here instead of the current server arguments validation.
     This is to avoid the server args validation from becoming too complex and difficult to maintain.
     """
 
@@ -185,7 +185,7 @@ def validate_attention_backends(
     use_mla: bool,
     sliding_window_size: int | None,
 ):
-    prefill_backend, decode_backend = ServerArgs.get_attention_backends(server_args)
+    prefill_backend, decode_backend = server_args.get_attention_backends()
     _validate_single_backend(
         prefill_backend,
         role="prefill",
