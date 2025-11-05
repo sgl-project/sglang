@@ -960,19 +960,19 @@ class FlashInferFusedMoE(FusedMoE):
         super().__init__(*args, **kwargs)
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        assert self.moe_runner_config.activation == "silu", (
-            "Only silu is supported for flashinfer blockscale fp8 moe"
-        )
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only silu is supported for flashinfer blockscale fp8 moe"
         assert self.quant_method is not None
-        assert topk_output.topk_config.renormalize, (
-            "Renormalize is required for flashinfer blockscale fp8 moe"
-        )
-        assert self.num_fused_shared_experts == 0, (
-            "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
-        )
-        assert self.moe_runner_config.is_gated, (
-            "Only gated MoEs are supported for flashinfer blockscale fp8 moe"
-        )
+        assert (
+            topk_output.topk_config.renormalize
+        ), "Renormalize is required for flashinfer blockscale fp8 moe"
+        assert (
+            self.num_fused_shared_experts == 0
+        ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
+        assert (
+            self.moe_runner_config.is_gated
+        ), "Only gated MoEs are supported for flashinfer blockscale fp8 moe"
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
@@ -1040,9 +1040,9 @@ class FlashInferFP4MoE(FusedMoE):
         """
         assert isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
 
-        assert self.moe_runner_config.is_gated, (
-            "Only gated MoEs are supported for flashinfer fp4 moe"
-        )
+        assert (
+            self.moe_runner_config.is_gated
+        ), "Only gated MoEs are supported for flashinfer fp4 moe"
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 

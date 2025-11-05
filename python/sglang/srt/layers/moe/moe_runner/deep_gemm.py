@@ -235,9 +235,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             if hidden_states_scale.dtype != torch.int:
                 b, s_mn, s_k = hidden_states_scale.shape
-                assert s_mn % 4 == 0 and s_k % 4 == 0, (
-                    f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
-                )
+                assert (
+                    s_mn % 4 == 0 and s_k % 4 == 0
+                ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )

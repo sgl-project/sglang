@@ -268,13 +268,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 assert not moe_runner_config.no_combine, "unsupported"
                 topk_weights, topk_ids, _ = topk_output
                 if moe_runner_config.apply_router_weight_on_input:
-                    assert topk_weights.dim() == 2, (
-                        "`topk_weights` should be in shape (num_tokens, topk)"
-                    )
+                    assert (
+                        topk_weights.dim() == 2
+                    ), "`topk_weights` should be in shape (num_tokens, topk)"
                     _, topk = topk_weights.shape
-                    assert topk == 1, (
-                        "Only support topk=1 when `apply_router_weight_on_input` is True"
-                    )
+                    assert (
+                        topk == 1
+                    ), "Only support topk=1 when `apply_router_weight_on_input` is True"
                     x = x * topk_weights.to(x.dtype)
                     topk_weights = torch.ones_like(
                         topk_weights, dtype=torch.float32
@@ -313,9 +313,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         moe_runner_config = self.moe_runner_config
 
-        assert moe_runner_config.activation == "silu", (
-            f"activation = {moe_runner_config.activation} is not supported."
-        )
+        assert (
+            moe_runner_config.activation == "silu"
+        ), f"activation = {moe_runner_config.activation} is not supported."
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu

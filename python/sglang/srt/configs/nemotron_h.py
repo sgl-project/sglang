@@ -216,12 +216,12 @@ class NemotronHConfig(PretrainedConfig):
 
         # Validate hybrid_override_pattern
         # M: Mamba2, *: Attention, -: MLP
-        assert len(self.hybrid_override_pattern) == self.num_hidden_layers, (
-            "hybrid_override_pattern must have same length as num_hidden_layers"
-        )
-        assert re.match(r"^[*\-ME]+$", self.hybrid_override_pattern), (
-            "hybrid_override_pattern must only contain characters 'M', '*', '-' or 'E'"
-        )
+        assert (
+            len(self.hybrid_override_pattern) == self.num_hidden_layers
+        ), "hybrid_override_pattern must have same length as num_hidden_layers"
+        assert re.match(
+            r"^[*\-ME]+$", self.hybrid_override_pattern
+        ), "hybrid_override_pattern must only contain characters 'M', '*', '-' or 'E'"
 
         # for backward compatibility
         if num_key_value_heads is None:
