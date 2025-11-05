@@ -33,6 +33,8 @@ def fused_moe_forward_native(
         x1 = F.silu(x1)
     elif moe_runner_config.activation == "gelu":
         x1 = F.gelu(x1)
+    elif activation == "relu":
+        x1 = F.relu(x1)
     else:
         raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
     x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
