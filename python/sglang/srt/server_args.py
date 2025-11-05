@@ -3743,6 +3743,10 @@ class ServerArgs:
                 "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."
             )
 
+        assert (
+            self.schedule_conservativeness >= 0
+        ), "schedule_conservativeness must be non-negative"
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 

@@ -36,6 +36,8 @@ class TestMaxQueuedRequests(CustomTestCase):
                 "1",
                 "--max-queued-requests",  # Enforce max queued request number is 1
                 "1",
+                "--attention-backend",
+                "triton",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )

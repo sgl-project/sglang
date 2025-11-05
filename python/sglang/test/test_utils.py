@@ -1553,7 +1553,7 @@ def send_generate_requests(base_url: str, num_requests: int) -> List[str]:
                 "text": prompt,
                 "sampling_params": {
                     "temperature": 0,
-                    "max_new_tokens": 50,
+                    "max_new_tokens": 500,
                 },
             },
         )
@@ -1580,7 +1580,7 @@ async def send_concurrent_generate_requests(
                     "text": prompt,
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 50,
+                        "max_new_tokens": 500,
                     },
                 },
             ) as response:
@@ -1604,7 +1604,7 @@ async def send_concurrent_generate_requests_with_custom_params(
                 """,
         "sampling_params": {
             "temperature": 0,
-            "max_new_tokens": 50,
+            "max_new_tokens": 500,
         },
     }
 

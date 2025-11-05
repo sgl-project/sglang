@@ -146,6 +146,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -269,10 +270,11 @@ class Scheduler(
             server_args.speculative_algorithm
         )
         self.gpu_id = gpu_id
+        self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
-        self.page_size = server_args.page_size
 
+        # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
                 server_args.enable_dp_attention,
@@ -298,24 +300,12 @@ class Scheduler(
         # Init moe config
         self.init_moe_config()
 
-        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
-        if self.server_args.reasoning_parser and self.tokenizer:
-            reasoning_parser = ReasoningParser(
-                model_type=self.server_args.reasoning_parser, stream_reasoning=False
-            )
-            self.tokenizer.think_end_id = self.tokenizer.encode(
-                reasoning_parser.detector.think_end_token, add_special_tokens=False
-            )[0]
-
         # Check whether overlap can be enabled
         if not self.is_generation:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
 
         # Launch a tensor parallel worker
-
-        from sglang.srt.managers.tp_worker import TpModelWorker
-
         self.tp_worker = TpModelWorker(
             server_args=server_args,
             gpu_id=gpu_id,
@@ -327,7 +317,6 @@ class Scheduler(
         )
 
         # Launch a draft worker for speculative decoding
-
         draft_worker_kwargs = dict(
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -481,10 +470,6 @@ class Scheduler(
         )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
-
-        assert (
-            server_args.schedule_conservativeness >= 0
-        ), "Invalid schedule_conservativeness"
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * server_args.schedule_conservativeness,
@@ -511,7 +496,6 @@ class Scheduler(
         )
         self.offload_tags = set()
         self.init_profiler()
-
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
             SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
@@ -526,9 +510,6 @@ class Scheduler(
             self.init_kv_events(server_args.kv_events_config)
 
         # Init disaggregation
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
         self.init_disaggregation()
 
         if envs.SGLANG_LOG_GC.get():
@@ -695,6 +676,15 @@ class Scheduler(
                     revision=server_args.revision,
                 )
 
+        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
+        if self.server_args.reasoning_parser and self.tokenizer:
+            reasoning_parser = ReasoningParser(
+                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+            )
+            self.tokenizer.think_end_id = self.tokenizer.encode(
+                reasoning_parser.detector.think_end_token, add_special_tokens=False
+            )[0]
+
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
 
@@ -835,6 +825,9 @@ class Scheduler(
         init_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_disaggregation(self):
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
