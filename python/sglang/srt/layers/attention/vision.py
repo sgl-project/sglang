@@ -13,13 +13,13 @@ from einops import rearrange
 
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_device_capability,
     is_blackwell,
     is_cuda,
     is_hip,
     is_npu,
     print_info_once,
-    get_bool_env_var,
 )
 
 _is_cuda = is_cuda()
@@ -55,10 +55,11 @@ ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip 
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
-    
+
+
 @dataclasses.dataclass
 class SingletonCache:
     data: Any = None
@@ -350,7 +351,7 @@ class VisionAiterAttention(nn.Module):
         if not _use_aiter:
             raise Exception("aiter_attn is only available for AMD")
         super().__init__()
-        
+
     def forward(
         self,
         q: torch.Tensor,
@@ -383,6 +384,7 @@ class VisionAiterAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
         )
+
 
 class VisionAscendAttention(nn.Module):
 
