@@ -5,7 +5,7 @@ Tests MCP tool calling in both streaming and non-streaming modes.
 These tests should work across all backends that support MCP (OpenAI, XAI).
 """
 
-from base import ResponseAPIBaseTest
+from basic_crud import ResponseAPIBaseTest
 
 
 class MCPTests(ResponseAPIBaseTest):
