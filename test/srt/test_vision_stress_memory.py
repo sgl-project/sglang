@@ -1,17 +1,15 @@
 """
 Stress test for VLM server to investigate potential memory leaks.
 
-(Uses nvidia-smi to correctly profile server memory)
 """
 
 import gc
-import re
 import subprocess
+import time
 import unittest
 
 import openai
 import pytest
-import torch
 
 # Import common utilities
 from test_vision_openai_server_common import (
@@ -39,17 +37,24 @@ def get_gpu_memory_gb():
         # Output is like "37285" (in MiB)
         memory_mib = int(result.stdout.strip())
         return memory_mib / 1024  # Convert MiB to GiB
-    except Exception as e:
+    # Catch specific, expected errors instead of a broad Exception
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
         print(f"Warning: Could not get GPU memory from nvidia-smi: {e}")
         return -1  # Return an invalid value to show failure
 
 
 # --- Base class for our stress tests ---
 class VLMStressTestMixin(unittest.TestCase):
+
+    # --- Default test parameters ---
     MODEL_NAME = None
     ITERATIONS = 200
     MAX_INCREASE_GB = 0.5  # Default threshold
     LOG_INTERVAL = 20
+
+    # --- Constants for sleep timers ---
+    SERVER_STABILIZE_TIME_S = 10
+    POST_LOOP_WAIT_TIME_S = 2
 
     @classmethod
     def setUpClass(cls):
@@ -68,8 +73,8 @@ class VLMStressTestMixin(unittest.TestCase):
         print(f"Server launched (PID: {cls.process.pid}).")
 
         # Allow time for model to fully load before measuring memory
-        print("Waiting 10s for server to stabilize before memory check...")
-        time.sleep(10)
+        print(f"Waiting {cls.SERVER_STABILIZE_TIME_S}s for server to stabilize...")
+        time.sleep(cls.SERVER_STABILIZE_TIME_S)
 
     @classmethod
     def tearDownClass(cls):
@@ -129,7 +134,7 @@ class VLMStressTestMixin(unittest.TestCase):
         gc.collect()
 
         # Wait a moment for any final requests to clear
-        time.sleep(2)
+        time.sleep(self.POST_LOOP_WAIT_TIME_S)
 
         memory_after = get_gpu_memory_gb()
         print(f"Memory allocated after loop: {memory_after:.4f} GB")
@@ -148,21 +153,17 @@ class VLMStressTestMixin(unittest.TestCase):
 # --- Test Case 1: Lightweight Model (0.5B) ---
 class TestVLMMemoryStress_0_5B(VLMStressTestMixin):
     MODEL_NAME = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
-    ITERATIONS = 200
-    MAX_INCREASE_GB = 0.5
-    LOG_INTERVAL = 20
+    # All other attributes (ITERATIONS, MAX_INCREASE_GB, LOG_INTERVAL)
+    # are inherited from the base class.
 
 
 # --- Test Case 2: Larger Model (7B) ---
 class TestVLMMemoryStress_7B(VLMStressTestMixin):
     MODEL_NAME = "Qwen/Qwen2-VL-7B-Instruct"
-    ITERATIONS = 200
-    MAX_INCREASE_GB = 1.0  # Allow 1.0 GB for a larger model
-    LOG_INTERVAL = 10
+    # ITERATIONS is inherited (200)
+    MAX_INCREASE_GB = 1.0  # Override the default 0.5
+    LOG_INTERVAL = 10  # Override the default 20
 
-
-# Need to import time for the sleep() calls
-import time
 
 if __name__ == "__main__":
     unittest.main()
