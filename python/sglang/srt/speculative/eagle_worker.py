@@ -271,7 +271,9 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch.spec_info = None
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             generation_batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
-            self.forward_draft_extend_after_target_decode(batch)
+            self.forward_draft_extend_after_target_decode(
+                batch, generation_batch_result.logits_output.hidden_states,
+            )
             return generation_batch_result
         else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
@@ -317,7 +319,7 @@ class EAGLEWorker(TpModelWorker):
         need_forward = global_need_forward_cnt > 0
         return need_forward
 
-    def forward_draft_extend_after_target_decode(self, batch: ScheduleBatch):
+    def forward_draft_extend_after_target_decode(self, batch: ScheduleBatch, target_hidden_states: torch.Tensor):
         """
         Running a simple decoding step for draft model to fill the KV
         cache for each target decode step when spec decode is turned off.
@@ -331,7 +333,6 @@ class EAGLEWorker(TpModelWorker):
         # the verified_id collected
         batch.spec_info.verified_id = batch.input_ids
         batch.return_hidden_states = False
-        target_hidden_states = batch.spec_info.hidden_states
         spec_info_backup = batch.spec_info
         # Set to none to trigger regular decode
         batch.spec_info = None
@@ -913,6 +914,7 @@ class EAGLEWorker(TpModelWorker):
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
         accept_length_backup = batch.spec_info.accept_length
+        accept_length_cpu_backup = batch.spec_info.accept_length_cpu
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
@@ -994,6 +996,7 @@ class EAGLEWorker(TpModelWorker):
         batch.req_pool_indices = req_pool_indices_backup
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
+        batch.spec_info.accept_length_cpu = accept_length_cpu_backup
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput

@@ -40,7 +40,7 @@ import re
 import time
 from enum import Enum, auto
 from http import HTTPStatus
-from itertools import chain
+from itertools import chain, accumulate
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -1028,8 +1028,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+    # Dynamic Spec Decode
     # Enable/disable speculative decoding from batch to batch
     is_spec_enabled_for_batch: bool = False
+    # Turn off: need to handle output_ids, set to False once
+    # output_ids handled
+    turning_off_specdecode: bool = False
+    # Turn on: need to run one step to capture draft hidden states
+    # set to False after one additional step of decode
+    turning_on_specdecode: bool = False
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1553,11 +1560,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.output_ids.to(torch.int64)
                 )
 
-        # Update fields
-        if not self.spec_algorithm.is_none() and not self.is_spec_enabled_for_batch:
+        if self.turning_off_specdecode:
             # In the case of changing from spec decode -> regular decode
-            # input_ids should be the last token produced by verify
-            self.input_ids = self.output_ids.reshape(bs, -1)[:, -1]
+            # we merged previously verfied tokens with the extend generated tokens
+            # from differen request.
+            accept_length = [acc + 1 for acc in self.spec_info.accept_length_cpu]
+            accept_length.extend([1] * (bs - len(accept_length)))
+            kept_output_ids = [idx - 1 for idx in list(accumulate(accept_length))]
+            assert len(kept_output_ids) == bs
+            self.input_ids = self.output_ids[kept_output_ids]
+            self.turning_off_specdecode = False
         else:
             self.input_ids = self.output_ids
         
