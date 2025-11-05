@@ -1435,10 +1435,10 @@ class MRotaryEmbedding(RotaryEmbedding):
             key: [num_tokens, num_kv_heads * head_size]
         """
         assert positions.ndim == 1 or positions.ndim == 2
-        if _is_npu:
-            return self._forward_npu(positions, query, key)
-        elif positions.ndim == 2 and self.mrope_section and _is_cuda:
+        if positions.ndim == 2 and self.mrope_section and _is_cuda:
             return self._forward_triton(positions, query, key)
+        elif _is_npu:
+            return self._forward_npu(positions, query, key)
         else:
             return self._forward_native(positions, query, key)
 
