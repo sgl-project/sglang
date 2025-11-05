@@ -2,11 +2,11 @@ import asyncio
 import concurrent
 import concurrent.futures
 import dataclasses
-from functools import partial
 import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
+from functools import partial
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
@@ -183,8 +183,9 @@ class BaseMultimodalProcessor(ABC):
             mp_context=mp.get_context("fork"),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
-        self.video_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_VIDEO_WORKERS", 8))
+        self.video_executor = concurrent.futures.ProcessPoolExecutor(
+            mp_context=mp.get_context("spawn"),
+            max_workers=int(os.environ.get("SGLANG_VIDEO_WORKERS", 32)),
         )
 
         # Mapping from attribute names to modality types
@@ -423,7 +424,6 @@ class BaseMultimodalProcessor(ABC):
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
 
-
     def submit_data_loading_tasks_async(
         self,
         text_parts: List[str],
@@ -494,7 +494,6 @@ class BaseMultimodalProcessor(ABC):
                 pass
 
         return futures, task_info
-
 
     def submit_data_loading_tasks(
         self,
@@ -750,7 +749,6 @@ class BaseMultimodalProcessor(ABC):
             videos=videos,
             input_text="".join(new_text_parts),
         )
-
 
     def load_mm_data(
         self,
