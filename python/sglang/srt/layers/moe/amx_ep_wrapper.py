@@ -33,8 +33,8 @@ except ImportError:
 
 
 @dataclass
-class AMXConfig:
-    """Configuration for AMX CPU expert computation.
+class KTConfig:
+    """Configuration for KTransformers heterogeneous computing CPU part.
 
     Args:
         layer_idx: Layer index in the model
@@ -58,17 +58,17 @@ class AMXConfig:
     num_layers: Optional[int] = None
 
 
-def create_amx_config_from_server_args(
+def create_kt_config_from_server_args(
     server_args: "ServerArgs", layer_idx: int
-) -> Optional[AMXConfig]:
-    """Create AMXConfig from ServerArgs if AMX is configured.
+) -> Optional[KTConfig]:
+    """Create KTConfig from ServerArgs if KT is configured.
 
     Args:
         server_args: Global server arguments
         layer_idx: Layer index in the model
 
     Returns:
-        AMXConfig if AMX is configured, None otherwise
+        KTConfig if KT is configured, None otherwise
     """
     if server_args.kt_amx_weight_path is None:
         return None
@@ -82,7 +82,7 @@ def create_amx_config_from_server_args(
         # If we can't get the config, num_layers will be None
         pass
 
-    return AMXConfig(
+    return KTConfig(
         layer_idx=layer_idx,
         num_gpu_experts=server_args.kt_num_gpu_experts,
         cpuinfer_threads=server_args.kt_cpuinfer,
@@ -110,12 +110,11 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
     Returns:
         Modified topk_ids tensor with CPU expert IDs masked as -1
     """
-    topk_ids = topk_ids.clone()
     topk_ids[topk_ids >= num_gpu_experts] = -1
     return topk_ids
 
 
-class AMXEPWrapperMethod(FusedMoEMethodBase):
+class KTEPWrapperMethod(FusedMoEMethodBase):
     """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
 
     This wrapper coordinates parallel execution of:
@@ -130,29 +129,29 @@ class AMXEPWrapperMethod(FusedMoEMethodBase):
     Example:
         # Wrap any GPU method with AMX CPU expert support
         gpu_method = CompressedTensorsWNA16MoEMethod(quant_config, prefix)
-        amx_config = AMXConfig(layer_idx=0, num_gpu_experts=4, ...)
-        method = AMXEPWrapperMethod(gpu_method, amx_config)
+        kt_config = KTConfig(layer_idx=0, num_gpu_experts=4, ...)
+        method = KTEPWrapperMethod(gpu_method, kt_config)
     """
 
     def __init__(
         self,
         gpu_method: FusedMoEMethodBase,
-        amx_config: AMXConfig,
+        kt_config: KTConfig,
     ):
         """Initialize the AMX EP wrapper.
 
         Args:
             gpu_method: The quantization method to use for GPU experts
-            amx_config: Configuration for AMX CPU expert computation
+            kt_config: Configuration for AMX CPU expert computation
         """
         if not KTRANSFORMERS_AVAILABLE:
             raise ImportError(
-                "kt_kernel is not installed. To use AMX EP wrapper, please install kt_kernel."
+                "kt_kernel is not installed. To use KTransformers EP wrapper, please install kt_kernel."
             )
 
         self.gpu_method = gpu_method
-        self.amx_config = amx_config
-        self.num_gpu_experts = amx_config.num_gpu_experts
+        self.kt_config = kt_config
+        self.num_gpu_experts = kt_config.num_gpu_experts
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -190,11 +189,11 @@ class AMXEPWrapperMethod(FusedMoEMethodBase):
         num_experts_per_tok = extra_weight_attrs.get("top_k")
         intermediate_size_full = extra_weight_attrs.get("intermediate_size_full")
 
-        layer_max_deferred = self.amx_config.max_deferred_experts_per_token or 0
+        layer_max_deferred = self.kt_config.max_deferred_experts_per_token or 0
         if (
-            self.amx_config.max_deferred_experts_per_token is not None
-            and self.amx_config.num_layers is not None
-            and self.amx_config.layer_idx == self.amx_config.num_layers - 1
+            self.kt_config.max_deferred_experts_per_token is not None
+            and self.kt_config.num_layers is not None
+            and self.kt_config.layer_idx == self.kt_config.num_layers - 1
         ):
             layer_max_deferred = 0
 
@@ -213,17 +212,17 @@ class AMXEPWrapperMethod(FusedMoEMethodBase):
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
             self.amx_wrapper = AMXMoEWrapper(
-                layer_idx=self.amx_config.layer_idx,
+                layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
                 num_gpu_experts=self.num_gpu_experts,
-                cpuinfer_threads=self.amx_config.cpuinfer_threads,
-                threadpool_count=self.amx_config.threadpool_count,
-                amx_weight_path=self.amx_config.amx_weight_path,
-                chunked_prefill_size=self.amx_config.chunked_prefill_size,
-                amx_method=self.amx_config.amx_method,
+                cpuinfer_threads=self.kt_config.cpuinfer_threads,
+                threadpool_count=self.kt_config.threadpool_count,
+                amx_weight_path=self.kt_config.amx_weight_path,
+                chunked_prefill_size=self.kt_config.chunked_prefill_size,
+                amx_method=self.kt_config.amx_method,
                 max_deferred_experts_per_token=layer_max_deferred,
             )
 
@@ -248,7 +247,7 @@ class AMXEPWrapperMethod(FusedMoEMethodBase):
 
             physical_to_logical_map_cpu = (
                 get_global_expert_location_metadata()
-                .physical_to_logical_map_cpu[self.amx_config.layer_idx]
+                .physical_to_logical_map_cpu[self.kt_config.layer_idx]
                 .contiguous()
             )
             self.amx_wrapper.load_weights(physical_to_logical_map_cpu)
@@ -381,7 +380,7 @@ class AMXEPWrapperMethod(FusedMoEMethodBase):
             Attribute value from gpu_method
         """
         # Avoid infinite recursion for internal attributes
-        if name in ("gpu_method", "amx_wrapper", "amx_config"):
+        if name in ("gpu_method", "amx_wrapper", "kt_config"):
             raise AttributeError(
                 f"'{type(self).__name__}' object has no attribute '{name}'"
             )

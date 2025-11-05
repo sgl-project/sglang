@@ -58,7 +58,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.moe.amx_ep_wrapper import AMXEPWrapperMethod
+from sglang.srt.layers.moe.amx_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -479,9 +479,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(
-                self.experts.quant_method, AMXEPWrapperMethod
-            ):
+            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)

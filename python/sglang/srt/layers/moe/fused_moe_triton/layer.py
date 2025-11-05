@@ -23,8 +23,8 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.amx_ep_wrapper import (
-    AMXEPWrapperMethod,
-    create_amx_config_from_server_args,
+    KTEPWrapperMethod,
+    create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
@@ -205,13 +205,13 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
         server_args = get_global_server_args()
-        amx_config = create_amx_config_from_server_args(server_args, layer_id)
-        if amx_config is not None:
+        kt_config = create_kt_config_from_server_args(server_args, layer_id)
+        if kt_config is not None:
             if quant_config is not None:
                 gpu_method = quant_config.get_quant_method(self, prefix)
             else:
                 gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
-            self.quant_method = AMXEPWrapperMethod(gpu_method, amx_config)
+            self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
             if quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
@@ -548,7 +548,7 @@ class FusedMoE(torch.nn.Module):
 
         if isinstance(
             self.quant_method,
-            AMXEPWrapperMethod,
+            KTEPWrapperMethod,
         ):
             if self.quant_method.num_gpu_experts != -1:
                 if expert_id >= self.quant_method.num_gpu_experts:
@@ -577,7 +577,7 @@ class FusedMoE(torch.nn.Module):
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
         method = self.quant_method
-        if method.__class__.__name__ == "AMXEPWrapperMethod":
+        if method.__class__.__name__ == "KTEPWrapperMethod":
             method = method.gpu_method
 
         loaded_weight = (
