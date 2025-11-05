@@ -100,7 +100,9 @@ class BaseTpWorker(ABC):
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
-            recv_req.model_path, recv_req.load_format
+            recv_req.model_path,
+            recv_req.load_format,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
 
@@ -309,6 +311,7 @@ class TpModelWorker(BaseTpWorker):
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
 
     @property
@@ -381,6 +384,7 @@ class TpModelWorker(BaseTpWorker):
 
             if (
                 self.enable_overlap
+                and not self.enable_spec
                 and model_worker_batch.sampling_info.grammars is not None
             ):
 
