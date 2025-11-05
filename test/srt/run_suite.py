@@ -234,6 +234,7 @@ suites = {
         TestFile("hicache/test_hicache_storage_benchmark.py"),
         TestFile("hicache/test_hicache_storage_e2e.py"),
         TestFile("layers/attention/nsa/test_act_quant_triton.py"),
+        TestFile("layers/moe/test_moe_runners.py"),
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
         TestFile("models/lora/test_lora.py"),
