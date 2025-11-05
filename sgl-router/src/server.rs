@@ -115,6 +115,10 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
     state.router.health_generate(req).await
 }
 
+async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
+    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client).await
+}
+
 async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_server_info(req).await
 }
@@ -641,6 +645,7 @@ pub fn build_app(
         .route("/readiness", get(readiness))
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
+        .route("/engine_metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
@@ -737,14 +742,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .subscribe(Arc::new(LoggingSubscriber))
         .await;
 
-    engine.register_workflow(create_worker_registration_workflow());
+    engine.register_workflow(create_worker_registration_workflow(&config.router_config));
     engine.register_workflow(create_worker_removal_workflow());
     engine.register_workflow(create_mcp_registration_workflow());
     app_context
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
-    info!("Workflow engine initialized with worker and MCP registration workflows");
+    info!(
+        "Workflow engine initialized with worker and MCP registration workflows (health check timeout: {}s)",
+        config.router_config.health_check.timeout_secs
+    );
 
     info!(
         "Initializing workers for routing mode: {:?}",
@@ -764,6 +772,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await
         .map_err(|e| format!("Failed to submit worker initialization job: {}", e))?;
 
+    info!("Worker initialization job submitted (will complete in background)");
+
     if let Some(mcp_config) = &config.router_config.mcp_config {
         info!("Found {} MCP server(s) in config", mcp_config.servers.len());
         let mcp_job = Job::InitializeMcpServers {
@@ -777,12 +787,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         info!("No MCP config provided, skipping MCP server initialization");
     }
 
-    // Start background refresh for all registered static MCP servers
+    // Start background refresh for ALL MCP servers (static + dynamic in LRU cache)
     if let Some(mcp_manager) = app_context.mcp_manager.get() {
-        let refresh_interval = Duration::from_secs(300); // 5 minutes, matches default TTL
+        let refresh_interval = Duration::from_secs(600); // 10 minutes
         let _refresh_handle =
             Arc::clone(mcp_manager).spawn_background_refresh_all(refresh_interval);
-        info!("Started background refresh for all static MCP servers");
+        info!("Started background refresh for all MCP servers (every 10 minutes)");
     }
 
     let worker_stats = app_context.worker_registry.stats();

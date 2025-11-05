@@ -16,11 +16,14 @@ use crate::protocols::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
     generate::GenerateRequest,
+    responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
 
 // Include the generated protobuf code
+#[allow(clippy::all)]
 pub mod proto {
+    #![allow(clippy::all, unused_qualifications)]
     tonic::include_proto!("sglang.grpc.scheduler");
 }
 
@@ -299,6 +302,47 @@ impl SglangSchedulerClient {
         Ok(grpc_request)
     }
 
+    /// Build a GenerateRequest from ResponsesRequest (OpenAI Responses API)
+    ///
+    /// NOTE: This is used by the Harmony router only. The Regular router uses
+    /// responses_to_chat() conversion and goes through the chat pipeline.
+    pub fn build_generate_request_from_responses(
+        &self,
+        request_id: String,
+        body: &ResponsesRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        harmony_stop_ids: Option<Vec<u32>>,
+        tool_call_constraint: Option<(String, String)>,
+    ) -> Result<proto::GenerateRequest, String> {
+        // Build sampling params from ResponsesRequest
+        let mut sampling_params =
+            self.build_grpc_sampling_params_from_responses(body, tool_call_constraint)?;
+
+        // Inject Harmony stop token IDs if provided
+        if let Some(stop_ids) = harmony_stop_ids {
+            sampling_params.stop_token_ids = stop_ids;
+        }
+
+        let grpc_request = proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: processed_text,
+                input_ids: token_ids,
+            }),
+            mm_inputs: None, // Responses API doesn't support multimodal yet
+            sampling_params: Some(sampling_params),
+            return_logprob: false, // Responses API uses top_logprobs field instead
+            logprob_start_len: -1,
+            top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
+            return_hidden_states: false,
+            stream: body.stream.unwrap_or(false),
+            ..Default::default()
+        };
+
+        Ok(grpc_request)
+    }
+
     /// Build gRPC SamplingParams from OpenAI request
     fn build_grpc_sampling_params(
         &self,
@@ -395,6 +439,62 @@ impl SglangSchedulerClient {
             0 => Ok(None),
             1 => Ok(constraints.pop()),
             _ => Err("Multiple constraints are not allowed.".to_string()),
+        }
+    }
+
+    /// Build gRPC SamplingParams from ResponsesRequest
+    fn build_grpc_sampling_params_from_responses(
+        &self,
+        request: &ResponsesRequest,
+        tool_call_constraint: Option<(String, String)>,
+    ) -> Result<proto::SamplingParams, String> {
+        // ResponsesRequest doesn't have stop sequences in the same way
+        // For Harmony router: Tools are handled via structural_tag constraints
+
+        let max_new_tokens = request.max_output_tokens.map(|v| v as i32);
+
+        Ok(proto::SamplingParams {
+            temperature: request.temperature.unwrap_or(1.0),
+            top_p: request.top_p.unwrap_or(1.0),
+            top_k: -1,               // ResponsesRequest doesn't expose top_k
+            min_p: 0.0,              // ResponsesRequest doesn't expose min_p
+            frequency_penalty: 0.0,  // ResponsesRequest doesn't expose frequency_penalty
+            presence_penalty: 0.0,   // ResponsesRequest doesn't expose presence_penalty
+            repetition_penalty: 1.0, // ResponsesRequest doesn't expose repetition_penalty
+            max_new_tokens,
+            stop: vec![],               // No stop sequences in Responses API
+            stop_token_ids: vec![],     // Handled by Harmony stop tokens
+            skip_special_tokens: false, // Keep special tokens for Harmony
+            spaces_between_special_tokens: true,
+            ignore_eos: false,
+            no_stop_trim: false,
+            n: 1, // Responses API doesn't support n>1
+            constraint: self.build_constraint_for_responses(tool_call_constraint)?,
+            ..Default::default()
+        })
+    }
+
+    /// Build constraint for Responses API (simpler than Chat API's build_constraint)
+    ///
+    /// Responses API doesn't support response_format, ebnf, or regex constraints,
+    /// so this only handles tool_call_constraint.
+    fn build_constraint_for_responses(
+        &self,
+        tool_call_constraint: Option<(String, String)>,
+    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
+        if let Some((constraint_type, constraint_value)) = tool_call_constraint {
+            let tool_constraint = match constraint_type.as_str() {
+                "structural_tag" => {
+                    proto::sampling_params::Constraint::StructuralTag(constraint_value)
+                }
+                "json_schema" => proto::sampling_params::Constraint::JsonSchema(constraint_value),
+                "ebnf" => proto::sampling_params::Constraint::EbnfGrammar(constraint_value),
+                "regex" => proto::sampling_params::Constraint::Regex(constraint_value),
+                _ => return Err(format!("Unknown constraint type: {}", constraint_type)),
+            };
+            Ok(Some(tool_constraint))
+        } else {
+            Ok(None)
         }
     }
 
