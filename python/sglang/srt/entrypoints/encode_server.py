@@ -122,6 +122,7 @@ class ImageEncoder:
         self.engine = MooncakeTransferEngine(
             hostname=self.local_ip,
             gpu_id=self.gpu_id,
+            ib_device=server_args.disaggregation_ib_device,
         )
 
         self.context = zmq.asyncio.Context(2)
@@ -154,7 +155,7 @@ class ImageEncoder:
             mm_item.set(k, _convert(v))
         mm_embedding = self.model.get_image_feature([mm_item])
         if len(mm_embedding.shape) == 3:
-            mm_embedding = mm_embedding.squeeze(0)
+            mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
         return mm_embedding
 
     def send(
