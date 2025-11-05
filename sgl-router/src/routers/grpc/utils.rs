@@ -273,7 +273,7 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
         .map_err(|e| format!("Failed to serialize tool schema: {}", e))
 }
 
-/// Filter tools based on tool_choice (shared by both routers)
+/// Filter tools based on tool_choice
 /// Returns a reference to the original body if no filtering needed,
 /// otherwise returns a cloned and filtered body
 pub fn filter_tools_for_request(
