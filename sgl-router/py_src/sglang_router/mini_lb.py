@@ -386,14 +386,15 @@ async def handle_generate_request(request_data: dict, raw_request: Request):
     modified_request = request_data.copy()
 
     batch_size = _get_request_batch_size(modified_request)
-    trace_context = _get_trace_context(raw_request)
+    external_trace_header = _get_trace_context(raw_request)
     if batch_size is not None:
         modified_request.update(
             {
                 "bootstrap_host": [hostname] * batch_size,
                 "bootstrap_port": [bootstrap_port] * batch_size,
                 "bootstrap_room": [
-                    _generate_bootstrap_room(trace_context) for _ in range(batch_size)
+                    _generate_bootstrap_room(external_trace_header)
+                    for _ in range(batch_size)
                 ],
             }
         )
@@ -402,7 +403,7 @@ async def handle_generate_request(request_data: dict, raw_request: Request):
             {
                 "bootstrap_host": hostname,
                 "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(trace_context),
+                "bootstrap_room": _generate_bootstrap_room(external_trace_header),
             }
         )
 
@@ -417,7 +418,9 @@ async def handle_generate_request(request_data: dict, raw_request: Request):
 
 
 async def _forward_to_backend(
-    request_data: dict, endpoint_name: str, trace_context: Optional[Dict[str, Any]]
+    request_data: dict,
+    endpoint_name: str,
+    external_trace_header: Optional[Dict[str, Any]],
 ):
     prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
@@ -429,7 +432,7 @@ async def _forward_to_backend(
         {
             "bootstrap_host": hostname,
             "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(trace_context),
+            "bootstrap_room": _generate_bootstrap_room(external_trace_header),
         }
     )
 
@@ -463,11 +466,14 @@ async def handle_completion_request(request_data: dict, raw_request: Request):
     )
 
 
-def _generate_bootstrap_room(trace_context: Optional[Dict[str, Any]]):
+def _generate_bootstrap_room(external_trace_header: Optional[Dict[str, Any]]):
     bootstrap_room = random.randint(0, 2**63 - 1)
     if lb.enable_trace:
         trace_req_start(
-            bootstrap_room, bootstrap_room, role="router", trace_context=trace_context
+            bootstrap_room,
+            bootstrap_room,
+            role="router",
+            external_trace_header=external_trace_header,
         )
         trace_slice_start("mini_lb_launch", bootstrap_room)
     return bootstrap_room
