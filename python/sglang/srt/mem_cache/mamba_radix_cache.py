@@ -402,6 +402,7 @@ class MambaRadixCache(BasePrefixCache):
                 src_index = last_node.mamba_value
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
                 req.mamba_pool_idx = dst_index[0]
+                req.mamba_pool_idx_reserverd = req.mamba_pool_idx
             else:
                 src_index = last_node.mamba_value
                 dst_index = req.mamba_pool_idx.unsqueeze(0)

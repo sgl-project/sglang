@@ -2526,6 +2526,11 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.tree_cache.cache_finished_req(req)
 
+            # For mamba radix cache
+            if req.mamba_pool_idx_reserverd is not None:
+                self.tp_worker.model_runner.req_to_token_pool.mamba_pool.free(
+                    req.mamba_pool_idx_reserverd.unsqueeze(-1)
+                )
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
