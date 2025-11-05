@@ -63,7 +63,7 @@ _is_gfx95_supported = is_gfx95_supported()
 if _use_aiter and _is_gfx95_supported:
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = 128
 
 
 class ScatterMode(Enum):
@@ -559,7 +559,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 and _is_flashinfer_available
                 and hasattr(layernorm, "forward_with_allreduce_fusion")
                 and get_global_server_args().enable_flashinfer_allreduce_fusion
-                and hidden_states.shape[0] <= 4096
+                and hidden_states.shape[0] <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
