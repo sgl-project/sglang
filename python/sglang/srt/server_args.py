@@ -959,30 +959,27 @@ class ServerArgs:
                 quantization_config is not None
                 and quantization_config.get("quant_method") == "mxfp4"
             )
+            if is_mxfp4_quant_format:
+                # use bf16 for mxfp4 triton kernels
+                self.dtype = "bfloat16"
 
-            if is_blackwell_supported() and is_mxfp4_quant_format:
-                self.moe_runner_backend = "flashinfer_mxfp4"
-                logger.warning(
-                    "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
-                )
-            else:
-                if self.moe_runner_backend == "triton_kernel":
-                    assert (
-                        self.ep_size == 1
-                    ), "Triton kernel MoE is only supported when ep_size == 1"
-                if (
-                    self.moe_runner_backend == "auto"
-                    and self.ep_size == 1
-                    and is_triton_kernels_available()
-                ):
+            if self.moe_runner_backend == "auto":
+                if is_blackwell_supported() and is_mxfp4_quant_format:
+                    self.moe_runner_backend = "flashinfer_mxfp4"
+                    logger.warning(
+                        "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                    )
+                elif self.ep_size == 1 and is_triton_kernels_available():
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
                         "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
                     )
+
+            if self.moe_runner_backend == "triton_kernel":
+                assert (
+                    self.ep_size == 1
+                ), "Triton kernel MoE is only supported when ep_size == 1"
             self.disable_hybrid_swa_memory = True
-            if is_mxfp4_quant_format:
-                # use bf16 for mxfp4 triton kernels
-                self.dtype = "bfloat16"
 
         elif "Llama4" in model_arch and self.device != "cpu":
             assert self.attention_backend in {
