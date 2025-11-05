@@ -40,7 +40,7 @@ impl ChatPreparationStage {
         request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
         // Step 1: Filter tools if needed
-        let body_ref = utils::filter_tools_for_request(request);
+        let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
         // Step 2: Process messages and apply chat template
         let processed_messages =
