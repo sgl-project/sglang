@@ -52,7 +52,7 @@ use crate::{
     data_connector::{ResponseId, ResponseStorage},
     mcp::{self, McpManager},
     protocols::{
-        common::{Function, ToolCall, Usage},
+        common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
             McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
             ResponseOutputItem, ResponseReasoningContent, ResponseStatus, ResponseTool,
@@ -467,15 +467,6 @@ async fn execute_without_mcp_loop(
 /// - Calls `streaming::process_responses_iteration_stream()` for per-iteration events
 /// - Emits `response.completed` at end
 /// - Handles errors with `response.failed`
-///
-/// # Arguments
-///
-/// * `ctx` - Harmony responses context with pipeline and dependencies
-/// * `request` - Responses API request
-///
-/// # Returns
-///
-/// SSE stream response with proper headers
 pub async fn serve_harmony_responses_stream(
     ctx: &HarmonyResponsesContext,
     request: ResponsesRequest,
@@ -504,6 +495,9 @@ pub async fn serve_harmony_responses_stream(
         .unwrap()
         .as_secs();
     let mut emitter = ResponseStreamEventEmitter::new(response_id.clone(), model, created_at);
+
+    // Set original request for complete response fields
+    emitter.set_original_request(current_request.clone());
 
     // Clone context for spawned task
     let ctx_clone = ctx.clone();
@@ -717,8 +711,8 @@ async fn execute_mcp_tool_loop_streaming(
                     // Emit response.completed with incomplete_details and usage
                     let incomplete_details = json!({ "reason": "max_tool_calls" });
                     let usage_json = json!({
-                        "prompt_tokens": usage.prompt_tokens,
-                        "completion_tokens": usage.completion_tokens,
+                        "input_tokens": usage.prompt_tokens,
+                        "output_tokens": usage.completion_tokens,
                         "total_tokens": usage.total_tokens,
                         "incomplete_details": incomplete_details,
                     });
@@ -773,8 +767,8 @@ async fn execute_mcp_tool_loop_streaming(
 
                 // Emit response.completed with usage
                 let usage_json = json!({
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
+                    "input_tokens": usage.prompt_tokens,
+                    "output_tokens": usage.completion_tokens,
                     "total_tokens": usage.total_tokens,
                 });
                 let event = emitter.emit_completed(Some(&usage_json));
@@ -815,19 +809,34 @@ async fn execute_without_mcp_streaming(
     };
 
     // Process stream (emits all output items during streaming - function tool path emits function_call_arguments.* events)
-    if let Err(err_msg) = HarmonyStreamingProcessor::process_responses_iteration_stream_function(
-        execution_result,
-        emitter,
-        tx,
-    )
-    .await
-    {
-        emitter.emit_error(&err_msg, Some("processing_error"), tx);
-        return;
-    }
+    let iteration_result =
+        match HarmonyStreamingProcessor::process_responses_iteration_stream_function(
+            execution_result,
+            emitter,
+            tx,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err_msg) => {
+                emitter.emit_error(&err_msg, Some("processing_error"), tx);
+                return;
+            }
+        };
 
-    // Emit response.completed
-    let event = emitter.emit_completed(None);
+    // Extract usage from iteration result
+    let usage = match iteration_result {
+        ResponsesIterationResult::ToolCallsFound { usage, .. } => usage,
+        ResponsesIterationResult::Completed { usage, .. } => usage,
+    };
+
+    // Emit response.completed with usage
+    let usage_json = json!({
+        "input_tokens": usage.prompt_tokens,
+        "output_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    });
+    let event = emitter.emit_completed(Some(&usage_json));
     emitter.send_event_best_effort(&event, tx);
 }
 
@@ -1171,6 +1180,11 @@ fn build_next_request_with_tools(
     // Update request with new items
     request.input = ResponseInput::Items(items);
 
+    // Switch tool_choice to "auto" for subsequent iterations
+    // This prevents infinite loops when original tool_choice was "required" or specific function
+    // After receiving tool results, the model should be free to decide whether to call more tools or finish
+    request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+
     Ok(request)
 }
 
@@ -1196,14 +1210,6 @@ struct ToolResult {
 ///
 /// Converts MCP Tool entries (from rmcp SDK) to ResponseTool format so the model
 /// knows about available MCP tools when making tool calls.
-///
-/// # Arguments
-///
-/// * `mcp_tools` - MCP tools from the MCP manager inventory (rmcp::model::Tool)
-///
-/// # Returns
-///
-/// Vector of ResponseTool entries in MCP format
 pub fn convert_mcp_tools_to_response_tools(mcp_tools: &[mcp::Tool]) -> Vec<ResponseTool> {
     mcp_tools
         .iter()

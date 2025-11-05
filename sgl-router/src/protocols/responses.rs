@@ -447,6 +447,7 @@ fn default_top_p() -> Option<f32> {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[validate(schema(function = "validate_responses_cross_parameters"))]
 pub struct ResponsesRequest {
     /// Run the request in the background
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -718,6 +719,83 @@ pub fn validate_conversation_id(conv_id: &str) -> Result<(), validator::Validati
         )));
         return Err(error);
     }
+    Ok(())
+}
+
+/// Schema-level validation for cross-field dependencies
+fn validate_responses_cross_parameters(
+    request: &ResponsesRequest,
+) -> Result<(), validator::ValidationError> {
+    use super::common::{ToolChoice, ToolReference};
+
+    // Only validate if both tools and tool_choice are present
+    if let (Some(tools), Some(tool_choice)) = (&request.tools, &request.tool_choice) {
+        // Extract function tool names from ResponseTools
+        let function_tool_names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| match t.r#type {
+                ResponseToolType::Function => t.function.as_ref().map(|f| f.name.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        match tool_choice {
+            ToolChoice::Function { function, .. } => {
+                // Validate the specific function exists
+                if !function_tool_names.contains(&function.name.as_str()) {
+                    let mut e = validator::ValidationError::new("tool_choice_function_not_found");
+                    e.message = Some(
+                        format!(
+                            "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
+                            function.name
+                        )
+                        .into(),
+                    );
+                    return Err(e);
+                }
+            }
+            ToolChoice::AllowedTools {
+                mode,
+                tools: allowed_tools,
+                ..
+            } => {
+                // Validate mode is "auto" or "required"
+                if mode != "auto" && mode != "required" {
+                    let mut e = validator::ValidationError::new("tool_choice_invalid_mode");
+                    e.message = Some(
+                        format!(
+                            "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{}'.",
+                            mode
+                        )
+                        .into(),
+                    );
+                    return Err(e);
+                }
+
+                // Validate that all function tool references exist
+                for tool_ref in allowed_tools {
+                    if let ToolReference::Function { name } = tool_ref {
+                        if !function_tool_names.contains(&name.as_str()) {
+                            let mut e =
+                                validator::ValidationError::new("tool_choice_tool_not_found");
+                            e.message = Some(
+                                format!(
+                                    "Invalid value for 'tool_choice.tools': tool '{}' not found in 'tools'.",
+                                    name
+                                )
+                                .into(),
+                            );
+                            return Err(e);
+                        }
+                    }
+                    // Note: MCP and hosted tools don't need existence validation here
+                    // as they are resolved dynamically at runtime
+                }
+            }
+            _ => {}
+        }
+    }
+
     Ok(())
 }
 
