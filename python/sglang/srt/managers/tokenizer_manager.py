@@ -1764,13 +1764,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         # Inference time calculation.
         if (
-            hasattr(recv_obj, "inference_start_time")
-            and recv_obj.inference_start_time
-            and recv_obj.inference_start_time[i] is not None
+            hasattr(recv_obj, "forward_entry_time")
+            and recv_obj.forward_entry_time
+            and recv_obj.forward_entry_time[i] is not None
             and state.finished_time_perf > 0.0
         ):
-            inference_time = state.finished_time_perf - recv_obj.inference_start_time[i]
-            meta_info["inference_time"] = inference_time
+            forward_time = state.finished_time_perf - recv_obj.forward_entry_time[i]
+            meta_info["forward_time"] = forward_time
 
         # Decode throughput, time per token calculation. Only calculated if TTFT is available.
         if (

@@ -275,6 +275,7 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
             req.spec_verify_ct += 1
+            req.spec_accepted_tokens += accept_lens[i] - 1
 
         return predict_tokens
 
@@ -761,7 +762,7 @@ class SchedulerOutputProcessorMixin:
         output_hidden_states = None
 
         queue_times = []
-        inference_start_times = []
+        forward_entry_times = []
         prefill_delays = []
         prefill_latencies = []
 
@@ -867,7 +868,7 @@ class SchedulerOutputProcessorMixin:
                 retraction_counts.append(req.retraction_count)
 
                 queue_times.append(req.time_stats.get_queueing_time())
-                inference_start_times.append(req.time_stats.forward_entry_time)
+                forward_entry_times.append(req.time_stats.forward_entry_time)
 
                 if req.time_stats.prefill_start_time > 0.0:
                     prefill_delays.append(
@@ -982,7 +983,7 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct,
                     spec_accepted_tokens,
                     queue_times,
-                    inference_start_times,
+                    forward_entry_times,
                     prefill_delays,
                     prefill_latencies,
                     finished_reasons,
@@ -1027,7 +1028,7 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         cached_tokens = []
         queue_times = []
-        inference_start_times = []
+        forward_entry_times = []
         prefill_delays = []
         prefill_latencies = []
         retraction_counts = []
@@ -1041,7 +1042,7 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens.append(req.cached_tokens)
 
                 queue_times.append(req.time_stats.get_queueing_time())
-                inference_start_times.append(req.time_stats.forward_entry_time)
+                forward_entry_times.append(req.time_stats.forward_entry_time)
 
                 if req.time_stats.prefill_start_time > 0.0:
                     prefill_delays.append(
@@ -1065,7 +1066,7 @@ class SchedulerOutputProcessorMixin:
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 queue_time=queue_times,
-                inference_start_time=inference_start_times,
+                forward_entry_time=forward_entry_times,
                 prefill_delay=prefill_delays,
                 prefill_latency=prefill_latencies,
                 finished_reasons=finished_reasons,

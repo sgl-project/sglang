@@ -250,10 +250,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return BatchStrOutput(
             rids=recv_obj.rids,
-            queue_time=recv_obj.queue_time,
-            inference_start_time=recv_obj.inference_start_time,
-            prefill_delay=recv_obj.prefill_delay,
-            prefill_latency=recv_obj.prefill_latency,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
@@ -281,6 +277,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
+            queue_time=recv_obj.queue_time,
+            forward_entry_time=recv_obj.forward_entry_time,
+            prefill_delay=recv_obj.prefill_delay,
+            prefill_latency=recv_obj.prefill_latency,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
@@ -296,7 +296,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             queue_time=recv_obj.queue_time,
-            inference_start_time=recv_obj.inference_start_time,
+            forward_entry_time=recv_obj.forward_entry_time,
             prefill_delay=recv_obj.prefill_delay,
             prefill_latency=recv_obj.prefill_latency,
         )

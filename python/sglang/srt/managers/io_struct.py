@@ -71,16 +71,27 @@ class RequestTimingMetricsMixin:
     """
 
     # Queue duration: time spent waiting in queue before request is scheduled.
-    queue_time: List[Optional[float]]
+    queue_time: Optional[List[Optional[float]]]
 
-    # Inference start time: timestamp when inference computation begins (start of prefill).
-    inference_start_time: List[Optional[float]]
+    # Forward entry time: timestamp when the request enters the forward pass stage.
+    # This corresponds to `forward_entry_time` in TimeStats.
+    # In different modes:
+    #   - Unified/PD-colocate: timestamp when forward computation begins (covers prefill + decode)
+    #   - Prefill instance (P): timestamp when prefill forward pass begins
+    #   - Decode instance (D): timestamp when decode forward pass begins
+    # Note: This is NOT the same as prefill_start_time. There may be a delay between
+    # forward_entry_time and prefill_start_time (see prefill_delay).
+    forward_entry_time: Optional[List[Optional[float]]]
 
-    # Prefill delay: time spent waiting before prefill starts
-    prefill_delay: List[Optional[float]]
+    # Prefill delay: time spent waiting between forward entry and prefill start.
+    # Calculated as: prefill_start_time - forward_entry_time
+    # This represents the delay between when the request enters the forward stage
+    # and when prefill computation actually begins.
+    prefill_delay: Optional[List[Optional[float]]]
 
-    # Prefill latency: time spent during prefill computation
-    prefill_latency: List[Optional[float]]
+    # Prefill latency: time spent during prefill computation.
+    # Calculated as: prefill_end_time - prefill_start_time
+    prefill_latency: Optional[List[Optional[float]]]
 
 
 @dataclass

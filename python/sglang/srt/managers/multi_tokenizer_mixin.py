@@ -90,6 +90,7 @@ def _handle_output_by_index(output, i):
     """NOTE: A maintainable method is better here."""
     if isinstance(output, BatchTokenIDOutput):
         new_output = BatchTokenIDOutput(
+            rids=[output.rids[i]],
             spec_verify_ct=(
                 [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
             ),
@@ -99,9 +100,9 @@ def _handle_output_by_index(output, i):
                 else None
             ),
             queue_time=[output.queue_time[i]] if len(output.queue_time) > i else None,
-            inference_start_time=(
-                [output.inference_start_time[i]]
-                if len(output.inference_start_time) > i
+            forward_entry_time=(
+                [output.forward_entry_time[i]]
+                if len(output.forward_entry_time) > i
                 else None
             ),
             prefill_delay=(
@@ -224,7 +225,6 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             token_steps=([output.token_steps[i]] if output.token_steps else None),
-            rids=[output.rids[i]],
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
@@ -246,6 +246,7 @@ def _handle_output_by_index(output, i):
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
+            rids=[output.rids[i]],
             spec_verify_ct=(
                 [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
             ),
@@ -255,9 +256,9 @@ def _handle_output_by_index(output, i):
                 else None
             ),
             queue_time=[output.queue_time[i]] if len(output.queue_time) > i else None,
-            inference_start_time=(
-                [output.inference_start_time[i]]
-                if len(output.inference_start_time) > i
+            forward_entry_time=(
+                [output.forward_entry_time[i]]
+                if len(output.forward_entry_time) > i
                 else None
             ),
             prefill_delay=(
@@ -368,7 +369,6 @@ def _handle_output_by_index(output, i):
                 else None
             ),
             token_steps=([output.token_steps[i]] if output.token_steps else None),
-            rids=[output.rids[i]],
         )
     elif isinstance(output, BatchMultimodalOutput):
         new_output = BatchMultimodalOutput(
