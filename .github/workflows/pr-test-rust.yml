@@ -157,6 +157,16 @@ jobs:
           cache-all-crates: true
           cache-on-failure: true
 
+      - name: Cache router build
+        uses: actions/cache@v4
+        with:
+          path: |
+            sgl-router/target
+            sgl-router/.venv
+          key: ${{ runner.os }}-router-${{ hashFiles('sgl-router/Cargo.lock', 'sgl-router/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-router-
+
       - name: Install SGLang dependencies
         run: |
           sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
@@ -226,6 +236,16 @@ jobs:
           cache-all-crates: true
           cache-on-failure: true
 
+      - name: Cache router build
+        uses: actions/cache@v4
+        with:
+          path: |
+            sgl-router/target
+            sgl-router/.venv
+          key: ${{ runner.os }}-router-${{ hashFiles('sgl-router/Cargo.lock', 'sgl-router/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-router-
+
       - name: Install SGLang dependencies
         run: |
           sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
@@ -267,13 +287,12 @@ jobs:
           python3 -m venv .venv
           source .venv/bin/activate
           python -m pip install --upgrade pip maturin
-          maturin develop --release --features vendored-openssl
+          maturin develop --release --profile ci --features vendored-openssl
 
       - name: Run Python E2E response API tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
-          source .venv/bin/activate
           source "$HOME/.cargo/env"
           SHOW_ROUTER_LOGS=1 pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
 
@@ -281,7 +300,6 @@ jobs:
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
-          source .venv/bin/activate
           source "$HOME/.cargo/env"
           SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
 
