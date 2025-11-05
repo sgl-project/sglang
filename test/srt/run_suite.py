@@ -125,6 +125,7 @@ suites = {
         TestFile("test_torch_compile_moe.py", 210),
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_torchao.py", 70),
+        TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_moe_channel_fp8_kernel.py", 25),
@@ -218,6 +219,7 @@ suites = {
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
         TestFile("cpu/test_comm.py"),
+        TestFile("test_deepseek_v3_cutedsl_4gpu.py"),
         TestFile("entrypoints/http_server/test_abort_request.py"),
         TestFile("ep/test_deepep_internode.py"),
         TestFile("ep/test_deepep_intranode.py"),
@@ -371,9 +373,9 @@ suites = {
 suite_amd = {
     "per-commit-amd": [
         TestFile("function_call/test_json_schema_constraint.py", 1),
-        TestFile("hicache/test_hicache.py", 116),
-        TestFile("hicache/test_hicache_mla.py", 127),
-        TestFile("hicache/test_hicache_storage.py", 127),
+        # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
+        # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
+        # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         TestFile("lora/test_lora.py", 150),
         TestFile("lora/test_lora_backend.py", 99),
         TestFile("lora/test_lora_cuda_graph.py", 250),
@@ -384,8 +386,9 @@ suite_amd = {
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
-        TestFile("openai_server/basic/test_openai_embedding.py", 79),
-        TestFile("openai_server/basic/test_openai_server.py", 270),
+        TestFile("models/test_vlm_models.py", 437),
+        TestFile("openai_server/basic/test_openai_embedding.py", 141),
+        TestFile("openai_server/basic/test_openai_server.py", 149),
         TestFile("openai_server/basic/test_protocol.py", 10),
         TestFile("openai_server/basic/test_serving_chat.py", 10),
         TestFile("openai_server/basic/test_serving_completions.py", 10),
@@ -408,14 +411,15 @@ suite_amd = {
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_function_call_parser.py", 10),
-        TestFile("test_fused_moe.py", 80),
+        TestFile("test_fused_moe.py", 30),
+        TestFile("test_harmony_parser.py", 20),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 242),
-        TestFile("test_mla_deepseek_v3.py", 221),
+        # TestFile("test_mla_deepseek_v3.py", 221), # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 180),
@@ -432,9 +436,12 @@ suite_amd = {
         TestFile("test_torch_compile.py", 169),
         TestFile("test_torch_compile_moe.py", 210),
         TestFile("test_torch_native_attention_backend.py", 123),
-        TestFile("test_triton_attention_backend.py", 250),
+        # TestFile("test_triton_attention_kernels.py", 4),
+        TestFile("test_triton_attention_backend.py", 150),
+        TestFile("test_triton_sliding_window.py", 250),
         TestFile("test_wave_attention_kernels.py", 2),
         # Disabled temporarily
+        # TestFile("test_vlm_input_format.py", 300),
         # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
         # TestFile("rl/test_update_weights_from_tensor.py", 48),
