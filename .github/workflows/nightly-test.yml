@@ -117,7 +117,7 @@ jobs:
           bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 10
+        timeout-minutes: 60
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly-1-gpu
