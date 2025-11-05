@@ -1,57 +1,10 @@
-"""
-python3 -m unittest test_regex_constrained.TestRegexConstrained.test_regex_generate_email
-python3 -m unittest test_regex_constrained.TestRegexConstrained.test_regex_generate_greeting
-python3 -m unittest test_regex_constrained.TestRegexConstrainedLLGuidance.test_regex_generate_email
-python3 -m unittest test_regex_constrained.TestRegexConstrainedLLGuidance.test_regex_generate_greeting
-"""
-
 import json
-import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
 
-
-def setup_class(cls, backend: str, disable_overlap: bool):
-    cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-    cls.base_url = DEFAULT_URL_FOR_TEST
-
-    other_args = [
-        "--max-running-requests",
-        "10",
-        "--grammar-backend",
-        backend,
-    ]
-
-    if disable_overlap:
-        other_args += ["--disable-overlap-schedule"]
-
-    cls.process = popen_launch_server(
-        cls.model,
-        cls.base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
-    )
-
-
-class TestRegexConstrained(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, "xgrammar", disable_overlap=False)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def run_decode(
+class TestRegexConstrainedMixin:
+    def _run_decode_regex(
         self,
         regex,
         prompt,
@@ -100,7 +53,7 @@ class TestRegexConstrained(CustomTestCase):
         pattern = r"^user@example\.com$"
         prompt = "Generate an email address:"
 
-        self.run_decode(
+        self._run_decode_regex(
             regex=pattern,
             prompt=prompt,
             n=3,
@@ -110,7 +63,7 @@ class TestRegexConstrained(CustomTestCase):
         pattern = r"^(Hello|Hi|Hey)$"
         prompt = "Generate a greeting:"
 
-        self.run_decode(
+        self._run_decode_regex(
             regex=pattern,
             prompt=prompt,
             n=3,
@@ -120,7 +73,7 @@ class TestRegexConstrained(CustomTestCase):
         pattern = r"^\d{3}$"
         prompt = "Generate a three-digit number:"
 
-        self.run_decode(
+        self._run_decode_regex(
             regex=pattern,
             prompt=prompt,
             n=3,
@@ -130,7 +83,7 @@ class TestRegexConstrained(CustomTestCase):
         pattern = r"^\(\d{3}\) \d{3}-\d{4}$"
         prompt = "Generate a phone number:"
 
-        self.run_decode(
+        self._run_decode_regex(
             regex=pattern,
             prompt=prompt,
             n=3,
@@ -140,7 +93,7 @@ class TestRegexConstrained(CustomTestCase):
         pattern = r"^2024-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"
         prompt = "Generate a date in YYYY-MM-DD format:"
 
-        self.run_decode(
+        self._run_decode_regex(
             regex=pattern,
             prompt=prompt,
             n=3,
@@ -150,7 +103,7 @@ class TestRegexConstrained(CustomTestCase):
         pattern = r"^#[0-9A-F]{6}$"
         prompt = "Generate a hex color code:"
 
-        self.run_decode(
+        self._run_decode_regex(
             regex=pattern,
             prompt=prompt,
             n=3,
@@ -160,7 +113,7 @@ class TestRegexConstrained(CustomTestCase):
         pattern = r'^\{\s*"name"\s*:\s*"[a-zA-Z0-9 ]+"\s*,\s*"age"\s*:\s*[1-9][0-9]*\s*,\s*"city"\s*:\s*"[a-zA-Z0-9 ]+"\s*\}$'
         prompt = "Generate a simple JSON with name, age, and city:"
 
-        self.run_decode(
+        self._run_decode_regex(
             regex=pattern,
             prompt=prompt,
             n=3,
@@ -170,18 +123,8 @@ class TestRegexConstrained(CustomTestCase):
         pattern = r"^\[2024-01-01T12:00:00Z\] INFO: System\.process - Operation [a-z]+ successfully$"
         prompt = "Generate a log entry:"
 
-        self.run_decode(
+        self._run_decode_regex(
             regex=pattern,
             prompt=prompt,
             n=3,
         )
-
-
-class TestRegexConstrainedLLGuidance(TestRegexConstrained):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, "llguidance", disable_overlap=True)
-
-
-if __name__ == "__main__":
-    unittest.main()

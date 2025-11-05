@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
@@ -20,7 +20,7 @@ def get_cute_dtype(input: torch.Tensor) -> str:
 
 
 def flashinfer_cutedsl_moe_masked(
-    hidden_states: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+    hidden_states: tuple[torch.Tensor, Optional[torch.Tensor]],
     input_global_scale: torch.Tensor,
     w1: torch.Tensor,
     w1_blockscale: torch.Tensor,
@@ -40,7 +40,7 @@ def flashinfer_cutedsl_moe_masked(
 
     Args:
         hidden_states: Either of the following case
-            * torch.Tensor: [num_experts, m, k], bf16
+            * tuple[torch.Tensor, None]: [num_experts, m, k], bf16, None means no quant
             * tuple[torch.Tensor, torch.Tensor]: [num_experts, m, k // 2], uint8, [num_experts, m, k // 16], float8_e4m3fn
         input_global_scale (torch.Tensor): (l,)
         w1 (torch.Tensor): fp4 weights, [l, 2 * n, k // 2], uint8
@@ -74,21 +74,21 @@ def flashinfer_cutedsl_moe_masked(
     assert (
         w2_alpha.dtype == torch.float32
     ), f"w2_alpha must be float32, got {w2_alpha.dtype}"
+    assert (
+        len(hidden_states) == 2
+    ), f"hidden_states must be a tuple of length 2, got {len(hidden_states)}"
 
     # === Assertions on shapes ===
     n = w2.shape[-1] * 2  # intermediate dimension
 
-    if isinstance(hidden_states, tuple):
-        assert (
-            input_global_scale is None
-        ), "input_global_scale is needed when input needs quant"
+    if hidden_states[1] is not None:
 
         a_q = hidden_states[0].view(torch.uint8)
         a_q_sf = hidden_states[1].view(torch.float8_e4m3fn)
         m, k_by_2, num_experts = a_q.shape
         k = k_by_2 * 2
     else:
-        num_experts, m, k = hidden_states.shape
+        num_experts, m, k = hidden_states[0].shape
 
         assert (
             input_global_scale.dtype == torch.float32
@@ -98,7 +98,7 @@ def flashinfer_cutedsl_moe_masked(
         ), f"input_global_scale must be (l,), got {input_global_scale.shape}"
 
         a_q, a_q_sf = scaled_fp4_grouped_quant(
-            hidden_states,
+            hidden_states[0],
             input_global_scale,
             masked_m,
         )
