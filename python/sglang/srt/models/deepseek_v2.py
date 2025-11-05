@@ -1191,7 +1191,11 @@ class DeepseekV2MoE(nn.Module):
             ),  # block_size
             True,  # is_vnni
         )
-        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
+        if (
+            self.tp_size > 1
+            and not get_forward().fuse_mlp_allreduce
+            and not get_forward().mlp_reduce_scatter
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 

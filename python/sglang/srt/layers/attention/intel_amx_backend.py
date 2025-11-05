@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -38,7 +39,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.swa_out_cache_loc = None
 
         self.num_head = (
-            model_runner.model_config.num_attention_heads // model_runner.ps.tp_size
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
 
         # [NB]: `layer_id` set to 0 for qwen3-next models, as not all attn layers require kv pool

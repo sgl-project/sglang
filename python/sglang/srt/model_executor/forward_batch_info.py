@@ -52,6 +52,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
+    is_cpu,
     is_cuda,
     is_hip,
     is_npu,
@@ -73,6 +74,7 @@ if TYPE_CHECKING:
 _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 
 class ForwardMode(IntEnum):
@@ -1319,8 +1321,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
-        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
-        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
+        global_num_tokens_pinned = torch.tensor(
+            global_num_tokens, pin_memory=not _is_cpu
+        )
+        self.global_num_tokens_gpu.copy_(
+            global_num_tokens_pinned, non_blocking=not _is_cpu
+        )
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
@@ -1341,8 +1347,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.lora_ids is not None:
             self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
+        from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
+
         seq_len_fill_value = (
-            model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+            model_runner.attn_backend.get_cpu_graph_seq_len_fill_value()
+            if isinstance(model_runner.attn_backend, IntelAMXAttnBackend)
+            else model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         # Keep gpu_only batches sync-free: leave seq_lens_sum None and let the
         # attention backend over-allocate from an upper bound (see #26738).
