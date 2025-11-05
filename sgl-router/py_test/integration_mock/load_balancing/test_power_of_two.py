@@ -62,9 +62,15 @@ def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
         except Exception:
             pass
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
-        list(ex.map(_direct_load, range(128)))
-    time.sleep(1)
+    # Start background load in a non-blocking way to keep slow worker busy
+    background_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    background_futures = []
+    for i in range(32):
+        future = background_executor.submit(_direct_load, i)
+        background_futures.append(future)
+
+    # Wait longer for the load monitor to update (at least 2 monitor intervals)
+    time.sleep(3)
 
     def call(i):
         r = requests.post(
@@ -84,6 +90,9 @@ def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
         for wid in ex.map(call, range(200)):
             counts[wid] += 1
+
+    # Clean up background executor
+    background_executor.shutdown(wait=False)
 
     # Expect the slow worker (higher latency/inflight) to receive fewer requests
     fast_worker_id = [i for i in ids if i != slow_id][0]
