@@ -179,7 +179,6 @@ class TestHarmonyBackend(StateManagementTests, MCPTests, FunctionCallingBaseTest
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
 
-    @unittest.skip("TODO: Not implemented for OSS models")
     def test_previous_response_id_chaining(self):
         super().test_previous_response_id_chaining()
 
