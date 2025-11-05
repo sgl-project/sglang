@@ -1334,7 +1334,9 @@ async def sagemaker_chat_completions(
 @app.post("/embedding_bootstrap")
 async def embedding_bootstrap(request_data: dict):
     buffer_address = await _global_state.tokenizer_manager.allocate_embedding_buffer(
-        request_data["req_id"], request_data["embedding_length"]
+        request_data["req_id"],
+        request_data["embedding_length"],
+        request_data["embedding_dim"],
     )
     session_id = _global_state.tokenizer_manager.embeddings_engine.session_id
     return ORJSONResponse(

@@ -167,6 +167,7 @@ class ImageEncoder:
                 {
                     "embedding_size": mm_embedding.nbytes,
                     "embedding_len": mm_embedding.shape[0],
+                    "embedding_dim": mm_embedding.shape[1],
                 }
             )
             return request_data

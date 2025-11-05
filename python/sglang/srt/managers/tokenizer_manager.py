@@ -573,9 +573,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         return "batch_strings"
 
-    async def allocate_embedding_buffer(self, req_id, embedding_length):
+    async def allocate_embedding_buffer(self, req_id, embedding_length, embedding_dim):
         embeddings = torch.zeros(
-            (embedding_length, self.model_config.hidden_size),
+            (embedding_length, embedding_dim),
             dtype=self.model_config.dtype,
         )
         self.embeddings_engine.register(
