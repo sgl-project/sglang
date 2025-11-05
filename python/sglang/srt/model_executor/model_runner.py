@@ -1166,6 +1166,13 @@ class ModelRunner:
         flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
         metadata = flattened_tensor_bucket_dict["metadata"]
 
+        # move to correct device
+        self.device_module = torch.get_device_module(self.device)
+        infered_device = self.device_module.current_device()
+        flattened_tensor = _unwrap_tensor(
+            flattened_tensor, tp_rank=self.tp_rank, device=infered_device
+        )
+
         # Convert metadata dict to our format
         converted_metadata = []
         for meta in metadata:
