@@ -806,6 +806,8 @@ def get_benchmark_args(
     device="auto",
     pd_separated: bool = False,
     lora_name=None,
+    lora_request_distribution="uniform",
+    lora_zipf_alpha=1.5,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -834,6 +836,8 @@ def get_benchmark_args(
         apply_chat_template=False,
         profile=None,
         lora_name=lora_name,
+        lora_request_distribution=lora_request_distribution,
+        lora_zipf_alpha=lora_zipf_alpha,
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
