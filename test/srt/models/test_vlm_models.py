@@ -8,7 +8,7 @@ import sys
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -17,15 +17,16 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+_is_hip = is_hip()
 # VLM models for testing
-MODELS = [
-    SimpleNamespace(model="google/gemma-3-27b-it", mmmu_accuracy=0.45),
-    SimpleNamespace(
-        model="Qwen/Qwen2.5-VL-3B-Instruct",
-        mmmu_accuracy=0.4,
-    ),
-    SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
-]
+if _is_hip:
+    MODELS = [SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4)]
+else:
+    MODELS = [
+        SimpleNamespace(model="google/gemma-3-27b-it", mmmu_accuracy=0.45),
+        SimpleNamespace(model="Qwen/Qwen2.5-VL-3B-Instruct", mmmu_accuracy=0.4),
+        SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
+    ]
 
 # Set default mem_fraction_static to 0.8
 DEFAULT_MEM_FRACTION_STATIC = 0.8
@@ -145,6 +146,8 @@ class TestVLMModels(CustomTestCase):
             process_env = os.environ.copy()
             if custom_env:
                 process_env.update(custom_env)
+            # if test vlm with cuda_ipc feature, open this env_var
+            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
             # Prepare stdout/stderr redirection if needed
             stdout_file = None

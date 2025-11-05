@@ -145,6 +145,7 @@ async fn try_http_health_check(
         .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
+        .and_then(reqwest::Response::error_for_status)
         .map_err(|e| format!("Health check failed: {}", e))?;
 
     Ok(())
@@ -820,7 +821,29 @@ impl StepExecutor for ActivateWorkerStep {
 /// Note: Actual health check timeouts and retry attempts are configured per-worker
 /// via WorkerConfigRequest (populated from router config). The timeouts and retry
 /// policies here serve as workflow-level bounds to prevent infinite waiting.
-pub fn create_worker_registration_workflow() -> WorkflowDefinition {
+///
+/// # Arguments
+/// * `router_config` - Router configuration containing health check settings
+pub fn create_worker_registration_workflow(
+    router_config: &crate::config::RouterConfig,
+) -> WorkflowDefinition {
+    // Use health check timeout from config with 30 second buffer as workflow-level upper bound
+    let detect_timeout = Duration::from_secs(router_config.health_check.timeout_secs + 30);
+
+    // Calculate max_attempts to match the detect_timeout
+    // With Linear backoff (increment 1s, max 5s):
+    // - Attempts 1-5: 0s, 1s, 2s, 3s, 4s = 10s total
+    // - Attempts 6+: 5s each
+    // max_attempts = 5 + (timeout_seconds - 10) / 5
+    // Use 90% of timeout to leave buffer for actual connection attempts
+    let timeout_secs = detect_timeout.as_secs() as f64;
+    let effective_timeout = timeout_secs * 0.9;
+    let max_attempts = if effective_timeout > 10.0 {
+        (5 + ((effective_timeout - 10.0) / 5.0).ceil() as u32).max(3)
+    } else {
+        3
+    };
+
     WorkflowDefinition::new("worker_registration", "Worker Registration")
         .add_step(
             StepDefinition::new(
@@ -829,14 +852,14 @@ pub fn create_worker_registration_workflow() -> WorkflowDefinition {
                 Arc::new(DetectConnectionModeStep),
             )
             .with_retry(RetryPolicy {
-                max_attempts: 100,
+                max_attempts,
                 backoff: BackoffStrategy::Linear {
                     increment: Duration::from_secs(1),
                     max: Duration::from_secs(5),
                 },
             })
-            // Workflow-level timeout (upper bound); step uses config.health_check_timeout_secs
-            .with_timeout(Duration::from_secs(7200)) // 2 hours max
+            // Workflow-level timeout uses configured health check timeout + buffer
+            .with_timeout(detect_timeout)
             .with_failure_action(FailureAction::FailWorkflow),
         )
         .add_step(

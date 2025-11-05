@@ -98,7 +98,10 @@ def execute_sbo(
         ):
             forward_shared_experts()
 
-    hidden_states = experts.dispatcher.combine(combine_input=combine_input)
+    hidden_states = experts.dispatcher.combine(
+        combine_input=combine_input,
+        overlap_args=combine_overlap_args,
+    )
 
     return hidden_states
 

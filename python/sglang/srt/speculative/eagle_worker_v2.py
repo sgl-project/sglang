@@ -4,9 +4,9 @@ import time
 from typing import List, Optional, Tuple
 
 import torch
-from torch.cuda import Stream as CudaStream
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -38,18 +38,21 @@ from sglang.srt.utils.common import (
     empty_context,
     fast_topk,
     get_available_gpu_memory,
+    is_npu,
     next_power_of_2,
 )
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
 
 def _get_plan_stream(
     device: str,
-) -> Tuple[Optional[CudaStream], contextlib.AbstractContextManager]:
+) -> Tuple[any, contextlib.AbstractContextManager]:
     if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-        plan_stream: CudaStream = torch.get_device_module(device).Stream()
-        plan_stream_ctx = torch.cuda.stream(plan_stream)
+        plan_stream = torch.get_device_module(device).Stream()
+        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
         return plan_stream, plan_stream_ctx
     else:
         return None, contextlib.nullcontext()
@@ -99,7 +102,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        with empty_context():
+        with empty_context(), speculative_moe_backend_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -125,7 +128,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(self.draft_runner.tp_group):
+        with self.draft_tp_context(
+            self.draft_runner.tp_group
+        ), speculative_moe_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -206,7 +211,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if self.server_args.disable_cuda_graph or _is_npu:
             return
 
         # Capture draft
@@ -456,7 +461,9 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
         if self.plan_stream:
-            torch.cuda.current_stream().wait_stream(self.plan_stream)
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
 
         # Run draft extend batch in the main compute stream
         draft_logits_output = self.draft_runner.model.forward(
@@ -577,7 +584,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
-        batch.seq_lens.record_stream(torch.cuda.current_stream())
+        batch.seq_lens.record_stream(
+            torch.get_device_module(self.device).current_stream()
+        )
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
@@ -596,7 +605,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:
-            torch.cuda.current_stream().wait_stream(self.plan_stream)
+            torch.get_device_module().current_stream().wait_stream(self.plan_stream)
 
             # Some values such as custom_mask and position depend on the output of draft,
             # so the previous plan step used the wrong values. Here, we need to run the related
@@ -628,7 +637,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_length
-        verify_done = torch.cuda.Event()
+        verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
         all_verified_id = predict[accept_index]
