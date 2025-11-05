@@ -85,6 +85,7 @@ fn default_reasoning_effort() -> Option<ReasoningEffort> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    Minimal,
     Low,
     Medium,
     High,
