@@ -43,6 +43,8 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
+    get_dcp_group,
+    get_dcp_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -68,7 +70,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
+from sglang.srt.layers.attention.utils import (
+    concat_and_cast_mha_k_triton,
+    cp_lse_ag_out_rs,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -1222,8 +1227,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             self.rotary_emb = None
 
+        # TODO(augusto.yjh) 这里要改逻辑， local_heads是all heads, 而且还要返回lse，用来修正attn_out
         self.attn_mqa = RadixAttention(
-            self.num_local_heads,
+            self.num_local_heads * get_dcp_world_size(),
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,
@@ -1734,7 +1740,6 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
-
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
@@ -1827,7 +1832,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch=forward_batch,
                 layer_id=self.layer_id,
             )
-
+        # TODO(augusto.yjh) 这里要all_gather q_pe 和 q_node_out,以 tp8为例， [1, 8, 64] [1, 8, 512] 经过all gather后为 [1, 64, 64] [1, 64, 512], k_pe 为 [1, 1, 64], k_nope 为 [1, 1, 512], 从 local heads到all heads
+        if get_dcp_world_size() > 1:
+            q_pe = q_pe.contiguous()
+            q_nope_out = q_nope_out.contiguous()
+            gathered_q_pe = get_dcp_group().all_gather(q_pe, dim=-2)
+            gathered_q_nope_out = get_dcp_group().all_gather(q_nope_out, dim=-2)
+            q_pe = gathered_q_pe
+            q_nope_out = gathered_q_nope_out
         return (
             q_pe,
             k_pe,
@@ -1862,8 +1874,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                     "is_neox": self.rotary_emb.is_neox_style,
                     "llama_4_scaling": llama_4_scaling,
                 }
-
-            attn_output = self.attn_mqa(
+            # TODO(augusto.yjh) 返回lse, correct attn_output
+            attn_output, lse = self.attn_mqa(
                 q_nope_out,
                 k_nope,
                 k_nope,
@@ -1916,6 +1928,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        # TODO(augusto.yjh) all gather lse，订正attn_output
+        # TODO(augusto.yjh) 执行reduce scatter, 先reduce拿到正确的 attn_output, 再按local_num_heads scatter attn_output
+        if get_dcp_world_size() > 1:
+            attn_output = attn_output.view(
+                -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
+            )
+            attn_output = attn_output.contiguous()
+            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:

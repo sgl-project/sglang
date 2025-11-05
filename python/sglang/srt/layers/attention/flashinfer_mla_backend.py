@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -641,23 +642,27 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         )
 
         o = q_nope.new_empty(q_nope.shape)
+        # TODO(augusto.yjh) 返回lse
         # Direct call to run without the wrapper
-        o = decode_wrapper.run(
+        o, lse = decode_wrapper.run(
             q_nope,
             q_rope,
             k_buffer[:, :, : layer.v_head_dim],
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
+            return_lse=True,
         )
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
 
 
 class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads
+            // get_attention_tp_size()
+            * get_dcp_world_size()
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -727,6 +732,41 @@ class FlashInferMLAIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+
+            # TODO(augusto.yjh) 更新kv_indices
+            def filter_seq_indices(
+                paged_kernel_lens,
+                paged_kernel_lens_cumsum,
+                dcp_rank: int,
+                dpc_world_size: int,
+            ):
+                paged_kernel_lens_split = (
+                    (paged_kernel_lens - dcp_rank - 1) // dpc_world_size
+                ) + 1
+                all_filered_indice = []
+                for i in range(len(paged_kernel_lens_split)):
+                    indice = (
+                        torch.arange(
+                            paged_kernel_lens_split[i], device=paged_kernel_lens.device
+                        )
+                        * dpc_world_size
+                        + dcp_rank
+                        + paged_kernel_lens_cumsum[i]
+                    )
+                    all_filered_indice.append(indice)
+                filterd_kv_indices = torch.cat(all_filered_indice, dim=0).to(
+                    device="cuda"
+                )
+                return paged_kernel_lens_split, filterd_kv_indices
+
+            if get_dcp_world_size() > 1:
+                filtered_paged_kernel_lens, filterd_kv_indices = filter_seq_indices(
+                    paged_kernel_lens, kv_indptr, get_dcp_rank(), get_dcp_world_size()
+                )
+                kv_indices = kv_indices[filterd_kv_indices]
+                kv_lens = filtered_paged_kernel_lens.to(torch.int32)
+                kv_indptr[1 : bs + 1] = torch.cumsum(filtered_paged_kernel_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
