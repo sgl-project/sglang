@@ -33,7 +33,7 @@ def moe_align_block_size_stage1(
     for i in range(tokens_per_thread):
         if start_idx + i < numel:
             idx = tl.load(topk_ids_ptr + start_idx + i).to(tl.int32)
-            if (idx < num_experts and idx >= 0):
+            if idx < num_experts and idx >= 0:
                 token_cnt = tl.load(tokens_cnts_ptr + off_c + idx)
                 tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
 
@@ -160,11 +160,11 @@ def moe_align_block_size_triton(
     ),
 )
 def test_moe_align_block_size_compare_implementations(
-    block_size, 
-    num_tokens, 
-    topk, 
-    num_experts, 
-    pad_sorted_token_ids, 
+    block_size,
+    num_tokens,
+    topk,
+    num_experts,
+    pad_sorted_token_ids,
     topk_id_Exceedance,
 ):
 
@@ -177,7 +177,7 @@ def test_moe_align_block_size_compare_implementations(
     if topk_id_Exceedance and topk >= 2:
         indices = torch.stack(
             [
-                torch.randperm(topk, device="cuda")[: topk // 2 ] 
+                torch.randperm(topk, device="cuda")[: topk // 2]
                 for _ in range(num_tokens)
             ]
         )
