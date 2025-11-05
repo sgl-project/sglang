@@ -52,7 +52,7 @@ use crate::{
     data_connector::{ResponseId, ResponseStorage},
     mcp::{self, McpManager},
     protocols::{
-        common::{Function, ToolCall, Usage},
+        common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
             McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
             ResponseOutputItem, ResponseReasoningContent, ResponseStatus, ResponseTool,
@@ -467,15 +467,6 @@ async fn execute_without_mcp_loop(
 /// - Calls `streaming::process_responses_iteration_stream()` for per-iteration events
 /// - Emits `response.completed` at end
 /// - Handles errors with `response.failed`
-///
-/// # Arguments
-///
-/// * `ctx` - Harmony responses context with pipeline and dependencies
-/// * `request` - Responses API request
-///
-/// # Returns
-///
-/// SSE stream response with proper headers
 pub async fn serve_harmony_responses_stream(
     ctx: &HarmonyResponsesContext,
     request: ResponsesRequest,
@@ -1189,6 +1180,11 @@ fn build_next_request_with_tools(
     // Update request with new items
     request.input = ResponseInput::Items(items);
 
+    // Switch tool_choice to "auto" for subsequent iterations
+    // This prevents infinite loops when original tool_choice was "required" or specific function
+    // After receiving tool results, the model should be free to decide whether to call more tools or finish
+    request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+
     Ok(request)
 }
 
@@ -1214,14 +1210,6 @@ struct ToolResult {
 ///
 /// Converts MCP Tool entries (from rmcp SDK) to ResponseTool format so the model
 /// knows about available MCP tools when making tool calls.
-///
-/// # Arguments
-///
-/// * `mcp_tools` - MCP tools from the MCP manager inventory (rmcp::model::Tool)
-///
-/// # Returns
-///
-/// Vector of ResponseTool entries in MCP format
 pub fn convert_mcp_tools_to_response_tools(mcp_tools: &[mcp::Tool]) -> Vec<ResponseTool> {
     mcp_tools
         .iter()
