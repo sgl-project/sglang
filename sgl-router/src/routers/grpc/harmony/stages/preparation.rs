@@ -1,7 +1,5 @@
 //! Harmony Preparation Stage: Harmony encoding for chat and generate requests
 
-use std::collections::HashSet;
-
 use async_trait::async_trait;
 use axum::response::Response;
 use serde_json::json;
@@ -86,7 +84,7 @@ impl HarmonyPreparationStage {
         }
 
         // Step 1: Filter tools if needed
-        let body_ref = utils::filter_tools_for_request(request);
+        let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
         // Step 2: Build tool constraints
         let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
@@ -133,14 +131,15 @@ impl HarmonyPreparationStage {
         // Step 1: Extract function and MCP tools with schemas from ResponseTools
         let mut function_tools = extract_tools_from_response_tools(request.tools.as_deref(), true);
 
-        // Step 2: Filter tools based on AllowedTools if specified
-        if let Some(ToolChoice::AllowedTools { tools: allowed, .. }) = &request.tool_choice {
-            let allowed_names: HashSet<&str> =
-                allowed.iter().filter_map(|tr| tr.function_name()).collect();
-            function_tools.retain(|t| allowed_names.contains(t.function.name.as_str()));
+        // Step 2: Filter tools based on tool_choice (AllowedTools or Function)
+        // Note: Tool existence is already validated in ResponsesRequest::validate()
+        if let Some(filtered) =
+            utils::filter_tools_by_tool_choice(&function_tools, &request.tool_choice)
+        {
+            function_tools = filtered;
         }
 
-        // Step 3: Generate Harmony structural tags for filtered tools
+        // Step 3: Generate Harmony structural tags from filtered tools
         let tool_constraints = if !function_tools.is_empty() {
             Self::generate_harmony_structural_tag(&function_tools, &request.tool_choice)
                 .map_err(|e| *e)?
