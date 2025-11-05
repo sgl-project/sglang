@@ -117,14 +117,18 @@ impl ResponseStreamEventEmitter {
     ///
     /// After MCP tools are executed, this updates the stored output items
     /// to include the output field from the tool results.
-    pub(crate) fn update_mcp_call_outputs(&mut self, tool_results: &[crate::routers::grpc::harmony::responses::ToolResult]) {
+    pub(crate) fn update_mcp_call_outputs(
+        &mut self,
+        tool_results: &[crate::routers::grpc::harmony::responses::ToolResult],
+    ) {
         for tool_result in tool_results {
             // Find the output item with matching call_id
             for item_state in self.output_items.iter_mut() {
                 if let Some(ref mut item_data) = item_state.item_data {
                     // Check if this is an mcp_call item with matching call_id
                     if item_data.get("type").and_then(|t| t.as_str()) == Some("mcp_call")
-                        && item_data.get("call_id").and_then(|c| c.as_str()) == Some(&tool_result.call_id)
+                        && item_data.get("call_id").and_then(|c| c.as_str())
+                            == Some(&tool_result.call_id)
                     {
                         // Add output field
                         let output_str = serde_json::to_string(&tool_result.output)
