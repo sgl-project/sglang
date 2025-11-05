@@ -181,8 +181,6 @@ suites = {
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
-        # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12533
-        # TestFile("test_deepseek_v3_cutedsl_4gpu.py", 3600),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -282,6 +280,9 @@ suites = {
         TestFile("test_deepep_low_latency.py"),
         TestFile("test_deepep_small.py"),
         TestFile("test_deepseek_chat_templates.py"),
+        TestFile(
+            "test_deepseek_v3_cutedsl_4gpu.py"
+        ),  # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12533
         TestFile("test_disaggregation.py"),
         TestFile("test_double_sparsity.py"),
         TestFile("test_embedding_openai_server.py"),
