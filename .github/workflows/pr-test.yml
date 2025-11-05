@@ -463,6 +463,7 @@ jobs:
           cd test/srt
           lsmod | grep peermem
           capsh --print | grep cap_sys_rawio
+          ibstat
 
   pr-test-finish:
     needs:
