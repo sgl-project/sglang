@@ -20,7 +20,7 @@ use crate::{
 ///
 /// Features:
 /// - Tool Call Tags: `<tool_call>` and `</tool_call>` wrap each individual call
-/// - Each individual call is seperated by `\n`
+/// - Each individual call is separated by `\n`
 /// - Function Call Object: JSON object with "name" and "arguments" fields
 ///
 /// Reference: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct?chat_template=default
