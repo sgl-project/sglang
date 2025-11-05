@@ -13,7 +13,7 @@ from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    parallel_state,
+    get_tp_group,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -1372,7 +1372,7 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+        with use_symmetric_memory(get_tp_group()) as sm:
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
             sm.tag(output_parallel)
 

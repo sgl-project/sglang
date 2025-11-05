@@ -4,11 +4,10 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
-import torch.nn.functional as F
 from einops import rearrange
-from torch import nn
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.utils import add_prefix, align, is_cuda, is_hip, is_npu
 
 if is_cuda():
@@ -83,24 +82,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
-class V32LayerNorm(nn.Module):
-    """
-    Layer Normalization.
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor):
-        return F.layer_norm(
-            x.float(), (self.dim,), self.weight, self.bias, self.eps
-        ).type_as(x)
-
-
 class Indexer(CustomOp):
     def __init__(
         self,
@@ -119,6 +100,7 @@ class Indexer(CustomOp):
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        fuse_wk_and_weights_proj: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -129,6 +111,7 @@ class Indexer(CustomOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.fuse_wk_and_weights_proj = fuse_wk_and_weights_proj
         if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = align(self.sm_count // 2, 8)
@@ -140,21 +123,29 @@ class Indexer(CustomOp):
             quant_config=quant_config,
             prefix=add_prefix("wq_b", prefix),
         )
-        self.wk = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wk", prefix),
-        )
-        self.k_norm = V32LayerNorm(self.head_dim)
-        # NOTE: weight_proj is not quantized
-        self.weights_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.n_heads,
-            bias=False,
-            prefix=add_prefix("weights_proj", prefix),
-        )
+        if self.fuse_wk_and_weights_proj:
+            self.fused_wk_and_weights_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim + self.n_heads,
+                bias=False,
+                prefix=add_prefix("fused_wk_and_weights_proj", prefix),
+            )
+        else:
+            self.wk = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wk", prefix),
+            )
+            # NOTE: weight_proj is not quantized
+            self.weights_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.n_heads,
+                bias=False,
+                prefix=add_prefix("weights_proj", prefix),
+            )
+        self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,
@@ -169,8 +160,7 @@ class Indexer(CustomOp):
         self.softmax_scale = self.head_dim**-0.5
 
     @torch.compile(dynamic=True)
-    def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        weights, _ = self.weights_proj(x)
+    def _get_logits_head_gate(self, weights: torch.Tensor, q_scale: torch.Tensor):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
@@ -182,7 +172,7 @@ class Indexer(CustomOp):
         positions: torch.Tensor,
         enable_dual_stream: bool,
     ):
-
+        weights = None
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -199,7 +189,12 @@ class Indexer(CustomOp):
                 )
             with torch.cuda.stream(self.alt_stream):
                 # TODO we should also put DeepGEMM half SM here?
-                key, _ = self.wk(x)
+                if self.fuse_wk_and_weights_proj:
+                    key, weights = self.fused_wk_and_weights_proj(x)[0].split(
+                        [self.head_dim, self.n_heads], dim=-1
+                    )
+                else:
+                    key, _ = self.wk(x)
                 key = self.k_norm(key)
 
                 k_rope, _ = torch.split(
@@ -217,7 +212,12 @@ class Indexer(CustomOp):
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-            key, _ = self.wk(x)
+            if self.fuse_wk_and_weights_proj:
+                key, weights = self.fused_wk_and_weights_proj(x)[0].split(
+                    [self.head_dim, self.n_heads], dim=-1
+                )
+            else:
+                key, _ = self.wk(x)
             key = self.k_norm(key)
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -240,7 +240,7 @@ class Indexer(CustomOp):
             query = rotate_activation(query)
             key = rotate_activation(key)
 
-        return query, key
+        return query, key, weights
 
     def _get_topk_paged(
         self,
@@ -490,7 +490,9 @@ class Indexer(CustomOp):
         if metadata is None:
             return None
 
-        query, key = self._get_q_k_bf16(q_lora, x, positions, enable_dual_stream)
+        query, key, weights = self._get_q_k_bf16(
+            q_lora, x, positions, enable_dual_stream
+        )
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -517,7 +519,9 @@ class Indexer(CustomOp):
             index_k_scale=k_scale,
         )
 
-        weights = self._get_logits_head_gate(x, q_scale)
+        if not self.fuse_wk_and_weights_proj:
+            weights, _ = self.weights_proj(x)
+        weights = self._get_logits_head_gate(weights, q_scale)
 
         if is_cuda():
             assert forward_batch.seq_lens_cpu is not None

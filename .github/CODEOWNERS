@@ -1,6 +1,6 @@
 .github @merrymercy @zhyncs
 /docker @zhyncs @HaiShaw @ByronHsu
-/docker/Dockerfile.npu @ping1jing2
+/docker/npu.Dockerfile @ping1jing2
 /python/pyproject.toml @merrymercy @zhyncs
 /python/sglang/* @merrymercy @Ying1123 @zhyncs @hnyls2002
 /python/sglang/srt/constrained @hnyls2002
@@ -24,10 +24,20 @@
 /python/sglang/srt/speculative @Ying1123 @merrymercy @kssteven418
 /sgl-kernel @zhyncs @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /sgl-router @slin1237 @ByronHsu @CatherineSue
-/sgl-router/src/protocols @CatherineSue @key4ng
-/sgl-router/src/proto @CatherineSue
-/sgl-router/src/routers/http/openai_router.rs @key4ng
+/sgl-router/benches @slin1237
+/sgl-router/py_src @CatherineSue @key4ng @slin1237
+/sgl-router/py_test @CatherineSue @key4ng
+/sgl-router/src/config @slin1237
+/sgl-router/src/core @slin1237
 /sgl-router/src/data_connector @key4ng
-/sgl-router/src/mcp @key4ng
+/sgl-router/src/grpc_client @CatherineSue @slin1237
+/sgl-router/src/mcp @key4ng @slin1237
+/sgl-router/src/policies @slin1237 @ByronHsu
+/sgl-router/src/proto @CatherineSue @slin1237
+/sgl-router/src/protocols @CatherineSue @key4ng
+/sgl-router/src/reasoning_parser @CatherineSue
+/sgl-router/src/routers @CatherineSue @key4ng @slin1237
+/sgl-router/src/tokenizer @slin1237 @CatherineSue
+/sgl-router/src/tool_parser @slin1237 @CatherineSue
 /test/srt/test_modelopt* @Edwardf0t1
 /test/srt/ascend @ping1jing2

@@ -535,6 +535,17 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
+
+                        # Add usage stats if continuous_usage_stats is enabled
+                        if (
+                            request.stream_options
+                            and request.stream_options.continuous_usage_stats
+                        ):
+                            chunk.usage = UsageProcessor.calculate_token_usage(
+                                prompt_tokens=prompt_tokens.get(index, 0),
+                                completion_tokens=completion_tokens.get(index, 0),
+                            )
+
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle tool calls
@@ -579,6 +590,17 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
+
+                        # Add usage stats if continuous_usage_stats is enabled
+                        if (
+                            request.stream_options
+                            and request.stream_options.continuous_usage_stats
+                        ):
+                            chunk.usage = UsageProcessor.calculate_token_usage(
+                                prompt_tokens=prompt_tokens.get(index, 0),
+                                completion_tokens=completion_tokens.get(index, 0),
+                            )
+
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
             # Send finish_reason chunks for each index that completed
@@ -1056,6 +1078,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
+
+            # Add usage stats if continuous_usage_stats is enabled
+            if request.stream_options and request.stream_options.continuous_usage_stats:
+                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                chunk.usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+
             yield f"data: {chunk.model_dump_json()}\n\n"
 
         # Yield tool calls
@@ -1096,6 +1128,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
+
+            # Add usage stats if continuous_usage_stats is enabled
+            if request.stream_options and request.stream_options.continuous_usage_stats:
+                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                chunk.usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+
             yield f"data: {chunk.model_dump_json()}\n\n"
 
     def _check_for_unstreamed_tool_args(

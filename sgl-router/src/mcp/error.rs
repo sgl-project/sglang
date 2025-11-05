@@ -1,3 +1,8 @@
+//! MCP error types.
+//!
+//! Defines error variants for MCP operations including connection, tool execution,
+//! and configuration errors.
+
 use thiserror::Error;
 
 pub type McpResult<T> = Result<T, McpError>;
@@ -30,6 +35,9 @@ pub enum McpError {
 
     #[error("Prompt not found: {0}")]
     PromptNotFound(String),
+
+    #[error("Invalid arguments: {0}")]
+    InvalidArguments(String),
 
     #[error(transparent)]
     Sdk(#[from] Box<rmcp::RmcpError>),

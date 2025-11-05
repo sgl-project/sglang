@@ -70,7 +70,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("get_meta_buffer_ipc_handle", torch::kCPU, &get_meta_buffer_ipc_handle);
 
   // quick allreduce
-#ifdef USE_ROCM
   m.def(
       "qr_all_reduce(int fa, Tensor inp, Tensor out, int quant_level, bool "
       "cast_bf2half) -> ()");
@@ -86,7 +85,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   // Max input size in bytes
   m.def("qr_max_size", &qr_max_size);
-#endif
 
   /*
    * From csrc/moe
@@ -97,7 +95,9 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "pad_sorted_token_ids) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
-  m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
+  m.def(
+      "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
+      "moe_softcapping, Tensor? correction_bias) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
 
   /*
@@ -106,7 +106,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def(
       "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
       "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
-      "Tensor target_predict, int cuda_stream) -> ()");
+      "Tensor target_predict) -> ()");
   m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
 
   m.def(
@@ -115,12 +115,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> "
       "()");
   m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
-
-  /*
-   * From XGrammar
-   */
-  m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
-  m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
 
   /*
    * From csrc/kvcacheio
@@ -171,6 +165,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "transfer_kv_all_layer_direct_lf_pf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
       "Tensor dst_indices, int page_size) ->() ");
   m.impl("transfer_kv_all_layer_direct_lf_pf", torch::kCUDA, &transfer_kv_all_layer_direct_lf_pf);
+
+  /*
+   * From csrc/grammar
+   */
+  m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
+  m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
 }
 
 REGISTER_EXTENSION(common_ops)
