@@ -37,8 +37,8 @@ __global__ void count_and_sort_expert_tokens_kernel(
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
     if (expert_id < num_experts && expert_id >= 0) {
-          int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
-          sorted_token_ids[rank_post_pad] = i;
+      int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
+      sorted_token_ids[rank_post_pad] = i;
     }
   }
 }
