@@ -1496,6 +1496,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # TODO: remove this when npu_mrope supports QNumHeads * QHeadSize > 4096
         if query.shape[1] > 4096:
             return self._forward_native(positions, query, key)
         rotary_mode = "half"
