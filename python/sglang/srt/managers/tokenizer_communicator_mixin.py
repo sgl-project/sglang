@@ -399,6 +399,10 @@ class TokenizerCommunicatorMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
+        if obj.online:
+            result = (await self.update_weights_from_distributed_communicator(obj))[0]
+            return result.success, result.message
+
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
@@ -445,6 +449,10 @@ class TokenizerCommunicatorMixin:
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+
+        if obj.online:
+            result = (await self.update_weights_from_tensor_communicator(obj))[0]
+            return result.success, result.message
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)

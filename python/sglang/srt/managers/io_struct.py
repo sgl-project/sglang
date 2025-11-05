@@ -1009,6 +1009,17 @@ class FlushCacheReqOutput(BaseReq):
 
 
 @dataclass
+class PauseGenerationReqInput(BaseReq):
+    abort_all: bool = True
+    retract_all: bool = False
+
+
+@dataclass
+class ContinueGenerationReqInput(BaseReq):
+    pass
+
+
+@dataclass
 class UpdateWeightFromDiskReqInput(BaseReq):
     # The model path with the new weights
     model_path: str
@@ -1028,6 +1039,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
+    # Whether to update weights online
+    online: bool = False
 
 
 @dataclass
@@ -1051,6 +1064,10 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Whether to update weights online
+    online: bool = False
+    # Optional format specification for loading
+    flattened_bucket_meta: Optional[dict] = None
 
 
 @dataclass
@@ -1076,6 +1093,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Whether to update weights online
+    online: bool = False
 
 
 @dataclass
