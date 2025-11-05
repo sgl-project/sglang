@@ -122,10 +122,16 @@ class MiniLoadBalancer:
             decode_url,
         )
 
-    async def embedding_bootstrap(self, session, prefill_url, req_id, embedding_length):
+    async def embedding_bootstrap(
+        self, session, prefill_url, req_id, embedding_length, embedding_dim
+    ):
         response = await session.post(
             f"{prefill_url}/embedding_bootstrap",
-            json={"req_id": req_id, "embedding_length": embedding_length},
+            json={
+                "req_id": req_id,
+                "embedding_length": embedding_length,
+                "embedding_dim": embedding_dim,
+            },
         )
         response_json = await response.json()
         session_id = response_json["session_id"]
@@ -208,7 +214,11 @@ class MiniLoadBalancer:
             metadata_tasks = []
             prefill_ip = request_data["bootstrap_host"]
             session_id, buffer_address = await self.embedding_bootstrap(
-                session, prefill_url, req_id, embedding_length_tot
+                session,
+                prefill_url,
+                req_id,
+                embedding_length_tot,
+                response_json_list_sort[0]["embedding_dim"],
             )
             for idx in range(len(tasks)):
                 response_json = response_json_list_sort[idx]
