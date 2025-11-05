@@ -23,7 +23,10 @@ class BenchmarkConfig(TypedDict):
 def calculate_shard_intermediate_size(
     intermediate_size: int, tp_size: int, ep_size: int = 1
 ) -> int:
-    return 2 * intermediate_size // (tp_size // ep_size)
+    assert tp_size % ep_size == 0
+    moe_tp_size = tp_size // ep_size
+    assert intermediate_size % moe_tp_size == 0
+    return intermediate_size // moe_tp_size
 
 
 def get_model_config(
