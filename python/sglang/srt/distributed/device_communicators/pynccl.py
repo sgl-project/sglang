@@ -19,6 +19,7 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     ncclUniqueId,
 )
 from sglang.srt.distributed.utils import StatelessProcessGroup
+from sglang.srt.utils.common import get_current_device_stream_fast
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ class PyNcclCommunicator:
         if stream is not None:
             return stream
         if self.use_current_stream:
-            return torch.cuda.current_stream()
+            return get_current_device_stream_fast()
         return self.stream
 
     def all_reduce(

@@ -123,7 +123,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         if should_ignore_layer(
             prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
-            return UnquantizedLinearMethod()
+            if isinstance(layer, LinearBase):
+                return UnquantizedLinearMethod()
+            return None
+
         if isinstance(layer, LinearBase):
             # If linear_fp8_config is set, use FP8 for linear layers
             # This allows mixed quantization: experts with int4, linear layers with fp8
