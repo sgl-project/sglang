@@ -28,11 +28,51 @@ def moe_align_block_size(
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    gating_output: float,
+    gating_output: torch.Tensor,
     renormalize: bool = False,
+    moe_softcapping: float = 0.0,
+    correction_bias: Optional[torch.Tensor] = None,
 ) -> None:
+    """
+    Compute top-k softmax for MoE routing.
+
+    Args:
+        topk_weights: Output tensor for top-k weights [num_tokens, topk]
+        topk_ids: Output tensor for top-k expert indices [num_tokens, topk]
+        gating_output: Gating logits [num_tokens, num_experts]
+        renormalize: Whether to renormalize the top-k weights
+        moe_softcapping: Tanh softcapping value (0.0 to disable)
+        correction_bias: Per-expert bias correction [num_experts], must be float32 if provided
+    """
     torch.ops.sgl_kernel.topk_softmax.default(
-        topk_weights, topk_ids, gating_output, renormalize
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        moe_softcapping,
+        correction_bias,
+    )
+
+
+def moe_sum_reduce(
+    input_tensor,
+    output_tensor,
+    routed_scaling_factor=0,
+):
+    torch.ops.sgl_kernel.moe_sum_reduce.default(
+        input_tensor,
+        output_tensor,
+        routed_scaling_factor,
+    )
+
+
+def moe_sum(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+):
+    torch.ops.sgl_kernel.moe_sum.default(
+        input_tensor,
+        output_tensor,
     )
 
 

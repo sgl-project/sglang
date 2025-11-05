@@ -3,9 +3,9 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
+use std::{fmt::Debug, sync::Arc};
+
 use crate::core::Worker;
-use std::fmt::Debug;
-use std::sync::Arc;
 
 mod cache_aware;
 mod factory;
@@ -121,23 +121,29 @@ pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, WorkerType};
+    use crate::core::{BasicWorkerBuilder, WorkerType};
 
     #[test]
     fn test_get_healthy_worker_indices() {
         let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(BasicWorker::new(
-                "http://w1:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Arc::new(BasicWorker::new(
-                "http://w2:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Arc::new(BasicWorker::new(
-                "http://w3:8000".to_string(),
-                WorkerType::Regular,
-            )),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .api_key("test_api_key")
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .api_key("test_api_key2")
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w3:8000")
+                    .worker_type(WorkerType::Regular)
+                    .api_key("test_api_key")
+                    .build(),
+            ),
         ];
 
         // All healthy initially

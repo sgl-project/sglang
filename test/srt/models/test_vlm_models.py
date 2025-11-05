@@ -27,6 +27,9 @@ MODELS = [
     SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
 ]
 
+# Set default mem_fraction_static to 0.8
+DEFAULT_MEM_FRACTION_STATIC = 0.8
+
 
 class TestVLMModels(CustomTestCase):
     parsed_args = None  # Class variable to store args
@@ -37,6 +40,11 @@ class TestVLMModels(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.time_out = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+
+        if cls.parsed_args is None:
+            cls.parsed_args = SimpleNamespace(
+                mem_fraction_static=DEFAULT_MEM_FRACTION_STATIC
+            )
 
         # Set OpenAI API key and base URL environment variables. Needed for lmm-evals to work.
         os.environ["OPENAI_API_KEY"] = cls.api_key
@@ -73,7 +81,7 @@ class TestVLMModels(CustomTestCase):
         model = "openai_compatible"
         tp = 1
         tasks = "mmmu_val"
-        batch_size = 2
+        batch_size = 32
         log_suffix = "openai_compatible"
         os.makedirs(output_path, exist_ok=True)
 
@@ -137,6 +145,8 @@ class TestVLMModels(CustomTestCase):
             process_env = os.environ.copy()
             if custom_env:
                 process_env.update(custom_env)
+            # if test vlm with cuda_ipc feature, open this env_var
+            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
             # Prepare stdout/stderr redirection if needed
             stdout_file = None
@@ -171,7 +181,15 @@ class TestVLMModels(CustomTestCase):
             self.run_mmmu_eval(model.model, output_path)
 
             # Get the result file
-            result_file_path = glob.glob(f"{output_path}/*.json")[0]
+            # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories)
+            result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
+            if not result_files:
+                result_files = glob.glob(f"{output_path}/*.json")
+
+            if not result_files:
+                raise FileNotFoundError(f"No JSON result files found in {output_path}")
+
+            result_file_path = result_files[0]
 
             with open(result_file_path, "r") as f:
                 result = json.load(f)
@@ -302,7 +320,7 @@ if __name__ == "__main__":
         "--mem-fraction-static",
         type=float,
         help="Static memory fraction for the model",
-        default=0.8,
+        default=DEFAULT_MEM_FRACTION_STATIC,
     )
 
     # Parse args intended for unittest

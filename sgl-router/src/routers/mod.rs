@@ -1,5 +1,7 @@
 //! Router implementations
 
+use std::fmt::Debug;
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -7,50 +9,37 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use std::fmt::Debug;
+use serde_json::Value;
 
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+use crate::protocols::{
+    chat::ChatCompletionRequest,
+    classify::ClassifyRequest,
+    completion::CompletionRequest,
+    embedding::EmbeddingRequest,
+    generate::GenerateRequest,
+    rerank::RerankRequest,
+    responses::{ResponsesGetParams, ResponsesRequest},
 };
 
 pub mod factory;
 pub mod grpc;
 pub mod header_utils;
 pub mod http;
+pub mod openai; // New refactored OpenAI router module
 pub mod router_manager;
 
 pub use factory::RouterFactory;
-// Re-export HTTP routers for convenience (keeps routers::openai_router path working)
-pub use http::{openai_router, pd_router, pd_types, router};
-
-/// Worker management trait for administrative operations
-///
-/// This trait is separate from RouterTrait to allow Send futures
-/// for use in service discovery and other background tasks
-#[async_trait]
-pub trait WorkerManagement: Send + Sync {
-    /// Add a worker to the router
-    async fn add_worker(&self, worker_url: &str) -> Result<String, String>;
-
-    /// Remove a worker from the router
-    fn remove_worker(&self, worker_url: &str);
-
-    /// Get all worker URLs
-    fn get_worker_urls(&self) -> Vec<String>;
-}
+// Re-export HTTP routers for convenience
+pub use http::{pd_router, pd_types, router};
 
 /// Core trait for all router implementations
 ///
 /// This trait provides a unified interface for routing requests,
 /// regardless of whether it's a regular router or PD router.
 #[async_trait]
-pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
+pub trait RouterTrait: Send + Sync + Debug {
     /// Get a reference to self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
-
-    /// Route a health check request
-    async fn health(&self, req: Request<Body>) -> Response;
 
     /// Route a health generate request
     async fn health_generate(&self, req: Request<Body>) -> Response;
@@ -97,7 +86,12 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     ) -> Response;
 
     /// Retrieve a stored/background response by id
-    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
+    async fn get_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        params: &ResponsesGetParams,
+    ) -> Response;
 
     /// Cancel a background response by id
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
@@ -132,6 +126,14 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response;
 
+    /// Route classification requests (OpenAI-compatible /v1/classify)
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response;
+
     async fn route_rerank(
         &self,
         headers: Option<&HeaderMap>,
@@ -139,11 +141,111 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response;
 
-    /// Flush cache on all workers
-    async fn flush_cache(&self) -> Response;
+    // Conversations API
+    async fn create_conversation(&self, _headers: Option<&HeaderMap>, _body: &Value) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversations create endpoint not implemented",
+        )
+            .into_response()
+    }
 
-    /// Get worker loads (for monitoring)
-    async fn get_worker_loads(&self) -> Response;
+    async fn get_conversation(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversations get endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    async fn update_conversation(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+        _body: &Value,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversations update endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    async fn delete_conversation(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversations delete endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// List items for a conversation
+    async fn list_conversation_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+        _limit: Option<usize>,
+        _order: Option<String>,
+        _after: Option<String>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversation items list endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// Create items in a conversation
+    async fn create_conversation_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+        _body: &Value,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversation items create endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// Get a single conversation item
+    /// The `include` parameter is accepted but not yet implemented
+    async fn get_conversation_item(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+        _item_id: &str,
+        _include: Option<Vec<String>>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversation item get endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// Delete a conversation item
+    async fn delete_conversation_item(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversation item delete endpoint not implemented",
+        )
+            .into_response()
+    }
 
     /// Get router type name
     fn router_type(&self) -> &'static str;
@@ -152,13 +254,4 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     fn is_pd_mode(&self) -> bool {
         self.router_type() == "pd"
     }
-
-    /// Server liveness check - is the server process running
-    fn liveness(&self) -> Response {
-        // Simple liveness check - if we can respond, we're alive
-        (StatusCode::OK, "OK").into_response()
-    }
-
-    /// Server readiness check - is the server ready to handle requests
-    fn readiness(&self) -> Response;
 }

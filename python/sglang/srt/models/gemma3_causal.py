@@ -20,7 +20,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import (
     ROPE_INIT_FUNCTIONS,
-    AutoModel,
     Gemma3TextConfig,
     PretrainedConfig,
     PreTrainedModel,
@@ -761,4 +760,3 @@ class Gemma3ForCausalLM(PreTrainedModel):
 
 
 EntryClass = Gemma3ForCausalLM
-AutoModel.register(Gemma3TextConfig, Gemma3ForCausalLM, exist_ok=True)

@@ -23,7 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     align,
     direct_register_custom_op,
@@ -43,11 +43,17 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sgl_kernel import (
-        sgl_per_tensor_quant_fp8,
-        sgl_per_token_group_quant_fp8,
-        sgl_per_token_quant_fp8,
-    )
+    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
+
+    # Temporary
+    try:
+        from sgl_kernel import sgl_per_token_group_quant_8bit
+
+        enable_sgl_per_token_group_quant_8bit = True
+    except ImportError:
+        from sgl_kernel import sgl_per_token_group_quant_fp8
+
+        enable_sgl_per_token_group_quant_8bit = False
 
 if _is_hip:
     if _use_aiter:
@@ -61,7 +67,7 @@ if _is_hip:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     else:
         try:
-            import vllm._C
+            import vllm._C  # noqa: F401
         except ImportError:
             raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
 
@@ -453,7 +459,7 @@ def create_per_token_group_quant_fp8_output_scale(
                 x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
                 device=device,
                 dtype=torch.float32,
-            ).permute(-1, -2)[: x_shape[-2], :]
+            ).transpose(-1, -2)[: x_shape[-2], :]
         else:
             return torch.empty(
                 (x_shape[-1] // group_size,) + x_shape[:-1],
@@ -477,6 +483,7 @@ def sglang_per_token_group_quant_fp8(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -496,9 +503,26 @@ def sglang_per_token_group_quant_fp8(
     )
 
     if x.shape[0] > 0:
-        sgl_per_token_group_quant_fp8(
-            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
-        )
+        # Temporary
+        if enable_sgl_per_token_group_quant_8bit:
+            sgl_per_token_group_quant_8bit(
+                x,
+                x_q,
+                x_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                fuse_silu_and_mul,
+                masked_m,
+                enable_v2=enable_v2,
+            )
+        else:
+            assert not enable_v2
+            sgl_per_token_group_quant_fp8(
+                x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+            )
 
     return x_q, x_s
 
@@ -514,6 +538,7 @@ def sglang_per_token_group_quant_8bit(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
 ):
     from sglang.srt.layers.quantization.int8_kernel import (
         sglang_per_token_group_quant_int8,
@@ -529,6 +554,7 @@ def sglang_per_token_group_quant_8bit(
             group_size=group_size,
             eps=eps,
             dtype=dst_dtype,
+            enable_v2=enable_v2,
         )
 
     return sglang_per_token_group_quant_fp8(
@@ -540,6 +566,7 @@ def sglang_per_token_group_quant_8bit(
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
+        enable_v2=enable_v2,
     )
 
 
@@ -1804,3 +1831,21 @@ def triton_scaled_mm(
     )
 
     return result.to(out_dtype)
+
+
+if _is_cuda:
+    if enable_sgl_per_token_group_quant_8bit:
+
+        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_8bit")
+        def _(
+            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        ):
+            return
+
+    else:
+
+        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_fp8")
+        def _(
+            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        ):
+            return
