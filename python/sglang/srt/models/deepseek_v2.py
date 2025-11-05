@@ -415,8 +415,6 @@ def handle_attention_nsa(attn, forward_batch):
         return AttnForwardMethod.MLA
 
     if _is_extend_without_speculative(forward_batch):
-        NSA_THRESHOLD = envs.SGLANG_NSA_SEQ_LEN_THRESHOLD.value
-
         assert forward_batch.seq_lens_cpu is not None
         max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
@@ -424,7 +422,7 @@ def handle_attention_nsa(attn, forward_batch):
         # Currently only H200 (SM90) with FA3 is allowed to use MHA path
         is_hopper = _device_sm == 90
 
-        if max_kv_len <= NSA_THRESHOLD and is_hopper:
+        if max_kv_len <= attn.indexer.index_topk and is_hopper:
             # NSA backend uses varlen kernel which supports MHA_ONE_SHOT
             # Check if total sequence length fits in chunk capacity
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
@@ -1518,7 +1516,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 -1, self.num_local_heads, self.qk_head_dim
             )
 
-            # NSA Indexer: cache quantized keys, auto-skip topk for short sequences
+            # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
             if self.use_nsa and _is_extend_without_speculative(forward_batch):
                 _ = self.indexer(
                     x=hidden_states,

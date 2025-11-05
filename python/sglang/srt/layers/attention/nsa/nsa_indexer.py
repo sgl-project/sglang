@@ -261,64 +261,6 @@ class Indexer(CustomOp):
 
         return query, key, weights
 
-    def _construct_attention_indices(
-        self,
-        metadata: BaseIndexerMetadata,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Construct attention indices [0, 1, ..., visible_len-1, -1, ...]"""
-        seq_lens_expanded = metadata.get_seqlens_expanded()
-
-        row = torch.arange(self.index_topk, device=device, dtype=torch.int32).unsqueeze(
-            0
-        )
-        lens = seq_lens_expanded.to(device=device, dtype=torch.int32).unsqueeze(1)
-        valid = row < lens
-        indices_local = torch.where(valid, row, torch.full_like(row, -1))
-
-        from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
-
-        method = getattr(metadata, "topk_transform_method", None)
-
-        if method == TopkTransformMethod.PAGED:
-            page_table_1 = (
-                metadata.attn_metadata.page_table_1
-                if hasattr(metadata, "attn_metadata")
-                and hasattr(metadata.attn_metadata, "page_table_1")
-                else metadata.get_page_table_64()
-            )
-            extend_lens_cpu = (
-                getattr(metadata.attn_metadata, "nsa_extend_seq_lens_list", None)
-                if hasattr(metadata, "attn_metadata")
-                else None
-            )
-
-            from sglang.srt.layers.attention.nsa.transform_index import (
-                transform_index_page_table_prefill,
-            )
-
-            return transform_index_page_table_prefill(
-                page_table=page_table_1,
-                topk_indices=indices_local,
-                extend_lens_cpu=extend_lens_cpu,
-                page_size=1,
-            )
-
-        elif method == TopkTransformMethod.RAGGED:
-            off = (
-                getattr(metadata.attn_metadata, "topk_indices_offset", None)
-                if hasattr(metadata, "attn_metadata")
-                else None
-            )
-            if off is not None:
-                off = off.to(device=device, dtype=torch.int32)
-                if off.ndim == 1:
-                    off = off.unsqueeze(1)
-                mask = indices_local != -1
-                return torch.where(mask, indices_local + off, indices_local)
-
-        return indices_local
-
     def _get_k_bf16(
         self,
         x: torch.Tensor,
@@ -500,12 +442,20 @@ class Indexer(CustomOp):
             index_k_scale=k_scale,
         )
 
-        # MHA doesn't need topk_indices, early return for efficiency
+        # MHA doesn't need topk_indices
         if not return_indices:
             return None
 
-        # MLA: construct return_indices
-        return self._construct_attention_indices(metadata, x.device)
+        # MLA: use dummy logits with topk kernel's fast path to generate indices
+        # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
+        seq_lens_expanded = metadata.get_seqlens_expanded()
+        dummy_logits = torch.zeros(
+            seq_lens_expanded.shape[0],
+            self.index_topk,
+            dtype=torch.float32,
+            device=x.device,
+        )
+        return metadata.topk_transform(dummy_logits, self.index_topk)
 
     def forward_indexer(
         self,
@@ -624,13 +574,11 @@ class Indexer(CustomOp):
             return None
 
         # Determine if should skip topk based on sequence length
-        from sglang.srt.environ import envs
-
         should_skip = False
         if not forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
-                should_skip = max_kv_len <= envs.SGLANG_NSA_SEQ_LEN_THRESHOLD.value
+                should_skip = max_kv_len <= self.index_topk
 
         # Optimization: fast path when skipping topk computation
         if should_skip:

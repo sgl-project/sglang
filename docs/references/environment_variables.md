@@ -30,7 +30,6 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGL_CHUNKED_PREFIX_CACHE_THRESHOLD` | Sets the threshold for enabling chunked prefix caching | `8192` |
 | `SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION` | Enable RoPE fusion in Fused Multi-Layer Attention | `1` |
 | `SGLANG_DISABLE_FA4_WARMUP` | Disable Flash Attention 4 warmup passes (set to `1`, `true`, `yes`, or `on` to disable) | `false` |
-| `SGLANG_NSA_SEQ_LEN_THRESHOLD` | Sequence length threshold for Native Sparse Attention (NSA) topk computation. Skips topk for short sequences (<= threshold) where the overhead exceeds benefits, computes topk for long sequences (> threshold) where sparse attention significantly reduces computation | `2048` |
 
 ## DeepGEMM Configuration (Advanced Optimization)
 
