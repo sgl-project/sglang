@@ -1,4 +1,3 @@
-
 import json as json_lib
 import logging
 import math
@@ -127,7 +126,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
         super().__init__()
         self.pixel_shuffle_ratio = config.pixel_shuffle_ratio
         self.mlp = Llama4VisionMLP(
-            input_size=config.intermediate_size,
+            input_size=config.original_intermediate_size if hasattr(config, "original_intermediate_size") else config.intermediate_size,
             intermediate_size=config.projector_input_dim,
             output_size=config.projector_output_dim,
             bias=config.multi_modal_projector_bias,
@@ -166,6 +165,9 @@ class Llama4VisionEncoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
         self.intermediate_size = config.intermediate_size
+        num_dummy_heads = 0
+        if hasattr(config, "padded_num_attention_heads"):
+            num_dummy_heads = config.padded_num_attention_heads - config.num_attention_heads
 
         self.self_attn = VisionAttention(
             self.hidden_size,
@@ -179,6 +181,7 @@ class Llama4VisionEncoderLayer(nn.Module):
             softmax_in_single_precision=False,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
+            num_dummy_heads=num_dummy_heads,
             qkv_bias=True,
             customized_position_embedding_applier=apply_position_embedding,
         )
@@ -277,9 +280,10 @@ class Llama4UnfoldConvolution(nn.Module):
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size, kernel_size)
         self.unfold = torch.nn.Unfold(kernel_size=kernel_size, stride=config.patch_size)
+        output_size = config.head_dim * config.padded_num_attention_heads if hasattr(config, "padded_num_attention_heads") else config.hidden_size
         params = {
             "input_size": config.num_channels * kernel_size[0] * kernel_size[1],
-            "output_size": config.hidden_size,
+            "output_size": output_size,
             "bias": False,
             "quant_config": quant_config,
             "prefix": f"{prefix}.linear",

@@ -48,7 +48,7 @@ def get_num_heads_padding_size(tp_size, weight_block_size):
     return pad_size
 
 
-def update_intermediate_size(model_config, attr_name, intermediate_padding_size):
+def update_intermediate_size(model_config, attr_name, intermediate_padding_size, keep_origin=False):
     attr_value = intermediate_padding_size
     if hasattr(model_config, "hf_config") and hasattr(
         model_config.hf_config, attr_name
@@ -56,6 +56,7 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
         attr_value = getattr(model_config.hf_config, attr_name)
     elif hasattr(model_config, attr_name):
         attr_value = getattr(model_config, attr_name)
+    origin_value = attr_value
 
     if attr_value % intermediate_padding_size != 0:
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
@@ -67,6 +68,8 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
                 setattr(model_config.hf_text_config, attr_name, attr_value)
         else:
             setattr(model_config, attr_name, attr_value)
+            if keep_origin:
+                setattr(model_config, "original_" + attr_name, origin_value)
 
     return model_config
 
@@ -165,6 +168,7 @@ def adjust_config_with_unaligned_cpu_tp(
             vision_cfg_obj,
             "intermediate_size",
             intermediate_padding_size,
+            keep_origin=True,
         )
         update_fields = ["projector_input_dim"]
         for field in update_fields:
