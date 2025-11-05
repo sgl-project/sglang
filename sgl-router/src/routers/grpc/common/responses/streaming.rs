@@ -18,6 +18,7 @@ use crate::{
             ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
+    routers::grpc::harmony::responses::ToolResult,
 };
 
 pub enum OutputItemType {
@@ -123,10 +124,7 @@ impl ResponseStreamEventEmitter {
     ///
     /// After MCP tools are executed, this updates the stored output items
     /// to include the output field from the tool results.
-    pub(crate) fn update_mcp_call_outputs(
-        &mut self,
-        tool_results: &[crate::routers::grpc::harmony::responses::ToolResult],
-    ) {
+    pub(crate) fn update_mcp_call_outputs(&mut self, tool_results: &[ToolResult]) {
         for tool_result in tool_results {
             // Find the output item with matching call_id
             for item_state in self.output_items.iter_mut() {

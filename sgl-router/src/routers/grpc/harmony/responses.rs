@@ -784,7 +784,6 @@ async fn execute_mcp_tool_loop_streaming(
                     };
 
                 // Update mcp_call output items with execution results
-                // The items were created during streaming but didn't have output yet
                 emitter.update_mcp_call_outputs(&tool_results);
 
                 // Build next request with appended history
