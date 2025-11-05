@@ -368,6 +368,7 @@ def _handle_output_by_index(output, i):
                 else None
             ),
             token_steps=([output.token_steps[i]] if output.token_steps else None),
+            rids=[output.rids[i]],
         )
     elif isinstance(output, BatchMultimodalOutput):
         new_output = BatchMultimodalOutput(
