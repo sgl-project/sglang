@@ -505,6 +505,9 @@ pub async fn serve_harmony_responses_stream(
         .as_secs();
     let mut emitter = ResponseStreamEventEmitter::new(response_id.clone(), model, created_at);
 
+    // Set original request for complete response fields
+    emitter.set_original_request(current_request.clone());
+
     // Clone context for spawned task
     let ctx_clone = ctx.clone();
 
@@ -717,8 +720,8 @@ async fn execute_mcp_tool_loop_streaming(
                     // Emit response.completed with incomplete_details and usage
                     let incomplete_details = json!({ "reason": "max_tool_calls" });
                     let usage_json = json!({
-                        "prompt_tokens": usage.prompt_tokens,
-                        "completion_tokens": usage.completion_tokens,
+                        "input_tokens": usage.prompt_tokens,
+                        "output_tokens": usage.completion_tokens,
                         "total_tokens": usage.total_tokens,
                         "incomplete_details": incomplete_details,
                     });
@@ -773,8 +776,8 @@ async fn execute_mcp_tool_loop_streaming(
 
                 // Emit response.completed with usage
                 let usage_json = json!({
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
+                    "input_tokens": usage.prompt_tokens,
+                    "output_tokens": usage.completion_tokens,
                     "total_tokens": usage.total_tokens,
                 });
                 let event = emitter.emit_completed(Some(&usage_json));
@@ -815,19 +818,34 @@ async fn execute_without_mcp_streaming(
     };
 
     // Process stream (emits all output items during streaming - function tool path emits function_call_arguments.* events)
-    if let Err(err_msg) = HarmonyStreamingProcessor::process_responses_iteration_stream_function(
-        execution_result,
-        emitter,
-        tx,
-    )
-    .await
-    {
-        emitter.emit_error(&err_msg, Some("processing_error"), tx);
-        return;
-    }
+    let iteration_result =
+        match HarmonyStreamingProcessor::process_responses_iteration_stream_function(
+            execution_result,
+            emitter,
+            tx,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err_msg) => {
+                emitter.emit_error(&err_msg, Some("processing_error"), tx);
+                return;
+            }
+        };
 
-    // Emit response.completed
-    let event = emitter.emit_completed(None);
+    // Extract usage from iteration result
+    let usage = match iteration_result {
+        ResponsesIterationResult::ToolCallsFound { usage, .. } => usage,
+        ResponsesIterationResult::Completed { usage, .. } => usage,
+    };
+
+    // Emit response.completed with usage
+    let usage_json = json!({
+        "input_tokens": usage.prompt_tokens,
+        "output_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    });
+    let event = emitter.emit_completed(Some(&usage_json));
     emitter.send_event_best_effort(&event, tx);
 }
 

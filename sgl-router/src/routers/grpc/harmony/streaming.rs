@@ -924,6 +924,8 @@ impl HarmonyStreamingProcessor {
             if let Some(ref tool_calls) = accumulated_tool_calls {
                 for (call_idx, tool_call) in tool_calls.iter().enumerate() {
                     if let Some((output_index, item_id)) = tool_call_tracking.get(&call_idx) {
+                        let tool_name = &tool_call.function.name;
+
                         // Emit arguments done with final arguments
                         let args_str = tool_call.function.arguments.as_deref().unwrap_or("");
                         let event =
@@ -935,6 +937,21 @@ impl HarmonyStreamingProcessor {
                             let event = emitter.emit_mcp_call_completed(*output_index, item_id);
                             emitter.send_event_best_effort(&event, tx);
                         }
+
+                        // Emit output_item.done wrapper event
+                        let item = json!({
+                            "id": item_id,
+                            "type": mode.type_str(),
+                            "name": tool_name,
+                            "call_id": &tool_call.id,
+                            "arguments": args_str,
+                            "status": "completed"
+                        });
+                        let event = emitter.emit_output_item_done(*output_index, &item);
+                        emitter.send_event_best_effort(&event, tx);
+
+                        // Mark output item as completed
+                        emitter.complete_output_item(*output_index);
                     }
                 }
             }
