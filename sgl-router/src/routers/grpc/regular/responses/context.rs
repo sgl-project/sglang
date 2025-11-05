@@ -1,7 +1,7 @@
 //! Context for /v1/responses endpoint handlers
 //!
 //! Bundles all dependencies needed by responses handlers to avoid passing
-//! 10+ parameters to every function (fixes clippy::too_many_arguments).
+//! 10+ parameters to every function.
 
 use std::{collections::HashMap, sync::Arc};
 
