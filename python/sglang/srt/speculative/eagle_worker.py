@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -209,6 +210,12 @@ class EAGLEWorker(TpModelWorker):
             or server_args.speculative_eagle_mab_config_path
         )
         if self.use_mab:
+            arch = self.target_worker.model_runner.model_config.hf_config.architectures[
+                0
+            ]
+            self.is_qwen3_next = (
+                arch == "Qwen3NextForCausalLM" or arch == "Qwen3NextForCausalLMMTP"
+            )
             self._init_mab_configurations()
             self.log_mab_interval = 0
         # Some dummy tensors
@@ -1192,11 +1199,22 @@ class EAGLEWorker(TpModelWorker):
             self.update_speculative_args(mab_strategy)
 
             # Initialize draft worker resources
+            if self.is_qwen3_next:
+                qwen3_config: Qwen3NextConfig = (
+                    self.target_worker.model_runner.mambaish_config
+                )
+                qwen3_config.num_hidden_layers = 1
+                qwen3_config.full_attention_interval = 1
+
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.init_attention_backend()
                 self.init_cuda_graphs()
 
             # Initialize target worker resources
+            if self.is_qwen3_next:
+                qwen3_config.num_hidden_layers = 48
+                qwen3_config.full_attention_interval = 4
+
             self.target_worker.model_runner.init_attention_backend()
             self.target_worker.model_runner.init_device_graphs()
 
