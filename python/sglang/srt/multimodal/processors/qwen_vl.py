@@ -170,6 +170,7 @@ def smart_nframes(
         )
     return nframes
 
+
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(SGLangBaseProcessor):
     models = [
@@ -211,14 +212,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
-
     async def preprocess_video(
         self,
         vr,
         image_factor: int = IMAGE_FACTOR,
     ) -> torch.Tensor:
         if self.video_executor is not None:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 self.video_executor,
                 QwenVLImageProcessor.preprocess_video_task,
@@ -300,7 +300,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             f"total_time: {(torchvision_resize_time - entry_time) * 1000:.2f} ms"
         )
         return video, video_metadata
-
 
     async def process_mm_data_async(
         self,
