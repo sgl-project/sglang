@@ -17,7 +17,11 @@ _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR))
 
 # Import local modules
-from basic_crud import ConversationCRUDBaseTest, FunctionCallingBaseTest, ResponseCRUDBaseTest
+from basic_crud import (
+    ConversationCRUDBaseTest,
+    FunctionCallingBaseTest,
+    ResponseCRUDBaseTest,
+)
 from mcp import MCPTests
 from router_fixtures import (
     popen_launch_openai_xai_router,
