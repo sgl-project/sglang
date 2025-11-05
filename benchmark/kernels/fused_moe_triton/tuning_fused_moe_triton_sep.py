@@ -17,7 +17,6 @@ from common_utils import (
     get_default_batch_sizes,
     get_model_config,
     sort_config,
-    validate_ep_tp_mode,
 )
 from ray.experimental.tqdm_ray import tqdm
 from sgl_kernel import silu_and_mul
@@ -495,9 +494,6 @@ def save_configs_sep(
 
 def main(args: argparse.Namespace):
     print(args)
-
-    # Check EP mode constraint: tp_size must be 1 when ep_size > 1
-    validate_ep_tp_mode(args.ep_size, args.tp_size)
 
     model_config = get_model_config(
         args.model,

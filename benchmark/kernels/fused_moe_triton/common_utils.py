@@ -23,16 +23,7 @@ class BenchmarkConfig(TypedDict):
 def calculate_shard_intermediate_size(
     intermediate_size: int, tp_size: int, ep_size: int = 1
 ) -> int:
-    return intermediate_size if ep_size > 1 else 2 * intermediate_size // tp_size
-
-
-def validate_ep_tp_mode(ep_size: int, tp_size: int) -> None:
-    if ep_size > 1 and tp_size != 1:
-        raise ValueError(
-            f"When using Expert Parallelism (ep_size={ep_size}), "
-            f"tp_size must be set to 1, but got tp_size={tp_size}. "
-            f"Please set --tp-size 1 when using --ep-size > 1."
-        )
+    return 2 * intermediate_size // (tp_size // ep_size)
 
 
 def get_model_config(
@@ -59,11 +50,11 @@ def get_model_config(
         config = config.get_text_config()
 
     if architecture == "DbrxForCausalLM":
-        E = config.ffn_config.moe_num_experts
+        E = config.ffn_config.moe_num_experts // ep_size
         topk = config.ffn_config.moe_top_k
         intermediate_size = config.ffn_config.ffn_hidden_size
     elif architecture == "JambaForCausalLM":
-        E = config.num_experts
+        E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
     elif architecture in [
@@ -76,20 +67,19 @@ def get_model_config(
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
     elif architecture in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
-        E = (
-            config.n_routed_experts + (0 if disable_shared_experts_fusion else 1)
-            if architecture == "DeepseekV3ForCausalLM"
-            else config.n_routed_experts
+        E = (config.n_routed_experts // ep_size) + (
+            0
+            if disable_shared_experts_fusion
+            or architecture not in ["DeepseekV3ForCausalLM"]
+            else 1
         )
-        topk = config.num_experts_per_tok + (
-            0 if disable_shared_experts_fusion or topk_ids_dir is None else 1
-        )
+        topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
     elif architecture == "Llama4ForConditionalGeneration":
-        E = config.num_local_experts + (0 if disable_shared_experts_fusion else 1)
-        topk = config.num_experts_per_tok + (
-            0 if disable_shared_experts_fusion or topk_ids_dir is None else 1
+        E = config.num_local_experts // ep_size + (
+            0 if disable_shared_experts_fusion else 1
         )
+        topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
     elif architecture in [
         "Grok1ForCausalLM",
@@ -108,7 +98,7 @@ def get_model_config(
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
     elif architecture in ["Glm4MoeForCausalLM"]:
-        E = config.n_routed_experts
+        E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
     else:

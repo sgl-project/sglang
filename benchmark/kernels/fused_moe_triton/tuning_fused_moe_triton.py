@@ -16,7 +16,6 @@ from common_utils import (
     get_model_config,
     save_configs,
     sort_config,
-    validate_ep_tp_mode,
 )
 from ray.experimental.tqdm_ray import tqdm
 
@@ -314,9 +313,6 @@ class BenchmarkWorker:
 
 def main(args: argparse.Namespace):
     print(args)
-
-    # Check EP mode constraint: tp_size must be 1 when ep_size > 1
-    validate_ep_tp_mode(args.ep_size, args.tp_size)
 
     model_config = get_model_config(
         args.model, args.tp_size, args.ep_size, args.disable_shared_experts_fusion
