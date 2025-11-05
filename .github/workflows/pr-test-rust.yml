@@ -285,7 +285,6 @@ jobs:
           export RUSTC_WRAPPER=sccache
           cd sgl-router
           python3 -m venv .venv
-          source .venv/bin/activate
           python -m pip install --upgrade pip maturin
           maturin develop --release --profile ci --features vendored-openssl
 
