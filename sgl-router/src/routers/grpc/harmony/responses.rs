@@ -49,7 +49,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    data_connector::{ResponseId, ResponseStorage},
+    data_connector::{ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage},
     mcp::{self, McpManager},
     protocols::{
         common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
@@ -62,7 +62,7 @@ use crate::{
     },
     routers::grpc::{
         common::responses::{
-            build_sse_response, ensure_mcp_connection,
+            build_sse_response, ensure_mcp_connection, persist_response_if_needed,
             streaming::{OutputItemType, ResponseStreamEventEmitter},
         },
         context::SharedComponents,
@@ -157,6 +157,12 @@ pub struct HarmonyResponsesContext {
     /// Response storage for loading conversation history
     pub response_storage: Arc<dyn ResponseStorage>,
 
+    /// Conversation storage for persisting conversations
+    pub conversation_storage: Arc<dyn ConversationStorage>,
+
+    /// Conversation item storage for persisting conversation items
+    pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
+
     /// Optional streaming sender (for future streaming support)
     pub stream_tx: Option<mpsc::UnboundedSender<Result<String, String>>>,
 }
@@ -168,12 +174,16 @@ impl HarmonyResponsesContext {
         components: Arc<SharedComponents>,
         mcp_manager: Arc<McpManager>,
         response_storage: Arc<dyn ResponseStorage>,
+        conversation_storage: Arc<dyn ConversationStorage>,
+        conversation_item_storage: Arc<dyn ConversationItemStorage>,
     ) -> Self {
         Self {
             pipeline,
             components,
             mcp_manager,
             response_storage,
+            conversation_storage,
+            conversation_item_storage,
             stream_tx: None,
         }
     }
@@ -184,6 +194,8 @@ impl HarmonyResponsesContext {
         components: Arc<SharedComponents>,
         mcp_manager: Arc<McpManager>,
         response_storage: Arc<dyn ResponseStorage>,
+        conversation_storage: Arc<dyn ConversationStorage>,
+        conversation_item_storage: Arc<dyn ConversationItemStorage>,
         stream_tx: mpsc::UnboundedSender<Result<String, String>>,
     ) -> Self {
         Self {
@@ -191,6 +203,8 @@ impl HarmonyResponsesContext {
             components,
             mcp_manager,
             response_storage,
+            conversation_storage,
+            conversation_item_storage,
             stream_tx: Some(stream_tx),
         }
     }
@@ -237,6 +251,9 @@ pub async fn serve_harmony_responses(
     ctx: &HarmonyResponsesContext,
     request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
+    // Clone request for persistence
+    let original_request = request.clone();
+
     // Load previous conversation history if previous_response_id is set
     let current_request = load_previous_messages(ctx, request).await?;
 
@@ -244,12 +261,24 @@ pub async fn serve_harmony_responses(
     let has_mcp_tools =
         ensure_mcp_connection(&ctx.mcp_manager, current_request.tools.as_deref()).await?;
 
-    if has_mcp_tools {
-        execute_with_mcp_loop(ctx, current_request).await
+    let response = if has_mcp_tools {
+        execute_with_mcp_loop(ctx, current_request).await?
     } else {
         // No MCP tools - execute pipeline once (may have function tools or no tools)
-        execute_without_mcp_loop(ctx, current_request).await
-    }
+        execute_without_mcp_loop(ctx, current_request).await?
+    };
+
+    // Persist response to storage if store=true
+    persist_response_if_needed(
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        ctx.response_storage.clone(),
+        &response,
+        &original_request,
+    )
+    .await;
+
+    Ok(response)
 }
 
 /// Execute Harmony Responses with MCP tool loop
@@ -475,7 +504,7 @@ pub async fn serve_harmony_responses_stream(
     request: ResponsesRequest,
 ) -> Response {
     // Load previous conversation history if previous_response_id is set
-    let current_request = match load_previous_messages(ctx, request).await {
+    let current_request = match load_previous_messages(ctx, request.clone()).await {
         Ok(req) => req,
         Err(err_response) => return err_response,
     };
@@ -520,9 +549,10 @@ pub async fn serve_harmony_responses_stream(
         }
 
         if has_mcp_tools {
-            execute_mcp_tool_loop_streaming(ctx, current_request, &mut emitter, &tx).await;
+            execute_mcp_tool_loop_streaming(ctx, current_request, &request, &mut emitter, &tx)
+                .await;
         } else {
-            execute_without_mcp_streaming(ctx, &current_request, &mut emitter, &tx).await;
+            execute_without_mcp_streaming(ctx, &current_request, &request, &mut emitter, &tx).await;
         }
     });
 
@@ -537,9 +567,11 @@ pub async fn serve_harmony_responses_stream(
 /// - Emits mcp_list_tools events
 /// - Loops through tool execution iterations
 /// - Emits final response.completed event
+/// - Persists response internally
 async fn execute_mcp_tool_loop_streaming(
     ctx: &HarmonyResponsesContext,
     mut current_request: ResponsesRequest,
+    original_request: &ResponsesRequest,
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) {
@@ -784,6 +816,19 @@ async fn execute_mcp_tool_loop_streaming(
                     "Harmony Responses streaming completed - no more tool calls"
                 );
 
+                // Finalize response from emitter's accumulated data
+                let final_response = emitter.finalize(Some(usage.clone()));
+
+                // Persist response to storage if store=true
+                persist_response_if_needed(
+                    ctx.conversation_storage.clone(),
+                    ctx.conversation_item_storage.clone(),
+                    ctx.response_storage.clone(),
+                    &final_response,
+                    original_request,
+                )
+                .await;
+
                 // Emit response.completed with usage
                 let usage_json = json!({
                     "input_tokens": usage.prompt_tokens,
@@ -805,6 +850,7 @@ async fn execute_mcp_tool_loop_streaming(
 async fn execute_without_mcp_streaming(
     ctx: &HarmonyResponsesContext,
     current_request: &ResponsesRequest,
+    original_request: &ResponsesRequest,
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) {
@@ -848,6 +894,19 @@ async fn execute_without_mcp_streaming(
         ResponsesIterationResult::ToolCallsFound { usage, .. } => usage,
         ResponsesIterationResult::Completed { usage, .. } => usage,
     };
+
+    // Finalize response from emitter's accumulated data
+    let final_response = emitter.finalize(Some(usage.clone()));
+
+    // Persist response to storage if store=true
+    persist_response_if_needed(
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        ctx.response_storage.clone(),
+        &final_response,
+        original_request,
+    )
+    .await;
 
     // Emit response.completed with usage
     let usage_json = json!({

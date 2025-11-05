@@ -11,7 +11,13 @@ use uuid::Uuid;
 
 use crate::{
     mcp,
-    protocols::{chat::ChatCompletionStreamResponse, responses::ResponsesRequest},
+    protocols::{
+        chat::ChatCompletionStreamResponse,
+        common::{Usage, UsageInfo},
+        responses::{
+            ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+        },
+    },
 };
 
 pub enum OutputItemType {
@@ -579,6 +585,78 @@ impl ResponseStreamEventEmitter {
             .find(|i| i.output_index == output_index)
         {
             item.item_data = Some(item_data);
+        }
+    }
+
+    /// Finalize and return the complete ResponsesResponse
+    ///
+    /// This constructs the final ResponsesResponse from all accumulated output items
+    /// for persistence. Should be called after streaming is complete.
+    pub fn finalize(&self, usage: Option<Usage>) -> ResponsesResponse {
+        // Build output array from tracked items
+        let output: Vec<ResponseOutputItem> = self
+            .output_items
+            .iter()
+            .filter_map(|item| {
+                item.item_data
+                    .as_ref()
+                    .and_then(|data| serde_json::from_value(data.clone()).ok())
+            })
+            .collect();
+
+        // Convert Usage to ResponsesUsage
+        let responses_usage = usage.map(|u| {
+            let usage_info = UsageInfo {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+                reasoning_tokens: u
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.reasoning_tokens),
+                prompt_tokens_details: None,
+            };
+            ResponsesUsage::Classic(usage_info)
+        });
+
+        // Get original request fields or use defaults
+        let req = self.original_request.as_ref();
+
+        // Convert tool_choice to String
+        let tool_choice = req
+            .and_then(|r| r.tool_choice.as_ref())
+            .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
+            .unwrap_or_else(|| "auto".to_string());
+
+        ResponsesResponse {
+            id: self.response_id.clone(),
+            object: "response".to_string(),
+            created_at: self.created_at as i64,
+            status: ResponseStatus::Completed,
+            error: None,
+            incomplete_details: None,
+            instructions: req.and_then(|r| r.instructions.clone()),
+            max_output_tokens: req.and_then(|r| r.max_output_tokens),
+            model: self.model.clone(),
+            output,
+            parallel_tool_calls: req.and_then(|r| r.parallel_tool_calls).unwrap_or(true),
+            previous_response_id: req.and_then(|r| r.previous_response_id.clone()),
+            reasoning: None, // TODO: Extract from output items if needed
+            store: req.and_then(|r| r.store).unwrap_or(true),
+            temperature: req.and_then(|r| r.temperature),
+            text: None,
+            tool_choice,
+            tools: req
+                .map(|r| r.tools.clone().unwrap_or_default())
+                .unwrap_or_default(),
+            top_p: req.and_then(|r| r.top_p),
+            truncation: None, // Convert from Truncation to String if needed
+            usage: responses_usage,
+            metadata: req
+                .map(|r| r.metadata.clone().unwrap_or_default())
+                .unwrap_or_default(),
+            user: req.and_then(|r| r.user.clone()),
+            safety_identifier: None,
         }
     }
 
