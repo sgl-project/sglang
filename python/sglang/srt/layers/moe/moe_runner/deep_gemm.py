@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.moe.ep_moe.kernels import get_tma_aligned_size
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -287,15 +288,28 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.float8_e4m3fn,
             )
-            down_input_scale = torch.empty(
-                (
-                    gateup_output.shape[0],
-                    gateup_output.shape[1],
-                    gateup_output.shape[2] // 2 // scale_block_size,
-                ),
-                device=hidden_states_device,
-                dtype=torch.float32,
+            scale_shape = (
+                gateup_output.shape[0],
+                gateup_output.shape[1],
+                gateup_output.shape[2] // 2 // scale_block_size,
             )
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                down_input_scale = torch.empty(
+                    size=scale_shape,
+                    device=hidden_states_device,
+                    dtype=torch.float32,
+                )
+            else:
+                down_input_scale = torch.empty_strided(
+                    size=scale_shape,
+                    stride=(
+                        scale_shape[1] * scale_shape[2],
+                        1,
+                        get_tma_aligned_size(scale_shape[1], torch.float32.itemsize),
+                    ),
+                    device=hidden_states_device,
+                    dtype=torch.float32,
+                )
             silu_and_mul_masked_post_quant_fwd(
                 gateup_output,
                 down_input,
