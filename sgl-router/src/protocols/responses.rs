@@ -251,9 +251,10 @@ pub enum ResponseOutputItem {
 // Configuration Enums
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceTier {
+    #[default]
     Auto,
     Default,
     Flex,
@@ -261,23 +262,12 @@ pub enum ServiceTier {
     Priority,
 }
 
-impl Default for ServiceTier {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Truncation {
     Auto,
+    #[default]
     Disabled,
-}
-
-impl Default for Truncation {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
