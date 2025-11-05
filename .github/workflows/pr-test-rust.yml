@@ -167,7 +167,6 @@ jobs:
           export RUSTC_WRAPPER=sccache
           cd sgl-router
           python3 -m venv .venv
-          source .venv/bin/activate
           python -m pip install --upgrade pip maturin
           maturin develop --release --features vendored-openssl
 
@@ -175,7 +174,6 @@ jobs:
       - name: Run Python unit tests
         run: |
           cd sgl-router
-          source .venv/bin/activate
           source "$HOME/.cargo/env"
           python -m pip install pytest pytest-cov pytest-xdist
           pytest -q py_test/unit --cov=sglang_router --cov-report=term-missing --cov-fail-under=80
@@ -183,17 +181,15 @@ jobs:
       - name: Run Python integration tests
         run: |
           cd sgl-router
-          source .venv/bin/activate
           source "$HOME/.cargo/env"
           # Integration tests use FastAPI/uvicorn for mock workers
-          python -m pip install fastapi uvicorn orjson requests cryptography
+          python -m pip install fastapi uvicorn orjson
           pytest -q py_test/integration
 
       - name: Run Python E2E tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
-          source .venv/bin/activate
           source "$HOME/.cargo/env"
           python -m pip --no-cache-dir install --upgrade --ignore-installed blinker
           python -m pip --no-cache-dir install --upgrade genai-bench==0.0.2
