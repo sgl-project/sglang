@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: pr-test-rust-${{ github.ref }}
+  group: router-tests-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -70,7 +70,7 @@ jobs:
           python -c "import sglang_router; print('Python package: OK')"
           python -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
           python -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
-  unit-test-rust:
+  router-unit-tests:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     steps:
@@ -310,14 +310,14 @@ jobs:
 
 
   finish:
-    needs: [maturin-build-test, unit-test-rust, pytest-rust, pytest-rust-2]
+    needs: [maturin-build-test, router-unit-tests, router-http-tests, router-grpc-response-api-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
         run: echo "This is an empty step to ensure that all jobs are completed."
 
   summarize-benchmarks:
-    needs: pytest-rust
+    needs: router-http-tests
     runs-on: ubuntu-latest
     if: success()
 
