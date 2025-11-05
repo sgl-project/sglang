@@ -31,6 +31,7 @@ enum ItemStatus {
 struct OutputItemState {
     output_index: usize,
     status: ItemStatus,
+    item_data: Option<serde_json::Value>,
 }
 
 /// OpenAI-compatible event emitter for /v1/responses streaming
@@ -204,6 +205,34 @@ impl ResponseStreamEventEmitter {
     }
 
     pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
+        // Build output array from tracked items
+        let output: Vec<serde_json::Value> = self
+            .output_items
+            .iter()
+            .filter_map(|item| {
+                if item.status == ItemStatus::Completed {
+                    item.item_data.clone()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // If no items were tracked (legacy path), fall back to generic message
+        let output = if output.is_empty() {
+            vec![json!({
+                "id": self.message_id.clone(),
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": self.accumulated_text.clone()
+                }]
+            })]
+        } else {
+            output
+        };
+
         let mut response = json!({
             "type": "response.completed",
             "sequence_number": self.next_sequence(),
@@ -213,15 +242,7 @@ impl ResponseStreamEventEmitter {
                 "created_at": self.created_at,
                 "status": "completed",
                 "model": self.model,
-                "output": [{
-                    "id": self.message_id.clone(),
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "text",
-                        "text": self.accumulated_text.clone()
-                    }]
-                }]
+                "output": output
             }
         });
 
@@ -403,6 +424,9 @@ impl ResponseStreamEventEmitter {
         output_index: usize,
         item: &serde_json::Value,
     ) -> serde_json::Value {
+        // Store the item data for later use in emit_completed
+        self.store_output_item_data(output_index, item.clone());
+
         json!({
             "type": "response.output_item.done",
             "sequence_number": self.next_sequence(),
@@ -434,12 +458,13 @@ impl ResponseStreamEventEmitter {
         self.output_items.push(OutputItemState {
             output_index: index,
             status: ItemStatus::InProgress,
+            item_data: None,
         });
 
         (index, id)
     }
 
-    /// Mark output item as completed
+    /// Mark output item as completed and store its data
     pub fn complete_output_item(&mut self, output_index: usize) {
         if let Some(item) = self
             .output_items
@@ -447,6 +472,17 @@ impl ResponseStreamEventEmitter {
             .find(|i| i.output_index == output_index)
         {
             item.status = ItemStatus::Completed;
+        }
+    }
+
+    /// Store output item data when emitting output_item.done
+    pub fn store_output_item_data(&mut self, output_index: usize, item_data: serde_json::Value) {
+        if let Some(item) = self
+            .output_items
+            .iter_mut()
+            .find(|i| i.output_index == output_index)
+        {
+            item.item_data = Some(item_data);
         }
     }
 
