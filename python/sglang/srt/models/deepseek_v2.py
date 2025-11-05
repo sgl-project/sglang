@@ -74,8 +74,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
-    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -480,7 +480,8 @@ class DeepseekV2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+            x,
+            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
         return x
 
@@ -503,7 +504,7 @@ class MoEGate(nn.Module):
                 torch.bfloat16
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
-                and should_use_flashinfer_trtllm_moe()
+                and get_moe_runner_backend().is_flashinfer_trtllm()
                 else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
@@ -814,7 +815,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states += shared_output
-
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -883,7 +883,9 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_deepep(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         shared_output = None
         if hidden_states.shape[0] > 0:

@@ -1,7 +1,7 @@
 //! Shared response processing logic for gRPC routers
 //!
 //! This module contains response processing functions that are shared between
-//! the regular router and PD router, eliminating ~1,200 lines of exact duplicates.
+//! the regular router and PD router.
 
 use std::{sync::Arc, time::Instant};
 
@@ -9,28 +9,25 @@ use proto::generate_complete::MatchedStop;
 use serde_json::Value;
 use tracing::error;
 
-use super::{
-    context::{DispatchMetadata, ExecutionResult},
-    error, utils,
-};
 use crate::{
     grpc_client::proto,
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-        common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage},
+        common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue},
         generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
+    routers::grpc::{
+        common::{response_collection, response_formatting},
+        context::{DispatchMetadata, ExecutionResult},
+        error, utils,
+    },
     tokenizer::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
         traits::Tokenizer,
     },
     tool_parser::ParserFactory as ToolParserFactory,
 };
-
-// ============================================================================
-// Response Processor - Main Entry Point
-// ============================================================================
 
 /// Unified response processor for both routers
 #[derive(Clone)]
@@ -57,57 +54,6 @@ impl ResponseProcessor {
             configured_tool_parser,
             configured_reasoning_parser,
         }
-    }
-
-    /// Helper to collect responses from execution result and merge logprobs if needed
-    async fn collect_and_merge_responses(
-        execution_result: ExecutionResult,
-        request_logprobs: bool,
-    ) -> Result<Vec<proto::GenerateComplete>, axum::response::Response> {
-        let all_responses = match execution_result {
-            ExecutionResult::Single { mut stream } => {
-                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
-                stream.mark_completed();
-                responses
-            }
-            ExecutionResult::Dual {
-                mut prefill,
-                decode,
-            } => {
-                // Collect prefill for input_logprobs (don't mark completed yet)
-                let prefill_responses =
-                    utils::collect_stream_responses(&mut prefill, "Prefill").await?;
-
-                // Collect decode for actual output (don't mark completed yet)
-                let mut decode_stream = *decode;
-                let mut decode_responses =
-                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
-
-                // Mark both streams as completed now that both succeeded
-                prefill.mark_completed();
-                decode_stream.mark_completed();
-
-                // Merge prefill input_logprobs if requested
-                if request_logprobs {
-                    if let Some(prefill_input_logprobs) = prefill_responses
-                        .first()
-                        .and_then(|r| r.input_logprobs.clone())
-                    {
-                        for response in &mut decode_responses {
-                            response.input_logprobs = Some(prefill_input_logprobs.clone());
-                        }
-                    }
-                }
-
-                decode_responses
-            }
-        };
-
-        if all_responses.is_empty() {
-            return Err(error::internal_error("No responses from server"));
-        }
-
-        Ok(all_responses)
     }
 
     /// Process a single choice from GenerateComplete response
@@ -151,7 +97,6 @@ impl ResponseProcessor {
         let mut reasoning_text: Option<String> = None;
         let mut processed_text = final_text;
 
-        // Check if reasoning parsing is enabled and parser is available
         if original_request.separate_reasoning && reasoning_parser_available {
             let pooled_parser = utils::get_reasoning_parser(
                 &self.reasoning_parser_factory,
@@ -275,7 +220,7 @@ impl ResponseProcessor {
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
         // Collect all responses from the execution result
         let all_responses =
-            Self::collect_and_merge_responses(execution_result, request_logprobs).await?;
+            response_collection::collect_responses(execution_result, request_logprobs).await?;
 
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
@@ -341,28 +286,15 @@ impl ResponseProcessor {
         }
 
         // Build usage
-        let total_prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
-        let total_completion_tokens: u32 = all_responses
-            .iter()
-            .map(|r| r.completion_tokens as u32)
-            .sum();
-        let usage = Usage {
-            prompt_tokens: total_prompt_tokens,
-            completion_tokens: total_completion_tokens,
-            total_tokens: total_prompt_tokens + total_completion_tokens,
-            completion_tokens_details: None,
-        };
+        let usage = response_formatting::build_usage(&all_responses);
 
         // Build final ChatCompletionResponse
-        let response = ChatCompletionResponse {
-            id: dispatch.request_id.clone(),
-            object: "chat.completion".to_string(),
-            created: dispatch.created,
-            model: dispatch.model.clone(),
+        let response = response_formatting::build_chat_response(
             choices,
-            usage: Some(usage),
-            system_fingerprint: dispatch.weight_version.clone(),
-        };
+            &dispatch,
+            dispatch.model.clone(),
+            usage,
+        );
 
         Ok(response)
     }
@@ -436,7 +368,7 @@ impl ResponseProcessor {
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
         // Collect all responses from the execution result
         let all_responses =
-            Self::collect_and_merge_responses(execution_result, request_logprobs).await?;
+            response_collection::collect_responses(execution_result, request_logprobs).await?;
 
         // Process each completion
         let mut result_array = Vec::new();
@@ -474,7 +406,7 @@ impl ResponseProcessor {
             }
 
             let output_ids = std::mem::take(&mut complete.output_ids);
-            let finish_reason_str = std::mem::take(&mut complete.finish_reason);
+            let finish_reason_str = complete.finish_reason.to_string();
 
             // Parse finish_reason from string to proper type
             let finish_reason =
