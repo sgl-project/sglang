@@ -168,7 +168,7 @@ jobs:
           cd sgl-router
           python3 -m venv .venv
           python3 -m pip install --upgrade pip maturin
-          maturin develop --release --features vendored-openssl
+          maturin develop --release --profile ci --features vendored-openssl
 
 
       - name: Run Python unit tests
