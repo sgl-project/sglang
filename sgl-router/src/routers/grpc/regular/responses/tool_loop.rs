@@ -545,6 +545,7 @@ async fn execute_tool_loop_streaming_internal(
         .unwrap()
         .as_secs();
     let mut emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
+    emitter.set_original_request(original_request.clone());
 
     // Emit initial response.created and response.in_progress events
     let event = emitter.emit_created();
@@ -896,8 +897,8 @@ async fn execute_tool_loop_streaming_internal(
         // Emit final response.completed event
         let usage_json = accumulated_response.usage.as_ref().map(|u| {
             json!({
-                "prompt_tokens": u.prompt_tokens,
-                "completion_tokens": u.completion_tokens,
+                "input_tokens": u.prompt_tokens,
+                "output_tokens": u.completion_tokens,
                 "total_tokens": u.total_tokens
             })
         });

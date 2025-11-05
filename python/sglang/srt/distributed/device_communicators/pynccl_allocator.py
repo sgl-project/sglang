@@ -1,11 +1,11 @@
 import os
 import tempfile
+from contextlib import nullcontext
 
 import torch
 from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.server_args import get_global_server_args
 
 nccl_allocator_source = """
 
@@ -60,6 +60,9 @@ _cur_device = None
 
 
 def is_symmetric_memory_enabled():
+    # Import here to avoid circular import
+    from sglang.srt.server_args import get_global_server_args
+
     return get_global_server_args().enable_symm_mem
 
 
@@ -92,7 +95,7 @@ def get_nccl_mem_pool():
     return _mem_pool
 
 
-class use_symmetric_memory:
+class SymmetricMemoryContext:
     """
     Context manager for using symmetric memory with pynccl.
 
@@ -100,25 +103,17 @@ class use_symmetric_memory:
     by `ncclMemAlloc` and registered by `ncclCommWindowRegister`. Due to this, we introduce
     this context manager. All tensors created under this context will be correctly
     allocated and registered with a custom allocator.
-
-    In addition, developers need to manually tag the tensors that will be used as the input/output
-    of NCCL collectives with `tag(tensor)`.
     """
 
-    def __init__(self, group_coordinator: GroupCoordinator):
-        self.enabled = is_symmetric_memory_enabled()
-
-        if not self.enabled:
-            return
-
+    def __init__(
+        self,
+        group_coordinator: GroupCoordinator,
+    ):
         self.group_coordinator = group_coordinator
         self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
         self.is_graph_capture = torch.cuda.is_current_stream_capturing()
 
     def __enter__(self):
-        if not self.enabled:
-            return self
-
         assert (
             self.group_coordinator.pynccl_comm is not None
         ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.group_name}'"
@@ -139,16 +134,16 @@ class use_symmetric_memory:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not self.enabled:
-            return
-
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
 
         if self.is_graph_capture:
             torch._C._cuda_beginAllocateCurrentThreadToPool(_cur_device, _graph_pool_id)
 
-    def tag(self, tensor: torch.Tensor):
-        if not self.enabled:
-            return
 
-        tensor.symmetric_memory = True
+def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
+    disabled = (
+        not is_symmetric_memory_enabled()
+        or disabled
+        or group_coordinator.world_size == 1
+    )
+    return SymmetricMemoryContext(group_coordinator) if not disabled else nullcontext()
