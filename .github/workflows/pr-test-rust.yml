@@ -167,15 +167,15 @@ jobs:
           export RUSTC_WRAPPER=sccache
           cd sgl-router
           pip install maturin
-          maturin develop --release --features vendored-openssl
+          maturin build --release --out dist --features vendored-openssl --manylinux off
+          pip install --force-reinstall dist/*.whl
 
 
       - name: Run Python unit tests
         run: |
-          cd sgl-router
           source "$HOME/.cargo/env"
           pip install pytest pytest-cov pytest-xdist
-          pytest -q py_test/unit --cov=sglang_router --cov-report=term-missing --cov-fail-under=80
+          pytest -q sgl-router/py_test/unit --cov=sglang_router --cov-report=term-missing --cov-fail-under=80
 
       - name: Run Python integration tests
         run: |
@@ -183,7 +183,7 @@ jobs:
           source "$HOME/.cargo/env"
           # Integration tests use FastAPI/uvicorn for mock workers
           pip install fastapi uvicorn orjson
-          pytest -q -m integration
+          pytest -q sgl-router/py_test/integration
 
       - name: Run Python E2E tests
         run: |
