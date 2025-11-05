@@ -69,6 +69,7 @@ performance:
   - changed-files:
     - any-glob-to-any-file:
       - '**/benchmark/**/*'
+      - '**/benches/**/*'
       - '**/perf/**/*'
       - '**/*benchmark*'
 
