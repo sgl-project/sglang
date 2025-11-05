@@ -2330,8 +2330,7 @@ class Scheduler(
 
     def _is_no_request(self):
         no_request = (
-            len(self.waiting_queue) == 0
-            and self.running_batch.is_empty()
+            self.running_batch.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -2608,6 +2607,7 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
             self.last_batch = None
+            self.cur_batch = None #TODO: to confirm
 
         if recv_req.retract_all:
             self.running_batch.filter_batch()
@@ -2615,7 +2615,8 @@ class Scheduler(
                 retracted_reqs = self.running_batch.retract_decode(
                     self.server_args, retract_all=True
                 )
-                self._extend_requests_to_queue(retracted_reqs)
+                for req in retracted_reqs:
+                    self._add_request_to_queue(req)
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None

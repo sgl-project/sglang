@@ -1,12 +1,22 @@
 import gc
+import json
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
 import torch
 
 import sglang as sgl
+from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
 
 
 def test_update_weights_from_tensor(tp_size):
@@ -165,6 +175,106 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
             _check_param(engine, param_name, [2.0] * 5)
 
         engine.shutdown()
+
+
+class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--max-running-requests", 8],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def run_decode(self, max_new_tokens=32):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
+                },
+            },
+        )
+        return response.json()
+
+    def get_model_info(self):
+        response = requests.get(self.base_url + "/get_model_info")
+        model_path = response.json()["model_path"]
+        print(json.dumps(response.json()))
+        return model_path
+
+    def pause_generation(self):
+        response = requests.post(
+            self.base_url + "/pause_generation",
+            json={"abort_all": False, "retract_all": True},
+        )
+        ret = response.json()
+        return ret
+    
+    def continue_generation(self):
+        response = requests.post(
+            self.base_url + "/continue_generation",
+            json={},
+        )
+        ret = response.json()
+        return ret
+
+    def run_update_weights(self, named_tensors, non_blocking=False):
+        response = requests.post(
+            self.base_url + "/update_weights_from_tensor",
+            json={
+                "serialized_named_tensors": [
+                    MultiprocessingSerializer.serialize(named_tensors, output_str=True)
+                ],
+                "non_blocking": non_blocking,
+            },
+        )
+        ret = response.json()
+        return ret
+
+    def test_update_weights_non_blocking(self):
+        num_requests = 32
+        with ThreadPoolExecutor(num_requests) as executor:
+            futures = [
+                executor.submit(self.run_decode, 3000) for _ in range(num_requests)
+            ]
+
+            # ensure the decode has been started
+            time.sleep(2)
+
+            param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)]
+            new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
+            named_tensors = [(x, new_tensor) for x in param_names]
+
+            ret = self.pause_generation()
+            ret = self.run_update_weights(named_tensors, non_blocking=True)
+            self.assertTrue(ret["success"])
+            ret = self.continue_generation()
+
+            for future in as_completed(futures):
+                self.assertNotEqual(
+                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
+                )
+
+            for param_name in param_names[:3]:
+                response = requests.post(
+                    self.base_url + "/get_weights_by_name",
+                    json={"name": param_name},
+                )
+                actual_values = torch.tensor(response.json())[0, :5]
+                assert torch.allclose(
+                    actual_values, torch.tensor([1.5] * 5), atol=0.002
+                ), f"{actual_values=}"
 
 
 def _check_param(engine, param_name, expect_values):

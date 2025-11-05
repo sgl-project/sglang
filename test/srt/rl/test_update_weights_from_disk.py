@@ -231,6 +231,99 @@ class TestServerUpdateWeightsFromDiskAbortAllRequests(CustomTestCase):
         self.assertNotEqual(updated_model_path, origin_model_path)
 
 
+class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--max-running-requests", 8],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def run_decode(self, max_new_tokens=32):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
+                },
+            },
+        )
+        return response.json()
+
+    def get_model_info(self):
+        response = requests.get(self.base_url + "/get_model_info")
+        model_path = response.json()["model_path"]
+        print(json.dumps(response.json()))
+        return model_path
+
+    def run_update_weights(self, model_path, non_blocking=False):
+        response = requests.post(
+            self.base_url + "/update_weights_from_disk",
+            json={
+                "model_path": model_path,
+                "non_blocking": non_blocking,
+            },
+        )
+        ret = response.json()
+        return ret
+    
+    def pause_generation(self):
+        response = requests.post(
+            self.base_url + "/pause_generation",
+            json={"abort_all": False, "retract_all": True},
+        )
+        ret = response.json()
+        return ret
+    
+    def continue_generation(self):
+        response = requests.post(
+            self.base_url + "/continue_generation",
+            json={},
+        )
+        ret = response.json()
+        return ret
+
+    def test_update_weights_non_blocking(self):
+        origin_model_path = self.get_model_info()
+        print(f"[Server Mode] origin_model_path: {origin_model_path}")
+
+        num_requests = 32
+        with ThreadPoolExecutor(num_requests) as executor:
+            futures = [
+                executor.submit(self.run_decode, 1600) for _ in range(num_requests)
+            ]
+
+            # ensure the decode has been started
+            time.sleep(2)
+
+            new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "")
+            ret = self.pause_generation()
+            ret = self.run_update_weights(new_model_path, non_blocking=True)
+            self.assertTrue(ret["success"])
+            ret = self.continue_generation()
+
+            for future in as_completed(futures):
+                self.assertNotEqual(
+                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
+                )
+
+        updated_model_path = self.get_model_info()
+        print(f"[Server Mode] updated_model_path: {updated_model_path}")
+        self.assertEqual(updated_model_path, new_model_path)
+        self.assertNotEqual(updated_model_path, origin_model_path)
+
+
 ###############################################################################
 # Parameterized Tests for update_weights_from_disk
 # Test coverage is determined based on the value of is_in_ci:

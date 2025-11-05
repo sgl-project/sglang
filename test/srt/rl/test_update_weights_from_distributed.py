@@ -18,6 +18,7 @@ import os
 import random
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import requests
@@ -69,6 +70,8 @@ def init_process(
     backend,
     checking_parameters,
     tie_word_embeddings,
+    barrier,
+    non_blocking=False,
 ):
     torch.cuda.set_device(rank)
 
@@ -82,6 +85,7 @@ def init_process(
             checking_parameters,
             tie_word_embeddings,
             state_dict_key_to_shape,
+            barrier,
         )
     elif rank in [1, 2]:
         init_process_sgl(
@@ -95,6 +99,8 @@ def init_process(
             state_dict_key_to_shape,
             backend,
             tp_size,
+            barrier,
+            non_blocking=non_blocking,
         )
 
 
@@ -107,6 +113,7 @@ def init_process_hf(
     checking_parameters,
     tie_word_embeddings,
     state_dict_key_to_shape,
+    barrier,
 ):
     # These two environment variables are very important
     # to avoid unexpected behaviors of CUDA and NCCL.
@@ -163,6 +170,7 @@ def init_process_hf(
         group_name="test_parameter_update_group",
     )
     torch.cuda.synchronize()
+    barrier.wait()
     time_begin_broadcast = time.perf_counter()
 
     # The last parameter is lm_head.weight, which is tied
@@ -206,6 +214,8 @@ def init_process_sgl(
     state_dict_key_to_shape,
     backend,
     tp_size,
+    barrier,
+    non_blocking=False,
 ):
     torch.cuda.set_device(rank)
     torch.cuda.synchronize()
@@ -280,8 +290,25 @@ def init_process_sgl(
             },
         )
 
-    torch.cuda.synchronize()
-    time_begin_update = time.perf_counter()
+    if non_blocking:
+        def run_decode(max_new_tokens=32):
+            response = requests.post(
+                url + "/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": max_new_tokens,
+                        "ignore_eos": True,
+                    },
+                },
+            )
+            return response.json()
+
+        with ThreadPoolExecutor(32) as executor:
+            futures = [executor.submit(run_decode, 3000) for _ in range(32)]
+            time.sleep(2)
+
 
     # The last parameter is lm_head.weight, which is tied
     # with embed_tokens.weight. Actually, we only need
@@ -298,6 +325,14 @@ def init_process_sgl(
     dtypes = [torch.bfloat16 if backend == "Engine" else "bfloat16"] * len(names)
     shapes = [state_dict_key_to_shape[parameter_name] for parameter_name in names]
 
+    if non_blocking:
+        requests.post(
+            url + "/pause_generation",
+            json={"abort_all": False, "retract_all": True},
+        )
+    torch.cuda.synchronize()
+    barrier.wait()
+    time_begin_update = time.perf_counter()
     if backend == "Engine":
         engine.update_weights_from_distributed(
             names,
@@ -313,10 +348,16 @@ def init_process_sgl(
                 "dtypes": dtypes,
                 "shapes": shapes,
                 "group_name": "test_parameter_update_group",
+                "non_blocking": non_blocking,
             },
         )
     torch.cuda.synchronize()
     time_end_update = time.perf_counter()
+    if non_blocking:
+        requests.post(
+            url + "/continue_generation",
+            json={},
+        )
 
     # Measure the latency of broadcast/weights update.
     update_time = time_end_update - time_begin_update
@@ -381,6 +422,7 @@ def test_update_weights_from_distributed(
     state_dict_key_to_shape,
     truncate_size,
     checking_parameters,
+    non_blocking=False,
 ):
     tie_word_embeddings = (
         True if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else False
@@ -391,6 +433,7 @@ def test_update_weights_from_distributed(
     )
     param_queue = mp.Queue()
     results = {}
+    barrier = mp.Barrier(1 + dp_size)
 
     context = mp.spawn(
         init_process,
@@ -404,6 +447,8 @@ def test_update_weights_from_distributed(
             backend,
             checking_parameters,
             tie_word_embeddings,
+            barrier,
+            non_blocking,
         ),
         nprocs=1 + dp_size,
         join=False,
@@ -624,6 +669,75 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 checking_parameters,
             )
 
+class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
+
+    def test_update_weights_from_distributed(self):
+
+        assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
+        # test_suits : tp, dp, model_name, backend
+        if is_in_ci():
+            mode = "Server"
+            test_suits = [
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode),
+            ]
+        else:
+            test_suits = [
+                (1, 1, DEFAULT_MODEL_NAME_FOR_TEST, "Sever"),
+            ]
+
+            if torch.cuda.device_count() >= 4:
+                test_suits.append(
+                    (1, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server"),
+                )
+
+            if torch.cuda.device_count() >= 5:
+                test_suits.append(
+                    (2, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server"),
+                )
+
+        model_state_dict_shapes = {}
+        test_models = [test_suit[2] for test_suit in test_suits]
+
+        for model_name in test_models:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, torch_dtype="bfloat16"
+            ).to("cuda:0")
+            state_dict = model.state_dict()
+            state_dict_keys = list(state_dict.keys())
+            model_state_dict_shapes[model_name] = {
+                key: state_dict[key].shape for key in state_dict_keys
+            }
+            del model
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        truncate_size = 10
+        checking_parameters = [
+            "model.embed_tokens.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.1.self_attn.q_proj.weight",
+            "model.layers.2.self_attn.k_proj.weight",
+            "model.layers.3.self_attn.v_proj.weight",
+            "model.layers.4.self_attn.o_proj.weight",
+            "model.layers.5.mlp.gate_proj.weight",
+            "model.layers.6.mlp.up_proj.weight",
+            "model.layers.7.mlp.down_proj.weight",
+            "model.layers.8.post_attention_layernorm.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        ]
+
+        for tp_size, dp_size, model_name, backend in test_suits:
+            test_update_weights_from_distributed(
+                tp_size,
+                dp_size,
+                model_name,
+                backend,
+                model_state_dict_shapes[model_name],
+                truncate_size,
+                checking_parameters,
+                non_blocking=True,
+            )
 
 if __name__ == "__main__":
     unittest.main()
