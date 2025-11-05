@@ -3935,9 +3935,7 @@ def set_global_server_args_for_scheduler(server_args: ServerArgs):
     _global_server_args = server_args
 
 
-def set_global_server_args_for_tokenizer(server_args: ServerArgs):
-    global _global_server_args
-    _global_server_args = server_args
+set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
 
 
 def get_global_server_args() -> ServerArgs:
