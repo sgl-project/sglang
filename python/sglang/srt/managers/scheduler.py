@@ -439,13 +439,9 @@ class Scheduler(
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.last_prefill_tokens = 0
-        self.last_decode_stats_tic = time.perf_counter()
-        self.last_prefill_stats_tic = time.perf_counter()
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
-        self.kv_transfer_speed_gb_s: float = 0.0
-        self.kv_transfer_latency_ms: float = 0.0
         self.sessions: Dict[str, Session] = {}
         self.default_stream: CudaStream = torch.get_device_module(
             self.device
@@ -1426,7 +1422,8 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            self._set_or_validate_priority(req)
+            if not self._set_or_validate_priority(req):
+                return
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
@@ -1446,7 +1443,7 @@ class Scheduler(
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
-    def _set_or_validate_priority(self, req: Req):
+    def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
         if self.enable_priority_scheduling and req.priority is None:
             if self.schedule_low_priority_values_first:
@@ -1467,6 +1464,8 @@ class Scheduler(
                 rid=req.rid,
             )
             self.send_to_tokenizer.send_output(abort_req, req)
+            return False
+        return True
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -2386,6 +2385,12 @@ class Scheduler(
                 - self.tree_cache.swa_evictable_size()
             )
             num_tokens = max(num_tokens_full, num_tokens_swa)
+        elif self.is_hybrid_gdn:
+            num_tokens = (
+                self.max_total_num_tokens
+                - self.token_to_kv_pool_allocator.available_size()
+                - self.tree_cache.full_evictable_size()
+            )
         else:
             num_tokens = (
                 self.max_total_num_tokens

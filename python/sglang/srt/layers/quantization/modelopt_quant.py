@@ -11,13 +11,17 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.dp_attention import get_dp_global_num_tokens, get_local_dp_buffer
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_local_dp_buffer,
+    is_allocation_symmetric,
+)
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
-    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -526,7 +530,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
 
         # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
-        if should_use_flashinfer_trtllm_moe():
+        if get_moe_runner_backend().is_flashinfer_trtllm():
             from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
 
             # 1) Swap W13 halves: [Up, Gate] -> [Gate, Up] expected by FI
@@ -568,7 +572,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
 
         # Precompute and register per-expert output scaling factors for FI MoE
-        if should_use_flashinfer_trtllm_moe():
+        if get_moe_runner_backend().is_flashinfer_trtllm():
             # Note: w13_input_scale and w2_input_scale are scalar Parameters post-reduction
             assert (
                 hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
@@ -620,8 +624,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-        if should_use_flashinfer_trtllm_moe() and TopKOutputChecker.format_is_bypassed(
-            topk_output
+        if (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            and TopKOutputChecker.format_is_bypassed(topk_output)
         ):
             router_logits = topk_output.router_logits
             topk_config = topk_output.topk_config
@@ -662,7 +667,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 None if correction_bias is None else correction_bias.to(torch.bfloat16)
             )
 
-            with use_symmetric_memory(get_tp_group()) as sm:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
                 # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
                 # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
                 # so we put the whole function under the ``use_symmetric_memory`` context manager.
@@ -692,7 +699,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
                 )
-                sm.tag(output)
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -1079,7 +1085,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " quantization. Please use Blackwell and"
                 " above."
             )
-        self.enable_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
+        self.enable_flashinfer_trtllm_moe = (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+        )
         self._cache_permute_indices = {}
 
     @property
@@ -1443,7 +1451,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         layer.dispatcher.set_quant_config(
-            {"input_global_scale": layer.w13_input_scale_quant}
+            {
+                "input_global_scale": (
+                    layer.w13_input_scale_quant if CUTEDSL_MOE_NVFP4_DISPATCH else None
+                )
+            }
         )
 
         # Validate weight scales
@@ -1578,33 +1590,42 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             output_dtype = x.dtype
+            original_col = x.shape[1]
             x_sf = None
+
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 from flashinfer import nvfp4_block_scale_interleave
 
                 # Quantize before comm, swizzle after.
-                if x.shape[0] > 0:
-                    x, x_sf = fp4_quantize_flashinfer(
-                        x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
-                    )
-                else:
-                    x_col = x.shape[1]
-                    x = torch.zeros(0, x_col // 2, dtype=torch.uint8, device=x.device)
-                    x_sf = torch.zeros(
-                        0, x_col // 16, dtype=torch.uint8, device=x.device
-                    )
+                with use_symmetric_memory(
+                    get_tp_group(), disabled=not is_allocation_symmetric()
+                ):
+                    if x.shape[0] > 0:
+                        x, x_sf = fp4_quantize_flashinfer(
+                            x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
+                        )
+                    else:
+                        x_col = x.shape[1]
+                        x = torch.zeros(
+                            0, x_col // 2, dtype=torch.uint8, device=x.device
+                        )
+                        x_sf = torch.zeros(
+                            0, x_col // 16, dtype=torch.uint8, device=x.device
+                        )
                 topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
                     [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
                 )
                 x_sf = nvfp4_block_scale_interleave(x_sf)
 
-            with use_symmetric_memory(get_tp_group()) as sm:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
                 symm_output = torch.empty(
-                    x.shape[0], x.shape[1], dtype=output_dtype, device=x.device
+                    x.shape[0], original_col, dtype=output_dtype, device=x.device
                 )
-                sm.tag(symm_output)
 
             output = flashinfer_cutlass_fused_moe(
+                output=symm_output,
                 input=x,
                 token_selected_experts=topk_ids.to(torch.int),
                 token_final_scales=topk_weights,
@@ -1625,7 +1646,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
-                output=symm_output,
             )[0]
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 output, global_output = get_local_dp_buffer(), output
@@ -1672,7 +1692,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def apply_without_routing_weights(
         self,
         layer: FusedMoE,
-        x: torch.Tensor,
+        x: tuple[torch.Tensor, Optional[torch.Tensor]],
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
         down_gemm_overlap_args: Optional["DownGemmOverlapArgs"],
