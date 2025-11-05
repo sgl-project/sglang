@@ -186,7 +186,7 @@ jobs:
           source .venv/bin/activate
           source "$HOME/.cargo/env"
           # Integration tests use FastAPI/uvicorn for mock workers
-          python -m pip install fastapi uvicorn orjson requests
+          python -m pip install fastapi uvicorn orjson requests cryptography
           pytest -q py_test/integration
 
       - name: Run Python E2E tests
