@@ -811,7 +811,7 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     return x
 
 
-def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor, name: str = "") -> None:
+def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:
         if param.numel() == 1 and loaded_weight.numel() == 1:
@@ -827,7 +827,6 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor, name
 
             param.data.copy_(loaded_weight)
     except Exception:
-        print(name)
         # NOTE: This exception is added for the purpose of setting breakpoint to
         # debug weight loading issues.
         raise

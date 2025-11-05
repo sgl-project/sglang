@@ -149,23 +149,18 @@ def adjust_config_with_unaligned_cpu_tp(
             att_heads = vision_cfg_obj.num_attention_heads
         if hasattr(vision_cfg_obj, "attention_heads"):
             att_heads = vision_cfg_obj.attention_heads
-        if att_heads > 0 and att_heads % tp_size != 0:
+        if not hasattr(vision_cfg_obj, "head_dim") and hasattr(vision_cfg_obj, "hidden_size"):
             vision_cfg_obj.head_dim = vision_cfg_obj.hidden_size // att_heads
+        if att_heads > 0 and att_heads % tp_size != 0:
             from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
-
             pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
-            att_heads = pad_vocab_size(
+            padded_att_heads = pad_vocab_size(
                 att_heads, pad_size
             )
-            if vision_cfg_obj.model_type != "siglip_vision_model":  # Not applicable for Phi4MM
-                vision_cfg_obj.original_hidden_size = vision_cfg_obj.hidden_size
-                vision_cfg_obj.hidden_size = vision_cfg_obj.head_dim * att_heads
             if hasattr(vision_cfg_obj, "num_attention_heads"):
-                vision_cfg_obj.original_num_attention_heads = vision_cfg_obj.num_attention_heads
-                vision_cfg_obj.num_attention_heads = att_heads
+                vision_cfg_obj.padded_num_attention_heads = padded_att_heads
             if hasattr(vision_cfg_obj, "attention_heads"):
-                vision_cfg_obj.original_attention_heads = vision_cfg_obj.attention_heads
-                vision_cfg_obj.attention_heads = att_heads
+                vision_cfg_obj.padded_attention_heads = padded_att_heads
         vision_cfg_obj = update_intermediate_size(
             vision_cfg_obj,
             "intermediate_size",
