@@ -1,5 +1,7 @@
 //! Harmony Preparation Stage: Harmony encoding for chat and generate requests
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use axum::response::Response;
 use serde_json::json;
@@ -12,7 +14,7 @@ use crate::{
         responses::ResponsesRequest,
     },
     routers::grpc::{
-        common::stages::PipelineStage,
+        common::{responses::utils::extract_tools_from_response_tools, stages::PipelineStage},
         context::{PreparationOutput, RequestContext, RequestType},
         error, utils,
     },
@@ -128,18 +130,36 @@ impl HarmonyPreparationStage {
         ctx: &mut RequestContext,
         request: &ResponsesRequest,
     ) -> Result<Option<Response>, Response> {
-        // Build via Harmony from responses API request
+        // Step 1: Extract function and MCP tools with schemas from ResponseTools
+        let mut function_tools = extract_tools_from_response_tools(request.tools.as_deref(), true);
+
+        // Step 2: Filter tools based on AllowedTools if specified
+        if let Some(ToolChoice::AllowedTools { tools: allowed, .. }) = &request.tool_choice {
+            let allowed_names: HashSet<&str> =
+                allowed.iter().filter_map(|tr| tr.function_name()).collect();
+            function_tools.retain(|t| allowed_names.contains(t.function.name.as_str()));
+        }
+
+        // Step 3: Generate Harmony structural tags for filtered tools
+        let tool_constraints = if !function_tools.is_empty() {
+            Self::generate_harmony_structural_tag(&function_tools, &request.tool_choice)
+                .map_err(|e| *e)?
+        } else {
+            None
+        };
+
+        // Step 3: Build via Harmony from responses API request
         let build_output = self
             .builder
             .build_from_responses(request)
             .map_err(|e| error::bad_request(format!("Harmony build failed: {}", e)))?;
 
-        // Store results in preparation output
+        // Step 4: Store results with tool_constraints
         ctx.state.preparation = Some(PreparationOutput {
             original_text: None,
             token_ids: build_output.input_ids,
             processed_messages: None,
-            tool_constraints: None,
+            tool_constraints,
             filtered_request: None,
             harmony_mode: true,
             selection_text: Some(build_output.selection_text),

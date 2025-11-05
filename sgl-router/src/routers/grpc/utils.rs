@@ -9,7 +9,6 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use super::{error, ProcessedMessages};
-pub use crate::tokenizer::StopSequenceDecoder;
 use crate::{
     core::Worker,
     grpc_client::{proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient},
@@ -28,8 +27,9 @@ use crate::{
     tokenizer::{
         cache::CachedTokenizer,
         chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+        stop::StopSequenceDecoderBuilder,
         traits::Tokenizer,
-        HuggingFaceTokenizer,
+        HuggingFaceTokenizer, StopSequenceDecoder,
     },
     tool_parser::{
         ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
@@ -284,7 +284,7 @@ pub fn filter_tools_for_request(
             let mut filtered_body = body.clone();
             let all_tools = filtered_body.tools.as_ref().unwrap();
             let allowed_names: std::collections::HashSet<&str> =
-                allowed.iter().map(|t| t.name.as_str()).collect();
+                allowed.iter().filter_map(|t| t.function_name()).collect();
             let filtered_tools: Vec<Tool> = all_tools
                 .iter()
                 .filter(|t| allowed_names.contains(t.function.name.as_str()))
@@ -438,8 +438,6 @@ pub fn create_stop_decoder(
     skip_special_tokens: bool,
     no_stop_trim: bool,
 ) -> StopSequenceDecoder {
-    use crate::tokenizer::stop::StopSequenceDecoderBuilder;
-
     // Extract stop sequences
     let stop_sequences: Vec<String> = match stop {
         Some(StringOrArray::String(s)) => vec![s.clone()],
