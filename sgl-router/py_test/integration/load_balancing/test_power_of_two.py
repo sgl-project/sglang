@@ -65,7 +65,7 @@ def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
     # Start background load in a non-blocking way to keep slow worker busy
     background_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
     background_futures = []
-    for i in range(32)
+    for i in range(32):
         future = background_executor.submit(_direct_load, i)
         background_futures.append(future)
 
