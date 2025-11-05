@@ -669,6 +669,10 @@ class NemotronHForCausalLM(nn.Module):
             name = replace_substrings(name, self.remap_substr)
             updated_weights.append((name, loaded_weight))
 
+        # - FusedMoe.w1 (aka gate_proj) should be up_proj since that's
+        #   what the activation is applied to
+        # - FusedMoe.w3 (aka up_proj) should be ignored since we're
+        #   using non-gated MoE
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="up_proj",
             ckpt_down_proj_name="down_proj",
