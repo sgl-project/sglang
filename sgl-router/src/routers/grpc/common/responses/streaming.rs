@@ -2,17 +2,23 @@
 
 use std::collections::HashMap;
 
+use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
-use crate::{mcp, protocols::chat::ChatCompletionStreamResponse};
+use crate::{
+    mcp,
+    protocols::{chat::ChatCompletionStreamResponse, responses::ResponsesRequest},
+};
 
 pub enum OutputItemType {
     Message,
     McpListTools,
     McpCall,
+    FunctionCall,
     Reasoning,
 }
 
@@ -28,6 +34,7 @@ enum ItemStatus {
 struct OutputItemState {
     output_index: usize,
     status: ItemStatus,
+    item_data: Option<serde_json::Value>,
 }
 
 /// OpenAI-compatible event emitter for /v1/responses streaming
@@ -67,6 +74,7 @@ pub struct ResponseStreamEventEmitter {
     next_output_index: usize,
     current_message_output_index: Option<usize>, // Tracks output_index of current message
     current_item_id: Option<String>,             // Tracks item_id of current item
+    original_request: Option<ResponsesRequest>,
 }
 
 impl ResponseStreamEventEmitter {
@@ -89,7 +97,13 @@ impl ResponseStreamEventEmitter {
             next_output_index: 0,
             current_message_output_index: None,
             current_item_id: None,
+            original_request: None,
         }
+    }
+
+    /// Set the original request for including all fields in response.completed
+    pub fn set_original_request(&mut self, request: ResponsesRequest) {
+        self.original_request = Some(request);
     }
 
     fn next_sequence(&mut self) -> u64 {
@@ -201,32 +215,98 @@ impl ResponseStreamEventEmitter {
     }
 
     pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
-        let mut response = json!({
-            "type": "response.completed",
-            "sequence_number": self.next_sequence(),
-            "response": {
-                "id": self.response_id,
-                "object": "response",
-                "created_at": self.created_at,
-                "status": "completed",
-                "model": self.model,
-                "output": [{
-                    "id": self.message_id.clone(),
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "text",
-                        "text": self.accumulated_text.clone()
-                    }]
+        // Build output array from tracked items
+        let output: Vec<serde_json::Value> = self
+            .output_items
+            .iter()
+            .filter_map(|item| {
+                if item.status == ItemStatus::Completed {
+                    item.item_data.clone()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // If no items were tracked (legacy path), fall back to generic message
+        let output = if output.is_empty() {
+            vec![json!({
+                "id": self.message_id.clone(),
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": self.accumulated_text.clone()
                 }]
-            }
+            })]
+        } else {
+            output
+        };
+
+        // Build base response object
+        let mut response_obj = json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": "completed",
+            "model": self.model,
+            "output": output
         });
 
+        // Add usage if provided
         if let Some(usage_val) = usage {
-            response["response"]["usage"] = usage_val.clone();
+            response_obj["usage"] = usage_val.clone();
         }
 
-        response
+        // Add all original request fields if available
+        if let Some(ref req) = self.original_request {
+            Self::add_optional_field(&mut response_obj, "instructions", &req.instructions);
+            Self::add_optional_field(
+                &mut response_obj,
+                "max_output_tokens",
+                &req.max_output_tokens,
+            );
+            Self::add_optional_field(&mut response_obj, "max_tool_calls", &req.max_tool_calls);
+            Self::add_optional_field(
+                &mut response_obj,
+                "previous_response_id",
+                &req.previous_response_id,
+            );
+            Self::add_optional_field(&mut response_obj, "reasoning", &req.reasoning);
+            Self::add_optional_field(&mut response_obj, "temperature", &req.temperature);
+            Self::add_optional_field(&mut response_obj, "top_p", &req.top_p);
+            Self::add_optional_field(&mut response_obj, "truncation", &req.truncation);
+            Self::add_optional_field(&mut response_obj, "user", &req.user);
+
+            response_obj["parallel_tool_calls"] = json!(req.parallel_tool_calls.unwrap_or(true));
+            response_obj["store"] = json!(req.store.unwrap_or(true));
+            response_obj["tools"] = json!(req.tools.as_ref().unwrap_or(&vec![]));
+            response_obj["metadata"] = json!(req.metadata.as_ref().unwrap_or(&Default::default()));
+
+            // tool_choice: serialize if present, otherwise use "auto"
+            if let Some(ref tc) = req.tool_choice {
+                response_obj["tool_choice"] = json!(tc);
+            } else {
+                response_obj["tool_choice"] = json!("auto");
+            }
+        }
+
+        json!({
+            "type": "response.completed",
+            "sequence_number": self.next_sequence(),
+            "response": response_obj
+        })
+    }
+
+    /// Helper to add optional fields to JSON object
+    fn add_optional_field<T: serde::Serialize>(
+        obj: &mut serde_json::Value,
+        key: &str,
+        value: &Option<T>,
+    ) {
+        if let Some(val) = value {
+            obj[key] = json!(val);
+        }
     }
 
     // ========================================================================
@@ -343,6 +423,40 @@ impl ResponseStreamEventEmitter {
     }
 
     // ========================================================================
+    // Function Call Event Emission Methods
+    // ========================================================================
+
+    pub fn emit_function_call_arguments_delta(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+        delta: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "delta": delta
+        })
+    }
+
+    pub fn emit_function_call_arguments_done(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+        arguments: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": "response.function_call_arguments.done",
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id,
+            "arguments": arguments
+        })
+    }
+
+    // ========================================================================
     // Output Item Wrapper Events
     // ========================================================================
 
@@ -366,6 +480,9 @@ impl ResponseStreamEventEmitter {
         output_index: usize,
         item: &serde_json::Value,
     ) -> serde_json::Value {
+        // Store the item data for later use in emit_completed
+        self.store_output_item_data(output_index, item.clone());
+
         json!({
             "type": "response.output_item.done",
             "sequence_number": self.next_sequence(),
@@ -387,6 +504,7 @@ impl ResponseStreamEventEmitter {
         let id_prefix = match &item_type {
             OutputItemType::McpListTools => "mcpl",
             OutputItemType::McpCall => "mcp",
+            OutputItemType::FunctionCall => "fc",
             OutputItemType::Message => "msg",
             OutputItemType::Reasoning => "rs",
         };
@@ -396,12 +514,13 @@ impl ResponseStreamEventEmitter {
         self.output_items.push(OutputItemState {
             output_index: index,
             status: ItemStatus::InProgress,
+            item_data: None,
         });
 
         (index, id)
     }
 
-    /// Mark output item as completed
+    /// Mark output item as completed and store its data
     pub fn complete_output_item(&mut self, output_index: usize) {
         if let Some(item) = self
             .output_items
@@ -409,6 +528,17 @@ impl ResponseStreamEventEmitter {
             .find(|i| i.output_index == output_index)
         {
             item.status = ItemStatus::Completed;
+        }
+    }
+
+    /// Store output item data when emitting output_item.done
+    pub fn store_output_item_data(&mut self, output_index: usize, item_data: serde_json::Value) {
+        if let Some(item) = self
+            .output_items
+            .iter_mut()
+            .find(|i| i.output_index == output_index)
+        {
+            item.item_data = Some(item_data);
         }
     }
 
@@ -582,4 +712,40 @@ impl ResponseStreamEventEmitter {
             }
         }
     }
+
+    /// Emit an error event
+    ///
+    /// Creates and sends an error event with the given error message.
+    /// Uses OpenAI's error event format.
+    /// Use this for terminal errors that should abort the streaming response.
+    pub fn emit_error(
+        &mut self,
+        error_msg: &str,
+        error_code: Option<&str>,
+        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    ) {
+        let event = json!({
+            "type": "error",
+            "code": error_code.unwrap_or("internal_error"),
+            "message": error_msg,
+            "param": null,
+            "sequence_number": self.next_sequence()
+        });
+        let sse_data = format!("data: {}\n\n", serde_json::to_string(&event).unwrap());
+        let _ = tx.send(Ok(Bytes::from(sse_data)));
+    }
+}
+
+/// Build a Server-Sent Events (SSE) response
+///
+/// Creates a Response with proper SSE headers and streaming body.
+pub fn build_sse_response(rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>) -> Response {
+    let stream = UnboundedReceiverStream::new(rx);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }

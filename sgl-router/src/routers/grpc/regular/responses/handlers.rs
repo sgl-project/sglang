@@ -36,14 +36,13 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    http::{self, header, StatusCode},
+    http::{self, StatusCode},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
 use validator::Validate;
@@ -59,7 +58,7 @@ use crate::{
     },
     protocols::{
         chat::{self, ChatCompletionStreamResponse},
-        common,
+        common::{self, ToolChoice},
         responses::{
             self, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
             ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
@@ -67,8 +66,13 @@ use crate::{
         },
     },
     routers::{
-        grpc::{common::responses::streaming::ResponseStreamEventEmitter, error},
-        openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
+        grpc::{
+            common::responses::{
+                build_sse_response, ensure_mcp_connection, streaming::ResponseStreamEventEmitter,
+            },
+            error,
+        },
+        openai::conversations::persist_conversation_items,
     },
 };
 
@@ -81,33 +85,6 @@ pub async fn route_responses(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
 ) -> Response {
-    // 0. Fast worker validation (fail-fast before expensive operations)
-    let requested_model: Option<&str> = model_id.as_deref().or(Some(request.model.as_str()));
-
-    if let Some(model) = requested_model {
-        // Check if any workers support this model
-        let available_models = ctx.worker_registry.get_models();
-
-        if !available_models.contains(&model.to_string()) {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(json!({
-                    "error": {
-                        "message": format!(
-                            "No workers available for model '{}'. Available models: {}",
-                            model,
-                            available_models.join(", ")
-                        ),
-                        "type": "service_unavailable",
-                        "param": "model",
-                        "code": "no_available_workers"
-                    }
-                })),
-            )
-                .into_response();
-        }
-    }
-
     // 1. Validate request (includes conversation ID format)
     if let Err(validation_errors) = request.validate() {
         // Extract the first error message for conversation field
@@ -171,7 +148,10 @@ pub async fn route_responses(
     if is_streaming {
         route_responses_streaming(ctx, request, headers, model_id).await
     } else {
-        route_responses_sync(ctx, request, headers, model_id, None).await
+        // Generate response ID for synchronous execution
+        // TODO: we may remove this when we have builder pattern for responses
+        let response_id = Some(format!("resp_{}", Uuid::new_v4()));
+        route_responses_sync(ctx, request, headers, model_id, response_id).await
     }
 }
 
@@ -211,40 +191,24 @@ async fn route_responses_internal(
     // 1. Load conversation history and build modified request
     let modified_request = load_conversation_history(ctx, &request).await?;
 
-    // 2. Check if request has MCP tools - if so, use tool loop
-    let responses_response = if let Some(tools) = &request.tools {
-        // Ensure dynamic MCP client is registered for request-scoped tools
-        if ensure_request_mcp_client(&ctx.mcp_manager, tools)
-            .await
-            .is_some()
-        {
-            debug!("MCP tools detected, using tool loop");
+    // 2. Check MCP connection and get whether MCP tools are present
+    let has_mcp_tools = ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await?;
 
-            // Execute with MCP tool loop
-            execute_tool_loop(
-                ctx,
-                modified_request,
-                &request,
-                headers,
-                model_id,
-                response_id.clone(),
-            )
-            .await?
-        } else {
-            debug!("Failed to create MCP client from request tools");
-            // Fall through to non-MCP execution
-            execute_without_mcp(
-                ctx,
-                &modified_request,
-                &request,
-                headers,
-                model_id,
-                response_id.clone(),
-            )
-            .await?
-        }
+    let responses_response = if has_mcp_tools {
+        debug!("MCP tools detected, using tool loop");
+
+        // Execute with MCP tool loop
+        execute_tool_loop(
+            ctx,
+            modified_request,
+            &request,
+            headers,
+            model_id,
+            response_id.clone(),
+        )
+        .await?
     } else {
-        // No tools, execute normally
+        // No MCP tools - execute without MCP (may have function tools or no tools)
         execute_without_mcp(
             ctx,
             &modified_request,
@@ -289,18 +253,18 @@ async fn route_responses_streaming(
         Err(response) => return response, // Already a Response with proper status code
     };
 
-    // 2. Check if request has MCP tools - if so, use streaming tool loop
-    if let Some(tools) = &request.tools {
-        // Ensure dynamic MCP client is registered for request-scoped tools
-        if ensure_request_mcp_client(&ctx.mcp_manager, tools)
-            .await
-            .is_some()
-        {
-            debug!("MCP tools detected in streaming mode, using streaming tool loop");
+    // 2. Check MCP connection and get whether MCP tools are present
+    let has_mcp_tools =
+        match ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await {
+            Ok(has_mcp) => has_mcp,
+            Err(response) => return response,
+        };
 
-            return execute_tool_loop_streaming(ctx, modified_request, &request, headers, model_id)
-                .await;
-        }
+    if has_mcp_tools {
+        debug!("MCP tools detected in streaming mode, using streaming tool loop");
+
+        return execute_tool_loop_streaming(ctx, modified_request, &request, headers, model_id)
+            .await;
     }
 
     // 3. Convert ResponsesRequest → ChatCompletionRequest
@@ -352,8 +316,8 @@ async fn convert_chat_stream_to_responses_stream(
         )
         .await;
 
-    // Extract body and headers from chat response
-    let (parts, body) = chat_response.into_parts();
+    // Extract body from chat response
+    let (_parts, body) = chat_response.into_parts();
 
     // Create channel for transformed SSE events
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
@@ -392,29 +356,7 @@ async fn convert_chat_stream_to_responses_stream(
     });
 
     // Build SSE response with transformed stream
-    let stream = UnboundedReceiverStream::new(rx);
-    let body = Body::from_stream(stream);
-
-    let mut response = Response::builder().status(parts.status).body(body).unwrap();
-
-    // Copy headers from original chat response
-    *response.headers_mut() = parts.headers;
-
-    // Ensure SSE headers are set
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("text/event-stream"),
-    );
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("no-cache"),
-    );
-    response.headers_mut().insert(
-        header::CONNECTION,
-        header::HeaderValue::from_static("keep-alive"),
-    );
-
-    response
+    build_sse_response(rx)
 }
 
 /// Process chat SSE stream and transform to responses format
@@ -435,6 +377,18 @@ async fn process_and_transform_sse_stream(
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
+    event_emitter.set_original_request(original_request.clone());
+
+    // Emit initial response.created and response.in_progress events
+    let event = event_emitter.emit_created();
+    event_emitter
+        .send_event(&event, &tx)
+        .map_err(|_| "Failed to send response.created event".to_string())?;
+
+    let event = event_emitter.emit_in_progress();
+    event_emitter
+        .send_event(&event, &tx)
+        .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
     // Convert body to data stream
     let mut stream = body.into_data_stream();
@@ -479,15 +433,15 @@ async fn process_and_transform_sse_stream(
     // Emit final response.completed event with accumulated usage
     let usage_json = accumulator.usage.as_ref().map(|u| {
         let mut usage_obj = json!({
-            "prompt_tokens": u.prompt_tokens,
-            "completion_tokens": u.completion_tokens,
+            "input_tokens": u.prompt_tokens,
+            "output_tokens": u.completion_tokens,
             "total_tokens": u.total_tokens
         });
 
         // Include reasoning_tokens if present
         if let Some(details) = &u.completion_tokens_details {
             if let Some(reasoning_tokens) = details.reasoning_tokens {
-                usage_obj["completion_tokens_details"] = json!({
+                usage_obj["output_tokens_details"] = json!({
                     "reasoning_tokens": reasoning_tokens
                 });
             }
@@ -703,7 +657,7 @@ impl StreamingResponseAccumulator {
             store: self.original_request.store.unwrap_or(true),
             temperature: self.original_request.temperature,
             text: None,
-            tool_choice: "auto".to_string(),
+            tool_choice: ToolChoice::serialize_to_string(&self.original_request.tool_choice),
             tools: self.original_request.tools.clone().unwrap_or_default(),
             top_p: self.original_request.top_p,
             truncation: None,
