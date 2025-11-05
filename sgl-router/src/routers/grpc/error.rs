@@ -107,6 +107,30 @@ pub fn service_unavailable(message: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// Create a 424 Failed Dependency response
+///
+/// Use this when an external dependency (like MCP server) fails.
+///
+/// # Example
+/// ```ignore
+/// return Err(failed_dependency("Failed to connect to MCP server"));
+/// ```
+pub fn failed_dependency(message: impl Into<String>) -> Response {
+    let msg = message.into();
+    warn!("{}", msg);
+    (
+        StatusCode::FAILED_DEPENDENCY,
+        Json(json!({
+            "error": {
+                "message": msg,
+                "type": "external_connector_error",
+                "code": 424
+            }
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
