@@ -1564,6 +1564,7 @@ class MLATokenToKVPool(KVCache):
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
+    rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
         self,
@@ -1585,10 +1586,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
         # Calculate override_kv_cache_dim for FP8 storage:
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+        # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         override_dim = (
             kv_lora_rank
             + kv_lora_rank // self.quant_block_size * 4
-            + qk_rope_head_dim * dtype.itemsize
+            + qk_rope_head_dim * self.rope_storage_dtype.itemsize
         )
 
         super().__init__(
