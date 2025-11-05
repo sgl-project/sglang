@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 
 Image.MAX_IMAGE_PIXELS = None
 DEFAULT_NUM_TILES = 12
+NUM_VIDEO_FRAMES = 32  # TODO: allow num frames to be configurable
+NUM_VIDEO_TILES = 1
 
 
 class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
@@ -65,58 +67,18 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             std=self.norm_std,
         ).to(dtype=torch.bfloat16)
 
-    def select_frames(
-        self, video: "VideoReader", num_frames: int = 32
-    ):  # TODO: allow num frames to be configurable
-        total_frames = len(video)
-        return np.linspace(0, total_frames - 1, num_frames, dtype=int)
+    def render_image(self, *, num_tiles: int):
+        return f"{self.IMG_START_TOKEN}{self.IMG_CONTEXT_TOKEN * self.num_image_token * num_tiles}{self.IMG_END_TOKEN}"
 
-    def preprocess_video(self, video: "VideoReader"):
-        frames = self.select_frames(video)
+    def render_frame(self, frame_index: int, *, timestamp: float):
+        return f"Frame {frame_index + 1} sampled at {timestamp:.2f} seconds: {self.render_image(num_tiles=NUM_VIDEO_TILES)}"
+
+    @staticmethod
+    def parse_video(video: "VideoReader") -> tuple[np.ndarray, list[float]]:
+        frames = np.linspace(0, len(video) - 1, NUM_VIDEO_FRAMES, dtype=int)
         video_array = video.get_batch(frames).asnumpy()
-        assert isinstance(video_array, np.ndarray), "Video array must be a numpy array"
-        frames_tensors = [
-            self.preprocess_image(Image.fromarray(frame, mode="RGB"), max_num_tiles=1)
-            for frame in video_array
-        ]
-        processed_video = torch.cat(frames_tensors, dim=0)
-        fps = video.get_avg_fps()
-        assert isinstance(fps, float), "FPS must be a float"
-        timestamps = [frame / fps for frame in frames]
-        return processed_video, timestamps
-
-    def enhance_input_text(self, input_text: str, context_token: str, seqs: list[str]):
-        placeholder = "<<TEMP_PLACEHOLDER>>"
-        input_text = input_text.replace(context_token, placeholder)
-        for seq in seqs:
-            input_text = input_text.replace(placeholder, seq, 1)
-        input_text = input_text.replace(placeholder, context_token)
-        return input_text
-
-    def produce_image_feature(self, images: list[Image.Image], input_text: str):
-        preprocessed_images = [self.preprocess_image(image) for image in images]
-        seqs = [
-            f"{self.IMG_START_TOKEN}{self.IMG_CONTEXT_TOKEN * self.num_image_token * tiles.shape[0]}{self.IMG_END_TOKEN}"
-            for tiles in preprocessed_images
-        ]
-        concatenated_images = torch.cat(preprocessed_images, dim=0)
-        input_text = self.enhance_input_text(input_text, self.IMG_CONTEXT_TOKEN, seqs)
-        return concatenated_images, input_text
-
-    def produce_video_feature(self, videos: "list[VideoReader]", input_text: str):
-        preprocessed_videos = []
-        for video in videos:
-            preprocessed_video, timestamps = self.preprocess_video(video)
-            preprocessed_videos.append(preprocessed_video)
-            seqs = [
-                f"Frame {i + 1} sampled at {timestamp:.2f} seconds: {self.IMG_START_TOKEN}{self.VIDEO_CONTEXT_TOKEN * self.num_image_token}{self.IMG_END_TOKEN}"
-                for i, timestamp in enumerate(timestamps)
-            ]
-            input_text = self.enhance_input_text(
-                input_text, self.VIDEO_CONTEXT_TOKEN, seqs
-            )
-        concatenated_videos = torch.cat(preprocessed_videos, dim=0)
-        return concatenated_videos, input_text
+        timestamps = video.get_frame_timestamp(frames)[:, 0]
+        return video_array, timestamps
 
     async def process_mm_data_async(
         self, image_data, input_text, request_obj, **kwargs
@@ -128,16 +90,43 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
             discard_alpha_channel=True,
         )
-        image_feature, video_feature = None, None
-        if base_output.images:
-            image_feature, input_text = self.produce_image_feature(
-                base_output.images, input_text
-            )
 
-        if base_output.videos:
-            video_feature, input_text = self.produce_video_feature(
-                base_output.videos, input_text
+        image_feature = None
+        if base_output.images:
+            preprocessed_images = [
+                self.preprocess_image(image) for image in base_output.images
+            ]
+            rendered_images = [
+                self.render_image(num_tiles=image.shape[0])
+                for image in preprocessed_images
+            ]
+            input_text = input_text.replace(
+                self.IMG_CONTEXT_TOKEN, "".join(rendered_images), 1
             )
+            image_feature = torch.cat(preprocessed_images, dim=0)
+
+        video_feature = None
+        if base_output.videos:
+            preprocessed_videos = []
+            for video in base_output.videos:
+                video_array, timestamps = self.parse_video(video)
+                frames_tensors = [
+                    self.preprocess_image(
+                        Image.fromarray(frame, mode="RGB"),
+                        max_num_tiles=NUM_VIDEO_TILES,
+                    )
+                    for frame in video_array
+                ]
+                preprocessed_video = torch.cat(frames_tensors, dim=0)
+                preprocessed_videos.append(preprocessed_video)
+                rendered_frames = [
+                    self.render_frame(frame_index=i, timestamp=timestamp)
+                    for i, timestamp in enumerate(timestamps)
+                ]
+                input_text = input_text.replace(
+                    self.VIDEO_CONTEXT_TOKEN, "".join(rendered_frames), 1
+                )
+            video_feature = torch.cat(preprocessed_videos, dim=0)
 
         input_ids_tensor = self.tokenizer(input_text, return_tensors="pt")[
             "input_ids"
