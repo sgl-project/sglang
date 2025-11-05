@@ -461,7 +461,8 @@ jobs:
         timeout-minutes: 40
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200-deepep
+          lsmod | grep peermem
+          capsh --print | grep cap_sys_rawio
 
   pr-test-finish:
     needs:

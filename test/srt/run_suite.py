@@ -187,9 +187,10 @@ suites = {
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
+        TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-h200-deepep": [
-        TestFile("ep/test_mooncake_ep_small.py", 450),
+        TestFile("ep/test_deepep_large.py", 338),
     ],
     "per-commit-8-gpu-h200-deepseek-v32": [
         TestFile("test_deepseek_v32_basic.py", 275),
@@ -222,7 +223,6 @@ suites = {
         TestFile("entrypoints/http_server/test_abort_request.py"),
         TestFile("ep/test_deepep_internode.py"),
         TestFile("ep/test_deepep_intranode.py"),
-        TestFile("ep/test_deepep_large.py"),
         TestFile("ep/test_deepep_low_latency.py"),
         TestFile("ep/test_eplb.py"),
         TestFile("ep/test_hybrid_dp_ep_tp_mtp.py"),
