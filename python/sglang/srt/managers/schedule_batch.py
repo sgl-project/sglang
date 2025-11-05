@@ -1118,12 +1118,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
-    # For prefill logging stats (to be logged after batch execution)
-    prefill_adder: Optional[Any] = None  # PrefillAdder type
-    prefill_can_run_list: Optional[List[Any]] = None  # List[Req] type
-    prefill_running_bs: int = 0
-    prefill_running_bs_offline_batch: int = 0
-
     @classmethod
     def init_new(
         cls,
@@ -1892,10 +1886,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
-            prefill_adder=self.prefill_adder,
-            prefill_can_run_list=self.prefill_can_run_list,
-            prefill_running_bs=self.prefill_running_bs,
-            prefill_running_bs_offline_batch=self.prefill_running_bs_offline_batch,
         )
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:

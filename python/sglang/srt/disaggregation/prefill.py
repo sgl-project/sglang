@@ -393,15 +393,6 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         Adapted from process_batch_result_prefill
         """
-        # Log prefill stats after batch execution
-        if self.current_scheduler_metrics_enabled() and batch.prefill_adder is not None:
-            self.log_prefill_stats(
-                batch.prefill_adder,
-                batch.prefill_can_run_list,
-                batch.prefill_running_bs,
-                batch.prefill_running_bs_offline_batch,
-            )
-
         (
             logits_output,
             next_token_ids,
