@@ -285,7 +285,7 @@ jobs:
           export RUSTC_WRAPPER=sccache
           cd sgl-router
           python3 -m venv .venv
-          python -m pip install --upgrade pip maturin
+          python3 -m pip install --upgrade pip maturin
           maturin develop --release --profile ci --features vendored-openssl
 
       - name: Run Python E2E response API tests
