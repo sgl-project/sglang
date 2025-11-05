@@ -214,7 +214,7 @@ impl HarmonyPreparationStage {
             let params_schema = &tool.function.parameters;
 
             tags.push(json!({
-                "begin": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
+                "begin": format!("<|start|>assistant<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
                 "content": {
                     "type": "json_schema",
                     "json_schema": params_schema
@@ -228,7 +228,7 @@ impl HarmonyPreparationStage {
         let structural_tag = json!({
             "format": {
                 "type": "triggered_tags",
-                "triggers": ["<|channel|>commentary"],
+                "triggers": ["<|start|>assistant"],
                 "tags": tags,
                 "at_least_one": true,
                 "stop_after_first": stop_after_first
