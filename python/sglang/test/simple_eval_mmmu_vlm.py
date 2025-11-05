@@ -204,6 +204,7 @@ class MMMUVLMEval(Eval):
 
             # Sample
             response_text = sampler(prompt_messages)
+            response_text = response_text or ""
 
             # Parse and score
             gold = sample["answer"]
