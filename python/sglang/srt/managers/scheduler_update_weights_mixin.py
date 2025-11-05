@@ -106,6 +106,10 @@ class SchedulerUpdateWeightsMixin:
     def release_memory_occupation(
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
     ):
+        assert (
+            self._is_no_request()
+        ), "release_memory_occupation should be called only when no ongoing request."
+
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
@@ -127,6 +131,8 @@ class SchedulerUpdateWeightsMixin:
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
+        torch.cuda.synchronize()
 
         return ReleaseMemoryOccupationReqOutput()
 
