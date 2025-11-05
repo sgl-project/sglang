@@ -357,9 +357,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not (
-            get_moe_runner_backend().is_cutlass()
-            and self.quant_config.get_name() == "w4afp8"
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and not get_moe_runner_backend().is_cutlass()
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
