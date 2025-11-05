@@ -91,6 +91,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.layers.elementwise import fused_dual_input_rmsnorm
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
@@ -1563,8 +1564,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                         self.kv_a_layernorm.variance_epsilon,
                     )
                 else:
-                    q = self.q_a_layernorm(q)
-                    k_nope = self.kv_a_layernorm(k_nope)
+                    q, k_nope = fused_dual_input_rmsnorm(
+                        q,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.variance_epsilon,
+                        k_nope,
+                        self.kv_a_layernorm.weight,
+                        self.kv_a_layernorm.variance_epsilon,
+                    )
 
             # q_lora needed by indexer
             if self.use_nsa:

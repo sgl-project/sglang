@@ -227,10 +227,12 @@ def fused_rmsnorm_kernel(
     weight_ptr,
     eps: tl.constexpr,
     hidden_dim: tl.constexpr,
+    stride_row: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    input_start = pid * hidden_dim
+    input_start = pid * stride_row
+    output_start = pid * hidden_dim
 
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < hidden_dim
@@ -245,7 +247,7 @@ def fused_rmsnorm_kernel(
     a_rms = a / rms * w1
 
     tl.store(
-        output_ptr + input_start + offsets,
+        output_ptr + output_start + offsets,
         a_rms,  # implicitly casts to output dtype here
         mask=mask,
     )
@@ -258,18 +260,91 @@ def fused_rmsnorm(x, weight, eps, autotune=False, inplace=False):
     else:
         output = torch.empty_like(x)
     bs, hidden_dim = x.shape
+    stride_row = x.stride(0)
     max_warps = 16 if _is_hip else 32
     config = {
-        "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
+        "BLOCK_SIZE": triton.next_power_of_2(stride_row),
         "num_warps": max(
-            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
+            min(triton.next_power_of_2(triton.cdiv(stride_row, 256)), max_warps), 4
         ),
     }
 
     fused_rmsnorm_kernel[(bs,)](
-        output, x, weight, eps=eps, hidden_dim=hidden_dim, **config
+        output, x, weight, eps=eps, hidden_dim=hidden_dim, stride_row=stride_row, **config
     )
     return output
+
+
+@triton.jit
+def fused_dual_input_rmsnorm_kernel(
+    output_ptr1,
+    output_ptr2,
+    activ_ptr1, 
+    activ_ptr2,
+    weight_ptr1, 
+    weight_ptr2,
+    eps1: tl.constexpr,
+    eps2: tl.constexpr,
+    hidden_dim1: tl.constexpr,
+    hidden_dim2: tl.constexpr,
+    stride_row1: tl.constexpr,
+    stride_row2: tl.constexpr,
+    BLOCK_SIZE1: tl.constexpr,
+    BLOCK_SIZE2: tl.constexpr,
+):
+    fused_rmsnorm_kernel(output_ptr1, activ_ptr1, weight_ptr1, eps1, hidden_dim1, stride_row1, BLOCK_SIZE1)
+    fused_rmsnorm_kernel(output_ptr2, activ_ptr2, weight_ptr2, eps2, hidden_dim2, stride_row2, BLOCK_SIZE2)
+
+
+def fused_dual_input_rmsnorm(
+    x1,
+    weight1,
+    eps1,
+    x2,
+    weight2,
+    eps2,
+    autotune=False, 
+    inplace=False
+):
+    assert len(x1.shape) == 2 and len(x2.shape) == 2
+    assert x1.shape[0] == x2.shape[0]
+    if inplace:
+        output1 = x1
+        output2 = x2
+    else:
+        output1 = torch.empty_like(x1)
+        output2 = torch.empty_like(x2)
+    
+    bs, headdim_x1 = x1.shape
+    _, headdim_x2 = x2.shape
+    stride_row_x1 = x1.stride(0)
+    stride_row_x2 = x2.stride(0)
+    
+    max_warps = 16 if _is_hip else 32
+    config = {
+        "BLOCK_SIZE1": triton.next_power_of_2(headdim_x1),
+        "BLOCK_SIZE2": triton.next_power_of_2(headdim_x2),
+        "num_warps": max(
+            min(triton.next_power_of_2(triton.cdiv(max(headdim_x1, headdim_x2), 256)), max_warps), 4
+        ),
+    }
+
+    fused_dual_input_rmsnorm_kernel[(bs,)](
+        output1,
+        output2,
+        x1,
+        x2,
+        weight1,
+        weight2,
+        eps1=eps1,
+        eps2=eps2,
+        hidden_dim1=headdim_x1,
+        hidden_dim2=headdim_x2,
+        stride_row1=stride_row_x1,
+        stride_row2=stride_row_x2,
+        **config
+    )
+    return output1, output2
 
 
 class FusedDualResidualRMSNorm:
