@@ -263,9 +263,9 @@ def fused_rmsnorm(x, weight, eps, autotune=False, inplace=False):
     stride_row = x.stride(0)
     max_warps = 16 if _is_hip else 32
     config = {
-        "BLOCK_SIZE": triton.next_power_of_2(stride_row),
+        "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
         "num_warps": max(
-            min(triton.next_power_of_2(triton.cdiv(stride_row, 256)), max_warps), 4
+            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
         ),
     }
 
