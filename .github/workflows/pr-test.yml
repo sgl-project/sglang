@@ -464,6 +464,7 @@ jobs:
           lsmod | grep peermem
           capsh --print | grep cap_sys_rawio
           ibstat
+          ls /dev/infiniband
 
   pr-test-finish:
     needs:
