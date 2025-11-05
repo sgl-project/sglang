@@ -128,6 +128,7 @@ pub enum ResponseInputOutputItem {
         id: String,
         summary: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         content: Vec<ResponseReasoningContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
@@ -168,6 +169,7 @@ pub enum ResponseContentPart {
     #[serde(rename = "output_text")]
     OutputText {
         text: String,
+        #[serde(default)]
         #[serde(skip_serializing_if = "Vec::is_empty")]
         annotations: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
