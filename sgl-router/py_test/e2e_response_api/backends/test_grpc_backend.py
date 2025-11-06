@@ -74,7 +74,9 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
         return super().test_mcp_basic_tool_call_streaming()
 
 
-class TestHarmonyBackend(StateManagementTests, MCPTests, FunctionCallingBaseTest, StructuredOutputBaseTest):
+class TestHarmonyBackend(
+    StateManagementTests, MCPTests, FunctionCallingBaseTest, StructuredOutputBaseTest
+):
     """End to end tests for Harmony backend."""
 
     @classmethod
