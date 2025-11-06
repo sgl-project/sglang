@@ -59,7 +59,7 @@ class ChunkCache(BasePrefixCache):
         # Free the incremental part of the request
         self.token_to_kv_pool_allocator.free(kv_indices[prefill_offloaded_len:])
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
+        self.protected_size_ -= len(req.prefix_indices)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_indices = self.req_to_token_pool.req_to_token[
