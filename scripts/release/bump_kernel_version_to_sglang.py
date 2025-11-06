@@ -50,7 +50,7 @@ def update_python_pyproject(new_version: str) -> bool:
     new_content = re.sub(
         r'"sgl-kernel==[^"]+"',
         f'"sgl-kernel=={new_version}"',
-        content
+        content,
     )
 
     if content == new_content:
@@ -76,7 +76,7 @@ def update_engine_py(new_version: str) -> bool:
     new_content = re.sub(
         r'(assert_pkg_version\s*\(\s*"sgl-kernel"\s*,\s*)"[^"]+"',
         rf'\1"{new_version}"',
-        content
+        content,
     )
 
     if content == new_content:
@@ -100,10 +100,10 @@ def update_dockerfile(new_version: str) -> bool:
 
     # Replace ARG SGL_KERNEL_VERSION=x.x.x with new version
     new_content = re.sub(
-        r'^(ARG\s+SGL_KERNEL_VERSION=)(.+)$',
-        rf'\g<1>{new_version}',
+        r"^(ARG\s+SGL_KERNEL_VERSION=)(.+)$",
+        rf"\g<1>{new_version}",
         content,
-        flags=re.MULTILINE
+        flags=re.MULTILINE,
     )
 
     if content == new_content:

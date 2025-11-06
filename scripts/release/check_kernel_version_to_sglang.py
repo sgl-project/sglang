@@ -88,7 +88,7 @@ def get_kernel_version_from_dockerfile() -> str:
     content = dockerfile_path.read_text()
 
     # Match ARG SGL_KERNEL_VERSION=x.x.x
-    match = re.search(r'^ARG\s+SGL_KERNEL_VERSION=(.+)$', content, re.MULTILINE)
+    match = re.search(r"^ARG\s+SGL_KERNEL_VERSION=(.+)$", content, re.MULTILINE)
     if not match:
         print("Error: Could not find SGL_KERNEL_VERSION in Dockerfile")
         sys.exit(1)
@@ -125,11 +125,17 @@ def main():
         print(f"\n✓ Sync needed to version: {kernel_version}")
         mismatches = []
         if kernel_version != pyproject_version:
-            mismatches.append(f"  - python/pyproject.toml: {pyproject_version} → {kernel_version}")
+            mismatches.append(
+                f"  - python/pyproject.toml: {pyproject_version} → {kernel_version}"
+            )
         if kernel_version != engine_version:
-            mismatches.append(f"  - engine.py: {engine_version} → {kernel_version}")
+            mismatches.append(
+                f"  - engine.py: {engine_version} → {kernel_version}"
+            )
         if kernel_version != dockerfile_version:
-            mismatches.append(f"  - Dockerfile: {dockerfile_version} → {kernel_version}")
+            mismatches.append(
+                f"  - Dockerfile: {dockerfile_version} → {kernel_version}"
+            )
 
         print("Changes needed:")
         for mismatch in mismatches:
