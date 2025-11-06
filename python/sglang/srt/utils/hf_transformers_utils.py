@@ -27,8 +27,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
-from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
@@ -44,7 +42,8 @@ if TYPE_CHECKING:
 
 def _register_custom_configs():
     from transformers import AutoConfig
-
+    from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+    from sglang.srt.configs.internvl import InternVLChatConfig
     from sglang.srt.configs import (
         ChatGLMConfig,
         DbrxConfig,
