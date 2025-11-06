@@ -602,7 +602,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
-        if not config.language_only:
+        if not hasattr(config, "language_only") or not config.language_only:
             self.visual = Qwen3VLMoeVisionModel(
                 config.vision_config,
                 # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -618,10 +618,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
             self.config = config.text_config  # for qwen3-omni
-            self.config.mm_only = config.mm_only
-            self.config.language_only = config.language_only
+            if hasattr(config, "mm_only"):
+                self.config.mm_only = config.mm_only
+            if hasattr(config, "language_only"):
+                self.config.language_only = config.language_only
 
-        if not config.mm_only:
+        if not hasattr(config, "mm_only") or not config.mm_only:
             self.model = language_model_cls(
                 config=self.config,
                 quant_config=quant_config,
