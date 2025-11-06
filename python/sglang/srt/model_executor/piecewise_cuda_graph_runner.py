@@ -48,7 +48,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -225,16 +225,22 @@ class PiecewiseCudaGraphRunner:
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
-                out_cache_loc=torch.randint(0, 100, (num_tokens,), device=self.device),
+                out_cache_loc=torch.randint(
+                    0,
+                    100,
+                    (num_tokens,),
+                    device=self.device,
+                    dtype=self._cache_loc_dtype(),
+                ),
                 seq_lens_sum=num_tokens,
                 encoder_lens=None,
                 return_logprob=False,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
                 extend_prefix_lens=torch.tensor([num_tokens], device=self.device),
                 extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([num_tokens]),
+                extend_prefix_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                extend_logprob_start_lens_cpu=torch.tensor([num_tokens]),
+                extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=torch.arange(num_tokens, device=self.device),
                 global_num_tokens_gpu=None,
                 global_num_tokens_for_logprob_gpu=None,
@@ -260,7 +266,7 @@ class PiecewiseCudaGraphRunner:
             )
 
     def _cache_loc_dtype(self):
-        return torch.int64
+        return torch.int64 if not is_npu() else torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
         num_tokens = len(forward_batch.input_ids)
@@ -357,9 +363,9 @@ class PiecewiseCudaGraphRunner:
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
                 extend_prefix_lens=torch.tensor([num_tokens], device=self.device),
                 extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([num_tokens]),
+                extend_prefix_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                extend_logprob_start_lens_cpu=torch.tensor([num_tokens]),
+                extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
                 global_num_tokens_gpu=None,
                 global_num_tokens_for_logprob_gpu=None,
@@ -382,7 +388,11 @@ class PiecewiseCudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            set_dp_buffer_len(
+                global_dp_buffer_len,
+                num_tokens,
+                forward_batch.dp_padding_mode.is_max_len(),
+            )
             # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
             # It is True in this context but we need to set it to use low latency deepep mode.
             set_is_extend_in_batch(False)
