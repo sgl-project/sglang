@@ -22,7 +22,6 @@ from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Union
 
 import torch
-from transformers import PretrainedConfig
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs

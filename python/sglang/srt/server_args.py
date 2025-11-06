@@ -26,9 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 import orjson
 
-from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import ToolStrictLevel, envs
-from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -63,6 +61,7 @@ from sglang.utils import is_in_ci
 
 if TYPE_CHECKING:
     from sglang.srt.function_call.function_call_parser import FunctionCallParser
+    from sglang.srt.lora.lora_registry import LoRARef
     from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 logger = logging.getLogger(__name__)
@@ -930,6 +929,7 @@ class ServerArgs:
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
+        from sglang.srt.connector import ConnectorType
 
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
@@ -1906,6 +1906,8 @@ class ServerArgs:
             )
 
     def _handle_deterministic_inference(self):
+        from sglang.srt.connector import ConnectorType
+
         if self.rl_on_policy_target is not None:
             logger.warning(
                 "Enable deterministic inference because of rl_on_policy_target."
@@ -4054,6 +4056,8 @@ class ServerArgs:
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
 
     def check_lora_server_args(self):
+        from sglang.srt.utils.lora_utils import LoRARef
+
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.

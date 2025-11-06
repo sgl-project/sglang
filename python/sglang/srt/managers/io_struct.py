@@ -16,6 +16,8 @@ The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
+from __future__ import annotations
+
 import copy
 import uuid
 from abc import ABC
@@ -24,7 +26,6 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
@@ -32,6 +33,8 @@ from sglang.srt.utils import ImageData
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
+
+    from sglang.srt.managers.schedule_batch import BaseFinishReason
 else:
     Image = Any
 
