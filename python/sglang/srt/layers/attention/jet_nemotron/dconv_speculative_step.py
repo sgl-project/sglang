@@ -34,6 +34,7 @@ def _causal_conv_speculative_step_kernel(
     Intermediate_conv_window_stride_b,
     Intermediate_conv_window_stride_t,
     Intermediate_conv_window_stride_d,
+    pad_slot_id: tl.constexpr,
     W: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
 ):
@@ -41,6 +42,8 @@ def _causal_conv_speculative_step_kernel(
     pid_time = tl.program_id(1)
     pid_d_block = tl.program_id(2)
     cache_idx = tl.load(Cache_idx_ptr + pid_batch * Cache_idx_stride_b)
+    if cache_idx == pad_slot_id:
+        return
     offs_d = pid_d_block * BLOCK_SIZE_D + tl.arange(0, BLOCK_SIZE_D)
     d_mask = offs_d < D
     accumulator = tl.zeros((BLOCK_SIZE_D,), dtype=tl.float32)
@@ -131,6 +134,7 @@ def causal_conv_step_triton_speculative(
         intermediate_conv_window.stride(0),
         intermediate_conv_window.stride(1),
         intermediate_conv_window.stride(2),
+        pad_slot_id=PAD_SLOT_ID,
         W=W,
         BLOCK_SIZE_D=BLOCK_SIZE_D,
     )
