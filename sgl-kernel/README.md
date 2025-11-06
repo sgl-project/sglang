@@ -20,7 +20,6 @@ pip3 install sgl-kernel --upgrade
 ```
 
 ## Building from Source
-
 Requires
 - CMake ≥3.31,
 - Python ≥3.10
