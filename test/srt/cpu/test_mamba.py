@@ -148,13 +148,13 @@ def chunk_gated_delta_rule_update(
 
 class TestMambaAttention(CustomTestCase):
     def test_chunk_gated_delta_rule(self):
-        B, T, HK, HV, EK, EV, N = 1, 256, 3, 6, 64, 64, 2
+        B, T, HK, HV, EK, EV, N = 1, 256, 3, 6, 64, 64, 4
         query_ = torch.rand((B, T, HK, EK), dtype=torch.bfloat16) * 0.05
         key_ = torch.rand((B, T, HK, EK), dtype=torch.bfloat16) * 0.05
         value_ = torch.rand((B, T, HV, EV), dtype=torch.bfloat16) * 0.05
         g_ = torch.rand((B, T, HV), dtype=torch.float32) * 0.05
         beta_ = torch.rand((B, T, HV), dtype=torch.bfloat16) * 0.05
-        cu_seqlens_ = torch.tensor([0, 128, T], dtype=torch.int32)
+        cu_seqlens_ = torch.tensor([0, 96, 130, 170, T], dtype=torch.int32)
         initial_state_ = torch.rand((N, HV, EK, EV), dtype=torch.float32) * 0.05
 
         core_attn_out_ref, last_recurrent_state_ref = chunk_gated_delta_rule_update(
