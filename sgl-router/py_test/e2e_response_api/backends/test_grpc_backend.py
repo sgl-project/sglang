@@ -38,6 +38,9 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
             num_workers=1,
             tp_size=2,
             policy="round_robin",
+            worker_args=[
+                "--context-length=1000",
+            ],
             router_args=[
                 "--history-backend",
                 "memory",
