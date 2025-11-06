@@ -1039,8 +1039,9 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
-    # Whether to update weights online
-    online: bool = False
+    # Whether to wait for all ongoing inference requests to complete before updating
+    # parameters, or interrupt them and update parameters directly.
+    non_blocking: bool = False
 
 
 @dataclass
@@ -1064,10 +1065,9 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # Whether to update weights online
-    online: bool = False
-    # Optional format specification for loading
-    flattened_bucket_meta: Optional[dict] = None
+    # Whether to wait for all ongoing inference requests to complete before updating
+    # parameters, or interrupt them and update parameters directly.
+    non_blocking: bool = False
 
 
 @dataclass
@@ -1093,8 +1093,9 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # Whether to update weights online
-    online: bool = False
+    # Whether to wait for all ongoing inference requests to complete before updating
+    # parameters, or interrupt them and update parameters directly.
+    non_blocking: bool = False
 
 
 @dataclass
