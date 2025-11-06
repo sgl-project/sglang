@@ -67,19 +67,11 @@ class TestRetractDecodeChunkCache(TestRetractDecode):
 
     other_args = ["--disable-radix-cache"]
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
 
 class TestRetractDecodeChunkCachePaged(TestRetractDecode):
     """python -m unittest test_retract_decode.TestRetractDecodeChunkCachePaged"""
 
     other_args = ["--disable-radix-cache", "--page-size", "16"]
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
 
 
 @pytest.mark.skipif(is_in_ci(), reason="Skipped in CI due to long runtime")
