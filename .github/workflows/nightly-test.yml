@@ -143,7 +143,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu
+          python3 run_suite.py --suite nightly-4-gpu
 
   nightly-test-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang'
@@ -161,7 +161,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200
+          python3 run_suite.py --suite nightly-8-gpu-h200
 
   nightly-test-8-gpu-h20:
     if: github.repository == 'sgl-project/sglang'
@@ -181,7 +181,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h20
+          python3 run_suite.py --suite nightly-8-gpu-h20
 
   nightly-test-4-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
@@ -199,4 +199,4 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-b200
+          python3 run_suite.py --suite nightly-4-gpu-b200
