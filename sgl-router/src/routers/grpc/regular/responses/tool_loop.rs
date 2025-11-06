@@ -122,6 +122,14 @@ fn extract_all_tool_calls_from_chat(
     }
 }
 
+/// Check if a tool call is for an MCP tool by checking the MCP inventory
+///
+/// In regular/responses, both MCP and function tools have `tool_type: "function"` in chat format,
+/// so we must check by name against the MCP tool inventory.
+fn is_mcp_tool_call(tool_name: &str, mcp_tools: &[mcp::Tool]) -> bool {
+    mcp_tools.iter().any(|t| t.name == tool_name)
+}
+
 /// State for tracking multi-turn tool calling loop
 struct ToolLoopState {
     iteration: usize,
@@ -305,7 +313,28 @@ pub(super) async fn execute_tool_loop(
                 state.iteration, tool_name, call_id
             );
 
-            // Check combined limit BEFORE executing
+            // Check if this is an MCP tool or a function tool
+            if !is_mcp_tool_call(&tool_name, &mcp_tools) {
+                debug!(
+                    "Tool '{}' is not an MCP tool - returning to caller for execution",
+                    tool_name
+                );
+
+                // Convert chat response to responses format (includes the function tool call)
+                let responses_response = conversions::chat_to_responses(
+                    &chat_response,
+                    original_request,
+                    response_id.clone(),
+                )
+                .map_err(|e| {
+                    error::internal_error(format!("Failed to convert to responses format: {}", e))
+                })?;
+
+                // Return response with function tool call to caller
+                return Ok(responses_response);
+            }
+
+            // It's an MCP tool - check combined limit BEFORE executing
             let effective_limit = match max_tool_calls {
                 Some(user_max) => user_max.min(MAX_ITERATIONS),
                 None => MAX_ITERATIONS,
@@ -687,17 +716,28 @@ async fn execute_tool_loop_streaming_internal(
                 tool_calls.len()
             );
 
-            // Check combined limit
+            // Separate MCP and function tool calls
+            let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
+                .into_iter()
+                .partition(|(_, tool_name, _)| is_mcp_tool_call(tool_name, &mcp_tools));
+
+            debug!(
+                "Separated tool calls: {} MCP, {} function",
+                mcp_tool_calls.len(),
+                function_tool_calls.len()
+            );
+
+            // Check combined limit (only count MCP tools since function tools will be returned)
             let effective_limit = match max_tool_calls {
                 Some(user_max) => user_max.min(MAX_ITERATIONS),
                 None => MAX_ITERATIONS,
             };
 
-            if state.total_calls + tool_calls.len() > effective_limit {
+            if state.total_calls + mcp_tool_calls.len() > effective_limit {
                 warn!(
                     "Reached tool call limit: {} + {} > {} (max_tool_calls={:?}, safety_limit={})",
                     state.total_calls,
-                    tool_calls.len(),
+                    mcp_tool_calls.len(),
                     effective_limit,
                     max_tool_calls,
                     MAX_ITERATIONS
@@ -705,8 +745,8 @@ async fn execute_tool_loop_streaming_internal(
                 break;
             }
 
-            // Process each tool call
-            for (call_id, tool_name, args_json_str) in tool_calls {
+            // Process each MCP tool call
+            for (call_id, tool_name, args_json_str) in mcp_tool_calls {
                 state.total_calls += 1;
 
                 debug!(
@@ -844,6 +884,17 @@ async fn execute_tool_loop_streaming_internal(
                     success,
                     error,
                 );
+            }
+
+            // If there are function tool calls, exit MCP loop and return to caller
+            if !function_tool_calls.is_empty() {
+                debug!(
+                    "Found {} function tool call(s) - exiting MCP loop and returning to caller",
+                    function_tool_calls.len()
+                );
+                // Function tool calls are already in the emitter's output
+                // Break loop to return response to caller
+                break;
             }
 
             // Build next request with conversation history
