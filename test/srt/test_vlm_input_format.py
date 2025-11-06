@@ -69,8 +69,12 @@ class VLMInputTestBase:
         # overfitting to a specific phrasing.
         out_text = output["text"].lower()
 
+<<<<<<< HEAD
         car_keywords = ("taxi", "cab", "car", "vehicle", "suv", "van", "truck", "auto")
         assert any(w in out_text for w in car_keywords), out_text
+=======
+        assert any(w in out_text for w in ("taxi", "cab", "car")), out_text
+>>>>>>> 23ed88531 (test: relax VLM input format assertions for image understanding (#12755))
 
         has_sg_or_logo_side = any(
             kw in out_text
@@ -84,9 +88,12 @@ class VLMInputTestBase:
                 "laborator",
                 "company",
                 " text",
+<<<<<<< HEAD
                 "letters",
                 "icon",
                 "sgi",  # 容忍一次错拼
+=======
+>>>>>>> 23ed88531 (test: relax VLM input format assertions for image understanding (#12755))
             )
         )
         assert has_sg_or_logo_side, out_text
