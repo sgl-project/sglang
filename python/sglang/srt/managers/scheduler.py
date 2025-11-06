@@ -2527,10 +2527,8 @@ class Scheduler(
                 self.tree_cache.cache_finished_req(req)
 
             # For mamba radix cache
-            if req.mamba_pool_idx_reserved is not None:
-                self.tp_worker.model_runner.req_to_token_pool.mamba_pool.free(
-                    req.mamba_pool_idx_reserved.unsqueeze(-1)
-                )
+            if req.mamba_pool_idx is not None:
+                self.tree_cache.cache_finished_req(req, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue

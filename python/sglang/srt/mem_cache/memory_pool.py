@@ -415,7 +415,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 req.mamba_pool_idx = mid
             if mid is not None:
                 mamba_index.append(mid)
-                req.mamba_pool_idx_reserved = None
         assert len(select_index) == len(
             mamba_index
         ), f"Not enough space for mamba cache, try to increase --max-mamba-cache-size."

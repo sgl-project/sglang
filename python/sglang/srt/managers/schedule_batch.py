@@ -510,7 +510,6 @@ class Req:
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
-        self.mamba_pool_idx_reserved: Optional[torch.Tensor] = None  # shape (1)
 
         # Check finish
         self.tokenizer = None
