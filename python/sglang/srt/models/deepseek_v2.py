@@ -39,11 +39,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    parallel_state,
     tensor_model_parallel_all_reduce,
-)
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -78,8 +74,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
-    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -88,6 +84,7 @@ from sglang.srt.layers.quantization import CompressedTensorsConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
     CompressedTensorsWNA16AMXEPMoEMethod,
+    CompressedTensorsWNA16MoEMethod,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -402,6 +399,34 @@ def handle_attention_aiter(attn, forward_batch):
 
 
 def handle_attention_nsa(attn, forward_batch):
+    """
+    Select MHA or MLA based on sequence length for optimal performance.
+
+    - Decode: MLA (avoids per-token decompression)
+    - Prefill <= 2048: MHA (topk ineffective, MHA has lower FLOPs)
+    - Prefill > 2048: MLA (topk filtering reduces computation significantly)
+
+    TODO: B200 (SM100) MHA path is temporarily disabled due to FA4 gpqa accuracy issues.
+    """
+    if forward_batch.forward_mode.is_decode_or_idle():
+        return AttnForwardMethod.MLA
+
+    if _is_extend_without_speculative(forward_batch):
+        assert forward_batch.seq_lens_cpu is not None
+        max_kv_len = forward_batch.seq_lens_cpu.max().item()
+
+        # B200 (SM100) is temporarily disabled for MHA due to FA4 accuracy issues
+        # Currently only H200 (SM90) with FA3 is allowed to use MHA path
+        is_hopper = _device_sm == 90
+
+        if max_kv_len <= attn.indexer.index_topk and is_hopper:
+            # NSA backend uses varlen kernel which supports MHA_ONE_SHOT
+            # Check if total sequence length fits in chunk capacity
+            sum_seq_lens = sum(forward_batch.seq_lens_cpu)
+            # Use MHA_ONE_SHOT for best performance
+            if sum_seq_lens <= forward_batch.get_max_chunk_capacity():
+                return AttnForwardMethod.MHA_ONE_SHOT
+
     return AttnForwardMethod.MLA
 
 
@@ -484,7 +509,8 @@ class DeepseekV2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+            x,
+            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
         return x
 
@@ -507,7 +533,7 @@ class MoEGate(nn.Module):
                 torch.bfloat16
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
-                and should_use_flashinfer_trtllm_moe()
+                and get_moe_runner_backend().is_flashinfer_trtllm()
                 else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
@@ -752,18 +778,19 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(
-                self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
+            if (
+                not _is_cuda
+                or isinstance(
+                    self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
+                )
+                or isinstance(
+                    self.experts.quant_method, CompressedTensorsWNA16MoEMethod
+                )
             ):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-            final_hidden_states_out = torch.empty_like(final_hidden_states)
-
-        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-        final_hidden_states = final_hidden_states_out
-        sm.tag(final_hidden_states)
+        final_hidden_states += shared_output
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -818,15 +845,18 @@ class DeepseekV2MoE(nn.Module):
                 else {}
             ),
         )
-        if not _is_cuda and not _use_aiter:
+        if (
+            not _is_cuda
+            and not _use_aiter
+            or isinstance(
+                self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
+            )
+            or isinstance(self.experts.quant_method, CompressedTensorsWNA16MoEMethod)
+        ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
-            with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-                final_hidden_states_out = torch.empty_like(final_hidden_states)
-            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-            final_hidden_states = final_hidden_states_out
-            sm.tag(final_hidden_states)
+            final_hidden_states += shared_output
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -895,7 +925,9 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_deepep(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         shared_output = None
         if hidden_states.shape[0] > 0:
@@ -1476,8 +1508,21 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q_lora = self.q_a_layernorm(q)
+            q = self.q_b_proj(q_lora)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+
+            # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
+            if self.use_nsa and _is_extend_without_speculative(forward_batch):
+                _ = self.indexer(
+                    x=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                    return_indices=False,
+                )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
