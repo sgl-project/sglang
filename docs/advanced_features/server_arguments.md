@@ -95,6 +95,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-multimodal` | Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen | `None` | bool flag (set to enable) |
 | `--revision` | The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version. | `None` | Type: str |
 | `--model-impl` | Which implementation of the model to use. * "auto" will try to use the SGLang implementation if it exists and fall back to the Transformers implementation if no SGLang implementation is available. * "sglang" will use the SGLang model implementation. * "transformers" will use the Transformers model implementation. | `auto` | Type: str |
+| `--enable-parallel-tokenizer` | Enable ParallelTokenizer for long text tokenization. See also env vars `SGLANG_MAX_PARALLEL_TOKENIZER_CHUNK_SIZE` and `SGLANG_MAX_PARALLEL_TOKENIZER_OVERLAP_LEN`. | `False` | bool flag (set to enable) |
 
 ## HTTP server
 | Argument | Description | Defaults | Options |
