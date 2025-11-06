@@ -651,6 +651,12 @@ class ServerArgs:
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
+        if self.moe_runner_backend == "flashinfer_mxfp4":
+            self.moe_runner_backend = "flashinfer_trtllm"
+            print_deprecated_warning(
+                "NOTE: --moe-runner-backend=flashinfer_mxfp4 is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead."
+            )
+
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -976,14 +982,15 @@ class ServerArgs:
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
-                if is_blackwell_supported():
-                    self.quantization = "mxfp4"
+
+            if self.quantization is None and is_blackwell_supported():
+                self.quantization = "mxfp4"
 
             if self.moe_runner_backend == "auto":
                 if is_blackwell_supported() and is_mxfp4_quant_format:
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.warning(
-                        "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                        "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer trtllm MOE kernel."
                     )
                 elif self.ep_size == 1 and is_triton_kernels_available():
                     self.moe_runner_backend = "triton_kernel"
@@ -1424,11 +1431,6 @@ class ServerArgs:
             assert (
                 self.ep_size == 1
             ), "FP8 Cutlass MoE is only supported with ep_size == 1"
-        if self.moe_runner_backend == "flashinfer_mxfp4":
-            self.moe_runner_backend = "flashinfer_trtllm"
-            print_deprecated_warning(
-                "NOTE: --moe-runner-backend=flashinfer_mxfp4 is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead."
-            )
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":

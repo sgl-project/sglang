@@ -86,11 +86,6 @@ if _is_hip:
             err
         )
 
-try:
-    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-except ImportError:
-    flashinfer_cutlass_fused_moe = None
-
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
@@ -729,6 +724,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.enable_flashinfer_cutlass_moe:
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
             output_dtype = x.dtype
+
+            # Lazy import of flashinfer backend
+            from flashinfer.fused_moe import (
+                cutlass_fused_moe as flashinfer_cutlass_fused_moe,
+            )
 
             output = flashinfer_cutlass_fused_moe(
                 input=x_quant,

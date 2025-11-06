@@ -304,6 +304,7 @@ suites = {
         TestFile("test_fp8_kvcache.py"),
         TestFile("test_full_deepseek_v3.py"),
         TestFile("test_get_weights_by_name.py"),
+        TestFile("test_gpt_oss_backend_4gpu.py"),
         TestFile("test_gpt_oss_common.py"),
         TestFile("test_health_check.py"),
         TestFile("test_hicache.py"),
