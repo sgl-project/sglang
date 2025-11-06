@@ -1,9 +1,11 @@
 from typing import Optional, Union
+
 import torch
 import triton
 import triton.language as tl
 
 PAD_SLOT_ID = -1
+
 
 @triton.jit
 def _causal_conv_speculative_step_kernel(
@@ -258,6 +260,9 @@ def _causal_dynamic_conv1d_update_kernel(
     )
     mask_w = idx_feats < dim
 
+    conv_state_token_offset = (
+        state_len - KERNEL_WIDTH + 1
+    )  # our conv state is right aligned, not left aligned like causal_conv1d_triton.py
     prior_tokens = conv_states_base + conv_state_token_offset * stride_conv_state_tok
     if KERNEL_WIDTH >= 2:
         conv_states_ptrs = prior_tokens  # [BLOCK_N]
@@ -273,54 +278,61 @@ def _causal_dynamic_conv1d_update_kernel(
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
     # STEP 2: assume state_len > seqlen
-    idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
-
-    # The conv_state updates works in a sliding window manner,
-    # at each forward pass, the tokens are shift by 1, so we
-    # load since idx_tokens + 1.
-    conv_state_ptrs_source = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + conv_state_token_offset * stride_conv_state_tok
-        + (idx_feats * stride_conv_state_dim)[None, :]
-        + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
-            :, None
-        ]
-    )  # [BLOCK_M, BLOCK_N]
-    mask = (
-        (conv_state_batch_coord < num_cache_lines)
-        & ((idx_tokens + seqlen) < state_len)[:, None]
-        & (idx_feats < dim)[None, :]
-    )
-    conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
-
-    VAL = state_len - seqlen
-    x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
-
-    x_ptrs = (
-        x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
-
-    mask_x = (
-        (idx_tokens - VAL >= 0)[:, None]
-        & (idx_tokens - VAL < seqlen)[:, None]
-        & (idx_feats < dim)[None, :]
-    )  # token-index  # token-index  # feature-index
-    loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-    # tl.debug_barrier()
-
-    new_conv_state = tl.where(mask, conv_state, loaded_x)
-
-    conv_state_base = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + (idx_feats * stride_conv_state_dim)
-    )  # [BLOCK_N,]
-    conv_state_ptrs_target = (
-        conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
-    mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+    # this codepath shouldn't be used except during cuda graph capture, where it doesn't matter
     if not HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+
+        idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
+
+        # The conv_state updates works in a sliding window manner,
+        # at each forward pass, the tokens are shift by 1, so we
+        # load since idx_tokens + 1.
+
+        conv_state_ptrs_source = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + conv_state_token_offset * stride_conv_state_tok
+            + (idx_feats * stride_conv_state_dim)[None, :]
+            + (
+                (idx_tokens + (1 if IS_SPEC_DECODING else seqlen))
+                * stride_conv_state_tok
+            )[:, None]
+        )  # [BLOCK_M, BLOCK_N]
+        mask = (
+            (conv_state_batch_coord < num_cache_lines)
+            & ((idx_tokens + seqlen) < state_len)[:, None]
+            & (idx_feats < dim)[None, :]
+        )
+        conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
+
+        VAL = state_len - seqlen
+        x_base = (
+            x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
+        )  # [BLOCK_N]
+
+        x_ptrs = (
+            x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
+
+        mask_x = (
+            (idx_tokens - VAL >= 0)[:, None]
+            & (idx_tokens - VAL < seqlen)[:, None]
+            & (idx_feats < dim)[None, :]
+        )  # token-index  # token-index  # feature-index
+        loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+        # tl.debug_barrier()
+
+        new_conv_state = tl.where(mask, conv_state, loaded_x)
+
+        conv_state_base = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )  # [BLOCK_N,]
+        conv_state_ptrs_target = (
+            conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
+        mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+
         tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
@@ -356,7 +368,9 @@ def _causal_dynamic_conv1d_update_kernel(
 
     w_base = w_ptr + (idx_seq * stride_w_seq + idx_feats * stride_w_dim)  # [BLOCK_N,]
 
-    x_base_1d = x_base  # starting of chunk [BLOCK_N]
+    x_base_1d = (
+        x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
+    )  # starting of chunk [BLOCK_N]
     mask_x_1d = idx_feats < dim
 
     # STEP 5: compute each token
@@ -443,7 +457,9 @@ def _causal_dynamic_conv1d_update_kernel(
                     # store itself in KERNEL_WIDTH-2 slot, parent in KERNEL_WIDTH-3 slot, grand-parent in KERNEL_WIDTH-4 slot, ...
                     if KERNEL_WIDTH - j - 2 >= 0:
                         tl.store(
-                            base_ptr + (KERNEL_WIDTH - j - 2) * stride_inter_win,
+                            base_ptr
+                            + (state_len - j - 1)
+                            * stride_inter_win,  # assume conv state is right aligned, different than causal_conv1d_triton.py
                             matrix_x,
                             mask=mask_w,
                         )
@@ -648,7 +664,8 @@ def causal_dynamic_conv1d_update(
     if num_accepted_tokens is not None:
         state_len = width - 1 + (seqlen - 1)  # effective state_len needed
     else:
-        state_len = width - 1
+        pass
+        # state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
     np2_seqlen = triton.next_power_of_2(seqlen)
 

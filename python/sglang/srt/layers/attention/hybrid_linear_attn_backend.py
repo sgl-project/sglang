@@ -757,6 +757,9 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
         self.forward_metadata = JetNemotronMetadata(
             query_start_loc=metadata.query_start_loc,
             mamba_cache_indices=metadata.mamba_cache_indices,
+            retrieve_next_token=metadata.retrieve_next_token,
+            retrieve_next_sibling=metadata.retrieve_next_sibling,
+            retrieve_parent_token=metadata.retrieve_parent_token,
             seq_idx=seq_idx,
         )
 
@@ -874,7 +877,7 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
-                is_topk1=forward_batch.spec_info.topk==1
+                is_topk1=forward_batch.spec_info.topk == 1,
             )
             v = v.view(seq_len, -1)
         else:
