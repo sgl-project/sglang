@@ -907,7 +907,8 @@ class ServerArgs:
                     logger.info(
                         "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
                     )
-                if not self.enable_dp_attention:
+                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
+                if not self.enable_dp_attention and self.nnodes == 1:
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
@@ -964,7 +965,8 @@ class ServerArgs:
             )
 
             if is_blackwell_supported():
-                if not self.enable_dp_attention:
+                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
+                if not self.enable_dp_attention and self.nnodes == 1:
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
