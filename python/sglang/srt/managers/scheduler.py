@@ -2520,6 +2520,9 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.tree_cache.cache_finished_req(req)
 
+            # For mamba radix cache
+            if req.mamba_pool_idx is not None:
+                self.tree_cache.cache_finished_req(req, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
