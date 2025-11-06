@@ -806,6 +806,8 @@ def get_benchmark_args(
     device="auto",
     pd_separated: bool = False,
     lora_name=None,
+    lora_request_distribution="uniform",
+    lora_zipf_alpha=1.5,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -834,6 +836,8 @@ def get_benchmark_args(
         apply_chat_template=False,
         profile=None,
         lora_name=lora_name,
+        lora_request_distribution=lora_request_distribution,
+        lora_zipf_alpha=lora_zipf_alpha,
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
@@ -1553,7 +1557,7 @@ def send_generate_requests(base_url: str, num_requests: int) -> List[str]:
                 "text": prompt,
                 "sampling_params": {
                     "temperature": 0,
-                    "max_new_tokens": 50,
+                    "max_new_tokens": 500,
                 },
             },
         )
@@ -1580,7 +1584,7 @@ async def send_concurrent_generate_requests(
                     "text": prompt,
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 50,
+                        "max_new_tokens": 500,
                     },
                 },
             ) as response:
@@ -1604,7 +1608,7 @@ async def send_concurrent_generate_requests_with_custom_params(
                 """,
         "sampling_params": {
             "temperature": 0,
-            "max_new_tokens": 50,
+            "max_new_tokens": 500,
         },
     }
 

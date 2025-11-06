@@ -136,6 +136,7 @@ class Envs:
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
+    SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
@@ -197,6 +198,8 @@ class Envs:
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_ENABLE_FLASHINFER_GEMM = EnvBool(False)
+    # Default to the pick from flashinfer
+    SGLANG_FLASHINFER_FP4_GEMM_BACKEND = EnvStr("")
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
 
     # Triton
@@ -269,6 +272,8 @@ class Envs:
     SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
     SGLANG_KT_AMX_METHOD = EnvStr(None)
     SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
+    SGLANG_KT_MOE_MAX_DEFERRED_EXPERTS_PER_TOKEN = EnvInt(None)
+    SGLANG_KT_MOE_TOTAL_LAYERS = EnvInt(None)
 
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
