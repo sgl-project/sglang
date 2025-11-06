@@ -124,8 +124,10 @@ pub enum ResponsesIterationResult {
     /// Tool calls found in commentary channel - continue MCP loop
     ToolCallsFound {
         tool_calls: Vec<ToolCall>,
-        analysis: Option<String>, // For streaming emission
-        partial_text: String,     // For streaming emission
+        analysis: Option<String>, // For streaming emission or reasoning output
+        partial_text: String,     // For streaming emission or message output
+        usage: Usage,             // Token usage from this iteration
+        request_id: String,       // Request ID from dispatch
     },
     /// No tool calls - return final ResponsesResponse
     Completed {
@@ -206,6 +208,9 @@ impl HarmonyResponseProcessor {
             );
         }
 
+        // Build usage (needed for both ToolCallsFound and Completed)
+        let usage = response_formatting::build_usage(std::slice::from_ref(complete));
+
         // Check for tool calls in commentary channel
         if let Some(tool_calls) = parsed.commentary {
             // Tool calls found - return for MCP loop execution
@@ -213,6 +218,8 @@ impl HarmonyResponseProcessor {
                 tool_calls,
                 analysis: parsed.analysis,
                 partial_text: parsed.final_text,
+                usage,
+                request_id: dispatch.request_id.clone(),
             });
         }
 
@@ -244,9 +251,6 @@ impl HarmonyResponseProcessor {
             };
             output.push(message_item);
         }
-
-        // Build usage
-        let usage = response_formatting::build_usage(std::slice::from_ref(complete));
 
         // Build ResponsesResponse with all required fields
         let response = ResponsesResponse {
