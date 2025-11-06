@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, TypeAlias
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
@@ -48,6 +49,10 @@ if _is_hip:
         )
 else:
     from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+
+# Reuse this workspace buffer across all NSA backend instances
+global_workspace_buffer = None
 
 
 @dataclass(frozen=True)
@@ -231,14 +236,19 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
         self.speculative_step_id = speculative_step_id
 
-        # Workspace buffer for TRTLLm ragged attention kernel (SM100/B200)
-        # 128 MB workspace for intermediate computation (softmax states, etc.)
-        workspace_size_mb = 128
-        self.workspace_buffer = torch.zeros(
-            workspace_size_mb * 1024 * 1024,
-            dtype=torch.uint8,
-            device=self.device,
-        )
+        # Allocate global workspace buffer for TRTLLm ragged attention kernel (SM100/B200)
+        device_sm_major = torch.cuda.get_device_capability()[0]
+        if device_sm_major >= 10:
+            global global_workspace_buffer
+            if global_workspace_buffer is None:
+                global_workspace_buffer = torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = global_workspace_buffer
+        else:
+            self.workspace_buffer = None
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
