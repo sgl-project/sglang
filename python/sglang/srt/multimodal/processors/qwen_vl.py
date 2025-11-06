@@ -78,26 +78,6 @@ def smart_resize(
     return h_bar, w_bar
 
 
-def resize_image(
-    image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
-) -> Image.Image:
-    width, height = image.size
-    min_pixels = min_pixels
-    max_pixels = max_pixels
-    resized_height, resized_width = smart_resize(
-        height,
-        width,
-        factor=size_factor,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
-    )
-    image = image.resize((resized_width, resized_height), resample=RESIZE_RESAMPLE)
-    return image
-
-
 def round_by_factor(number: int, factor: int) -> int:
     """Returns the closest integer to 'number' that is divisible by 'factor'."""
     return round(number / factor) * factor
@@ -111,15 +91,6 @@ def ceil_by_factor(number: int, factor: int) -> int:
 def floor_by_factor(number: int, factor: int) -> int:
     """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
     return math.floor(number / factor) * factor
-
-
-async def resize_image_async(
-    image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
-):
-    return resize_image(image, min_pixels, max_pixels, size_factor)
 
 
 def smart_nframes(
@@ -291,16 +262,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
         )
-
-        # Qwen-specific: resize images if they are raw Image objects
-        if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [
-                resize_image_async(
-                    image, self.MIN_PIXELS, self.MAX_PIXELS, self.IMAGE_FACTOR
-                )
-                for image in base_output.images
-            ]
-            base_output.images = await asyncio.gather(*resize_tasks)
 
         video_metadata = None
         if base_output.videos:
