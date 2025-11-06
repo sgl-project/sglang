@@ -25,7 +25,7 @@ pub struct McpConfig {
     #[serde(default)]
     pub warmup: Vec<WarmupServer>,
 
-    /// Tool inventory refresh setting
+    /// Tool inventory refresh settings
     #[serde(default)]
     pub inventory: InventoryConfig,
 }
