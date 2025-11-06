@@ -403,10 +403,37 @@ async def validate_json_request(raw_request: Request):
 
 
 @app.get("/health")
+async def health(request: Request) -> Response:
+    """
+    Lightweight health check endpoint for liveness probe.
+
+    This endpoint performs a simple status check without generating any tokens,
+    making it suitable for Kubernetes liveness probes.
+
+    Returns:
+        200: Server is alive and operational
+        503: Server is starting, unhealthy, or shutting down
+    """
+    if _global_state.tokenizer_manager.gracefully_exit:
+        logger.info("Health check request received during shutdown. Returning 503.")
+        return Response(status_code=503)
+
+    if _global_state.tokenizer_manager.server_status in [
+        ServerStatus.Starting,
+        ServerStatus.UnHealthy,
+    ]:
+        return Response(status_code=503)
+
+    return Response(status_code=200)
+
+
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """
     Check the health of the inference server by sending a special request to generate one token.
+
+    This endpoint is suitable for Kubernetes readiness probes as it verifies the server
+    can actually handle generation requests given current constraints.
 
     If the server is running something, this request will be ignored, so it creates zero overhead.
     If the server is not running anything, this request will be run, so we know whether the server is healthy.
