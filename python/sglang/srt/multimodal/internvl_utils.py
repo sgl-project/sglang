@@ -1,14 +1,9 @@
 # copy from https://huggingface.co/OpenGVLab/InternVL3-1B
-from typing import TYPE_CHECKING
 
 import torch
 import torchvision.transforms as T
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
-from transformers.video_utils import VideoMetadata
-
-if TYPE_CHECKING:
-    from decord import VideoReader
 
 
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
@@ -110,21 +105,3 @@ def image_to_pixel_values(
     pixel_values = [transform(image) for image in images]
     pixel_values = torch.stack(pixel_values)
     return pixel_values
-
-
-# adapted from https://github.com/huggingface/transformers/blob/369c99d0cea403b77bd0aef818527106453fd9fc/src/transformers/video_utils.py#L312
-def video_reader_metadata(vr: "VideoReader") -> VideoMetadata:
-    video_fps = vr.get_avg_fps()
-    total_num_frames = len(vr)
-    duration = total_num_frames / video_fps if video_fps else 0
-
-    indices = list(range(total_num_frames))
-
-    metadata = VideoMetadata(
-        total_num_frames=int(total_num_frames),
-        fps=float(video_fps),
-        duration=float(duration),
-        video_backend="decord",
-        frames_indices=indices,
-    )
-    return metadata
