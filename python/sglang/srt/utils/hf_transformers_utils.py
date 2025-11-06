@@ -566,9 +566,6 @@ class ParallelTokenizer:
                         ids_lists, ov_lens, type_lists
                     )
                     if merged_ids is None:
-                        logger.warning(
-                            f"[ParallelTokenizer] Failed to merge results, fallback to hf tokenization"
-                        )
                         encoded = self.tokenizer_(text[ti], **kwargs)
                         merged_ids = encoded["input_ids"]
                         merged_types = encoded.get("token_type_ids")
@@ -632,12 +629,20 @@ class ParallelTokenizer:
                 cur_overlap_len = (
                     overlap_token_lens[idx] if idx < len(overlap_token_lens) else 0
                 )
+                if cur_overlap_len > _SGLANG_MAX_PARALLEL_TOKENIZER_OVERLAP_LEN:
+                    logger.warning(
+                        f"[ParallelTokenizer] Overlap length {cur_overlap_len} is greater than the maximum allowed {_SGLANG_MAX_PARALLEL_TOKENIZER_OVERLAP_LEN}, fallback to hf tokenization"
+                    )
+                    return None, None
                 lcs_start_list, lcs_len = lcs_solver(
                     cur_ids[-cur_overlap_len:],
                     nxt_ids[:cur_overlap_len],
                 )
                 if lcs_len <= 0:
                     # this should not happen
+                    logger.warning(
+                        f"[ParallelTokenizer] Failed to merge results, fallback to hf tokenization"
+                    )
                     return None, None
                 end_idx = len(cur_ids) - cur_overlap_len + lcs_start_list[0] + lcs_len
                 merged_ids.extend(cur_ids[start_idx:end_idx])
