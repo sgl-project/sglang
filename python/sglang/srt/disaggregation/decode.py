@@ -67,7 +67,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
@@ -229,6 +229,8 @@ class DecodePreallocQueue:
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
@@ -298,6 +300,8 @@ class DecodePreallocQueue:
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
+        from sglang.srt.managers.schedule_batch import RequestStage
+
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -412,6 +416,8 @@ class DecodePreallocQueue:
 
     def pop_preallocated(self) -> List[DecodeRequest]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage
+
         self._update_handshake_waiters()
 
         preallocated_reqs = []
@@ -727,6 +733,8 @@ class DecodeTransferQueue:
         decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
 
     def pop_transferred(self) -> List[Req]:
+        from sglang.srt.managers.schedule_batch import RequestStage
+
         if not self.queue:
             return []
         polls = poll_and_all_reduce(
@@ -788,6 +796,7 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
+        from sglang.srt.managers.schedule_batch import RequestStage
 
         while True:
             recv_reqs = self.recv_requests()
@@ -808,6 +817,8 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
+        from sglang.srt.managers.schedule_batch import RequestStage
+
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
@@ -888,6 +899,8 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
+        from sglang.srt.managers.schedule_batch import RequestStage, ScheduleBatch
+
         if self.grammar_queue:
             self.move_ready_grammar_requests()
 

@@ -28,7 +28,6 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 
 if TYPE_CHECKING:
@@ -42,8 +41,7 @@ if TYPE_CHECKING:
 
 def _register_custom_configs():
     from transformers import AutoConfig
-    from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
-    from sglang.srt.configs.internvl import InternVLChatConfig
+
     from sglang.srt.configs import (
         ChatGLMConfig,
         DbrxConfig,
@@ -64,6 +62,8 @@ def _register_custom_configs():
         Step3VLConfig,
         JetNemotronConfig,
     )
+    from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+    from sglang.srt.configs.internvl import InternVLChatConfig
 
     _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
         ChatGLMConfig,
@@ -482,6 +482,10 @@ def get_processor(
     **kwargs,
 ):
     from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+
+    from sglang.srt.multimodal.customized_mm_processor_utils import (
+        _CUSTOMIZED_MM_PROCESSOR,
+    )
 
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
