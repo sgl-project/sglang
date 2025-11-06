@@ -40,33 +40,6 @@ use crate::{
     },
 };
 
-/// Extract function call from a chat completion response
-/// Returns (call_id, tool_name, arguments_json_str) if found
-fn extract_function_call_from_chat(
-    response: &ChatCompletionResponse,
-) -> Option<(String, String, String)> {
-    // Check if response has choices with tool calls
-    let choice = response.choices.first()?;
-    let message = &choice.message;
-
-    // Look for tool_calls in the message
-    if let Some(tool_calls) = &message.tool_calls {
-        if let Some(tool_call) = tool_calls.first() {
-            return Some((
-                tool_call.id.clone(),
-                tool_call.function.name.clone(),
-                tool_call
-                    .function
-                    .arguments
-                    .clone()
-                    .unwrap_or_else(|| "{}".to_string()),
-            ));
-        }
-    }
-
-    None
-}
-
 /// Merge function tools from request with MCP tools and set tool_choice based on iteration
 fn prepare_chat_tools_and_choice(
     chat_request: &mut ChatCompletionRequest,
@@ -294,27 +267,61 @@ pub(super) async fn execute_tool_loop(
             )
             .await?;
 
-        // Check for function calls
-        if let Some((call_id, tool_name, args_json_str)) =
-            extract_function_call_from_chat(&chat_response)
-        {
+        // Check for function calls (extract all for parallel execution)
+        let tool_calls = extract_all_tool_calls_from_chat(&chat_response);
+
+        if !tool_calls.is_empty() {
             state.iteration += 1;
 
             debug!(
-                "Tool loop iteration {}: found call to {} (call_id: {})",
-                state.iteration, tool_name, call_id
+                "Tool loop iteration {}: found {} tool call(s)",
+                state.iteration,
+                tool_calls.len()
             );
 
-            // Check combined limit BEFORE executing
+            // Separate MCP and function tool calls
+            let mcp_tool_names: std::collections::HashSet<&str> =
+                mcp_tools.iter().map(|t| t.name.as_ref()).collect();
+            let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
+                .into_iter()
+                .partition(|(_, tool_name, _)| mcp_tool_names.contains(tool_name.as_str()));
+
+            debug!(
+                "Separated tool calls: {} MCP, {} function",
+                mcp_tool_calls.len(),
+                function_tool_calls.len()
+            );
+
+            // If ANY tool call is a function tool, return to caller immediately
+            if !function_tool_calls.is_empty() {
+                // Convert chat response to responses format (includes all tool calls)
+                let responses_response = conversions::chat_to_responses(
+                    &chat_response,
+                    original_request,
+                    response_id.clone(),
+                )
+                .map_err(|e| {
+                    error::internal_error(format!("Failed to convert to responses format: {}", e))
+                })?;
+
+                // Return response with function tool calls to caller
+                return Ok(responses_response);
+            }
+
+            // All MCP tools - check combined limit BEFORE executing
             let effective_limit = match max_tool_calls {
                 Some(user_max) => user_max.min(MAX_ITERATIONS),
                 None => MAX_ITERATIONS,
             };
 
-            if state.total_calls >= effective_limit {
+            if state.total_calls + mcp_tool_calls.len() > effective_limit {
                 warn!(
-                    "Reached tool call limit: {} (max_tool_calls={:?}, safety_limit={})",
-                    state.total_calls, max_tool_calls, MAX_ITERATIONS
+                    "Reached tool call limit: {} + {} > {} (max_tool_calls={:?}, safety_limit={})",
+                    state.total_calls,
+                    mcp_tool_calls.len(),
+                    effective_limit,
+                    max_tool_calls,
+                    MAX_ITERATIONS
                 );
 
                 // Convert chat response to responses format and mark as incomplete
@@ -334,46 +341,49 @@ pub(super) async fn execute_tool_loop(
                 return Ok(responses_response);
             }
 
-            // Increment after check
-            state.total_calls += 1;
+            // Execute all MCP tools
+            for (call_id, tool_name, args_json_str) in mcp_tool_calls {
+                debug!(
+                    "Calling MCP tool '{}' (call_id: {}) with args: {}",
+                    tool_name, call_id, args_json_str
+                );
 
-            // Execute the MCP tool - manager handles parsing and type coercion
-            debug!(
-                "Calling MCP tool '{}' with args: {}",
-                tool_name, args_json_str
-            );
-            let (output_str, success, error) = match ctx
-                .mcp_manager
-                .call_tool(tool_name.as_str(), args_json_str.as_str())
-                .await
-            {
-                Ok(result) => match serde_json::to_string(&result) {
-                    Ok(output) => (output, true, None),
-                    Err(e) => {
-                        let err = format!("Failed to serialize tool result: {}", e);
-                        warn!("{}", err);
-                        let error_json = json!({ "error": &err }).to_string();
-                        (error_json, false, Some(err))
+                let (output_str, success, error) = match ctx
+                    .mcp_manager
+                    .call_tool(tool_name.as_str(), args_json_str.as_str())
+                    .await
+                {
+                    Ok(result) => match serde_json::to_string(&result) {
+                        Ok(output) => (output, true, None),
+                        Err(e) => {
+                            let err = format!("Failed to serialize tool result: {}", e);
+                            warn!("{}", err);
+                            let error_json = json!({ "error": &err }).to_string();
+                            (error_json, false, Some(err))
+                        }
+                    },
+                    Err(err) => {
+                        let err_str = format!("tool call failed: {}", err);
+                        warn!("Tool execution failed: {}", err_str);
+                        // Return error as output, let model decide how to proceed
+                        let error_json = json!({ "error": &err_str }).to_string();
+                        (error_json, false, Some(err_str))
                     }
-                },
-                Err(err) => {
-                    let err_str = format!("tool call failed: {}", err);
-                    warn!("Tool execution failed: {}", err_str);
-                    // Return error as output, let model decide how to proceed
-                    let error_json = json!({ "error": &err_str }).to_string();
-                    (error_json, false, Some(err_str))
-                }
-            };
+                };
 
-            // Record the call in state
-            state.record_call(
-                call_id,
-                tool_name,
-                args_json_str,
-                output_str,
-                success,
-                error,
-            );
+                // Record the call in state
+                state.record_call(
+                    call_id,
+                    tool_name,
+                    args_json_str,
+                    output_str,
+                    success,
+                    error,
+                );
+
+                // Increment total calls counter
+                state.total_calls += 1;
+            }
 
             // Build resume request with conversation history
             // Start with original input
@@ -687,17 +697,30 @@ async fn execute_tool_loop_streaming_internal(
                 tool_calls.len()
             );
 
-            // Check combined limit
+            // Separate MCP and function tool calls
+            let mcp_tool_names: std::collections::HashSet<&str> =
+                mcp_tools.iter().map(|t| t.name.as_ref()).collect();
+            let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
+                .into_iter()
+                .partition(|(_, tool_name, _)| mcp_tool_names.contains(tool_name.as_str()));
+
+            debug!(
+                "Separated tool calls: {} MCP, {} function",
+                mcp_tool_calls.len(),
+                function_tool_calls.len()
+            );
+
+            // Check combined limit (only count MCP tools since function tools will be returned)
             let effective_limit = match max_tool_calls {
                 Some(user_max) => user_max.min(MAX_ITERATIONS),
                 None => MAX_ITERATIONS,
             };
 
-            if state.total_calls + tool_calls.len() > effective_limit {
+            if state.total_calls + mcp_tool_calls.len() > effective_limit {
                 warn!(
                     "Reached tool call limit: {} + {} > {} (max_tool_calls={:?}, safety_limit={})",
                     state.total_calls,
-                    tool_calls.len(),
+                    mcp_tool_calls.len(),
                     effective_limit,
                     max_tool_calls,
                     MAX_ITERATIONS
@@ -705,8 +728,8 @@ async fn execute_tool_loop_streaming_internal(
                 break;
             }
 
-            // Process each tool call
-            for (call_id, tool_name, args_json_str) in tool_calls {
+            // Process each MCP tool call
+            for (call_id, tool_name, args_json_str) in mcp_tool_calls {
                 state.total_calls += 1;
 
                 debug!(
@@ -844,6 +867,70 @@ async fn execute_tool_loop_streaming_internal(
                     success,
                     error,
                 );
+            }
+
+            // If there are function tool calls, emit events and exit MCP loop
+            if !function_tool_calls.is_empty() {
+                debug!(
+                    "Found {} function tool call(s) - emitting events and exiting MCP loop",
+                    function_tool_calls.len()
+                );
+
+                // Emit function_tool_call events for each function tool
+                for (call_id, tool_name, args_json_str) in function_tool_calls {
+                    // Allocate output_index for this function_tool_call item
+                    let (output_index, item_id) =
+                        emitter.allocate_output_index(OutputItemType::FunctionCall);
+
+                    // Build initial function_tool_call item
+                    let item = json!({
+                        "id": item_id,
+                        "type": "function_tool_call",
+                        "call_id": call_id,
+                        "name": tool_name,
+                        "status": "in_progress",
+                        "arguments": ""
+                    });
+
+                    // Emit output_item.added
+                    let event = emitter.emit_output_item_added(output_index, &item);
+                    emitter.send_event(&event, &tx)?;
+
+                    // Emit function_call_arguments.delta
+                    let event = emitter.emit_function_call_arguments_delta(
+                        output_index,
+                        &item_id,
+                        &args_json_str,
+                    );
+                    emitter.send_event(&event, &tx)?;
+
+                    // Emit function_call_arguments.done
+                    let event = emitter.emit_function_call_arguments_done(
+                        output_index,
+                        &item_id,
+                        &args_json_str,
+                    );
+                    emitter.send_event(&event, &tx)?;
+
+                    // Build complete item
+                    let item_complete = json!({
+                        "id": item_id,
+                        "type": "function_tool_call",
+                        "call_id": call_id,
+                        "name": tool_name,
+                        "status": "completed",
+                        "arguments": args_json_str
+                    });
+
+                    // Emit output_item.done
+                    let event = emitter.emit_output_item_done(output_index, &item_complete);
+                    emitter.send_event(&event, &tx)?;
+
+                    emitter.complete_output_item(output_index);
+                }
+
+                // Break loop to return response to caller
+                break;
             }
 
             // Build next request with conversation history
