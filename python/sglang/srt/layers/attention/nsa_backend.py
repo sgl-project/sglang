@@ -1208,9 +1208,27 @@ class NativeSparseAttnBackend(AttentionBackend):
         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
         device_sm_major = torch.cuda.get_device_capability()[0]
         if device_sm_major >= 10:
-            return self._forward_trtllm_ragged_mha(
-                q, k, v, layer, forward_batch, metadata,
-                is_prefix_chunk, cu_seqlens_q, cu_seqlens_k, max_seqlen_k, causal
+            import flashinfer
+
+            seq_lens = metadata.cache_seqlens_int32
+            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q,
+                key=k,
+                value=v,
+                workspace_buffer=self.workspace_buffer,
+                seq_lens=seq_lens,
+                max_q_len=metadata.max_seq_len_q,
+                max_kv_len=max_seqlen_k,
+                bmm1_scale=layer.scaling,
+                bmm2_scale=1.0,
+                o_sf_scale=1.0,
+                batch_size=forward_batch.batch_size,
+                window_left=-1,
+                cum_seq_lens_q=cu_seqlens_q,
+                cum_seq_lens_kv=cu_seqlens_k,
+                enable_pdl=False,
+                is_causal=causal,
+                return_lse=False,
             )
 
         # Use FA3 for SM90 (Hopper/H200)
@@ -1228,70 +1246,6 @@ class NativeSparseAttnBackend(AttentionBackend):
             causal=causal,
             ver=fa_version,
         )
-
-    def _forward_trtllm_ragged_mha(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: "RadixAttention",
-        forward_batch: ForwardBatch,
-        metadata: NSAMetadata,
-        is_prefix_chunk: bool,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        max_seqlen_k: int,
-        causal: bool,
-    ) -> torch.Tensor:
-        """Standard MHA using TRTLLm ragged attention for SM100 (Blackwell).
-        
-        Uses flashinfer.prefill.trtllm_ragged_attention_deepseek kernel which provides
-        better performance than FA4 on Blackwell architecture.
-        """
-        import flashinfer
-        
-        # Determine seq_lens and o_sf_scale based on processing mode
-        if is_prefix_chunk:
-            # Processing historical prefix chunks
-            chunk_idx = forward_batch.prefix_chunk_idx
-            seq_lens = forward_batch.prefix_chunk_seq_lens[chunk_idx]
-            o_sf_scale = -1.0  # Negative scale for LSE accumulation
-        else:
-            # Processing current tokens (with or without prefix)
-            mha_one_shot = getattr(forward_batch, "mha_one_shot", False)
-            if mha_one_shot:
-                # MHA_ONE_SHOT: process all tokens (prefix + current) in one shot
-                seq_lens = metadata.cache_seqlens_int32
-            else:
-                # MHA_CHUNKED_KV: only process current tokens
-                seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
-            o_sf_scale = 1.0
-        
-        return_lse = getattr(forward_batch, "mha_return_lse", False)
-        
-        result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=self.workspace_buffer,
-            seq_lens=seq_lens,
-            max_q_len=metadata.max_seq_len_q,
-            max_kv_len=max_seqlen_k,
-            bmm1_scale=layer.scaling,
-            bmm2_scale=1.0,
-            o_sf_scale=o_sf_scale,
-            batch_size=forward_batch.batch_size,
-            window_left=-1,  # No sliding window attention
-            cum_seq_lens_q=cu_seqlens_q,
-            cum_seq_lens_kv=cu_seqlens_k,
-            enable_pdl=False,  # PDL (Persistent Data Layout) optimization disabled
-            is_causal=causal,
-            return_lse=return_lse,
-        )
-        
-        # TRTLLm kernel returns LSE in correct format (total_tokens, nheads)
-        # No need to transpose unlike flash_attn_varlen_func
-        return result
 
     def _forward_tilelang(
         self,
