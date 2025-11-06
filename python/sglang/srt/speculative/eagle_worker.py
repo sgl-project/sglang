@@ -705,7 +705,10 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-        if self.target_worker.model_runner.hybrid_gdn_config is not None or self.target_worker.model_runner.jet_nemotron_config is not None:
+        if (
+            self.target_worker.model_runner.hybrid_gdn_config is not None
+            or self.target_worker.model_runner.jet_nemotron_config is not None
+        ):
             accepted_length = (
                 torch.tensor(
                     res.accept_length_per_req_cpu,
@@ -742,9 +745,12 @@ class EAGLEWorker(TpModelWorker):
                 )
             else:
                 max_relative_indices_per_req = accepted_length - 1
-            if self.target_worker.model_runner.jet_nemotron_config is not None and spec_info.topk == 1:
+            if (
+                self.target_worker.model_runner.jet_nemotron_config is not None
+                and spec_info.topk == 1
+            ):
                 self.target_worker.model_runner.attn_backend.update_jet_nemotron_topk1_state_after_mtp_verify(
-                    max_relative_indices_per_req, self.target_worker.model_runner.model
+                    accepted_length, self.target_worker.model_runner.model
                 )
             else:
                 self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
