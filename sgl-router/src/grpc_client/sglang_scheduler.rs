@@ -402,10 +402,23 @@ impl SglangSchedulerClient {
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
         let mut constraints = Vec::new();
 
-        if let Some(ResponseFormat::JsonSchema { json_schema }) = &request.response_format {
-            let schema_str = serde_json::to_string(&json_schema.schema)
-                .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
+        // Handle response_format constraints
+        match &request.response_format {
+            Some(ResponseFormat::JsonObject) => {
+                // json_object mode - constrain to valid JSON object
+                let schema = serde_json::json!({"type": "object"});
+                let schema_str = serde_json::to_string(&schema)
+                    .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
+                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
+            }
+            Some(ResponseFormat::JsonSchema { json_schema }) => {
+                let schema_str = serde_json::to_string(&json_schema.schema)
+                    .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
+                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
+            }
+            Some(ResponseFormat::Text) | None => {
+                // No constraint for text format
+            }
         }
 
         if let Some(ebnf) = &request.ebnf {
