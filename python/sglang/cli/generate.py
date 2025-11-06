@@ -1,6 +1,6 @@
 import argparse
 
-from sglang.cli.main import get_is_diffusion_model, get_model_path
+from sglang.cli.utils import get_is_diffusion_model, get_model_path
 from sglang.multimodal_gen.runtime.entrypoints.cli.generate import (
     add_multimodal_gen_generate_args,
     generate_cmd,
