@@ -666,6 +666,20 @@ async fn execute_mcp_tool_loop_streaming(
         );
     }
 
+    // Build HashSet of MCP tool names for O(1) lookup during streaming
+    // Clone tool names to owned strings to avoid borrowing current_request
+    let mcp_tool_names: std::collections::HashSet<String> = current_request
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|t| t.r#type == ResponseToolType::Mcp)
+                .filter_map(|t| t.function.as_ref().map(|f| f.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Emit mcp_list_tools on first iteration
     let (output_index, item_id) = emitter.allocate_output_index(OutputItemType::McpListTools);
 
@@ -769,21 +783,21 @@ async fn execute_mcp_tool_loop_streaming(
             }
         };
 
-        // Process stream with token-level streaming (MCP path - emits mcp_call.* events)
-        let iteration_result =
-            match HarmonyStreamingProcessor::process_responses_iteration_stream_mcp(
-                execution_result,
-                emitter,
-                tx,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(err_msg) => {
-                    emitter.emit_error(&err_msg, Some("processing_error"), tx);
-                    return;
-                }
-            };
+        // Process stream with token-level streaming (mixed tools - emits correct events per tool type)
+        let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
+            execution_result,
+            emitter,
+            tx,
+            &mcp_tool_names,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err_msg) => {
+                emitter.emit_error(&err_msg, Some("processing_error"), tx);
+                return;
+            }
+        };
 
         // Handle iteration result (tool calls or completion)
         match iteration_result {
@@ -977,20 +991,22 @@ async fn execute_without_mcp_streaming(
     };
 
     // Process stream (emits all output items during streaming - function tool path emits function_call_arguments.* events)
-    let iteration_result =
-        match HarmonyStreamingProcessor::process_responses_iteration_stream_function(
-            execution_result,
-            emitter,
-            tx,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(err_msg) => {
-                emitter.emit_error(&err_msg, Some("processing_error"), tx);
-                return;
-            }
-        };
+    // Pass empty HashSet so all tools are treated as function tools (per-tool detection)
+    let empty_mcp_tools = std::collections::HashSet::new();
+    let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
+        execution_result,
+        emitter,
+        tx,
+        &empty_mcp_tools,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err_msg) => {
+            emitter.emit_error(&err_msg, Some("processing_error"), tx);
+            return;
+        }
+    };
 
     // Extract usage from iteration result
     let usage = match iteration_result {

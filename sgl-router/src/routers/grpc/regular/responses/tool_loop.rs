@@ -869,13 +869,66 @@ async fn execute_tool_loop_streaming_internal(
                 );
             }
 
-            // If there are function tool calls, exit MCP loop and return to caller
+            // If there are function tool calls, emit events and exit MCP loop
             if !function_tool_calls.is_empty() {
                 debug!(
-                    "Found {} function tool call(s) - exiting MCP loop and returning to caller",
+                    "Found {} function tool call(s) - emitting events and exiting MCP loop",
                     function_tool_calls.len()
                 );
-                // Function tool calls are already in the emitter's output
+
+                // Emit function_tool_call events for each function tool
+                for (call_id, tool_name, args_json_str) in function_tool_calls {
+                    // Allocate output_index for this function_tool_call item
+                    let (output_index, item_id) =
+                        emitter.allocate_output_index(OutputItemType::FunctionCall);
+
+                    // Build initial function_tool_call item
+                    let item = json!({
+                        "id": item_id,
+                        "type": "function_tool_call",
+                        "call_id": call_id,
+                        "name": tool_name,
+                        "status": "in_progress",
+                        "arguments": ""
+                    });
+
+                    // Emit output_item.added
+                    let event = emitter.emit_output_item_added(output_index, &item);
+                    emitter.send_event(&event, &tx)?;
+
+                    // Emit function_call_arguments.delta
+                    let event = emitter.emit_function_call_arguments_delta(
+                        output_index,
+                        &item_id,
+                        &args_json_str,
+                    );
+                    emitter.send_event(&event, &tx)?;
+
+                    // Emit function_call_arguments.done
+                    let event = emitter.emit_function_call_arguments_done(
+                        output_index,
+                        &item_id,
+                        &args_json_str,
+                    );
+                    emitter.send_event(&event, &tx)?;
+
+                    // Build complete item
+                    let item_complete = json!({
+                        "id": item_id,
+                        "type": "function_tool_call",
+                        "call_id": call_id,
+                        "name": tool_name,
+                        "status": "completed",
+                        "arguments": args_json_str
+                    });
+
+                    // Emit output_item.done
+                    let event = emitter.emit_output_item_done(output_index, &item_complete);
+                    emitter.send_event(&event, &tx)?;
+
+                    emitter.complete_output_item(output_index);
+                }
+
                 // Break loop to return response to caller
                 break;
             }
