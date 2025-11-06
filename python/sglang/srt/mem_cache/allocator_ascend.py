@@ -61,6 +61,17 @@ def alloc_extend_kernel_ascend(
 
 
 class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+        need_sort: bool,
+    ):
+        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
+        self.roundup = page_size - 1
 
     def alloc_extend(
         self,
@@ -77,8 +88,8 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         num_new_pages = (
-            (seq_lens + self.page_size - 1) // self.page_size
-            - (prefix_lens + self.page_size - 1) // self.page_size
+            (seq_lens + self.roundup) // self.page_size
+            - (prefix_lens + self.roundup) // self.page_size
         ).sum()
         num_new_pages_item = num_new_pages.item()
         if self.need_sort and num_new_pages_item > len(self.free_pages):
@@ -87,13 +98,14 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages_item > len(self.free_pages):
             return None
 
-        out_indices = torch.empty(
-            (extend_num_tokens,), dtype=torch.int64, device=self.device
-        )
-
         if num_new_pages_item < 200:
             import sgl_kernel_npu  # noqa: F401
 
+            out_indices = torch.empty(
+                (extend_num_tokens,),
+                dtype=torch.int64,
+                device=self.device,
+            )
             torch.ops.npu.alloc_extend(
                 prefix_lens,
                 seq_lens,
@@ -103,8 +115,14 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 out_indices,
                 num_new_pages,
             )
+            out_indices = out_indices.int()
 
         else:
+            out_indices = torch.empty(
+                (extend_num_tokens,),
+                dtype=torch.int32,
+                device=self.device,
+            )
             alloc_extend_kernel_ascend(
                 prefix_lens,
                 seq_lens,
