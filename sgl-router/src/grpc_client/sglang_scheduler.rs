@@ -482,7 +482,7 @@ impl SglangSchedulerClient {
     /// so this only handles tool_call_constraint.
     /// Build constraint for Responses API
     ///
-    /// Priority: structured output (text field) > tool call constraint
+    /// Priority: Harmony structural tag (from preparation) > text field > other tool constraints
     fn build_constraint_for_responses(
         &self,
         text: &Option<crate::protocols::responses::TextConfig>,
@@ -490,7 +490,17 @@ impl SglangSchedulerClient {
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
         use crate::protocols::responses::TextFormat;
 
-        // Priority 1: Structured output from text field
+        // Priority 1: If Harmony prepared a structural tag, use it (indicates Harmony model with special handling)
+        if let Some((ref constraint_type, ref constraint_value)) = tool_call_constraint {
+            if constraint_type == "structural_tag" {
+                // Harmony models use structural tags - don't override with text field processing
+                return Ok(Some(proto::sampling_params::Constraint::StructuralTag(
+                    constraint_value.clone(),
+                )));
+            }
+        }
+
+        // Priority 2: Structured output from text field (for regular gRPC models)
         if let Some(text_config) = text {
             if let Some(format) = &text_config.format {
                 match format {
@@ -518,12 +528,9 @@ impl SglangSchedulerClient {
             }
         }
 
-        // Priority 2: Tool call constraint (from Harmony preparation or regular tool handling)
+        // Priority 3: Other tool call constraints (json_schema, ebnf, regex)
         if let Some((constraint_type, constraint_value)) = tool_call_constraint {
             let tool_constraint = match constraint_type.as_str() {
-                "structural_tag" => {
-                    proto::sampling_params::Constraint::StructuralTag(constraint_value)
-                }
                 "json_schema" => proto::sampling_params::Constraint::JsonSchema(constraint_value),
                 "ebnf" => proto::sampling_params::Constraint::EbnfGrammar(constraint_value),
                 "regex" => proto::sampling_params::Constraint::Regex(constraint_value),

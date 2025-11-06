@@ -9,6 +9,6 @@ pub mod preparation;
 pub mod request_building;
 pub mod response_processing;
 
-pub use preparation::{build_structural_tag_for_structured_output, HarmonyPreparationStage};
+pub use preparation::HarmonyPreparationStage;
 pub use request_building::HarmonyRequestBuildingStage;
 pub use response_processing::HarmonyResponseProcessingStage;

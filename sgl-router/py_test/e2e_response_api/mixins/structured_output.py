@@ -44,8 +44,6 @@ class StructuredOutputBaseTest(CustomTestCase):
 
     def test_structured_output_json_schema(self):
         """Test structured output with json_schema format."""
-        # Note: This test requires a model that supports structured outputs
-        # (e.g., gpt-4o-2024-08-06 or newer)
 
         # Create response with structured output
         data = {
