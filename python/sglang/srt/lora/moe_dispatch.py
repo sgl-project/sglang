@@ -1,0 +1,61 @@
+# Copyright 2023-2025 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""MoE-specific LoRA dispatch utilities."""
+
+import torch
+
+
+def per_lora_moe_dispatch(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    weight_indices: torch.Tensor,
+    num_experts: int,
+    num_loras: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Dispatch tokens to experts with per-LoRA routing.
+
+    Args:
+        topk_ids: [num_tokens, top_k] - Expert IDs selected by router
+        topk_weights: [num_tokens, top_k] - Router weights
+        weight_indices: [num_tokens] - LoRA adapter ID for each token
+        num_experts: Total number of experts
+        num_loras: Total number of LoRA adapters
+
+    Returns:
+        sorted_token_ids: Token indices sorted by (lora_id, expert_id)
+        sorted_expert_ids: Corresponding expert IDs
+        sorted_weights: Corresponding router weights
+    """
+    num_tokens, top_k = topk_ids.shape
+    device = topk_ids.device
+
+    # Flatten topk dimensions: [num_tokens * top_k]
+    flat_topk_ids = topk_ids.flatten()
+    flat_topk_weights = topk_weights.flatten()
+    flat_token_ids = torch.arange(num_tokens, device=device).repeat_interleave(top_k)
+    flat_lora_ids = weight_indices.repeat_interleave(top_k)
+
+    # Create composite key for sorting: lora_id * num_experts + expert_id
+    composite_key = flat_lora_ids * num_experts + flat_topk_ids
+
+    # Sort by composite key to group by (lora_id, expert_id)
+    sorted_indices = torch.argsort(composite_key)
+
+    sorted_token_ids = flat_token_ids[sorted_indices]
+    sorted_expert_ids = flat_topk_ids[sorted_indices]
+    sorted_weights = flat_topk_weights[sorted_indices]
+
+    return sorted_token_ids, sorted_expert_ids, sorted_weights
