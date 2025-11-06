@@ -18,11 +18,12 @@ sys.path.insert(0, str(_TEST_DIR))
 from mixins.function_call import FunctionCallingBaseTest
 from mixins.mcp import MCPTests
 from mixins.state_management import StateManagementTests
+from mixins.structured_output import StructuredOutputBaseTest
 from router_fixtures import popen_launch_workers_and_router
 from util import kill_process_tree
 
 
-class TestGrpcBackend(StateManagementTests, MCPTests):
+class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
     """End to end tests for gRPC backend."""
 
     @classmethod
@@ -73,7 +74,7 @@ class TestGrpcBackend(StateManagementTests, MCPTests):
         return super().test_mcp_basic_tool_call_streaming()
 
 
-class TestHarmonyBackend(StateManagementTests, MCPTests, FunctionCallingBaseTest):
+class TestHarmonyBackend(StateManagementTests, MCPTests, FunctionCallingBaseTest, StructuredOutputBaseTest):
     """End to end tests for Harmony backend."""
 
     @classmethod

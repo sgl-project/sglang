@@ -449,7 +449,9 @@ impl SglangSchedulerClient {
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<proto::SamplingParams, String> {
         // ResponsesRequest doesn't have stop sequences in the same way
-        // For Harmony router: Tools are handled via structural_tag constraints
+        // Constraints are handled in priority order:
+        // 1. Structured output (text field) - for both regular and Harmony models
+        // 2. Tool call constraint - from Harmony preparation or regular tool handling
 
         let max_new_tokens = request.max_output_tokens.map(|v| v as i32);
 
@@ -469,7 +471,7 @@ impl SglangSchedulerClient {
             ignore_eos: false,
             no_stop_trim: false,
             n: 1, // Responses API doesn't support n>1
-            constraint: self.build_constraint_for_responses(tool_call_constraint)?,
+            constraint: self.build_constraint_for_responses(&request.text, tool_call_constraint)?,
             ..Default::default()
         })
     }
@@ -478,10 +480,45 @@ impl SglangSchedulerClient {
     ///
     /// Responses API doesn't support response_format, ebnf, or regex constraints,
     /// so this only handles tool_call_constraint.
+    /// Build constraint for Responses API
+    ///
+    /// Priority: structured output (text field) > tool call constraint
     fn build_constraint_for_responses(
         &self,
+        text: &Option<crate::protocols::responses::TextConfig>,
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
+        use crate::protocols::responses::TextFormat;
+
+        // Priority 1: Structured output from text field
+        if let Some(text_config) = text {
+            if let Some(format) = &text_config.format {
+                match format {
+                    TextFormat::Text => {
+                        // No constraint for plain text
+                    }
+                    TextFormat::JsonObject => {
+                        // json_object mode - constrain to valid JSON object
+                        let schema = serde_json::json!({"type": "object"});
+                        let schema_str = serde_json::to_string(&schema)
+                            .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
+                        return Ok(Some(proto::sampling_params::Constraint::JsonSchema(
+                            schema_str,
+                        )));
+                    }
+                    TextFormat::JsonSchema { schema, .. } => {
+                        // json_schema mode - constrain to provided schema
+                        let schema_str = serde_json::to_string(schema)
+                            .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
+                        return Ok(Some(proto::sampling_params::Constraint::JsonSchema(
+                            schema_str,
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Priority 2: Tool call constraint (from Harmony preparation or regular tool handling)
         if let Some((constraint_type, constraint_value)) = tool_call_constraint {
             let tool_constraint = match constraint_type.as_str() {
                 "structural_tag" => {
@@ -492,10 +529,10 @@ impl SglangSchedulerClient {
                 "regex" => proto::sampling_params::Constraint::Regex(constraint_value),
                 _ => return Err(format!("Unknown constraint type: {}", constraint_type)),
             };
-            Ok(Some(tool_constraint))
-        } else {
-            Ok(None)
+            return Ok(Some(tool_constraint));
         }
+
+        Ok(None)
     }
 
     fn build_single_constraint_from_plain(

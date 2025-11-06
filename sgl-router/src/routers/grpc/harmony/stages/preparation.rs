@@ -139,8 +139,13 @@ impl HarmonyPreparationStage {
             function_tools = filtered;
         }
 
-        // Step 3: Generate Harmony structural tags from filtered tools
-        let tool_constraints = if !function_tools.is_empty() {
+        // Step 3: Generate Harmony structural tags
+        // Priority: structured output (text field) > tool constraints
+        let tool_constraints = if let Some(text_config) = &request.text {
+            // Structured output takes priority for Harmony models
+            Self::generate_structural_output_tag_for_harmony(text_config).map_err(|e| *e)?
+        } else if !function_tools.is_empty() {
+            // Fall back to tool constraints
             Self::generate_harmony_structural_tag(&function_tools, &request.tool_choice)
                 .map_err(|e| *e)?
         } else {
@@ -167,6 +172,38 @@ impl HarmonyPreparationStage {
         });
 
         Ok(None)
+    }
+
+    /// Generate Harmony structural tag for structured output (text field)
+    ///
+    /// Converts text.format to structural tag that constrains the final channel.
+    /// Returns None if text.format is not specified or is "text".
+    fn generate_structural_output_tag_for_harmony(
+        text_config: &crate::protocols::responses::TextConfig,
+    ) -> Result<Option<(String, String)>, Box<Response>> {
+        use crate::protocols::responses::TextFormat;
+
+        let Some(format) = &text_config.format else {
+            return Ok(None);
+        };
+
+        match format {
+            TextFormat::Text => Ok(None),
+            TextFormat::JsonObject => {
+                // json_object mode - constrain final channel to produce valid JSON object
+                let tag = build_structural_tag_for_structured_output(
+                    &serde_json::json!({"type": "object"}),
+                )
+                .map_err(|e| Box::new(error::internal_error(e)))?;
+                Ok(Some(("structural_tag".to_string(), tag)))
+            }
+            TextFormat::JsonSchema { schema, .. } => {
+                // json_schema mode - constrain final channel to the provided schema
+                let tag = build_structural_tag_for_structured_output(schema)
+                    .map_err(|e| Box::new(error::internal_error(e)))?;
+                Ok(Some(("structural_tag".to_string(), tag)))
+            }
+        }
     }
 
     /// Generate Harmony structural tag for tool constraints
@@ -261,4 +298,37 @@ impl HarmonyPreparationStage {
             )))
         })
     }
+}
+
+/// Build Harmony structural tag for structured output (JSON schema constraint)
+///
+/// Creates a structural tag that applies JSON schema constraint to the final channel only,
+/// allowing the model to still produce proper Harmony format with channels.
+/// This is used for the Responses API text.format field (json_object or json_schema).
+pub fn build_structural_tag_for_structured_output(
+    schema: &serde_json::Value,
+) -> Result<String, String> {
+    let structural_tag = json!({
+        "format": {
+            "type": "triggered_tags",
+            "triggers": ["<|channel|>final"],
+            "tags": [{
+                "begin": "<|channel|>final<|constrain|>json<|message|>",
+                "content": {
+                    "type": "json_schema",
+                    "json_schema": schema
+                },
+                "end": ""
+            }],
+            "at_least_one": true,
+            "stop_after_first": false
+        }
+    });
+
+    serde_json::to_string(&structural_tag).map_err(|e| {
+        format!(
+            "Failed to serialize structural tag for structured output: {}",
+            e
+        )
+    })
 }
