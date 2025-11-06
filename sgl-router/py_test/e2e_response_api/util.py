@@ -2,12 +2,15 @@
 Utility functions for Response API e2e tests.
 """
 
+import logging
 import os
 import signal
 import threading
 import unittest
 
 import psutil
+
+logger = logging.getLogger(__name__)
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
@@ -69,14 +72,10 @@ class CustomTestCase(unittest.TestCase):
                 return super(CustomTestCase, self)._callTestMethod(method)
             except Exception as e:
                 if attempt < max_retry:
-                    print(
+                    logger.info(
                         f"Test failed on attempt {attempt + 1}/{max_retry + 1}, retrying..."
                     )
                     continue
                 else:
                     # Last attempt, re-raise the exception
                     raise
-
-    def setUp(self):
-        """Print test method name at the start of each test."""
-        print(f"[Test Method] {self._testMethodName}", flush=True)

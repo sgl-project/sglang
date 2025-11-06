@@ -180,11 +180,12 @@ def _get_quantization_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
     packed_modules_mapping: Dict[str, List[str]],
+    remap_prefix: Dict[str, str] | None = None,
 ) -> Optional[QuantizationConfig]:
     """Get the quantization config."""
     if model_config.quantization is not None:
         quant_config = get_quant_config(
-            model_config, load_config, packed_modules_mapping
+            model_config, load_config, packed_modules_mapping, remap_prefix
         )
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
@@ -220,6 +221,7 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
+    remap_prefix = getattr(model_class, "remap_prefix", None)
     if _is_npu:
         packed_modules_mapping.update(
             {
@@ -243,7 +245,7 @@ def _initialize_model(
         )
 
     quant_config = _get_quantization_config(
-        model_config, load_config, packed_modules_mapping
+        model_config, load_config, packed_modules_mapping, remap_prefix
     )
 
     # Build kwargs conditionally
@@ -381,6 +383,10 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns = ["*.pt"]
         elif load_format == LoadFormat.NPCACHE:
             allow_patterns = ["*.bin"]
+        elif load_format == LoadFormat.DUMMY:
+            raise ValueError(
+                f"DUMMY load_format should use DummyModelLoader and not call _prepare_weights"
+            )
         else:
             raise ValueError(f"Unknown load_format: {load_format}")
 
@@ -610,6 +616,8 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+                if _is_npu:
+                    torch.npu.empty_cache()
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -2041,6 +2049,9 @@ def get_model_loader(
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
 
+    if load_config.load_format == LoadFormat.DUMMY:
+        return DummyModelLoader(load_config)
+
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
         or model_config.quantization in ["modelopt_fp8", "modelopt_fp4", "modelopt"]
@@ -2066,9 +2077,6 @@ def get_model_loader(
 
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
-
-    if load_config.load_format == LoadFormat.DUMMY:
-        return DummyModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)

@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: pr-test-rust-${{ github.ref }}
+  group: router-tests-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -21,7 +21,56 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  unit-test-rust:
+  maturin-build-test:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sglang-repo
+
+      - name: Move sgl-router folder to root
+        run: |
+          mv sglang-repo/sgl-router/* .
+          rm -rf sglang-repo
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install protoc and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget unzip gcc g++ perl make
+          cd /tmp
+          wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip
+          sudo unzip protoc-32.0-linux-x86_64.zip -d /usr/local
+          rm protoc-32.0-linux-x86_64.zip
+          protoc --version
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
+      - name: Test maturin build
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist --features vendored-openssl
+          rust-toolchain: stable
+          sccache: true
+
+      - name: List built wheel
+        run: ls -lh dist/
+
+      - name: Test wheel install
+        run: |
+          pip install dist/*.whl
+          python -c "import sglang_router; print('Python package: OK')"
+          python -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
+          python -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
+  router-unit-tests:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     steps:
@@ -48,6 +97,7 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
+          rustup component add clippy
           cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run fmt
@@ -83,7 +133,7 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  pytest-rust:
+  router-http-tests:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: 4-gpu-a10
     timeout-minutes: 32
@@ -116,16 +166,16 @@ jobs:
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
           cd sgl-router
-          pip install setuptools-rust wheel build
-          python3 -m build
-          pip install --force-reinstall dist/*.whl
-
+          python3 -m pip install --upgrade pip maturin
+          pip uninstall -y sglang-router
+          maturin build --release --profile ci --features vendored-openssl
+          pip install target/wheels/*.whl
 
       - name: Run Python unit tests
         run: |
           cd sgl-router
           source "$HOME/.cargo/env"
-          pip install pytest pytest-cov pytest-xdist
+          python3 -m pip install pytest pytest-cov pytest-xdist
           pytest -q py_test/unit --cov=sglang_router --cov-report=term-missing --cov-fail-under=80
 
       - name: Run Python integration tests
@@ -133,16 +183,17 @@ jobs:
           cd sgl-router
           source "$HOME/.cargo/env"
           # Integration tests use FastAPI/uvicorn for mock workers
-          pip install fastapi uvicorn orjson
-          pytest -q -m integration
+          python3 -m pip install fastapi uvicorn orjson
+          pytest -q py_test/integration_mock
 
       - name: Run Python E2E tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
+          source "$HOME/.cargo/env"
           python3 -m pip --no-cache-dir install --upgrade --ignore-installed blinker
-          python3 -m pip --no-cache-dir install --upgrade --break-system-packages genai-bench==0.0.2
-          pytest -m e2e -s  -vv -o log_cli=true --log-cli-level=INFO
+          python3 -m pip --no-cache-dir install --upgrade genai-bench==0.0.2
+          pytest py_test/e2e_http -s  -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Upload benchmark results
         if: success()
@@ -151,10 +202,10 @@ jobs:
           name: genai-bench-results-all-policies
           path: sgl-router/benchmark_**/
 
-  pytest-rust-2:
+  router-grpc-response-api-tests:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: 4-gpu-a10
-    timeout-minutes: 16
+    timeout-minutes: 32
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -179,37 +230,76 @@ jobs:
         run: |
           sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
 
+      - name: Setup Oracle Instant Client
+        run: |
+          sudo apt-get install -y unzip
+          INSTANT_CLIENT_DIR="/home/ubuntu/instant-client"
+          INSTANT_CLIENT_ZIP="instantclient-basic-linux.x64-23.9.0.25.07.zip"
+
+          if [ ! -d "$INSTANT_CLIENT_DIR/instantclient_23_9" ]; then
+            echo "Downloading Oracle Instant Client..."
+            mkdir -p "$INSTANT_CLIENT_DIR"
+            cd "$INSTANT_CLIENT_DIR"
+            wget https://download.oracle.com/otn_software/linux/instantclient/2390000/$INSTANT_CLIENT_ZIP
+            unzip $INSTANT_CLIENT_ZIP
+            rm $INSTANT_CLIENT_ZIP
+          else
+            echo "Oracle Instant Client already exists, skipping download"
+          fi
+
+          echo "LD_LIBRARY_PATH=/home/ubuntu/instant-client/instantclient_23_9:\$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+      - name: Start Oracle Database
+        run: |
+          docker run -d -p 1521:1521 -e ORACLE_PASSWORD=oracle --name oracle-db gvenzl/oracle-xe:21-slim
+          echo "Starting Oracle DB..."
+
+          # Export Oracle connection environment variables
+          echo "ATP_USER=system" >> $GITHUB_ENV
+          echo "ATP_PASSWORD=oracle" >> $GITHUB_ENV
+          echo "ATP_DSN=localhost:1521/XEPDB1" >> $GITHUB_ENV
+
       - name: Build python binding
         run: |
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
           cd sgl-router
-          pip install setuptools-rust wheel build
-          python3 -m build
-          pip install --force-reinstall dist/*.whl
+          python3 -m venv .venv
+          python3 -m pip install --upgrade pip maturin
+          pip uninstall -y sglang-router
+          maturin build --release --profile ci --features vendored-openssl
+          pip install target/wheels/*.whl
 
       - name: Run Python E2E response API tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
+          source "$HOME/.cargo/env"
           SHOW_ROUTER_LOGS=1 pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Run Python E2E gRPC tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
+          source "$HOME/.cargo/env"
           SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
+
+      - name: Cleanup Oracle Database
+        if: always()
+        run: |
+          docker stop oracle-db || true
+          docker rm oracle-db || true
 
 
   finish:
-    needs: [unit-test-rust, pytest-rust, pytest-rust-2]
+    needs: [maturin-build-test, router-unit-tests, router-http-tests, router-grpc-response-api-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
         run: echo "This is an empty step to ensure that all jobs are completed."
 
   summarize-benchmarks:
-    needs: pytest-rust
+    needs: router-http-tests
     runs-on: ubuntu-latest
     if: success()
 

@@ -58,6 +58,11 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sglang.srt.tracing.trace import (
+    trace_event_batch,
+    trace_slice_batch,
+    trace_slice_end,
+)
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -151,6 +156,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
+        self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
             size + pre_alloc_size, cache_params, device, speculative_num_draft_tokens
         )
@@ -313,6 +319,7 @@ class DecodePreallocQueue:
             )
 
             req.add_latency(RequestStage.DECODE_PREPARE)
+            trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -521,13 +528,15 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
-            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.decode_transfer_queue_entry_time = (
                 time.perf_counter()
             )
             decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
+            trace_slice_end(
+                RequestStage.DECODE_BOOTSTRAP, decode_req.req.rid, auto_next_anon=True
+            )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -765,19 +774,29 @@ class DecodeTransferQueue:
                 indices_to_remove.add(i)
                 decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
 
-                # special handling for sampling_params.max_new_tokens == 1
-                if decode_req.req.sampling_params.max_new_tokens == 1:
+                decode_req.req.check_finished()
+                if decode_req.req.finished():
                     # finish immediately
                     decode_req.req.time_stats.forward_entry_time = (
                         decode_req.req.time_stats.completion_time
                     ) = time.perf_counter()
-                    decode_req.req.check_finished()
                     self.scheduler.stream_output(
                         [decode_req.req], decode_req.req.return_logprob
                     )
                     self.tree_cache.cache_finished_req(decode_req.req)
+                    trace_slice_end(
+                        RequestStage.DECODE_QUICK_FINISH,
+                        decode_req.req.rid,
+                        thread_finish_flag=True,
+                    )
                 else:
                     transferred_reqs.append(decode_req.req)
+                    trace_slice_end(
+                        RequestStage.DECODE_TRANSFERRED,
+                        decode_req.req.rid,
+                        auto_next_anon=True,
+                    )
+
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -823,6 +842,7 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
+                    trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
                     if prepare_mlp_sync_flag:
                         self._prepare_idle_batch_and_run(None)
                 else:
@@ -872,6 +892,7 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
+                    trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
                     if prepare_mlp_sync_flag:
                         batch_, batch_result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
@@ -954,6 +975,9 @@ class SchedulerDisaggregationDecodeMixin:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
 
+        if ret:
+            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
+            trace_event_batch("schedule", ret.reqs, attrs=attrs)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
@@ -1009,6 +1033,9 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            self.decode_offload_manager.check_offload_progress()
+
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
@@ -1031,6 +1058,3 @@ class SchedulerDisaggregationDecodeMixin:
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
             self.waiting_queue.extend(alloc_reqs)
-
-        if self.server_args.disaggregation_decode_enable_offload_kvcache:
-            self.decode_offload_manager.check_offload_progress()

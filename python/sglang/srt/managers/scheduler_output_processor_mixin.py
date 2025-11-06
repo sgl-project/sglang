@@ -14,7 +14,13 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
 )
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    BaseFinishReason,
+    Req,
+    RequestStage,
+    ScheduleBatch,
+)
+from sglang.srt.tracing.trace import trace_slice
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
@@ -160,6 +166,14 @@ class SchedulerOutputProcessorMixin:
                             )
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
+
+                    trace_slice(
+                        RequestStage.PREFILL_FORWARD,
+                        req.rid,
+                        auto_next_anon=not req.finished(),
+                        thread_finish_flag=req.finished(),
+                    )
+
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
@@ -188,6 +202,12 @@ class SchedulerOutputProcessorMixin:
                                 )
                             logprob_pt += num_input_logprobs
 
+                    trace_slice(
+                        RequestStage.PREFILL_CHUNKED_FORWARD,
+                        req.rid,
+                        auto_next_anon=True,
+                    )
+
         else:  # embedding or reward model
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
@@ -203,7 +223,10 @@ class SchedulerOutputProcessorMixin:
                         i
                     ].item()
             else:
-                embeddings = embeddings.tolist()
+                if isinstance(embeddings, torch.Tensor):
+                    embeddings = embeddings.tolist()
+                else:
+                    embeddings = [tensor.tolist() for tensor in embeddings]
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -223,6 +246,13 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
+
+                trace_slice(
+                    RequestStage.PREFILL_FORWARD,
+                    req.rid,
+                    auto_next_anon=not req.finished(),
+                    thread_finish_flag=req.finished(),
+                )
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
@@ -245,6 +275,7 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
             req.spec_verify_ct += 1
+            req.spec_accepted_tokens += accept_lens[i] - 1
 
         return predict_tokens
 
@@ -727,7 +758,13 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         spec_verify_ct = []
         spec_accepted_tokens = []
+        retraction_counts = []
         output_hidden_states = None
+
+        queue_times = []
+        forward_entry_times = []
+        prefill_delays = []
+        prefill_latencies = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -758,7 +795,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
-            if self.model_config.is_multimodal_gen and req.to_abort:
+            if self.model_config.is_multimodal_gen and req.to_finish:
                 continue
 
             if req.finished():
@@ -827,6 +864,29 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+                retraction_counts.append(req.retraction_count)
+
+                queue_times.append(req.time_stats.get_queueing_time())
+                forward_entry_times.append(req.time_stats.forward_entry_time)
+
+                if req.time_stats.prefill_start_time > 0.0:
+                    prefill_delays.append(
+                        req.time_stats.prefill_start_time
+                        - req.time_stats.forward_entry_time
+                    )
+                else:
+                    prefill_delays.append(None)
+
+                if (
+                    req.time_stats.prefill_start_time > 0.0
+                    and req.time_stats.prefill_end_time > 0.0
+                ):
+                    prefill_latencies.append(
+                        req.time_stats.prefill_end_time
+                        - req.time_stats.prefill_start_time
+                    )
+                else:
+                    prefill_latencies.append(None)
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -919,37 +979,42 @@ class SchedulerOutputProcessorMixin:
 
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
-                    finished_reasons,
-                    decoded_texts,
-                    decode_ids_list,
-                    read_offsets,
-                    output_ids,
-                    skip_special_tokens,
-                    spaces_between_special_tokens,
-                    no_stop_trim,
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    spec_verify_ct,
-                    spec_accepted_tokens,
-                    input_token_logprobs_val,
-                    input_token_logprobs_idx,
-                    output_token_logprobs_val,
-                    output_token_logprobs_idx,
-                    input_top_logprobs_val,
-                    input_top_logprobs_idx,
-                    output_top_logprobs_val,
-                    output_top_logprobs_idx,
-                    input_token_ids_logprobs_val,
-                    input_token_ids_logprobs_idx,
-                    output_token_ids_logprobs_val,
-                    output_token_ids_logprobs_idx,
+                    spec_verify_ct=spec_verify_ct,
+                    spec_accepted_tokens=spec_accepted_tokens,
+                    queue_time=queue_times,
+                    forward_entry_time=forward_entry_times,
+                    prefill_delay=prefill_delays,
+                    prefill_latency=prefill_latencies,
+                    finished_reasons=finished_reasons,
+                    decoded_texts=decoded_texts,
+                    decode_ids=decode_ids_list,
+                    read_offsets=read_offsets,
+                    output_ids=output_ids,
+                    skip_special_tokens=skip_special_tokens,
+                    spaces_between_special_tokens=spaces_between_special_tokens,
+                    no_stop_trim=no_stop_trim,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cached_tokens=cached_tokens,
+                    input_token_logprobs_val=input_token_logprobs_val,
+                    input_token_logprobs_idx=input_token_logprobs_idx,
+                    output_token_logprobs_val=output_token_logprobs_val,
+                    output_token_logprobs_idx=output_token_logprobs_idx,
+                    input_top_logprobs_val=input_top_logprobs_val,
+                    input_top_logprobs_idx=input_top_logprobs_idx,
+                    output_top_logprobs_val=output_top_logprobs_val,
+                    output_top_logprobs_idx=output_top_logprobs_idx,
+                    input_token_ids_logprobs_val=input_token_ids_logprobs_val,
+                    input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+                    output_token_ids_logprobs_val=output_token_ids_logprobs_val,
+                    output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
+                    retraction_counts=retraction_counts,
                 )
             )
 
@@ -961,6 +1026,11 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
+        queue_times = []
+        forward_entry_times = []
+        prefill_delays = []
+        prefill_latencies = []
+        retraction_counts = []
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
@@ -969,15 +1039,43 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                queue_times.append(req.time_stats.get_queueing_time())
+                forward_entry_times.append(req.time_stats.forward_entry_time)
+
+                if req.time_stats.prefill_start_time > 0.0:
+                    prefill_delays.append(
+                        req.time_stats.prefill_start_time
+                        - req.time_stats.forward_entry_time
+                    )
+                else:
+                    prefill_delays.append(None)
+
+                if (
+                    req.time_stats.prefill_start_time > 0.0
+                    and req.time_stats.prefill_end_time > 0.0
+                ):
+                    prefill_latencies.append(
+                        req.time_stats.prefill_end_time
+                        - req.time_stats.prefill_start_time
+                    )
+                else:
+                    prefill_latencies.append(None)
+                retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
-                finished_reasons,
-                embeddings,
-                prompt_tokens,
-                cached_tokens,
-                rids=rids,
+                queue_time=queue_times,
+                forward_entry_time=forward_entry_times,
+                prefill_delay=prefill_delays,
+                prefill_latency=prefill_latencies,
+                finished_reasons=finished_reasons,
+                embeddings=embeddings,
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
                 http_worker_ipcs=http_worker_ipcs,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
+                retraction_counts=retraction_counts,
+                rids=rids,
             )
         )
