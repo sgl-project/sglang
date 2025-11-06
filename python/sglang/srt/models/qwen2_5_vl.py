@@ -170,6 +170,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        max_seqlen: int = None,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -182,6 +183,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            max_seqlen=max_seqlen,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -403,6 +405,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
             dtype=torch.int32,
         )
         cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+        max_cu_window_seqlens = cu_window_seqlens.max().item()
 
         # Move window_index to the same device as x before using it to index x
         window_index = window_index.to(device=x.device)
@@ -439,16 +442,19 @@ class Qwen2_5_VisionTransformer(nn.Module):
             ]
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
-
+        max_cu_seqlens = cu_seqlens.max().item()
         # transformers
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
+                max_cu_seqlens_now = max_cu_seqlens
             else:
                 cu_seqlens_now = cu_window_seqlens
+                max_cu_seqlens_now = max_cu_window_seqlens
             x = blk(
-                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
+                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings, 
+                max_seqlen=max_cu_seqlens_now,
             )
 
         # adapter

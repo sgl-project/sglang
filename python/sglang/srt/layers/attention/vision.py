@@ -256,6 +256,8 @@ class VisionTritonAttention(nn.Module):
         cu_seqlens: Optional[torch.Tensor],
         bsz: int,
         seq_len: int,
+        seq_lens: torch.Tensor = None,
+        max_seqlen: int = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -269,15 +271,17 @@ class VisionTritonAttention(nn.Module):
 
         # [b * s, head, head_size]
         output = torch.empty_like(q)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        if seq_lens is None:
+            seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).cuda()
+        if max_seqlen is None:
+            max_seqlen = seq_lens.max()
         context_attention_fwd(
             q,
             k,
             v,
             output,
-            cu_seqlens.cuda(),
-            seq_lens.cuda(),
+            cu_seqlens,
+            seq_lens,
             max_seqlen,
             is_causal=False,
         )
@@ -302,6 +306,7 @@ class VisionFlash3Attention(nn.Module):
         cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
         bsz: int,
         seq_len: int,
+        max_seqlen: int = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -318,11 +323,11 @@ class VisionFlash3Attention(nn.Module):
                     _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
                 )
             cu_seqlens = cu_seqlens.get_data()
-
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
-
+        if max_seqlen is None:
+            max_seqlen = seq_lens.max().item()
+            
         output = flash_attn_varlen_func(
             q,
             k,
@@ -570,6 +575,7 @@ class VisionAttention(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        max_seqlen: int = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -663,6 +669,7 @@ class VisionAttention(nn.Module):
             seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
+            max_seqlen=max_seqlen,
         )
 
         assert output.dim() == 3, output.shape
