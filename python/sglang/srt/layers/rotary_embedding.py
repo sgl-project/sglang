@@ -2714,6 +2714,8 @@ def apply_rotary_pos_emb_npu(
 
 if _is_npu:
     apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+if _is_cpu and _is_cpu_amx_available:
+    apply_rotary_pos_emb = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu
 else:
     apply_rotary_pos_emb = apply_rotary_pos_emb_native
 

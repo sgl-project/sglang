@@ -163,6 +163,105 @@ void rotary_embedding_neox_2D_kernel_impl(
 }
 
 template <typename scalar_t>
+void apply_rotary_pos_emb_kernel_impl(
+    scalar_t* __restrict__ query,
+    scalar_t* __restrict__ key,
+    float* __restrict__ cos,
+    float* __restrict__ sin,
+    int64_t query_stride_s,
+    int64_t key_stride_s,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_size,
+    int64_t num_tokens) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t bVecSize = bVec::size();
+  constexpr int64_t fVecSize = fVec::size();
+
+  int64_t embed_dim = head_size / 2;
+  bool flag = (embed_dim % bVecSize == 0);
+  int64_t loop_upper = flag ? embed_dim : embed_dim - bVecSize;
+
+  auto compute_loop = [&](int64_t token_head, float* cos_ptr, float* sin_ptr, scalar_t* qk) {
+    int64_t j = 0;
+    for (; j < loop_upper; j += bVecSize) {
+      int64_t rot_offset = j;
+      int64_t x_index = rot_offset;
+      int64_t y_index = embed_dim + rot_offset;
+
+      int64_t out_x = token_head + x_index;
+      int64_t out_y = token_head + y_index;
+
+      fVec _cos_x_0 = fVec::loadu(cos_ptr + x_index);
+      fVec _sin_x_0 = fVec::loadu(sin_ptr + x_index);
+      fVec _cos_x_1 = fVec::loadu(cos_ptr + x_index + fVecSize);
+      fVec _sin_x_1 = fVec::loadu(sin_ptr + x_index + fVecSize);
+
+      fVec _cos_y_0 = fVec::loadu(cos_ptr + y_index);
+      fVec _sin_y_0 = fVec::loadu(sin_ptr + y_index);
+      fVec _cos_y_1 = fVec::loadu(cos_ptr + y_index + fVecSize);
+      fVec _sin_y_1 = fVec::loadu(sin_ptr + y_index + fVecSize);
+
+      bVec _q_x = bVec::loadu(qk + out_x);
+      bVec _q_y = bVec::loadu(qk + out_y);
+      fVec _q_x_0, _q_x_1;
+      std::tie(_q_x_0, _q_x_1) = at::vec::convert_to_float(_q_x);
+      fVec _q_y_0, _q_y_1;
+      std::tie(_q_y_0, _q_y_1) = at::vec::convert_to_float(_q_y);
+
+      auto out1_0 = _q_x_0 * _cos_x_0 - _q_y_0 * _sin_x_0;
+      auto out1_1 = _q_x_1 * _cos_x_1 - _q_y_1 * _sin_x_1;
+      auto out1 = convert_from_float_ext<scalar_t>(out1_0, out1_1);
+      out1.store(qk + out_x);
+
+      auto out2_0 = _q_y_0 * _cos_y_0 + _q_x_0 * _sin_y_0;
+      auto out2_1 = _q_y_1 * _cos_y_1 + _q_x_1 * _sin_y_1;
+      auto out2 = convert_from_float_ext<scalar_t>(out2_0, out2_1);
+      out2.store(qk + out_y);
+    }
+    if (!flag) {
+      for (; j < embed_dim; ++j) {
+        int64_t x_index = j;
+        int64_t y_index = embed_dim + j;
+
+        int64_t out_x = token_head + x_index;
+        int64_t out_y = token_head + y_index;
+
+        float _cos_x = cos_ptr[x_index];
+        float _sin_x = sin_ptr[x_index];
+        float _cos_y = cos_ptr[y_index];
+        float _sin_y = sin_ptr[y_index];
+
+        float _q_x = qk[out_x];
+        float _q_y = qk[out_y];
+
+        qk[out_x] = _q_x * _cos_x - _q_y * _sin_x;
+        qk[out_y] = _q_y * _cos_y + _q_x * _sin_y;
+      }
+    }
+  };
+
+#pragma omp parallel for
+  for (int64_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
+    float* cos_ptr = cos + token_idx * head_size;
+    float* sin_ptr = sin + token_idx * head_size;
+
+    for (int64_t i = 0; i < num_heads; ++i) {
+      int64_t head_idx = i;
+      int64_t token_head = token_idx * query_stride_s + head_idx * head_size;
+      compute_loop(token_head, cos_ptr, sin_ptr, query);
+    }
+
+    for (int64_t i = 0; i < num_kv_heads; ++i) {
+      int64_t head_idx = i;
+      int64_t token_head = token_idx * key_stride_s + head_idx * head_size;
+      compute_loop(token_head, cos_ptr, sin_ptr, key);
+    }
+  }
+}
+
+template <typename scalar_t>
 void rotary_embedding_2D_kernel_impl(
     int64_t* __restrict__ positions,
     scalar_t* __restrict__ query,
@@ -343,4 +442,51 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     }
   });
   return std::make_tuple(query_out, key_out);
+}
+
+// query: [num_tokens, num_heads, head_size]
+// key: [num_tokens, num_heads, head_size]
+// cos: [num_tokens, head_size]
+// sin: [num_tokens, head_size]
+std::tuple<at::Tensor, at::Tensor>
+apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
+  RECORD_FUNCTION("sgl-kernel::apply_rotary_pos_emb_cpu", std::vector<c10::IValue>({query, key}));
+  CHECK_INPUT(query);
+  CHECK_INPUT(key);
+  CHECK_INPUT(cos);
+  CHECK_INPUT(sin);
+  CHECK_DIM(3, query);
+  CHECK_DIM(3, key);
+  CHECK_DIM(2, cos);
+  CHECK_DIM(2, sin);
+  const auto input_dtype = query.scalar_type();
+  int64_t num_tokens = query.size(0);
+  CHECK_EQ(num_tokens, key.size(0));
+  CHECK_EQ(num_tokens, cos.size(0));
+  CHECK_EQ(num_tokens, sin.size(0));
+  int64_t num_heads = query.size(1);
+  CHECK_EQ(num_heads, key.size(1));
+  int64_t head_size = query.size(2);
+  CHECK_EQ(head_size, key.size(2));
+  CHECK_EQ(head_size, cos.size(1));
+  CHECK_EQ(head_size, sin.size(1));
+  int64_t q_stride_s = query.stride(0);
+  int64_t k_stride_s = key.stride(0);
+  TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
+  TORCH_CHECK(cos.scalar_type() == at::kFloat, "expect cos to be float32, got ", cos.scalar_type());
+  TORCH_CHECK(sin.scalar_type() == at::kFloat, "expect sin to be float32, got ", sin.scalar_type());
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "apply_rotary_pos_emb_cpu", [&] {
+    apply_rotary_pos_emb_kernel_impl<scalar_t>(
+        query.data_ptr<scalar_t>(),
+        key.data_ptr<scalar_t>(),
+        cos.data_ptr<float>(),
+        sin.data_ptr<float>(),
+        q_stride_s,
+        k_stride_s,
+        num_heads,
+        num_heads,
+        head_size,
+        num_tokens);
+  });
+  return std::make_tuple(query, key);
 }

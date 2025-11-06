@@ -7,6 +7,7 @@ from utils import precision
 from sglang.srt.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
     RotaryEmbedding,
+    apply_rotary_pos_emb_native,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
@@ -175,6 +176,23 @@ class TestROPE(CustomTestCase):
                 num_q_heads,
                 num_kv_heads,
             )
+
+    def test_apply_rotary_pos_emb(self):
+        num_tokens = 1024
+        num_heads = 8
+        head_size = 72
+        query = torch.randn(num_tokens, num_heads, head_size).to(torch.bfloat16)
+        key = torch.randn(num_tokens, num_heads, head_size).to(torch.bfloat16)
+        cos = torch.rand(num_tokens, head_size).to(torch.float32)
+        sin = torch.rand(num_tokens, head_size).to(torch.float32)
+        query_clone = query.clone()
+        key_clone = key.clone()
+        q_out_ref, k_out_ref = apply_rotary_pos_emb_native(query, key, cos, sin)
+        q_out_sgl, k_out_sgl = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(
+            query_clone, key_clone, cos, sin
+        )
+        torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
