@@ -742,6 +742,8 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float, continue_
     """
     tic = time.perf_counter()
     success = True
+    passed_tests = []
+    failed_tests = []
 
     for i, file in enumerate(files):
         filename, estimated_time = file.name, file.estimated_time
@@ -779,10 +781,13 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float, continue_
                     flush=True,
                 )
                 success = False
+                failed_tests.append((filename, f"exit code {ret_code}"))
                 if not continue_on_error:
                     # Stop at first failure for PR tests
                     break
                 # Otherwise continue to next test for nightly tests
+            else:
+                passed_tests.append(filename)
         except TimeoutError:
             kill_process_tree(process.pid)
             time.sleep(5)
@@ -791,6 +796,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float, continue_
                 flush=True,
             )
             success = False
+            failed_tests.append((filename, f"timeout after {timeout_per_file}s"))
             if not continue_on_error:
                 # Stop at first timeout for PR tests
                 break
@@ -800,6 +806,20 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float, continue_
         print(f"Success. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
     else:
         print(f"Fail. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
+
+    # Print summary
+    print(f"\n{'='*60}", flush=True)
+    print(f"Test Summary: {len(passed_tests)}/{len(files)} passed", flush=True)
+    print(f"{'='*60}", flush=True)
+    if passed_tests:
+        print("✓ PASSED:", flush=True)
+        for test in passed_tests:
+            print(f"  {test}", flush=True)
+    if failed_tests:
+        print("\n✗ FAILED:", flush=True)
+        for test, reason in failed_tests:
+            print(f"  {test} ({reason})", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
     return 0 if success else -1
 
