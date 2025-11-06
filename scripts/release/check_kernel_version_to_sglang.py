@@ -67,8 +67,7 @@ def get_kernel_version_from_engine() -> str:
     # Find the assert_pkg_version call for sgl-kernel
     # Look for the pattern: assert_pkg_version("sgl-kernel", "version", ...)
     match = re.search(
-        r'assert_pkg_version\s*\(\s*"sgl-kernel"\s*,\s*"([^"]+)"',
-        content
+        r'assert_pkg_version\s*\(\s*"sgl-kernel"\s*,\s*"([^"]+)"', content
     )
     if not match:
         print("Error: Could not find sgl-kernel version in engine.py")
@@ -129,9 +128,7 @@ def main():
                 f"  - python/pyproject.toml: {pyproject_version} → {kernel_version}"
             )
         if kernel_version != engine_version:
-            mismatches.append(
-                f"  - engine.py: {engine_version} → {kernel_version}"
-            )
+            mismatches.append(f"  - engine.py: {engine_version} → {kernel_version}")
         if kernel_version != dockerfile_version:
             mismatches.append(
                 f"  - Dockerfile: {dockerfile_version} → {kernel_version}"
