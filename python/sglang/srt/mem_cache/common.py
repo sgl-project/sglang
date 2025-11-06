@@ -86,6 +86,7 @@ def write_cache_indices(
     req_to_token_pool: ReqToTokenPool,
 ):
     if support_triton(get_global_server_args().attention_backend):
+        
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
@@ -352,7 +353,7 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
+    if batch.tree_cache and batch.tree_cache.page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
