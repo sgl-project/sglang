@@ -6,6 +6,7 @@ Run with:
     python3 -m unittest e2e_response_api.backends.test_grpc_backend.TestGrpcBackend
 """
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -76,6 +77,65 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
     # - test_mcp_basic_tool_call_streaming
     # - test_mixed_mcp_and_function_tools (requires external MCP server)
     # - test_mixed_mcp_and_function_tools_streaming (requires external MCP server)
+    def test_structured_output_json_schema(self):
+        """Override with simpler schema for Llama model (complex schemas not well supported)."""
+        data = {
+            "model": self.model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": "Solve: 8x + 7 = -23. What is x?",
+                },
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "math_answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                    },
+                }
+            },
+        }
+
+        create_resp = self.make_request("/v1/responses", "POST", data)
+        self.assertEqual(create_resp.status_code, 200)
+
+        create_data = create_resp.json()
+        self.assertIn("id", create_data)
+        self.assertIn("output", create_data)
+        self.assertIn("text", create_data)
+
+        # Verify text format was echoed back correctly
+        self.assertIn("format", create_data["text"])
+        self.assertEqual(create_data["text"]["format"]["type"], "json_schema")
+        self.assertEqual(create_data["text"]["format"]["name"], "math_answer")
+        self.assertIn("schema", create_data["text"]["format"])
+
+        # Find the message output
+        output_text = next(
+            (
+                content.get("text", "")
+                for item in create_data.get("output", [])
+                if item.get("type") == "message"
+                for content in item.get("content", [])
+                if content.get("type") == "output_text"
+            ),
+            None,
+        )
+
+        self.assertIsNotNone(output_text, "No output_text found in response")
+        self.assertTrue(output_text.strip(), "output_text is empty")
+
+        # Parse JSON output
+        output_json = json.loads(output_text)
+
+        # Verify simple schema structure (just answer field)
+        self.assertIn("answer", output_json)
+        self.assertIsInstance(output_json["answer"], str)
+        self.assertTrue(output_json["answer"], "Answer is empty")
 
 
 class TestGrpcHarmonyBackend(
@@ -95,11 +155,12 @@ class TestGrpcHarmonyBackend(
             num_workers=1,
             tp_size=2,
             policy="round_robin",
+            worker_args=[
+                "--reasoning-parser=gpt-oss",
+            ],
             router_args=[
                 "--history-backend",
                 "memory",
-                "--reasoning-parser",
-                "gpt-oss",
             ],
         )
 

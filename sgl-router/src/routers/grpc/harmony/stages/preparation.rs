@@ -88,7 +88,7 @@ impl HarmonyPreparationStage {
 
         // Step 2: Build tool constraints
         let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
-            Self::generate_harmony_structural_tag(tools, &body_ref.tool_choice).map_err(|e| *e)?
+            Self::generate_tool_call_constraint(tools, &body_ref.tool_choice).map_err(|e| *e)?
         } else {
             None
         };
@@ -143,10 +143,10 @@ impl HarmonyPreparationStage {
         // Priority: structured output (text field) > tool constraints
         let tool_constraints = if let Some(text_config) = &request.text {
             // Structured output takes priority for Harmony models
-            Self::generate_structural_output_tag_for_harmony(text_config).map_err(|e| *e)?
+            Self::generate_text_format_constraint(text_config).map_err(|e| *e)?
         } else if !function_tools.is_empty() {
             // Fall back to tool constraints
-            Self::generate_harmony_structural_tag(&function_tools, &request.tool_choice)
+            Self::generate_tool_call_constraint(&function_tools, &request.tool_choice)
                 .map_err(|e| *e)?
         } else {
             None
@@ -178,7 +178,7 @@ impl HarmonyPreparationStage {
     ///
     /// Converts text.format to structural tag that constrains the final channel.
     /// Returns None if text.format is not specified or is "text".
-    fn generate_structural_output_tag_for_harmony(
+    fn generate_text_format_constraint(
         text_config: &crate::protocols::responses::TextConfig,
     ) -> Result<Option<(String, String)>, Box<Response>> {
         use crate::protocols::responses::TextFormat;
@@ -191,15 +191,13 @@ impl HarmonyPreparationStage {
             TextFormat::Text => Ok(None),
             TextFormat::JsonObject => {
                 // json_object mode - constrain final channel to produce valid JSON object
-                let tag = build_structural_tag_for_structured_output(
-                    &serde_json::json!({"type": "object"}),
-                )
-                .map_err(|e| Box::new(error::internal_error(e)))?;
+                let tag = build_text_format_structural_tag(&serde_json::json!({"type": "object"}))
+                    .map_err(|e| Box::new(error::internal_error(e)))?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
             TextFormat::JsonSchema { schema, .. } => {
                 // json_schema mode - constrain final channel to the provided schema
-                let tag = build_structural_tag_for_structured_output(schema)
+                let tag = build_text_format_structural_tag(schema)
                     .map_err(|e| Box::new(error::internal_error(e)))?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
@@ -210,7 +208,7 @@ impl HarmonyPreparationStage {
     ///
     /// Uses structural tags with `triggered_tags` format to force Harmony format output.
     /// This ensures the model outputs in Harmony format (with channels) even when constrained.
-    fn generate_harmony_structural_tag(
+    fn generate_tool_call_constraint(
         tools: &[Tool],
         tool_choice: &Option<ToolChoice>,
     ) -> Result<Option<(String, String)>, Box<Response>> {
@@ -220,16 +218,16 @@ impl HarmonyPreparationStage {
 
         match choice {
             ToolChoice::Function { function, .. } => {
-                let tag = Self::build_harmony_structural_tag(tools, Some(&function.name))?;
+                let tag = Self::build_tool_call_structural_tag(tools, Some(&function.name))?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
             ToolChoice::Value(ToolChoiceValue::Required) => {
-                let tag = Self::build_harmony_structural_tag(tools, None)?;
+                let tag = Self::build_tool_call_structural_tag(tools, None)?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
             ToolChoice::AllowedTools { mode, .. } => {
                 if mode == "required" {
-                    let tag = Self::build_harmony_structural_tag(tools, None)?;
+                    let tag = Self::build_tool_call_structural_tag(tools, None)?;
                     Ok(Some(("structural_tag".to_string(), tag)))
                 } else {
                     Ok(None)
@@ -240,7 +238,7 @@ impl HarmonyPreparationStage {
     }
 
     /// Build Harmony structural tag for tool calling constraints
-    fn build_harmony_structural_tag(
+    fn build_tool_call_structural_tag(
         tools: &[Tool],
         specific_function: Option<&str>,
     ) -> Result<String, Box<Response>> {
@@ -305,9 +303,7 @@ impl HarmonyPreparationStage {
 /// Creates a structural tag that applies JSON schema constraint to the final channel only,
 /// allowing the model to still produce proper Harmony format with channels.
 /// This is used for the Responses API text.format field (json_object or json_schema).
-pub fn build_structural_tag_for_structured_output(
-    schema: &serde_json::Value,
-) -> Result<String, String> {
+pub fn build_text_format_structural_tag(schema: &serde_json::Value) -> Result<String, String> {
     let structural_tag = json!({
         "format": {
             "type": "triggered_tags",
