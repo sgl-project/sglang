@@ -437,7 +437,8 @@ class MambaRadixCache(BasePrefixCache):
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        cache_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        token_ids = (req.origin_input_ids + req.output_ids)[:cache_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -448,11 +449,7 @@ class MambaRadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
-        mamba_value = (
-            self.req_to_token_pool.get_mamba_indices(req.req_pool_idx)
-            .unsqueeze(-1)
-            .clone()
-        )
+        mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
 
         if is_insert:
             new_prefix_len, mamba_exist = self.insert(
@@ -469,8 +466,11 @@ class MambaRadixCache(BasePrefixCache):
             )
             mamba_exist = True
 
-        self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=mamba_exist)
-        self.dec_lock_ref(req.last_node)
+        if req.req_pool_idx is not None:
+            self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=mamba_exist)
+            self.dec_lock_ref(req.last_node)
+        else:  # for abort case
+            self.req_to_token_pool.mamba_pool.free(mamba_value)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
