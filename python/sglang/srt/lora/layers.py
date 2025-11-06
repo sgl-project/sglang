@@ -337,8 +337,12 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 def get_lora_layer(
     layer: nn.Module, lora_backend: BaseLoRABackend
 ) -> BaseLayerWithLoRA:
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.lora_moe import FusedMoEWithLoRA
+
     supported_layer_types = {
         # the order matters
+        FusedMoE: FusedMoEWithLoRA,
         VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,
         QKVParallelLinear: QKVParallelLinearWithLoRA,
         MergedColumnParallelLinear: MergedColumnParallelLinearWithLoRA,
