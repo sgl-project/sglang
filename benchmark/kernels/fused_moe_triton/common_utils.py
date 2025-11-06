@@ -26,7 +26,7 @@ def calculate_shard_intermediate_size(
     assert tp_size % ep_size == 0
     moe_tp_size = tp_size // ep_size
     assert intermediate_size % moe_tp_size == 0
-    return intermediate_size // moe_tp_size
+    return 2 * intermediate_size // moe_tp_size
 
 
 def get_model_config(
