@@ -2,6 +2,7 @@ import asyncio
 import logging
 from typing import Optional
 
+import aiohttp
 import torch
 import uvicorn
 import zmq
@@ -141,9 +142,10 @@ class ImageEncoder:
             mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
         return mm_embedding
 
-    def mm_send(
+    async def mm_send(
         self,
         prefill_host,
+        prefill_url,
         embedding: torch.Tensor,
         mm_data: EmbeddingData,
         session_id=None,
@@ -163,10 +165,11 @@ class ImageEncoder:
         if prefill_host in self.send_to_prefill_sockets:
             socket = self.send_to_prefill_sockets[prefill_host]
         else:
+            embedding_port = await self.get_embedding_port(prefill_url)
             socket = get_zmq_socket(
                 self.context,
                 zmq.PUSH,
-                f"tcp://{prefill_host}:{self.server_args.embedding_port}",
+                f"tcp://{prefill_host}:{embedding_port}",
                 False,
             )
             self.send_to_prefill_sockets[prefill_host] = socket
@@ -184,16 +187,30 @@ class ImageEncoder:
         self.embedding_to_send[mm_data.req_id] = mm_data
         return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
 
-    async def send(self, req_id, prefill_host, session_id=None, buffer_address=None):
+    async def send(
+        self, req_id, prefill_host, prefill_url, session_id=None, buffer_address=None
+    ):
         mm_data: EmbeddingData = self.embedding_to_send[req_id]
-        self.mm_send(
+        await self.mm_send(
             prefill_host,
+            prefill_url,
             mm_data.embedding,
             mm_data,
             session_id,
             buffer_address,
         )
         del self.embedding_to_send[req_id]
+
+    async def get_embedding_port(self, prefill_url):
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=1800)
+        ) as session:
+            response = await session.post(
+                f"{prefill_url}/embedding_bootstrap",
+                json={"embedding_port": None},
+            )
+            response_json = await response.json()
+            return response_json["embedding_port"]
 
 
 app = FastAPI()
@@ -228,15 +245,18 @@ async def handle_encode_request(request: dict):
         await encoder.send(
             req_id=request["req_id"],
             prefill_host=request["bootstrap_host"],
+            prefill_url=request["prefill_url"],
         )
         return ORJSONResponse(content=None)
 
 
 @app.post("/send")
 async def handle_send_request(request: dict):
+    # mooncake backend
     await encoder.send(
         req_id=request["req_id"],
         prefill_host=request["bootstrap_host"],
+        prefill_url=request["prefill_url"],
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
     )
