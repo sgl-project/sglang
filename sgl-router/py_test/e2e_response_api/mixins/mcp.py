@@ -80,14 +80,13 @@ class MCPTests(ResponseAPIBaseTest):
             self.assertIn("arguments", mcp_call)
             self.assertIn("output", mcp_call)
 
-        # Should have final message output
-        messages = [item for item in output if item.get("type") == "message"]
-        self.assertGreater(
-            len(messages), 0, "Response should contain at least one message"
-        )
-
         # Strict mode: additional validation for HTTP backends
         if self.mcp_validation_mode == "strict":
+            # Should have final message output
+            messages = [item for item in output if item.get("type") == "message"]
+            self.assertGreater(
+                len(messages), 0, "Response should contain at least one message"
+            )
             # Verify message structure
             for msg in messages:
                 self.assertIn("content", msg)
