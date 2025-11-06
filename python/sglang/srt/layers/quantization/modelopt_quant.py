@@ -1455,8 +1455,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 logger.warning(f"w13_input_scale values: {w13_input_scale}")
                 logger.warning(f"Unique values: {torch.unique(w13_input_scale)}")
                 logger.warning(f"All equal? {torch.all(w13_input_scale == w13_input_scale[0])}")
-                #assert torch.all(w13_input_scale == w13_input_scale[0])
-                logger.warning("ISHAN: removed assert so this might break down the line lets see...")
+                if not torch.all(w13_input_scale == w13_input_scale[0]):
+                    logger.warning("This would have triggered an assert: w13_input_scale is not constant across experts, but continuing anyway.")
                 w13_input_scale = w13_input_scale[0]
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(torch.float32)
