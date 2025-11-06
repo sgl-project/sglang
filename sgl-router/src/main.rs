@@ -5,7 +5,7 @@ use sglang_router_rs::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig, RouterConfig,
-        RoutingMode, TokenizerCacheConfig,
+        RoutingMode, TokenizerCacheConfig, WorkerLoadLimitConfig,
     },
     core::ConnectionMode,
     metrics::PrometheusConfig,
@@ -258,6 +258,15 @@ struct CliArgs {
 
     #[arg(long, default_value = "/health")]
     health_check_endpoint: String,
+
+    #[arg(long, default_value_t = 1073741824)]
+    worker_load_limit_max_req: u32,
+
+    #[arg(long, default_value_t = 1073741824)]
+    worker_load_limit_max_waiting_reqs: u32,
+
+    #[arg(long, default_value_t = 1073741824)]
+    worker_load_limit_max_token: u32,
 
     #[arg(long, default_value_t = false)]
     enable_igw: bool,
@@ -574,6 +583,11 @@ impl CliArgs {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
+            })
+            .worker_load_limit_config(WorkerLoadLimitConfig {
+                max_req: self.worker_load_limit_max_req,
+                max_waiting_reqs: self.worker_load_limit_max_waiting_reqs,
+                max_token: self.worker_load_limit_max_token,
             })
             .tokenizer_cache(TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
