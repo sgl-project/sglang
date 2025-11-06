@@ -148,6 +148,7 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
                 2,
                 "--chunked-prefill-size",
                 256,
+                "--enable-multimodal",
             ],
         )
 
