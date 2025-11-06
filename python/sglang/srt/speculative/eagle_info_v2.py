@@ -23,11 +23,16 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import fast_topk, is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils.common import fast_topk, is_cuda, is_hip, is_npu, next_power_of_2
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -41,11 +46,8 @@ if is_cuda():
         top_k_renorm_prob,
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
-        verify_tree_greedy,
     )
     from sgl_kernel.top_k import fast_topk
-elif is_hip():
-    from sgl_kernel import verify_tree_greedy
 
 
 @triton.jit
@@ -78,7 +80,7 @@ def assign_draft_cache_locs_page_size_1(
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
-        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool
+        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size()
 
@@ -112,15 +114,15 @@ class EagleDraftInputV2Mixin:
                 extend_num_tokens,
             )
 
-        assign_req_to_token_pool[(bs,)](
+        assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             self.allocate_lens,
             new_allocate_lens,
             out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
+            bs,
         )
+
         self.allocate_lens = new_allocate_lens
 
         # FIXME(lsyin): make this sync optional
@@ -199,20 +201,14 @@ class EagleVerifyInputV2Mixin:
         bs = len(batch.req_pool_indices)
         batch.input_ids = self.draft_token
         device = batch.input_ids.device
-        batch.out_cache_loc = torch.empty(
-            (bs * self.draft_token_num,),
-            dtype=torch.int64,
+        batch.out_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=req_to_token_pool.req_to_token,
+            start_offset=batch.seq_lens,
+            end_offset=batch.seq_lens + self.draft_token_num,
+            batch_size=bs,
+            draft_token_num=self.draft_token_num,
             device=device,
-        )
-
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + self.draft_token_num,
-            batch.out_cache_loc,
-            req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
         )
 
         # Get a forward batch
@@ -258,11 +254,10 @@ class EagleVerifyInputV2Mixin:
         accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
-        if sampling_info.is_all_greedy:
+        if sampling_info.is_all_greedy or _is_npu:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
-
-            verify_tree_greedy(
+            predict, accept_index, accept_length = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
@@ -271,6 +266,7 @@ class EagleVerifyInputV2Mixin:
                 retrive_next_token=self.retrive_next_token,
                 retrive_next_sibling=self.retrive_next_sibling,
                 target_predict=target_predict,
+                topk=self.topk,
             )
         else:
             # Apply temperature and get target probs
@@ -294,9 +290,7 @@ class EagleVerifyInputV2Mixin:
                 ),
             )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
-
-            # This is currently not used
-            draft_probs = torch.empty_like(target_probs)
+            draft_probs = torch.zeros_like(target_probs)
 
             # coins for rejection sampling
             coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
@@ -338,7 +332,7 @@ class EagleVerifyInputV2Mixin:
         return predict, accept_length, accept_index
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def select_top_k_tokens_tmp(
     i: int,
     topk_p: torch.Tensor,
@@ -456,3 +450,50 @@ def assign_extend_cache_locs(
         tl.store(out_cache_ptr + save_offset, data, mask=mask)
         load_offset += BLOCK_SIZE
         save_offset += BLOCK_SIZE
+
+
+def assign_extend_cache_locs_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+    device,
+) -> torch.Tensor:
+    if _is_cuda or _is_hip:
+        out_cache_loc = torch.empty(
+            (batch_size * draft_token_num,),
+            dtype=torch.int64,
+            device=device,
+        )
+        assign_extend_cache_locs[(batch_size,)](
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+            next_power_of_2(batch_size),
+        )
+
+        return out_cache_loc
+
+    elif _is_npu:
+        import sgl_kernel_npu  # noqa: F401
+
+        out_cache_loc = torch.empty(
+            (batch_size * draft_token_num,),
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.ops.npu.cache_loc_update(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+        )
+        out_cache_loc = out_cache_loc.to(dtype=torch.int64)
+
+        return out_cache_loc

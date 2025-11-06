@@ -41,6 +41,10 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             mini_lb = MiniLoadBalancer(router_args)
             mini_lb.start()
         else:
+            # TODO: support tracing for router(Rust).
+            del router_args.enable_trace
+            del router_args.otlp_traces_endpoint
+
             if Router is None:
                 raise RuntimeError("Rust Router is not installed")
             router_args._validate_router_args()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -18,12 +18,8 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.utils import get_int_env_var
 
-try:
-    from mooncake.mooncake_ep_buffer import Buffer
-
-    use_mooncake_ep = True
-except ImportError:
-    use_mooncake_ep = False
+if TYPE_CHECKING:
+    from sglang.srt.single_batch_overlap import CombineOverlapArgs
 
 from enum import Enum, auto
 
@@ -83,6 +79,9 @@ class EPBuffer:
         if cls._buffer is not None:
             return cls._buffer
 
+        # Lazy import Buffer to avoid creating CUDA context at module import time
+        from mooncake.mooncake_ep_buffer import Buffer
+
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
@@ -119,7 +118,9 @@ class _MooncakeEPDispatcherImpl:
         return_recv_hook: bool,
         deepep_mode: DeepEPMode,
     ):
-        if not use_mooncake_ep:
+        try:
+            from mooncake.mooncake_ep_buffer import Buffer  # noqa: F401
+        except ImportError:
             raise ImportError(
                 "Mooncake EP is not installed. Please install Mooncake package at "
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "
@@ -234,13 +235,14 @@ class _MooncakeEPDispatcherImpl:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_ids,
             topk_weights,
         )
-        return hidden_states, event, hook
+        return hidden_states, event, hook, overlap_args
 
     def combine_b(self, hidden_states, event, hook):
         hook() if self.return_recv_hook else event.current_stream_wait()
@@ -342,23 +344,27 @@ class MooncakeEPDispatcher(BaseDispatcher):
         del self._dispatch_intermediate_state
         return self._get_impl().dispatch_b(*inner_state)
 
-    def combine(self, *args, **kwargs) -> Tuple:
-        self.combine_a(*args, **kwargs)
+    def combine(
+        self,
+        combine_input: CombineInput,
+        overlap_args: Optional[CombineOverlapArgs] = None,
+    ) -> Tuple:
+        self.combine_a(combine_input, overlap_args)
         ret = self.combine_b()
         return ret
 
     def combine_a(
         self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        overlap_args: Optional = None,
+        combine_input: CombineInput,
+        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
+        hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            overlap_args=overlap_args,
         )
         self._combine_intermediate_state = inner_state
 

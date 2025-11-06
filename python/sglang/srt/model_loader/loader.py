@@ -387,6 +387,10 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns = ["*.pt"]
         elif load_format == LoadFormat.NPCACHE:
             allow_patterns = ["*.bin"]
+        elif load_format == LoadFormat.DUMMY:
+            raise ValueError(
+                f"DUMMY load_format should use DummyModelLoader and not call _prepare_weights"
+            )
         else:
             raise ValueError(f"Unknown load_format: {load_format}")
 
@@ -2049,6 +2053,9 @@ def get_model_loader(
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
 
+    if load_config.load_format == LoadFormat.DUMMY:
+        return DummyModelLoader(load_config)
+
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
         or model_config.quantization in ["modelopt_fp8", "modelopt_fp4", "modelopt"]
@@ -2074,9 +2081,6 @@ def get_model_loader(
 
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
-
-    if load_config.load_format == LoadFormat.DUMMY:
-        return DummyModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)

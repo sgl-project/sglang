@@ -18,6 +18,21 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from sglang_router.router_args import RouterArgs
 
+try:
+    from sglang.srt.tracing.trace import (
+        process_tracing_init,
+        trace_get_remote_propagate_context,
+        trace_req_finish,
+        trace_req_start,
+        trace_set_thread_info,
+        trace_slice_end,
+        trace_slice_start,
+    )
+
+    trace_package_imported = True
+except ImportError:
+    trace_package_imported = False
+
 logger = logging.getLogger(__name__)
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
@@ -46,6 +61,13 @@ class MiniLoadBalancer:
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
+        self.otlp_traces_endpoint = router_args.otlp_traces_endpoint
+        self.enable_trace = router_args.enable_trace
+        if self.enable_trace and not trace_package_imported:
+            logger.warning(
+                "Tracing is not supported in this environment. Please install sglang."
+            )
+            self.enable_trace = False
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -68,6 +90,9 @@ class MiniLoadBalancer:
     def start(self):
         global lb
         lb = self
+        if self.enable_trace:
+            process_tracing_init(self.otlp_traces_endpoint, "sglang")
+            trace_set_thread_info("Mini lb")
         uvicorn.run(app, host=self.host, port=self.port)
 
     def select_pair(self):
@@ -91,10 +116,32 @@ class MiniLoadBalancer:
                 total=self.timeout
             )  # Add timeout for request reliability
         ) as session:
+            headers = {}
+            bootstrap_room_list = []
+            if self.enable_trace:
+                bootstrap_room_list = (
+                    modified_request["bootstrap_room"]
+                    if isinstance(modified_request["bootstrap_room"], list)
+                    else [modified_request["bootstrap_room"]]
+                )
+                trace_context = trace_get_remote_propagate_context(bootstrap_room_list)
+                headers = {"trace_context": trace_context}
+
             tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                session.post(f"{decode_server}/{endpoint}", json=modified_request),
+                session.post(
+                    f"{prefill_server}/{endpoint}",
+                    json=modified_request,
+                    headers=headers,
+                ),
+                session.post(
+                    f"{decode_server}/{endpoint}",
+                    json=modified_request,
+                    headers=headers,
+                ),
             ]
+
+            for bootstrap_room in bootstrap_room_list:
+                trace_slice_end("mini_lb_launch", bootstrap_room, auto_next_anon=True)
 
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
@@ -114,6 +161,14 @@ class MiniLoadBalancer:
             else:
                 ret_json = await decode_response.json()
 
+            for bootstrap_room in bootstrap_room_list:
+                trace_slice_end(
+                    "wait_PD_finish",
+                    bootstrap_room,
+                    thread_finish_flag=True,
+                )
+                trace_req_finish(bootstrap_room)
+
             return ORJSONResponse(
                 content=ret_json,
                 status_code=decode_response.status,
@@ -131,10 +186,36 @@ class MiniLoadBalancer:
                 )  # Add timeout for request reliability
             ) as session:
                 # Create the tasks for both prefill and decode requests
+                headers = {}
+                bootstrap_room_list = []
+                if self.enable_trace:
+                    bootstrap_room_list = (
+                        modified_request["bootstrap_room"]
+                        if isinstance(modified_request["bootstrap_room"], list)
+                        else [modified_request["bootstrap_room"]]
+                    )
+                    trace_context = trace_get_remote_propagate_context(
+                        bootstrap_room_list
+                    )
+                    headers = {"trace_context": trace_context}
+
                 tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
+                    session.post(
+                        f"{prefill_server}/{endpoint}",
+                        json=modified_request,
+                        headers=headers,
+                    ),
+                    session.post(
+                        f"{decode_server}/{endpoint}",
+                        json=modified_request,
+                        headers=headers,
+                    ),
                 ]
+
+                for bootstrap_room in bootstrap_room_list:
+                    trace_slice_end(
+                        "mini_lb_launch", bootstrap_room, auto_next_anon=True
+                    )
                 # Wait for both responses to complete. Since this is streaming, they return immediately.
                 prefill_response, decode_response = await asyncio.gather(*tasks)
 
@@ -173,6 +254,14 @@ class MiniLoadBalancer:
                         AIOHTTP_STREAM_READ_CHUNK_SIZE
                     ):
                         yield chunk
+
+            for bootstrap_room in bootstrap_room_list:
+                trace_slice_end(
+                    "wait_PD_finish",
+                    bootstrap_room,
+                    thread_finish_flag=True,
+                )
+                trace_req_finish(bootstrap_room)
 
         return StreamingResponse(
             stream_results(),
@@ -367,7 +456,11 @@ async def handle_completion_request(request_data: dict):
 
 
 def _generate_bootstrap_room():
-    return random.randint(0, 2**63 - 1)
+    bootstrap_room = random.randint(0, 2**63 - 1)
+    if lb.enable_trace:
+        trace_req_start(bootstrap_room, bootstrap_room, role="router")
+        trace_slice_start("mini_lb_launch", bootstrap_room)
+    return bootstrap_room
 
 
 # We may utilize `GenerateReqInput`'s logic later

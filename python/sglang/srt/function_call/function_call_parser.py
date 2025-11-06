@@ -8,6 +8,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCallConstraint,
     ToolChoice,
 )
+from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -16,6 +17,7 @@ from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -49,6 +51,7 @@ class FunctionCallParser:
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "step3": Step3Detector,
+        "minimax-m2": MinimaxM2Detector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
@@ -60,6 +63,7 @@ class FunctionCallParser:
 
         self.detector = detector
         self.tools = tools
+        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -140,7 +144,10 @@ class FunctionCallParser:
             info = get_structure_info(name)
 
             # accept all if not strict, otherwise only accept the schema
-            schema = function.parameters if function.strict else {}
+            is_strict = (
+                function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
+            )
+            schema = function.parameters if is_strict else {}
 
             tool_structures.append(
                 StructuresResponseFormat(
@@ -178,7 +185,10 @@ class FunctionCallParser:
         if (
             self.detector.supports_structural_tag()
             and tool_choice == "auto"
-            and any(tool.function.strict for tool in self.tools)
+            and (
+                any(tool.function.strict for tool in self.tools)
+                or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+            )
         ):
             tag = self.get_structure_tag()
             return ("structural_tag", tag)

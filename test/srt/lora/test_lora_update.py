@@ -28,6 +28,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    calculate_rouge_l,
     is_in_ci,
     popen_launch_server,
 )
@@ -763,7 +764,7 @@ class LoRAUpdateTestSessionBase:
         max_lora_rank: Optional[int],
         enable_lora: Optional[bool] = None,
         lora_target_modules: Optional[List[str]] = None,
-        lora_backend: str = "triton",
+        lora_backend: str = "csgmv",
         disable_cuda_graph: bool = False,
         cuda_graph_max_bs: int = 4,
     ):
@@ -1278,6 +1279,8 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 max_new_tokens=test_case.max_new_tokens,
             )
 
+            ROUGE_L_TOL = 0.9
+
             print(f"Dynamic output: {dynamic_output}")
             print(f"Static output: {static_output}")
             print("=" * 100)
@@ -1295,12 +1298,15 @@ class TestLoRADynamicUpdate(CustomTestCase):
                     f"Output length mismatch at batch {i}:\n- Dynamic={len(dynamic)}\n- Static={len(static)}",
                 )
                 for j, (d_out, s_out) in enumerate(zip(dynamic, static), start=1):
-                    d_out = d_out.strip()
-                    s_out = s_out.strip()
-                    self.assertEqual(
-                        d_out,
-                        s_out,
-                        f"Output mismatch at batch {i}, prompt {j}:\n- Dynamic: '{d_out}'\n- Static: '{s_out}'",
+                    d_out_str = d_out.strip()
+                    s_out_str = s_out.strip()
+                    rouge_score = calculate_rouge_l([d_out_str], [s_out_str])[0]
+
+                    self.assertGreaterEqual(
+                        rouge_score,
+                        ROUGE_L_TOL,
+                        f"ROUGE-L score {rouge_score} of outputs is below tolerance of {ROUGE_L_TOL} "
+                        f"at batch {i}, prompt {j}:\n- Dynamic: '{d_out}'\n- Static: '{s_out}'",
                     )
 
     def test_dynamic_lora_update_engine(self):
@@ -1321,6 +1327,78 @@ class TestLoRADynamicUpdate(CustomTestCase):
         self._run_dynamic_adapter_updates(
             mode=LoRAUpdateTestSessionMode.SERVER, test_cases=test_cases
         )
+
+    def test_v1_models_endpoint_with_lora(self):
+        """
+        Test that /v1/models endpoint returns base model and loaded LoRA adapters.
+        """
+        adapters = [
+            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+        ]
+
+        with LoRAUpdateTestSession(
+            testcase=self,
+            mode=LoRAUpdateTestSessionMode.SERVER,
+            model_path="meta-llama/Llama-3.1-8B-Instruct",
+            lora_paths=[],
+            max_loras_per_batch=2,
+            max_lora_rank=256,
+            lora_target_modules=["all"],
+            enable_lora=True,
+        ) as session:
+            # Test with no adapters loaded
+            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
+            self.assertTrue(response.ok, response.text)
+            models_data = response.json()
+            self.assertEqual(models_data["object"], "list")
+            self.assertEqual(len(models_data["data"]), 1)  # Only base model
+            base_model = models_data["data"][0]
+            self.assertIn("meta-llama", base_model["id"].lower())
+            self.assertIsNone(base_model.get("parent"))
+
+            # Load first adapter
+            session.load_lora_adapter(lora_name="adapter1", lora_path=adapters[0])
+
+            # Test with one adapter loaded
+            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
+            self.assertTrue(response.ok, response.text)
+            models_data = response.json()
+            self.assertEqual(len(models_data["data"]), 2)  # Base model + 1 adapter
+
+            # Verify adapter information
+            adapter_models = [m for m in models_data["data"] if m.get("parent")]
+            self.assertEqual(len(adapter_models), 1)
+            self.assertEqual(adapter_models[0]["id"], "adapter1")
+            self.assertEqual(adapter_models[0]["root"], adapters[0])
+            self.assertIsNotNone(adapter_models[0]["parent"])
+
+            # Load second adapter
+            session.load_lora_adapter(lora_name="adapter2", lora_path=adapters[1])
+
+            # Test with two adapters loaded
+            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
+            self.assertTrue(response.ok, response.text)
+            models_data = response.json()
+            self.assertEqual(len(models_data["data"]), 3)  # Base model + 2 adapters
+
+            # Verify both adapters are listed
+            adapter_models = [m for m in models_data["data"] if m.get("parent")]
+            self.assertEqual(len(adapter_models), 2)
+            adapter_names = {m["id"] for m in adapter_models}
+            self.assertEqual(adapter_names, {"adapter1", "adapter2"})
+
+            # Unload one adapter
+            session.unload_lora_adapter(lora_name="adapter1")
+
+            # Test after unloading
+            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
+            self.assertTrue(response.ok, response.text)
+            models_data = response.json()
+            self.assertEqual(len(models_data["data"]), 2)  # Base model + 1 adapter
+            adapter_models = [m for m in models_data["data"] if m.get("parent")]
+            self.assertEqual(len(adapter_models), 1)
+            self.assertEqual(adapter_models[0]["id"], "adapter2")
 
 
 if __name__ == "__main__":

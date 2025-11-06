@@ -9,10 +9,10 @@ use super::{
     RouterTrait,
 };
 use crate::{
+    app_context::AppContext,
     config::{PolicyConfig, RoutingMode},
     core::ConnectionMode,
     policies::PolicyFactory,
-    server::AppContext,
 };
 
 /// Factory for creating router instances based on configuration
@@ -127,14 +127,7 @@ impl RouterFactory {
             return Err("OpenAI mode requires at least one worker URL".to_string());
         }
 
-        let router = OpenAIRouter::new(
-            worker_urls,
-            Some(ctx.router_config.circuit_breaker.clone()),
-            ctx.response_storage.clone(),
-            ctx.conversation_storage.clone(),
-            ctx.conversation_item_storage.clone(),
-        )
-        .await?;
+        let router = OpenAIRouter::new(worker_urls, ctx).await?;
 
         Ok(Box::new(router))
     }

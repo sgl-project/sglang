@@ -840,12 +840,9 @@ class AWQMoEMethod(FusedMoEMethodBase):
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
-        # The input must currently be float16
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-
         orig_dtype = x.dtype
-        x = x.half()
 
         topk_weights, topk_ids, router_logits = topk_output
 

@@ -46,7 +46,7 @@ jobs:
           docker build \
             ${PR_REPO:+--build-arg SG_LANG_REPO=$PR_REPO} \
             ${PR_HEAD_REF:+--build-arg SG_LANG_BRANCH=$PR_HEAD_REF} \
-            --no-cache --progress=plain -f docker/Dockerfile.xpu -t xpu_sglang_main:bmg .
+            --no-cache --progress=plain -f docker/xpu.Dockerfile -t xpu_sglang_main:bmg .
 
       - name: Run container
         id: start_container

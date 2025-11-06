@@ -705,8 +705,9 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         threadpool_count,
         amx_weight_path,
         chunked_prefill_size,
+        max_deferred_experts_per_token,
+        total_num_hidden_layers,
     ):
-
         if not KTRANSFORMERS_AVAILABLE:
             raise ImportError(
                 "kt_kernel is not installed, to use CompressedTensorsWNA16AMXEPMoEMethod, please install kt_kernel."
@@ -723,6 +724,8 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         self.cpuinfer = cpuinfer
         self.threadpool_count = threadpool_count
         self.amx_wrapper = None
+        self.max_deferred_experts_per_token = max_deferred_experts_per_token
+        self.total_num_hidden_layers = total_num_hidden_layers
 
     def create_weights(
         self,
@@ -733,6 +736,13 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        layer_max_deferred = self.max_deferred_experts_per_token or 0
+        if (
+            self.max_deferred_experts_per_token is not None
+            and self.total_num_hidden_layers is not None
+            and self.layer_idx == self.total_num_hidden_layers - 1
+        ):
+            layer_max_deferred = 0
         self.experts_num = num_experts
         self.num_experts_per_tok = extra_weight_attrs.pop("top_k")
         self.hidden_size = hidden_size
@@ -751,6 +761,8 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
             threadpool_count=self.threadpool_count,
             amx_weight_path=self.amx_weight_path,
             chunked_prefill_size=self.chunked_prefill_size,
+            max_deferred_experts_per_token=layer_max_deferred,
+            amx_method=envs.SGLANG_KT_AMX_METHOD.value,
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -847,6 +859,8 @@ def override_config(
     amx_weight_path,
     amx_method,
     chunked_prefill_size,
+    max_deferred_experts_per_token,
+    num_hidden_layers,
 ):
     """Override MOE configuration via environment variables."""
     # Set environment variables using envs utility class
@@ -862,6 +876,12 @@ def override_config(
         envs.SGLANG_KT_AMX_METHOD.set(amx_method)
     if chunked_prefill_size is not None:
         envs.SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE.set(chunked_prefill_size)
+    envs.SGLANG_KT_MOE_MAX_DEFERRED_EXPERTS_PER_TOKEN.set(
+        max_deferred_experts_per_token
+    )
+    envs.SGLANG_KT_MOE_TOTAL_LAYERS.set(num_hidden_layers)
+    cls.max_deferred_experts_per_token = max_deferred_experts_per_token
+    cls.total_num_hidden_layers = num_hidden_layers
 
 
 class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
@@ -886,6 +906,8 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
         threadpool_count = envs.SGLANG_KT_THREADPOOL_COUNT.value
         amx_weight_path = envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.value
         chunked_prefill_size = envs.SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE.value
+        max_deferred = envs.SGLANG_KT_MOE_MAX_DEFERRED_EXPERTS_PER_TOKEN.value
+        total_layers = envs.SGLANG_KT_MOE_TOTAL_LAYERS.value
 
         self.AMX_method = CompressedTensorsWNA16AMXMoEMethod(
             quant_config,
@@ -895,6 +917,8 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
             threadpool_count,
             amx_weight_path,
             chunked_prefill_size,
+            max_deferred_experts_per_token=max_deferred,
+            total_num_hidden_layers=total_layers,
         )
         self.marlin_method = CompressedTensorsWNA16MoEMethod(
             quant_config, self.num_gpu_experts
