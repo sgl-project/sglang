@@ -3,13 +3,13 @@
 import asyncio
 import base64
 import subprocess
+import tempfile
 import time
 import unittest
-from pathlib import Path
-import tempfile
 import uuid
-from urllib.request import urlopen
 from contextlib import contextmanager
+from pathlib import Path
+from urllib.request import urlopen
 
 from openai import OpenAI
 
@@ -124,6 +124,7 @@ class TestVideoHttpServer(unittest.TestCase):
 
         asyncio.run(send_concurrent_requests())
 
+
 class TestImage2VideoHttpServer(unittest.TestCase):
     model_name = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
     timeout = 1200
@@ -134,7 +135,9 @@ class TestImage2VideoHttpServer(unittest.TestCase):
     ) -> bytes:
 
         image_url = "https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true"
-        with downloaded_temp_file(image_url, prefix="i2v_input_", suffix=".jpg") as tmp_path:
+        with downloaded_temp_file(
+            image_url, prefix="i2v_input_", suffix=".jpg"
+        ) as tmp_path:
             video = client.videos.create(
                 prompt=prompt,
                 input_reference=tmp_path,

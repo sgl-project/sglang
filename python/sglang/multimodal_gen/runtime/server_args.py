@@ -807,10 +807,12 @@ class ServerArgs:
             logger.info(
                 f"Ring degree not set, " f"using default value {self.ring_degree}"
             )
-        
+
         if self.ring_degree > 1:
             if self.attention_backend != None and self.attention_backend != "fa3":
-                raise ValueError("Ring Attention is only supported for fa3 backend for now")
+                raise ValueError(
+                    "Ring Attention is only supported for fa3 backend for now"
+                )
             else:
                 self.attention_backend = "fa3"
                 logger.info(
