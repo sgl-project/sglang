@@ -36,6 +36,7 @@ class TestOpenaiBackend(
     """End to end tests for OpenAI backend."""
 
     api_key = os.environ.get("OPENAI_API_KEY")
+    mcp_validation_mode = "strict"  # Enable strict validation for HTTP backend
 
     @classmethod
     def setUpClass(cls):
