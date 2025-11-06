@@ -328,7 +328,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if self.server_args.mm_transfer_backend == "mooncake":
                 self.embeddings_engine = MooncakeTransferEngine(
                     hostname=get_local_ip_auto(),
-                    gpu_id=0,
+                    gpu_id=None,
                     ib_device=server_args.disaggregation_ib_device,
                 )
                 self.embeddings_buffer = dict()
