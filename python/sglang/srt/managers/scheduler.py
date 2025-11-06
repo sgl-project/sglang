@@ -972,6 +972,14 @@ class Scheduler(
 
             self.last_batch = batch
 
+            # Profiler step (scheduled) if enabled
+            prof = getattr(self, "_profiler", None)
+            if prof is not None:
+                try:
+                    prof.step()
+                except Exception:
+                    pass
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
@@ -1002,6 +1010,14 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
                 self._check_runtime_mem_leak()
+
+            # Profiler step (scheduled) if enabled
+            prof = getattr(self, "_profiler", None)
+            if prof is not None:
+                try:
+                    prof.step()
+                except Exception:
+                    pass
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
@@ -2762,6 +2778,47 @@ def run_scheduler_process(
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
 
+    # Start a scheduled PyTorch profiler in the scheduler (GPU) process
+    prof = None
+    try:  # keep failures non-fatal
+        import logging
+
+        import torch  # type: ignore
+        from torch.profiler import ProfilerActivity, profile, schedule  # type: ignore
+
+        activities = [ProfilerActivity.CPU]
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+
+        dp_s = dp_rank if dp_rank is not None else 0
+        trace_path = f"torch_trace_scheduler_dp{dp_s}_tp{tp_rank}_ep{moe_ep_rank}_pp{pp_rank}_gpu{gpu_id}.json"
+
+        def _export_callback(p):
+            try:
+                p.export_chrome_trace(trace_path)
+                logging.info(f"Scheduler profiler trace written to {trace_path}")
+            except Exception:
+                logging.exception("Scheduler profiler export_chrome_trace() failed")
+
+        prof = profile(
+            activities=activities,
+            schedule=schedule(wait=5, warmup=5, active=20, repeat=1),
+            on_trace_ready=_export_callback,
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=False,
+        )
+
+        act_str = "CPU+CUDA" if (len(activities) > 1) else "CPU"
+        logging.info(
+            f"Starting scheduler torch profiler with schedule(wait=5,warmup=5,active=20), output {trace_path} (activities={act_str})"
+        )
+        prof.start()
+    except Exception:
+        import logging as _logging
+
+        _logging.exception("Failed to start scheduler torch profiler")
+
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(
@@ -2791,6 +2848,12 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
+        # Attach profiler to the created scheduler instance (same thread)
+        if prof is not None:
+            try:
+                scheduler._profiler = prof
+            except Exception:
+                logger.exception("Failed to attach profiler to scheduler instance")
         pipe_writer.send(
             {
                 "status": "ready",
