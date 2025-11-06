@@ -167,7 +167,9 @@ class DecodeKVCacheOffloadManager:
                     prefill_offloaded_len,
                 ) = self.ongoing_offload.pop(ack_id)
 
-                self._release_finished_req(req, prefill_offloaded_len)
+                self.tree_cache.release_decode_offload_finished_req(
+                    req, prefill_offloaded_len
+                )
                 self._trigger_backup(
                     req,
                     host_indices,
@@ -176,17 +178,6 @@ class DecodeKVCacheOffloadManager:
                     prefill_offloaded_len,
                 )
             finish_count -= 1
-
-    def _release_finished_req(self, req, prefill_offloaded_len):
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx,
-            : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
-        ]
-
-        # Free the incremental part of the request
-        self.token_to_kv_pool_allocator.free(kv_indices[prefill_offloaded_len:])
-        self.req_to_token_pool.free(req.req_pool_idx)
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
 
     def _check_backup_progress(self, finish_count):
         """Check the progress of backup from host to storage."""

@@ -51,6 +51,16 @@ class ChunkCache(BasePrefixCache):
             last_host_node=None,
         )
 
+    def release_decode_offload_finished_req(self, req: Req, prefill_offloaded_len: int):
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx,
+            : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
+        ]
+        # Free the incremental part of the request
+        self.token_to_kv_pool_allocator.free(kv_indices[prefill_offloaded_len:])
+        self.req_to_token_pool.free(req.req_pool_idx)
+        self.tree_cache.protected_size_ -= len(req.prefix_indices)
+
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx,
