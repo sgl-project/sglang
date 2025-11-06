@@ -35,7 +35,7 @@ uv pip install --prerelease=allow  -e "python/.[diffusion]"
 
 ## Method 3: Using Docker
 
-The Docker images are available on Docker Hub at [lmsysorg/sgl-diffusion](), built from the [Dockerfile](https://github.com/sgl-project/sgl-diffusion/tree/main/docker).
+The Docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from the [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker/Dockerfile.diffusion).
 Replace `<secret>` below with your HuggingFace Hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash
