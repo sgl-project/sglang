@@ -196,9 +196,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else server_args.speculative_num_draft_tokens
         )
 
-        # Initialize tokenizer and processor
         set_global_server_args_for_tokenizer(server_args)
 
+        # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
             try:
@@ -370,6 +370,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if self.server_args.gc_warning_threshold_secs > 0.0:
             configure_gc_warning(self.server_args.gc_warning_threshold_secs)
 
+        # Dispatcher and communicators
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (
@@ -387,15 +388,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
                 ),
-                (
-                    FreezeGCReq,
-                    lambda x: None,
-                ),
+                (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
             ]
         )
-
         self.init_communicators(server_args)
 
     async def generate_request(
@@ -407,9 +404,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        if request:
-            if "trace_context" in request.headers:
-                trace_set_remote_propagate_context(request.headers["trace_context"])
+        if request and "trace_context" in request.headers:
+            trace_set_remote_propagate_context(request.headers["trace_context"])
 
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
