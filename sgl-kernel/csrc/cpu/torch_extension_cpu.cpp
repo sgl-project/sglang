@@ -29,7 +29,6 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input);
 
 // l2norm
 at::Tensor l2norm_cpu(at::Tensor& input, double eps);
-at::Tensor qwen3_next_l2norm_cpu(at::Tensor& input, double eps);
 
 // rmsnorm
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);

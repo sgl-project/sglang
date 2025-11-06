@@ -36,12 +36,6 @@ class TestNorm(CustomTestCase):
         else:
             return x, residual
 
-    def _qwen3_next_l2norm(
-        self, x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6
-    ):
-        inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-        return x * inv_norm
-
     def _norm_test(self, m, n, dtype):
 
         x = torch.randn([m, n], dtype=dtype)
@@ -84,32 +78,11 @@ class TestNorm(CustomTestCase):
         atol = rtol = precision[ref_out.dtype]
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
-    def _qwen3_next_l2norm_test(self, m, n, dtype):
-
-        x = torch.randn([m, n], dtype=dtype)
-        variance_epsilon = 1e-6
-
-        out = torch.ops.sgl_kernel.qwen3_next_l2norm_cpu(x, variance_epsilon)
-        ref_out = self._qwen3_next_l2norm(x, eps=variance_epsilon)
-
-        atol = rtol = precision[ref_out.dtype]
-        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
-
-        x = torch.randn([1, 2, m, n], dtype=dtype)
-        variance_epsilon = 1e-6
-
-        out = torch.ops.sgl_kernel.qwen3_next_l2norm_cpu(x, variance_epsilon)
-        ref_out = self._qwen3_next_l2norm(x, eps=variance_epsilon)
-
-        atol = rtol = precision[ref_out.dtype]
-        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
-
     def test_norm(self):
         for params in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=params[0], n=params[1], dtype=params[2]):
                 self._norm_test(*params)
                 self._l2norm_test(*params)
-                self._qwen3_next_l2norm_test(*params)
 
 
 class TestFusedRMSNormGated(CustomTestCase):
