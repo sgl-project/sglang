@@ -85,6 +85,14 @@ class TestXaiBackend(StateManagementTests):
     def tearDownClass(cls):
         kill_process_tree(cls.cluster["router"].pid)
 
+    def test_mcp_basic_tool_call(self):
+        """Test basic MCP tool call (non-streaming) with strict validation."""
+        super().test_mcp_basic_tool_call(mode="strict")
+
+    def test_mcp_basic_tool_call_streaming(self):
+        """Test basic MCP tool call (streaming) with strict validation."""
+        super().test_mcp_basic_tool_call_streaming(mode="strict")
+
 
 if __name__ == "__main__":
     unittest.main()
