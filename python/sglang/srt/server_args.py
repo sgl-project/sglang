@@ -1469,6 +1469,10 @@ class ServerArgs:
                 self.hicache_mem_layout = "page_first_kv_split"
             else:
                 self.hicache_mem_layout = "page_first_direct"
+            logger.warning(
+                f"Ascend NPU Platform detected, change `hicache_io_backend` to `kernel_ascend` and "
+                f"`hicache_mem_layout` to `{self.hicache_mem_layout}`"
+            )
 
     def _handle_speculative_decoding(self):
         if self.speculative_algorithm == "NEXTN":
