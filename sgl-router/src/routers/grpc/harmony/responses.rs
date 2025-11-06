@@ -548,9 +548,9 @@ async fn execute_without_mcp_loop(
             );
 
             Ok(build_tool_response(
-                vec![],      // No MCP tools (no MCP server available)
-                vec![],      // No MCP results
-                tool_calls,  // All as function tools needing caller execution
+                vec![],
+                vec![],
+                tool_calls,
                 analysis,
                 partial_text,
                 usage,
@@ -862,7 +862,9 @@ async fn execute_mcp_tool_loop_streaming(
 
                 // Execute MCP tools (if any)
                 let mcp_results = if !mcp_tool_calls.is_empty() {
-                    match execute_mcp_tools(&ctx.mcp_manager, &mcp_tool_calls, &mut mcp_tracking).await {
+                    match execute_mcp_tools(&ctx.mcp_manager, &mcp_tool_calls, &mut mcp_tracking)
+                        .await
+                    {
                         Ok(results) => results,
                         Err(err_response) => {
                             emitter.emit_error(
@@ -1056,6 +1058,7 @@ async fn execute_without_mcp_streaming(
 ///
 /// ResponsesResponse with tool calls
 /// TODO: Refactor to use builder pattern
+#[allow(clippy::too_many_arguments)]
 fn build_tool_response(
     mcp_tool_calls: Vec<ToolCall>,
     mcp_results: Vec<ToolResult>,
