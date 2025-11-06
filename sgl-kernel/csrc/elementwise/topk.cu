@@ -441,6 +441,9 @@ void fast_topk_transform_interface(
   CHECK_CUDA(dst_page_table);
   CHECK_CUDA(src_page_table);
   CHECK_CUDA(cu_seqlens_q);
+  if (row_starts_opt.has_value()) {
+    CHECK_CUDA(row_starts_opt.value());
+  }
   const auto params = get_params(score, lengths, row_starts_opt);
   const auto B = score.size(0);
   TORCH_CHECK(dst_page_table.dim() == 2 && dst_page_table.is_contiguous());
@@ -459,13 +462,13 @@ void fast_topk_transform_interface(
   const auto src_stride = src_page_table.stride(0);
 
   // dispatch to decode or prefill
-  const auto is_decode = (prefill_bs == B);
+  const auto is_decode = !row_starts_opt.has_value();
   if (is_decode) {
+    TORCH_CHECK(prefill_bs == B, "prefill_bs should be equal to B for decode");
     setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
     topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
         params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
   } else {
-    TORCH_CHECK(row_starts_opt.has_value(), "row_starts is required for prefill");
     setup_kernel_smem_once<topk_transform_prefill_kernel, kSmem>();
     topk_transform_prefill_kernel<<<grid, block, kSmem, stream>>>(
         params,
@@ -490,6 +493,7 @@ void fast_topk_transform_ragged_interface(
   CHECK_CUDA(lengths);
   CHECK_CUDA(topk_indices_ragged);
   CHECK_CUDA(topk_indices_offset);
+  CHECK_CUDA(row_starts);
 
   const auto params = get_params(score, lengths, row_starts);
   const auto B = score.size(0);
