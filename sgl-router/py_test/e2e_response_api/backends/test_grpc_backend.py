@@ -38,7 +38,14 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
             num_workers=1,
             tp_size=2,
             policy="round_robin",
-            router_args=["--history-backend", "memory", "--tool-call-parser", "llama", "--reasoning-parser", "llama"],
+            router_args=[
+                "--history-backend",
+                "memory",
+                "--tool-call-parser",
+                "llama",
+                "--reasoning-parser",
+                "llama",
+            ],
         )
 
         cls.base_url = cls.cluster["base_url"]
@@ -87,7 +94,12 @@ class TestGrpcHarmonyBackend(
             num_workers=1,
             tp_size=2,
             policy="round_robin",
-            router_args=["--history-backend", "memory", "--reasoning-parser", "harmony"],
+            router_args=[
+                "--history-backend",
+                "memory",
+                "--reasoning-parser",
+                "harmony",
+            ],
         )
 
         cls.base_url = cls.cluster["base_url"]
