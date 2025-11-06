@@ -232,6 +232,19 @@ class MultimodalDataItem:
 
     def set(self, key: str, value: Any):
         self.__setitem__(key, value)
+        
+    def reconstruct(self):
+        reconstruct_device = torch.cuda.current_device()
+        if isinstance(self.feature, CudaIpcTensorTransportProxy):
+            self.feature = self.feature.reconstruct_on_target_device(reconstruct_device)
+        
+        if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
+            self.precomputed_embeddings = self.precomputed_embeddings.reconstruct_on_target_device(reconstruct_device)
+        
+        for extra_key in self.model_specific_data:
+            if isinstance(self.model_specific_data[extra_key], CudaIpcTensorTransportProxy):
+                extra_data = self.model_specific_data[extra_key].reconstruct_on_target_device(reconstruct_device)
+                self.model_specific_data[extra_key] = extra_data
 
     @staticmethod
     def is_empty_list(l):
@@ -320,6 +333,13 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
+        #  reconstruct from ipc-handle to Tensor
+        if "mm_items" in obj:
+            assert isinstance(obj["mm_items"], list), "mm_items should be a list"
+            for item_idx in range(len(obj["mm_items"])):
+                if isinstance(obj["mm_items"][item_idx], MultimodalDataItem):
+                    obj["mm_items"][item_idx].reconstruct()
+               
         ret = MultimodalInputs(
             mm_items=obj["mm_items"],
         )

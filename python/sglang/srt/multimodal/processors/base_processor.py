@@ -657,6 +657,28 @@ class BaseMultimodalProcessor(ABC):
                     else:
                         if item.precomputed_embeddings.is_cuda:
                             item.precomputed_embeddings = item.precomputed_embeddings.to("cpu")
+                
+                for extra_key in item.model_specific_data:
+                    if isinstance(item.model_specific_data[extra_key], torch.Tensor):
+                        extra_data = item.model_specific_data[extra_key]
+                        sync_flag, available_slice = (
+                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
+                                extra_data
+                            )
+                        )
+                        
+                        if isinstance(available_slice, torch.Tensor):
+                            available_slice.copy_(
+                                extra_data.view(torch.int8).view(-1), non_blocking=True
+                            )
+                            logger.info("repalce {} with cudaipc-handle".format(extra_key))
+                            item.model_specific_data[extra_key]= CudaIpcTensorTransportProxy(
+                                data=available_slice,
+                                info_data=extra_data,
+                                sync_buffer_meta=sync_flag,
+                            )
+                        
+                        
         else:
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
