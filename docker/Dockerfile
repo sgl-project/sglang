@@ -205,7 +205,7 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --upgrade 
 RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]; then \
     wget -q https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/${TRITON_LANG_COMMIT}.zip && \
     unzip -q ${TRITON_LANG_COMMIT}.zip && rm ${TRITON_LANG_COMMIT}.zip && mv triton-${TRITON_LANG_COMMIT} triton && \
-    pip install --break-system-packages -r python/requirements.txt && \
+    cd triton && pip install --break-system-packages -r python/requirements.txt && \
     MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --break-system-packages -e .; \
 fi
 
