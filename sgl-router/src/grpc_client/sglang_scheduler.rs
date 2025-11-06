@@ -461,10 +461,8 @@ impl SglangSchedulerClient {
         request: &ResponsesRequest,
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<proto::SamplingParams, String> {
-        // ResponsesRequest doesn't have stop sequences in the same way
-        // Constraints are handled in priority order:
-        // 1. Structured output (text field) - for both regular and Harmony models
-        // 2. Tool call constraint - from Harmony preparation or regular tool handling
+        // Used by Harmony models only. Regular models use Chat API path.
+        // Constraints come from Harmony preparation stage (structural_tag) or tool handling.
 
         let max_new_tokens = request.max_output_tokens.map(|v| v as i32);
 
@@ -484,75 +482,36 @@ impl SglangSchedulerClient {
             ignore_eos: false,
             no_stop_trim: false,
             n: 1, // Responses API doesn't support n>1
-            constraint: self.build_constraint_for_responses(&request.text, tool_call_constraint)?,
+            constraint: self.build_constraint_for_responses(tool_call_constraint)?,
             ..Default::default()
         })
     }
 
-    /// Build constraint for Responses API (simpler than Chat API's build_constraint)
-    ///
-    /// Responses API doesn't support response_format, ebnf, or regex constraints,
-    /// so this only handles tool_call_constraint.
     /// Build constraint for Responses API
     ///
-    /// Priority: Harmony structural tag (from preparation) > text field > other tool constraints
+    /// Handles constraints from Harmony preparation stage (structural_tag for Harmony models)
+    /// or other tool call constraints.
+    ///
+    /// Note: Regular gRPC models use Chat API path with response_format, not this function.
     fn build_constraint_for_responses(
         &self,
-        text: &Option<crate::protocols::responses::TextConfig>,
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
-        use crate::protocols::responses::TextFormat;
-
-        // Priority 1: If Harmony prepared a structural tag, use it (indicates Harmony model with special handling)
-        if let Some((ref constraint_type, ref constraint_value)) = tool_call_constraint {
-            if constraint_type == "structural_tag" {
-                // Harmony models use structural tags - don't override with text field processing
-                return Ok(Some(proto::sampling_params::Constraint::StructuralTag(
-                    constraint_value.clone(),
-                )));
-            }
-        }
-
-        // Priority 2: Structured output from text field (for regular gRPC models)
-        if let Some(text_config) = text {
-            if let Some(format) = &text_config.format {
-                match format {
-                    TextFormat::Text => {
-                        // No constraint for plain text
-                    }
-                    TextFormat::JsonObject => {
-                        // json_object mode - constrain to valid JSON object
-                        let schema = serde_json::json!({"type": "object"});
-                        let schema_str = serde_json::to_string(&schema)
-                            .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
-                        return Ok(Some(proto::sampling_params::Constraint::JsonSchema(
-                            schema_str,
-                        )));
-                    }
-                    TextFormat::JsonSchema { schema, .. } => {
-                        // json_schema mode - constrain to provided schema
-                        let schema_str = serde_json::to_string(schema)
-                            .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
-                        return Ok(Some(proto::sampling_params::Constraint::JsonSchema(
-                            schema_str,
-                        )));
-                    }
-                }
-            }
-        }
-
-        // Priority 3: Other tool call constraints (json_schema, ebnf, regex)
         if let Some((constraint_type, constraint_value)) = tool_call_constraint {
             let tool_constraint = match constraint_type.as_str() {
+                "structural_tag" => {
+                    // Harmony models: structural tag from preparation stage
+                    proto::sampling_params::Constraint::StructuralTag(constraint_value)
+                }
                 "json_schema" => proto::sampling_params::Constraint::JsonSchema(constraint_value),
                 "ebnf" => proto::sampling_params::Constraint::EbnfGrammar(constraint_value),
                 "regex" => proto::sampling_params::Constraint::Regex(constraint_value),
                 _ => return Err(format!("Unknown constraint type: {}", constraint_type)),
             };
-            return Ok(Some(tool_constraint));
+            Ok(Some(tool_constraint))
+        } else {
+            Ok(None)
         }
-
-        Ok(None)
     }
 
     fn build_single_constraint_from_plain(
