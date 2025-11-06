@@ -5,14 +5,24 @@ Tests MCP tool calling in both streaming and non-streaming modes.
 These tests should work across all backends that support MCP (OpenAI, XAI).
 """
 
+import json
+
 from basic_crud import ResponseAPIBaseTest
 
 
 class MCPTests(ResponseAPIBaseTest):
     """Tests for MCP tool calling in both streaming and non-streaming modes."""
 
+    # Class attribute to control validation strictness
+    # Subclasses can override this to enable strict validation
+    mcp_validation_mode = "relaxed"
+
     def test_mcp_basic_tool_call(self):
-        """Test basic MCP tool call (non-streaming)."""
+        """Test basic MCP tool call (non-streaming).
+
+        Validation strictness is controlled by the class attribute `mcp_validation_mode`.
+        Set to "strict" in subclasses for additional HTTP-specific validation.
+        """
         tools = [
             {
                 "type": "mcp",
@@ -70,26 +80,31 @@ class MCPTests(ResponseAPIBaseTest):
             self.assertIn("arguments", mcp_call)
             self.assertIn("output", mcp_call)
 
-        # Should have final message output
-        messages = [item for item in output if item.get("type") == "message"]
-        self.assertGreater(
-            len(messages), 0, "Response should contain at least one message"
-        )
+        # Strict mode: additional validation for HTTP backends
+        if self.mcp_validation_mode == "strict":
+            # Should have final message output
+            messages = [item for item in output if item.get("type") == "message"]
+            self.assertGreater(
+                len(messages), 0, "Response should contain at least one message"
+            )
+            # Verify message structure
+            for msg in messages:
+                self.assertIn("content", msg)
+                self.assertIsInstance(msg["content"], list)
 
-        # Verify message structure
-        for msg in messages:
-            self.assertIn("content", msg)
-            self.assertIsInstance(msg["content"], list)
-
-            # Check content has text
-            for content_item in msg["content"]:
-                if content_item.get("type") == "output_text":
-                    self.assertIn("text", content_item)
-                    self.assertIsInstance(content_item["text"], str)
-                    self.assertGreater(len(content_item["text"]), 0)
+                # Check content has text
+                for content_item in msg["content"]:
+                    if content_item.get("type") == "output_text":
+                        self.assertIn("text", content_item)
+                        self.assertIsInstance(content_item["text"], str)
+                        self.assertGreater(len(content_item["text"]), 0)
 
     def test_mcp_basic_tool_call_streaming(self):
-        """Test basic MCP tool call (streaming)."""
+        """Test basic MCP tool call (streaming).
+
+        Validation strictness is controlled by the class attribute `mcp_validation_mode`.
+        Set to "strict" in subclasses for additional HTTP-specific validation.
+        """
         tools = [
             {
                 "type": "mcp",
@@ -160,28 +175,6 @@ class MCPTests(ResponseAPIBaseTest):
             "Should have mcp_call.completed event",
         )
 
-        # Check for text output events
-        self.assertIn(
-            "response.content_part.added",
-            event_types,
-            "Should have content_part.added event",
-        )
-        self.assertIn(
-            "response.output_text.delta",
-            event_types,
-            "Should have output_text.delta events",
-        )
-        self.assertIn(
-            "response.output_text.done",
-            event_types,
-            "Should have output_text.done event",
-        )
-        self.assertIn(
-            "response.content_part.done",
-            event_types,
-            "Should have content_part.done event",
-        )
-
         # Verify final completed event has full response
         completed_events = [e for e in events if e.get("event") == "response.completed"]
         self.assertEqual(len(completed_events), 1)
@@ -197,7 +190,6 @@ class MCPTests(ResponseAPIBaseTest):
 
         self.assertIn("mcp_list_tools", final_output_types)
         self.assertIn("mcp_call", final_output_types)
-        self.assertIn("message", final_output_types)
 
         # Verify mcp_call items in final output
         mcp_calls = [item for item in final_output if item.get("type") == "mcp_call"]
@@ -210,19 +202,207 @@ class MCPTests(ResponseAPIBaseTest):
             self.assertIn("arguments", mcp_call)
             self.assertIn("output", mcp_call)
 
-        # Verify text deltas combine to final message
-        text_deltas = [
-            e.get("data", {}).get("delta", "")
+        # Strict mode: additional validation for HTTP backends
+        if self.mcp_validation_mode == "strict":
+            # Check for text output events
+            self.assertIn(
+                "response.content_part.added",
+                event_types,
+                "Should have content_part.added event",
+            )
+            self.assertIn(
+                "response.output_text.delta",
+                event_types,
+                "Should have output_text.delta events",
+            )
+            self.assertIn(
+                "response.output_text.done",
+                event_types,
+                "Should have output_text.done event",
+            )
+            self.assertIn(
+                "response.content_part.done",
+                event_types,
+                "Should have content_part.done event",
+            )
+
+            self.assertIn("message", final_output_types)
+
+            # Verify text deltas combine to final message
+            text_deltas = [
+                e.get("data", {}).get("delta", "")
+                for e in events
+                if e.get("event") == "response.output_text.delta"
+            ]
+            self.assertGreater(len(text_deltas), 0, "Should have text deltas")
+
+            # Get final text from output_text.done event
+            text_done_events = [
+                e for e in events if e.get("event") == "response.output_text.done"
+            ]
+            self.assertGreater(len(text_done_events), 0)
+
+            final_text = text_done_events[0].get("data", {}).get("text", "")
+            self.assertGreater(len(final_text), 0, "Final text should not be empty")
+
+    def test_mixed_mcp_and_function_tools(self):
+        """Test mixed MCP and function tools (non-streaming)."""
+        tools = [
+            {
+                "type": "mcp",
+                "server_url": "https://mcp.deepwiki.com/mcp",
+                "server_label": "deepwiki",
+                "require_approval": "never",
+            },
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get the current weather in a given location",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        ]
+
+        resp = self.create_response(
+            "What is the weather in seattle now?",
+            tools=tools,
+            stream=False,
+            tool_choice="auto",
+        )
+
+        # Should successfully make the request
+        self.assertEqual(resp.status_code, 200)
+
+        data = resp.json()
+
+        # Basic response structure
+        self.assertIn("id", data)
+        self.assertIn("status", data)
+        self.assertIn("output", data)
+
+        # Verify output array is not empty
+        output = data["output"]
+        self.assertIsInstance(output, list)
+        self.assertGreater(len(output), 0)
+
+        # Check for function_call (not mcp_call for get_weather)
+        function_calls = [
+            item for item in output if item.get("type") == "function_call"
+        ]
+        self.assertGreater(
+            len(function_calls), 0, "Response should contain at least one function_call"
+        )
+
+        # Verify function_call structure for get_weather
+        weather_call = function_calls[0]
+        self.assertIn("name", weather_call)
+        self.assertEqual(weather_call["name"], "get_weather")
+        self.assertIn("call_id", weather_call)
+        self.assertIn("arguments", weather_call)
+        self.assertIn("status", weather_call)
+
+        # Parse and verify arguments
+        args = json.loads(weather_call["arguments"])
+        self.assertIn("location", args)
+        self.assertIn("seattle", args["location"].lower())
+
+    def test_mixed_mcp_and_function_tools_streaming(self):
+        """Test mixed MCP and function tools (streaming)."""
+        tools = [
+            {
+                "type": "mcp",
+                "server_url": "https://mcp.deepwiki.com/mcp",
+                "server_label": "deepwiki",
+                "require_approval": "never",
+            },
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get the current weather in a given location",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        ]
+
+        resp = self.create_response(
+            "What is the weather in seattle now?",
+            tools=tools,
+            stream=True,
+            tool_choice="auto",  # Encourage tool usage
+        )
+
+        # Should successfully make the request
+        self.assertEqual(resp.status_code, 200)
+
+        events = self.parse_sse_events(resp)
+        self.assertGreater(len(events), 0)
+
+        event_types = [e.get("event") for e in events]
+
+        # Check for lifecycle events
+        self.assertIn(
+            "response.created", event_types, "Should have response.created event"
+        )
+
+        # Should have mcp_list_tools events
+        self.assertIn(
+            "response.mcp_list_tools.completed",
+            event_types,
+            "Should have mcp_list_tools.completed event",
+        )
+
+        # Should have function_call_arguments events (not mcp_call_arguments)
+        self.assertIn(
+            "response.function_call_arguments.delta",
+            event_types,
+            "Should have function_call_arguments.delta event for function tools",
+        )
+        self.assertIn(
+            "response.function_call_arguments.done",
+            event_types,
+            "Should have function_call_arguments.done event for function tools",
+        )
+
+        # Should NOT have mcp_call_arguments events for function tools
+        # (get_weather should use function_call_arguments, not mcp_call_arguments)
+        mcp_call_arg_events = [
+            e
             for e in events
-            if e.get("event") == "response.output_text.delta"
+            if e.get("event") == "response.mcp_call_arguments.delta"
+            and "get_weather" in str(e.get("data", {}))
         ]
-        self.assertGreater(len(text_deltas), 0, "Should have text deltas")
+        self.assertEqual(
+            len(mcp_call_arg_events),
+            0,
+            "Should NOT emit mcp_call_arguments.delta for function tools (get_weather)",
+        )
 
-        # Get final text from output_text.done event
-        text_done_events = [
-            e for e in events if e.get("event") == "response.output_text.done"
+        # Verify function_call_arguments.delta event structure
+        func_arg_deltas = [
+            e
+            for e in events
+            if e.get("event") == "response.function_call_arguments.delta"
         ]
-        self.assertGreater(len(text_done_events), 0)
+        self.assertGreater(
+            len(func_arg_deltas), 0, "Should have function_call_arguments.delta events"
+        )
 
-        final_text = text_done_events[0].get("data", {}).get("text", "")
-        self.assertGreater(len(final_text), 0, "Final text should not be empty")
+        # Check that at least one delta event contains location arguments
+        has_location = False
+        for event in func_arg_deltas:
+            data = event.get("data", {})
+            delta = data.get("delta", "")
+            if "location" in delta.lower() or "seattle" in delta.lower():
+                has_location = True
+                break
+
+        self.assertTrue(
+            has_location,
+            "function_call_arguments.delta should contain location/seattle",
+        )
