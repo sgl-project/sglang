@@ -34,7 +34,6 @@ KVCache actually holds the physical kv cache.
 import abc
 import logging
 from contextlib import nullcontext
-from itertools import groupby
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -66,6 +65,7 @@ if _is_npu:
     import torch_npu
 
 elastic_pool = get_bool_env_var("SGLANG_ELASTIC_MEM_POOL", "true")
+# elastic_pool = get_bool_env_var("SGLANG_ELASTIC_MEM_POOL", "false")
 cu_page_size = get_int_env_var("SGLANG_CU_PAGE_SIZE", 2 << 20)
 if elastic_pool:
     import signal
@@ -639,36 +639,40 @@ class MHATokenToKVPool(KVCache):
         vmm_ops.init_emem(current_device_id, cu_page_size)
 
         assert self.size % self.page_size == 0
-        page_num = int(self.size / self.page_size) + 1
+        self.esize = (
+            ((self.size + self.page_size) + self.page_size - 1)
+            // self.page_size
+            * self.page_size
+        )
         page_size = self.page_size
         state_shape = (self.head_num, self.head_dim)
         dtype = self.store_dtype
-        vsize_ratio = 8
         self.ek_buffer = [
             ETensor(
                 f"{self.pool_name}-k-{i}",
-                page_num,
+                self.esize,
                 page_size,
                 state_shape,
                 dtype,
-                vsize_ratio,
+                current_device_id,
             )
             for i in range(self.layer_num)
         ]
         self.ev_buffer = [
             ETensor(
                 f"{self.pool_name}-v-{i}",
-                page_num,
+                self.esize,
                 page_size,
                 state_shape,
                 dtype,
-                vsize_ratio,
+                current_device_id,
             )
             for i in range(self.layer_num)
         ]
         self.k_buffer = [etensor.etensor for etensor in self.ek_buffer]
         self.v_buffer = [etensor.etensor for etensor in self.ev_buffer]
-        logger.info(f"{state_shape=}, {self.ek_buffer[0].page_memsize=}")
+        self.state_memsize = self.ek_buffer[0].state_memsize
+        logger.info(f"{self.esize=}, {self.k_buffer[0].shape=}")
 
     def _create_data_ptrs(self):
         self.k_data_ptrs = torch.tensor(
@@ -860,41 +864,25 @@ class MHATokenToKVPool(KVCache):
             num_stages=2,
         )
 
-    def disable(self, page_indices: List[int]) -> int:
-        for _, g in groupby(
-            enumerate(sorted(set(page_indices))), lambda x: x[1] - x[0]
-        ):
-            group = list(g)
-            group_start = group[0][1]
-            group_len = len(group)
-            logger.debug(f"{group_start}, {group_len}")
-        unmap_num = 0
+    def disable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
+        total_unmap_num = 0
         for ek, ev in zip(self.ek_buffer, self.ev_buffer):
-            unmap_num += ek.disable(page_indices)
-            unmap_num += ev.disable(page_indices)
-        self.size -= len(page_indices) * self.page_size
-        return unmap_num
+            unmap_num, pass_indices, proc_indices = ek.disable(indices)
+            total_unmap_num += unmap_num
+            unmap_num, pass_indices, proc_indices = ev.disable(indices)
+            total_unmap_num += unmap_num
+        self.size -= len(proc_indices)
+        return total_unmap_num, pass_indices, proc_indices
 
-    def enable(self, page_indices: List[int]) -> int:
-        map_num = 0
+    def enable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
+        total_map_num = 0
         for ek, ev in zip(self.ek_buffer, self.ev_buffer):
-            map_num += ek.enable(page_indices)
-            map_num += ev.enable(page_indices)
-        self.size += len(page_indices) * self.page_size
-        return map_num
-
-    def expand(self, page_num: int) -> int:
-        logger.debug(f"{page_num=}")
-        expand_num = 0
-        for ek, ev in zip(self.ek_buffer, self.ev_buffer):
-            expand_num += ek.expand(page_num)
-            expand_num += ev.expand(page_num)
-        logger.debug(f"{self.k_buffer[0].shape=}")
-        self.k_buffer = [etensor.etensor for etensor in self.ek_buffer]
-        self.v_buffer = [etensor.etensor for etensor in self.ev_buffer]
-        logger.debug(f"{self.k_buffer[0].shape=}")
-        self.size += page_num * self.page_size
-        return expand_num
+            map_num, pass_indices, proc_indices = ek.enable(indices)
+            total_map_num += map_num
+            map_num, pass_indices, proc_indices = ev.enable(indices)
+            total_map_num += map_num
+        self.size += len(proc_indices)
+        return total_map_num, pass_indices, proc_indices
 
 
 class HybridLinearKVPool(KVCache):

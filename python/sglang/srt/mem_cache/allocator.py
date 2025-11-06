@@ -27,7 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.memory_pool import SWAKVPool
+from sglang.srt.mem_cache.memory_pool import SWAKVPool, cu_page_size
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
@@ -187,47 +187,64 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def disable(self, need_size: int) -> int:
         self.merge_and_sort_free()
-        logger.debug(f"{len(self.free_pages)=}")
+        logger.debug(f"{(need_size, len(self.free_pages))=}")
         if need_size > len(self.free_pages):
             return 0
 
-        select_index = self.free_pages[-need_size:]
+        select_index = self.free_pages[-need_size:].tolist()
         self.free_pages = self.free_pages[:-need_size]
-        self.invalid_pages = torch.cat((self.invalid_pages, select_index))
+        unmap_num, pass_indices, proc_indices = self._kvcache.disable(select_index)
 
-        page_indices = select_index.tolist()
-        unmap_num = self._kvcache.disable(page_indices)
+        self.free_pages = torch.cat(
+            (
+                self.free_pages,
+                torch.tensor(pass_indices, dtype=torch.int64, device=self.device),
+            )
+        )
+        self.invalid_pages = torch.cat(
+            (
+                self.invalid_pages,
+                torch.tensor(proc_indices, dtype=torch.int64, device=self.device),
+            )
+        )
+
         self.size = self._kvcache.size
 
         return unmap_num
 
     def enable(self, need_size: int) -> int:
-        logger.debug(f"{len(self.invalid_pages)=}")
-        if need_size > len(self.invalid_pages):
-            return 0
+        expand_size = 0
+        invalid_size = len(self.invalid_pages)
+        if need_size > invalid_size:
+            expand_size = need_size - invalid_size
+        logger.debug(f"{(need_size, invalid_size, expand_size)=}")
+
         self.invalid_pages, _ = torch.sort(self.invalid_pages)
 
-        select_index = self.invalid_pages[:need_size]
-        self.invalid_pages = self.invalid_pages[need_size:]
-        self.release_pages = torch.cat((self.release_pages, select_index))
+        select_index = self.invalid_pages[:need_size].tolist()
+        select_index.extend(
+            range(self.size + invalid_size, self.size + invalid_size + expand_size)
+        )
 
-        page_indices = select_index.tolist()
-        map_num = self._kvcache.enable(page_indices)
+        self.invalid_pages = self.invalid_pages[need_size:]
+        map_num, pass_indices, proc_indices = self._kvcache.enable(select_index)
+
+        self.invalid_pages = torch.cat(
+            (
+                self.invalid_pages,
+                torch.tensor(pass_indices, dtype=torch.int64, device=self.device),
+            )
+        )
+        self.release_pages = torch.cat(
+            (
+                self.release_pages,
+                torch.tensor(proc_indices, dtype=torch.int64, device=self.device),
+            )
+        )
+
         self.size = self._kvcache.size
 
         return map_num
-
-    def expand(self, need_size: int) -> int:
-        logger.debug(f"{need_size=}")
-        expand_index = torch.arange(
-            self.size, self.size + need_size, dtype=torch.int64, device=self.device
-        )
-
-        expand_num = self._kvcache.expand(need_size)
-        self.size = self._kvcache.size
-        self.release_pages = torch.cat((self.release_pages, expand_index))
-
-        return expand_num
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -260,8 +277,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache.swa_kv_pool,
             need_sort,
         )
+        # expand as full pool may expand
         self.full_to_swa_index_mapping = torch.empty(
-            size + size_swa + 1,
+            (size + size_swa + 1) * 10,
             dtype=torch.int64,
             device=device,
         )
@@ -355,35 +373,34 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             return self.full_attn_allocator.has_invalid()
 
-    def disable(self, need_size: int, is_swa: bool = True) -> int:
-        unmap_num = 0
-        if is_swa:
-            unmap_num = self.swa_attn_allocator.disable(need_size)
-            self._size_swa = self.swa_attn_allocator.size
-        else:
-            unmap_num = self.full_attn_allocator.disable(need_size)
-            self._size_full = self.full_attn_allocator.size
-        return unmap_num
+    def cu_page_to_token(
+        self, cu_page_num: int, layer_num: int, state_memsize: int
+    ) -> int:
+        cu_mem = cu_page_num * cu_page_size
+        cu_mem_per_kv_layer = cu_mem // 2 // layer_num
+        token_num = cu_mem_per_kv_layer // state_memsize
+        return token_num
 
-    def enable(self, need_size: int, is_swa: bool = True) -> int:
-        map_num = 0
-        if is_swa:
-            map_num = self.swa_attn_allocator.enable(need_size)
-            self._size_swa = self.swa_attn_allocator.size
-        else:
-            map_num = self.full_attn_allocator.enable(need_size)
-            self._size_full = self.full_attn_allocator.size
-        return map_num
+    def transfer_token(self, token_num: int, swa_to_full: bool = True) -> None:
+        allocator_disable = (
+            self.swa_attn_allocator if swa_to_full else self.full_attn_allocator
+        )
+        allocator_enable = (
+            self.full_attn_allocator if swa_to_full else self.swa_attn_allocator
+        )
 
-    def expand(self, need_size: int, is_swa: bool = True) -> int:
-        expand_num = 0
-        if is_swa:
-            expand_num = self.swa_attn_allocator.expand(need_size)
-            self._size_swa = self.swa_attn_allocator.size
-        else:
-            expand_num = self.full_attn_allocator.expand(need_size)
-            self._size_full = self.full_attn_allocator.size
-        return expand_num
+        unmap_num = allocator_disable.disable(token_num)
+        need_size = self.cu_page_to_token(
+            unmap_num,
+            allocator_enable._kvcache.layer_num,
+            allocator_enable._kvcache.state_memsize,
+        )
+        map_num = allocator_enable.enable(need_size)
+
+        self._size_swa = self.swa_attn_allocator.size
+        self._size_full = self.full_attn_allocator.size
+
+        logger.info(f"{(unmap_num, map_num)=}, {(self._size_swa, self._size_full)=}")
 
 
 @triton.jit
