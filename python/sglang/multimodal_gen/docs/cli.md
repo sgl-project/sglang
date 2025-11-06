@@ -265,7 +265,7 @@ SAMPLING_ARGS=(
   --output-file-name "A curious raccoon.mp4"
 )
 
-sglang generate $SERVER_ARGS $SAMPLING_ARGS
+sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 ```
 
 Once the generation task has finished, the server will shut down automatically.
