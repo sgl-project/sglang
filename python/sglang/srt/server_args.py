@@ -662,7 +662,10 @@ class ServerArgs:
         self._handle_load_format()
 
         # Handle PD disaggregation.
-        self._handle_disaggregation()
+        self._handle_pd_disaggregation()
+
+        # Handle E disaggregation.
+        self._handle_e_disaggregation()
 
         # Validate tokenizer settings.
         self._handle_tokenizer_batching()
@@ -1860,7 +1863,15 @@ class ServerArgs:
             ):
                 self.load_format = "auto"
 
-    def _handle_disaggregation(self):
+    def _handle_e_disaggregation(self):
+        if self.mm_only and self.language_only:
+            raise ValueError("Cannot set --mm-only and --language-only together")
+        if self.mm_only and not self.disaggregation_mode == "null":
+            raise ValueError(
+                "Cannot set --mm-only and --disaggregation-mode prefill/decode together"
+            )
+
+    def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
             assert (
                 self.disaggregation_decode_tp is None
