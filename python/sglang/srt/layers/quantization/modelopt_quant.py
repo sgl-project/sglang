@@ -1451,10 +1451,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale = _slice_scale(w2_input_scale)
 
             if CUTEDSL_MOE_NVFP4_DISPATCH:
-                print(f"w13_input_scale shape: {w13_input_scale.shape}")
-                print(f"w13_input_scale values: {w13_input_scale}")
-                print(f"Unique values: {torch.unique(w13_input_scale)}")
-                print(f"All equal? {torch.all(w13_input_scale == w13_input_scale[0])}")
+                logger.warning(f"w13_input_scale shape: {w13_input_scale.shape}")
+                logger.warning(f"w13_input_scale values: {w13_input_scale}")
+                logger.warning(f"Unique values: {torch.unique(w13_input_scale)}")
+                logger.warning(f"All equal? {torch.all(w13_input_scale == w13_input_scale[0])}")
                 #assert torch.all(w13_input_scale == w13_input_scale[0])
                 logger.warning("ISHAN: removed assert so this might break down the line lets see...")
                 w13_input_scale = w13_input_scale[0]
