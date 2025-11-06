@@ -61,11 +61,15 @@ class TestOpenaiBackend(
     # - test_mixed_mcp_and_function_tools (requires external MCP server)
     # - test_mixed_mcp_and_function_tools_streaming (requires external MCP server)
 
-    @unittest.skip("Requires external MCP server (deepwiki) - may not be accessible in CI")
+    @unittest.skip(
+        "Requires external MCP server (deepwiki) - may not be accessible in CI"
+    )
     def test_mixed_mcp_and_function_tools(self):
         super().test_mixed_mcp_and_function_tools()
 
-    @unittest.skip("Requires external MCP server (deepwiki) - may not be accessible in CI")
+    @unittest.skip(
+        "Requires external MCP server (deepwiki) - may not be accessible in CI"
+    )
     def test_mixed_mcp_and_function_tools_streaming(self):
         super().test_mixed_mcp_and_function_tools_streaming()
 

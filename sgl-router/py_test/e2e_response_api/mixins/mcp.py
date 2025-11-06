@@ -270,7 +270,7 @@ class MCPTests(ResponseAPIBaseTest):
             "What is the weather in seattle now?",
             tools=tools,
             stream=False,
-            tool_choice="auto"
+            tool_choice="auto",
         )
 
         # Should successfully make the request
@@ -334,7 +334,7 @@ class MCPTests(ResponseAPIBaseTest):
             "What is the weather in seattle now?",
             tools=tools,
             stream=True,
-            tool_choice="auto"  # Encourage tool usage
+            tool_choice="auto",  # Encourage tool usage
         )
 
         # Should successfully make the request
