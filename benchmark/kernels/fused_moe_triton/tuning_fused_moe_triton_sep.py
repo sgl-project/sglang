@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 from common_utils import (
     BenchmarkConfig,
+    get_config_filename,
     get_configs_compute_bound,
     get_default_batch_sizes,
     get_model_config,
