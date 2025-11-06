@@ -61,6 +61,7 @@ jobs:
             --build-arg BUILD_TYPE=${{ matrix.build_type }} \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
             --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
+            --build-arg USE_LATEST_SGLANG=1 \
             -t lmsysorg/sglang:${{ matrix.tag }} \
             --no-cache \
             .
