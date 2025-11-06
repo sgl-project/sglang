@@ -3,11 +3,10 @@
 //! This module contains all MCP-related functionality for the OpenAI router:
 //! - Tool loop state management for multi-turn tool calling
 //! - MCP tool execution and result handling
-//! - Output item builders for MCP-specific response formats (including web_search_call)
+//! - Output item builders for MCP-specific response formats
 //! - SSE event generation for streaming MCP operations
 //! - Payload transformation for MCP tool interception
 //! - Metadata injection for MCP operations
-//! - Web search preview tool handling (simplified MCP interface)
 
 use std::{io, sync::Arc};
 
@@ -17,7 +16,7 @@ use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::utils::{event_types, web_search_constants, ToolContext};
+use super::utils::event_types;
 use crate::{
     mcp,
     protocols::responses::{
@@ -37,16 +36,11 @@ pub(crate) struct McpLoopConfig {
     /// Maximum iterations as safety limit (internal only, default: 10)
     /// Prevents infinite loops when max_tool_calls is not set
     pub max_iterations: usize,
-    /// Tool context for handling web_search_preview vs regular tools
-    pub tool_context: ToolContext,
 }
 
 impl Default for McpLoopConfig {
     fn default() -> Self {
-        Self {
-            max_iterations: 10,
-            tool_context: ToolContext::Regular,
-        }
+        Self { max_iterations: 10 }
     }
 }
 
@@ -164,13 +158,6 @@ pub async fn ensure_request_mcp_client(
         .server_label
         .clone()
         .unwrap_or_else(|| "request-mcp".to_string());
-
-    // Validate that web_search_preview is not used as it's a reserved name
-    if name == web_search_constants::WEB_SEARCH_PREVIEW_SERVER_NAME {
-        warn!("Rejecting request MCP with reserved server name: {}", name);
-        return None;
-    }
-
     let token = tool.authorization.clone();
     let transport = if server_url.contains("/sse") {
         mcp::McpTransport::Sse {
@@ -215,7 +202,6 @@ pub(super) async fn execute_streaming_tool_calls(
     state: &mut ToolLoopState,
     server_label: &str,
     sequence_number: &mut u64,
-    tool_context: ToolContext,
 ) -> bool {
     // Execute all pending tool calls (sequential, as PR3 is skipped)
     for call in pending_calls {
@@ -272,7 +258,6 @@ pub(super) async fn execute_streaming_tool_calls(
             success,
             error_msg.as_deref(),
             sequence_number,
-            tool_context,
         ) {
             // Client disconnected, no point continuing tool execution
             return false;
@@ -292,7 +277,6 @@ pub(super) async fn execute_streaming_tool_calls(
 pub(super) fn prepare_mcp_payload_for_streaming(
     payload: &mut Value,
     active_mcp: &Arc<mcp::McpManager>,
-    tool_context: ToolContext,
 ) {
     if let Some(obj) = payload.as_object_mut() {
         // Remove any non-function tools from outgoing payload
@@ -307,27 +291,10 @@ pub(super) fn prepare_mcp_payload_for_streaming(
             }
         }
 
-        // Build function tools for discovered MCP tools
+        // Build function tools for all discovered MCP tools
         let mut tools_json = Vec::new();
-
-        // Get tools with server names from inventory
-        // Returns Vec<(tool_name, server_name, Tool)>
-        let tools = active_mcp.inventory().list_tools();
-
-        // Filter tools based on context
-        let filtered_tools: Vec<_> = if tool_context.is_web_search() {
-            // Only include tools from web_search_preview server
-            tools
-                .into_iter()
-                .filter(|(_, server_name, _)| {
-                    server_name == web_search_constants::WEB_SEARCH_PREVIEW_SERVER_NAME
-                })
-                .collect()
-        } else {
-            tools
-        };
-
-        for (_, _, t) in filtered_tools {
+        let tools = active_mcp.list_tools();
+        for t in tools {
             let parameters = Value::Object((*t.input_schema).clone());
             let tool = serde_json::json!({
                 "type": event_types::ITEM_TYPE_FUNCTION,
@@ -499,7 +466,6 @@ pub(super) fn send_mcp_list_tools_events(
 
 /// Send mcp_call completion events after tool execution
 /// Returns false if client disconnected
-#[allow(clippy::too_many_arguments)]
 pub(super) fn send_mcp_call_completion_events_with_error(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     call: &FunctionCallInProgress,
@@ -508,7 +474,6 @@ pub(super) fn send_mcp_call_completion_events_with_error(
     success: bool,
     error_msg: Option<&str>,
     sequence_number: &mut u64,
-    tool_context: ToolContext,
 ) -> bool {
     let effective_output_index = call.effective_output_index();
 
@@ -520,24 +485,17 @@ pub(super) fn send_mcp_call_completion_events_with_error(
         server_label,
         success,
         error_msg,
-        tool_context,
     );
 
-    // Get the item_id
+    // Get the mcp_call item_id
     let item_id = mcp_call_item
         .get("id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Event 1: response.{web_search_call|mcp_call}.completed
-    let completed_event_type = if tool_context.is_web_search() {
-        event_types::WEB_SEARCH_CALL_COMPLETED
-    } else {
-        event_types::MCP_CALL_COMPLETED
-    };
-
+    // Event 1: response.mcp_call.completed
     let completed_payload = json!({
-        "type": completed_event_type,
+        "type": event_types::MCP_CALL_COMPLETED,
         "sequence_number": *sequence_number,
         "output_index": effective_output_index,
         "item_id": item_id
@@ -546,7 +504,8 @@ pub(super) fn send_mcp_call_completion_events_with_error(
 
     let completed_event = format!(
         "event: {}\ndata: {}\n\n",
-        completed_event_type, completed_payload
+        event_types::MCP_CALL_COMPLETED,
+        completed_payload
     );
     if tx.send(Ok(Bytes::from(completed_event))).is_err() {
         return false;
@@ -579,40 +538,28 @@ pub(super) fn inject_mcp_metadata_streaming(
     state: &ToolLoopState,
     mcp: &Arc<mcp::McpManager>,
     server_label: &str,
-    tool_context: ToolContext,
 ) {
     if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
         output_array.retain(|item| {
             item.get("type").and_then(|t| t.as_str()) != Some(event_types::ITEM_TYPE_MCP_LIST_TOOLS)
         });
 
-        let mut insert_pos = 0;
-
-        // Only add mcp_list_tools for non-web-search cases
-        if !tool_context.is_web_search() {
-            let list_tools_item = build_mcp_list_tools_item(mcp, server_label);
-            output_array.insert(0, list_tools_item);
-            insert_pos = 1;
-        }
+        let list_tools_item = build_mcp_list_tools_item(mcp, server_label);
+        output_array.insert(0, list_tools_item);
 
         let mcp_call_items =
-            build_executed_mcp_call_items(&state.conversation_history, server_label, tool_context);
+            build_executed_mcp_call_items(&state.conversation_history, server_label);
+        let mut insert_pos = 1;
         for item in mcp_call_items {
             output_array.insert(insert_pos, item);
             insert_pos += 1;
         }
     } else if let Some(obj) = response.as_object_mut() {
         let mut output_items = Vec::new();
-
-        // Only add mcp_list_tools for non-web-search cases
-        if !tool_context.is_web_search() {
-            output_items.push(build_mcp_list_tools_item(mcp, server_label));
-        }
-
+        output_items.push(build_mcp_list_tools_item(mcp, server_label));
         output_items.extend(build_executed_mcp_call_items(
             &state.conversation_history,
             server_label,
-            tool_context,
         ));
         obj.insert("output".to_string(), Value::Array(output_items));
     }
@@ -711,7 +658,6 @@ pub(super) async fn execute_tool_loop(
                     "max_tool_calls",
                     active_mcp,
                     original_body,
-                    config.tool_context,
                 );
             }
 
@@ -770,28 +716,22 @@ pub(super) async fn execute_tool_loop(
                     })
                     .unwrap_or("mcp");
 
+                // Build mcp_list_tools item
+                let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
+
                 // Insert at beginning of output array
                 if let Some(output_array) = response_json
                     .get_mut("output")
                     .and_then(|v| v.as_array_mut())
                 {
-                    let mut insert_pos = 0;
+                    output_array.insert(0, list_tools_item);
 
-                    // Only add mcp_list_tools for non-web-search cases
-                    if !config.tool_context.is_web_search() {
-                        let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
-                        output_array.insert(0, list_tools_item);
-                        insert_pos = 1;
-                    }
+                    // Build mcp_call items using helper function
+                    let mcp_call_items =
+                        build_executed_mcp_call_items(&state.conversation_history, server_label);
 
-                    // Build mcp_call items (will be web_search_call for web search tools)
-                    let mcp_call_items = build_executed_mcp_call_items(
-                        &state.conversation_history,
-                        server_label,
-                        config.tool_context,
-                    );
-
-                    // Insert call items after mcp_list_tools (if present)
+                    // Insert mcp_call items after mcp_list_tools using mutable position
+                    let mut insert_pos = 1;
                     for item in mcp_call_items {
                         output_array.insert(insert_pos, item);
                         insert_pos += 1;
@@ -811,17 +751,13 @@ pub(super) fn build_incomplete_response(
     reason: &str,
     active_mcp: &Arc<mcp::McpManager>,
     original_body: &ResponsesRequest,
-    tool_context: ToolContext,
 ) -> Result<Value, String> {
     let obj = response
         .as_object_mut()
         .ok_or_else(|| "response not an object".to_string())?;
 
     // Set status to completed (not failed - partial success)
-    obj.insert(
-        "status".to_string(),
-        Value::String(web_search_constants::STATUS_COMPLETED.to_string()),
-    );
+    obj.insert("status".to_string(), Value::String("completed".to_string()));
 
     // Set incomplete_details
     obj.insert(
@@ -863,7 +799,6 @@ pub(super) fn build_incomplete_response(
                     server_label,
                     false, // Not successful
                     Some("Not executed - response stopped due to limit"),
-                    tool_context,
                 );
                 mcp_call_items.push(mcp_call_item);
             }
@@ -871,28 +806,20 @@ pub(super) fn build_incomplete_response(
 
         // Add mcp_list_tools and executed mcp_call items at the beginning
         if state.total_calls > 0 || !mcp_call_items.is_empty() {
-            let mut insert_pos = 0;
+            let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
+            output_array.insert(0, list_tools_item);
 
-            // Only add mcp_list_tools for non-web-search cases
-            if !tool_context.is_web_search() {
-                let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
-                output_array.insert(0, list_tools_item);
-                insert_pos = 1;
-            }
+            // Add mcp_call items for executed calls using helper
+            let executed_items =
+                build_executed_mcp_call_items(&state.conversation_history, server_label);
 
-            // Add mcp_call items for executed calls (will be web_search_call for web search)
-            let executed_items = build_executed_mcp_call_items(
-                &state.conversation_history,
-                server_label,
-                tool_context,
-            );
-
+            let mut insert_pos = 1;
             for item in executed_items {
                 output_array.insert(insert_pos, item);
                 insert_pos += 1;
             }
 
-            // Add incomplete mcp_call items (will be web_search_call for web search)
+            // Add incomplete mcp_call items
             for item in mcp_call_items {
                 output_array.insert(insert_pos, item);
                 insert_pos += 1;
@@ -918,67 +845,6 @@ pub(super) fn build_incomplete_response(
     }
 
     Ok(response)
-}
-
-// ============================================================================
-// Web Search Preview Helpers
-// ============================================================================
-
-/// Detect if request has web_search_preview tool
-pub(super) fn has_web_search_preview_tool(tools: &[ResponseTool]) -> bool {
-    tools
-        .iter()
-        .any(|t| matches!(t.r#type, ResponseToolType::WebSearchPreview))
-}
-
-/// Check if MCP server "web_search_preview" is available
-pub(super) async fn is_web_search_mcp_available(mcp_manager: &Arc<mcp::McpManager>) -> bool {
-    mcp_manager
-        .get_client(web_search_constants::WEB_SEARCH_PREVIEW_SERVER_NAME)
-        .await
-        .is_some()
-}
-
-/// Build a web_search_call output item (MVP - status only)
-///
-/// The MCP search results are passed to the LLM internally via function_call_output,
-/// but we don't expose them in the web_search_call item to the client.
-fn build_web_search_call_item(query: Option<String>) -> Value {
-    let mut action = serde_json::Map::new();
-    action.insert(
-        "type".to_string(),
-        Value::String(web_search_constants::ACTION_TYPE_SEARCH.to_string()),
-    );
-    if let Some(q) = query {
-        action.insert("query".to_string(), Value::String(q));
-    }
-
-    json!({
-        "id": generate_id("ws"),
-        "type": event_types::ITEM_TYPE_WEB_SEARCH_CALL,
-        "status": web_search_constants::STATUS_COMPLETED,
-        "action": action
-    })
-}
-
-/// Build a failed web_search_call output item
-fn build_web_search_call_item_failed(error: &str, query: Option<String>) -> Value {
-    let mut action = serde_json::Map::new();
-    action.insert(
-        "type".to_string(),
-        Value::String(web_search_constants::ACTION_TYPE_SEARCH.to_string()),
-    );
-    if let Some(q) = query {
-        action.insert("query".to_string(), Value::String(q));
-    }
-
-    json!({
-        "id": generate_id("ws"),
-        "type": event_types::ITEM_TYPE_WEB_SEARCH_CALL,
-        "status": web_search_constants::STATUS_FAILED,
-        "action": action,
-        "error": error
-    })
 }
 
 // ============================================================================
@@ -1018,47 +884,24 @@ pub(super) fn build_mcp_call_item(
     server_label: &str,
     success: bool,
     error: Option<&str>,
-    tool_context: ToolContext,
 ) -> Value {
-    // Check if this is a web_search_preview context - if so, build web_search_call format
-    if tool_context.is_web_search() {
-        // Extract query from arguments for web_search_call
-        let query = serde_json::from_str::<Value>(arguments).ok().and_then(|v| {
-            v.get("query")
-                .and_then(|q| q.as_str().map(|s| s.to_string()))
-        });
-
-        // Build web_search_call item (MVP - status only, no results)
-        if success {
-            build_web_search_call_item(query)
-        } else {
-            build_web_search_call_item_failed(error.unwrap_or("Tool execution failed"), query)
-        }
-    } else {
-        // Regular mcp_call item
-        json!({
-            "id": generate_id("mcp"),
-            "type": event_types::ITEM_TYPE_MCP_CALL,
-            "status": if success {
-                web_search_constants::STATUS_COMPLETED
-            } else {
-                web_search_constants::STATUS_FAILED
-            },
-            "approval_request_id": Value::Null,
-            "arguments": arguments,
-            "error": error,
-            "name": tool_name,
-            "output": output,
-            "server_label": server_label
-        })
-    }
+    json!({
+        "id": generate_id("mcp"),
+        "type": event_types::ITEM_TYPE_MCP_CALL,
+        "status": if success { "completed" } else { "failed" },
+        "approval_request_id": Value::Null,
+        "arguments": arguments,
+        "error": error,
+        "name": tool_name,
+        "output": output,
+        "server_label": server_label
+    })
 }
 
 /// Helper function to build mcp_call items from executed tool calls in conversation history
 pub(super) fn build_executed_mcp_call_items(
     conversation_history: &[Value],
     server_label: &str,
-    tool_context: ToolContext,
 ) -> Vec<Value> {
     let mut mcp_call_items = Vec::new();
 
@@ -1097,7 +940,6 @@ pub(super) fn build_executed_mcp_call_items(
                 } else {
                     None
                 },
-                tool_context,
             );
             mcp_call_items.push(mcp_call_item);
         }
