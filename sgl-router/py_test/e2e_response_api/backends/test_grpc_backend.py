@@ -23,7 +23,7 @@ from util import kill_process_tree
 
 
 class TestGrpcBackend(StateManagementTests, MCPTests):
-    """End to end tests for gRPC backend."""
+    """End to end tests for gRPC backend (Regular backend with Llama)."""
 
     @classmethod
     def setUpClass(cls):
@@ -61,6 +61,12 @@ class TestGrpcBackend(StateManagementTests, MCPTests):
 
     def test_mcp_basic_tool_call_streaming(self):
         return super().test_mcp_basic_tool_call_streaming()
+
+    # Inherited from MCPTests:
+    # - test_mcp_basic_tool_call
+    # - test_mcp_basic_tool_call_streaming
+    # - test_mixed_mcp_and_function_tools (requires external MCP server)
+    # - test_mixed_mcp_and_function_tools_streaming (requires external MCP server)
 
 
 class TestGrpcHarmonyBackend(StateManagementTests, MCPTests, FunctionCallingBaseTest):
@@ -102,9 +108,11 @@ class TestGrpcHarmonyBackend(StateManagementTests, MCPTests, FunctionCallingBase
     def test_conversation_with_multiple_turns(self):
         super().test_conversation_with_multiple_turns()
 
-    @unittest.skip("TODO: 501 Not Implemented")
-    def test_conversation_with_multiple_turns(self):
-        super().test_conversation_with_multiple_turns()
+    # Inherited from MCPTests:
+    # - test_mcp_basic_tool_call
+    # - test_mcp_basic_tool_call_streaming
+    # - test_mixed_mcp_and_function_tools (requires external MCP server)
+    # - test_mixed_mcp_and_function_tools_streaming (requires external MCP server)
 
 
 if __name__ == "__main__":

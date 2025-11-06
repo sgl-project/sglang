@@ -267,7 +267,10 @@ class MCPTests(ResponseAPIBaseTest):
         ]
 
         resp = self.create_response(
-            "What is the weather in seattle now?", tools=tools, stream=False
+            "What is the weather in seattle now?",
+            tools=tools,
+            stream=False,
+            tool_choice="auto"
         )
 
         # Should successfully make the request
@@ -328,7 +331,10 @@ class MCPTests(ResponseAPIBaseTest):
         ]
 
         resp = self.create_response(
-            "What is the weather in seattle now?", tools=tools, stream=True
+            "What is the weather in seattle now?",
+            tools=tools,
+            stream=True,
+            tool_choice="auto"  # Encourage tool usage
         )
 
         # Should successfully make the request

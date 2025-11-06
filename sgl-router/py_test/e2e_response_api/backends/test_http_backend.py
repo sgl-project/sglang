@@ -55,6 +55,20 @@ class TestOpenaiBackend(
     def tearDownClass(cls):
         kill_process_tree(cls.cluster["router"].pid)
 
+    # Inherited from MCPTests:
+    # - test_mcp_basic_tool_call (with strict validation)
+    # - test_mcp_basic_tool_call_streaming (with strict validation)
+    # - test_mixed_mcp_and_function_tools (requires external MCP server)
+    # - test_mixed_mcp_and_function_tools_streaming (requires external MCP server)
+
+    @unittest.skip("Requires external MCP server (deepwiki) - may not be accessible in CI")
+    def test_mixed_mcp_and_function_tools(self):
+        super().test_mixed_mcp_and_function_tools()
+
+    @unittest.skip("Requires external MCP server (deepwiki) - may not be accessible in CI")
+    def test_mixed_mcp_and_function_tools_streaming(self):
+        super().test_mixed_mcp_and_function_tools_streaming()
+
 
 class TestXaiBackend(StateManagementTests):
     """End to end tests for XAI backend."""
