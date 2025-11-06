@@ -97,7 +97,7 @@ def cutlass_fused_experts_fp8(
         b_scales_ptrs (torch.Tensor): Pointers container for calculating offsets of the input scales for each expert.
         use_fp8_blockscale (bool, optional): Flag indicating usage of FP8 with
             block scaling. Currently, only `True` is supported. Defaults to `True`.
-
+        output (torch.Tensor, optional): Output tensor. If not provided, a new tensor will be created.
     Returns:
         torch.Tensor: The computed MoE layer output. Shape: `(m, k)`, dtype matches `a`.
 

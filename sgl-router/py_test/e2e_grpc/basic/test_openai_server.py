@@ -23,6 +23,7 @@ _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_workers_and_router
 from util import (
+    DEFAULT_GPT_OSS_MODEL_PATH,
     DEFAULT_MODEL_PATH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -291,6 +292,52 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 
         with self.assertRaises(openai.NotFoundError):
             client.models.retrieve("non-existent-model")
+
+
+class TestOpenAIServerGptOss(TestOpenAIServer):
+    """
+    Test OpenAI API through gRPC router with openai/gpt-oss-20b model.
+    Extends TestOpenAIServer and only changes the model.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_GPT_OSS_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+
+        cls.cluster = popen_launch_workers_and_router(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            num_workers=1,
+            tp_size=2,
+            policy="round_robin",
+            api_key=cls.api_key,
+        )
+
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    def test_chat_completion(self):
+        for parallel_sample_num in [1, 2]:
+            self.run_chat_completion(None, parallel_sample_num)
+
+    def test_chat_completion_stream(self):
+        for parallel_sample_num in [1, 2]:
+            self.run_chat_completion_stream(None, parallel_sample_num)
+
+    @unittest.skip("Skipping for OSS models")
+    def test_regex(self):
+        super().test_regex()
+
+    @unittest.skip("Skipping for OSS models")
+    def test_response_prefill(self):
+        super().test_response_prefill()
+
+    @unittest.skip("Skipping for OSS models")
+    def test_penalty(self):
+        super().test_penalty()
 
 
 if __name__ == "__main__":
