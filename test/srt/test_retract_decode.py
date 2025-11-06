@@ -103,7 +103,8 @@ class TestRetractDecodeLongOutput(CustomTestCase):
             "sampling_params": {"max_new_tokens": 90000, "ignore_eos": True},
         }
         res = requests.post(f"{self.base_url}/generate", json=data)
-        print(f"Response status code: {res.status_code}")
+        assert res.status_code == 200, f"Request failed: {res.status_code}"
+        assert self.process.poll() is None, "Server crashed during test"
 
 
 @pytest.mark.skipif(is_in_ci(), reason="Skipped in CI due to long runtime")
