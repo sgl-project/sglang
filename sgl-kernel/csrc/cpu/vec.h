@@ -127,8 +127,8 @@ inline __m512bh CVT_FP8_TO_BF16(__m256i a) {
 // https://github.com/thu-pacman/chitu/blob/1ed2078ec26581ebdca05b7306d4385f86edaa7c/csrc/cuda/marlin/marlin_gemm/dequant.h#L387
 //
 inline __attribute__((always_inline)) __m512bh CVT_FP8_TO_BF16_EXT(__m256i a) {
-  static const __m512i mask0 = _mm512_set1_epi16(0x80); // sign bit
-  static const __m512i mask1 = _mm512_set1_epi16(0x7F); // exponent and mantissa
+  static const __m512i mask0 = _mm512_set1_epi16(0x80);  // sign bit
+  static const __m512i mask1 = _mm512_set1_epi16(0x7F);  // exponent and mantissa
   static const __m512i mask2 = _mm512_set1_epi16(0x4000);
 
   __m512i x = _mm512_cvtepu8_epi16(a);
