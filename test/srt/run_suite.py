@@ -215,7 +215,13 @@ suites = {
         TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
         TestFile("test_deepseek_v3_deterministic.py", 240),
     ],
+    "nightly-4-gpu-b200": [
+        TestFile("test_fp4_moe.py", 300),
+    ],
+    "nightly-4-gpu": [],
     "nightly-8-gpu": [],
+    "nightly-8-gpu-h200": [],
+    "nightly-8-gpu-h20": [],
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
         TestFile("cpu/test_comm.py"),
