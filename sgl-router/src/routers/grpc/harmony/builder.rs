@@ -277,6 +277,8 @@ impl HarmonyBuilder {
                 "high" => ReasoningEffort::High,
                 "medium" => ReasoningEffort::Medium,
                 "low" => ReasoningEffort::Low,
+                // Harmony does not support minimal reasoning effort
+                "minimal" => ReasoningEffort::Low,
                 _ => ReasoningEffort::Medium,
             });
 
@@ -302,6 +304,7 @@ impl HarmonyBuilder {
                 ResponsesReasoningEffort::High => ReasoningEffort::High,
                 ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
                 ResponsesReasoningEffort::Low => ReasoningEffort::Low,
+                ResponsesReasoningEffort::Minimal => ReasoningEffort::Low,
             });
 
         self.build_system_message(reasoning_effort, with_custom_tools)

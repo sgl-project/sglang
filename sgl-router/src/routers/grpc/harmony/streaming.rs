@@ -615,7 +615,7 @@ impl HarmonyStreamingProcessor {
         let mut accumulated_tool_calls: Option<Vec<ToolCall>> = None;
 
         // Track which items we've started
-        let mut reasoning_output_index: Option<usize> = None;
+        let mut has_emitted_reasoning = false;
         let mut message_output_index: Option<usize> = None;
         let mut message_item_id: Option<String> = None;
         let mut has_emitted_content_part_added = false;
@@ -646,18 +646,14 @@ impl HarmonyStreamingProcessor {
                     if let Some(delta) = delta_result {
                         // Analysis channel → Reasoning item (wrapper events only, emitted once)
                         if let Some(_analysis_text) = &delta.analysis_delta {
-                            if reasoning_output_index.is_none() {
-                                // Allocate reasoning item and emit wrapper events
-                                let (output_index, _item_id) =
-                                    emitter.allocate_output_index(OutputItemType::Reasoning);
-                                reasoning_output_index = Some(output_index);
-
+                            if !has_emitted_reasoning {
                                 // Emit reasoning item (added + done in one call)
                                 // Note: reasoning_content will be provided at finalize
                                 emitter
                                     .emit_reasoning_item(tx, None)
                                     .map_err(|e| format!("Failed to emit reasoning item: {}", e))?;
 
+                                has_emitted_reasoning = true;
                                 has_analysis = true;
                             }
                         }
@@ -737,7 +733,7 @@ impl HarmonyStreamingProcessor {
 
                                 // Emit output_item.added wrapper event
                                 let call_id = tc_delta.id.as_ref().unwrap();
-                                let item = json!({
+                                let mut item = json!({
                                     "id": item_id,
                                     "type": mode.type_str(),
                                     "name": tool_name,
@@ -745,6 +741,14 @@ impl HarmonyStreamingProcessor {
                                     "arguments": "",
                                     "status": "in_progress"
                                 });
+
+                                // Add server_label for MCP calls
+                                if mode.emits_status_events() {
+                                    if let Some(ref server_label) = emitter.mcp_server_label {
+                                        item["server_label"] = json!(server_label);
+                                    }
+                                }
+
                                 let event = emitter.emit_output_item_added(output_index, &item);
                                 emitter.send_event_best_effort(&event, tx);
 
@@ -840,7 +844,7 @@ impl HarmonyStreamingProcessor {
                                 }
 
                                 // Emit output_item.done wrapper event
-                                let item = json!({
+                                let mut item = json!({
                                     "id": item_id,
                                     "type": mode.type_str(),
                                     "name": tool_name,
@@ -848,11 +852,21 @@ impl HarmonyStreamingProcessor {
                                     "arguments": args_str,
                                     "status": "completed"
                                 });
-                                let event = emitter.emit_output_item_done(*output_index, &item);
-                                emitter.send_event_best_effort(&event, tx);
 
-                                // Mark output item as completed
+                                // Add server_label for MCP calls
+                                if mode.emits_status_events() {
+                                    // MCP mode - include server_label
+                                    if let Some(ref server_label) = emitter.mcp_server_label {
+                                        item["server_label"] = json!(server_label);
+                                    }
+                                }
+
+                                let event = emitter.emit_output_item_done(*output_index, &item);
+
+                                // Mark output item as completed before sending
                                 emitter.complete_output_item(*output_index);
+
+                                emitter.send_event_best_effort(&event, tx);
                             }
                         }
                     }
@@ -882,9 +896,11 @@ impl HarmonyStreamingProcessor {
                             }]
                         });
                         let event = emitter.emit_output_item_done(output_index, &item);
-                        emitter.send_event_best_effort(&event, tx);
 
+                        // Mark as completed before sending (so it's included in final output even if send fails)
                         emitter.complete_output_item(output_index);
+
+                        emitter.send_event_best_effort(&event, tx);
                     }
                 }
                 Some(proto::generate_response::Response::Error(err)) => {
@@ -928,6 +944,8 @@ impl HarmonyStreamingProcessor {
             if let Some(ref tool_calls) = accumulated_tool_calls {
                 for (call_idx, tool_call) in tool_calls.iter().enumerate() {
                     if let Some((output_index, item_id)) = tool_call_tracking.get(&call_idx) {
+                        let tool_name = &tool_call.function.name;
+
                         // Emit arguments done with final arguments
                         let args_str = tool_call.function.arguments.as_deref().unwrap_or("");
                         let event =
@@ -939,6 +957,30 @@ impl HarmonyStreamingProcessor {
                             let event = emitter.emit_mcp_call_completed(*output_index, item_id);
                             emitter.send_event_best_effort(&event, tx);
                         }
+
+                        // Emit output_item.done wrapper event
+                        let mut item = json!({
+                            "id": item_id,
+                            "type": mode.type_str(),
+                            "name": tool_name,
+                            "call_id": &tool_call.id,
+                            "arguments": args_str,
+                            "status": "completed"
+                        });
+
+                        // Add server_label for MCP calls
+                        if mode.emits_status_events() {
+                            if let Some(ref server_label) = emitter.mcp_server_label {
+                                item["server_label"] = json!(server_label);
+                            }
+                        }
+
+                        let event = emitter.emit_output_item_done(*output_index, &item);
+
+                        // Mark output item as completed before sending
+                        emitter.complete_output_item(*output_index);
+
+                        emitter.send_event_best_effort(&event, tx);
                     }
                 }
             }

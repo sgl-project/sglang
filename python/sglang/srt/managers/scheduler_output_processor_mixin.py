@@ -858,7 +858,6 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
-
                 retraction_counts.append(req.retraction_count)
 
                 if not self.spec_algorithm.is_none():
