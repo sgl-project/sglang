@@ -84,6 +84,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     placeholder_processed_text,
                     prep.token_ids.clone(),
                     prep.harmony_stop_ids.clone(),
+                    prep.tool_constraints.clone(),
                 )
                 .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?,
             _ => unreachable!(),
