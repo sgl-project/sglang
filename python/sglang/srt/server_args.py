@@ -542,6 +542,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    enable_fused_qk_norm_rope: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -3737,6 +3738,11 @@ class ServerArgs:
             "--enable-nsa-prefill-context-parallel",
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
+        )
+        parser.add_argument(
+            "--enable-fused-qk-norm-rope",
+            action="store_true",
+            help="Enable fused qk normalization and rope rotary embedding.",
         )
 
         # Dynamic batch tokenizer
