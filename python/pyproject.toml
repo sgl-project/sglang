@@ -94,8 +94,6 @@ diffusion = [
     "vsa==0.0.4",
 ]
 
-all = ["sglang[diffusion]"]
-
 [tool.uv.extra-build-dependencies]
 st-attn = ["torch", "setuptools"]
 vsa = ["torch", "setuptools"]
