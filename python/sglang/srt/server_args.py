@@ -58,6 +58,7 @@ from sglang.srt.utils.common import (
     json_list_type,
     nullable_str,
     parse_connector_type,
+    wait_port_available,
     xpu_has_xmx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
@@ -437,6 +438,7 @@ class ServerArgs:
     kt_cpuinfer: Optional[int] = None
     kt_threadpool_count: Optional[int] = None
     kt_num_gpu_experts: Optional[int] = None
+    kt_max_deferred_experts_per_token: Optional[int] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -922,19 +924,32 @@ class ServerArgs:
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
                     )
-                if self.moe_a2a_backend == "none" and self.moe_runner_backend == "auto":
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
-                    )
-                    if self.quantization is None:
-                        # Default DeepSeek V3/R1 native FP8 when not explicitly set,
-                        # Because we need this condition for an assertion in
-                        # flashinfer_trtllm MoE runner backend.
+                quantization_config = getattr(hf_config, "quantization_config", None)
+                quant_method = (
+                    quantization_config.get("quant_method")
+                    if quantization_config is not None
+                    else None
+                )
+                if self.quantization is None:
+                    # Default DeepSeek V3/R1 native FP8 when not explicitly set,
+                    # Because we need this condition for an assertion in
+                    # flashinfer_trtllm MoE runner backend.
+                    if quant_method is None:
                         self.quantization = "fp8"
                         logger.info(
                             "Quantization not specified, default to fp8 for DeepSeek on sm100"
                         )
+                    else:
+                        self.quantization = quant_method
+                if (
+                    self.moe_a2a_backend == "none"
+                    and self.moe_runner_backend == "auto"
+                    and self.quantization in ["fp8", "modelopt_fp8", "modelopt_fp4"]
+                ):
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
+                    )
 
         elif model_arch in ["GptOssForCausalLM"]:
             if (
@@ -971,30 +986,27 @@ class ServerArgs:
                 quantization_config is not None
                 and quantization_config.get("quant_method") == "mxfp4"
             )
+            if is_mxfp4_quant_format:
+                # use bf16 for mxfp4 triton kernels
+                self.dtype = "bfloat16"
 
-            if is_blackwell_supported() and is_mxfp4_quant_format:
-                self.moe_runner_backend = "flashinfer_mxfp4"
-                logger.warning(
-                    "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
-                )
-            else:
-                if self.moe_runner_backend == "triton_kernel":
-                    assert (
-                        self.ep_size == 1
-                    ), "Triton kernel MoE is only supported when ep_size == 1"
-                if (
-                    self.moe_runner_backend == "auto"
-                    and self.ep_size == 1
-                    and is_triton_kernels_available()
-                ):
+            if self.moe_runner_backend == "auto":
+                if is_blackwell_supported() and is_mxfp4_quant_format:
+                    self.moe_runner_backend = "flashinfer_mxfp4"
+                    logger.warning(
+                        "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                    )
+                elif self.ep_size == 1 and is_triton_kernels_available():
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
                         "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
                     )
+
+            if self.moe_runner_backend == "triton_kernel":
+                assert (
+                    self.ep_size == 1
+                ), "Triton kernel MoE is only supported when ep_size == 1"
             self.disable_hybrid_swa_memory = True
-            if is_mxfp4_quant_format:
-                # use bf16 for mxfp4 triton kernels
-                self.dtype = "bfloat16"
 
         elif "Llama4" in model_arch and self.device != "cpu":
             assert self.attention_backend in {
@@ -1344,6 +1356,21 @@ class ServerArgs:
             override_config,
         )
 
+        num_hidden_layers = None
+        if self.kt_max_deferred_experts_per_token is not None:
+            try:
+                model_config = self.get_model_config()
+                base_config = (
+                    getattr(model_config, "hf_text_config", None)
+                    or model_config.hf_config
+                )
+                num_hidden_layers = getattr(base_config, "num_hidden_layers", None)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to load model config for kt_max_deferred_experts_per_token: %s",
+                    exc,
+                )
+
         override_config(
             CompressedTensorsWNA16AMXEPMoEMethod,
             self.kt_num_gpu_experts,
@@ -1352,6 +1379,8 @@ class ServerArgs:
             self.kt_amx_weight_path,
             self.kt_amx_method,
             self.chunked_prefill_size,
+            self.kt_max_deferred_experts_per_token,
+            num_hidden_layers,
         )
 
     def _handle_data_parallelism(self):
@@ -2659,7 +2688,7 @@ class ServerArgs:
         parser.add_argument(
             "--mm-attention-backend",
             type=str,
-            choices=["sdpa", "fa3", "triton_attn", "ascend_attn"],
+            choices=["sdpa", "fa3", "triton_attn", "ascend_attn", "aiter_attn"],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
         )
@@ -3052,6 +3081,12 @@ class ServerArgs:
             "--kt-num-gpu-experts",
             type=int,
             help="[ktransformers parameter] The number of GPU experts.",
+        )
+        parser.add_argument(
+            "--kt-max-deferred-experts-per-token",
+            type=int,
+            default=ServerArgs.kt_max_deferred_experts_per_token,
+            help="Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         )
 
         # Double Sparsity
@@ -3754,6 +3789,10 @@ class ServerArgs:
                 "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."
             )
 
+        assert (
+            self.schedule_conservativeness >= 0
+        ), "schedule_conservativeness must be non-negative"
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
@@ -3947,9 +3986,7 @@ def set_global_server_args_for_scheduler(server_args: ServerArgs):
     _global_server_args = server_args
 
 
-def set_global_server_args_for_tokenizer(server_args: ServerArgs):
-    global _global_server_args
-    _global_server_args = server_args
+set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
 
 
 def get_global_server_args() -> ServerArgs:
@@ -4073,7 +4110,8 @@ class PortArgs:
             ), "please provide --dist-init-addr as host:port of head node"
 
             dist_init_host, dist_init_port = dist_init_addr
-            port_base = int(dist_init_port) + 1
+            dist_init_port = int(dist_init_port)
+            port_base = dist_init_port + 1
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_ipc_name = port_base + 3
@@ -4083,6 +4121,25 @@ class PortArgs:
             else:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
+
+            try:
+                if dp_rank is None:
+                    wait_port_available(dist_init_port, "dist_init_port")
+                    wait_port_available(port_base, "port_base")
+                    wait_port_available(detokenizer_port, "detokenizer_port")
+                    wait_port_available(nccl_port, "nccl_port")
+                    wait_port_available(rpc_port, "rpc_port")
+                    wait_port_available(metrics_ipc_name, "metrics_ipc_name")
+                # Check scheduler_input_port only for dp.
+                # Skip check when using worker_ports since the port is already bound by our ZMQ socket
+                if dp_rank is None or worker_ports is None:
+                    wait_port_available(scheduler_input_port, "scheduler_input_port")
+            except ValueError as e:
+                logger.exception(
+                    f"Port is already in use. {dist_init_port=} {port_base=} {detokenizer_port=} {nccl_port=} {scheduler_input_port=}"
+                )
+                raise
+
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
