@@ -384,7 +384,7 @@ class Scheduler(
             self.is_entry_rank = self.attn_tp_rank == 0
         else:
             self.cpu_group = self.tp_cpu_group
-            self.is_entry_rank = self.tp_group.rank == 0
+            self.is_entry_rank = self.tp_group.local_rank == 0
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
@@ -1191,7 +1191,7 @@ class Scheduler(
             if group_world_size > 1:
                 obj_list = [image_inputs]
                 torch.distributed.broadcast_object_list(
-                    obj_list, src=0, group=self.cpu_group
+                    obj_list, src=self.tp_group.first_rank, group=self.cpu_group
                 )
                 image_inputs = obj_list[0]
         else:
@@ -1199,7 +1199,7 @@ class Scheduler(
             if group_world_size > 1:
                 obj_list = [None]
                 torch.distributed.broadcast_object_list(
-                    obj_list, src=0, group=self.cpu_group
+                    obj_list, src=self.tp_group.first_rank, group=self.cpu_group
                 )
                 image_inputs = obj_list[0]
             else:
