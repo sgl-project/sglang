@@ -33,7 +33,7 @@ python3 -m sglang.launch_server \
 
 ## Hardware-specific notes / recommendations
 
-- On H100 with FP8: Use the FP8 checkpoint for best memory efficiency. 
+- On H100 with FP8: Use the FP8 checkpoint for best memory efficiency.
 - On A100 / H100 with BF16 (non-FP8): It’s recommended to use `--mm-max-concurrent-calls` to control parallel throughput and GPU memory usage during image/video inference.
 - On H200 & B200: The model can be run “out of the box”, supporting full context length plus concurrent image + video processing.
 
