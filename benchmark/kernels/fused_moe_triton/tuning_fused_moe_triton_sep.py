@@ -593,20 +593,20 @@ def main(args: argparse.Namespace):
             config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
         ]
     filename = get_config_filename(
-            E,
-            shard_intermediate_size,
-            hidden_size,
-            topk,
-            dtype,
-            use_fp8_w8a8,
-            use_int8_w8a8,
-            use_int8_w8a16,
-            per_channel_quant,
-            block_shape,
-        )
+        E,
+        shard_intermediate_size,
+        hidden_size,
+        topk,
+        dtype,
+        use_fp8_w8a8,
+        use_int8_w8a8,
+        use_int8_w8a16,
+        per_channel_quant,
+        block_shape,
+    )
     print(
-            f"Start tuning over {len(search_space)} configurations to create {filename}..."
-        )
+        f"Start tuning over {len(search_space)} configurations to create {filename}..."
+    )
 
     start = time.perf_counter()
     configs = _distribute(
