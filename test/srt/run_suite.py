@@ -217,6 +217,7 @@ suites = {
     ],
     "nightly-4-gpu-b200": [
         TestFile("test_fp4_moe.py", 300),
+        TestFile("test_gpt_oss_backend_4gpu.py", 400),
     ],
     "nightly-4-gpu": [],
     "nightly-8-gpu": [],
@@ -304,7 +305,6 @@ suites = {
         TestFile("test_fp8_kvcache.py"),
         TestFile("test_full_deepseek_v3.py"),
         TestFile("test_get_weights_by_name.py"),
-        TestFile("test_gpt_oss_backend_4gpu.py"),
         TestFile("test_gpt_oss_common.py"),
         TestFile("test_health_check.py"),
         TestFile("test_hicache.py"),
