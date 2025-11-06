@@ -717,9 +717,11 @@ async fn execute_tool_loop_streaming_internal(
             );
 
             // Separate MCP and function tool calls
+            let mcp_tool_names: std::collections::HashSet<&str> =
+                mcp_tools.iter().map(|t| t.name.as_ref()).collect();
             let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
                 .into_iter()
-                .partition(|(_, tool_name, _)| is_mcp_tool_call(tool_name, &mcp_tools));
+                .partition(|(_, tool_name, _)| mcp_tool_names.contains(tool_name.as_str()));
 
             debug!(
                 "Separated tool calls: {} MCP, {} function",

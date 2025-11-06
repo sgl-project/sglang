@@ -204,21 +204,16 @@ impl HarmonyResponsesContext {
     }
 }
 
-/// Check if a tool call is for an MCP tool by checking the tool type field
+/// Build a HashSet of MCP tool names for O(1) lookup
 ///
-/// This function looks up the tool in the request's tool list and checks if its
-/// type is ResponseToolType::Mcp (vs ResponseToolType::Function).
-fn is_mcp_tool_call(tool_name: &str, request_tools: &[ResponseTool]) -> bool {
+/// Creates a HashSet containing the names of all MCP tools in the request,
+/// allowing for efficient O(1) lookups when partitioning tool calls.
+fn build_mcp_tool_names_set(request_tools: &[ResponseTool]) -> std::collections::HashSet<&str> {
     request_tools
         .iter()
-        .find(|t| {
-            t.function
-                .as_ref()
-                .map(|f| f.name == tool_name)
-                .unwrap_or(false)
-        })
-        .map(|tool| tool.r#type == ResponseToolType::Mcp)
-        .unwrap_or(false)
+        .filter(|t| t.r#type == ResponseToolType::Mcp)
+        .filter_map(|t| t.function.as_ref().map(|f| f.name.as_str()))
+        .collect()
 }
 
 /// Execute Harmony Responses API request with multi-turn MCP tool support
@@ -370,9 +365,10 @@ async fn execute_with_mcp_loop(
 
                 // Separate MCP and function tool calls based on tool type
                 let request_tools = current_request.tools.as_deref().unwrap_or(&[]);
+                let mcp_tool_names = build_mcp_tool_names_set(request_tools);
                 let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
                     .into_iter()
-                    .partition(|tc| is_mcp_tool_call(&tc.function.name, request_tools));
+                    .partition(|tc| mcp_tool_names.contains(tc.function.name.as_str()));
 
                 debug!(
                     mcp_calls = mcp_tool_calls.len(),
@@ -399,7 +395,10 @@ async fn execute_with_mcp_loop(
                     );
 
                     // Combine back for response
-                    let all_tool_calls = [mcp_tool_calls, function_tool_calls].concat();
+                    let all_tool_calls: Vec<_> = mcp_tool_calls
+                        .into_iter()
+                        .chain(function_tool_calls)
+                        .collect();
 
                     // Build response with incomplete status - no tools executed due to limit
                     let mut response = build_tool_response(
@@ -804,9 +803,10 @@ async fn execute_mcp_tool_loop_streaming(
 
                 // Separate MCP and function tool calls based on tool type
                 let request_tools = current_request.tools.as_deref().unwrap_or(&[]);
+                let mcp_tool_names = build_mcp_tool_names_set(request_tools);
                 let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
                     .into_iter()
-                    .partition(|tc| is_mcp_tool_call(&tc.function.name, request_tools));
+                    .partition(|tc| mcp_tool_names.contains(tc.function.name.as_str()));
 
                 debug!(
                     mcp_calls = mcp_tool_calls.len(),
