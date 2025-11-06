@@ -19,7 +19,6 @@ def main():
     version_file = Path("sgl-kernel/python/sgl_kernel/version.py")
 
     files_to_update = [
-        Path("docker/Dockerfile"),
         Path("sgl-kernel/pyproject.toml"),
         Path("sgl-kernel/pyproject_cpu.toml"),
         Path("sgl-kernel/pyproject_rocm.toml"),
