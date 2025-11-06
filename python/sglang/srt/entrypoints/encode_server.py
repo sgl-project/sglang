@@ -92,8 +92,6 @@ class ImageEncoder:
         else:
             dist_init_method = f"tcp://127.0.0.1:{port_args.nccl_port}"
 
-        self.gpu_id = 0
-
         init_distributed_environment(
             world_size=1, rank=0, distributed_init_method=dist_init_method
         )
@@ -103,7 +101,7 @@ class ImageEncoder:
         self.model = get_model(
             model_config=self.model_config,
             load_config=self.load_config,
-            device_config=DeviceConfig(device="cuda", gpu_id=self.gpu_id),
+            device_config=DeviceConfig(),
         )
 
         logger.info(f"Using transfer backend: {self.server_args.mm_transfer_backend}")
@@ -113,7 +111,7 @@ class ImageEncoder:
 
             self.engine = MooncakeTransferEngine(
                 hostname=self.local_ip,
-                gpu_id=self.gpu_id,
+                gpu_id=None,
                 ib_device=server_args.disaggregation_ib_device,
             )
 
@@ -162,8 +160,8 @@ class ImageEncoder:
             mm_data.embedding_list[mm_data.part_idx] = None
 
         # Send ack/data
-        if prefill_host in self.send_to_prefill_sockets:
-            socket = self.send_to_prefill_sockets[prefill_host]
+        if prefill_url in self.send_to_prefill_sockets:
+            socket = self.send_to_prefill_sockets[prefill_url]
         else:
             embedding_port = await self.get_embedding_port(prefill_url)
             socket = get_zmq_socket(
@@ -172,7 +170,7 @@ class ImageEncoder:
                 f"tcp://{prefill_host}:{embedding_port}",
                 False,
             )
-            self.send_to_prefill_sockets[prefill_host] = socket
+            self.send_to_prefill_sockets[prefill_url] = socket
         socket.send_pyobj(mm_data)
 
     @torch.inference_mode()
