@@ -20,9 +20,9 @@
 //!
 //!     match result {
 //!         ToolCallsFound { tool_calls, .. } => {
-//!             // Execute MCP tools
-//!             // Build next request with tool results
-//!             // Continue loop
+//!             // Separate MCP tools from function tools
+//!             // Execute MCP tools, return if function tools found
+//!             // Continue loop with MCP results if only MCP tools
 //!         }
 //!         Completed { response, .. } => {
 //!             return Ok(response);
@@ -30,12 +30,6 @@
 //!     }
 //! }
 //! ```
-//!
-//! ## Design Reference
-//!
-//! See `/Users/simolin/workspace/sglang/.claude/docs/harmony_pipeline/tool_loop_design.md`
-//! for complete architecture, rationale, and implementation details.
-
 use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -214,15 +208,6 @@ impl HarmonyResponsesContext {
 ///
 /// This function looks up the tool in the request's tool list and checks if its
 /// type is ResponseToolType::Mcp (vs ResponseToolType::Function).
-///
-/// # Arguments
-///
-/// * `tool_name` - Name of the tool to check
-/// * `request_tools` - Tool list from the request
-///
-/// # Returns
-///
-/// true if the tool is an MCP tool, false otherwise (including if tool not found)
 fn is_mcp_tool_call(tool_name: &str, request_tools: &[ResponseTool]) -> bool {
     request_tools
         .iter()
@@ -1038,24 +1023,6 @@ async fn execute_without_mcp_streaming(
 
 /// Build ResponsesResponse with tool calls (MCP and/or function tools)
 ///
-/// This function handles all tool call response scenarios:
-/// - MCP tools (if any) are marked as completed WITH output (already executed)
-/// - Function tools (if any) are marked as completed WITHOUT output (need caller execution)
-/// - Works with pure MCP, pure function, or mixed tool calls
-///
-/// # Arguments
-///
-/// * `mcp_tool_calls` - MCP tool calls that were executed (can be empty)
-/// * `mcp_results` - Results from executing MCP tools (can be empty)
-/// * `function_tool_calls` - Function tool calls that need caller execution (can be empty)
-/// * `analysis` - Analysis channel content (reasoning)
-/// * `partial_text` - Final channel content (message)
-/// * `usage` - Token usage
-/// * `request_id` - Request ID
-/// * `responses_request` - Original request
-///
-/// # Returns
-///
 /// ResponsesResponse with tool calls
 /// TODO: Refactor to use builder pattern
 #[allow(clippy::too_many_arguments)]
@@ -1063,8 +1030,8 @@ fn build_tool_response(
     mcp_tool_calls: Vec<ToolCall>,
     mcp_results: Vec<ToolResult>,
     function_tool_calls: Vec<ToolCall>,
-    analysis: Option<String>,
-    partial_text: String,
+    analysis: Option<String>, // Analysis channel content (reasoning)
+    partial_text: String,     // Final channel content (message)
     usage: Usage,
     request_id: String,
     responses_request: Arc<ResponsesRequest>,
@@ -1179,13 +1146,6 @@ fn build_tool_response(
 /// Executes each tool call sequentially via the MCP manager.
 /// Tool execution errors are returned as error results to the model
 /// (allows model to handle gracefully).
-///
-/// # Arguments
-///
-/// * `mcp_manager` - MCP manager for tool execution
-/// * `tool_calls` - Tool calls from commentary channel
-///
-/// # Returns
 ///
 /// Vector of tool results (one per tool call)
 async fn execute_mcp_tools(
@@ -1308,24 +1268,12 @@ async fn execute_mcp_tools(
 /// 1. Original input items (preserved)
 /// 2. Assistant message with analysis (reasoning) + partial_text + tool_calls
 /// 3. Tool result messages for each tool execution
-///
-/// # Arguments
-///
-/// * `request` - Current request (contains original input)
-/// * `tool_calls` - Tool calls from commentary channel
-/// * `tool_results` - Results from MCP tool execution
-/// * `analysis` - Analysis channel content (becomes reasoning content)
-/// * `partial_text` - Final channel content (becomes message content)
-///
-/// # Returns
-///
-/// New ResponsesRequest with appended history
 fn build_next_request_with_tools(
     mut request: ResponsesRequest,
     tool_calls: Vec<ToolCall>,
     tool_results: Vec<ToolResult>,
-    analysis: Option<String>,
-    partial_text: String,
+    analysis: Option<String>, // Analysis channel content (becomes reasoning content)
+    partial_text: String,     // Final channel content (becomes message content)
 ) -> Result<ResponsesRequest, Box<Response>> {
     // Get current input items (or empty vec if Text variant)
     let mut items = match request.input {
