@@ -12,7 +12,6 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
-import base64
 import io
 import json
 import os
@@ -26,13 +25,17 @@ import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
+import pybase64
 import requests
+from datasets import load_dataset
+from PIL import Image
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoProcessor,
@@ -86,6 +89,7 @@ class RequestFuncOutput:
     latency: float = 0.0
     ttft: float = 0.0  # Time to first token
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
+    text_chunks: List[str] = field(default_factory=list)
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
@@ -256,6 +260,9 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
+                                    output.text_chunks.append(
+                                        data["choices"][0]["text"]
+                                    )
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
@@ -572,9 +579,8 @@ async def async_request_sglang_generate(
                                     num_new_tokens = output_len - last_output_len
                                     if num_new_tokens == 0:
                                         continue
-                                    adjust_itl = (
-                                        timestamp - most_recent_timestamp
-                                    ) / num_new_tokens
+                                    chunk_gap = timestamp - most_recent_timestamp
+                                    adjust_itl = chunk_gap / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
 
                                 most_recent_timestamp = timestamp
@@ -609,7 +615,10 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
-            async with session.post(url=api_url) as response:
+            body = {
+                "activities": getattr(args, "profile_activities", []),
+            }
+            async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -621,6 +630,48 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
             output.error = "".join(traceback.format_exception(*exc_info))
 
     return output
+
+
+def _build_profile_urls(
+    profile_prefill_url: Optional[List[str]],
+    profile_decode_url: Optional[List[str]],
+) -> List[Tuple[str, str]]:
+    """Build profile URLs list from prefill/decode URL arguments.
+
+    Returns:
+        List of (worker_type, url) tuples. e.g., [("Prefill-0", "http://..."), ("Decode-0", "http://...")]
+    """
+    profile_urls = []
+    if profile_prefill_url:
+        for idx, url in enumerate(profile_prefill_url):
+            profile_urls.append((f"Prefill-{idx}", url))
+    if profile_decode_url:
+        for idx, url in enumerate(profile_decode_url):
+            profile_urls.append((f"Decode-{idx}", url))
+    return profile_urls
+
+
+async def _call_profile_pd(profile_urls: List[Tuple[str, str]], mode: str) -> None:
+    """Call profile endpoint (start/stop) on PD separated workers.
+
+    Args:
+        profile_urls: List of (worker_type, url) tuples
+        mode: "start" or "stop"
+    """
+    endpoint = "/start_profile" if mode == "start" else "/stop_profile"
+    action = "Starting" if mode == "start" else "Stopping"
+    action_past = "started" if mode == "start" else "stopped"
+
+    print(f"{action} profiler...")
+
+    for worker_type, url in profile_urls:
+        profile_output = await async_request_profile(api_url=url + endpoint)
+        if profile_output.success:
+            print(f"Profiler {action_past} for {worker_type} worker at {url}")
+        else:
+            print(
+                f"Failed to {mode} profiler for {worker_type} worker at {url}: {profile_output.error}"
+            )
 
 
 def get_model(pretrained_model_name_or_path: str) -> str:
@@ -671,7 +722,7 @@ def get_processor(
     if pretrained_model_name_or_path.endswith(
         ".json"
     ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.hf_transformers_utils import get_processor
+        from sglang.srt.utils.hf_transformers_utils import get_processor
 
         return get_processor(pretrained_model_name_or_path)
 
@@ -720,6 +771,7 @@ def get_dataset(args, tokenizer, model_id=None):
             image_content=args.image_content,
             image_format=args.image_format,
             image_resolution=args.image_resolution,
+            backend=args.backend,
         )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
@@ -737,6 +789,7 @@ def get_dataset(args, tokenizer, model_id=None):
         input_requests = sample_mmmu_requests(
             num_requests=args.num_prompts,
             processor=processor,
+            backend=args.backend,
             fixed_output_len=args.random_output_len,
             random_sample=True,
         )
@@ -935,7 +988,7 @@ async def get_mooncake_request_over_time(
         for i in range(num_rounds):
             # Add user query for the current round
             chat_history.append(
-                {"role": "user", "content": f"Round {i+1}: {user_query_base}"}
+                {"role": "user", "content": f"Round {i + 1}: {user_query_base}"}
             )
 
             # Form the full prompt from history
@@ -964,7 +1017,8 @@ async def get_mooncake_request_over_time(
 
 def sample_mmmu_requests(
     num_requests: int,
-    processor: AutoProcessor,
+    processor: AutoProcessor | AutoTokenizer,
+    backend: str = "sglang",
     fixed_output_len: Optional[int] = None,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
@@ -973,22 +1027,12 @@ def sample_mmmu_requests(
 
     Args:
         num_requests: Number of requests to sample.
-        tokenizer: Tokenizer to use for token counting.
         fixed_output_len: If provided, use this fixed output length for all requests.
-        apply_chat_template: Whether to apply the chat template to the prompt.
         random_sample: Whether to randomly sample or take the first N.
 
     Returns:
         List of tuples (prompt, prompt_token_len, output_token_len).
     """
-    try:
-        import io
-
-        import pybase64
-        from datasets import load_dataset
-    except ImportError:
-        raise ImportError("Please install datasets: pip install datasets")
-
     print("Loading MMMU dataset from HuggingFace...")
 
     try:
@@ -1047,7 +1091,7 @@ def sample_mmmu_requests(
                 text_prompt = f"Question: {question}\n\nAnswer: "
                 output_len = fixed_output_len if fixed_output_len is not None else 256
                 data_row = create_mm_data_row(
-                    text_prompt, [image], [image_data], output_len, processor
+                    text_prompt, [image], [image_data], output_len, processor, backend
                 )
                 filtered_dataset.append(data_row)
 
@@ -1282,19 +1326,27 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
     )
 
 
-def create_mm_data_row(text_prompt, images, images_base64, output_len, processor):
+def create_mm_data_row(
+    text_prompt, images: list, images_base64, output_len, processor, backend
+):
     try:
-        content_items = [
-            {"type": "image_url", "image_url": {"url": img_url}}
-            for img_url in images_base64
-        ]
-        content_items.append({"type": "text", "text": text_prompt})
+        if type(processor).__name__ == "Phi4MMProcessor":
+            # <|endoftext10|> is the image token used in the phi-4-multimodal model.
+            content_items = text_prompt.replace("image 1", "|endoftext10|")
+        else:
+            content_items = [
+                {"type": "image", "image": {"url": image_base64}}
+                for image_base64 in images_base64
+            ]
+            content_items.append({"type": "text", "text": text_prompt})
         prompt_str = processor.apply_chat_template(
             [{"role": "user", "content": content_items}],
             add_generation_prompt=True,
             tokenize=False,
         )
-    except Exception:
+    except Exception as e:
+        # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
+        print(f"Error applying chat template: {e}, fallback to <image> tag")
         # Some tokenizers do not support list content; fall back to a placeholder in the text
         prompt_str = f"<image>{text_prompt}"
 
@@ -1321,13 +1373,24 @@ def create_mm_data_row(text_prompt, images, images_base64, output_len, processor
         )["input_ids"].numel()
     except Exception:
         # Fallback: just tokenize the text prompt directly
-        text_prompt_len = len(processor.tokenizer.encode(text_prompt))
+        tokenizer_to_use = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
 
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
 
+    use_raw_prompt = backend in [
+        "sglang-oai",
+        "sglang-oai-chat",
+        "vllm",
+        "vllm-chat",
+        "lmdeploy",
+        "lmdeploy-chat",
+    ]
     return DatasetRow(
-        prompt=text_prompt,
+        prompt=text_prompt if use_raw_prompt else prompt_str,
         prompt_len=prompt_len,
         output_len=output_len,
         text_prompt_len=text_prompt_len,
@@ -1346,6 +1409,7 @@ def sample_image_requests(
     image_content: str,
     image_format: str,
     image_resolution: str,
+    backend: str,
 ) -> List[DatasetRow]:
     """Generate requests with images.
 
@@ -1355,13 +1419,6 @@ def sample_image_requests(
     - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
       only counts text tokens and excludes image data.
     """
-    try:
-        import pybase64
-        from PIL import Image
-    except ImportError as e:
-        raise ImportError(
-            "Please install Pillow to generate random images: pip install pillow"
-        ) from e
 
     # Parse resolution (supports presets and 'heightxwidth')
     width, height = parse_image_resolution(image_resolution)
@@ -1418,6 +1475,7 @@ def sample_image_requests(
             list(images_base64),
             int(output_lens[i]),
             processor,
+            backend,
         )
 
         dataset.append(data_row)
@@ -1425,14 +1483,20 @@ def sample_image_requests(
     print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
     print(
-        f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes//num_requests} bytes per request"
+        f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"
     )
     return dataset
 
 
+@lru_cache(maxsize=1)
+def get_available_tokens(tokenizer):
+    """Get all available token ids from the tokenizer vocabulary."""
+    return list(tokenizer.get_vocab().values())
+
+
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
+    all_available_tokens = get_available_tokens(tokenizer)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
@@ -1443,7 +1507,7 @@ def get_gen_prefix_cache_path(args, tokenizer):
 
     # Create a unique cache filename based on the generation parameters
     cache_key = (
-        f"gen_shared_prefix_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
+        f"gen_shared_prefix_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
         f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
         f"{tokenizer.__class__.__name__}.pkl"
     )
@@ -1578,6 +1642,7 @@ def calculate_metrics(
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
     backend: str,
+    accept_length: Optional[float] = None,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
@@ -1589,6 +1654,14 @@ def calculate_metrics(
     tpots: List[float] = []
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
+    retokenized_itls: List[float] = []
+
+    use_retokenized_itl = (
+        accept_length is not None
+        and accept_length > 0
+        and backend in ("sglang-oai", "sglang-oai-chat")
+    )
+
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_len
@@ -1602,7 +1675,17 @@ def calculate_metrics(
             total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
-            itls += outputs[i].itl
+            if use_retokenized_itl:
+                for k, itl in enumerate(outputs[i].itl):
+                    num_tokens = len(
+                        tokenizer.encode(
+                            outputs[i].text_chunks[k], add_special_tokens=False
+                        )
+                    )
+                    adjusted_itl = itl / num_tokens
+                    retokenized_itls.extend([adjusted_itl] * num_tokens)
+            else:
+                itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
@@ -1618,6 +1701,8 @@ def calculate_metrics(
             "on the benchmark arguments.",
             stacklevel=2,
         )
+
+    itls = retokenized_itls if use_retokenized_itl else itls
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -1668,6 +1753,8 @@ async def benchmark(
     max_concurrency: Optional[int],
     disable_tqdm: bool,
     lora_names: List[str],
+    lora_request_distribution: Optional[str],
+    lora_zipf_alpha: Optional[float],
     extra_request_body: Dict[str, Any],
     profile: bool,
     pd_separated: bool = False,
@@ -1676,6 +1763,8 @@ async def benchmark(
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
     mooncake_num_rounds=1,
+    profile_prefill_url: Optional[List[str]] = None,
+    profile_decode_url: Optional[List[str]] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1765,14 +1854,28 @@ async def benchmark(
 
     time.sleep(1.0)
 
+    # Build profile URLs for PD separated mode (do this once at the beginning)
+    pd_profile_urls = []
+    if profile and pd_separated:
+        pd_profile_urls = _build_profile_urls(profile_prefill_url, profile_decode_url)
+        if not pd_profile_urls:
+            print(
+                "Warning: PD separated mode requires --profile-prefill-url or --profile-decode-url"
+            )
+            print("Skipping profiler start. Please specify worker URLs for profiling.")
+
     # Start profiler
     if profile:
-        print("Starting profiler...")
-        profile_output = await async_request_profile(
-            api_url=base_url + "/start_profile"
-        )
-        if profile_output.success:
-            print("Profiler started")
+        if pd_separated:
+            if pd_profile_urls:
+                await _call_profile_pd(pd_profile_urls, "start")
+        else:
+            print("Starting profiler...")
+            profile_output = await async_request_profile(
+                api_url=base_url + "/start_profile"
+            )
+            if profile_output.success:
+                print("Profiler started")
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
@@ -1792,11 +1895,30 @@ async def benchmark(
     else:
         request_generator = get_request(input_requests, request_rate)
 
+    # Prepare LoRA request distribution parameters
+    if lora_request_distribution == "distinct":
+        lora_idx = 0
+    elif lora_request_distribution == "skewed":
+        weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
+        lora_probs = weights / np.sum(weights)
+    else:
+        lora_idx = None
+        lora_probs = None
+
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     async for request in request_generator:
         if lora_names is not None and len(lora_names) != 0:
-            idx = random.randint(0, len(lora_names) - 1)
-            lora_name = lora_names[idx]
+            if lora_request_distribution == "uniform":
+                lora_name = random.choice(lora_names)
+            elif lora_request_distribution == "distinct":
+                lora_name = lora_names[lora_idx]
+                lora_idx = (lora_idx + 1) % len(lora_names)
+            else:
+                assert (
+                    lora_request_distribution == "skewed"
+                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+
+                lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
             lora_name = None
 
@@ -1821,10 +1943,16 @@ async def benchmark(
 
     # Stop profiler
     if profile:
-        print("Stopping profiler...")
-        profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
-        if profile_output.success:
-            print("Profiler stopped")
+        if pd_separated:
+            if pd_profile_urls:
+                await _call_profile_pd(pd_profile_urls, "stop")
+        else:
+            print("Stopping profiler...")
+            profile_output = await async_request_profile(
+                api_url=base_url + "/stop_profile"
+            )
+            if profile_output.success:
+                print("Profiler stopped")
 
     if pbar is not None:
         pbar.close()
@@ -1837,9 +1965,15 @@ async def benchmark(
             server_info_json = server_info.json()
             if "decode" in server_info_json:
                 server_info_json = server_info_json["decode"][0]
-            accept_length = server_info_json["internal_states"][0].get(
-                "avg_spec_accept_length", None
-            )
+            if (
+                "internal_states" in server_info_json
+                and server_info_json["internal_states"]
+            ):
+                accept_length = server_info_json["internal_states"][0].get(
+                    "avg_spec_accept_length", None
+                )
+            else:
+                accept_length = None
         else:
             accept_length = None
     else:
@@ -1853,6 +1987,7 @@ async def benchmark(
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
         backend=backend,
+        accept_length=accept_length,
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -1925,6 +2060,9 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
+    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
+    server_info = resp.json() if resp.status_code == 200 else None
+
     if (
         metrics.median_ttft_ms is not None
         and metrics.mean_itl_ms is not None
@@ -1932,6 +2070,7 @@ async def benchmark(
     ):
         result = {
             # Arguments
+            "tag": getattr(args, "tag", None),
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,
@@ -1940,6 +2079,8 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
+            # Information
+            "server_info": server_info,
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -2057,6 +2198,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
 
+    if not hasattr(args, "served_model_name"):
+        args.served_model_name = None
+
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -2166,11 +2310,20 @@ def run_benchmark(args_: argparse.Namespace):
             not args.tokenize_prompt
         ), "`--tokenize-prompt` not compatible with image dataset"
 
+    if args.lora_request_distribution in ["distinct", "skewed"]:
+        assert (
+            args.lora_name is not None and len(args.lora_name) > 1
+        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+
+    assert (
+        args.lora_zipf_alpha > 1
+    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+
     print(f"{args}\n")
 
     # Read dataset
     backend = args.backend
-    model_id = args.model
+    model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
@@ -2178,6 +2331,17 @@ def run_benchmark(args_: argparse.Namespace):
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
+
+    # Prepare LoRA arguments
+    lora_request_distribution = (
+        args.lora_request_distribution if args.lora_name is not None else None
+    )
+
+    lora_zipf_alpha = (
+        args.lora_zipf_alpha
+        if args.lora_name is not None and args.lora_request_distribution == "skewed"
+        else None
+    )
 
     return asyncio.run(
         benchmark(
@@ -2191,6 +2355,8 @@ def run_benchmark(args_: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             disable_tqdm=args.disable_tqdm,
             lora_names=args.lora_name,
+            lora_request_distribution=lora_request_distribution,
+            lora_zipf_alpha=lora_zipf_alpha,
             extra_request_body=extra_request_body,
             profile=args.profile,
             pd_separated=args.pd_separated,
@@ -2199,6 +2365,8 @@ def run_benchmark(args_: argparse.Namespace):
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
             mooncake_num_rounds=args.mooncake_num_rounds,
+            profile_prefill_url=getattr(args, "profile_prefill_url", None),
+            profile_decode_url=getattr(args, "profile_decode_url", None),
         )
     )
 
@@ -2266,6 +2434,11 @@ if __name__ == "__main__":
         "--model",
         type=str,
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        help="The name of the model as served by the serving service. If not set, this defaults to the value of --model.",
     )
     parser.add_argument(
         "--tokenizer",
@@ -2405,6 +2578,14 @@ if __name__ == "__main__":
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
+    # TODO unify all these
+    parser.add_argument(
+        "--profile-activities",
+        type=str,
+        nargs="+",
+        default=["CPU", "GPU"],
+        choices=["CPU", "GPU", "CUDA_PROFILER"],
+    )
     parser.add_argument(
         "--lora-name",
         type=str,
@@ -2412,6 +2593,27 @@ if __name__ == "__main__":
         default=None,
         action=LoRAPathAction,
         help="The names of LoRA adapters. You can provide a list of names in the format {name} {name} {name}...",
+    )
+    parser.add_argument(
+        "--lora-request-distribution",
+        type=str,
+        default="uniform",
+        choices=[
+            "uniform",
+            "distinct",
+            "skewed",
+        ],
+        help="What distribution to sample the LoRA adapters specified in --lora-name. Borrowed from the Punica paper. "
+        "'distinct' distribution means selecting a new LoRA adapter for every request. "
+        "'skewed' distribution follows the Zipf distribution, where the number of requests "
+        "to model i specified in --lora-name is α times the number of requests for model i+1, "
+        "where α > 1.",
+    )
+    parser.add_argument(
+        "--lora-zipf-alpha",
+        type=float,
+        default=1.5,
+        help="The parameter to use for the Zipf distribution when --lora-request-distribution='skewed'.",
     )
     parser.add_argument(
         "--prompt-suffix",
@@ -2423,6 +2625,30 @@ if __name__ == "__main__":
         "--pd-separated",
         action="store_true",
         help="Benchmark PD disaggregation server",
+    )
+
+    # Create a mutually exclusive group for profiling URLs
+    # In PD separated mode, prefill and decode workers must be profiled separately
+    profile_url_group = parser.add_mutually_exclusive_group()
+    profile_url_group.add_argument(
+        "--profile-prefill-url",
+        type=str,
+        nargs="*",
+        default=None,
+        help="URL(s) of the prefill worker(s) for profiling in PD separated mode. "
+        "Can specify multiple URLs: --profile-prefill-url http://localhost:30000 http://localhost:30001. "
+        "NOTE: Cannot be used together with --profile-decode-url. "
+        "In PD separated mode, prefill and decode workers must be profiled separately.",
+    )
+    profile_url_group.add_argument(
+        "--profile-decode-url",
+        type=str,
+        nargs="*",
+        default=None,
+        help="URL(s) of the decode worker(s) for profiling in PD separated mode. "
+        "Can specify multiple URLs: --profile-decode-url http://localhost:30010 http://localhost:30011. "
+        "NOTE: Cannot be used together with --profile-prefill-url. "
+        "In PD separated mode, prefill and decode workers must be profiled separately.",
     )
     parser.add_argument(
         "--flush-cache",
@@ -2499,6 +2725,9 @@ if __name__ == "__main__":
             "toolagent",
         ],
         help="Underlying workload for the mooncake dataset.",
+    )
+    parser.add_argument(
+        "--tag", type=str, default=None, help="The tag to be dumped to output."
     )
     args = parser.parse_args()
     run_benchmark(args)

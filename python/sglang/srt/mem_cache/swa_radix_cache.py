@@ -20,12 +20,12 @@ The radix tree data structure for managing the hybrid (full and SWA) KV cache.
 """
 
 import heapq
-import time
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+from numpy import float64
 
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
@@ -50,6 +50,7 @@ class TreeNode:
 
     counter = 0
     swa_uuid_counter = 1
+    last_access_time_counter_float = float64(1.0)
 
     def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
@@ -64,7 +65,7 @@ class TreeNode:
         self.full_lock_ref = 0
         self.swa_lock_ref = 0
         # last access time is only used for sanity check. LRU is maintained by the lru list.
-        self.last_access_time = time.monotonic()
+        self.last_access_time = get_last_access_time()
 
         self.hit_count = 0
         # store the host indices of KV cache
@@ -97,6 +98,12 @@ class TreeNode:
 def gen_swa_uuid() -> int:
     TreeNode.swa_uuid_counter += 1
     return TreeNode.swa_uuid_counter
+
+
+def get_last_access_time() -> float64:
+    ret = TreeNode.last_access_time_counter_float
+    TreeNode.last_access_time_counter_float += 1.0
+    return ret
 
 
 class LRUList:
@@ -427,19 +434,18 @@ class SWARadixCache(BasePrefixCache):
 
         return self._insert_helper(self.root_node, key, value, prev_prefix_len)
 
-    def cache_finished_req(self, req: Req) -> None:
+    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
+        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx,
-                : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
+                req.req_pool_idx, :all_token_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
-        all_token_len = len(token_ids)
+        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
@@ -449,11 +455,12 @@ class SWARadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = actual_kv_len // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].clone()
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
         else:
             page_aligned_len = actual_kv_len
-            page_aligned_kv_indices = kv_indices.clone()
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
             if self.is_eagle:
                 self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
@@ -470,11 +477,19 @@ class SWARadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
-        new_prefix_len = self.insert(
-            RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
-            page_aligned_kv_indices,
-            old_prefix_len,
-        )
+        if is_insert:
+            new_prefix_len = self.insert(
+                RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
+                page_aligned_kv_indices,
+                old_prefix_len,
+            )
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:page_aligned_len]
+            )
+
+        # free the unaligned tail
+        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -502,10 +517,12 @@ class SWARadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = actual_kv_len // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].clone()
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
         else:
             page_aligned_len = actual_kv_len
-            page_aligned_kv_indices = kv_indices.clone()
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
         # For EAGLE, the page_aligned_len is for the bigram key, the normal key len should +1
         page_aligned_token_len = (
@@ -831,15 +848,18 @@ class SWARadixCache(BasePrefixCache):
 
         # update time for matched nodes, and make nodes closer to root to be least recently used
         # this allows swa to evict nodes closer to root first
-        self.full_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
-        self.swa_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
+        node_update = best_last_node
+        self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+        self.swa_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
 
         # This last_access_time is for sanity check, can be deleted after validation in production
-        cur_time = time.monotonic()
-        while node:
-            node.last_access_time = cur_time
-            cur_time -= 0.0001
-            node = node.parent
+        cur_time = get_last_access_time()
+        while node_update:
+            node_update.last_access_time = cur_time
+            cur_time -= (
+                0.00001  # assuming less than 100000 nodes in a branch of the tree
+            )
+            node_update = node_update.parent
 
         return value[:best_value_len], best_last_node
 
@@ -857,7 +877,7 @@ class SWARadixCache(BasePrefixCache):
         new_node.swa_uuid = child.swa_uuid
         child.swa_uuid = None
         # child time should be later than parent's time for swa tombstone
-        child.last_access_time = time.monotonic()
+        child.last_access_time = get_last_access_time()
 
         # remove the child from the lru lists because it is being split
         self.full_lru_list.remove_node(child)
@@ -882,7 +902,7 @@ class SWARadixCache(BasePrefixCache):
     ) -> int:
         # Update the last access time from root to leaf, so that
         # swa will tombstone the node closer to root first
-        node.last_access_time = time.monotonic()
+        node.last_access_time = get_last_access_time()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:
@@ -895,7 +915,7 @@ class SWARadixCache(BasePrefixCache):
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = time.monotonic()
+            node.last_access_time = get_last_access_time()
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:
                 self.swa_lru_list.reset_node_mru(node)

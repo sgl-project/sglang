@@ -4,23 +4,23 @@
 //! eliminating deep parameter passing chains and providing a single source of truth
 //! for request state.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::http::HeaderMap;
 use serde_json::Value;
 
-use crate::core::Worker;
-use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{ChatCompletionRequest, ChatCompletionResponse, GenerateRequest};
-use crate::reasoning_parser::ReasoningParserFactory;
-use crate::tokenizer::stop::StopSequenceDecoder;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ToolParserFactory;
-
-// ============================================================================
-// Core Context Types
-// ============================================================================
+use crate::{
+    core::Worker,
+    grpc_client::{proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatCompletionResponse},
+        generate::{GenerateRequest, GenerateResponse},
+        responses::ResponsesRequest,
+    },
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer},
+    tool_parser::ParserFactory as ToolParserFactory,
+};
 
 /// Main request processing context
 ///
@@ -28,13 +28,8 @@ use crate::tool_parser::ToolParserFactory;
 /// through the pipeline stages. Uses Rust's type system to enforce proper
 /// stage ordering at compile time.
 pub struct RequestContext {
-    // === Input (Immutable) ===
     pub input: RequestInput,
-
-    // === Shared Components (Immutable References) ===
     pub components: Arc<SharedComponents>,
-
-    // === Processing State (Mutable, evolves through pipeline) ===
     pub state: ProcessingState,
 }
 
@@ -46,9 +41,11 @@ pub struct RequestInput {
 }
 
 /// Request type variants
+/// Using Arc instead of Box to enable cheap cloning for background tasks
 pub enum RequestType {
-    Chat(Box<ChatCompletionRequest>),
-    Generate(Box<GenerateRequest>),
+    Chat(Arc<ChatCompletionRequest>),
+    Generate(Arc<GenerateRequest>),
+    Responses(Arc<ResponsesRequest>),
 }
 
 /// Shared components (injected once at creation)
@@ -80,10 +77,6 @@ pub struct ProcessingState {
     pub response: ResponseState,
 }
 
-// ============================================================================
-// Stage-Specific Output Types
-// ============================================================================
-
 /// Output from preparation stage (Step 1)
 pub struct PreparationOutput {
     /// Original text (for chat) or resolved text (for generate)
@@ -100,6 +93,19 @@ pub struct PreparationOutput {
 
     /// Filtered request (if tools were filtered)
     pub filtered_request: Option<ChatCompletionRequest>,
+
+    // Harmony-specific fields
+    /// Whether this is a Harmony request (default: false)
+    pub harmony_mode: bool,
+
+    /// Selection text for worker routing (Harmony only)
+    pub selection_text: Option<String>,
+
+    /// Harmony messages for history tracking (Harmony only)
+    pub harmony_messages: Option<Vec<super::harmony::HarmonyMessage>>,
+
+    /// Stop token IDs for Harmony models
+    pub harmony_stop_ids: Option<Vec<u32>>,
 }
 
 /// Worker selection (Step 2)
@@ -151,6 +157,16 @@ pub struct ResponseState {
 
     /// Final processed response
     pub final_response: Option<FinalResponse>,
+
+    /// Responses API iteration result (Harmony only, for tool loop orchestration)
+    pub responses_iteration_result: Option<super::harmony::ResponsesIterationResult>,
+
+    // Harmony-specific parser state
+    /// Harmony parser for non-streaming (single parser for all indices)
+    pub harmony_parser: Option<super::harmony::HarmonyParserAdapter>,
+
+    /// Harmony parsers for streaming (one per index for n>1 support)
+    pub harmony_parser_per_index: Option<HashMap<usize, super::harmony::HarmonyParserAdapter>>,
 }
 
 /// Streaming state (per-choice tracking)
@@ -172,21 +188,17 @@ pub struct StreamingState {
     pub has_tool_calls: HashMap<u32, bool>,
 }
 
-// ============================================================================
-// Context Builders
-// ============================================================================
-
 impl RequestContext {
     /// Create context for chat completion request
     pub fn for_chat(
-        request: ChatCompletionRequest,
+        request: Arc<ChatCompletionRequest>,
         headers: Option<HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Self {
         Self {
             input: RequestInput {
-                request_type: RequestType::Chat(Box::new(request)),
+                request_type: RequestType::Chat(request),
                 headers,
                 model_id,
             },
@@ -197,14 +209,32 @@ impl RequestContext {
 
     /// Create context for generate request
     pub fn for_generate(
-        request: GenerateRequest,
+        request: Arc<GenerateRequest>,
         headers: Option<HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Self {
         Self {
             input: RequestInput {
-                request_type: RequestType::Generate(Box::new(request)),
+                request_type: RequestType::Generate(request),
+                headers,
+                model_id,
+            },
+            components,
+            state: ProcessingState::default(),
+        }
+    }
+
+    /// Create context for Responses API request
+    pub fn for_responses(
+        request: Arc<ResponsesRequest>,
+        headers: Option<HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self {
+            input: RequestInput {
+                request_type: RequestType::Responses(request),
                 headers,
                 model_id,
             },
@@ -226,11 +256,11 @@ impl RequestContext {
         }
     }
 
-    /// Try to get chat request
-    pub fn try_chat_request(&self) -> Option<&ChatCompletionRequest> {
+    /// Get Arc clone of chat request (panics if not chat)
+    pub fn chat_request_arc(&self) -> Arc<ChatCompletionRequest> {
         match &self.input.request_type {
-            RequestType::Chat(req) => Some(req.as_ref()),
-            _ => None,
+            RequestType::Chat(req) => Arc::clone(req),
+            _ => panic!("Expected chat request"),
         }
     }
 
@@ -242,11 +272,27 @@ impl RequestContext {
         }
     }
 
-    /// Try to get generate request
-    pub fn try_generate_request(&self) -> Option<&GenerateRequest> {
+    /// Get Arc clone of generate request (panics if not generate)
+    pub fn generate_request_arc(&self) -> Arc<GenerateRequest> {
         match &self.input.request_type {
-            RequestType::Generate(req) => Some(req.as_ref()),
-            _ => None,
+            RequestType::Generate(req) => Arc::clone(req),
+            _ => panic!("Expected generate request"),
+        }
+    }
+
+    /// Get responses request (panics if not responses)
+    pub fn responses_request(&self) -> &ResponsesRequest {
+        match &self.input.request_type {
+            RequestType::Responses(req) => req.as_ref(),
+            _ => panic!("Expected responses request"),
+        }
+    }
+
+    /// Get Arc clone of responses request (panics if not responses)
+    pub fn responses_request_arc(&self) -> Arc<ResponsesRequest> {
+        match &self.input.request_type {
+            RequestType::Responses(req) => Arc::clone(req),
+            _ => panic!("Expected responses request"),
         }
     }
 
@@ -255,27 +301,10 @@ impl RequestContext {
         match &self.input.request_type {
             RequestType::Chat(req) => req.stream,
             RequestType::Generate(req) => req.stream,
+            RequestType::Responses(req) => req.stream.unwrap_or(false),
         }
     }
-
-    /// Check if request is chat
-    pub fn is_chat(&self) -> bool {
-        matches!(&self.input.request_type, RequestType::Chat(_))
-    }
-
-    /// Check if request is generate
-    pub fn is_generate(&self) -> bool {
-        matches!(&self.input.request_type, RequestType::Generate(_))
-    }
 }
-
-// ============================================================================
-// Default Implementations
-// ============================================================================
-
-// ============================================================================
-// Helper Methods
-// ============================================================================
 
 impl WorkerSelection {
     pub fn is_dual(&self) -> bool {
@@ -374,25 +403,21 @@ impl ClientSelection {
     }
 }
 
-// ============================================================================
-// Execution and Response Types
-// ============================================================================
-
-use tonic::codec::Streaming;
-
 /// Result of request execution (streams from workers)
+/// Uses AbortOnDropStream to automatically abort on cancellation
 pub enum ExecutionResult {
     Single {
-        stream: Streaming<proto::GenerateResponse>,
+        stream: AbortOnDropStream,
     },
     Dual {
-        prefill: Streaming<proto::GenerateResponse>,
-        decode: Box<Streaming<proto::GenerateResponse>>,
+        prefill: AbortOnDropStream,
+        decode: Box<AbortOnDropStream>,
     },
 }
 
 /// Final processed response
 pub enum FinalResponse {
     Chat(ChatCompletionResponse),
-    Generate(Box<GenerateRequest>),
+    /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
+    Generate(Vec<GenerateResponse>),
 }
