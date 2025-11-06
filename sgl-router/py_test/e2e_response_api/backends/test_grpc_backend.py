@@ -48,6 +48,9 @@ class TestGrpcBackend(StateManagementTests, MCPTests):
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
 
+    def test_previous_response_id_chaining(self):
+        super().test_previous_response_id_chaining()
+
     @unittest.skip("TODO: return 501 Not Implemented")
     def test_conversation_with_multiple_turns(self):
         super().test_conversation_with_multiple_turns()
@@ -55,9 +58,6 @@ class TestGrpcBackend(StateManagementTests, MCPTests):
     @unittest.skip("TODO: decode error message")
     def test_mutually_exclusive_parameters(self):
         super().test_mutually_exclusive_parameters()
-
-    def test_previous_response_id_chaining(self):
-        super().test_previous_response_id_chaining()
 
     def test_mcp_basic_tool_call_streaming(self):
         return super().test_mcp_basic_tool_call_streaming()
@@ -89,6 +89,9 @@ class TestGrpcHarmonyBackend(StateManagementTests, MCPTests, FunctionCallingBase
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
 
+    def test_previous_response_id_chaining(self):
+        super().test_previous_response_id_chaining()
+
     @unittest.skip(
         "TODO: fix requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0)"
     )
@@ -98,9 +101,6 @@ class TestGrpcHarmonyBackend(StateManagementTests, MCPTests, FunctionCallingBase
     @unittest.skip("TODO: 501 Not Implemented")
     def test_conversation_with_multiple_turns(self):
         super().test_conversation_with_multiple_turns()
-
-    def test_previous_response_id_chaining(self):
-        super().test_previous_response_id_chaining()
 
     @unittest.skip("TODO: 501 Not Implemented")
     def test_conversation_with_multiple_turns(self):
