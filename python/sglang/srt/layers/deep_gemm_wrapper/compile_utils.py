@@ -8,8 +8,8 @@ import torch
 from tqdm import tqdm
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    disable_symmetric_memory_contexts,
-    restore_symmetric_memory_contexts,
+    disable_symmetric_memory_context,
+    restore_symmetric_memory_context,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
@@ -126,7 +126,7 @@ def _compile_deep_gemm_one_type_all(
 ) -> None:
     # Symmetric memory allocation performs a collective operation across all the GPUs.
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
-    saved_contexts = disable_symmetric_memory_contexts()
+    saved_context = disable_symmetric_memory_context()
     try:
         if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
@@ -148,8 +148,8 @@ def _compile_deep_gemm_one_type_all(
         del executor
         torch.cuda.empty_cache()
     finally:
-        # Restore symmetric memory contexts
-        restore_symmetric_memory_contexts(saved_contexts)
+        # Restore symmetric memory context
+        restore_symmetric_memory_context(saved_context)
 
 
 class _BaseWarmupExecutor:

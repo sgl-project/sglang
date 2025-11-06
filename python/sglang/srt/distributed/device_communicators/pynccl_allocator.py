@@ -62,7 +62,7 @@ _allocator = None
 _mem_pool = None
 _graph_pool_id = None
 _cur_device = None
-_active_symmetric_memory_contexts = []
+_active_symmetric_memory_context = None
 
 
 def is_symmetric_memory_enabled():
@@ -74,16 +74,17 @@ def set_graph_pool_id(graph_pool_id):
     _graph_pool_id = graph_pool_id
 
 
-def disable_symmetric_memory_contexts():
-    saved_contexts = _active_symmetric_memory_contexts.copy()
-    for context in reversed(saved_contexts):
-        context.__exit__(None, None, None)
-    return saved_contexts
+def disable_symmetric_memory_context():
+    if _active_symmetric_memory_context is None:
+        return None
+    saved_context = _active_symmetric_memory_context
+    saved_context.__exit__(None, None, None)
+    return saved_context
 
 
-def restore_symmetric_memory_contexts(saved_contexts):
-    for context in saved_contexts:
-        context.__enter__()
+def restore_symmetric_memory_context(saved_context):
+    if saved_context is not None:
+        saved_context.__enter__()
 
 
 def get_nccl_mem_pool():
@@ -157,8 +158,8 @@ class SymmetricMemoryContext:
             self.group_coordinator.pynccl_comm.comm.value
         )
 
-        global _active_symmetric_memory_contexts
-        _active_symmetric_memory_contexts.append(self)
+        global _active_symmetric_memory_context
+        _active_symmetric_memory_context = self
 
         return self
 
@@ -173,8 +174,8 @@ class SymmetricMemoryContext:
             else:
                 torch._C._cuda_beginAllocateToPool(_cur_device, _graph_pool_id)
 
-        global _active_symmetric_memory_contexts
-        _active_symmetric_memory_contexts.pop()
+        global _active_symmetric_memory_context
+        _active_symmetric_memory_context = None
 
         self.exited = True
 
