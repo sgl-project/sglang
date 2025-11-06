@@ -7,6 +7,7 @@ import torch
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -53,8 +54,11 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     is_cuda,
+    is_npu,
     next_power_of_2,
 )
+
+_is_npu = is_npu()
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -122,7 +126,7 @@ class EAGLEWorker(TpModelWorker):
             ctx = draft_tp_context(get_attention_tp_group())
         else:
             ctx = empty_context()
-        with ctx:
+        with ctx, speculative_moe_backend_context():
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -171,7 +175,9 @@ class EAGLEWorker(TpModelWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(self.draft_model_runner.tp_group):
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -205,7 +211,7 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if self.server_args.disable_cuda_graph or _is_npu:
             return
 
         # Capture draft
@@ -256,7 +262,9 @@ class EAGLEWorker(TpModelWorker):
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
             )
-            with self.draft_tp_context(self.draft_model_runner.tp_group):
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ), speculative_moe_backend_context():
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
@@ -267,13 +275,17 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
-            with self.draft_tp_context(self.draft_model_runner.tp_group):
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ), speculative_moe_backend_context():
                 spec_info = self.draft(batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
 
-            with self.draft_tp_context(self.draft_model_runner.tp_group):
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ), speculative_moe_backend_context():
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
@@ -691,19 +703,45 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-        # QQ: can be optimized
         if self.target_worker.model_runner.hybrid_gdn_config is not None:
-            # res.draft_input.accept_length is on GPU but may be empty for last verify?
             accepted_length = (
                 torch.tensor(
                     res.accept_length_per_req_cpu,
                     device=logits_output.hidden_states.device,
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                 )
                 + 1
             )
+
+            # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
+            # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
+            if spec_info.topk > 1 and res.accepted_indices.shape[0] > 0:
+                # accepted_indices=[0,2,3,4,5,7,9,10,11], accepted_length=[4, 3, 2], cumulative_accepted_lengths=[4, 7, 9]
+                # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
+                # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
+                # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+                cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
+                req_start_positions = torch.cat(
+                    [
+                        torch.zeros(
+                            1,
+                            dtype=cumulative_accepted_lengths.dtype,
+                            device=cumulative_accepted_lengths.device,
+                        ),
+                        cumulative_accepted_lengths[:-1],
+                    ]
+                )
+                first_token_indices_per_req = res.accepted_indices[req_start_positions]
+                last_token_indices_per_req = res.accepted_indices[
+                    cumulative_accepted_lengths - 1
+                ]
+                max_relative_indices_per_req = (
+                    last_token_indices_per_req - first_token_indices_per_req
+                )
+            else:
+                max_relative_indices_per_req = accepted_length - 1
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                accepted_length, self.target_worker.model_runner.model
+                max_relative_indices_per_req, self.target_worker.model_runner.model
             )
 
         if batch.return_logprob:
@@ -945,7 +983,7 @@ class EAGLEWorker(TpModelWorker):
         draft_input.hidden_states = logits_output.hidden_states
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
