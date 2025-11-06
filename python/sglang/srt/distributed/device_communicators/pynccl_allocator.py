@@ -3,9 +3,14 @@ import tempfile
 from contextlib import nullcontext
 
 import torch
+import torch.utils.cpp_extension
+from packaging import version
 from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.server_args import get_global_server_args
+
+after_2_8_0 = version.parse(torch.__version__) >= version.parse("2.8.0")
 
 nccl_allocator_source = """
 
@@ -60,9 +65,6 @@ _cur_device = None
 
 
 def is_symmetric_memory_enabled():
-    # Import here to avoid circular import
-    from sglang.srt.server_args import get_global_server_args
-
     return get_global_server_args().enable_symm_mem
 
 
@@ -123,7 +125,12 @@ class SymmetricMemoryContext:
                 _graph_pool_id is not None
             ), "graph_pool_id is not set under graph capture"
             # Pause graph memory pool to use symmetric memory with cuda graph
-            torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
+            if after_2_8_0:
+                torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
+            else:
+                torch._C._cuda_endAllocateCurrentStreamToPool(
+                    _cur_device, _graph_pool_id
+                )
 
         self._mem_pool_ctx.__enter__()
 
@@ -137,7 +144,12 @@ class SymmetricMemoryContext:
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
 
         if self.is_graph_capture:
-            torch._C._cuda_beginAllocateCurrentThreadToPool(_cur_device, _graph_pool_id)
+            if after_2_8_0:
+                torch._C._cuda_beginAllocateCurrentThreadToPool(
+                    _cur_device, _graph_pool_id
+                )
+            else:
+                torch._C._cuda_beginAllocateToPool(_cur_device, _graph_pool_id)
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
