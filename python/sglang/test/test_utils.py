@@ -730,7 +730,16 @@ class TestFile:
     estimated_time: float = 60
 
 
-def run_unittest_files(files: List[TestFile], timeout_per_file: float):
+def run_unittest_files(files: List[TestFile], timeout_per_file: float, continue_on_error: bool = False):
+    """
+    Run a list of test files.
+
+    Args:
+        files: List of TestFile objects to run
+        timeout_per_file: Timeout in seconds for each test file
+        continue_on_error: If True, continue running remaining tests even if one fails.
+                          If False, stop at first failure (default behavior for PR tests).
+    """
     tic = time.perf_counter()
     success = True
 
@@ -764,18 +773,28 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             ret_code = run_with_timeout(
                 run_one_file, args=(filename,), timeout=timeout_per_file
             )
-            assert (
-                ret_code == 0
-            ), f"expected return code 0, but {filename} returned {ret_code}"
+            if ret_code != 0:
+                print(
+                    f"\n✗ FAILED: {filename} returned exit code {ret_code}\n",
+                    flush=True,
+                )
+                success = False
+                if not continue_on_error:
+                    # Stop at first failure for PR tests
+                    break
+                # Otherwise continue to next test for nightly tests
         except TimeoutError:
             kill_process_tree(process.pid)
             time.sleep(5)
             print(
-                f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
+                f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n",
                 flush=True,
             )
             success = False
-            break
+            if not continue_on_error:
+                # Stop at first timeout for PR tests
+                break
+            # Otherwise continue to next test for nightly tests
 
     if success:
         print(f"Success. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
