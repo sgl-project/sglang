@@ -291,7 +291,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch,
             )
             probs = torch.softmax(ret.next_token_logits, dim=-1)
-            ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
+            ret.topk_logp, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -388,6 +388,6 @@ class EAGLEDraftExtendCudaGraphRunner:
                 next_token_logits=out.next_token_logits[:raw_bs],
                 hidden_states=out.hidden_states[:raw_bs],
             )
-            out.topk_p = out_copy.topk_p[:raw_bs]
+            out.topk_logp = out_copy.topk_logp[:raw_bs]
             out.topk_index = out_copy.topk_index[:raw_bs]
         return out

@@ -94,7 +94,7 @@ class EAGLEDraftCudaGraphRunner:
             self.mrope_positions = torch.zeros(
                 (3, self.max_num_token), dtype=torch.int64
             )
-            self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
+            self.topk_logp = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             self.hidden_states = torch.zeros(
                 (self.max_bs, self.model_runner.model_config.hidden_size),
@@ -163,7 +163,7 @@ class EAGLEDraftCudaGraphRunner:
         out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
         positions = self.positions[:num_tokens]
         mrope_positions = self.mrope_positions[:, :num_tokens]
-        topk_p = self.topk_p[:num_seqs]
+        topk_logp = self.topk_logp[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
         hidden_states = self.hidden_states[:num_seqs]
 
@@ -209,7 +209,7 @@ class EAGLEDraftCudaGraphRunner:
             global_num_tokens_for_logprob = None
 
         spec_info = EagleDraftInput(
-            topk_p=topk_p,
+            topk_logp=topk_logp,
             topk_index=topk_index,
             hidden_states=hidden_states,
             capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -313,7 +313,7 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.out_cache_loc
         )
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
+        self.topk_logp[:raw_bs].copy_(forward_batch.spec_info.topk_logp)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
 
