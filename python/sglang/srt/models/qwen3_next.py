@@ -198,6 +198,8 @@ def fused_gdn_gating_kernel(
     a,
     dt_bias,
     seq_len,
+    a_stride_m: tl.constexpr,
+    a_stride_k: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     beta: tl.constexpr,
     threshold: tl.constexpr,
@@ -205,7 +207,7 @@ def fused_gdn_gating_kernel(
 ):
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
-    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    off = (i_b * seq_len + i_s) * a_stride_m + head_off * a_stride_k
     mask = head_off < NUM_HEADS
     blk_A_log = tl.load(A_log + head_off, mask=mask)
     blk_a = tl.load(a + off, mask=mask)
@@ -230,7 +232,18 @@ def fused_gdn_gating(
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty_like(a, dtype=torch.float32)
     fused_gdn_gating_kernel[grid](
-        g, A_log, a, dt_bias, seq_len, num_heads, beta, threshold, 8, num_warps=1
+        g,
+        A_log,
+        a,
+        dt_bias,
+        seq_len,
+        a.stride(0),
+        a.stride(1),
+        num_heads,
+        beta,
+        threshold,
+        8,
+        num_warps=1,
     )
     return g
 
