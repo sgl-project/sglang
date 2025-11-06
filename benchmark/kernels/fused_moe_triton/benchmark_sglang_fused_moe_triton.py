@@ -3,7 +3,7 @@ import argparse
 
 import torch
 import triton
-from common_utils import get_model_config, validate_ep_tp_mode
+from common_utils import get_model_config
 
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -221,7 +221,6 @@ def main():
             pipeline_model_parallel_size=args.tp_size,
         )
 
-        validate_ep_tp_mode(args.ep_size, args.tp_size)
         model_config = get_model_config(args.model, args.tp_size, args.ep_size)
         benchmark.run(
             show_plots=True,

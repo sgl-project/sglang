@@ -15,7 +15,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe as fused_moe_sglang,
 )
 
-from .common_utils import get_model_config, validate_ep_tp_mode
+from .common_utils import get_model_config
 
 
 def fused_moe_vllm_api(
@@ -247,7 +247,6 @@ def main():
             pipeline_model_parallel_size=1,
         )
 
-        validate_ep_tp_mode(args.ep_size, args.tp_size)
         shape_configs = get_model_config(args.model, args.tp_size, args.ep_size)
         benchmark.run(
             show_plots=True,
