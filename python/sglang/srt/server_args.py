@@ -259,7 +259,6 @@ class ServerArgs:
     # Encode prefill disaggregation
     mm_only: bool = False
     language_only: bool = False
-    embedding_port: Optional[int] = 54213
     mm_transfer_backend: str = "zmq"
 
     # Quantization and data type
@@ -2256,12 +2255,6 @@ class ServerArgs:
             "--language-only",
             action="store_true",
             help="For VLM, load weights for the language model only.",
-        )
-        parser.add_argument(
-            "--embedding-port",
-            type=int,
-            default=ServerArgs.embedding_port,
-            help="The port for transmitting embedding metadata.",
         )
         parser.add_argument(
             "--mm-transfer-backend",

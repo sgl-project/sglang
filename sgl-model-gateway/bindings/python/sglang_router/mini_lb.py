@@ -178,6 +178,7 @@ class MiniLoadBalancer:
                     "num_parts": num_parts,
                     "part_idx": cum_idx,
                     "req_id": req_id,
+                    "prefill_url": prefill_url,
                     "bootstrap_host": prefill_host,
                 }
             )
@@ -236,6 +237,7 @@ class MiniLoadBalancer:
                         "session_id": session_id,
                         "buffer_address": buffer_address_adjust,
                         "bootstrap_host": prefill_host,
+                        "prefill_url": prefill_url,
                     }
                 )
                 metadata_tasks.append(

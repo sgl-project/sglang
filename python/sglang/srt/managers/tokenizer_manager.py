@@ -103,6 +103,7 @@ from sglang.srt.utils import (
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
+    get_free_port,
     get_local_ip_auto,
     get_zmq_socket,
     kill_process_tree,
@@ -318,8 +319,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         # Recv embedding from encoding server
         if self.model_config.is_multimodal and self.server_args.language_only:
+            self.embedding_port = get_free_port()
             self.recv_from_encoder = get_zmq_socket(
-                context, zmq.PULL, f"tcp://*:{server_args.embedding_port}", True
+                context, zmq.PULL, f"tcp://*:{self.embedding_port}", True
             )
             self.received_data = dict()
             self.embeddings_lock = asyncio.Lock()
