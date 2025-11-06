@@ -42,6 +42,8 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         video_pruning_rate: float = 0.0,
         video_context_token: str = "<video>",
         img_context_token: str = "<image>",
+        img_start_token: str = "<img>",
+        img_end_token: str = "</img>",
         norm_mean: tuple[float, float, float] | list[float] = IMAGENET_MEAN,
         norm_std: tuple[float, float, float] | list[float] = IMAGENET_STD,
         use_thumbnail: bool = True,
@@ -98,3 +100,6 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         assert len(self.norm_std) == 3, "norm_std must be a tuple of 3 elements"
         self.use_thumbnail = use_thumbnail
         self.llm_config._attn_implementation = self._attn_implementation
+
+        self.img_start_token = img_start_token
+        self.img_end_token = img_end_token

@@ -29,8 +29,8 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         self.image_size = hf_config.image_size
         self.VIDEO_CONTEXT_TOKEN = hf_config.video_context_token
         self.IMG_CONTEXT_TOKEN = hf_config.img_context_token
-        self.IMG_START_TOKEN = "<img>"
-        self.IMG_END_TOKEN = "</img>"
+        self.IMG_START_TOKEN = hf_config.img_start_token
+        self.IMG_END_TOKEN = hf_config.img_end_token
         self.num_image_token = int(
             (self.image_size // hf_config.patch_size) ** 2
             * (hf_config.downsample_ratio**2)
@@ -55,6 +55,11 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         self.norm_std = hf_config.norm_std
         self.use_thumbnail = hf_config.use_thumbnail
 
+        self.PLACEHOLDER = self.tokenizer.unk_token
+        assert isinstance(self.PLACEHOLDER, str)
+        self.PLACEHOLDER_ID = tokenizer.convert_tokens_to_ids(self.PLACEHOLDER)
+        assert isinstance(self.PLACEHOLDER_ID, int)
+
     def preprocess_image(
         self, image: Image.Image, *, max_num_tiles: int = DEFAULT_NUM_TILES
     ) -> torch.Tensor:
@@ -70,8 +75,10 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
     def render_image(self, *, num_tiles: int):
         return f"{self.IMG_START_TOKEN}{self.IMG_CONTEXT_TOKEN * self.num_image_token * num_tiles}{self.IMG_END_TOKEN}"
 
-    def render_frame(self, frame_index: int, *, timestamp: float):
-        return f"Frame {frame_index + 1} sampled at {timestamp:.2f} seconds: {self.render_image(num_tiles=NUM_VIDEO_TILES)}"
+    def render_frame(
+        self, frame_index: int, *, timestamp: float, start_placeholder_token: str
+    ):
+        return f"Frame {frame_index + 1} sampled at {timestamp:.2f} seconds: {start_placeholder_token}{self.IMG_CONTEXT_TOKEN * self.num_image_token}{self.IMG_END_TOKEN}"
 
     @staticmethod
     def parse_video(video: "VideoReader") -> tuple[np.ndarray, list[float]]:
@@ -91,6 +98,8 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             discard_alpha_channel=True,
         )
 
+        prompt = input_text
+
         image_feature = None
         if base_output.images:
             preprocessed_images = [
@@ -100,9 +109,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                 self.render_image(num_tiles=image.shape[0])
                 for image in preprocessed_images
             ]
-            input_text = input_text.replace(
-                self.IMG_CONTEXT_TOKEN, "".join(rendered_images), 1
-            )
+            prompt = prompt.replace(self.IMG_CONTEXT_TOKEN, "".join(rendered_images), 1)
             image_feature = torch.cat(preprocessed_images, dim=0)
 
         video_feature = None
@@ -120,41 +127,50 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                 preprocessed_video = torch.cat(frames_tensors, dim=0)
                 preprocessed_videos.append(preprocessed_video)
                 rendered_frames = [
-                    self.render_frame(frame_index=i, timestamp=timestamp)
+                    self.render_frame(
+                        i,
+                        timestamp=timestamp,
+                        start_placeholder_token=self.PLACEHOLDER,
+                    )
                     for i, timestamp in enumerate(timestamps)
                 ]
-                input_text = input_text.replace(
+                prompt = prompt.replace(
                     self.VIDEO_CONTEXT_TOKEN, "".join(rendered_frames), 1
                 )
             video_feature = torch.cat(preprocessed_videos, dim=0)
 
-        input_ids_tensor = self.tokenizer(input_text, return_tensors="pt")[
-            "input_ids"
-        ].flatten()
+        prompt_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"].flatten()
+        offsets = self.get_mm_items_offset(prompt_ids, self.mm_tokens.image_token_id)
+        img_offsets = [
+            (start, end)
+            for start, end in offsets
+            if prompt_ids[start - 1] == self.img_start_token_id
+        ]
+        video_offsets = [
+            (start, end)
+            for start, end in offsets
+            if prompt_ids[start - 1] == self.PLACEHOLDER_ID
+        ]
+        # Cleanup:
+        prompt_ids[prompt_ids == self.PLACEHOLDER_ID] = self.img_start_token_id
 
         items = []
-
-        for modality, feature in {
-            (Modality.IMAGE, image_feature),
-            (Modality.VIDEO, video_feature),
-        }:
-            if feature is not None:
-                token_id = self.mm_tokens.get_token_id_by_modality(modality)
-                items.append(
-                    MultimodalDataItem(
-                        feature=feature,
-                        modality=modality,
-                        offsets=self.get_mm_items_offset(
-                            input_ids_tensor.to("cuda"), token_id
-                        ),
-                    )
-                )
+        if image_feature is not None:
+            item = MultimodalDataItem(
+                Modality.IMAGE, feature=image_feature, offsets=img_offsets
+            )
+            items.append(item)
+        if video_feature is not None:
+            item = MultimodalDataItem(
+                Modality.VIDEO, feature=video_feature, offsets=video_offsets
+            )
+            items.append(item)
 
         return {
-            "input_ids": input_ids_tensor.tolist(),
+            "input_ids": prompt_ids.tolist(),
             "mm_items": items,
             "im_start_id": self.img_start_token_id,
             "im_end_id": self.img_end_token_id,
             "im_token_id": self.mm_tokens.image_token_id,
-            "video_token_id": self.mm_tokens.video_token_id,
+            "video_token_id": self.mm_tokens.image_token_id,
         }
