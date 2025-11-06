@@ -43,8 +43,6 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
                 "memory",
                 "--tool-call-parser",
                 "llama",
-                "--reasoning-parser",
-                "llama",
             ],
         )
 
@@ -98,7 +96,7 @@ class TestGrpcHarmonyBackend(
                 "--history-backend",
                 "memory",
                 "--reasoning-parser",
-                "harmony",
+                "gpt-oss",
             ],
         )
 
