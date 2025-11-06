@@ -2,9 +2,6 @@ name: Bot Bump Kernel Version to SGLang
 
 on:
   workflow_dispatch:
-  schedule:
-    # Run daily at 00:00 UTC to check for kernel version updates
-    - cron: '0 0 * * *'
 
 permissions:
   contents: write
