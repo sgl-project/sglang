@@ -20,11 +20,13 @@ from mixins.function_call import FunctionCallingBaseTest
 from mixins.mcp import MCPTests
 from mixins.state_management import StateManagementTests
 from mixins.structured_output import StructuredOutputBaseTest
+from mixins.streaming_events import HarmonyStreamingEventsTests, StreamingEventsTests
+from mixins.tool_choice import ToolChoiceTests
 from router_fixtures import popen_launch_workers_and_router
 from util import kill_process_tree
 
 
-class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
+class TestGrpcBackend(StateManagementTests, MCPTests, StreamingEventsTests, StructuredOutputBaseTest):
     """End to end tests for gRPC backend (Regular backend with Llama)."""
 
     @classmethod
@@ -146,9 +148,18 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
 
 
 class TestGrpcHarmonyBackend(
-    StateManagementTests, MCPTests, FunctionCallingBaseTest, StructuredOutputBaseTest
+    StateManagementTests,
+    MCPTests,
+    FunctionCallingBaseTest,
+    StreamingEventsTests,
+    HarmonyStreamingEventsTests,
+    StructuredOutputBaseTest,
+    ToolChoiceTests,
 ):
-    """End to end tests for Harmony backend."""
+    """End to end tests for Harmony backend.
+
+    Note: Tool choice tests require --reasoning-parser gpt-oss in the worker.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -162,13 +173,8 @@ class TestGrpcHarmonyBackend(
             num_workers=1,
             tp_size=2,
             policy="round_robin",
-            worker_args=[
-                "--reasoning-parser=gpt-oss",
-            ],
-            router_args=[
-                "--history-backend",
-                "memory",
-            ],
+            router_args=["--history-backend", "memory"],
+            worker_args=["--reasoning-parser", "gpt-oss"],
         )
 
         cls.base_url = cls.cluster["base_url"]
@@ -197,6 +203,23 @@ class TestGrpcHarmonyBackend(
     # - test_mcp_basic_tool_call_streaming
     # - test_mixed_mcp_and_function_tools (requires external MCP server)
     # - test_mixed_mcp_and_function_tools_streaming (requires external MCP server)
+
+    # Inherited from StreamingEventsTests:
+    # - test_output_index_zero_based
+    # - test_output_item_done_event_emitted
+    # - test_output_array_in_completed_event
+
+    # Inherited from HarmonyStreamingEventsTests:
+    # - test_reasoning_content_output_index
+    # - test_reasoning_content_in_output_array
+
+    # Inherited from ToolChoiceTests:
+    # - test_tool_choice_auto
+    # - test_tool_choice_required
+    # - test_tool_choice_specific_function
+    # - test_tool_choice_streaming
+    # - test_tool_choice_with_mcp_tools
+    # - test_tool_choice_mixed_function_and_mcp
 
 
 if __name__ == "__main__":

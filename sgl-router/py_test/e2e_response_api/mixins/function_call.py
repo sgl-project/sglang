@@ -9,6 +9,8 @@ import json
 import sys
 from pathlib import Path
 
+import requests
+
 # Add current directory for local imports
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR))
@@ -36,7 +38,6 @@ class ResponseAPIBaseTest(CustomTestCase):
 
         This is a minimal implementation - subclasses should import from basic_crud.
         """
-        import requests
 
         url = f"{self.base_url}{endpoint}"
         headers = {"Content-Type": "application/json"}
