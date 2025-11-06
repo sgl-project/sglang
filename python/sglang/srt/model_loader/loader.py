@@ -772,43 +772,20 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         1. Records original parameter state (shape, stride, dtype, size)
         2. Records weight loader functions and metadata
         3. Loads INT8 weights from VERL (already quantized)
-        4. Processes weights via standard SGLang quantization path
-        5. Model's load_weights will call rebinding_and_load_weights for fast reloads
+        4. Processes weights via standard SGLang quantization path (transpose to column-major)
+        5. Backs up weight_scale parameters for reload consistency
         
         Note: VERL handles BF16→INT8 quantization before sending weights to SGLang.
         """
 
-        # Check if already called to prevent duplicate processing
-        if getattr(model, "process_weights_after_loading_already_called", False):
-            logger.warning(
-                "[QuantizedRL] process_weights_after_loading already called for model"
-            )
-            return
-
-        # Step 1: Record original weight state BEFORE loading/quantization
-        if not hasattr(model, "original_weights_rebuild_keys"):
-            logger.info("Recording parameter state for RL training")
-            model.original_weights_rebuild_keys = {}
-            param_count = 0
-
-            for name, p in model.named_parameters():
-                model.original_weights_rebuild_keys[name] = {
-                    "shape": p.shape,
-                    "stride": p.stride(),
-                    "dtype": p.dtype,
-                    "nbytes": p.untyped_storage().nbytes(),
-                }
-                param_count += 1
-
-        # Step 2: Record weight loader functions and metadata
+        # Step 1: Record weight loader functions and metadata BEFORE loading
+        # (must be done before load_weights because the parameters still have the loader attributes)
         recorded_loader = {
             k: dict() for k in QuantizedRLModelLoader.RECORDED_LOADER_KEYS
         }
-        param_count = 0
         params_with_loaders = 0
 
         for name, p in model.named_parameters():
-            param_count += 1
             param_has_loader = False
 
             for key in QuantizedRLModelLoader.RECORDED_LOADER_KEYS:
@@ -828,32 +805,71 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             if param_has_loader:
                 params_with_loaders += 1
 
-        total_recorded = sum(len(loader_k) for loader_k in recorded_loader.values())
-        logger.debug(f"Recorded {total_recorded} loader functions for {params_with_loaders} parameters")
-
+        logger.info(f"Recorded loader functions for {params_with_loaders} parameters")
         model.recorded_loader = recorded_loader
 
-        # Step 3: Load INT8 weights from VERL (already quantized)
+        # Step 2: Load INT8 weights from VERL (already quantized, ROW-MAJOR format)
         model.load_weights(weights)
+        
+        # Step 3: Record parameter state AFTER loading but BEFORE transpose (FlashRL approach)
+        # We record shape/stride of the ROW-MAJOR INT8 parameters (as loaded from disk/VERL)
+        # During reload, we'll reset to this row-major shape, load row-major INT8, and copy back.
+        logger.info("Recording parameter state after loading (row-major INT8)")
+        model.original_weights_rebuild_keys = {}
 
-        # Step 4: Process weights via standard SGLang quantization path
+        for name, p in model.named_parameters():
+            model.original_weights_rebuild_keys[name] = {
+                "shape": p.shape,
+                "stride": p.stride(),
+                "dtype": p.dtype,
+                "nbytes": p.untyped_storage().nbytes(),
+            }
+
+        # Step 4: Process weights after loading (transpose to column-major for INT8 inference)
+        # This is ONLY done on initial load. Reloads skip this step (FlashRL approach).
+        logger.info("[QuantizedRL] Transposing weights to column-major (first load)")
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
 
-        # Step 5: Mark as ready for RL training
-        model.quantized_rl_quant_type = "w8a8_int8"
-        model.process_weights_after_loading_already_called = True
-        
-        # Step 6: Backup weight_scale parameters (FlashRL approach)
+        # Step 4.5: Restore weight_loader attributes after process_weights_after_loading
+        # Why? process_weights_after_loading creates NEW Parameter objects (e.g., layer.weight = Parameter(...))
+        # This loses custom attributes like weight_loader. We need to restore them for reloads!
+        logger.info("[QuantizedRL] Restoring weight_loader attributes after transpose")
+        current_params = dict(model.named_parameters())
+        for k, loader_dict in recorded_loader.items():
+            for param_name, loader in loader_dict.items():
+                if param_name in current_params:
+                    param = current_params[param_name]
+                    # Always restore (process_weights_after_loading may have replaced the Parameter)
+                    if callable(loader):
+                        if hasattr(loader, "__self__"):
+                            setattr(param, k, loader)
+                        else:
+                            setattr(
+                                param,
+                                k,
+                                QuantizedRLModelLoader._bond_method_to_cls(
+                                    loader, param
+                                ),
+                            )
+                    else:
+                        setattr(param, k, loader)
+        del current_params
+
+        # Step 5: Backup weight_scale parameters (FlashRL approach)
         # These will be restored after each reload to maintain consistent quantization
         model.quantized_rl_scale_backup = {}
         for name, param in model.named_parameters():
             if "weight_scale" in name:
                 model.quantized_rl_scale_backup[name] = param.data.clone()
         logger.info(f"Backed up {len(model.quantized_rl_scale_backup)} weight_scale parameters")
+        
+        # Step 6: Mark initial load as complete
+        # This flag is checked by is_reload_scenario() to distinguish initial load from reloads
+        model.quantized_rl_initial_load_complete = True
         logger.info("Model ready for RL training (INT8 inference, BF16 training in VERL)")
 
     @staticmethod
@@ -862,7 +878,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         return (
             hasattr(model, "original_weights_rebuild_keys")
             and hasattr(model, "recorded_loader")
-            and getattr(model, "process_weights_after_loading_already_called", False)
+            and getattr(model, "quantized_rl_initial_load_complete", False)
         )
 
 
@@ -952,6 +968,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         updated_params = first_time_load_weights(iter(weights_list))
 
         # Step 6: Restore stride and copy data back (FlashRL approach: lines 309-315)
+        # IMPORTANT: We do NOT call process_weights_after_loading here (FlashRL approach).
+        # Weights are already in column-major from initial load. The torch.as_strided trick
+        # allows us to load row-major weights and copy them back to column-major memory
+        # without needing to transpose again.
         processed_weights = dict(model.named_parameters())
         params_copied = 0
         for name in updated_param_names:
