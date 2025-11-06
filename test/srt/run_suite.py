@@ -217,11 +217,15 @@ suites = {
     ],
     "nightly-4-gpu-b200": [
         TestFile("test_fp4_moe.py", 300),
+        TestFile("test_gpt_oss_4gpu.py", 275),
     ],
     "nightly-4-gpu": [],
     "nightly-8-gpu": [],
     "nightly-8-gpu-h200": [],
     "nightly-8-gpu-h20": [],
+    # "nightly-8-gpu-b200": [
+    #     TestFile("test_deepseek_v31_fp8_8gpu.py", 600),
+    # ],
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
         TestFile("cpu/test_comm.py"),
