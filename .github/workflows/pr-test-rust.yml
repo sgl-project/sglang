@@ -157,16 +157,6 @@ jobs:
           cache-all-crates: true
           cache-on-failure: true
 
-      - name: Cache router build
-        uses: actions/cache@v4
-        with:
-          path: |
-            sgl-router/target
-            sgl-router/.venv
-          key: ${{ runner.os }}-router-${{ hashFiles('sgl-router/Cargo.lock', 'sgl-router/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-router-
-
       - name: Install SGLang dependencies
         run: |
           sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
@@ -235,16 +225,6 @@ jobs:
           workspaces: sgl-router
           cache-all-crates: true
           cache-on-failure: true
-
-      - name: Cache router build
-        uses: actions/cache@v4
-        with:
-          path: |
-            sgl-router/target
-            sgl-router/.venv
-          key: ${{ runner.os }}-router-${{ hashFiles('sgl-router/Cargo.lock', 'sgl-router/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-router-
 
       - name: Install SGLang dependencies
         run: |
