@@ -40,33 +40,6 @@ use crate::{
     },
 };
 
-/// Extract function call from a chat completion response
-/// Returns (call_id, tool_name, arguments_json_str) if found
-fn extract_function_call_from_chat(
-    response: &ChatCompletionResponse,
-) -> Option<(String, String, String)> {
-    // Check if response has choices with tool calls
-    let choice = response.choices.first()?;
-    let message = &choice.message;
-
-    // Look for tool_calls in the message
-    if let Some(tool_calls) = &message.tool_calls {
-        if let Some(tool_call) = tool_calls.first() {
-            return Some((
-                tool_call.id.clone(),
-                tool_call.function.name.clone(),
-                tool_call
-                    .function
-                    .arguments
-                    .clone()
-                    .unwrap_or_else(|| "{}".to_string()),
-            ));
-        }
-    }
-
-    None
-}
-
 /// Merge function tools from request with MCP tools and set tool_choice based on iteration
 fn prepare_chat_tools_and_choice(
     chat_request: &mut ChatCompletionRequest,
@@ -120,14 +93,6 @@ fn extract_all_tool_calls_from_chat(
     } else {
         Vec::new()
     }
-}
-
-/// Check if a tool call is for an MCP tool by checking the MCP inventory
-///
-/// In regular/responses, both MCP and function tools have `tool_type: "function"` in chat format,
-/// so we must check by name against the MCP tool inventory.
-fn is_mcp_tool_call(tool_name: &str, mcp_tools: &[mcp::Tool]) -> bool {
-    mcp_tools.iter().any(|t| t.name == tool_name)
 }
 
 /// State for tracking multi-turn tool calling loop
@@ -302,25 +267,34 @@ pub(super) async fn execute_tool_loop(
             )
             .await?;
 
-        // Check for function calls
-        if let Some((call_id, tool_name, args_json_str)) =
-            extract_function_call_from_chat(&chat_response)
-        {
+        // Check for function calls (extract all for parallel execution)
+        let tool_calls = extract_all_tool_calls_from_chat(&chat_response);
+
+        if !tool_calls.is_empty() {
             state.iteration += 1;
 
             debug!(
-                "Tool loop iteration {}: found call to {} (call_id: {})",
-                state.iteration, tool_name, call_id
+                "Tool loop iteration {}: found {} tool call(s)",
+                state.iteration,
+                tool_calls.len()
             );
 
-            // Check if this is an MCP tool or a function tool
-            if !is_mcp_tool_call(&tool_name, &mcp_tools) {
-                debug!(
-                    "Tool '{}' is not an MCP tool - returning to caller for execution",
-                    tool_name
-                );
+            // Separate MCP and function tool calls
+            let mcp_tool_names: std::collections::HashSet<&str> =
+                mcp_tools.iter().map(|t| t.name.as_ref()).collect();
+            let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
+                .into_iter()
+                .partition(|(_, tool_name, _)| mcp_tool_names.contains(tool_name.as_str()));
 
-                // Convert chat response to responses format (includes the function tool call)
+            debug!(
+                "Separated tool calls: {} MCP, {} function",
+                mcp_tool_calls.len(),
+                function_tool_calls.len()
+            );
+
+            // If ANY tool call is a function tool, return to caller immediately
+            if !function_tool_calls.is_empty() {
+                // Convert chat response to responses format (includes all tool calls)
                 let responses_response = conversions::chat_to_responses(
                     &chat_response,
                     original_request,
@@ -330,20 +304,24 @@ pub(super) async fn execute_tool_loop(
                     error::internal_error(format!("Failed to convert to responses format: {}", e))
                 })?;
 
-                // Return response with function tool call to caller
+                // Return response with function tool calls to caller
                 return Ok(responses_response);
             }
 
-            // It's an MCP tool - check combined limit BEFORE executing
+            // All MCP tools - check combined limit BEFORE executing
             let effective_limit = match max_tool_calls {
                 Some(user_max) => user_max.min(MAX_ITERATIONS),
                 None => MAX_ITERATIONS,
             };
 
-            if state.total_calls >= effective_limit {
+            if state.total_calls + mcp_tool_calls.len() > effective_limit {
                 warn!(
-                    "Reached tool call limit: {} (max_tool_calls={:?}, safety_limit={})",
-                    state.total_calls, max_tool_calls, MAX_ITERATIONS
+                    "Reached tool call limit: {} + {} > {} (max_tool_calls={:?}, safety_limit={})",
+                    state.total_calls,
+                    mcp_tool_calls.len(),
+                    effective_limit,
+                    max_tool_calls,
+                    MAX_ITERATIONS
                 );
 
                 // Convert chat response to responses format and mark as incomplete
@@ -363,46 +341,49 @@ pub(super) async fn execute_tool_loop(
                 return Ok(responses_response);
             }
 
-            // Increment after check
-            state.total_calls += 1;
+            // Execute all MCP tools
+            for (call_id, tool_name, args_json_str) in mcp_tool_calls {
+                debug!(
+                    "Calling MCP tool '{}' (call_id: {}) with args: {}",
+                    tool_name, call_id, args_json_str
+                );
 
-            // Execute the MCP tool - manager handles parsing and type coercion
-            debug!(
-                "Calling MCP tool '{}' with args: {}",
-                tool_name, args_json_str
-            );
-            let (output_str, success, error) = match ctx
-                .mcp_manager
-                .call_tool(tool_name.as_str(), args_json_str.as_str())
-                .await
-            {
-                Ok(result) => match serde_json::to_string(&result) {
-                    Ok(output) => (output, true, None),
-                    Err(e) => {
-                        let err = format!("Failed to serialize tool result: {}", e);
-                        warn!("{}", err);
-                        let error_json = json!({ "error": &err }).to_string();
-                        (error_json, false, Some(err))
+                let (output_str, success, error) = match ctx
+                    .mcp_manager
+                    .call_tool(tool_name.as_str(), args_json_str.as_str())
+                    .await
+                {
+                    Ok(result) => match serde_json::to_string(&result) {
+                        Ok(output) => (output, true, None),
+                        Err(e) => {
+                            let err = format!("Failed to serialize tool result: {}", e);
+                            warn!("{}", err);
+                            let error_json = json!({ "error": &err }).to_string();
+                            (error_json, false, Some(err))
+                        }
+                    },
+                    Err(err) => {
+                        let err_str = format!("tool call failed: {}", err);
+                        warn!("Tool execution failed: {}", err_str);
+                        // Return error as output, let model decide how to proceed
+                        let error_json = json!({ "error": &err_str }).to_string();
+                        (error_json, false, Some(err_str))
                     }
-                },
-                Err(err) => {
-                    let err_str = format!("tool call failed: {}", err);
-                    warn!("Tool execution failed: {}", err_str);
-                    // Return error as output, let model decide how to proceed
-                    let error_json = json!({ "error": &err_str }).to_string();
-                    (error_json, false, Some(err_str))
-                }
-            };
+                };
 
-            // Record the call in state
-            state.record_call(
-                call_id,
-                tool_name,
-                args_json_str,
-                output_str,
-                success,
-                error,
-            );
+                // Record the call in state
+                state.record_call(
+                    call_id,
+                    tool_name,
+                    args_json_str,
+                    output_str,
+                    success,
+                    error,
+                );
+
+                // Increment total calls counter
+                state.total_calls += 1;
+            }
 
             // Build resume request with conversation history
             // Start with original input
