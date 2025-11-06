@@ -152,6 +152,8 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -170,7 +172,6 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
-    disable_request_logging,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -179,7 +180,6 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     numa_bind_to_node,
     point_to_point_pyobj,
-    pyspy_dump_schedulers,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
@@ -215,6 +215,7 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
+    SchedulerMultiplexMixin,
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
 ):
@@ -254,6 +255,7 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.enable_metrics_for_all_schedulers = (
@@ -268,10 +270,11 @@ class Scheduler(
             server_args.speculative_algorithm
         )
         self.gpu_id = gpu_id
+        self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
-        self.page_size = server_args.page_size
 
+        # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
                 server_args.enable_dp_attention,
@@ -287,20 +290,15 @@ class Scheduler(
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
 
+        # Init pdmux context
+        if self.enable_pdmux:
+            self.init_pdmux()
+
         # Init tokenizer
         self.init_tokenizer()
 
         # Init moe config
         self.init_moe_config()
-
-        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
-        if self.server_args.reasoning_parser and self.tokenizer:
-            reasoning_parser = ReasoningParser(
-                model_type=self.server_args.reasoning_parser, stream_reasoning=False
-            )
-            self.tokenizer.think_end_id = self.tokenizer.encode(
-                reasoning_parser.detector.think_end_token, add_special_tokens=False
-            )[0]
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -308,7 +306,6 @@ class Scheduler(
             logger.info("Overlap scheduler is disabled for embedding models.")
 
         # Launch a tensor parallel worker
-
         from sglang.srt.managers.tp_worker import TpModelWorker
 
         self.tp_worker = TpModelWorker(
@@ -322,7 +319,6 @@ class Scheduler(
         )
 
         # Launch a draft worker for speculative decoding
-
         draft_worker_kwargs = dict(
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -426,19 +422,17 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
+        # The current split prefill batch
+        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.last_prefill_tokens = 0
-        self.last_decode_stats_tic = time.perf_counter()
-        self.last_prefill_stats_tic = time.perf_counter()
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
-        self.kv_transfer_speed_gb_s: float = 0.0
-        self.kv_transfer_latency_ms: float = 0.0
         self.sessions: Dict[str, Session] = {}
         self.default_stream: CudaStream = torch.get_device_module(
             self.device
@@ -478,10 +472,6 @@ class Scheduler(
         )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
-
-        assert (
-            server_args.schedule_conservativeness >= 0
-        ), "Invalid schedule_conservativeness"
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * server_args.schedule_conservativeness,
@@ -508,7 +498,6 @@ class Scheduler(
         )
         self.offload_tags = set()
         self.init_profiler()
-
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
             SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
@@ -516,17 +505,14 @@ class Scheduler(
             else None
         )
 
+        # Init disaggregation
+        self.init_disaggregation()
+
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
         if self.enable_kv_cache_events:
             self.init_kv_events(server_args.kv_events_config)
-
-        # Init disaggregation
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
-        self.init_disaggregation()
 
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
@@ -692,6 +678,15 @@ class Scheduler(
                     revision=server_args.revision,
                 )
 
+        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
+        if self.server_args.reasoning_parser and self.tokenizer:
+            reasoning_parser = ReasoningParser(
+                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+            )
+            self.tokenizer.think_end_id = self.tokenizer.encode(
+                reasoning_parser.detector.think_end_token, add_special_tokens=False
+            )[0]
+
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
 
@@ -832,6 +827,9 @@ class Scheduler(
         init_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_disaggregation(self):
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
@@ -1419,7 +1417,8 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            self._set_or_validate_priority(req)
+            if not self._set_or_validate_priority(req):
+                return
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
@@ -1439,7 +1438,7 @@ class Scheduler(
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
-    def _set_or_validate_priority(self, req: Req):
+    def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
         if self.enable_priority_scheduling and req.priority is None:
             if self.schedule_low_priority_values_first:
@@ -1460,6 +1459,8 @@ class Scheduler(
                 rid=req.rid,
             )
             self.send_to_tokenizer.send_output(abort_req, req)
+            return False
+        return True
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -1952,9 +1953,14 @@ class Scheduler(
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
+        # Capture prefill start time for EXTEND mode
+        if batch.forward_mode == ForwardMode.EXTEND:
+            current_time = time.perf_counter()
+            for req in batch.reqs:
+                req.time_stats.prefill_start_time = current_time
+
         # Run forward
         if self.is_generation:
-
             batch_or_worker_batch = batch
 
             if self.enable_overlap or self.spec_algorithm.is_none():
@@ -2011,6 +2017,9 @@ class Scheduler(
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
@@ -2043,11 +2052,18 @@ class Scheduler(
             batch_result.extend_logprob_start_len_per_req = (
                 extend_logprob_start_len_per_req
             )
-            return batch_result
+            ret = batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
+
+        # Capture prefill end time for EXTEND mode
+        if batch.forward_mode == ForwardMode.EXTEND:
+            current_time = time.perf_counter()
+            for req in batch.reqs:
+                req.time_stats.prefill_end_time = current_time
+
         return ret
 
     def launch_batch_sample_if_needed(
@@ -2295,59 +2311,6 @@ class Scheduler(
             self._add_request_to_queue(req)
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
 
-    def watchdog_thread(self):
-        """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
-        self.watchdog_last_forward_ct = 0
-        self.watchdog_last_time = time.perf_counter()
-
-        while True:
-            current = time.perf_counter()
-            if self.cur_batch is not None:
-                if self.watchdog_last_forward_ct == self.forward_ct:
-                    if current > self.watchdog_last_time + self.watchdog_timeout:
-                        break
-                else:
-                    self.watchdog_last_forward_ct = self.forward_ct
-                    self.watchdog_last_time = current
-            time.sleep(self.watchdog_timeout // 2)
-
-        if not disable_request_logging():
-            # Print batch size and memory pool info to check whether there are de-sync issues.
-            if self.is_hybrid:
-                (
-                    _,
-                    _,
-                    _,
-                    _,
-                    full_available_size,
-                    full_evictable_size,
-                    swa_available_size,
-                    swa_evictable_size,
-                ) = self._get_swa_token_info()
-                info_msg = (
-                    f"{full_available_size=}, "
-                    f"{full_evictable_size=}, "
-                    f"{swa_available_size=}, "
-                    f"{swa_evictable_size=}, "
-                )
-            else:
-                _, _, available_size, evictable_size = self._get_token_info()
-                info_msg = f"{available_size=}, " f"{evictable_size=}, "
-            logger.error(
-                f"{self.cur_batch.batch_size()=}, "
-                f"{self.cur_batch.reqs=}, "
-                f"{info_msg}"
-            )
-
-        pyspy_dump_schedulers()
-        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
-        print(file=sys.stderr, flush=True)
-        print(file=sys.stdout, flush=True)
-
-        # Wait for some time so that the parent process can print the error.
-        time.sleep(5)
-        self.parent_process.send_signal(signal.SIGQUIT)
-
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
@@ -2430,6 +2393,12 @@ class Scheduler(
                 - self.tree_cache.swa_evictable_size()
             )
             num_tokens = max(num_tokens_full, num_tokens_swa)
+        elif self.is_hybrid_gdn:
+            num_tokens = (
+                self.max_total_num_tokens
+                - self.token_to_kv_pool_allocator.available_size()
+                - self.tree_cache.full_evictable_size()
+            )
         else:
             num_tokens = (
                 self.max_total_num_tokens
@@ -2565,6 +2534,9 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.tree_cache.cache_finished_req(req)
 
+            # For mamba radix cache
+            if req.mamba_pool_idx is not None:
+                self.tree_cache.cache_finished_req(req, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -2846,7 +2818,9 @@ def run_scheduler_process(
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
-            if server_args.pp_size > 1:
+            if scheduler.enable_pdmux:
+                scheduler.event_loop_pdmux()
+            elif server_args.pp_size > 1:
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap()

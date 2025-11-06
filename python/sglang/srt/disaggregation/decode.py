@@ -156,6 +156,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
+        self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
             size + pre_alloc_size, cache_params, device, speculative_num_draft_tokens
         )
@@ -773,17 +774,12 @@ class DecodeTransferQueue:
                 indices_to_remove.add(i)
                 decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
 
-                # special handling for corner cases
-                should_finish = (
-                    decode_req.req.sampling_params.max_new_tokens == 1
-                    or output_id in decode_req.req.eos_token_ids
-                )
-                if should_finish:
+                decode_req.req.check_finished()
+                if decode_req.req.finished():
                     # finish immediately
                     decode_req.req.time_stats.forward_entry_time = (
                         decode_req.req.time_stats.completion_time
                     ) = time.perf_counter()
-                    decode_req.req.check_finished()
                     self.scheduler.stream_output(
                         [decode_req.req], decode_req.req.return_logprob
                     )

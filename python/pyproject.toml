@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.4.post1"
+version = "0.5.4.post3"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,7 +26,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.4.1",
+  "flashinfer_python==0.5.0",
+  "flashinfer_cubin==0.5.0",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -56,7 +57,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.16.post4",
+  "sgl-kernel==0.3.16.post5",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
@@ -78,6 +79,25 @@ dependencies = [
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+diffusion = [
+    "diffusers==0.35.2",
+    "yunchang==0.6.3.post1",
+    "opencv-python==4.10.0.84",
+    "imageio==2.36.0",
+    "imageio-ffmpeg==0.5.1",
+    "PyYAML==6.0.1",
+    "moviepy>=2.0.0",
+    "cloudpickle",
+    "remote-pdb",
+    "torchcodec==0.5.0",
+    "st_attn ==0.0.7",
+    "vsa==0.0.4",
+]
+
+[tool.uv.extra-build-dependencies]
+st-attn = ["torch", "setuptools"]
+vsa = ["torch", "setuptools"]
+
 test = [
   "accelerate",
   "expecttest",
@@ -100,6 +120,9 @@ tracing = [
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.scripts]
+sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
