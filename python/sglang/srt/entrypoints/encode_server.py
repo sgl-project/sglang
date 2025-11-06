@@ -261,3 +261,8 @@ async def handle_send_request(request: dict):
         buffer_address=request["buffer_address"],
     )
     return ORJSONResponse(content=None)
+
+
+@app.get("/health_check")
+async def handle_send_request():
+    return ORJSONResponse(content={"is_alive": True})
