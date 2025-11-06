@@ -65,14 +65,12 @@ use crate::{
             ResponsesUsage,
         },
     },
-    routers::{
-        grpc::{
-            common::responses::{
-                build_sse_response, ensure_mcp_connection, streaming::ResponseStreamEventEmitter,
-            },
-            error,
+    routers::grpc::{
+        common::responses::{
+            build_sse_response, ensure_mcp_connection, persist_response_if_needed,
+            streaming::ResponseStreamEventEmitter,
         },
-        openai::conversations::persist_conversation_items,
+        error,
     },
 };
 
@@ -221,21 +219,14 @@ async fn route_responses_internal(
     };
 
     // 5. Persist response to storage if store=true
-    if request.store.unwrap_or(true) {
-        if let Ok(response_json) = serde_json::to_value(&responses_response) {
-            if let Err(e) = persist_conversation_items(
-                ctx.conversation_storage.clone(),
-                ctx.conversation_item_storage.clone(),
-                ctx.response_storage.clone(),
-                &response_json,
-                &request,
-            )
-            .await
-            {
-                warn!("Failed to persist response: {}", e);
-            }
-        }
-    }
+    persist_response_if_needed(
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        ctx.response_storage.clone(),
+        &responses_response,
+        &request,
+    )
+    .await;
 
     Ok(responses_response)
 }
@@ -454,25 +445,15 @@ async fn process_and_transform_sse_stream(
     event_emitter.send_event(&completed_event, &tx)?;
 
     // Finalize and persist accumulated response
-    if original_request.store.unwrap_or(true) {
-        let final_response = accumulator.finalize();
-
-        if let Ok(response_json) = serde_json::to_value(&final_response) {
-            if let Err(e) = persist_conversation_items(
-                conversation_storage.clone(),
-                conversation_item_storage.clone(),
-                response_storage.clone(),
-                &response_json,
-                &original_request,
-            )
-            .await
-            {
-                warn!("Failed to persist streaming response: {}", e);
-            } else {
-                debug!("Persisted streaming response: {}", final_response.id);
-            }
-        }
-    }
+    let final_response = accumulator.finalize();
+    persist_response_if_needed(
+        conversation_storage,
+        conversation_item_storage,
+        response_storage,
+        &final_response,
+        &original_request,
+    )
+    .await;
 
     Ok(())
 }
