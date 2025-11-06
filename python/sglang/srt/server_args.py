@@ -392,6 +392,7 @@ class ServerArgs:
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
+    enable_flashinfer_mnnvl_allreduce: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -900,9 +901,13 @@ class ServerArgs:
                         "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
                     )
                 if not self.enable_dp_attention:
-                    self.enable_flashinfer_allreduce_fusion = True
+                    self.enable_flashinfer_allreduce_fusion = False
                     logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
+                        "Don't enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
+                    )
+                    self.enable_flashinfer_mnnvl_allreduce = True
+                    logger.info(
+                        "Enable FlashInfer mnnvl AllReduce on sm100 for DeepseekV3ForCausalLM"
                     )
                 if self.moe_a2a_backend == "none" and self.moe_runner_backend == "auto":
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -944,10 +949,14 @@ class ServerArgs:
 
             if is_blackwell_supported():
                 if not self.enable_dp_attention:
-                    self.enable_flashinfer_allreduce_fusion = True
+                    self.enable_flashinfer_allreduce_fusion = False
                     logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
+                        "Dont' enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
                     )
+                    self.enable_flashinfer_mnnvl_allreduce = True
+                    logger.info(
+                        "Enable FlashInfer mnnvl AllReduce on sm100 for DeepseekV3ForCausalLM"
+                    )                    
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
@@ -2798,6 +2807,11 @@ class ServerArgs:
             action="store_true",
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
+        parser.add_argument(
+            "--enable-flashinfer-mnnvl-allreduce",
+            action="store_true",
+            help="Enable FlashInfer mnnvl allreduce.",
+        )        
         parser.add_argument(
             "--deepep-mode",
             type=str,

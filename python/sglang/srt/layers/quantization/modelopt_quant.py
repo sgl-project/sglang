@@ -1067,6 +1067,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
+        backend = (
+            FLASHINFER_FP4_GEMM_BACKEND
+            if FLASHINFER_FP4_GEMM_BACKEND
+            else "cutlass"
+        )
         out = fp4_gemm(
             x_fp4,
             w,
@@ -1074,7 +1079,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             w_scale_interleaved,
             layer.alpha,
             output_dtype,
-            **(dict(backend=FLASHINFER_FP4_GEMM_BACKEND) if FLASHINFER_FP4_GEMM_BACKEND else dict()),
+            **(dict(backend=backend)),
         )
         if bias is not None:
             out = out + bias

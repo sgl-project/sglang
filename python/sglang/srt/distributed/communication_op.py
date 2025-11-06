@@ -7,9 +7,17 @@ import torch.distributed
 
 from .parallel_state import get_tp_group
 
+use_flashinfer_mnnvl_allreduce = True  # Will be set in server_args.py
+# TODO(shuw): make it configurable
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
+    from sglang.srt.layers.flashinfer_allreduce import (
+        run_flashinfer_mnnvl_allreduce,
+    )
+    if use_flashinfer_mnnvl_allreduce:
+        return run_flashinfer_mnnvl_allreduce(input_)
+
     return get_tp_group().all_reduce(input_)
 
 
