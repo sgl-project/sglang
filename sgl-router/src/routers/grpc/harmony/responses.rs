@@ -1557,7 +1557,7 @@ async fn load_previous_messages(
         .await
         .map_err(|e| {
             error!(
-                function = "load_conversation_history",
+                function = "load_previous_messages",
                 prev_id = %prev_id_str,
                 error = %e,
                 "Failed to load previous response chain from storage"
