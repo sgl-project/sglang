@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
@@ -14,7 +15,26 @@ from sglang.test.test_utils import (
 )
 
 
-class MOFP8Test(CustomTestCase):
+def _get_compute_capability():
+    """Get the compute capability of the current GPU."""
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    return 0
+
+
+@unittest.skipIf(
+    torch.version.hip is not None,
+    "ModelOpt quantization is unsupported on ROCm/AMD GPUs",
+)
+@unittest.skipIf(
+    not torch.cuda.is_available(), "ModelOpt FP8 tests require CUDA-enabled NVIDIA GPU"
+)
+@unittest.skipIf(
+    _get_compute_capability() < 89,
+    "ModelOpt FP8 requires compute capability 8.9+ (Hopper or newer GPUs)",
+)
+class MOTest(CustomTestCase):
     model: str = None
     quantization: str = None
     # TODO (jingyu-ml): Add the test case wo fp8_e4m3 kv cache
@@ -24,7 +44,7 @@ class MOFP8Test(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if cls is MOFP8Test:
+        if cls is MOTest:
             raise unittest.SkipTest("Skip base test class")
 
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -43,7 +63,7 @@ class MOFP8Test(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if cls is MOFP8Test:
+        if cls is MOTest:
             return
         kill_process_tree(cls.process.pid)
 
@@ -91,26 +111,89 @@ class MOFP8Test(CustomTestCase):
         self.assertGreaterEqual(throughput, self.throughput_threshold)
 
 
-# At the top of the file
-LLAMA_MODEL = "nvidia/Llama-3.1-8B-Instruct-FP8"
-LLAMA_GSM8K_ACC_THRESHOLD = 0.69
+LLAMA_FP8_MODEL = "nvidia/Llama-3.1-8B-Instruct-FP8"
+LLAMA_FP4_MODEL = "nvidia/Llama-3.1-8B-Instruct-FP4"
+# We only tested 200 questions, so the results have high variance.
+LLAMA_GSM8K_ACC_THRESHOLD = 0.63
 LLAMA_THROUGHPUT_THRESHOLD = 120
 
-QWEN_MODEL = "nvidia/Qwen3-8B-FP8"
-QWEN_GSM8K_ACC_THRESHOLD = 0.90
+QWEN_FP8_MODEL = "nvidia/Qwen3-8B-FP8"
+QWEN_FP4_MODEL = "nvidia/Qwen3-8B-FP4"
+# We only tested 200 questions, so the results have high variance.
+QWEN_GSM8K_ACC_THRESHOLD = 0.88
 QWEN_THROUGHPUT_THRESHOLD = 120
 
 
-class TestMOLlamaFP8(MOFP8Test):
-    model = LLAMA_MODEL
+@unittest.skipIf(
+    torch.version.hip is not None,
+    "ModelOpt quantization is unsupported on ROCm/AMD GPUs",
+)
+@unittest.skipIf(
+    not torch.cuda.is_available(), "ModelOpt FP8 tests require CUDA-enabled NVIDIA GPU"
+)
+@unittest.skipIf(
+    _get_compute_capability() < 89,
+    "ModelOpt FP8 requires compute capability 8.9+ (Hopper or newer GPUs)",
+)
+class TestMOLlamaFP8(MOTest):
+    model = LLAMA_FP8_MODEL
     quantization = "modelopt"
     kv_cache_dtype = "fp8_e4m3"
     gsm8k_accuracy_threshold = LLAMA_GSM8K_ACC_THRESHOLD
     throughput_threshold = LLAMA_THROUGHPUT_THRESHOLD
 
 
-class TestMOQwenFP8(MOFP8Test):
-    model = QWEN_MODEL
+@unittest.skipIf(
+    torch.version.hip is not None,
+    "ModelOpt quantization is unsupported on ROCm/AMD GPUs",
+)
+@unittest.skipIf(
+    not torch.cuda.is_available(), "ModelOpt FP8 tests require CUDA-enabled NVIDIA GPU"
+)
+@unittest.skipIf(
+    _get_compute_capability() < 89,
+    "ModelOpt FP8 requires compute capability 8.9+ (Hopper or newer GPUs)",
+)
+class TestMOQwenFP8(MOTest):
+    model = QWEN_FP8_MODEL
+    quantization = "modelopt"
+    kv_cache_dtype = "fp8_e4m3"
+    gsm8k_accuracy_threshold = QWEN_GSM8K_ACC_THRESHOLD
+    throughput_threshold = QWEN_THROUGHPUT_THRESHOLD
+
+
+@unittest.skipIf(
+    torch.version.hip is not None,
+    "ModelOpt quantization is unsupported on ROCm/AMD GPUs",
+)
+@unittest.skipIf(
+    not torch.cuda.is_available(), "ModelOpt FP8 tests require CUDA-enabled NVIDIA GPU"
+)
+@unittest.skipIf(
+    _get_compute_capability() < 100,
+    "ModelOpt FP4 requires compute capability 10.0+ (Blackwell or newer GPUs)",
+)
+class TestMOLlamaFP4(MOTest):
+    model = LLAMA_FP4_MODEL
+    quantization = "modelopt"
+    kv_cache_dtype = "fp8_e4m3"
+    gsm8k_accuracy_threshold = LLAMA_GSM8K_ACC_THRESHOLD
+    throughput_threshold = LLAMA_THROUGHPUT_THRESHOLD
+
+
+@unittest.skipIf(
+    torch.version.hip is not None,
+    "ModelOpt quantization is unsupported on ROCm/AMD GPUs",
+)
+@unittest.skipIf(
+    not torch.cuda.is_available(), "ModelOpt FP8 tests require CUDA-enabled NVIDIA GPU"
+)
+@unittest.skipIf(
+    _get_compute_capability() < 100,
+    "ModelOpt FP4 requires compute capability 10.0+ (Blackwell or newer GPUs)",
+)
+class TestMOQwenFP4(MOTest):
+    model = QWEN_FP4_MODEL
     quantization = "modelopt"
     kv_cache_dtype = "fp8_e4m3"
     gsm8k_accuracy_threshold = QWEN_GSM8K_ACC_THRESHOLD
