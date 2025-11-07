@@ -337,6 +337,12 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
+
+    # 🆕 动态推测解码参数
+    enable_dynamic_spec: bool = False  # 是否启用动态推测解码
+    speculative_batch_size_threshold: int = 8  # decode batch size 阈值
+    speculative_dynamic_log_interval: int = 100  # 日志打印间隔（每N次决策打印一次）
+
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -2399,6 +2405,23 @@ class ServerArgs:
             choices=["prefill", "decode"],
             help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
             default=ServerArgs.speculative_attention_mode,
+        )
+        parser.add_argument(
+            "--enable-dynamic-spec",
+            action="store_true",
+            help="Enable dynamic speculative decoding based on batch size. When enabled, speculative decoding will be automatically disabled when decode batch size exceeds the threshold.",
+        )
+        parser.add_argument(
+            "--speculative-batch-size-threshold",
+            type=int,
+            default=ServerArgs.speculative_batch_size_threshold,
+            help="The batch size threshold for dynamic speculative decoding. Speculative decoding will only be used when decode batch size is <= this threshold.",
+        )
+        parser.add_argument(
+            "--speculative-dynamic-log-interval",
+            type=int,
+            default=ServerArgs.speculative_dynamic_log_interval,
+            help="Log interval (in iterations) for dynamic speculative decoding statistics.",
         )
         # Ngram speculative decoding
         parser.add_argument(

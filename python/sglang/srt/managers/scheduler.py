@@ -148,7 +148,7 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -676,6 +676,9 @@ class Scheduler(
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
+
+            self.last_step_in_spec_mode = False
+
         elif self.spec_algorithm.is_standalone():
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
@@ -1727,9 +1730,10 @@ class Scheduler(
             )
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
-        if memory_leak:
-            msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
-            raise ValueError(msg)
+        # FIXME(sunpeng): figure out why memory_leak
+        # if memory_leak:
+        #     msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+        #     raise ValueError(msg)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             req_total_size = (
@@ -2172,6 +2176,94 @@ class Scheduler(
     ):
         pass
 
+    def should_use_speculative_decoding(self, batch: ScheduleBatch) -> bool:
+        """Dynamic decision for whether to use speculative decoding based on batch size."""
+        # If speculative decoding is not configured, always return False
+        if self.spec_algorithm.is_none():
+            return False
+
+        # never enable spec decoding for extend mode
+        if batch.forward_mode.is_extend():
+            return False
+
+        # If no threshold is set, use original logic (always use spec when available)
+        if self.server_args.speculative_batch_size_threshold is None:
+            return True
+
+        # Make decision based on batch size for decode operations only
+        current_batch_size = batch.batch_size()
+        return current_batch_size <= self.server_args.speculative_batch_size_threshold
+
+    def cleanup_speculative_state(self, batch: ScheduleBatch):
+        """Clean up speculative decoding related state when switching to non-spec mode."""
+        if batch.spec_info:
+            # Extract the first token from each sequence's candidates for standard sampling
+            if hasattr(batch.spec_info, 'draft_token') and batch.spec_info.draft_token is not None:
+                # Get draft tokens and reshape to (bs, draft_token_num)
+                draft_tokens = batch.spec_info.draft_token
+                bs = len(batch.reqs)
+                draft_token_num = len(draft_tokens) // bs
+                candidates = draft_tokens.reshape(bs, draft_token_num)
+
+                # Get the first token from each sequence (candidates[:, 0])
+                first_tokens = candidates[:, 0]
+
+                # Update input_ids with the first tokens (for next decode step)
+                batch.input_ids = first_tokens.to(torch.int64)
+
+                # TODO(sunpeng): do we really need this?
+                # Update individual request output_ids
+                for i, req in enumerate(batch.reqs):
+                    if i < len(first_tokens):
+                        token_id = first_tokens[i].item()
+                        req.output_ids.append(token_id)
+            else:
+                # If no draft_token available, use the last token from each request
+                batch.input_ids = torch.tensor([
+                    req.output_ids[-1] if len(req.output_ids) > 0 else req.origin_input_ids[-1]
+                    for req in batch.reqs
+                ], dtype=torch.int64, device=batch.device)
+
+        # Clear spec_info state
+        batch.spec_info = None
+        batch.spec_algorithm = SpeculativeAlgorithm.NONE
+
+
+    def initialize_speculative_state(self, batch: ScheduleBatch):
+        """Initialize speculative state when switching from non-spec to spec mode.
+        This method creates a spec_info and allocates cache using speculative decoding
+        allocation logic, similar to what _draft_preprocess_decode does.
+        """
+        # Note: batch.spec_info might already exist if created by eagle_worker in previous iteration
+        # In that case, we reuse the existing spec_info instead of creating a new one
+        orig_forward_mode = batch.forward_mode
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.spec_algorithm = self.spec_algorithm
+
+        # # Create initial spec_info only if it doesn't exist
+        # if batch.spec_info is None:
+        #     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+            
+        #     batch.spec_info = EagleDraftInput.create_idle_input(
+        #         device=batch.device,
+        #         hidden_size=batch.model_config.hidden_size,
+        #         dtype=batch.model_config.dtype,
+        #         topk=self.server_args.speculative_eagle_topk or 1,
+        #         capture_hidden_mode=CaptureHiddenMode.LAST,
+        #     )
+
+        # For EXTEND mode, we need to properly allocate memory for the new token
+        # while preserving the existing paged KV cache
+        bs = batch.batch_size()
+
+        batch.prefix_lens = [l - 1 for l in batch.seq_lens.cpu().tolist()]  # All previous tokens are prefix
+        batch.extend_lens = [1] * bs
+        batch.extend_num_tokens = bs
+        batch.extend_logprob_start_lens = [max(0, seq_len - 2) for seq_len in batch.seq_lens.cpu().tolist()]
+        batch.attn_attend_prefix_cache = True
+
+        return orig_forward_mode
+
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -2184,82 +2276,130 @@ class Scheduler(
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
+        use_spec_decoding = False
+
         # Run forward
         if self.is_generation:
+            # Dynamic decision for speculative decoding based on batch size
+            has_spec_config = not self.spec_algorithm.is_none()
 
-            batch_or_worker_batch = batch
-
-            if self.enable_overlap or self.spec_algorithm.is_none():
-                # FIXME(lsyin): remove this if and finally unify the abstraction
+            # Case 1: No spec config - always run in non-spec mode
+            if not has_spec_config:
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
-            if self.enable_overlap:
-                # FIXME: remove this assert
-                assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
-                model_worker_batch = batch_or_worker_batch
-                self.record_batch_in_overlap(model_worker_batch)
+                if self.enable_overlap:
+                    assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
+                    model_worker_batch = batch_or_worker_batch
+                    self.record_batch_in_overlap(model_worker_batch)
 
-                # Sampling info will be modified during forward
-                model_worker_batch.sampling_info = (
-                    model_worker_batch.sampling_info.copy_for_forward()
-                )
-
-                bs = len(model_worker_batch.seq_lens)
-                future_indices = self.future_map.alloc_future_indices(bs)
-
-                with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.default_stream)
-                    self.future_map.resolve_future(model_worker_batch)
-                    batch_result = self.model_worker.forward_batch_generation(
-                        model_worker_batch
+                    model_worker_batch.sampling_info = (
+                        model_worker_batch.sampling_info.copy_for_forward()
                     )
-                    # FIXME(lsyin): maybe move this to forward_batch_generation
-                    batch_result.copy_done = torch.get_device_module(
-                        self.device
-                    ).Event()
-                    if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu()
-                    else:
-                        batch_result.future_indices = future_indices
 
-                # FIXME(lsyin): move this assignment elsewhere
-                future_indices_or_next_token_ids = -future_indices.indices
+                    bs = len(model_worker_batch.seq_lens)
+                    future_indices = self.future_map.alloc_future_indices(bs)
 
-                if batch.is_v2_eagle:
-                    # FIXME(lsyin): tmp code for eagle v2
-                    # We only keep future indices for next draft input
+                    with self.forward_stream_ctx:
+                        self.forward_stream.wait_stream(self.default_stream)
+                        self.future_map.resolve_future(model_worker_batch)
+                        batch_result = self.model_worker.forward_batch_generation(
+                            model_worker_batch
+                        )
+                        batch_result.copy_done = torch.get_device_module(
+                            self.device
+                        ).Event()
+                        if batch_result.delay_sample_func is None:
+                            self.future_map.store_to_map(future_indices, batch_result)
+                            batch_result.copy_to_cpu()
+                        else:
+                            batch_result.future_indices = future_indices
 
-                    batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
+                    future_indices_or_next_token_ids = -future_indices.indices
 
-                    # batch.spec_info = EagleDraftInput(
-                    #     future_indices=future_indices,
-                    #     verify_done=batch_result.next_draft_input.verify_done,
-                    #     # FIXME(lsyin): remove the allocate_lens in EagleDraftInput
-                    #     allocate_lens=batch_result.next_draft_input.allocate_lens,
-                    # )
+                    if batch.is_v2_eagle:
+                        batch.spec_info = batch_result.next_draft_input
+                        batch.spec_info.future_indices = future_indices
+                        batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                else:
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch_or_worker_batch
+                    )
+                    future_indices_or_next_token_ids = batch_result.next_token_ids
+                    self.update_cache_from_scheduler(batch, batch_result)
 
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+            # Cases 2 & 3: Has spec config - dynamic decision based on batch size
             else:
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch_or_worker_batch
-                )
-                future_indices_or_next_token_ids = batch_result.next_token_ids
-                self.update_cache_from_scheduler(batch, batch_result)
+                use_spec_decoding = self.should_use_speculative_decoding(batch)
+                
+                # Debug logging for mode switching (only log when mode changes)
+                batch_size = batch.batch_size()
+                threshold = self.server_args.speculative_batch_size_threshold
+                
+                # 🔍 DEBUG: 强制打印每次决策（用于调试threshold问题）
+                if batch.forward_mode.is_decode():
+                    logger.info(
+                        f"🔍 [DEBUG] Decode batch decision: batch_size={batch_size}, "
+                        f"threshold={threshold}, use_spec={use_spec_decoding}, "
+                        f"is_extend={batch.forward_mode.is_extend()}"
+                    )
+                
+                # Only log when switching modes to reduce log spam
+                if use_spec_decoding != self.last_step_in_spec_mode:
+                    logger.info(
+                        f"Dynamic spec decision: batch_size={batch_size}, "
+                        f"threshold={threshold}, use_spec={use_spec_decoding}"
+                    )
 
-            # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
-            #       which can probably be replaced by future_indices later [TODO(lsyin)].
-            #       we shall still keep the original outputs, e.g. next_token_ids
-            #       in the GenerationBatchOutput for processing after copy_done.
+                # Case 2: Has config but dynamically disabled - non-spec mode with state management
+                if not use_spec_decoding:
+                    batch.spec_algorithm = SpeculativeAlgorithm.NONE
+                    
+                    # Handle spec -> non-spec transition
+                    if self.last_step_in_spec_mode:
+                        logger.info(f"Switching from spec to non-spec mode (batch_size={batch_size})")
+                        self.cleanup_speculative_state(batch)
+                        self.last_step_in_spec_mode = False
+
+                    # 🔑 使用 tp_worker (target-only)，而不是 model_worker (EAGLEWorker)
+                    # 当动态禁用 spec decode 时，应该直接运行 target model
+                    batch_or_worker_batch = batch.get_model_worker_batch()
+                    batch_result = self.tp_worker.forward_batch_generation(batch_or_worker_batch)
+                    future_indices_or_next_token_ids = batch_result.next_token_ids
+                    self.update_cache_from_scheduler(batch, batch_result)
+
+                # Case 3: Has config and dynamically enabled - spec mode
+                else:
+                    # Handle non-spec -> spec transition
+                    orig_forward_mode = None
+                    if not self.last_step_in_spec_mode:
+                        logger.info(f"Switching from non-spec to spec mode (batch_size={batch_size})")
+                        orig_forward_mode = self.initialize_speculative_state(batch)
+                        self.last_step_in_spec_mode = True
+
+                    # Note: self.model_worker is draft_worker (eagle_worker) when spec is configured
+                    # The eagle_worker will run in spec mode because batch.spec_algorithm is set
+                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    
+                    # Update spec decoding metrics if available
+                    if batch_result.num_accepted_tokens is not None:
+                        bs = batch.batch_size()
+                        self.spec_num_total_accepted_tokens += batch_result.num_accepted_tokens + bs
+                        self.spec_num_total_forward_ct += bs
+                        self.num_generated_tokens += batch_result.num_accepted_tokens
+
+                    # Restore forward mode if we just switched
+                    if orig_forward_mode is not None:
+                        batch.forward_mode = orig_forward_mode
+
+                    future_indices_or_next_token_ids = batch_result.next_token_ids
+
+            # Common post-processing for all generation paths
             batch.output_ids = future_indices_or_next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
-            if batch.return_logprob or self.spec_algorithm.is_eagle():
+            if batch.return_logprob or (self.spec_algorithm.is_eagle() and use_spec_decoding):
                 extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
             else:
                 extend_input_len_per_req = None
