@@ -35,6 +35,7 @@ def create_remote_connector(url, device, **kwargs) -> BaseConnector:
     else:
         raise ValueError(f"Invalid connector type: {url}")
 
+
 def verify_if_url_is_gcs_bucket(url):
     if url.startswith("gs://"):
         os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = "https://storage.googleapis.com"
@@ -43,6 +44,7 @@ def verify_if_url_is_gcs_bucket(url):
         os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
         url = url.replace("gs://", "s3://", 1)
     return url
+
 
 def get_connector_type(client: BaseConnector) -> ConnectorType:
     if isinstance(client, BaseKVConnector):
