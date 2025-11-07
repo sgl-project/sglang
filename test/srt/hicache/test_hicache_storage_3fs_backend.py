@@ -76,6 +76,8 @@ class TestHf3fsBackendAccuracy(HiCacheStorage3FSBackendBaseMixin, CustomTestCase
         server_args, env_vars = super()._get_additional_server_args_and_env()
         server_args["--hicache-ratio"] = 1.5
         server_args["--tp-size"] = 2
+        server_args["--hicache-mem-layout"] = "page_first_direct"
+        server_args["--hicache-io-backend"] = "direct"
         return server_args, env_vars
 
     def test_eval_accuracy(self):
