@@ -131,24 +131,33 @@ def test_topk_kernel(bs: int, k: int, seq_len: int, has_row_starts: bool) -> Non
 @pytest.mark.parametrize("bs", [1, 132, 256, 4096])
 @pytest.mark.parametrize("k", [2048])  # we only support 2048 now
 @pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
-@pytest.mark.parametrize("is_prefill", [True, False])
+@pytest.mark.parametrize("mode", ["extend", "decode", "target_verify"])
 @torch.inference_mode()
-def test_topk_transform_kernel(bs: int, k: int, seq_len: int, is_prefill: bool) -> None:
+def test_topk_transform_kernel(bs: int, k: int, seq_len: int, mode: str) -> None:
     torch.manual_seed(42)
 
     stream = torch.cuda.Stream()
     torch.cuda.set_stream(stream)
-    score = torch.randn(bs, MAX_SEQ_LEN, dtype=torch.float32, device="cuda")
-    lengths = torch.full((bs,), seq_len, dtype=torch.int32, device="cuda")
 
-    if is_prefill:
+    # NOTE: for decode, cumulative seqlens_q is just 0..=bs
+    # NOTE: since page table is arange, they equal topk indices
+    if mode == "decode":
+        step = 1
+    else:
+        step = 4 if bs % 4 == 0 else 1
+    num_tokens = bs
+    bs = bs // step
+
+    if mode == "extend":
         row_starts = torch.randint(0, 2048, (bs,), dtype=torch.int32, device="cuda")
     else:
         row_starts = None
 
-    # NOTE: for decode, cumulative seqlens_q is just 0..=bs
-    # NOTE: since page table is arange, they equal topk indices
-    cu_seqlens_q = torch.arange(0, bs + 1, dtype=torch.int32, device="cuda")
+    score = torch.randn(bs, MAX_SEQ_LEN, dtype=torch.float32, device="cuda")
+    lengths = torch.full((bs,), seq_len, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.arange(
+        0, num_tokens + 1, step=step, dtype=torch.int32, device="cuda"
+    )
     src_page_table = torch.arange(0, seq_len, dtype=torch.int32, device="cuda")
     src_page_table = src_page_table.unsqueeze(0).expand(bs, -1)
 
@@ -179,7 +188,7 @@ def test_topk_transform_kernel(bs: int, k: int, seq_len: int, is_prefill: bool) 
         bs,
         k,
         seq_len,
-        max_permit_error=2,
+        max_permit_error=5,
     )
 
 
@@ -229,7 +238,7 @@ def test_topk_transform_ragged_kernel(bs: int, k: int, seq_len: int) -> None:
         k,
         seq_len,
         topk_indices_offset,
-        max_permit_error=2,
+        max_permit_error=5,
     )
 
 

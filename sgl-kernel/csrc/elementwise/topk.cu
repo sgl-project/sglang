@@ -295,7 +295,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
   const auto length = lengths[bid];
-  const auto row_start = row_starts[bid];
+  const auto row_start = row_starts == nullptr ? 0 : row_starts[bid];
   const auto dst_page_entry = dst_page_table + bid * TopK;
   const auto score = input + bid * input_stride;
 
@@ -462,9 +462,11 @@ void fast_topk_transform_interface(
   const auto src_stride = src_page_table.stride(0);
 
   // dispatch to decode or prefill
-  const auto is_decode = !row_starts_opt.has_value();
+  // extend and draft extend: row_starts_opt is not null, invokes the prefill kernel
+  // decode: row_starts_opt is null, invokes the decode kernel
+  // target verify: row_starts_opt is null, invokes the prefill kernel
+  const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
   if (is_decode) {
-    TORCH_CHECK(prefill_bs == B, "prefill_bs should be equal to B for decode");
     setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
     topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
         params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
