@@ -85,7 +85,7 @@ def fast_topk_transform_ragged_fused(
     lengths: torch.Tensor,
     topk_indices_offset: torch.Tensor,  # ragged kv
     topk: int,
-    row_starts: torch.Tensor,
+    row_starts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Get the topk indices of the score tensor and then transform the topk indices to
@@ -100,7 +100,9 @@ def fast_topk_transform_ragged_fused(
         topk: The number of topk indices to get
         row_starts: The start index of each row in the score tensor of shape (B).
             For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
-            of the score tensor.
+            of the score tensor. It can be None if only the fast path is triggered,
+            in the case of all values in lengths <= topk (not checked in the kernel,
+            guaranteed by the caller).
     Returns:
         The topk indices tensor of shape (B, topk)
     """

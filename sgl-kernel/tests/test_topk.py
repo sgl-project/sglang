@@ -195,8 +195,11 @@ def test_topk_transform_kernel(bs: int, k: int, seq_len: int, mode: str) -> None
 @pytest.mark.parametrize("bs", [1, 132, 256, 4096])
 @pytest.mark.parametrize("k", [2048])  # we only support 2048 now
 @pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
+@pytest.mark.parametrize("has_row_starts", [True, False])
 @torch.inference_mode()
-def test_topk_transform_ragged_kernel(bs: int, k: int, seq_len: int) -> None:
+def test_topk_transform_ragged_kernel(
+    bs: int, k: int, seq_len: int, has_row_starts: bool
+) -> None:
     # Used in prefill only
     torch.manual_seed(42)
 
@@ -205,7 +208,10 @@ def test_topk_transform_ragged_kernel(bs: int, k: int, seq_len: int) -> None:
     # bs: # of q tokens
     score = torch.randn(bs, MAX_SEQ_LEN, dtype=torch.float32, device="cuda")
     # kv_len
-    row_starts = torch.randint(0, 2048, (bs,), dtype=torch.int32, device="cuda")
+    if has_row_starts:
+        row_starts = torch.randint(0, 2048, (bs,), dtype=torch.int32, device="cuda")
+    else:
+        row_starts = None
     lengths = torch.full((bs,), seq_len, dtype=torch.int32, device="cuda")
     topk_indices_offset = torch.randint(
         0, 1024, (bs,), dtype=torch.int32, device="cuda"

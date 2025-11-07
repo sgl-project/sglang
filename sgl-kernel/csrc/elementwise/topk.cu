@@ -343,7 +343,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
   const auto& [input, row_starts, _, lengths, input_stride] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
-  const auto row_start = row_starts[bid];
+  const auto row_start = row_starts == nullptr ? 0 : row_starts[bid];
   const auto length = lengths[bid];
   const auto dst_indices_entry = topk_indices_ragged + bid * TopK;
   const auto score = input + bid * input_stride;
@@ -490,14 +490,16 @@ void fast_topk_transform_ragged_interface(
     const at::Tensor& lengths,
     at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
-    const at::Tensor& row_starts) {
+    std::optional<at::Tensor> row_starts_opt) {
   CHECK_CUDA(score);
   CHECK_CUDA(lengths);
   CHECK_CUDA(topk_indices_ragged);
   CHECK_CUDA(topk_indices_offset);
-  CHECK_CUDA(row_starts);
+  if (row_starts_opt.has_value()) {
+    CHECK_CUDA(row_starts_opt.value());
+  }
 
-  const auto params = get_params(score, lengths, row_starts);
+  const auto params = get_params(score, lengths, row_starts_opt);
   const auto B = score.size(0);
   TORCH_CHECK(topk_indices_ragged.dim() == 2 && topk_indices_ragged.is_contiguous());
   TORCH_CHECK(topk_indices_offset.dim() == 1);

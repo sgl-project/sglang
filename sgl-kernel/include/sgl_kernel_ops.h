@@ -189,7 +189,7 @@ void fast_topk_transform_ragged_interface(
     const at::Tensor& lengths,
     at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
-    const at::Tensor& row_starts);
+    std::optional<at::Tensor> row_starts_opt = std::nullopt);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
