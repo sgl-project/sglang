@@ -72,11 +72,6 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
     def test_mcp_basic_tool_call_streaming(self):
         return super().test_mcp_basic_tool_call_streaming()
 
-    # Inherited from MCPTests:
-    # - test_mcp_basic_tool_call
-    # - test_mcp_basic_tool_call_streaming
-    # - test_mixed_mcp_and_function_tools (requires external MCP server)
-    # - test_mixed_mcp_and_function_tools_streaming (requires external MCP server)
     def test_structured_output_json_schema(self):
         """Override with simpler schema for Llama model (complex schemas not well supported)."""
         data = {
@@ -140,6 +135,12 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
         self.assertIn("answer", output_json)
         self.assertIsInstance(output_json["answer"], str)
         self.assertTrue(output_json["answer"], "Answer is empty")
+    
+    # Inherited from MCPTests:
+    # - test_mcp_basic_tool_call
+    # - test_mcp_basic_tool_call_streaming
+    # - test_mixed_mcp_and_function_tools (requires external MCP server)
+    # - test_mixed_mcp_and_function_tools_streaming (requires external MCP server)
 
 
 class TestGrpcHarmonyBackend(

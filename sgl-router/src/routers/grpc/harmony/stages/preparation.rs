@@ -140,17 +140,26 @@ impl HarmonyPreparationStage {
         }
 
         // Step 3: Generate Harmony structural tags
-        // Priority: structured output (text field) > tool constraints
-        let tool_constraints = if let Some(text_config) = &request.text {
-            // Structured output takes priority for Harmony models
-            Self::generate_text_format_constraint(text_config).map_err(|e| *e)?
-        } else if !function_tools.is_empty() {
-            // Fall back to tool constraints
+        let tool_constraint = if !function_tools.is_empty() {
             Self::generate_tool_call_constraint(&function_tools, &request.tool_choice)
                 .map_err(|e| *e)?
         } else {
             None
         };
+
+        let text_constraint = if let Some(text_config) = &request.text {
+            Self::generate_text_format_constraint(text_config).map_err(|e| *e)?
+        } else {
+            None
+        };
+
+        if tool_constraint.is_some() && text_constraint.is_some() {
+            return Err(error::bad_request(
+                "Cannot use both tool_choice (required/function) and text format (json_object/json_schema) simultaneously".to_string(),
+            ));
+        }
+
+        let constraint = tool_constraint.or(text_constraint);
 
         // Step 3: Build via Harmony from responses API request
         let build_output = self
@@ -158,12 +167,12 @@ impl HarmonyPreparationStage {
             .build_from_responses(request)
             .map_err(|e| error::bad_request(format!("Harmony build failed: {}", e)))?;
 
-        // Step 4: Store results with tool_constraints
+        // Step 4: Store results with constraint
         ctx.state.preparation = Some(PreparationOutput {
             original_text: None,
             token_ids: build_output.input_ids,
             processed_messages: None,
-            tool_constraints,
+            tool_constraints: constraint,
             filtered_request: None,
             harmony_mode: true,
             selection_text: Some(build_output.selection_text),
@@ -190,13 +199,11 @@ impl HarmonyPreparationStage {
         match format {
             TextFormat::Text => Ok(None),
             TextFormat::JsonObject => {
-                // json_object mode - constrain final channel to produce valid JSON object
                 let tag = build_text_format_structural_tag(&serde_json::json!({"type": "object"}))
                     .map_err(|e| Box::new(error::internal_error(e)))?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
             TextFormat::JsonSchema { schema, .. } => {
-                // json_schema mode - constrain final channel to the provided schema
                 let tag = build_text_format_structural_tag(schema)
                     .map_err(|e| Box::new(error::internal_error(e)))?;
                 Ok(Some(("structural_tag".to_string(), tag)))
