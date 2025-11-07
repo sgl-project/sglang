@@ -602,7 +602,7 @@ pub async fn collect_stream_responses(
                         all_responses.push(complete);
                     }
                     Some(Error(err)) => {
-                        error!(function = "collect_all_responses", worker = %worker_name, error = %err.message, "Worker generation error");
+                        error!(function = "collect_stream_responses", worker = %worker_name, error = %err.message, "Worker generation error");
                         // Don't mark as completed - let Drop send abort for error cases
                         return Err(error::internal_error(format!(
                             "{} generation failed: {}",
