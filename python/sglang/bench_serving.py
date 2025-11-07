@@ -1680,7 +1680,6 @@ def calculate_metrics(
                 # Support optional text/vision split in dict format
                 text_prompt_len = input_requests[i].get("text_prompt_len", prompt_len)
                 vision_prompt_len = input_requests[i].get("vision_prompt_len", 0)
-                
                 total_input += prompt_len
                 total_input_text += text_prompt_len
                 total_input_vision += vision_prompt_len
