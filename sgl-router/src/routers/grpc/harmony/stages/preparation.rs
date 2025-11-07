@@ -300,22 +300,37 @@ impl HarmonyPreparationStage {
 
 /// Build Harmony structural tag for structured output (JSON schema constraint)
 ///
-/// Creates a structural tag that applies JSON schema constraint to the final channel only,
-/// allowing the model to still produce proper Harmony format with channels.
+/// Creates a structural tag that applies JSON schema constraint to the final channel,
+/// supporting both reasoning-enabled and reasoning-disabled modes:
+/// - With reasoning: triggers on `<|start|>assistant<|channel|>final` (waits for analysis to complete)
+/// - Without reasoning: triggers on `<|channel|>final` (goes directly to final channel)
+///
 /// This is used for the Responses API text.format field (json_object or json_schema).
 pub fn build_text_format_structural_tag(schema: &serde_json::Value) -> Result<String, String> {
     let structural_tag = json!({
         "format": {
             "type": "triggered_tags",
-            "triggers": ["<|channel|>final"],
-            "tags": [{
-                "begin": "<|channel|>final<|constrain|>json<|message|>",
-                "content": {
-                    "type": "json_schema",
-                    "json_schema": schema
+            "triggers": ["<|start|>assistant<|channel|>final", "<|channel|>final"],
+            "tags": [
+                {
+                    // Pattern 1: For reasoning-enabled mode (with analysis channel before final)
+                    "begin": "<|start|>assistant<|channel|>final<|constrain|>json<|message|>",
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema
+                    },
+                    "end": ""
                 },
-                "end": ""
-            }],
+                {
+                    // Pattern 2: For reasoning-disabled mode (goes directly to final channel)
+                    "begin": "<|channel|>final<|constrain|>json<|message|>",
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema
+                    },
+                    "end": ""
+                }
+            ],
             "at_least_one": true,
             "stop_after_first": false
         }
