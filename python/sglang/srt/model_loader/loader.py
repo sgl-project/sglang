@@ -711,17 +711,18 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     - This loader integrates the same logic directly into SGLang's loading pipeline
     
     The challenge: quantization transforms weights and creates new tensors, losing:
-    - Original parameter shapes/strides
-    - Weight loader functions  
-    - Memory locations
+    - Original parameter shapes/strides (needed for torch.as_strided reset)
+    - Weight loader functions (needed to reload weights correctly)
+    - Memory locations (need to preserve for efficient GPU operations)
     
     Solution (FlashRL approach):
-    1. Load model with w8a8_int8 infrastructure (initial load)
-    2. Record original parameter state and weight loaders
-    3. Backup weight_scale parameters (these are from w8a8_int8, should not be updated)
-    4. On reload: reset to original state, load+quantize, copy back to original memory
-    5. Restore backed-up weight_scale parameters (FlashRL's approach)
-    6. This preserves memory locations for efficient GPU operations
+    1. Load raw checkpoint weights into model
+    2. Record PRE-quantization state (shape, stride) - needed for torch.as_strided reset
+    3. Record weight loader functions - needed to reload weights
+    4. Apply w8a8_int8 quantization (transposes/transforms weights)
+    5. Backup weight_scale parameters (from w8a8_int8, should not be updated on reload)
+    6. On reload: reset to pre-quant state, restore loaders, load+quantize, copy to original memory
+    7. Restore backed-up weight_scale parameters to preserve INT8 quantization config
     
     Inspired by FlashRL's sglang_patch.py, adapted for native SGLang integration.
     """
@@ -793,8 +794,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         """
         Initial load for RL training with quantized models.
         
-        Key difference from FlashRL: We record attributes BEFORE process_weights_after_loading
-        (FlashRL does it AFTER at line 297), requiring dimension adjustment for w8a8_int8 transpose.
+        Follows FlashRL's approach: Record pre-quantization state, apply quantization, backup scales.
+        Key difference: We record loader attributes BEFORE quantization with dimension adjustment
+        to handle w8a8_int8's weight transpose, while FlashRL can record from the same snapshot AFTER.
         """
         # FlashRL line 282: Load raw checkpoint weights
         logger.info("[QuantizedRL] Loading raw checkpoint weights")
@@ -802,6 +804,18 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         
         # FlashRL line 283: Capture parameters before quantization strips attributes
         original_weights = dict(model.named_parameters())
+        
+        # FlashRL lines 287-291: Record pre-quantization state for reload reconstruction
+        # This MUST be done BEFORE quantization to capture original shape/stride
+        logger.info("[QuantizedRL] Recording pre-quantization state")
+        model.original_weights_rebuild_keys = {}
+        for name, p in original_weights.items():
+            model.original_weights_rebuild_keys[name] = {
+                "shape": p.shape,
+                "stride": p.stride(),
+                "dtype": p.dtype,
+                "nbytes": p.untyped_storage().nbytes(),
+            }
         
         # FlashRL lines 294-307: Record parameter attributes before quantization
         logger.info("[QuantizedRL] Recording loader attributes before quantization")
@@ -812,6 +826,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         
         # EXTRA (not in FlashRL): Module lookup for w8a8_int8 dimension adjustment
         # Needed because w8a8_int8 transposes weights, changing dimension indices
+        # We record BEFORE quantization, so we must adjust dimensions to match post-transpose layout
+        # FlashRL records from same snapshot but AFTER quantization, so dims are already correct
         named_modules_dict = dict(model.named_modules())
 
         for name, p in original_weights.items():
@@ -823,8 +839,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     attr = getattr(p, key)
                     if not callable(attr):
                         # EXTRA: Adjust output_dim/input_dim for w8a8_int8 transpose
-                        # w8a8_int8 transposes [output,input] to [input,output], swapping dims
-                        # FlashRL records AFTER transpose so dims are correct; we record BEFORE so must adjust
+                        # w8a8_int8 transposes [output,input] to [input,output], swapping dims 0<->1
                         if key in ["output_dim", "input_dim"]:
                             module_name = ".".join(name.split(".")[:-1])
                             if module_name in named_modules_dict:
@@ -854,16 +869,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             if quant_method is not None:
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
-        
-        # FlashRL lines 287-291: Record post-quantization state for reload reconstruction
-        model.original_weights_rebuild_keys = {}
-        for name, p in model.named_parameters():
-            model.original_weights_rebuild_keys[name] = {
-                "shape": p.shape,
-                "stride": p.stride(),
-                "dtype": p.dtype,
-                "nbytes": p.untyped_storage().nbytes(),
-            }
         
         # FlashRL lines 324-329: Backup weight_scale (INT8 quantization scales, must not update on reload)
         for name, p in model.named_parameters():
