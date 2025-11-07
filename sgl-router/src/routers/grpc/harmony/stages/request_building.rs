@@ -67,7 +67,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                 let body = prep.filtered_request.as_ref().unwrap_or(request.as_ref());
 
                 builder_client
-                    .build_generate_request(
+                    .build_generate_request_from_chat(
                         request_id,
                         body,
                         placeholder_processed_text,
@@ -84,6 +84,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     placeholder_processed_text,
                     prep.token_ids.clone(),
                     prep.harmony_stop_ids.clone(),
+                    prep.tool_constraints.clone(),
                 )
                 .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?,
             _ => unreachable!(),

@@ -18,6 +18,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_deepep_mode,
@@ -841,15 +842,15 @@ class FusedMoE(torch.nn.Module):
             **kwargs,
         )
 
-        with use_symmetric_memory(get_tp_group()) as sm:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
             # TODO: should we add some conditions here?
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
             ].contiguous()
-
-            sm.tag(final_hidden_states)
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -1048,10 +1049,18 @@ class FlashInferFP4MoE(FusedMoE):
 
         router_logits = router_logits.to(torch.float32)
 
-        with use_symmetric_memory(get_tp_group()) as sm:
-            symm_output = torch.empty_like(hidden_states)
-            sm.tag(symm_output)
-
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            num_tokens = hs_fp4.shape[0]
+            hidden_size = (
+                hs_fp4.shape[-1] * 2
+                if hs_fp4.dtype == torch.uint8
+                else hs_fp4.shape[-1]
+            )
+            symm_output = torch.empty(
+                num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
+            )
         result = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=topk_config.correction_bias.to(hidden_states.dtype),
