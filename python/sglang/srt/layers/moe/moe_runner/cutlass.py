@@ -147,6 +147,18 @@ class CutlassRunnerCore(MoeRunnerCore):
         out_dtype = runner_input.hidden_states.dtype
         device = runner_input.hidden_states.device
 
+        # Common validation assertions for all CUTLASS MoE types
+        assert (
+            runner_input.topk_weights.shape == runner_input.topk_ids.shape
+        ), "topk shape mismatch"
+        assert runner_input.hidden_states.dtype in [
+            torch.half,
+            torch.bfloat16,
+        ], "Invalid input dtype - must be half or bfloat16"
+        assert (
+            quant_info.w13_weight.shape[0] == quant_info.w2_weight.shape[0]
+        ), "Expert number mismatch between w13 and w2"
+
         rep_primary = runner_input.rep_primary
         rep_aux = runner_input.rep_aux
         num_tokens = runner_input.hidden_states.shape[0]
@@ -154,6 +166,26 @@ class CutlassRunnerCore(MoeRunnerCore):
         topk = runner_input.topk_ids.shape[1]
 
         if moe_type == CutlassMoEType.BlockscaledFP8:
+            # FP8-specific validation assertions
+            assert (
+                quant_info.w13_weight.dtype == torch.float8_e4m3fn
+            ), "w13_weight must be float8_e4m3fn"
+            assert (
+                quant_info.w2_weight.dtype == torch.float8_e4m3fn
+            ), "w2_weight must be float8_e4m3fn"
+            assert (
+                runner_input.hidden_states.shape[1] == quant_info.w13_weight.shape[1]
+            ), "Hidden size mismatch w1"
+            assert (
+                quant_info.w13_weight.shape[2] == quant_info.w2_weight.shape[1] * 2
+            ), "Hidden size mismatch w2"
+            assert (
+                quant_info.w13_weight.shape[0] == quant_info.w13_scale.shape[0]
+            ), "w1 scales expert number mismatch"
+            assert (
+                quant_info.w13_weight.shape[0] == quant_info.w2_scale.shape[0]
+            ), "w2 scales expert number mismatch"
+
             intermediate_size = quant_info.w2_weight.size(1)
             num_experts = quant_info.w13_weight.size(0)
 
@@ -224,7 +256,32 @@ class CutlassRunnerCore(MoeRunnerCore):
             )
 
         elif moe_type == CutlassMoEType.BlockscaledFP4:
+            # FP4-specific validation assertions
             params = quant_info.params
+            assert quant_info.w13_weight.dtype == torch.uint8, "weight 1 must be uint8"
+            assert quant_info.w2_weight.dtype == torch.uint8, "weight 2 must be uint8"
+            assert (
+                quant_info.w13_weight.ndim == 3
+                and quant_info.w2_weight.ndim == 3
+                and quant_info.w1_blockscale.ndim == 3
+                and quant_info.w2_blockscale.ndim == 3
+            ), "All Weights must be of rank 3 for cutlass_moe_fp4"
+
+            e_w1, nx2_w1, half_k_w1 = quant_info.w13_weight.shape
+            e_w2, k_w2, half_n_w2 = quant_info.w2_weight.shape
+
+            assert (
+                e_w1 == e_w2 and e_w1 == params.num_experts
+            ), "Number of experts must match between weights."
+            assert (
+                runner_input.hidden_states.shape[1] // 2 == half_k_w1
+                and params.hidden_size == k_w2
+            ), "Hidden size mismatch between a, w1 and w2"
+            assert (
+                nx2_w1 == params.intermediate_size_per_partition * 2
+                and half_n_w2 == params.intermediate_size_per_partition // 2
+            ), "mismatch in expected `n`"
+            assert 2 * half_k_w1 == k_w2, "Hidden size mismatch w2 and w1"
 
             c1 = cutlass_fp4_group_mm(
                 rep_primary,

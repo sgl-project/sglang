@@ -5,10 +5,13 @@ import triton  # Added import
 import triton.testing  # Added import
 from transformers import AutoConfig
 
-from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 
 # Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
@@ -128,38 +131,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
     problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
     problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
 
-    # --- Lambdas for Benchmarking ---
-    cutlass_lambda = lambda: cutlass_fused_experts_fp8(
-        x,
-        w1.transpose(1, 2),  # Transposed
-        w2.transpose(1, 2),  # Transposed
-        w1_scale.transpose(1, 2),
-        w2_scale.transpose(1, 2),
-        topk_weights,
-        topk_ids,
-        a1_strides,
-        c1_strides,
-        a2_strides,
-        c2_strides,
-        workspace,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-    )
-
-    topk_output = StandardTopKOutput(
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        router_logits=torch.randn(
-            (batch_size, topk), device=topk_weights.device, dtype=dtype
-        ),
-    )
-
+    # --- Setup for refactored MoeRunner ---
     moe_runner_config = MoeRunnerConfig(
         num_experts=E,
         top_k=topk,
@@ -170,18 +142,56 @@ def run_test(tp_size, batch_size, model_config, check=False):
         inplace=False,
     )
 
+    # Create dispatch output
+    dispatch_output = StandardDispatchOutput(
+        hidden_states=x,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+    # CUTLASS runner setup
+    cutlass_runner = MoeRunner(MoeRunnerBackend.CUTLASS, moe_runner_config)
+    cutlass_quant_info = CutlassMoeQuantInfo(
+        moe_type=CutlassMoEType.BlockscaledFP8,
+        w13_weight=w1.transpose(1, 2),
+        w2_weight=w2.transpose(1, 2),
+        w13_scale=w1_scale.transpose(1, 2),
+        w2_scale=w2_scale.transpose(1, 2),
+        expert_offsets=expert_offsets,
+        problem_sizes1=problem_sizes1,
+        problem_sizes2=problem_sizes2,
+        ab_strides_13=a1_strides,
+        ab_strides_2=a2_strides,
+        c_strides_13=c1_strides,
+        c_strides_2=c2_strides,
+        workspace=workspace,
+        a_ptrs=a_ptrs,
+        b_ptrs=b_ptrs,
+        out_ptrs=out_ptrs,
+        a_scales_ptrs=a_scales_ptrs,
+        b_scales_ptrs=b_scales_ptrs,
+    )
+
+    # TRITON runner setup
     # Note: Triton expects non-transposed weights
-    triton_lambda = lambda: fused_experts(
-        x,
-        w1,
-        w2,
-        topk_output,
-        moe_runner_config,
-        use_fp8_w8a8=True,
-        w1_scale=w1_scale,
+    triton_runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+    triton_quant_info = TritonMoeQuantInfo(
+        w13_weight=w1,
+        w2_weight=w2,
+        use_fp8=True,
+        w13_scale=w1_scale,
         w2_scale=w2_scale,
         block_shape=block_shape,
     )
+
+    # Lambdas using refactored runner paths
+    cutlass_lambda = lambda: cutlass_runner.run(
+        dispatch_output, cutlass_quant_info
+    ).hidden_states
+
+    triton_lambda = lambda: triton_runner.run(
+        dispatch_output, triton_quant_info
+    ).hidden_states
 
     # --- Warmup ---
     print("Warming up...")
@@ -212,42 +222,15 @@ def run_test(tp_size, batch_size, model_config, check=False):
     if check:
         print("Running correctness check...")
         with torch.no_grad():
-            # Run CUTLASS version (requires transposed weights)
-            y_cutlass = cutlass_fused_experts_fp8(
-                x,
-                w1.transpose(1, 2),  # Transposed
-                w2.transpose(1, 2),  # Transposed
-                w1_scale.transpose(1, 2),
-                w2_scale.transpose(1, 2),
-                topk_weights,
-                topk_ids,
-                a1_strides,
-                c1_strides,
-                a2_strides,
-                c2_strides,
-                workspace,
-                a_ptrs,
-                b_ptrs,
-                out_ptrs,
-                a_scales_ptrs,
-                b_scales_ptrs,
-                expert_offsets,
-                problem_sizes1,
-                problem_sizes2,
-            )
+            # Run CUTLASS version using refactored runner
+            y_cutlass = cutlass_runner.run(
+                dispatch_output, cutlass_quant_info
+            ).hidden_states
 
-            # Run Triton version (requires original shape weights, use inplace=False)
-            y_triton = fused_experts(
-                x,
-                w1,  # Original shape
-                w2,  # Original shape
-                topk_output,
-                moe_runner_config,
-                use_fp8_w8a8=True,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                block_shape=block_shape,
-            )
+            # Run Triton version using refactored runner
+            y_triton = triton_runner.run(
+                dispatch_output, triton_quant_info
+            ).hidden_states
 
         diff = calc_diff(y_cutlass, y_triton)
         print(f"Diff: {diff:.6f}")

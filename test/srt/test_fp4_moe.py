@@ -8,9 +8,11 @@ from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_m
 from sgl_kernel import scaled_fp4_grouped_quant, scaled_fp4_quant, silu_and_mul
 from torch.nn import functional as F
 
-from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
 if torch.cuda.get_device_capability() < (10, 0):
@@ -383,28 +385,58 @@ def test_cutlass_fp4_moe_no_graph(
         w2_blockscale,
         w2_alphas,
     ):
+        # Create MoeRunnerConfig
+        runner_config = MoeRunnerConfig(
+            num_experts=e,
+            top_k=topk,
+            hidden_size=k,
+            intermediate_size_per_partition=n,
+            params_dtype=dtype,
+            activation="silu",
+            inplace=False,
+        )
+
+        # Create CutlassMoEParams
         params = CutlassMoEParams(
             CutlassMoEType.BlockscaledFP4,
             device=a.device,
             num_experts=e,
-            intermediate_size_per_partition=n,  # n
+            intermediate_size_per_partition=n,
             hidden_size=k,
-        )  # k
-        return cutlass_moe_fp4(
-            a=a,
-            a1_gscale=a1_gs,
-            w1_fp4=w1_q,
-            w1_blockscale=w1_blockscale,
-            w1_alphas=w1_alphas,
-            a2_gscale=a2_gs,
-            w2_fp4=w2_q,
-            w2_blockscale=w2_blockscale,
-            w2_alphas=w2_alphas,
+        )
+
+        # Create MoeRunner with CUTLASS backend
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        runner = MoeRunner(MoeRunnerBackend.CUTLASS, runner_config)
+
+        # Create dispatch output
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=a,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            params=params,
-            apply_router_weight_on_input=False,
         )
+
+        # Create quant info
+        quant_info = CutlassMoeQuantInfo(
+            moe_type=CutlassMoEType.BlockscaledFP4,
+            w13_weight=w1_q,
+            w2_weight=w2_q,
+            w1_blockscale=w1_blockscale,
+            w1_alpha=w1_alphas,
+            w2_blockscale=w2_blockscale,
+            w2_alpha=w2_alphas,
+            a1_gscale=a1_gs,
+            a2_gscale=a2_gs,
+            params=params,
+        )
+
+        # Run through the runner (handles pre_permute and post_permute internally)
+        combine_input = runner.run(dispatch_output, quant_info)
+
+        # The runner already applied topk weights and summed across experts
+        # combine_input.hidden_states is the final (m, k) output
+        return combine_input.hidden_states
 
     check_moe(m, n, k, e, topk, dtype, cutlass_moe_impl, flip_w13=False)
 
