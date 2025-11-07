@@ -11,20 +11,6 @@ use crate::protocols::responses::*;
 /// Builder for ResponsesResponse
 ///
 /// Provides a fluent interface for constructing responses with sensible defaults.
-///
-/// # Example
-/// ```
-/// use sglang_router_rs::protocols::builders::ResponsesResponseBuilder;
-/// use sglang_router_rs::protocols::responses::ResponseStatus;
-///
-/// # fn example() -> ResponsesResponse {
-/// let response = ResponsesResponse::builder("resp_123", "gpt-4")
-///     .status(ResponseStatus::Completed)
-///     .output(vec![])
-///     .build();
-/// # response
-/// # }
-/// ```
 #[must_use = "Builder does nothing until .build() is called"]
 #[derive(Clone, Debug)]
 pub struct ResponsesResponseBuilder {
