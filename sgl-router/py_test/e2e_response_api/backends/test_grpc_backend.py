@@ -83,8 +83,12 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
             "model": self.model,
             "input": [
                 {
+                    "role": "system",
+                    "content": "You are a math solver. Return ONLY a JSON object that matches the schema—no extra text.",
+                },
+                {
                     "role": "user",
-                    "content": "What is 2+2? Answer in JSON",
+                    "content": "What is 1 + 1?",
                 },
             ],
             "text": {

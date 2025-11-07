@@ -238,6 +238,10 @@ impl HarmonyPreparationStage {
     }
 
     /// Build Harmony structural tag for tool calling constraints
+    ///
+    /// Supports both reasoning-enabled and reasoning-disabled modes:
+    /// - With reasoning: triggers on `<|start|>assistant<|channel|>commentary` (waits for analysis)
+    /// - Without reasoning: triggers on `<|channel|>commentary` (goes directly to commentary)
     fn build_tool_call_structural_tag(
         tools: &[Tool],
         specific_function: Option<&str>,
@@ -262,11 +266,12 @@ impl HarmonyPreparationStage {
             ))));
         }
 
-        // Build tags for each tool
+        // Build tags for each tool - need two patterns per tool for reasoning on/off
         for tool in tools_to_use {
             let tool_name = &tool.function.name;
             let params_schema = &tool.function.parameters;
 
+            // Pattern 1: For reasoning-enabled mode (with analysis channel before commentary)
             tags.push(json!({
                 "begin": format!("<|start|>assistant<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
                 "content": {
@@ -275,6 +280,16 @@ impl HarmonyPreparationStage {
                 },
                 "end": "" // `end` is empty because <|call|> comes naturally from Harmony stop tokens
             }));
+
+            // Pattern 2: For reasoning-disabled mode (goes directly to commentary channel)
+            tags.push(json!({
+                "begin": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
+                "content": {
+                    "type": "json_schema",
+                    "json_schema": params_schema
+                },
+                "end": ""
+            }));
         }
 
         let stop_after_first = specific_function.is_some();
@@ -282,7 +297,7 @@ impl HarmonyPreparationStage {
         let structural_tag = json!({
             "format": {
                 "type": "triggered_tags",
-                "triggers": ["<|start|>assistant"],
+                "triggers": ["<|start|>assistant<|channel|>commentary", "<|channel|>commentary"],
                 "tags": tags,
                 "at_least_one": true,
                 "stop_after_first": stop_after_first
@@ -332,7 +347,7 @@ pub fn build_text_format_structural_tag(schema: &serde_json::Value) -> Result<St
                 }
             ],
             "at_least_one": true,
-            "stop_after_first": false
+            "stop_after_first": true
         }
     });
 
