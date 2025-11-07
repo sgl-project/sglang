@@ -169,24 +169,19 @@ def test_moe_align_block_size_compare_implementations(
 ):
 
     val = 1 if topk_id_Exceedance and topk >= 2 else 0
-    topk_ids = torch.argsort(torch.rand(num_tokens, num_experts + val, device="cuda"), dim=1)[
-        :, :topk
-    ]
+    topk_ids = torch.argsort(
+        torch.rand(num_tokens, num_experts + val, device="cuda"), dim=1
+    )[:, :topk]
 
     # topk_id_Exceedance == True means some ids == -1 in topk_ids,
     # need to be skip in following process
     if topk_id_Exceedance and topk >= 2:
         topk_ids = topk_ids - 1
         indices = torch.stack(
-            [
-                torch.randperm(topk, device="cuda")[: 1]
-                for _ in range(num_tokens)
-            ]
+            [torch.randperm(topk, device="cuda")[:1] for _ in range(num_tokens)]
         )
 
-        rows = (
-            torch.arange(num_tokens, device="cuda").unsqueeze(1).expand(-1, 1)
-        )
+        rows = torch.arange(num_tokens, device="cuda").unsqueeze(1).expand(-1, 1)
         topk_ids[rows, indices] = num_experts
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
