@@ -210,7 +210,7 @@ impl HarmonyResponseProcessor {
             )
             .map_err(|e| {
                 error!(
-                    function = "process_non_streaming_response",
+                    function = "process_responses_iteration",
                     error = %e,
                     "Harmony parsing failed on complete response"
                 );
