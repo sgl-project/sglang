@@ -11,7 +11,7 @@ sgl-diffusion features an end-to-end unified pipeline for accelerating diffusion
 sgl-diffusion has the following features:
   - broad model support: Wan, FastWan, Hunyuan, Qwen-Image, Qwen-Image-Edit
   - ease of use: OpenAI compatible api + cli + python sdk support
-  - Diverse hardware support: H100, H200, A100, B200, 4090
+  - diverse hardware support: H100, H200, A100, B200, 4090
 
 ## Getting Started
 
