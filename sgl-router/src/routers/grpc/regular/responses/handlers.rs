@@ -43,7 +43,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 use validator::Validate;
 
@@ -644,8 +644,14 @@ async fn execute_without_mcp(
     response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
     // Convert ResponsesRequest → ChatCompletionRequest
-    let chat_request = conversions::responses_to_chat(modified_request)
-        .map_err(|e| error::bad_request(format!("Failed to convert request: {}", e)))?;
+    let chat_request = conversions::responses_to_chat(modified_request).map_err(|e| {
+        error!(
+            function = "execute_without_mcp",
+            error = %e,
+            "Failed to convert ResponsesRequest to ChatCompletionRequest"
+        );
+        error::bad_request(format!("Failed to convert request: {}", e))
+    })?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
     let chat_response = ctx
@@ -659,8 +665,14 @@ async fn execute_without_mcp(
         .await?; // Preserve the Response error as-is
 
     // Convert ChatCompletionResponse → ResponsesResponse
-    conversions::chat_to_responses(&chat_response, original_request, response_id)
-        .map_err(|e| error::internal_error(format!("Failed to convert to responses format: {}", e)))
+    conversions::chat_to_responses(&chat_response, original_request, response_id).map_err(|e| {
+        error!(
+            function = "execute_without_mcp",
+            error = %e,
+            "Failed to convert ChatCompletionResponse to ResponsesResponse"
+        );
+        error::internal_error(format!("Failed to convert to responses format: {}", e))
+    })
 }
 
 /// Load conversation history and response chains, returning modified request
@@ -737,7 +749,15 @@ async fn load_conversation_history(
             .conversation_storage
             .get_conversation(&conv_id)
             .await
-            .map_err(|e| error::internal_error(format!("Failed to check conversation: {}", e)))?;
+            .map_err(|e| {
+                error!(
+                    function = "load_conversation_history",
+                    conversation_id = %conv_id_str,
+                    error = %e,
+                    "Failed to check conversation existence in storage"
+                );
+                error::internal_error(format!("Failed to check conversation: {}", e))
+            })?;
 
         if conversation.is_none() {
             return Err(error::not_found(format!(

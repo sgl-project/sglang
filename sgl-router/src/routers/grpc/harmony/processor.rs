@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::response::Response;
 use proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId};
+use tracing::error;
 
 use super::HarmonyParserAdapter;
 use crate::{
@@ -63,6 +64,11 @@ impl HarmonyResponseProcessor {
 
             // Parse Harmony channels with HarmonyParserAdapter
             let mut parser = HarmonyParserAdapter::new().map_err(|e| {
+                error!(
+                    function = "process_non_streaming_chat_response",
+                    error = %e,
+                    "Failed to create Harmony parser"
+                );
                 error::internal_error(format!("Failed to create Harmony parser: {}", e))
             })?;
 
@@ -73,7 +79,14 @@ impl HarmonyResponseProcessor {
                     complete.finish_reason.clone(),
                     matched_stop.clone(),
                 )
-                .map_err(|e| error::internal_error(format!("Harmony parsing failed: {}", e)))?;
+                .map_err(|e| {
+                    error!(
+                        function = "process_non_streaming_chat_response",
+                        error = %e,
+                        "Harmony parsing failed on complete response"
+                    );
+                    error::internal_error(format!("Harmony parsing failed: {}", e))
+                })?;
 
             // Build response message (assistant)
             let message = ChatCompletionMessage {
@@ -171,6 +184,11 @@ impl HarmonyResponseProcessor {
 
         // Parse Harmony channels
         let mut parser = HarmonyParserAdapter::new().map_err(|e| {
+            error!(
+                function = "process_responses_iteration",
+                error = %e,
+                "Failed to create Harmony parser"
+            );
             error::internal_error(format!("Failed to create Harmony parser: {}", e))
         })?;
 
@@ -190,7 +208,14 @@ impl HarmonyResponseProcessor {
                 complete.finish_reason.clone(),
                 matched_stop,
             )
-            .map_err(|e| error::internal_error(format!("Harmony parsing failed: {}", e)))?;
+            .map_err(|e| {
+                error!(
+                    function = "process_responses_iteration",
+                    error = %e,
+                    "Harmony parsing failed on complete response"
+                );
+                error::internal_error(format!("Harmony parsing failed: {}", e))
+            })?;
 
         // VALIDATION: Check if model incorrectly generated Tool role messages
         // This happens when the model copies the format of tool result messages

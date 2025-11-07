@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use tracing::error;
 use uuid::Uuid;
 
 use crate::routers::grpc::{
@@ -26,17 +27,21 @@ impl ChatRequestBuildingStage {
 #[async_trait]
 impl PipelineStage for ChatRequestBuildingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let prep = ctx
-            .state
-            .preparation
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Preparation not completed"))?;
+        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+            error!(
+                function = "ChatRequestBuildingStage::execute",
+                "Preparation not completed"
+            );
+            error::internal_error("Preparation not completed")
+        })?;
 
-        let clients = ctx
-            .state
-            .clients
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
+        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
+            error!(
+                function = "ChatRequestBuildingStage::execute",
+                "Client acquisition not completed"
+            );
+            error::internal_error("Client acquisition not completed")
+        })?;
 
         let chat_request = ctx.chat_request_arc();
 
@@ -63,7 +68,10 @@ impl PipelineStage for ChatRequestBuildingStage {
                     .clone(),
                 prep.tool_constraints.clone(),
             )
-            .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?;
+            .map_err(|e| {
+                error!(function = "ChatRequestBuildingStage::execute", error = %e, "Failed to build generate request");
+                error::bad_request(format!("Invalid request parameters: {}", e))
+            })?;
 
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
