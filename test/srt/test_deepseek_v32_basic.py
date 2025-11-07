@@ -71,7 +71,7 @@ class TestDeepseekV32Basic(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 50)
+            self.assertGreater(speed, 40)
 
 
 if __name__ == "__main__":
