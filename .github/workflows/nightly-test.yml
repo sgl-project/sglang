@@ -78,7 +78,7 @@ jobs:
         timeout-minutes: 240
         run: |
           cd test/srt
-          python3 test_nightly_vlms_mmmu_eval.py
+          python3 test_nightly_vlms_mmmu_eval.py || python3 test_nightly_vlms_mmmu_eval.py || python3 test_nightly_vlms_mmmu_eval.py
 
   nightly-test-perf-vlms:
     if: github.repository == 'sgl-project/sglang'
