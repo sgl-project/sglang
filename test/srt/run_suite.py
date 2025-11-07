@@ -216,7 +216,7 @@ suites = {
         TestFile("test_deepseek_v3_deterministic.py", 240),
     ],
     "nightly-4-gpu-b200": [
-        # TestFile("test_fp4_moe.py", 300),  # TODO: Fix pytest dependency issue
+        TestFile("test_fp4_moe.py", 300),
         TestFile("test_nightly_gpt_oss_4gpu_perf.py", 600),
     ],
     "nightly-4-gpu": [],
