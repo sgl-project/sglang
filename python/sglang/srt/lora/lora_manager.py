@@ -38,8 +38,15 @@ from sglang.srt.lora.utils import (
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import replace_submodule
+from sglang.srt.utils import is_npu, replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+if is_npu():
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it to True
+    torch.cuda.is_available = lambda: False
+
 
 logger = logging.getLogger(__name__)
 
@@ -88,9 +95,9 @@ class LoRAManager:
             lora_paths=lora_paths,
         )
 
-    def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int, device):
+    def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        with torch.device(device):
+        with torch.device("cuda"):
             self.cuda_graph_batch_info = LoRABatchInfo(
                 bs=max_bs_in_cuda_graph,
                 use_cuda_graph=True,

@@ -97,9 +97,7 @@ class TritonLoRABackend(BaseLoRABackend):
         return lora_output
 
     def init_cuda_graph_batch_info(
-        self,
-        cuda_graph_batch_info: LoRABatchInfo,
-        max_bs_in_cuda_graph: int,
+        self, cuda_graph_batch_info: LoRABatchInfo, max_bs_in_cuda_graph: int
     ):
         # Initialize seg_lens and seg_indptr for CUDA graph as they remain constant
         # across batches.
