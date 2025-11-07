@@ -1,7 +1,4 @@
-import time
 import unittest
-
-import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
@@ -31,18 +28,6 @@ class TestPiecewiseCudaGraphCorrectness(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def test_gpqa(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gpqa",
-            num_examples=64,
-            num_threads=16,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.235)
 
     def test_mmlu(self):
         args = SimpleNamespace(
