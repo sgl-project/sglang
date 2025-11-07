@@ -580,7 +580,6 @@ mod tests {
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
             )),
-            tokenizer: None,
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             router_manager: None,
@@ -595,6 +594,7 @@ mod tests {
             worker_job_queue: Arc::new(std::sync::OnceLock::new()),
             workflow_engine: Arc::new(std::sync::OnceLock::new()),
             mcp_manager: Arc::new(std::sync::OnceLock::new()),
+            tokenizer_registry: Arc::new(crate::tokenizer::registry::TokenizerRegistry::new()),
         })
     }
 
