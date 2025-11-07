@@ -15,12 +15,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-from sglang.srt.layers.moe.token_dispatcher.standard import (
-    StandardCombineInput,
-    StandardDispatchOutput,
-)
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
 from sglang.srt.utils import is_cuda, is_sm90_supported
 
 if TYPE_CHECKING:
@@ -29,6 +24,10 @@ if TYPE_CHECKING:
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+        StandardDispatchOutput,
     )
 
 if is_cuda():
@@ -40,10 +39,6 @@ if is_cuda():
         scaled_fp4_experts_quant,
         shuffle_rows,
         silu_and_mul,
-    )
-
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
     )
 
 
@@ -121,6 +116,8 @@ class CutlassMoeQuantInfo(MoeQuantInfo):
 class CutlassRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
+        from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
+
         if not is_cuda():
             raise RuntimeError("Cutlass runner requires CUDA support.")
         if not is_sm90_supported():
@@ -136,7 +133,10 @@ class CutlassRunnerCore(MoeRunnerCore):
         quant_info: CutlassMoeQuantInfo,
         running_state: Dict[str, torch.Tensor],
     ) -> CutlassRunnerOutput:
-        # Handle DeepEP modes
+        from sglang.srt.layers.quantization.fp8_kernel import (  # Handle DeepEP modes
+            sglang_per_token_group_quant_fp8,
+        )
+
         if runner_input.use_deepep_ll:
             return self._run_deepep_ll(runner_input, quant_info, running_state)
         elif runner_input.use_deepep_normal:
@@ -497,6 +497,10 @@ def pre_permute_standard_to_cutlass(
     runner_config: MoeRunnerConfig,
     running_state: Dict[str, torch.Tensor],
 ) -> CutlassRunnerInput:
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
     hidden_states, topk_output = dispatch_output
     topk_weights, topk_ids, _ = topk_output
 
