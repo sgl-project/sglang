@@ -267,6 +267,8 @@ jobs:
             --name brave-search-server \
             shoofio/brave-search-mcp-sse:1.0.10
           echo "Starting Brave MCP Server..."
+          sleep 2
+          curl -f http://localhost:8001/sse && echo "Brave MCP Server is healthy!"
 
       - name: Build python binding
         run: |
