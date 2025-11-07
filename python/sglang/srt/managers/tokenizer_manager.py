@@ -75,7 +75,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
-from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.schedule_batch import Modality, RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -317,7 +316,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
 
-        # Recv embedding from encoding server
+        # E Disaggregation
         if self.model_config.is_multimodal and self.server_args.language_only:
             self.embedding_port = get_free_port()
             self.recv_from_encoder = get_zmq_socket(
@@ -744,17 +743,19 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            mm_inputs: Dict = await self.mm_data_processor.process(
-                image_data=obj.image_data,
-                audio_data=obj.audio_data,
-                input_text_or_ids=(input_text or input_ids),
-                request_obj=obj,
-                max_req_input_len=self.max_req_input_len,
-            )
-            if mm_inputs and "input_ids" in mm_inputs:
-                input_ids = mm_inputs["input_ids"]
 
-            if self.server_args.language_only:
+            if not self.server_args.language_only:
+                mm_inputs: Dict = await self.mm_data_processor.process(
+                    image_data=obj.image_data,
+                    audio_data=obj.audio_data,
+                    input_text_or_ids=(input_text or input_ids),
+                    request_obj=obj,
+                    max_req_input_len=self.max_req_input_len,
+                )
+            else:
+                # E Disaggregation
+                recv_embedding = None
+                img_grid_thw = None
                 # Use async lock to avoid race condition
                 async with self.embeddings_lock:
                     while (
@@ -762,23 +763,25 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         or not self.received_data[obj.bootstrap_room].ready
                     ):
                         await self.handle_embedding()
-                    for mm_item in mm_inputs["mm_items"]:
-                        if mm_item.modality == Modality.IMAGE:
-                            if self.server_args.mm_transfer_backend == "mooncake":
-                                mm_item.precomputed_embeddings = self.embeddings_buffer[
-                                    obj.bootstrap_room
-                                ]
-                                self.embeddings_engine.deregister(
-                                    mm_item.precomputed_embeddings.data_ptr()
-                                )
-                            elif self.server_args.mm_transfer_backend == "zmq":
-                                mm_item.precomputed_embeddings = self.received_data[
-                                    obj.bootstrap_room
-                                ].get()
+
+                    recv_embedding_data = self.received_data[obj.bootstrap_room]
+                    if self.server_args.mm_transfer_backend == "mooncake":
+                        recv_embedding = self.embeddings_buffer[obj.bootstrap_room]
+                        self.embeddings_engine.deregister(recv_embedding.data_ptr())
+                    elif self.server_args.mm_transfer_backend == "zmq":
+                        recv_embedding = recv_embedding_data.get_embedding()
+                    img_grid_thw = recv_embedding_data.get_img_grid()
                     del self.received_data[obj.bootstrap_room]
                     if self.server_args.mm_transfer_backend == "mooncake":
                         del self.embeddings_buffer[obj.bootstrap_room]
 
+                prompt = input_text or input_ids
+                mm_inputs = self.mm_processor.get_mm_data(
+                    prompt, recv_embedding, img_grid_thw
+                )
+
+            if mm_inputs and "input_ids" in mm_inputs:
+                input_ids = mm_inputs["input_ids"]
         else:
             mm_inputs = None
 

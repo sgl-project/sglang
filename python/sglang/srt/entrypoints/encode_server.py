@@ -39,10 +39,11 @@ logger = logging.getLogger(__name__)
 
 
 class EmbeddingData:
-    def __init__(self, req_id, num_parts, part_idx, embedding=None):
+    def __init__(self, req_id, num_parts, part_idx, image_grid_dim, embedding=None):
         self.req_id = req_id
         self.num_parts = num_parts
         self.part_idx = part_idx
+        self.image_grid_dim = image_grid_dim
         self.embedding = embedding
 
         # aggregated data
@@ -50,15 +51,25 @@ class EmbeddingData:
         self.embedding_list = [
             embedding if i == self.part_idx else None for i in range(self.num_parts)
         ]
+        self.image_grid_dim_list = [
+            self.image_grid_dim if i == self.part_idx else None
+            for i in range(self.num_parts)
+        ]
 
     def add(self, embedding_data):
         assert self.req_id == embedding_data.req_id
         assert not self.ready_list[embedding_data.part_idx]
         self.ready_list[embedding_data.part_idx] = True
+        self.image_grid_dim_list[embedding_data.part_idx] = (
+            embedding_data.image_grid_dim
+        )
         self.embedding_list[embedding_data.part_idx] = embedding_data.embedding
 
-    def get(self):
+    def get_embedding(self):
         return torch.concatenate(self.embedding_list)
+
+    def get_img_grid(self):
+        return torch.concatenate(self.image_grid_dim_list)
 
     @property
     def ready(self):
@@ -66,6 +77,18 @@ class EmbeddingData:
 
     def __repr__(self):
         return f"EmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx})"
+
+
+_image_grid_attrs = ["image_grid_thw", "image_grid_hws"]
+
+
+def _get_image_grid_dim(images_input):
+    for attr in _image_grid_attrs:
+        if attr in images_input:
+            return images_input[attr]
+    raise ValueError(
+        f"Image grid dim ({_image_grid_attrs}) not found in {images_input}"
+    )
 
 
 class ImageEncoder:
@@ -164,7 +187,7 @@ class ImageEncoder:
         mm_embedding = self.model.get_image_feature([mm_item])
         if len(mm_embedding.shape) != 2:
             mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
-        return mm_embedding
+        return _get_image_grid_dim(images_input), mm_embedding
 
     async def mm_send(
         self,
@@ -201,11 +224,12 @@ class ImageEncoder:
 
     @torch.inference_mode()
     async def encode(self, mm_items, req_id, num_parts, part_idx):
-        mm_embedding = await self.mm_encode(mm_items)
+        image_grid_dim, mm_embedding = await self.mm_encode(mm_items)
         mm_data = EmbeddingData(
             req_id,
             num_parts,
             part_idx,
+            image_grid_dim,
             mm_embedding,
         )
         self.embedding_to_send[mm_data.req_id] = mm_data
