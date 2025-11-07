@@ -103,6 +103,11 @@ class SGLangCIAnalyzer:
             "nightly": [
                 "nightly-test-perf-text-models",
                 "nightly-test-eval-text-models",
+                "nightly-test-1-gpu",
+                "nightly-test-4-gpu",
+                "nightly-test-8-gpu-h200",
+                "nightly-test-8-gpu-h20",
+                "nightly-test-4-gpu-b200",
             ],
             "integration": [
                 "run-all-notebooks",
@@ -190,6 +195,10 @@ class SGLangCIAnalyzer:
                     "nightly-test-eval-vlms",
                     "nightly-test-perf-vlms",
                     "nightly-test-1-gpu",
+                    "nightly-test-4-gpu",
+                    "nightly-test-8-gpu-h200",
+                    "nightly-test-8-gpu-h20",
+                    "nightly-test-4-gpu-b200",
                 ]
 
                 if job_name in target_jobs:

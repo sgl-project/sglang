@@ -12,9 +12,9 @@ use crate::{
         responses::ResponsesRequest,
     },
     routers::grpc::{
+        common::{responses::utils::extract_tools_from_response_tools, stages::PipelineStage},
         context::{PreparationOutput, RequestContext, RequestType},
-        stages::PipelineStage,
-        utils,
+        error, utils,
     },
 };
 
@@ -56,7 +56,7 @@ impl PipelineStage for HarmonyPreparationStage {
             let request_arc = ctx.responses_request_arc();
             self.prepare_responses(ctx, &request_arc).await?;
         } else {
-            return Err(utils::bad_request_error(
+            return Err(error::bad_request(
                 "Only Chat and Responses requests supported in Harmony pipeline".to_string(),
             ));
         }
@@ -78,13 +78,13 @@ impl HarmonyPreparationStage {
     ) -> Result<Option<Response>, Response> {
         // Validate - reject logprobs
         if request.logprobs {
-            return Err(utils::bad_request_error(
+            return Err(error::bad_request(
                 "logprobs are not supported for Harmony models".to_string(),
             ));
         }
 
         // Step 1: Filter tools if needed
-        let body_ref = utils::filter_tools_for_request(request);
+        let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
         // Step 2: Build tool constraints
         let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
@@ -97,7 +97,7 @@ impl HarmonyPreparationStage {
         let build_output = self
             .builder
             .build_from_chat(&body_ref)
-            .map_err(|e| utils::bad_request_error(format!("Harmony build failed: {}", e)))?;
+            .map_err(|e| error::bad_request(format!("Harmony build failed: {}", e)))?;
 
         // Step 4: Store results
         ctx.state.preparation = Some(PreparationOutput {
@@ -128,18 +128,37 @@ impl HarmonyPreparationStage {
         ctx: &mut RequestContext,
         request: &ResponsesRequest,
     ) -> Result<Option<Response>, Response> {
-        // Build via Harmony from responses API request
+        // Step 1: Extract function and MCP tools with schemas from ResponseTools
+        let mut function_tools = extract_tools_from_response_tools(request.tools.as_deref(), true);
+
+        // Step 2: Filter tools based on tool_choice (AllowedTools or Function)
+        // Note: Tool existence is already validated in ResponsesRequest::validate()
+        if let Some(filtered) =
+            utils::filter_tools_by_tool_choice(&function_tools, &request.tool_choice)
+        {
+            function_tools = filtered;
+        }
+
+        // Step 3: Generate Harmony structural tags from filtered tools
+        let tool_constraints = if !function_tools.is_empty() {
+            Self::generate_harmony_structural_tag(&function_tools, &request.tool_choice)
+                .map_err(|e| *e)?
+        } else {
+            None
+        };
+
+        // Step 3: Build via Harmony from responses API request
         let build_output = self
             .builder
             .build_from_responses(request)
-            .map_err(|e| utils::bad_request_error(format!("Harmony build failed: {}", e)))?;
+            .map_err(|e| error::bad_request(format!("Harmony build failed: {}", e)))?;
 
-        // Store results in preparation output
+        // Step 4: Store results with tool_constraints
         ctx.state.preparation = Some(PreparationOutput {
             original_text: None,
             token_ids: build_output.input_ids,
             processed_messages: None,
-            tool_constraints: None,
+            tool_constraints,
             filtered_request: None,
             harmony_mode: true,
             selection_text: Some(build_output.selection_text),
@@ -202,7 +221,7 @@ impl HarmonyPreparationStage {
 
         // Validate specific function exists
         if specific_function.is_some() && tools_to_use.is_empty() {
-            return Err(Box::new(utils::bad_request_error(format!(
+            return Err(Box::new(error::bad_request(format!(
                 "Tool '{}' not found in tools list",
                 specific_function.unwrap()
             ))));
@@ -214,7 +233,7 @@ impl HarmonyPreparationStage {
             let params_schema = &tool.function.parameters;
 
             tags.push(json!({
-                "begin": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
+                "begin": format!("<|start|>assistant<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
                 "content": {
                     "type": "json_schema",
                     "json_schema": params_schema
@@ -228,7 +247,7 @@ impl HarmonyPreparationStage {
         let structural_tag = json!({
             "format": {
                 "type": "triggered_tags",
-                "triggers": ["<|channel|>commentary"],
+                "triggers": ["<|start|>assistant"],
                 "tags": tags,
                 "at_least_one": true,
                 "stop_after_first": stop_after_first
@@ -236,7 +255,7 @@ impl HarmonyPreparationStage {
         });
 
         serde_json::to_string(&structural_tag).map_err(|e| {
-            Box::new(utils::internal_error_message(format!(
+            Box::new(error::internal_error(format!(
                 "Failed to serialize structural tag: {}",
                 e
             )))

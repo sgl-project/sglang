@@ -21,23 +21,18 @@ from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip, log_info_on_rank0
 
-logger = logging.getLogger(__name__)
+try:
+    # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
+    import sgl_kernel  # noqa: F401
+
+    custom_ar = True
+except ImportError:
+    # For CPUs
+    custom_ar = False
+
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-
-
-try:
-    if ops.use_vllm_custom_allreduce and not _is_hip:
-        # Use vLLM custom allreduce
-        ops.meta_size()
-    else:
-        # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
-        import sgl_kernel  # noqa: F401
-    custom_ar = True
-except Exception:
-    # For CPUs
-    custom_ar = False
 
 logger = logging.getLogger(__name__)
 

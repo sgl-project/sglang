@@ -14,6 +14,7 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
+import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
@@ -690,6 +691,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    _lora_pattern = re.compile(
+        r"^model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern.match(module_name))
 
     def forward(
         self,

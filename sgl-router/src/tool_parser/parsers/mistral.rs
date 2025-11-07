@@ -17,10 +17,7 @@ use crate::{
 /// Handles the Mistral-specific format:
 /// `[TOOL_CALLS] [{"name": "func", "arguments": {...}}, ...]`
 ///
-/// Features:
-/// - Bracket counting for proper JSON array extraction
-/// - Support for multiple tool calls in a single array
-/// - String-aware parsing to handle nested brackets in JSON
+/// Reference: https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3?chat_template=default
 pub struct MistralParser {
     /// Parser for handling incomplete JSON during streaming
     partial_json: PartialJson,
@@ -42,7 +39,11 @@ pub struct MistralParser {
 
     /// Token configuration
     bot_token: &'static str,
+    eot_token: &'static str,
     tool_call_separator: &'static str,
+
+    /// Track whether we've already stripped the closing ] bracket
+    array_closed: bool,
 }
 
 impl MistralParser {
@@ -56,7 +57,9 @@ impl MistralParser {
             current_tool_name_sent: false,
             streamed_args_for_tool: Vec::new(),
             bot_token: "[TOOL_CALLS] [",
+            eot_token: "]",
             tool_call_separator: ", ",
+            array_closed: false,
         }
     }
 
@@ -207,13 +210,26 @@ impl ToolParser for MistralParser {
 
         // Check if current_text has tool_call
         let has_tool_start = self.has_tool_markers(current_text)
-            || (self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator));
+            || (self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
             // Only clear buffer if we're sure no tool call is starting
             if helpers::ends_with_partial_token(&self.buffer, self.bot_token).is_none() {
-                let normal_text = self.buffer.clone();
+                let mut normal_text = self.buffer.clone();
                 self.buffer.clear();
+
+                // Strip ] only once (the closing bracket of [TOOL_CALLS] array)
+                // current_tool_id > 0 means we've parsed at least one tool
+                if !self.array_closed
+                    && self.current_tool_id > 0
+                    && normal_text.starts_with(self.eot_token)
+                {
+                    normal_text = normal_text
+                        .strip_prefix(self.eot_token)
+                        .unwrap()
+                        .to_string();
+                    self.array_closed = true;
+                }
 
                 return Ok(StreamingParseResult {
                     normal_text,
@@ -231,7 +247,7 @@ impl ToolParser for MistralParser {
         // Determine start index for JSON parsing
         let start_idx = if let Some(pos) = current_text.find(self.bot_token) {
             pos + self.bot_token.len()
-        } else if self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator) {
+        } else if self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator) {
             self.tool_call_separator.len()
         } else {
             0
@@ -266,5 +282,6 @@ impl ToolParser for MistralParser {
             &mut self.current_tool_name_sent,
             &mut self.streamed_args_for_tool,
         );
+        self.array_closed = false;
     }
 }

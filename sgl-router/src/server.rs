@@ -115,6 +115,10 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
     state.router.health_generate(req).await
 }
 
+async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
+    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client).await
+}
+
 async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_server_info(req).await
 }
@@ -641,6 +645,7 @@ pub fn build_app(
         .route("/readiness", get(readiness))
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
+        .route("/engine_metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));

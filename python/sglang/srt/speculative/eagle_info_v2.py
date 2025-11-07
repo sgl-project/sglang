@@ -290,9 +290,7 @@ class EagleVerifyInputV2Mixin:
                 ),
             )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
-
-            # This is currently not used
-            draft_probs = torch.empty_like(target_probs)
+            draft_probs = torch.zeros_like(target_probs)
 
             # coins for rejection sampling
             coins = torch.rand_like(candidates, dtype=torch.float32, device=device)

@@ -11,6 +11,7 @@
 pub mod circuit_breaker;
 pub mod error;
 pub mod job_queue;
+pub mod metrics_aggregator;
 pub mod retry;
 pub mod token_bucket;
 pub mod worker;

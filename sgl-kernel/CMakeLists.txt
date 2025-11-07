@@ -320,6 +320,7 @@ set(SOURCES
     "csrc/kvcacheio/transfer.cu"
     "csrc/mamba/causal_conv1d.cu"
     "csrc/memory/store.cu"
+    "csrc/memory/weak_ref_tensor.cpp"
 
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"

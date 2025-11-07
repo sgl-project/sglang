@@ -1,4 +1,4 @@
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -50,8 +50,6 @@ class InternS1ForConditionalGeneration(nn.Module):
             (image_size // patch_size) ** 2 * (config.downsample_ratio**2)
         )
         self.downsample_ratio = config.downsample_ratio
-        self.ps_version = getattr(config, "ps_version", "v1")
-        # self.template = getattr(config, 'template', 'internvl2_5')
 
         config.vision_config.use_flash_attn = True if use_flash_attn else False
         config.text_config._attn_implementation = (
@@ -59,7 +57,6 @@ class InternS1ForConditionalGeneration(nn.Module):
         )
 
         logger.info(f"num_image_token: {self.num_image_token}")
-        logger.info(f"ps_version: {self.ps_version}")
 
         self.vision_model = InternVisionModel(config.vision_config)
         if config.text_config.architectures[0] == "Qwen2ForCausalLM":
@@ -104,13 +101,7 @@ class InternS1ForConditionalGeneration(nn.Module):
             int(w * scale_factor),
             int(c / (scale_factor * scale_factor)),
         )
-        if self.ps_version == "v1":
-            logger.warn(
-                "In ps_version 'v1', the height and width have not been swapped back, "
-                "which results in a transposed image."
-            )
-        else:
-            x = x.permute(0, 2, 1, 3).contiguous()
+        x = x.permute(0, 2, 1, 3).contiguous()
         return x
 
     def extract_feature(self, pixel_values):
@@ -224,7 +215,6 @@ class InternS1ForConditionalGeneration(nn.Module):
             )
 
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -280,13 +270,5 @@ class InternS1ForConditionalGeneration(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-            loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            raise RuntimeError(
-                f"Some weights are not initialized from checkpoints: {unloaded_params}"
-            )
-        return loaded_params
 
-
-EntryClass = [InternS1ForConditionalGeneration]
+EntryClass = InternS1ForConditionalGeneration

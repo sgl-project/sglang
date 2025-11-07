@@ -2,7 +2,6 @@
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 
 class KimiLinearConfig(PretrainedConfig):
@@ -150,6 +149,8 @@ class KimiLinearConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
         shape = KimiLinearStateShape.create(
             tp_world_size=get_attention_tp_size(),
             num_heads=self.linear_attn_config["num_heads"],

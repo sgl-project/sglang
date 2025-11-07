@@ -47,7 +47,7 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @dataclass(frozen=True)
@@ -823,7 +823,23 @@ class NativeSparseAttnBackend(AttentionBackend):
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
 
-        # Do absorbed multi-latent attention
+        # Detect MHA mode: multi KV heads (vs MLA with single KV head)
+        is_mha_mode = (layer.tp_k_head_num == layer.tp_q_head_num) and (
+            layer.tp_k_head_num > 1
+        )
+
+        # Use MHA kernel if in MHA_ONE_SHOT mode
+        if is_mha_mode and k is not None and v is not None and q_rope is None:
+            return self._forward_standard_mha(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+            )
+
+        # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
@@ -1153,6 +1169,49 @@ class NativeSparseAttnBackend(AttentionBackend):
             is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
         )
         return o
+
+    def _forward_standard_mha(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: NSAMetadata,
+    ) -> torch.Tensor:
+        """Standard MHA using FlashAttention varlen for MHA_ONE_SHOT mode."""
+        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+
+        # MHA_ONE_SHOT: k/v include all tokens (prefix + current)
+        cu_seqlens_q = metadata.cu_seqlens_q
+        cu_seqlens_k = metadata.cu_seqlens_k
+        max_seqlen_k = metadata.max_seq_len_k
+        causal = True
+
+        # Verify batch sizes match (length of cu_seqlens should be batch_size + 1)
+        assert len(cu_seqlens_q) == len(cu_seqlens_k), (
+            f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q)-1} requests, "
+            f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
+        )
+
+        # Determine FA version: FA3 for SM90 (Hopper), FA4 for SM100+ (Blackwell and beyond)
+        device_sm_major = torch.cuda.get_device_capability()[0]
+        fa_version = 4 if device_sm_major >= 10 else 3
+
+        return flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=layer.scaling,
+            causal=causal,
+            ver=fa_version,
+        )
 
     def _forward_tilelang(
         self,

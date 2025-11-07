@@ -38,6 +38,9 @@ class SchedulerMetricsMixin:
     def init_metrics(
         self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
     ):
+        self.last_decode_stats_tic = time.perf_counter()
+        self.last_prefill_stats_tic = time.perf_counter()
+
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -50,6 +53,8 @@ class SchedulerMetricsMixin:
         self.spec_total_num_forward_ct = 0
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
+        self.kv_transfer_bootstrap_ms: float = 0.0
+        self.kv_transfer_alloc_ms: float = 0.0
 
         self.stats = SchedulerStats()
 
@@ -159,6 +164,8 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid:
                 self.stats.swa_token_usage = swa_token_usage
+            if self.is_hybrid_gdn:
+                self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.cache_hit_rate = cache_hit_rate
@@ -178,6 +185,8 @@ class SchedulerMetricsMixin:
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
+                self.stats.kv_transfer_bootstrap_ms = self.kv_transfer_bootstrap_ms
+                self.stats.kv_transfer_alloc_ms = self.kv_transfer_alloc_ms
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue
@@ -299,6 +308,8 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid:
                 self.stats.swa_token_usage = swa_token_usage
+            if self.is_hybrid_gdn:
+                self.stats.mamba_usage = mamba_usage
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)

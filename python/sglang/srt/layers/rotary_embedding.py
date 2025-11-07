@@ -1302,6 +1302,31 @@ def triton_mrope(
     return q, k
 
 
+@torch._dynamo.disable()
+def triton_mrope_wrapper(
+    query,
+    key,
+    cos,
+    sin,
+    mrope_section,
+    head_size,
+    rotary_dim,
+    mrope_interleaved,
+    is_neox_style,
+):
+    return triton_mrope(
+        query,
+        key,
+        cos,
+        sin,
+        mrope_section,
+        head_size,
+        rotary_dim,
+        mrope_interleaved,
+        is_neox_style,
+    )
+
+
 class MRotaryEmbedding(RotaryEmbedding):
     """Rotary Embedding with Multimodal Sections."""
 
@@ -1460,8 +1485,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         if positions.ndim == 2:
             assert self.mrope_section
 
-            torch._dynamo.graph_break()
-            q, k = triton_mrope(
+            q, k = triton_mrope_wrapper(
                 query,
                 key,
                 cos,
@@ -1472,7 +1496,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                 self.mrope_interleaved,
                 self.is_neox_style,
             )
-            torch._dynamo.graph_break()
 
             return q.reshape(query_shape), k.reshape(key_shape)
 

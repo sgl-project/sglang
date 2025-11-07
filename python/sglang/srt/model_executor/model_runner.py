@@ -56,7 +56,7 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
-    set_symm_mem_all_reduce,
+    set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -138,6 +138,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_cuda,
+    is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
     log_info_on_rank0,
@@ -195,6 +197,7 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
         )
 
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -605,7 +608,7 @@ class ModelRunner:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
-        set_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
+        set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
 
         if not self.is_draft_worker:
             if self.device == "cpu":
@@ -859,6 +862,7 @@ class ModelRunner:
         model_path: str,
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
+        recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -913,6 +917,9 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
+
+        if recapture_cuda_graph and self.device == "cuda":
+            self.init_device_graphs()
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
@@ -1273,6 +1280,21 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                # kv_scale_buffer
+                scale_block_size = 16
+                cell_size = (cell_size // 2) + (
+                    (
+                        (
+                            self.model_config.kv_lora_rank
+                            + self.model_config.qk_rope_head_dim
+                        )
+                        // scale_block_size
+                    )
+                    * num_layers
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
+
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(self.model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
@@ -1509,6 +1531,15 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
+        elif self.server_args.kv_cache_dtype == "fp4_e2m1":
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                self.kv_cache_dtype = torch.float4_e2m1fn_x2
+                logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
+            else:
+                logger.warning(
+                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
+                )
+                self.kv_cache_dtype = self.dtype
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."

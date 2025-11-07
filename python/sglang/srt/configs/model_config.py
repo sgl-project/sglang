@@ -234,6 +234,7 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
+            override_config_file=server_args.decrypted_config_file,
             **kwargs,
         )
 
