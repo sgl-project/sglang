@@ -11,7 +11,7 @@ It is recommended to use uv for a faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install sglang[diffusion] --prerelease=allow
+uv pip install 'sglang[diffusion]' --prerelease=allow
 ```
 
 ## Method 2: From source
