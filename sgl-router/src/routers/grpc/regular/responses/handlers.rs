@@ -58,7 +58,7 @@ use crate::{
     },
     protocols::{
         chat::{self, ChatCompletionStreamResponse},
-        common::{self, ToolChoice},
+        common::{self},
         responses::{
             self, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
             ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
@@ -147,7 +147,6 @@ pub async fn route_responses(
         route_responses_streaming(ctx, request, headers, model_id).await
     } else {
         // Generate response ID for synchronous execution
-        // TODO: we may remove this when we have builder pattern for responses
         let response_id = Some(format!("resp_{}", Uuid::new_v4()));
         route_responses_sync(ctx, request, headers, model_id, response_id).await
     }
@@ -621,32 +620,13 @@ impl StreamingResponseAccumulator {
             ResponsesUsage::Classic(usage_info)
         });
 
-        ResponsesResponse {
-            id: self.response_id,
-            object: "response".to_string(),
-            created_at: self.created_at,
-            status,
-            error: None,
-            incomplete_details: None,
-            instructions: self.original_request.instructions.clone(),
-            max_output_tokens: self.original_request.max_output_tokens,
-            model: self.model,
-            output,
-            parallel_tool_calls: self.original_request.parallel_tool_calls.unwrap_or(true),
-            previous_response_id: self.original_request.previous_response_id.clone(),
-            reasoning: None,
-            store: self.original_request.store.unwrap_or(true),
-            temperature: self.original_request.temperature,
-            text: None,
-            tool_choice: ToolChoice::serialize_to_string(&self.original_request.tool_choice),
-            tools: self.original_request.tools.clone().unwrap_or_default(),
-            top_p: self.original_request.top_p,
-            truncation: None,
-            usage,
-            user: None,
-            safety_identifier: self.original_request.user.clone(),
-            metadata: self.original_request.metadata.clone().unwrap_or_default(),
-        }
+        ResponsesResponse::builder(&self.response_id, &self.model)
+            .copy_from_request(&self.original_request)
+            .created_at(self.created_at)
+            .status(status)
+            .output(output)
+            .maybe_usage(usage)
+            .build()
     }
 }
 
