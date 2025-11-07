@@ -25,14 +25,14 @@ pub enum ChatMessage {
     },
     #[serde(rename = "user")]
     User {
-        content: UserMessageContent,
+        content: MessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
     #[serde(rename = "assistant")]
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        content: Option<MessageContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,18 +43,36 @@ pub enum ChatMessage {
     },
     #[serde(rename = "tool")]
     Tool {
-        content: String,
+        content: MessageContent,
         tool_call_id: String,
     },
     #[serde(rename = "function")]
     Function { content: String, name: String },
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
-pub enum UserMessageContent {
+pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    pub fn to_simple_string(&self) -> String {
+        match self {
+            MessageContent::Text(text) => text.clone(),
+            MessageContent::Parts(parts) => {
+                let texts: Vec<String> = parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                texts.join(" ")
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -317,12 +335,12 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::Validati
     for msg in messages.iter() {
         if let ChatMessage::User { content, .. } = msg {
             match content {
-                UserMessageContent::Text(text) if text.is_empty() => {
+                MessageContent::Text(text) if text.is_empty() => {
                     return Err(validator::ValidationError::new(
                         "message content cannot be empty",
                     ));
                 }
-                UserMessageContent::Parts(parts) if parts.is_empty() => {
+                MessageContent::Parts(parts) if parts.is_empty() => {
                     return Err(validator::ValidationError::new(
                         "message content parts cannot be empty",
                     ));
@@ -587,26 +605,17 @@ impl GenerationRequest for ChatCompletionRequest {
             .iter()
             .filter_map(|msg| match msg {
                 ChatMessage::System { content, .. } => Some(content.clone()),
-                ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) => Some(text.clone()),
-                    UserMessageContent::Parts(parts) => {
-                        let texts: Vec<String> = parts
-                            .iter()
-                            .filter_map(|part| match part {
-                                ContentPart::Text { text } => Some(text.clone()),
-                                _ => None,
-                            })
-                            .collect();
-                        Some(texts.join(" "))
-                    }
-                },
+                ChatMessage::User { content, .. } => Some(content.to_simple_string()),
                 ChatMessage::Assistant {
                     content,
                     reasoning_content,
                     ..
                 } => {
                     // Combine content and reasoning content for routing decisions
-                    let main_content = content.clone().unwrap_or_default();
+                    let main_content = content
+                        .as_ref()
+                        .map(|c| c.to_simple_string())
+                        .unwrap_or_default();
                     let reasoning = reasoning_content.clone().unwrap_or_default();
                     if main_content.is_empty() && reasoning.is_empty() {
                         None
@@ -614,7 +623,7 @@ impl GenerationRequest for ChatCompletionRequest {
                         Some(format!("{} {}", main_content, reasoning).trim().to_string())
                     }
                 }
-                ChatMessage::Tool { content, .. } => Some(content.clone()),
+                ChatMessage::Tool { content, .. } => Some(content.to_simple_string()),
                 ChatMessage::Function { content, .. } => Some(content.clone()),
             })
             .collect::<Vec<String>>()

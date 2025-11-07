@@ -1,6 +1,6 @@
 use sglang_router_rs::{
     protocols::{
-        chat::{ChatMessage, UserMessageContent},
+        chat::{ChatMessage, MessageContent},
         common::{ContentPart, ImageUrl},
     },
     tokenizer::chat_template::{
@@ -23,7 +23,7 @@ fn test_simple_chat_template() {
     let processor = ChatTemplateProcessor::new(template.to_string());
 
     let messages = [ChatMessage::User {
-        content: UserMessageContent::Text("Test".to_string()),
+        content: MessageContent::Text("Test".to_string()),
         name: None,
     }];
 
@@ -57,7 +57,7 @@ fn test_chat_template_with_tokens() {
     let processor = ChatTemplateProcessor::new(template.to_string());
 
     let messages = [ChatMessage::User {
-        content: UserMessageContent::Text("Test".to_string()),
+        content: MessageContent::Text("Test".to_string()),
         name: None,
     }];
 
@@ -122,7 +122,7 @@ fn test_llama_style_template() {
             name: None,
         },
         ChatMessage::User {
-            content: UserMessageContent::Text("What is 2+2?".to_string()),
+            content: MessageContent::Text("What is 2+2?".to_string()),
             name: None,
         },
     ];
@@ -173,17 +173,17 @@ fn test_chatml_template() {
 
     let messages = [
         ChatMessage::User {
-            content: UserMessageContent::Text("Hello".to_string()),
+            content: MessageContent::Text("Hello".to_string()),
             name: None,
         },
         ChatMessage::Assistant {
-            content: Some("Hi there!".to_string()),
+            content: Some(MessageContent::Text("Hi there!".to_string())),
             name: None,
             tool_calls: None,
             reasoning_content: None,
         },
         ChatMessage::User {
-            content: UserMessageContent::Text("How are you?".to_string()),
+            content: MessageContent::Text("How are you?".to_string()),
             name: None,
         },
     ];
@@ -225,7 +225,7 @@ assistant:
     let processor = ChatTemplateProcessor::new(template.to_string());
 
     let messages = [ChatMessage::User {
-        content: UserMessageContent::Text("Test".to_string()),
+        content: MessageContent::Text("Test".to_string()),
         name: None,
     }];
 
@@ -312,7 +312,7 @@ fn test_template_with_multimodal_content() {
     let processor = ChatTemplateProcessor::new(template.to_string());
 
     let messages = [ChatMessage::User {
-        content: UserMessageContent::Parts(vec![
+        content: MessageContent::Parts(vec![
             ContentPart::Text {
                 text: "Look at this:".to_string(),
             },
