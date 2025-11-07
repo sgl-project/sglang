@@ -11,6 +11,7 @@ from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 
@@ -112,6 +113,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
         torch.rand(batch_size, topk, device="cuda", dtype=dtype), dim=-1
     )
     topk_ids = torch.randint(0, E, (batch_size, topk), dtype=torch.int32, device="cuda")
+    router_logits = torch.randn((batch_size, E), device="cuda", dtype=dtype)
 
     a1_strides = torch.full((E,), H, dtype=torch.int64, device="cuda")
     c1_strides = torch.full((E,), I, dtype=torch.int64, device="cuda")
@@ -143,10 +145,14 @@ def run_test(tp_size, batch_size, model_config, check=False):
     )
 
     # Create dispatch output
-    dispatch_output = StandardDispatchOutput(
-        hidden_states=x,
+    topk_output = StandardTopKOutput(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+        router_logits=router_logits,
+    )
+    dispatch_output = StandardDispatchOutput(
+        hidden_states=x,
+        topk_output=topk_output,
     )
 
     # CUTLASS runner setup
