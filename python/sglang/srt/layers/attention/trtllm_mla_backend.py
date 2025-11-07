@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda, is_flashinfer_available
+from sglang.srt.utils import is_cuda, is_flashinfer_available, is_float4_e2m1fn_x2
 from sglang.srt.utils.common import cached_triton_kernel
 
 if is_flashinfer_available():
@@ -361,19 +361,35 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         num_tokens_per_bs = max_num_tokens // max_bs
 
-        # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
-        self.padded_q_buffer = torch.zeros(
-            (max_bs, num_tokens_per_bs, self.num_q_heads, self.kv_cache_dim),
-            dtype=self.data_type,
-            device=self.device,
-        )
+        if is_float4_e2m1fn_x2(self.data_type):
+            # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
+            self.store_dtype = torch.uint8
+            self.padded_q_buffer = torch.zeros(
+                (max_bs, num_tokens_per_bs // 2, self.num_q_heads, self.kv_cache_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
 
-        # Buffer for unpadded output: (max_num_tokens, num_q_heads, v_head_dim)
-        self.unpad_output_buffer = torch.zeros(
-            (max_num_tokens, self.num_q_heads, 512),
-            dtype=self.data_type,
-            device=self.device,
-        )
+            # Buffer for unpadded output: (max_num_tokens, num_q_heads, v_head_dim)
+            self.unpad_output_buffer = torch.zeros(
+                (max_num_tokens // 2, self.num_q_heads, 512),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+        else:
+            # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
+            self.padded_q_buffer = torch.zeros(
+                (max_bs, num_tokens_per_bs, self.num_q_heads, self.kv_cache_dim),
+                dtype=self.data_type,
+                device=self.device,
+            )
+
+            # Buffer for unpadded output: (max_num_tokens, num_q_heads, v_head_dim)
+            self.unpad_output_buffer = torch.zeros(
+                (max_num_tokens, self.num_q_heads, 512),
+                dtype=self.data_type,
+                device=self.device,
+            )
 
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
@@ -569,7 +585,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             if forward_batch.forward_mode.is_target_verify():
                 max_seq = max_seq + self.num_draft_tokens
                 seq_lens = seq_lens + self.num_draft_tokens
-                self.forward_decode_metadata.seq_lens_k = seq_lens
+                self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
             elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 max_seq = forward_batch.seq_lens_cpu.max().item()
 
@@ -588,7 +604,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.sum_seq_lens_q = sum_seq_lens_q
                 self.forward_decode_metadata.cu_seqlens_q = cu_seqlens_q
                 self.forward_decode_metadata.seq_lens_q = forward_batch.extend_seq_lens
-                self.forward_decode_metadata.seq_lens_k = seq_lens
+                self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
 
             max_seqlen_pad = self._calc_padded_blocks(max_seq)
             block_kv_indices = self._create_block_kv_indices(

@@ -19,10 +19,11 @@ use crate::{
 /// `<tool_call>\n{"name": "func", "arguments": {...}}\n</tool_call>`
 ///
 /// Features:
-/// - XML-style tags with JSON content
-/// - Support for multiple sequential tool calls
-/// - Newline-aware parsing
-/// - Buffering for partial end tokens
+/// - Tool Call Tags: `<tool_call>` and `</tool_call>` wrap each individual call
+/// - Each individual call is separated by `\n`
+/// - Function Call Object: JSON object with "name" and "arguments" fields
+///
+/// Reference: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct?chat_template=default
 pub struct QwenParser {
     /// Parser for handling incomplete JSON during streaming
     partial_json: PartialJson,
@@ -49,8 +50,9 @@ pub struct QwenParser {
     normal_text_buffer: String,
 
     /// Token configuration
-    bot_token: &'static str,
-    eot_token: &'static str,
+    /// Start/end tokens for each individual tool call (not the entire sequence)
+    individual_tool_start_token: &'static str,
+    individual_tool_end_token: &'static str,
     tool_call_separator: &'static str,
 }
 
@@ -70,8 +72,8 @@ impl QwenParser {
             current_tool_name_sent: false,
             streamed_args_for_tool: Vec::new(),
             normal_text_buffer: String::new(),
-            bot_token: "<tool_call>\n",
-            eot_token: "\n</tool_call>",
+            individual_tool_start_token: "<tool_call>\n",
+            individual_tool_end_token: "\n</tool_call>",
             tool_call_separator: "\n",
         }
     }
@@ -157,11 +159,13 @@ impl ToolParser for QwenParser {
 
         // Check if current_text has tool_call
         let has_tool_start = self.has_tool_markers(current_text)
-            || (self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator));
+            || (self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
             // Only clear buffer if we're sure no tool call is starting
-            if helpers::ends_with_partial_token(&self.buffer, self.bot_token).is_none() {
+            if helpers::ends_with_partial_token(&self.buffer, self.individual_tool_start_token)
+                .is_none()
+            {
                 let normal_text = self.buffer.clone();
                 self.buffer.clear();
 
@@ -170,7 +174,7 @@ impl ToolParser for QwenParser {
                     calls: vec![],
                 });
             } else {
-                // Might be partial bot_token, keep buffering
+                // Might be partial individual_tool_start_token, keep buffering
                 return Ok(StreamingParseResult::default());
             }
         }
@@ -179,9 +183,9 @@ impl ToolParser for QwenParser {
         let tool_indices = helpers::get_tool_indices(tools);
 
         // Determine start index for JSON parsing
-        let start_idx = if let Some(pos) = current_text.find(self.bot_token) {
-            pos + self.bot_token.len()
-        } else if self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator) {
+        let start_idx = if let Some(pos) = current_text.find(self.individual_tool_start_token) {
+            pos + self.individual_tool_start_token.len()
+        } else if self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator) {
             self.tool_call_separator.len()
         } else {
             0
@@ -205,7 +209,7 @@ impl ToolParser for QwenParser {
             self.normal_text_buffer.push_str(&result.normal_text);
 
             // Check if buffer contains complete end token (without leading newline)
-            let end_token_without_newline = &self.eot_token[1..]; // "</tool_call>"
+            let end_token_without_newline = &self.individual_tool_end_token[1..]; // "</tool_call>"
             if self.normal_text_buffer.contains(end_token_without_newline) {
                 // Complete end token found - clean it and return
                 let cleaned_text = self

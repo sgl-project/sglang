@@ -43,7 +43,18 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
+from sglang.srt.mem_cache.utils import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton,
+    set_mla_kv_scale_buffer_triton,
+)
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_float4_e2m1fn_x2,
+    is_npu,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -151,6 +162,7 @@ class MambaPool:
         ssm_dtype = cache_params.dtype.temporal
         num_mamba_layers = len(cache_params.layers)
 
+        self.device = device
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(
             "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
@@ -260,7 +272,6 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
             self.size = size
-            self.device = device
             self.free_slots = torch.arange(
                 self.size, dtype=torch.int64, device=self.device
             )
@@ -1261,131 +1272,6 @@ class AscendTokenToKVPool(MHATokenToKVPool):
         )
 
 
-@triton.jit
-def set_mla_kv_buffer_kernel(
-    kv_buffer_ptr,
-    cache_k_nope_ptr,
-    cache_k_rope_ptr,
-    loc_ptr,
-    buffer_stride: tl.constexpr,
-    nope_stride: tl.constexpr,
-    rope_stride: tl.constexpr,
-    nope_dim: tl.constexpr,
-    rope_dim: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    pid_loc = tl.program_id(0)
-    pid_blk = tl.program_id(1)
-
-    base = pid_blk * BLOCK
-    offs = base + tl.arange(0, BLOCK)
-    total_dim = nope_dim + rope_dim
-    mask = offs < total_dim
-
-    loc = tl.load(loc_ptr + pid_loc)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
-
-    if base + BLOCK <= nope_dim:
-        src = tl.load(
-            cache_k_nope_ptr + pid_loc * nope_stride + offs,
-            mask=mask,
-        )
-    else:
-        offs_rope = offs - nope_dim
-        src = tl.load(
-            cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
-            mask=mask,
-        )
-
-    tl.store(dst_ptr, src, mask=mask)
-
-
-def set_mla_kv_buffer_triton(
-    kv_buffer: torch.Tensor,
-    loc: torch.Tensor,
-    cache_k_nope: torch.Tensor,
-    cache_k_rope: torch.Tensor,
-):
-    nope_dim = cache_k_nope.shape[-1]
-    rope_dim = cache_k_rope.shape[-1]
-    total_dim = nope_dim + rope_dim
-    BLOCK = 128
-    n_loc = loc.numel()
-    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
-
-    set_mla_kv_buffer_kernel[grid](
-        kv_buffer,
-        cache_k_nope,
-        cache_k_rope,
-        loc,
-        kv_buffer.stride(0),
-        cache_k_nope.stride(0),
-        cache_k_rope.stride(0),
-        nope_dim,
-        rope_dim,
-        BLOCK=BLOCK,
-    )
-
-
-@triton.jit
-def get_mla_kv_buffer_kernel(
-    kv_buffer_ptr,
-    cache_k_nope_ptr,
-    cache_k_rope_ptr,
-    loc_ptr,
-    buffer_stride: tl.constexpr,
-    nope_stride: tl.constexpr,
-    rope_stride: tl.constexpr,
-    nope_dim: tl.constexpr,
-    rope_dim: tl.constexpr,
-):
-    pid_loc = tl.program_id(0)
-    loc = tl.load(loc_ptr + pid_loc)
-    loc_src_ptr = kv_buffer_ptr + loc * buffer_stride
-
-    nope_offs = tl.arange(0, nope_dim)
-    nope_src_ptr = loc_src_ptr + nope_offs
-    nope_src = tl.load(nope_src_ptr)
-
-    tl.store(
-        cache_k_nope_ptr + pid_loc * nope_stride + nope_offs,
-        nope_src,
-    )
-
-    rope_offs = tl.arange(0, rope_dim)
-    rope_src_ptr = loc_src_ptr + nope_dim + rope_offs
-    rope_src = tl.load(rope_src_ptr)
-    tl.store(
-        cache_k_rope_ptr + pid_loc * rope_stride + rope_offs,
-        rope_src,
-    )
-
-
-def get_mla_kv_buffer_triton(
-    kv_buffer: torch.Tensor,
-    loc: torch.Tensor,
-    cache_k_nope: torch.Tensor,
-    cache_k_rope: torch.Tensor,
-):
-    # The source data type will be implicitly converted to the target data type.
-    nope_dim = cache_k_nope.shape[-1]  # 512
-    rope_dim = cache_k_rope.shape[-1]  # 64
-    n_loc = loc.numel()
-    grid = (n_loc,)
-
-    get_mla_kv_buffer_kernel[grid](
-        kv_buffer,
-        cache_k_nope,
-        cache_k_rope,
-        loc,
-        kv_buffer.stride(0),
-        cache_k_nope.stride(0),
-        cache_k_rope.stride(0),
-        nope_dim,
-        rope_dim,
-    )
-
-
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -1417,9 +1303,11 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
         self.nsa_kv_cache_store_fp8 = use_nsa and dtype == torch.float8_e4m3fn
-        # TODO do not hardcode
+        assert not (
+            self.nsa_kv_cache_store_fp8 and override_kv_cache_dim is None
+        ), "override_kv_cache_dim must be provided when using NSA with FP8 kv cache storage"
         self.kv_cache_dim = (
-            656
+            override_kv_cache_dim
             if self.use_nsa and self.nsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
@@ -1430,15 +1318,41 @@ class MLATokenToKVPool(KVCache):
                 if self.custom_mem_pool
                 else nullcontext()
             ):
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.kv_buffer = [
-                    torch.zeros(
-                        (size + page_size, 1, self.kv_cache_dim),
-                        dtype=self.store_dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
+                if is_float4_e2m1fn_x2(self.dtype):
+                    m = size + page_size
+                    n = 1  # head_num
+                    k = self.kv_cache_dim  # head_dim
+
+                    scale_block_size = 16
+                    self.store_dtype = torch.uint8
+
+                    self.kv_buffer = [
+                        torch.zeros(
+                            (m, n, k // 2),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
+
+                    self.kv_scale_buffer = [
+                        torch.zeros(
+                            (m, k // scale_block_size),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
+                else:
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.kv_buffer = [
+                        torch.zeros(
+                            (size + page_size, 1, self.kv_cache_dim),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
 
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
@@ -1471,7 +1385,23 @@ class MLATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+            if is_float4_e2m1fn_x2(self.dtype):
+                cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(
+                    torch.uint8
+                )
+                cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
+
+                from sglang.srt.layers.quantization.kvfp4_tensor import (
+                    KVFP4QuantizeUtil,
+                )
+
+                cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+                    cache_k_nope_fp4, cache_k_nope_fp4_sf
+                )
+                return cache_k_nope_fp4_dequant
+            else:
+                return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+
         return self.kv_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
@@ -1497,11 +1427,29 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
         if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
+            if is_float4_e2m1fn_x2(self.dtype):
+                from sglang.srt.layers.quantization.kvfp4_tensor import (
+                    KVFP4QuantizeUtil,
+                )
+
+                cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
+                    cache_k
+                )
+            else:
+                cache_k = cache_k.to(self.dtype)
+
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
-                self.store_dtype
-            )
+            if is_float4_e2m1fn_x2(self.dtype):
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
+                    self.store_dtype
+                )
+                self.kv_scale_buffer[layer_id - self.start_layer][loc] = (
+                    cache_k_fp4_sf.view(self.store_dtype)
+                )
+            else:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+                    self.store_dtype
+                )
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
@@ -1523,18 +1471,44 @@ class MLATokenToKVPool(KVCache):
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
         else:
             if cache_k_nope.dtype != self.dtype:
-                cache_k_nope = cache_k_nope.to(self.dtype)
-                cache_k_rope = cache_k_rope.to(self.dtype)
+                if is_float4_e2m1fn_x2(self.dtype):
+                    from sglang.srt.layers.quantization.kvfp4_tensor import (
+                        KVFP4QuantizeUtil,
+                    )
+
+                    cache_k_nope_fp4, cache_k_nope_fp4_sf = (
+                        KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
+                    )
+                    cache_k_rope_fp4, cache_k_rope_fp4_sf = (
+                        KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
+                    )
+                else:
+                    cache_k_nope = cache_k_nope.to(self.dtype)
+                    cache_k_rope = cache_k_rope.to(self.dtype)
             if self.store_dtype != self.dtype:
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id - self.start_layer],
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-            )
+            if is_float4_e2m1fn_x2(self.dtype):
+                set_mla_kv_buffer_triton(
+                    self.kv_buffer[layer_id - self.start_layer],
+                    loc,
+                    cache_k_nope_fp4,
+                    cache_k_rope_fp4,
+                )
+                set_mla_kv_scale_buffer_triton(
+                    self.kv_scale_buffer[layer_id - self.start_layer],
+                    loc,
+                    cache_k_nope_fp4_sf,
+                    cache_k_rope_fp4_sf,
+                )
+            else:
+                set_mla_kv_buffer_triton(
+                    self.kv_buffer[layer_id - self.start_layer],
+                    loc,
+                    cache_k_nope,
+                    cache_k_rope,
+                )
 
     def get_mla_kv_buffer(
         self,
@@ -1590,6 +1564,7 @@ class MLATokenToKVPool(KVCache):
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
+    rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
         self,
@@ -1605,6 +1580,19 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
+        assert (
+            kv_lora_rank % self.quant_block_size == 0
+        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {self.quant_block_size}"
+
+        # Calculate override_kv_cache_dim for FP8 storage:
+        # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+        # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
+        override_dim = (
+            kv_lora_rank
+            + kv_lora_rank // self.quant_block_size * 4
+            + qk_rope_head_dim * self.rope_storage_dtype.itemsize
+        )
+
         super().__init__(
             size,
             page_size,
@@ -1617,6 +1605,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             start_layer,
             end_layer,
             use_nsa=True,
+            override_kv_cache_dim=override_dim,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
