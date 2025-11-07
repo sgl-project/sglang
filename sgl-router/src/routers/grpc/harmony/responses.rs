@@ -39,7 +39,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use serde_json::{from_str, from_value, json, to_string, to_value, Value};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -324,6 +324,12 @@ async fn execute_with_mcp_loop(
 
         // Safety check: prevent infinite loops
         if iteration_count > MAX_TOOL_ITERATIONS {
+            error!(
+                function = "handle_response_request",
+                iteration_count = iteration_count,
+                max_iterations = MAX_TOOL_ITERATIONS,
+                "Maximum tool iterations exceeded"
+            );
             return Err(error::internal_error(format!(
                 "Maximum tool iterations ({}) exceeded",
                 MAX_TOOL_ITERATIONS
@@ -1181,6 +1187,13 @@ async fn execute_mcp_tools(
         // Parse tool arguments from JSON string
         let args_str = tool_call.function.arguments.as_deref().unwrap_or("{}");
         let args: Value = from_str(args_str).map_err(|e| {
+            error!(
+                function = "execute_mcp_tools",
+                tool_name = %tool_call.function.name,
+                call_id = %tool_call.id,
+                error = %e,
+                "Failed to parse tool arguments JSON"
+            );
             error::internal_error(format!(
                 "Invalid tool arguments JSON for tool '{}': {}",
                 tool_call.function.name, e
@@ -1543,6 +1556,12 @@ async fn load_previous_messages(
         .get_response_chain(&prev_id, None)
         .await
         .map_err(|e| {
+            error!(
+                function = "load_conversation_history",
+                prev_id = %prev_id_str,
+                error = %e,
+                "Failed to load previous response chain from storage"
+            );
             error::internal_error(format!(
                 "Failed to load previous response chain for {}: {}",
                 prev_id_str, e
