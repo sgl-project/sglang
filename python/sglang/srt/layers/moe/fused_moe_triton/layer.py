@@ -231,8 +231,6 @@ class FusedMoE(torch.nn.Module):
                 if not use_weight_loader_fused
                 else self.weight_loader_fused
             ),
-            intermediate_size_full=intermediate_size,
-            top_k=top_k,
             with_bias=with_bias,
         )
 
