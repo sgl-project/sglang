@@ -1,5 +1,5 @@
 <div align="center">
-<img src=assets/logos/logo.svg width="30%"/>
+<img src=https://github.com/lm-sys/lm-sys.github.io/releases/download/test/sgl-diffusion-logo.png width="30%"/>
 </div>
 
 **sgl-diffusion is an inference framework for accelerated image/video generation.**
@@ -9,17 +9,9 @@ sgl-diffusion features an end-to-end unified pipeline for accelerating diffusion
 ## Key Features
 
 sgl-diffusion has the following features:
-
-- State-of-the-art performance optimizations for inference
-    - [Video Sparse Attention](https://arxiv.org/pdf/2505.13389)
-    - [Sliding Tile Attention](https://arxiv.org/pdf/2502.04507)
-    - [TeaCache](https://arxiv.org/pdf/2411.19108)
-    - [Sage Attention](https://arxiv.org/abs/2410.02367)
-    - USP
-    - CFG Parallel
-- Diverse hardware and OS support
-    - Supported hardware: H100, H200, A100, B200, 4090
-    - Supported OS: Linux, Windows, MacOS
+  - broad model support: Wan, FastWan, Hunyuan, Qwen-Image, Qwen-Image-Edit
+  - ease of use: OAI compatible api + cli + python sdk support
+  - Diverse hardware support: H100, H200, A100, B200, 4090
 
 ## Getting Started
 
@@ -27,7 +19,7 @@ sgl-diffusion has the following features:
 uv pip install sglang[.diffusion] --prerelease=allow
 ```
 
-For more information, check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
+For more installation methods (e.g. pypi, uv, docker), check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
 
 
 ## Inference
@@ -68,7 +60,7 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
-For more information, check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/cli.md).
+For more usage examples (e.g. OpenAI compatible API, server mode), check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/cli.md).
 
 ## Contributing
 

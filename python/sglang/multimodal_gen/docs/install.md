@@ -23,10 +23,10 @@ cd sglang
 
 # Install the Python packages
 pip install --upgrade pip
-pip install -e "python/.[diffusion]"
+pip install -e "python/[diffusion]"
 
 # With uv
-uv pip install --prerelease=allow  -e "python/.[diffusion]"
+uv pip install --prerelease=allow  -e "python/[diffusion]"
 ```
 
 **Quick fixes for common problems:**
