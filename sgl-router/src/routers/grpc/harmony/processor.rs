@@ -269,7 +269,7 @@ impl HarmonyResponseProcessor {
             reasoning: None, // Set by caller if needed
             store: responses_request.store.unwrap_or(true),
             temperature: responses_request.temperature,
-            text: None,
+            text: responses_request.text.clone(),
             tool_choice: responses_request
                 .tool_choice
                 .as_ref()

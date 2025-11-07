@@ -51,7 +51,7 @@ impl PipelineStage for ChatRequestBuildingStage {
         let body_ref = prep.filtered_request.as_ref().unwrap_or(&chat_request);
 
         let mut proto_request = builder_client
-            .build_generate_request(
+            .build_generate_request_from_chat(
                 request_id,
                 body_ref,
                 prep.processed_messages.as_ref().unwrap().text.clone(),
