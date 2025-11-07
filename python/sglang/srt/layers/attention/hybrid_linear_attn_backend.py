@@ -808,34 +808,20 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
         v = v.squeeze(1)
         v = v.view(1, batch_size, v.shape[1] // head_v_dim, head_v_dim)
 
-        # core_attn_out = fused_sigmoid_gating_delta_rule_update(
-        #     A_log=A_log,
-        #     dt_bias=dt_bias,
-        #     q=q,
-        #     k=k,
-        #     v=v,
-        #     a=a,
-        #     b=b,
-        #     initial_state_source=ssm_states,
-        #     initial_state_indices=cache_indices,
-        #     cu_seqlens=query_start_loc,
-        #     use_qk_l2norm_in_kernel=True,
-        #     softplus_beta=1.0,
-        #     softplus_threshold=20.0,
-        # )
-        g = -A_log.float().exp() * torch.nn.functional.softplus(a.float() + dt_bias)
-        beta = b.sigmoid()
-
-        core_attn_out = fused_recurrent_gated_delta_rule_update(
+        core_attn_out = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
             q=q,
             k=k,
             v=v,
-            g=g,
-            beta=beta,
+            a=a,
+            b=b,
             initial_state_source=ssm_states,
             initial_state_indices=cache_indices,
             cu_seqlens=query_start_loc,
             use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
         )
 
         return core_attn_out
@@ -915,8 +901,7 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
         v = v.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
         beta = b.sigmoid()
-        # g = fused_gdn_gating(A_log, a, dt_bias)
-        g = -A_log.float().exp() * torch.nn.functional.softplus(a.float() + dt_bias)
+        g = fused_gdn_gating(A_log, a, dt_bias)
 
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)
@@ -938,32 +923,21 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            core_attn_out = fused_recurrent_gated_delta_rule_update(
+            recurrent_state = ssm_states[cache_indices]
+            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=q,
                 k=k,
                 v=v,
                 g=g,
                 beta=beta,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
+                initial_state=recurrent_state,
+                output_final_state=True,
                 cu_seqlens=query_start_loc,
+                head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
-            # recurrent_state = ssm_states[cache_indices]
-            # core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-            #     q=q,
-            #     k=k,
-            #     v=v,
-            #     g=g,
-            #     beta=beta,
-            #     initial_state=recurrent_state,
-            #     output_final_state=True,
-            #     cu_seqlens=query_start_loc,
-            #     head_first=False,
-            #     use_qk_l2norm_in_kernel=True,
-            # )
-            # last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            # ssm_states[cache_indices] = last_recurrent_state
+            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+            ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 

@@ -240,7 +240,7 @@ class DynamicShortConvolution(nn.Module):
                         conv_state=cache,
                         weight=self.get_kernel(generator_input),
                         bias=None,
-                        # activation=self.activation,
+                        activation=self.activation,
                         cache_seqlens=None,
                         conv_state_indices=cache_indices,
                         num_accepted_tokens=None,
@@ -252,7 +252,6 @@ class DynamicShortConvolution(nn.Module):
                     .transpose(1, 2)
                     .contiguous()
                 )
-                out = ACT2FN[self.activation](out)
                 return out
 
         if mask is not None:

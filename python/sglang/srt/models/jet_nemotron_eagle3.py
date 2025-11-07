@@ -5,6 +5,7 @@ import torch.nn as nn
 from transformers.utils import logging
 
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -18,9 +19,8 @@ from sglang.srt.models.jet_nemotron import (
     JetBlock,
     JetNemotronAttention,
     JetNemotronForCausalLM,
+    JetNemotronMLP,
 )
-from sglang.srt.models.jet_nemotron import JetNemotronMLPOld as JetNemotronMLP
-from sglang.srt.models.jet_nemotron import JetNemotronRMSNorm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
@@ -73,16 +73,12 @@ class JetNemotronDecoderLayerEagle3(nn.Module):
             )
 
         self.mlp = JetNemotronMLP(config, quant_config, prefix)
-        self.input_layernorm = JetNemotronRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = JetNemotronRMSNorm(
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.hidden_norm = JetNemotronRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -125,7 +121,7 @@ class JetNemotronModelEagle3(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
-        self.norm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.midlayer = JetNemotronDecoderLayerEagle3(config, 0, quant_config, prefix)
         if hasattr(config, "target_hidden_size"):
             self.fc = torch.nn.Linear(

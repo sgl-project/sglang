@@ -21,7 +21,6 @@ from typing import Any, Iterable, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
-import transformers
 from einops import rearrange
 from torch import nn
 from transformers.utils import logging
@@ -121,11 +120,6 @@ class JetBlock(nn.Module):
         )
 
         self.g_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        # self.o_norm = FusedRMSNormGated(
-        #     self.head_v_dim,
-        #     eps=float(jet_block_config.norm_eps),
-        #     autotune_interval=self.autotune_interval,
-        # )
         self.o_norm = RMSNormGated(
             self.head_v_dim,
             eps=float(jet_block_config.norm_eps),
@@ -172,25 +166,6 @@ class JetBlock(nn.Module):
 
 
 class JetNemotronMLP(nn.Module):
-    def __init__(self, config: JetNemotronConfig):
-        super().__init__()
-        hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size
-
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.act_fn = transformers.activations.get_activation(config.hidden_act)
-
-    def forward(self, hidden_state):
-        gate = self.gate_proj(hidden_state)
-        up = self.up_proj(hidden_state)
-        activated = self.act_fn(gate)
-        combined = activated * up
-        return self.down_proj(combined)
-
-
-class JetNemotronMLPOld(nn.Module):
     def __init__(
         self,
         config: JetNemotronConfig,
@@ -318,31 +293,6 @@ class JetNemotronAttention(nn.Module):
         return output
 
 
-class JetNemotronRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        JetNemotronRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight * hidden_states).to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
-EFFICIENT_ATTENTION_CLASSES = {
-    "jet": JetBlock,
-}
-
-
 class JetNemotronDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -373,15 +323,9 @@ class JetNemotronDecoderLayer(nn.Module):
                 sliding_window=config.efficient_attention_config["swa"]["window_size"],
             )
         else:
-            assert config.layer_types[layer_id] in EFFICIENT_ATTENTION_CLASSES, (
-                f"Layer type {config.layer_types[layer_id]} not supported. Supported types are: "
-                f"{['attn', 'swa'] + list(EFFICIENT_ATTENTION_CLASSES.keys())}"
-            )
-            self.self_attn = EFFICIENT_ATTENTION_CLASSES[config.layer_types[layer_id]](
-                config, layer_id, quant_config, prefix
-            )
+            self.self_attn = JetBlock(config, layer_id, quant_config, prefix)
 
-        self.mlp = JetNemotronMLP(config)
+        self.mlp = JetNemotronMLP(config, quant_config, prefix)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -525,8 +469,6 @@ class JetNemotronForCausalLM(nn.Module):
                 ):
                     continue
                 param_name = weight_name.replace(shard_weight_name_part, param_name)
-                if param_name not in params_dict:
-                    continue
                 param = params_dict[param_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
