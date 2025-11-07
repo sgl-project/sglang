@@ -162,6 +162,7 @@ class MambaPool:
         ssm_dtype = cache_params.dtype.temporal
         num_mamba_layers = len(cache_params.layers)
 
+        self.device = device
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(
             "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
@@ -271,7 +272,6 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
             self.size = size
-            self.device = device
             self.free_slots = torch.arange(
                 self.size, dtype=torch.int64, device=self.device
             )
@@ -1303,9 +1303,11 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
         self.nsa_kv_cache_store_fp8 = use_nsa and dtype == torch.float8_e4m3fn
-        # TODO do not hardcode
+        assert not (
+            self.nsa_kv_cache_store_fp8 and override_kv_cache_dim is None
+        ), "override_kv_cache_dim must be provided when using NSA with FP8 kv cache storage"
         self.kv_cache_dim = (
-            656
+            override_kv_cache_dim
             if self.use_nsa and self.nsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
@@ -1562,6 +1564,7 @@ class MLATokenToKVPool(KVCache):
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
+    rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
         self,
@@ -1577,6 +1580,19 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
+        assert (
+            kv_lora_rank % self.quant_block_size == 0
+        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {self.quant_block_size}"
+
+        # Calculate override_kv_cache_dim for FP8 storage:
+        # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+        # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
+        override_dim = (
+            kv_lora_rank
+            + kv_lora_rank // self.quant_block_size * 4
+            + qk_rope_head_dim * self.rope_storage_dtype.itemsize
+        )
+
         super().__init__(
             size,
             page_size,
@@ -1589,6 +1605,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             start_layer,
             end_layer,
             use_nsa=True,
+            override_kv_cache_dim=override_dim,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
