@@ -1263,11 +1263,6 @@ class ServerArgs:
             raise ValueError(
                 "FA4 backend is only supported for prefill. Please use `--prefill-attention-backend fa4` instead."
             )
-        if self.prefill_attention_backend == "fa4":
-            logger.warning(
-                f"FA4 backend only supports page size 128, changing page_size from {self.page_size} to 128."
-            )
-            self.page_size = 128
 
         # AMD platforms backends
         if self.attention_backend == "aiter":
