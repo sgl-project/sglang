@@ -24,7 +24,7 @@ sgl-diffusion has the following features:
 ## Getting Started
 
 ```bash
-uv pip install sglang[diffusion] --prerelease=allow
+uv pip install 'sglang[diffusion]' --prerelease=allow
 ```
 
 For more information, check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
