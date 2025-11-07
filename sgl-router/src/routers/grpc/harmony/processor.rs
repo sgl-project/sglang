@@ -99,14 +99,14 @@ impl HarmonyResponseProcessor {
         let usage = response_formatting::build_usage(&all_responses);
 
         // Final ChatCompletionResponse
-        let response = response_formatting::build_chat_response(
-            choices,
-            &dispatch,
-            chat_request.model.clone(),
-            usage,
-        );
-
-        Ok(response)
+        Ok(
+            ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
+                .created(dispatch.created)
+                .choices(choices)
+                .usage(usage)
+                .maybe_system_fingerprint(dispatch.weight_version.clone())
+                .build(),
+        )
     }
 }
 
@@ -253,42 +253,20 @@ impl HarmonyResponseProcessor {
         }
 
         // Build ResponsesResponse with all required fields
-        let response = ResponsesResponse {
-            id: dispatch.request_id.clone(),
-            object: "response".to_string(),
-            created_at: dispatch.created as i64,
-            status: ResponseStatus::Completed,
-            error: None,
-            incomplete_details: None,
-            instructions: responses_request.instructions.clone(),
-            max_output_tokens: responses_request.max_output_tokens,
-            model: responses_request.model.clone(),
-            output,
-            parallel_tool_calls: responses_request.parallel_tool_calls.unwrap_or(true),
-            previous_response_id: responses_request.previous_response_id.clone(),
-            reasoning: None, // Set by caller if needed
-            store: responses_request.store.unwrap_or(true),
-            temperature: responses_request.temperature,
-            text: responses_request.text.clone(),
-            tool_choice: responses_request
-                .tool_choice
-                .as_ref()
-                .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
-                .unwrap_or_else(|| "auto".to_string()),
-            tools: responses_request.tools.clone().unwrap_or_default(),
-            top_p: responses_request.top_p,
-            truncation: None,
-            usage: Some(ResponsesUsage::Modern(ResponseUsage {
+        let response = ResponsesResponse::builder(&dispatch.request_id, &responses_request.model)
+            .copy_from_request(&responses_request)
+            .created_at(dispatch.created as i64)
+            .status(ResponseStatus::Completed)
+            .output(output)
+            .maybe_text(responses_request.text.clone())
+            .usage(ResponsesUsage::Modern(ResponseUsage {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
                 total_tokens: usage.total_tokens,
                 input_tokens_details: None,
                 output_tokens_details: None,
-            })),
-            user: None,
-            safety_identifier: responses_request.user.clone(),
-            metadata: responses_request.metadata.clone().unwrap_or_default(),
-        };
+            }))
+            .build();
 
         Ok(ResponsesIterationResult::Completed {
             response: Box::new(response),
