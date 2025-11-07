@@ -72,7 +72,9 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(Arc::new(
+                sglang_router_rs::tokenizer::registry::TokenizerRegistry::new(),
+            )) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)
@@ -183,7 +185,9 @@ pub async fn create_test_context_with_mcp_config(
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(Arc::new(
+                sglang_router_rs::tokenizer::registry::TokenizerRegistry::new(),
+            )) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)
