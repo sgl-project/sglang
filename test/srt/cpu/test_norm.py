@@ -86,7 +86,7 @@ class TestNorm(CustomTestCase):
                 self._l2norm_test(*params)
 
 
-class TestQwen3NextRMSNormGated(CustomTestCase):
+class TestFusedRMSNormGated(CustomTestCase):
     M = [4096, 1024]
     N = [4096, 4096 + 13]
     dtype = [torch.float16, torch.bfloat16]
@@ -118,7 +118,7 @@ class TestQwen3NextRMSNormGated(CustomTestCase):
         variance_epsilon = 1e-6
         gate = torch.randn([batch_size, hidden_size], dtype=dtype)
 
-        out = torch.ops.sgl_kernel.qwen3_next_rmsnorm_gated_cpu(
+        out = torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
             x, weight, gate, variance_epsilon
         )
         ref_out = self._forward_native(x, weight, variance_epsilon, gate)

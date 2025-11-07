@@ -222,7 +222,7 @@ void fused_add_rmsnorm_kernel_impl(
 }
 
 template <typename scalar_t>
-void qwen3_next_rmsnorm_gated_kernel_impl(
+void fused_rmsnorm_gated_kernel_impl(
     scalar_t* __restrict__ output,
     const scalar_t* __restrict__ input,
     const scalar_t* __restrict__ weight,
@@ -349,8 +349,8 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
 // input : {batch_size, hidden_size}
 // weight: {hidden_size}
 // gate: {batch_size, hidden_size}
-at::Tensor qwen3_next_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps) {
-  RECORD_FUNCTION("sgl-kernel::qwen3_next_rmsnorm_gated_cpu", std::vector<c10::IValue>({input, weight, gate}));
+at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps) {
+  RECORD_FUNCTION("sgl-kernel::fused_rmsnorm_gated_cpu", std::vector<c10::IValue>({input, weight, gate}));
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(weight);
@@ -366,8 +366,8 @@ at::Tensor qwen3_next_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, a
   at::Tensor output = at::empty_like(input);
   int64_t input_strideN = input.stride(0);
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "qwen3_next_rmsnorm_gated_kernel", [&] {
-    qwen3_next_rmsnorm_gated_kernel_impl<scalar_t>(
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_rmsnorm_gated_kernel", [&] {
+    fused_rmsnorm_gated_kernel_impl<scalar_t>(
         output.data_ptr<scalar_t>(),
         input.data_ptr<scalar_t>(),
         weight.data_ptr<scalar_t>(),
