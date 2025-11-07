@@ -179,18 +179,13 @@ class HarmonyStreamingEventsTests(ResponseAPIBaseTest):
         ]
         self.assertGreater(len(output_item_added_events), 0)
 
-        # Find reasoning and message items
-        reasoning_items = []
-        message_items = []
-
-        for event in output_item_added_events:
-            item = event.get("data", {}).get("item", {})
-            item_type = item.get("type")
-
-            if item_type == "reasoning":
-                reasoning_items.append(item)
-            elif item_type == "message":
-                message_items.append(item)
+        output_items = [
+            e.get("data", {}).get("item", {}) for e in output_item_added_events
+        ]
+        reasoning_items = [
+            item for item in output_items if item.get("type") == "reasoning"
+        ]
+        message_items = [item for item in output_items if item.get("type") == "message"]
 
         # If reasoning is present, verify it has output_index: 0
         if reasoning_items:

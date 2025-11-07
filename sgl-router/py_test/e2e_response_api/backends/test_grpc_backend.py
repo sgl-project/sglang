@@ -19,14 +19,16 @@ sys.path.insert(0, str(_TEST_DIR))
 from mixins.function_call import FunctionCallingBaseTest
 from mixins.mcp import MCPTests
 from mixins.state_management import StateManagementTests
-from mixins.structured_output import StructuredOutputBaseTest
 from mixins.streaming_events import HarmonyStreamingEventsTests, StreamingEventsTests
+from mixins.structured_output import StructuredOutputBaseTest
 from mixins.tool_choice import ToolChoiceTests
 from router_fixtures import popen_launch_workers_and_router
 from util import kill_process_tree
 
 
-class TestGrpcBackend(StateManagementTests, MCPTests, StreamingEventsTests, StructuredOutputBaseTest):
+class TestGrpcBackend(
+    StateManagementTests, MCPTests, StreamingEventsTests, StructuredOutputBaseTest
+):
     """End to end tests for gRPC backend (Regular backend with Llama)."""
 
     @classmethod
