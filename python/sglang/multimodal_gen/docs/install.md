@@ -29,13 +29,9 @@ pip install -e "python/.[diffusion]"
 uv pip install --prerelease=allow  -e "python/.[diffusion]"
 ```
 
-**Quick fixes for common problems:**
-
-- If you want to develop sgl-diffusion, it is recommended to use Docker. The Docker image is `lmsysorg/sgl-diffusion:latest`.
-
 ## Method 3: Using Docker
 
-The Docker images are available on Docker Hub at [lmsysorg/sgl-diffusion](), built from the [Dockerfile](https://github.com/sgl-project/sgl-diffusion/tree/main/docker).
+The Docker images are available on Docker Hub at [lmsysorg/sglang](), built from the [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your HuggingFace Hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash
@@ -45,7 +41,7 @@ docker run --gpus all \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<secret>" \
     --ipc=host \
-    lmsysorg/sglang:diffusion \
+    lmsysorg/sglang:dev \
     sglang generate --model-path black-forest-labs/FLUX.1-dev \
     --prompt "A logo With Bold Large text: SGL Diffusion" \
     --save-output
