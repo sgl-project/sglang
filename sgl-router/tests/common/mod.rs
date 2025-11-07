@@ -26,6 +26,7 @@ use sgl_model_gateway::{
     middleware::TokenBucket,
     policies::PolicyRegistry,
     protocols::common::{Function, Tool},
+    tokenizer::registry::TokenizerRegistry,
 };
 
 /// Helper function to create AppContext for tests
@@ -74,7 +75,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)
@@ -205,7 +206,7 @@ pub async fn create_test_context_with_mcp_config(
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)

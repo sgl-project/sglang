@@ -9,8 +9,9 @@
 //! 3. DiscoverDPInfo - Fetch DP (Data Parallel) information (only for DP-aware workers)
 //! 4. CreateWorker - Build worker object(s) with merged config + metadata
 //! 5. RegisterWorker - Register worker(s) in registry
-//! 6. UpdatePolicies - Update policy registry with worker information
-//! 7. ActivateWorker - Mark worker(s) as healthy
+//! 6. RegisterTokenizer - Load and register tokenizer for model (optional)
+//! 7. UpdatePolicies - Update policy registry with worker information
+//! 8. ActivateWorker - Mark worker(s) as healthy
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -29,6 +30,7 @@ use crate::{
     },
     protocols::worker_spec::WorkerConfigRequest,
     routers::grpc::client::GrpcClient,
+    tokenizer::factory,
 };
 
 // HTTP client for metadata fetching
@@ -367,7 +369,7 @@ impl StepExecutor for DiscoverMetadataStep {
     }
 }
 
-/// Step 2.5: Discover DP (Data Parallel) information (only for DP-aware workers)
+/// Step 3: Discover DP (Data Parallel) information (only for DP-aware workers)
 pub struct DiscoverDPInfoStep;
 
 #[async_trait]
@@ -408,7 +410,7 @@ impl StepExecutor for DiscoverDPInfoStep {
     }
 }
 
-/// Step 3: Create worker object with merged configuration + metadata
+/// Step 4: Create worker object with merged configuration + metadata
 pub struct CreateWorkerStep;
 
 #[async_trait]
@@ -651,7 +653,7 @@ impl StepExecutor for CreateWorkerStep {
     }
 }
 
-/// Step 4: Register worker(s) in registry
+/// Step 5: Register worker(s) in registry
 pub struct RegisterWorkerStep;
 
 #[async_trait]
@@ -700,7 +702,84 @@ impl StepExecutor for RegisterWorkerStep {
     }
 }
 
-/// Step 5: Update policy registry with worker information
+/// Step 6: Register tokenizer for the worker's model (optional, non-blocking)
+pub struct RegisterTokenizerStep;
+
+#[async_trait]
+impl StepExecutor for RegisterTokenizerStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let config: Arc<WorkerConfigRequest> = context
+            .get("worker_config")
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
+        let labels: Arc<HashMap<String, String>> = context
+            .get("labels")
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("labels".to_string()))?;
+        let app_context: Arc<AppContext> = context
+            .get("app_context")
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+
+        // Get model_id from worker (consistent with UpdatePoliciesStep pattern)
+        let model_id = if config.dp_aware {
+            // DP-aware path: Get model_id from first worker
+            let workers: Arc<Vec<Arc<dyn Worker>>> = context
+                .get("workers")
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+            workers[0].model_id().to_string()
+        } else {
+            // Non-DP-aware path: Get model_id from single worker
+            let worker: Arc<Arc<dyn Worker>> = context
+                .get("worker")
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
+            worker.model_id().to_string()
+        };
+
+        // Get tokenizer path (prefer tokenizer_path, fallback to model_path)
+        let Some(tokenizer_path) = labels
+            .get("tokenizer_path")
+            .or_else(|| labels.get("model_path"))
+        else {
+            warn!(
+                "No tokenizer_path or model_path found for model {}",
+                model_id
+            );
+            return Ok(StepResult::Success);
+        };
+
+        debug!(
+            "Registering tokenizer for model {} from {}",
+            model_id, tokenizer_path
+        );
+
+        // Load and register tokenizer
+        if let Err(e) = app_context
+            .tokenizer_registry
+            .load(&model_id, || async move {
+                factory::create_tokenizer_async(&tokenizer_path.to_string())
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await
+        {
+            warn!(
+                "Failed to load tokenizer for model {} from {}: {}",
+                model_id, tokenizer_path, e
+            );
+        } else {
+            debug!(
+                "Successfully registered tokenizer for model {} from {}",
+                model_id, tokenizer_path
+            );
+        }
+
+        Ok(StepResult::Success)
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        true // Tokenizer loading failures are retryable (network/IO issues)
+    }
+}
+
+/// Step 7: Update policy registry with worker information
 pub struct UpdatePoliciesStep;
 
 #[async_trait]
@@ -791,7 +870,7 @@ impl StepExecutor for UpdatePoliciesStep {
     }
 }
 
-/// Step 6: Activate worker(s) by marking them as healthy
+/// Step 8: Activate worker(s) by marking them as healthy
 pub struct ActivateWorkerStep;
 
 #[async_trait]
@@ -904,6 +983,19 @@ pub fn create_worker_registration_workflow(
             )
             .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::FailWorkflow),
+        )
+        .add_step(
+            StepDefinition::new(
+                "register_tokenizer",
+                "Register Tokenizer",
+                Arc::new(RegisterTokenizerStep),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
+            })
+            .with_timeout(Duration::from_secs(10))
+            .with_failure_action(FailureAction::ContinueNextStep), // Tokenizer loading is optional
         )
         .add_step(
             StepDefinition::new(
