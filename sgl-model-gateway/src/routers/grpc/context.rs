@@ -21,7 +21,7 @@ use crate::{
         responses::ResponsesRequest,
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer},
+    tokenizer::{stop::StopSequenceDecoder, TokenizerRegistry},
     tool_parser::ParserFactory as ToolParserFactory,
 };
 
@@ -53,7 +53,7 @@ pub enum RequestType {
 
 /// Shared components (injected once at creation)
 pub struct SharedComponents {
-    pub tokenizer: Arc<dyn Tokenizer>,
+    pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
 }
