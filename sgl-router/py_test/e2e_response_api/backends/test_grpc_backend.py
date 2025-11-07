@@ -135,7 +135,7 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
         self.assertIn("answer", output_json)
         self.assertIsInstance(output_json["answer"], str)
         self.assertTrue(output_json["answer"], "Answer is empty")
-    
+
     # Inherited from MCPTests:
     # - test_mcp_basic_tool_call
     # - test_mcp_basic_tool_call_streaming
