@@ -697,34 +697,42 @@ class LayeredModelLoader(DefaultModelLoader):
 
 class QuantizedRLModelLoader(DefaultModelLoader):
     """
-    Model loader designed for RL training with quantized models (FlashRL approach).
+    Model loader designed for RL training with FP8 quantization (native SGLang support).
     
-    This loader follows FlashRL's proven approach for RL training:
-    1. Load model WITH w8a8_int8 quantization infrastructure (creates weight_scale params, INT8 kernels)
-    2. VERL trains the Actor model in BF16/FP16 (full precision)
-    3. Before sending weights to SGLang, apply profile-based quantization (BF16 -> INT8)
-    4. SGLang loads quantized INT8 weights into the w8a8_int8 model for fast inference rollouts
-    5. Preserve weight_scale parameters across reloads (they should not be updated)
+    **Workflow:**
+    1. Load model WITH FP8 quantization (native SGLang support)
+    2. Initial load: Use base model with FP8 quantization
+    3. VERL trains the Actor model in BF16/FP16 (full precision)
+    4. SGLang reloads BF16/FP16 weights and re-applies FP8 quantization for inference rollouts
+    5. Use torch.as_strided trick to preserve memory locations across reloads
     
-    Key difference from FlashRL's SGLang patch:
-    - FlashRL patches SGLang's load_weights_and_postprocess at runtime
-    - This loader integrates the same logic directly into SGLang's loading pipeline
+    **Usage:**
     
-    The challenge: quantization transforms weights and creates new tensors, losing:
+        --model-path Qwen/Qwen2.5-7B  # Base model (used by both VERL and SGLang)
+        --quantization fp8
+        --load-format quantized_rl
+        
+        Both initial load and reloads use the same base model with FP8 quantization
+    
+    **Key Features:**
+    - Uses SGLang's native FP8 quantization (no custom profiles needed)
+    - Single model path for both training and inference
+    - Efficient weight reloading with memory preservation
+    - Compatible with VERL's on-policy training workflow
+    
+    **The Challenge:**
+    Quantization transforms weights and creates new tensors, losing:
     - Original parameter shapes/strides (needed for torch.as_strided reset)
     - Weight loader functions (needed to reload weights correctly)
     - Memory locations (need to preserve for efficient GPU operations)
     
-    Solution (FlashRL approach):
-    1. Load raw checkpoint weights into model
+    **Solution:**
+    1. Load weights with SGLang's native FP8 quantization
     2. Record PRE-quantization state (shape, stride) - needed for torch.as_strided reset
     3. Record weight loader functions - needed to reload weights
-    4. Apply w8a8_int8 quantization (transposes/transforms weights)
-    5. Backup weight_scale parameters (from w8a8_int8, should not be updated on reload)
-    6. On reload: reset to pre-quant state, restore loaders, load+quantize, copy to original memory
-    7. Restore backed-up weight_scale parameters to preserve INT8 quantization config
-    
-    Inspired by FlashRL's sglang_patch.py, adapted for native SGLang integration.
+    4. Apply FP8 post-processing (SGLang's native quantization)
+    5. On reload: reset to pre-quant state, restore loaders, load weights, copy to original memory
+    6. Re-apply FP8 quantization using SGLang's native flow
     """
 
     # Keys to record from parameters for weight reloading (matches FlashRL)
@@ -742,41 +750,25 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         
-        # Always init quantize_fn from FlashRL
-        try:
-            from flash_rl.flash_quantization import get_quantize_fn
-            self.quantize_fn = get_quantize_fn("int8")
-            logger.info("[QuantizedRL] Loaded FlashRL INT8 quantization function")
-        except ImportError:
-            raise ImportError(
-                "FlashRL is required for quantized_rl load format. "
-                "Install with: pip install flash-rl"
-            )
-            
-        # Load profile from path - REQUIRED
-        if not load_config.quant_profile_path:
-            raise ValueError(
-                "quant_profile_path is required for quantized_rl load format. "
-                "Example: --load-config '{\"quant_profile_path\": \"/root/profile.7b.pt\"}'"
-            )
+        logger.info("[QuantizedRL] Using native SGLang FP8 quantization")
+        logger.info("[QuantizedRL] No custom profiles or pre-quantized models needed")
         
-        self.quant_profile = torch.load(load_config.quant_profile_path)
-        logger.info(f"[QuantizedRL] Loaded profile from {load_config.quant_profile_path}")
-        
-        # FlashRL: Global backup for weight_scale parameters
-        # These are created by w8a8_int8 quantization and should be preserved across reloads
-        self.weight_scale_backup = {}
+        # Track whether initial load is complete
+        self._initial_load_complete = False
 
     def _prepare_weights(
         self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
     ):
-        """Override to handle LoadFormat.QUANTIZED_RL by treating it as AUTO."""
-        # QUANTIZED_RL uses the same weight loading as AUTO, difference is in processing
+        """Use standard weight preparation - no special handling needed for FP8."""
+        # Always use the base model path (same for initial load and reloads)
+        logger.info(
+            f"[QuantizedRL] Loading from base model: {model_name_or_path}"
+        )
+        
+        # Use standard AUTO loading
         temp_config = LoadConfig(load_format=LoadFormat.AUTO)
         temp_loader = DefaultModelLoader(temp_config)
-        return temp_loader._prepare_weights(
-            model_name_or_path, revision, fall_back_to_pt
-        )
+        return temp_loader._prepare_weights(model_name_or_path, revision, fall_back_to_pt)
 
     @staticmethod
     def _bond_method_to_cls(func, obj):
@@ -792,30 +784,27 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
     def load_weights_and_postprocess(self, model, weights, target_device):
         """
-        Initial load for RL training with quantized models.
+        Initial load for RL training with FP8 quantization.
         
-        Follows FlashRL sglang_patch.py approach exactly (lines 255-302):
-        1. Load raw weights - parameters have attributes like output_dim/input_dim
-        2. Record pre-quantization state (shape, stride) for torch.as_strided reset during reload
-        3. Record loader attributes (weight_loader, output_dim, input_dim, etc.)
-        4. Apply w8a8_int8 quantization which:
-           - Transposes weights via .t() 
-           - Creates NEW Parameter objects, removing all custom attributes
-        5. Backup weight_scale parameters
+        Workflow:
+        1. Load BF16/FP16 weights from base model
+        2. Record pre-quantization state for future reloads
+        3. Apply FP8 quantization using SGLang's native flow
         
         After quantization, parameters have NO custom attributes - this is fine because:
         - Initial inference doesn't need output_dim/input_dim (they have None fallback)
         - Reload will restore them when needed (after resetting to pre-quant shape)
         """
-        # FlashRL lines 255-256: Load raw checkpoint weights
-        logger.info("[QuantizedRL] Loading raw checkpoint weights")
+        logger.info("[QuantizedRL] Initial load: loading base model weights with FP8 quantization")
+        
+        # Load weights using standard flow
         model.load_weights(weights)
         
-        # Capture parameters before quantization creates new Parameter objects
+        # Capture parameters before process_weights_after_loading creates new Parameter objects
         original_weights = dict(model.named_parameters())
         
-        # FlashRL lines 260-264: Record pre-quantization state for reload reconstruction
-        # This MUST be done BEFORE quantization to capture original shape/stride
+        # Record pre-quantization state for reload reconstruction
+        # This MUST be done BEFORE process_weights_after_loading to capture original shape/stride
         logger.info("[QuantizedRL] Recording pre-quantization state")
         model.original_weights_rebuild_keys = {}
         for name, p in original_weights.items():
@@ -826,7 +815,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 "nbytes": p.untyped_storage().nbytes(),
             }
         
-        # FlashRL lines 267-280: Record parameter attributes before quantization
+        # Record parameter attributes before process_weights_after_loading
         logger.info("[QuantizedRL] Recording loader attributes before quantization")
         recorded_loader = {
             k: dict() for k in QuantizedRLModelLoader.RECORDED_LOADER_KEYS
@@ -841,13 +830,13 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     param_has_loader = True
                     attr = getattr(p, key)
                     if not callable(attr):
-                        # FlashRL line 275: Record non-callable attributes as-is
+                        # Record non-callable attributes as-is
                         recorded_loader[key][name] = attr
                     elif hasattr(attr, "__self__") and p is attr.__self__:
-                        # FlashRL line 277: Bound method - store unbound function
+                        # Bound method - store unbound function
                         recorded_loader[key][name] = attr.__func__
                     else:
-                        # FlashRL line 279: Regular function/callable
+                        # Regular function/callable
                         recorded_loader[key][name] = attr
 
             if param_has_loader:
@@ -856,31 +845,17 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         logger.info(f"[QuantizedRL] Recorded loader attributes for {params_with_loaders} parameters")
         model.recorded_loader = recorded_loader
         
-        # FlashRL lines 283-295: Apply w8a8_int8 quantization
-        # This transposes weights and creates NEW Parameter objects, removing all custom attributes
-        logger.info("[QuantizedRL] Applying w8a8_int8 quantization")
+        # Apply FP8 post-processing using SGLang's native quantization
+        # This creates NEW Parameter objects, removing all custom attributes
+        logger.info("[QuantizedRL] Applying FP8 post-processing (native SGLang quantization)")
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
         
-        # FlashRL lines 297-302: Backup weight_scale (INT8 quantization scales, must not update on reload)
-        for name, p in model.named_parameters():
-            if "weight_scale" in name:
-                self.weight_scale_backup[name] = p.data.clone().cpu()
-        logger.info(f"[QuantizedRL] Backed up {len(self.weight_scale_backup)} weight_scale parameters")
-        model.quantized_rl_weight_scale_backup = self.weight_scale_backup
-        
-        # FlashRL line 240: Store quantization function/profile for reloads
-        if self.quantize_fn is not None:
-            model.quantized_rl_quantize_fn = self.quantize_fn
-            model.quantized_rl_quant_profile = self.quant_profile
-        else:
-            model.quantized_rl_quantize_fn = None
-            model.quantized_rl_quant_profile = None
-        
         model.quantized_rl_initial_load_complete = True
+        self._initial_load_complete = True
         logger.info("[QuantizedRL] Initial load complete")
 
     @staticmethod
@@ -896,38 +871,33 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
         """
-        Reload weights for RL training (FlashRL sglang_patch.py lines 198-204, 212-236).
+        Reload weights for RL training with FP8 quantization.
         Uses torch.as_strided + copy_ to preserve memory locations, avoiding GPU fragmentation.
         
-        FlashRL reload flow:
-        1. Reset parameters to pre-quant shape with torch.as_strided (lines 198-200)
-        2. Restore attributes ONLY IF MISSING - skips if still present (lines 201-204)
-        3. Load quantized weights (lines 212-214)
-        4. Copy back to original memory locations (lines 308-315)
-        5. Restore weight_scale on last batch (lines 228-236)
+        Reload flow:
+        1. Reset parameters to pre-quant shape with torch.as_strided
+        2. Restore attributes ONLY IF MISSING - skips if still present
+        3. Load weights (BF16/FP16 from VERL)
+        4. Copy back to original memory locations
+        5. Cleanup on last batch
         """
-        quantize_fn = getattr(model, 'quantized_rl_quantize_fn', None)
-        quant_profile = getattr(model, 'quantized_rl_quant_profile', None)
-        
         logger.info("[QuantizedRL] Weight reload started")
-        if quantize_fn is not None:
-            logger.info("[QuantizedRL] Using profile-based quantization")
 
-        # FlashRL lines 188, 90-146: Identify updated parameters
+        # Identify updated parameters
         weights_list = list(weights)
         updated_param_names, is_last_update = QuantizedRLModelLoader._get_updated_params(
             weights_list, model
         )
         logger.info(f"[QuantizedRL] Updating {len(updated_param_names)} parameters (last_batch={is_last_update})")
 
-        # FlashRL lines 192-195: Save current parameter data pointers
+        # Save current parameter data pointers
         existing_params = dict(model.named_parameters())
         current_param_data = {}
         for name in updated_param_names:
             if name in existing_params:
                 current_param_data[name] = existing_params[name].data
 
-        # FlashRL lines 198-200: Reset to pre-quantization state using torch.as_strided
+        # Reset to pre-quantization state using torch.as_strided
         for name, rebuild_info in model.original_weights_rebuild_keys.items():
             if name in updated_param_names and name in existing_params:
                 existing_params[name].data = torch.as_strided(
@@ -936,7 +906,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     rebuild_info["stride"],
                 )
 
-        # FlashRL lines 201-204: Restore weight loader attributes
+        # Restore weight loader attributes
         # ONLY restore if attribute is missing (not hasattr check)
         # After quantization, attributes were removed by Parameter creation, so this restores them
         restored_count = 0
@@ -944,7 +914,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             for param_name, loader in loader_dict.items():
                 if param_name in updated_param_names and param_name in existing_params:
                     param = existing_params[param_name]
-                    if not hasattr(param, k):  # FlashRL line 203: Only if missing
+                    if not hasattr(param, k):  # Only if missing
                         if callable(loader):
                             if hasattr(loader, "__self__"):
                                 setattr(param, k, loader)
@@ -958,14 +928,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         logger.info(f"[QuantizedRL] Restored attributes for {restored_count} parameters")
         del existing_params
 
-        # FlashRL lines 212-214: Apply quantization (if provided) and load weights
-        if quantize_fn is not None:
-            quantized_weights = quantize_fn(iter(weights_list), quant_profile)
-            updated_params = first_time_load_weights(quantized_weights)
-        else:
-            updated_params = first_time_load_weights(iter(weights_list))
+        # Load weights (no custom quantization - SGLang's FP8 will handle it)
+        updated_params = first_time_load_weights(iter(weights_list))
 
-        # FlashRL lines 308-315: Copy new weights back to original memory (torch.as_strided trick)
+        # Copy new weights back to original memory (torch.as_strided trick)
         processed_weights = dict(model.named_parameters())
         params_copied = 0
         for name in updated_param_names:
@@ -980,15 +946,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         logger.info(f"[QuantizedRL] Copied {params_copied} parameters back to original memory locations")
 
-        # FlashRL lines 228-236: On last batch, restore weight_scale and cleanup
+        # On last batch, cleanup
         if is_last_update:
-            logger.info("[QuantizedRL] Last batch - restoring weight_scale parameters")
-            if hasattr(model, 'quantized_rl_weight_scale_backup'):
-                weight_scale_backup = model.quantized_rl_weight_scale_backup
-                for name, p in model.named_parameters():
-                    if "weight_scale" in name and name in weight_scale_backup:
-                        p.data.copy_(weight_scale_backup[name].to(p.device))
-                logger.info(f"[QuantizedRL] Restored {len(weight_scale_backup)} weight_scale parameters")
+            logger.info("[QuantizedRL] Last batch - cleanup")
             del current_param_data
             del processed_weights
             gc.collect()
@@ -2466,23 +2426,21 @@ def get_model_loader(
         return LayeredModelLoader(load_config)
 
     # Check for QUANTIZED_RL format early
-    # FlashRL approach: BF16/FP16 model with profile-based quantization during weight loading
+    # FP8 approach: BF16/FP16 model with native FP8 quantization
     if load_config.load_format == LoadFormat.QUANTIZED_RL:
-        logger.info("Using QuantizedRLModelLoader for RL training with FlashRL-style quantization.")
+        logger.info("Using QuantizedRLModelLoader for RL training with native FP8 quantization.")
         logger.info(
-            "FlashRL approach: Model loads without quantization (BF16/FP16), "
-            "quantization applied during weight loading using profile/custom kernel."
+            "FP8 approach: Model loads with native SGLang FP8 quantization. "
+            "Same model path for both training (VERL) and inference (SGLang)."
         )
         
-        # FlashRL approach: Load model WITH w8a8_int8 quantization infrastructure
-        # This creates weight_scale parameters and sets up INT8 kernels
-        # Then during reloads, we quantize BF16 weights and load them into this INT8 model
+        # Set quantization to FP8 for native SGLang support
         if model_config and not model_config.quantization:
             logger.info(
-                f"QuantizedRL: Setting quantization to w8a8_int8 (FlashRL approach). "
-                f"Model will be loaded with INT8 infrastructure, weights reloaded with profile-based quantization."
+                "QuantizedRL: Setting quantization to fp8 (native SGLang support). "
+                "Model will be loaded with FP8 infrastructure, weights reloaded from VERL."
             )
-            model_config.quantization = "w8a8_int8"
+            model_config.quantization = "fp8"
         
         return QuantizedRLModelLoader(load_config)
 
