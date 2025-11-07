@@ -358,6 +358,9 @@ class ModelRunner:
         )
 
         if not self.is_draft_worker:
+            print(
+                f"compute_initial_expert_location_metadata: ep_rank={self.moe_ep_rank}"
+            )
             set_global_expert_location_metadata(
                 compute_initial_expert_location_metadata(
                     server_args=server_args,

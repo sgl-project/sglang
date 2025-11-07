@@ -93,7 +93,7 @@ class ExpertLocationMetadata:
 
         if common is None:
             return None
-
+        print(f"init_trivial: common={common}")
         num_physical_experts = common["num_physical_experts"]
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_layers = model_config_for_expert_location.num_layers
@@ -103,7 +103,7 @@ class ExpertLocationMetadata:
             torch.arange(0, num_physical_experts).repeat(num_layers, 1)
             % num_logical_experts
         )
-
+        print(f"init_trivial: physical_to_logical_map={physical_to_logical_map}")
         return ExpertLocationMetadata.init_by_mapping(
             server_args,
             model_config,
