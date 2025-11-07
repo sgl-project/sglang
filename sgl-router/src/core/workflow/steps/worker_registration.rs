@@ -682,7 +682,7 @@ impl StepExecutor for CreateWorkerStep {
 
             // Store worker (singular) and labels in context
             context.set("worker", worker);
-            context.set("labels", final_labels);
+            context.set("labels", final_labels.clone());
 
             Ok(StepResult::Success)
         }
@@ -724,6 +724,35 @@ impl StepExecutor for RegisterWorkerStep {
             }
 
             context.set("worker_ids", worker_ids);
+
+            // Load and register tokenizer if needed
+            let labels: Arc<HashMap<String, String>> = context
+                .get("labels")
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("labels".to_string()))?;
+
+            if let Some(model_id) = labels.get("model_id") {
+                if let Some(tokenizer_path) = labels
+                    .get("tokenizer_path")
+                    .or_else(|| labels.get("model_path"))
+                {
+                    let tokenizer_path_owned = tokenizer_path.to_string();
+                    if let Err(e) = app_context
+                        .tokenizer_registry
+                        .load_and_register(model_id, || async move {
+                            crate::tokenizer::factory::create_tokenizer_async(&tokenizer_path_owned)
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                    {
+                        warn!(
+                            "Failed to load tokenizer for model {} from {}: {}",
+                            model_id, tokenizer_path, e
+                        );
+                    }
+                }
+            }
+
             Ok(StepResult::Success)
         } else {
             // Non-DP-aware path: Register single worker
@@ -737,6 +766,34 @@ impl StepExecutor for RegisterWorkerStep {
 
             debug!("Registered worker {} with ID {:?}", config.url, worker_id);
             context.set("worker_id", worker_id);
+
+            // Load and register tokenizer if needed
+            let labels: Arc<HashMap<String, String>> = context
+                .get("labels")
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("labels".to_string()))?;
+
+            if let Some(model_id) = labels.get("model_id") {
+                if let Some(tokenizer_path) = labels
+                    .get("tokenizer_path")
+                    .or_else(|| labels.get("model_path"))
+                {
+                    let tokenizer_path_owned = tokenizer_path.to_string();
+                    if let Err(e) = app_context
+                        .tokenizer_registry
+                        .load_and_register(model_id, || async move {
+                            crate::tokenizer::factory::create_tokenizer_async(&tokenizer_path_owned)
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                    {
+                        warn!(
+                            "Failed to load tokenizer for model {} from {}: {}",
+                            model_id, tokenizer_path, e
+                        );
+                    }
+                }
+            }
 
             Ok(StepResult::Success)
         }
@@ -851,6 +908,23 @@ impl StepExecutor for ActivateWorkerStep {
         let config: Arc<WorkerConfigRequest> = context
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
+        let app_context: Arc<AppContext> = context
+            .get("app_context")
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+
+        // Verify tokenizer registration for this model
+        let labels: Arc<HashMap<String, String>> = context
+            .get("labels")
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("labels".to_string()))?;
+
+        if let Some(model_id) = labels.get("model_id") {
+            if app_context.tokenizer_registry.contains(model_id) {
+                info!(
+                    "Tokenizer verified in registry for model {} (worker: {})",
+                    model_id, config.url
+                );
+            }
+        }
 
         // Check if we have multiple workers (DP-aware) or single worker
         if config.dp_aware {

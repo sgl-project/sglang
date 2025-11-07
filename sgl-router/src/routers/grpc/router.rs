@@ -52,12 +52,9 @@ pub struct GrpcRouter {
 impl GrpcRouter {
     /// Create a new gRPC router
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
-        // Extract necessary components from context
-        let tokenizer = ctx
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| "gRPC router requires tokenizer".to_string())?
-            .clone();
+        // Get tokenizer registry (no longer requires pre-loaded tokenizer)
+        let tokenizer_registry = ctx.tokenizer_registry.clone();
+
         let reasoning_parser_factory = ctx
             .reasoning_parser_factory
             .as_ref()
@@ -74,7 +71,7 @@ impl GrpcRouter {
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
-            tokenizer: tokenizer.clone(),
+            tokenizer_registry: tokenizer_registry.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
         });
@@ -83,7 +80,7 @@ impl GrpcRouter {
         let pipeline = RequestPipeline::new_regular(
             worker_registry.clone(),
             _policy_registry.clone(),
-            tokenizer.clone(),
+            tokenizer_registry.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -94,7 +91,7 @@ impl GrpcRouter {
         let harmony_pipeline = RequestPipeline::new_harmony(
             worker_registry.clone(),
             _policy_registry.clone(),
-            tokenizer.clone(),
+            tokenizer_registry.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
