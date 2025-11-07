@@ -23,7 +23,6 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 # Clear torch compilation cache
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 rm -rf /root/.cache/flashinfer
-pip3 uninstall flashinfer-python flashinfer-cubin flashinfer-jit-cache || true
 
 # Install apt packages
 apt install -y git libnuma-dev libssl-dev pkg-config
@@ -80,6 +79,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
 
     # Clean up existing installations
     $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
+    $PIP_CMD uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_INSTALL_SUFFIX || true
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
@@ -91,10 +91,14 @@ else
 
     # Clean up existing installations
     $PIP_CMD uninstall sgl-kernel sglang || true
+    $PIP_CMD uninstall flashinfer-python flashinfer-cubin flashinfer-jit-cache || true
 fi
 
 # Install the main package
 $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
+
+# TODO: Adding this as a workaround for CI failure
+$PIP_CMD install pytest $PIP_INSTALL_SUFFIX
 
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
