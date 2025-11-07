@@ -186,9 +186,14 @@ class AMXEPWrapperMethod(FusedMoEMethodBase):
         self.hidden_size = hidden_size
         self.intermediate_size_per_partition = intermediate_size_per_partition
 
-        # Extract required parameters from extra_weight_attrs
-        num_experts_per_tok = extra_weight_attrs.get("top_k")
-        intermediate_size_full = extra_weight_attrs.get("intermediate_size_full")
+        # Get required parameters from layer object
+        # top_k: number of experts selected per token
+        num_experts_per_tok = layer.top_k
+
+        # intermediate_size_full: full intermediate size before TP partitioning
+        intermediate_size_full = (
+            layer.intermediate_size_per_partition * layer.moe_tp_size
+        )
 
         layer_max_deferred = self.amx_config.max_deferred_experts_per_token or 0
         if (
