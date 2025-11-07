@@ -18,6 +18,7 @@ ARG NVSHMEM_VERSION=3.4.5
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
+ARG INSTALL_FLASHINFER_JIT_CACHE=0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -125,6 +126,9 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
    ; \
    fi \
  && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
+      python3 -m pip install flashinfer-jit-cache==0.5.0 --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
+    fi \
  && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
       python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
