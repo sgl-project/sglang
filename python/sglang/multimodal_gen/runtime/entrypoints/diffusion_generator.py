@@ -258,10 +258,10 @@ class DiffGenerator:
         data_type = (
             DataType.IMAGE
             if self.server_args.pipeline_config.is_image_gen
-            or sampling_params.num_frames == 1
+            or pretrained_sampling_params.num_frames == 1
             else DataType.VIDEO
         )
-        sampling_params.data_type = data_type
+        pretrained_sampling_params.data_type = data_type
         pretrained_sampling_params.set_output_file_name()
 
         requests: list[Req] = []

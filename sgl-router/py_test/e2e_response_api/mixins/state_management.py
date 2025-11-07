@@ -7,7 +7,7 @@ These tests should work across all backends (OpenAI, XAI, gRPC).
 
 import unittest
 
-from base import ResponseAPIBaseTest
+from basic_crud import ResponseAPIBaseTest
 
 
 class StateManagementTests(ResponseAPIBaseTest):
