@@ -388,11 +388,7 @@ class ModelRunner:
         )
         self.expert_location_updater = ExpertLocationUpdater()
 
-        (
-            ElasticEPStateManager.init(self.server_args)
-            if self.server_args.elastic_ep_backend
-            else None
-        )
+        ElasticEPStateManager.init(self.server_args)
         # Load the model
         self.sampler = Sampler()
         self.load_model()
@@ -835,27 +831,29 @@ class ModelRunner:
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
+        a = time.time()
+        self.expert_location_updater.update(
+            self.model.routed_experts_weights_of_layer,
+            new_expert_location_metadata,
+            update_layer_ids=update_layer_ids,
+            nnodes=self.server_args.nnodes,
+            rank=self.tp_rank,
+        )
+        b = time.time()
         if ElasticEPStateManager.instance() is not None:
-            # TODO: refactor the weights update when elastic ep
-            old_expert_location_metadata = get_global_expert_location_metadata()
-            assert old_expert_location_metadata is not None
-            old_expert_location_metadata.update(
-                new_expert_location_metadata,
-                update_layer_ids=update_layer_ids,
-            )
+            def missing_experts_name_filter(name: str) -> bool:
+                for expert in range(self.tp_rank * 4, self.tp_rank * 4 + 4):
+                    if f"mlp.experts.{expert}." in name:
+                        return True
+                return False
+
             self.update_weights_from_disk(
                 self.server_args.model_path,
                 self.server_args.load_format,
-                lambda name: "mlp.experts" in name and "mlp.shared_experts" not in name,
+                missing_experts_name_filter,
             )
-        else:
-            self.expert_location_updater.update(
-                self.model.routed_experts_weights_of_layer,
-                new_expert_location_metadata,
-                update_layer_ids=update_layer_ids,
-                nnodes=self.server_args.nnodes,
-                rank=self.tp_rank,
-            )
+            c = time.time()
+            logger.info(f"b - a = {b - a} s, c - b = {c - b} s")
 
     def update_weights_from_disk(
         self,
@@ -2152,6 +2150,27 @@ class ModelRunner:
                 split_forward_count,
             )
 
+            elastic_ep_state = ElasticEPStateManager.instance()
+            if (
+                elastic_ep_state is not None
+                and not elastic_ep_state.is_active_equal_last()
+            ):
+                elastic_ep_state.snapshot_active_to_last()
+                elastic_ep_state.sync_active_to_cpu()
+                logging.info("EPLB due to rank faults")
+                gen = self.eplb_manager.rebalance()
+                while True:
+                    try:
+                        next(gen)
+                    except StopIteration:
+                        break
+                output = self._forward_raw(
+                    forward_batch,
+                    skip_attn_backend_init,
+                    pp_proxy_tensors,
+                    reinit_attn_backend,
+                    split_forward_count,
+                )
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
 

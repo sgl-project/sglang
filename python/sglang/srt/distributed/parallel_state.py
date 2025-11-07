@@ -268,6 +268,8 @@ class GroupCoordinator:
         pynccl_use_current_stream: bool = False,
         torch_compile: Optional[bool] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
+        active_ranks: Optional[torch.Tensor] = None,
+        active_ranks_cpu: Optional[torch.Tensor] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -282,14 +284,33 @@ class GroupCoordinator:
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
-            # a cpu_group to allow direct coordination between processes through
-            # the CPU. The backend is chosen based on `torch_distributed_backend`
             if "mooncake" in torch_distributed_backend:
-                cpu_group = torch.distributed.new_group(ranks, backend="mooncake-cpu")
+                from mooncake.ep import MooncakeBackendOptions
+
+                device_group = torch.distributed.new_group(
+                    ranks,
+                    backend="mooncake",
+                    pg_options=(
+                        MooncakeBackendOptions(active_ranks)
+                        if active_ranks is not None
+                        else None
+                    ),
+                )
+                cpu_group = torch.distributed.new_group(
+                    ranks,
+                    backend="mooncake-cpu",
+                    pg_options=(
+                        MooncakeBackendOptions(active_ranks_cpu)
+                        if active_ranks_cpu is not None
+                        else None
+                    ),
+                )
             else:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
+                # a group with `gloo` backend, to allow direct coordination
+                # between processes through the CPU.
                 cpu_group = torch.distributed.new_group(
                     ranks, backend="gloo", timeout=gloo_timeout
                 )
@@ -1342,6 +1363,8 @@ def init_model_parallel_group(
     pynccl_use_current_stream: bool = True,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     torch_compile: Optional[bool] = None,
+    active_ranks: Optional[torch.Tensor] = None,
+    active_ranks_cpu: Optional[torch.Tensor] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1353,7 +1376,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=not (_is_npu or _is_xpu),
+        use_pynccl=not (_is_npu or _is_xpu or backend == "mooncake"),
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
@@ -1364,10 +1387,23 @@ def init_model_parallel_group(
         group_name=group_name,
         pynccl_use_current_stream=pynccl_use_current_stream,
         torch_compile=torch_compile,
+        active_ranks=active_ranks,
+        active_ranks_cpu=active_ranks_cpu,
     )
 
 
 _TP: Optional[GroupCoordinator] = None
+_TP_ACTIVE_RANKS: Optional[torch.Tensor] = None
+_TP_ACTIVE_RANKS_CPU: Optional[torch.Tensor] = None
+
+
+def get_tp_active_ranks():
+    return _TP_ACTIVE_RANKS
+
+
+def get_tp_active_ranks_cpu():
+    return _TP_ACTIVE_RANKS_CPU
+
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
@@ -1581,6 +1617,18 @@ def initialize_model_parallel(
         )
         group_ranks.append(ranks)
 
+    global _TP_ACTIVE_RANKS
+    global _TP_ACTIVE_RANKS_CPU
+    if backend == "mooncake":
+        _TP_ACTIVE_RANKS = torch.ones(
+            (tensor_model_parallel_size,), dtype=torch.int32, device="cuda"
+        )
+        _TP_ACTIVE_RANKS_CPU = torch.ones(
+            (tensor_model_parallel_size,), dtype=torch.int32, device="cpu"
+        )
+    else:
+        _TP_ACTIVE_RANKS = None
+        _TP_ACTIVE_RANKS_CPU = None
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
         group_ranks,
@@ -1592,6 +1640,8 @@ def initialize_model_parallel(
         group_name="tp",
         pynccl_use_current_stream=duplicate_tp_group,
         torch_compile=torch_compile,
+        active_ranks=_TP_ACTIVE_RANKS,
+        active_ranks_cpu=_TP_ACTIVE_RANKS_CPU,
     )
 
     if duplicate_tp_group:

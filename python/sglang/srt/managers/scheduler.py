@@ -59,13 +59,19 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tp_active_ranks,
+    get_tp_active_ranks_cpu,
+    get_world_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActiveRanksOutput,
     BaseBatchReq,
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
@@ -2052,6 +2058,17 @@ class Scheduler(
             batch_result.extend_logprob_start_len_per_req = (
                 extend_logprob_start_len_per_req
             )
+            if (
+                self.server_args.enable_dp_attention
+                and self.server_args.elastic_ep_backend == "mooncake"
+            ):
+                # Get the tensors indicating rank activeness
+                tp_active_ranks = get_tp_active_ranks().detach().cpu().numpy()
+                tp_active_ranks_cpu = get_tp_active_ranks_cpu().detach().numpy()
+                tp_active_ranks &= tp_active_ranks_cpu
+                self.send_to_tokenizer.send_output(
+                    ActiveRanksOutput(status=tp_active_ranks.tolist())
+                )
             ret = batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
@@ -2172,9 +2189,12 @@ class Scheduler(
         if len(offload_tags) == 0 and disable_overlap_schedule:
             group = tp_group.device_group
             device = tp_group.device
+            torch.distributed.barrier(group=tp_group.cpu_group)
+            tp_active_ranks = get_tp_active_ranks()
         else:
             group = tp_group.cpu_group
             device = "cpu"
+            tp_active_ranks = get_tp_active_ranks_cpu()
 
         local_info = torch.tensor(
             [
@@ -2199,6 +2219,14 @@ class Scheduler(
             local_info,
             group=group,
         )
+        if tp_active_ranks is not None:
+            # Mooncake Backend tells which ranks are non-active
+            # Set a fallback value for those ranks
+            global_info.view(-1, 6)[tp_active_ranks == 0, :] = torch.tensor(
+                [0, 1, 0, 0, 1, ForwardMode.IDLE.value],
+                device=global_info.device,
+                dtype=global_info.dtype,
+            )
         global_num_tokens = global_info[:, 0, 0].tolist()
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
