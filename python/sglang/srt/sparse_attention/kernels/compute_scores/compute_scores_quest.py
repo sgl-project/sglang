@@ -102,7 +102,7 @@ def compute_quest_score(
     # k = k.squeeze(1)
 
     NUM_Q_HEADS = q.shape[1]
-    GROUP_SIZE = NUM_Q_HEADS // NUM_KV_HEADS
+    GROUP_SIZE = triton.next_power_of_2(NUM_Q_HEADS // NUM_KV_HEADS)
 
     PADDED_HEAD_DIM = max(16, triton.next_power_of_2(HEAD_DIM))
 

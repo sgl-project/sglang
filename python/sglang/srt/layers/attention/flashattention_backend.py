@@ -353,6 +353,7 @@ class FlashAttentionBackend(AttentionBackend):
                 stream_budget=(128, 256),
                 is_cuda_graph=not model_runner.server_args.disable_cuda_graph,
                 moving_average_factor=model_runner.server_args.sparse_moving_average_factor,
+                skip_first_n_layers=model_runner.server_args.sparse_skip_first_n_layers,
             )
         
             self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(manager_config)
@@ -1072,7 +1073,21 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
                 # # Default: single-token self-attention
-                if not self.sparse_attn:
+                if self.sparse_attn:
+                    result = cute_flash_attn_with_kvcache(
+                        q_reshaped, 
+                        key_cache, 
+                        value_cache, 
+                        cache_seqlens=cache_seqlens, 
+                        cu_seqlens_q=metadata.cu_seqlens_q, 
+                        max_seqlen_q=1, 
+                        page_table=page_table, 
+                        causal=True, 
+                        groupwise=True,
+                        softmax_scale=layer.scaling,
+                        softcap=layer.logit_cap,
+                    )
+                else:
                     result = flash_attn_with_kvcache(
                         q=q_reshaped,
                         k_cache=key_cache,
@@ -1092,21 +1107,7 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn,
                         **kwargs,
                     )
-                
-                else:
-                    result = cute_flash_attn_with_kvcache(
-                        q_reshaped, 
-                        key_cache, 
-                        value_cache, 
-                        cache_seqlens=cache_seqlens, 
-                        cu_seqlens_q=metadata.cu_seqlens_q, 
-                        max_seqlen_q=1, 
-                        page_table=page_table, 
-                        causal=True, 
-                        groupwise=True,
-                        softmax_scale=layer.scaling,
-                        softcap=layer.logit_cap,
-                    )
+
                 # exit(-1)
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result

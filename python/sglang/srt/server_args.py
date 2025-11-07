@@ -300,6 +300,7 @@ class ServerArgs:
     sparse_attn_algo: str = "lserver"
     sparse_token_budget: int = 4096
     sparse_moving_average_factor: float = 0.4
+    sparse_skip_first_n_layers: int = 0
 
     def __post_init__(self):
         # Check deprecated arguments
@@ -2033,6 +2034,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.sparse_moving_average_factor,
             help="The moving average factor for sparse attention.",
+        )
+        parser.add_argument(
+            "--sparse-skip-first-n-layers",
+            type=int,
+            default=ServerArgs.sparse_skip_first_n_layers,
+            help="The number of layers to skip at the beginning of the model for sparse attention.",
         )
 
     @classmethod

@@ -27,6 +27,7 @@ class ManagerConfig:
         is_cuda_graph: bool,
         decode_cuda_graph_metadata: Optional[dict] = None,
         moving_average_factor: float = 0.4,
+        skip_first_n_layers: int = 0,
     ):
         self.keys = keys
         self.values = values
@@ -50,6 +51,7 @@ class ManagerConfig:
         self.head_num = self.keys[0].shape[1]
         self.head_dim = self.keys[0].shape[2]
         self.moving_average_factor = moving_average_factor
+        self.skip_first_n_layers = skip_first_n_layers
 
 
 class RetriveQuery:
@@ -294,7 +296,7 @@ class CacheManager:
 
     def _retrive_loop(self):
         while True:
-            for layer_id in range(self.config.num_layers):
+            for layer_id in range(self.config.skip_first_n_layers, self.config.num_layers):
                 if self.retrived_query[layer_id].updated:
                     if self.config.is_cuda_graph:
                         self.graph_runner.replay(layer_id)
