@@ -25,7 +25,7 @@ def calc_diff(x, y):
 
 def get_model_config(tp_size: int):
     config = AutoConfig.from_pretrained(
-        "deepseek-ai/Deepseek-R1", trust_remote_code=True
+        "gaunernst/DeepSeek-V2-Lite-Chat-FP8", trust_remote_code=True
     )
     E = config.n_routed_experts
     topk = config.num_experts_per_tok
@@ -184,7 +184,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
     triton_quant_info = TritonMoeQuantInfo(
         w13_weight=w1,
         w2_weight=w2,
-        use_fp8=True,
+        use_fp8_w8a8=True,
         w13_scale=w1_scale,
         w2_scale=w2_scale,
         block_shape=block_shape,
