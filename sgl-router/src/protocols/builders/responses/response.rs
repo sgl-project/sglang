@@ -94,6 +94,9 @@ impl ResponsesResponseBuilder {
     /// This populates fields like instructions, max_output_tokens, temperature, etc.
     /// from the original request, making it easy to construct a response that mirrors
     /// the request parameters.
+    ///
+    /// Note: `safety_identifier` is intentionally NOT copied as it is for content moderation
+    /// and should be set independently from the request's `user` field (which is for billing/tracking).
     pub fn copy_from_request(mut self, request: &ResponsesRequest) -> Self {
         self.instructions = request.instructions.clone();
         self.max_output_tokens = request.max_output_tokens;
@@ -109,7 +112,6 @@ impl ResponsesResponseBuilder {
         self.tools = request.tools.clone().unwrap_or_default();
         self.top_p = request.top_p;
         self.user = request.user.clone();
-        self.safety_identifier = request.user.clone();
         self.metadata = request.metadata.clone().unwrap_or_default();
         self
     }
