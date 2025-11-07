@@ -89,6 +89,17 @@ class CutlassMoeQuantInfo(MoeQuantInfo):
     w2_alpha: Optional[torch.Tensor] = None
     a1_gscale: Optional[torch.Tensor] = None
     a2_gscale: Optional[torch.Tensor] = None
+    # W4A8 specific fields
+    a_strides1: Optional[torch.Tensor] = None
+    b_strides1: Optional[torch.Tensor] = None
+    c_strides1: Optional[torch.Tensor] = None
+    a_strides2: Optional[torch.Tensor] = None
+    b_strides2: Optional[torch.Tensor] = None
+    c_strides2: Optional[torch.Tensor] = None
+    s_strides13: Optional[torch.Tensor] = None
+    s_strides2: Optional[torch.Tensor] = None
+    w13_input_scale: Optional[torch.Tensor] = None
+    w2_input_scale: Optional[torch.Tensor] = None
     params: Optional[CutlassMoEParams] = None
 
 
@@ -121,7 +132,6 @@ class CutlassRunnerCore(MoeRunnerCore):
         topk = runner_input.topk_ids.shape[1]
 
         if moe_type == CutlassMoEType.BlockscaledFP8:
-
             intermediate_size = quant_info.w2_weight.size(1)
             num_experts = quant_info.w13_weight.size(0)
 
@@ -228,6 +238,34 @@ class CutlassRunnerCore(MoeRunnerCore):
                 device,
                 params.to_gemm2_args(),
             )
+        elif moe_type == CutlassMoEType.W4A8:
+            from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+
+            down_output = cutlass_w4a8_moe(
+                runner_input.hidden_states,
+                quant_info.w13_weight,
+                quant_info.w2_weight,
+                quant_info.w13_scale,
+                quant_info.w2_scale,
+                runner_input.topk_weights,
+                runner_input.topk_ids,
+                quant_info.a_strides1,
+                quant_info.b_strides1,
+                quant_info.c_strides1,
+                quant_info.a_strides2,
+                quant_info.b_strides2,
+                quant_info.c_strides2,
+                quant_info.s_strides13,
+                quant_info.s_strides2,
+                quant_info.expert_offsets,
+                quant_info.problem_sizes1,
+                quant_info.problem_sizes2,
+                quant_info.w13_input_scale,
+                quant_info.w2_input_scale,
+                apply_router_weight_on_input=self.config.apply_router_weight_on_input,
+            )
+            # W4A8 already returns combined output
+            return CutlassRunnerOutput(hidden_states=down_output)
         # Optional no-combine path: return (M, topk, K) without reduction
         if self.config.no_combine:
             reordered = shuffle_rows(

@@ -13,6 +13,7 @@ class CutlassMoEType(Enum):
 
     BlockscaledFP8 = auto()
     BlockscaledFP4 = auto()
+    W4A8 = auto()
 
 
 @dataclass
