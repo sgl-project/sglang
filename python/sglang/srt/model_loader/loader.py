@@ -315,6 +315,9 @@ class DefaultModelLoader(BaseModelLoader):
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             )
 
+    counter_before_loading_weights: float = 0.0
+    counter_after_loading_weights: float = 0.0
+
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
@@ -484,6 +487,9 @@ class DefaultModelLoader(BaseModelLoader):
             else:
                 weights_iterator = pt_weights_iterator(hf_weights_files)
 
+        if self.counter_before_loading_weights == 0.0:
+            logger.info("Beginning to load weights")
+            self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
@@ -599,6 +605,12 @@ class DefaultModelLoader(BaseModelLoader):
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )
+
+        self.counter_after_loading_weights = time.perf_counter()
+        logger.info(
+            "Loading weights took %.2f seconds",
+            self.counter_after_loading_weights -
+            self.counter_before_loading_weights)
 
         return model.eval()
 
