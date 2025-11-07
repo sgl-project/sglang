@@ -84,7 +84,7 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
             "input": [
                 {
                     "role": "user",
-                    "content": "Solve: 8x + 7 = -23. What is x?",
+                    "content": "What is 2+2? Answer in JSON",
                 },
             ],
             "text": {
