@@ -9,18 +9,17 @@ import random
 import urllib
 from http import HTTPStatus
 from itertools import chain
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import aiohttp
 import orjson
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from sglang_router.router_args import RouterArgs
 
 try:
     from sglang.srt.tracing.trace import (
-        extract_trace_headers,
         process_tracing_init,
         trace_get_remote_propagate_context,
         trace_req_finish,
@@ -377,7 +376,7 @@ async def get_model_info():
 
 
 @app.post("/generate")
-async def handle_generate_request(request_data: dict, raw_request: Request):
+async def handle_generate_request(request_data: dict):
     prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
@@ -386,15 +385,13 @@ async def handle_generate_request(request_data: dict, raw_request: Request):
     modified_request = request_data.copy()
 
     batch_size = _get_request_batch_size(modified_request)
-    external_trace_header = _get_trace_context(raw_request)
     if batch_size is not None:
         modified_request.update(
             {
                 "bootstrap_host": [hostname] * batch_size,
                 "bootstrap_port": [bootstrap_port] * batch_size,
                 "bootstrap_room": [
-                    _generate_bootstrap_room(external_trace_header)
-                    for _ in range(batch_size)
+                    _generate_bootstrap_room() for _ in range(batch_size)
                 ],
             }
         )
@@ -403,7 +400,7 @@ async def handle_generate_request(request_data: dict, raw_request: Request):
             {
                 "bootstrap_host": hostname,
                 "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(external_trace_header),
+                "bootstrap_room": _generate_bootstrap_room(),
             }
         )
 
@@ -417,11 +414,7 @@ async def handle_generate_request(request_data: dict, raw_request: Request):
         )
 
 
-async def _forward_to_backend(
-    request_data: dict,
-    endpoint_name: str,
-    external_trace_header: Optional[Dict[str, Any]],
-):
+async def _forward_to_backend(request_data: dict, endpoint_name: str):
     prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
@@ -432,7 +425,7 @@ async def _forward_to_backend(
         {
             "bootstrap_host": hostname,
             "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(external_trace_header),
+            "bootstrap_room": _generate_bootstrap_room(),
         }
     )
 
@@ -453,28 +446,19 @@ async def _forward_to_backend(
 
 
 @app.post("/v1/chat/completions")
-async def handle_chat_completion_request(request_data: dict, raw_request: Request):
-    return await _forward_to_backend(
-        request_data, "v1/chat/completions", _get_trace_context(raw_request)
-    )
+async def handle_chat_completion_request(request_data: dict):
+    return await _forward_to_backend(request_data, "v1/chat/completions")
 
 
 @app.post("/v1/completions")
-async def handle_completion_request(request_data: dict, raw_request: Request):
-    return await _forward_to_backend(
-        request_data, "v1/completions", _get_trace_context(raw_request)
-    )
+async def handle_completion_request(request_data: dict):
+    return await _forward_to_backend(request_data, "v1/completions")
 
 
-def _generate_bootstrap_room(external_trace_header: Optional[Dict[str, Any]]):
+def _generate_bootstrap_room():
     bootstrap_room = random.randint(0, 2**63 - 1)
     if lb.enable_trace:
-        trace_req_start(
-            bootstrap_room,
-            bootstrap_room,
-            role="router",
-            external_trace_header=external_trace_header,
-        )
+        trace_req_start(bootstrap_room, bootstrap_room, role="router")
         trace_slice_start("mini_lb_launch", bootstrap_room)
     return bootstrap_room
 
@@ -486,13 +470,6 @@ def _get_request_batch_size(request):
     if (input_ids := request.get("input_ids")) is not None:
         return None if isinstance(input_ids[0], int) else len(input_ids)
     return None
-
-
-def _get_trace_context(raw_request: Request):
-    if lb.enable_trace:
-        return extract_trace_headers(raw_request.headers)
-    else:
-        return None
 
 
 @app.get("/v1/models")
