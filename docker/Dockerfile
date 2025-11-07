@@ -313,7 +313,7 @@ RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo
 
 # Install S3 dependencies
-RUN python3 -m pip install --no-cache-dir --break-system-packages \
+RUN python3 -m pip install \
     boto3 \
     runai-model-streamer \
     runai-model-streamer-s3
