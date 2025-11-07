@@ -42,6 +42,10 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.distributed import (
+    get_context_model_parallel_world_size,
+    get_world_group,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     Req,
@@ -104,6 +108,7 @@ class PrefillBootstrapQueue:
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
+        self.world_group = get_world_group()
         self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
         self.transfer_backend = transfer_backend
@@ -242,8 +247,15 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
+        cp_size = get_context_model_parallel_world_size()
+        if cp_size > 1:
+            cpu_group = self.world_group.cpu_group  # world_group -> cp * attn_tp
+        else:
+            cpu_group = self.gloo_group
+
         polls = poll_and_all_reduce(
-            [req.disagg_kv_sender for req in self.queue], self.gloo_group
+            [req.disagg_kv_sender for req in self.queue],
+            cpu_group,
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
@@ -520,7 +532,11 @@ class SchedulerDisaggregationPrefillMixin:
 
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_tp_cpu_group,
+            (
+                get_world_group().cpu_group
+                if self.server_args.cp_size > 1
+                else self.attn_tp_cpu_group
+            ),
         )
 
         undone_reqs: List[Req] = []
