@@ -240,17 +240,18 @@ impl SglangSchedulerClient {
     }
 
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest
-    pub fn build_generate_request(
+    pub fn build_generate_request_from_chat(
         &self,
         request_id: String,
         body: &ChatCompletionRequest,
         processed_text: String,
         token_ids: Vec<u32>,
         multimodal_inputs: Option<proto::MultimodalInputs>,
-        constraint: Option<(String, String)>, // (constraint_type, constraint_value)
+        tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
     ) -> Result<proto::GenerateRequest, String> {
         // Build sampling params
-        let sampling_params = self.build_grpc_sampling_params(body, constraint)?;
+        let sampling_params =
+            self.build_grpc_sampling_params_from_chat(body, tool_call_constraint)?;
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -343,11 +344,11 @@ impl SglangSchedulerClient {
         Ok(grpc_request)
     }
 
-    /// Build gRPC SamplingParams from OpenAI request
-    fn build_grpc_sampling_params(
+    /// Build gRPC SamplingParams from ChatCompletionRequest
+    fn build_grpc_sampling_params_from_chat(
         &self,
         request: &ChatCompletionRequest,
-        constraint: Option<(String, String)>,
+        tool_call_constraint: Option<(String, String)>,
     ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = self.extract_stop_strings(request);
 
@@ -380,7 +381,7 @@ impl SglangSchedulerClient {
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1) as i32,
-            constraint: self.build_constraint_for_chat(request, constraint)?,
+            constraint: self.build_constraint_for_chat(request, tool_call_constraint)?,
             ..Default::default()
         })
     }
@@ -398,7 +399,7 @@ impl SglangSchedulerClient {
     fn build_constraint_for_chat(
         &self,
         request: &ChatCompletionRequest,
-        constraint: Option<(String, String)>,
+        tool_call_constraint: Option<(String, String)>,
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
         let mut constraints = Vec::new();
 
@@ -431,8 +432,8 @@ impl SglangSchedulerClient {
             constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
         }
 
-        // Handle constraint from preparation stage (e.g., tool calls, structured output)
-        if let Some((constraint_type, constraint_value)) = constraint {
+        // Handle tool call constraint from preparation stage
+        if let Some((constraint_type, constraint_value)) = tool_call_constraint {
             if !constraints.is_empty() {
                 return Err("Constrained decoding is not compatible with tool calls.".to_string());
             }
