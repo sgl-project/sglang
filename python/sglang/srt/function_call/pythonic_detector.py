@@ -5,6 +5,7 @@ import re
 from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -91,7 +92,9 @@ class PythonicDetector(BaseFormatDetector):
                     logger.warning(
                         f"Model attempted to call undefined function: {function_name}"
                     )
-                    continue
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        continue  # Skip unknown tools (default legacy behavior)
+
                 arguments = {}
                 for keyword in call.keywords:
                     arguments[keyword.arg] = self._get_parameter_value(keyword.value)

@@ -15,6 +15,7 @@
 
 import contextlib
 import json
+import logging
 import os
 import tempfile
 import warnings
@@ -43,6 +44,7 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    KimiLinearConfig,
     KimiVLConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
@@ -54,6 +56,7 @@ from sglang.srt.configs import (
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
+from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
@@ -67,6 +70,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     Step3VLConfig,
     LongcatFlashConfig,
     Olmo3Config,
+    KimiLinearConfig,
     Qwen3NextConfig,
     FalconH1Config,
     DotsVLMConfig,
@@ -172,6 +176,16 @@ def _load_deepseek_v32_model(
     )
 
 
+def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
+    # TODO: Remove this workaround related when AutoConfig correctly identifies deepseek-ocr.
+    # Hugging Face's AutoConfig currently misidentifies it as deepseekvl2.
+    return (
+        getattr(config, "auto_map", None) is not None
+        and config.auto_map.get("AutoModel")
+        == "modeling_deepseekocr.DeepseekOCRForCausalLM"
+    )
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -235,11 +249,7 @@ def get_config(
     if config.model_type in _CONFIG_REGISTRY:
         model_type = config.model_type
         if model_type == "deepseek_vl_v2":
-            if (
-                getattr(config, "auto_map", None) is not None
-                and config.auto_map.get("AutoModel")
-                == "modeling_deepseekocr.DeepseekOCRForCausalLM"
-            ):
+            if _is_deepseek_ocr_model(config):
                 model_type = "deepseek-ocr"
         config_class = _CONFIG_REGISTRY[model_type]
         config = config_class.from_pretrained(model, revision=revision)
@@ -339,6 +349,12 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
+# Filter warnings like: https://github.com/sgl-project/sglang/issues/8082
+class TokenizerWarningsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Calling super().encode with" not in record.getMessage()
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -383,6 +399,10 @@ def get_tokenizer(
             tokenizer_revision=tokenizer_revision,
             clean_up_tokenization_spaces=False,
             **kwargs,
+        )
+        # Filter tokenizer warnings
+        logging.getLogger(tokenizer.__class__.__module__).addFilter(
+            TokenizerWarningsFilter()
         )
     except TypeError as e:
         # The LLaMA tokenizer causes a protobuf error in some environments.
@@ -445,6 +465,10 @@ def get_processor(
         **kwargs,
     )
 
+    if _is_deepseek_ocr_model(config):
+        # Temporary hack for load deepseek-ocr
+        config.model_type = "deepseek-ocr"
+
     # fix: for Qwen2-VL and Sarashina2Vision models, inject default 'size' if not provided.
     if config.model_type in {"qwen2_vl", "sarashina2_vision"}:
         if "size" not in kwargs:
@@ -462,13 +486,22 @@ def get_processor(
                 **kwargs,
             )
         else:
-            processor = AutoProcessor.from_pretrained(
-                tokenizer_name,
-                *args,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
+            if config.model_type in _CUSTOMIZED_MM_PROCESSOR:
+                processor = _CUSTOMIZED_MM_PROCESSOR[config.model_type].from_pretrained(
+                    tokenizer_name,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            else:
+                processor = AutoProcessor.from_pretrained(
+                    tokenizer_name,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
 
     except ValueError as e:
         error_message = str(e)
