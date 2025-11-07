@@ -163,7 +163,6 @@ def main(args):
     else:
         import asyncio
 
-        loop = asyncio.get_event_loop()
         batches = [
             [] for _ in range((len(arguments) + args.parallel - 1) // args.parallel)
         ]
@@ -171,7 +170,7 @@ def main(args):
             batches[i // args.parallel].append(arg)
         for bt in tqdm(batches):
             tasks = [run_single_agent_async(arg) for arg in bt]
-            loop.run_until_complete(asyncio.gather(*tasks))
+            asyncio.run(asyncio.gather(*tasks))
 
     latency = time.perf_counter() - tic
 
