@@ -328,6 +328,87 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             max_req_input_len=self.model_info["max_req_input_len"],
         )
 
+    async def GetTokenizerInfo(
+        self,
+        request: sglang_scheduler_pb2.GetTokenizerInfoRequest,
+        _context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.GetTokenizerInfoResponse:
+        """Get tokenizer files and configuration content."""
+        logger.debug("Receive tokenizer info request")
+
+        try:
+            # Determine base path
+            base_path = self.server_args.tokenizer_path or self.server_args.model_path
+            if not base_path:
+                return sglang_scheduler_pb2.GetTokenizerInfoResponse(
+                    success=False,
+                    error_message="No tokenizer_path or model_path configured",
+                )
+
+            # Determine which files to read
+            requested_files = list(request.requested_files) if request.requested_files else []
+            if not requested_files:
+                # Default: read common tokenizer files
+                requested_files = [
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "chat_template.jinja",
+                    "chat_template.json",
+                ]
+
+            files = {}
+            base_dir = base_path
+
+            # Check if base_path is a file or directory
+            if os.path.isfile(base_path):
+                base_dir = os.path.dirname(base_path)
+                # If it's tokenizer.json, include it
+                if os.path.basename(base_path) == "tokenizer.json":
+                    if "tokenizer.json" not in requested_files:
+                        requested_files.append("tokenizer.json")
+
+            # Read requested files
+            for filename in requested_files:
+                file_path = os.path.join(base_dir, filename)
+                if os.path.exists(file_path) and os.path.isfile(file_path):
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            files[filename] = f.read()
+                        logger.debug(f"Read tokenizer file: {filename}")
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to read tokenizer file {filename}: {e}",
+                            exc_info=True,
+                        )
+                        # Continue with other files
+
+            if not files:
+                return sglang_scheduler_pb2.GetTokenizerInfoResponse(
+                    success=False,
+                    error_message=f"No tokenizer files found in {base_dir}",
+                    base_path=base_dir,
+                    tokenizer_path=self.server_args.tokenizer_path or "",
+                    model_path=self.server_args.model_path or "",
+                )
+
+            return sglang_scheduler_pb2.GetTokenizerInfoResponse(
+                files=files,
+                base_path=base_dir,
+                tokenizer_path=self.server_args.tokenizer_path or "",
+                model_path=self.server_args.model_path or "",
+                success=True,
+            )
+
+        except Exception as e:
+            logger.error(f"Error in GetTokenizerInfo: {e}", exc_info=True)
+            return sglang_scheduler_pb2.GetTokenizerInfoResponse(
+                success=False,
+                error_message=str(e),
+                base_path="",
+                tokenizer_path=self.server_args.tokenizer_path or "",
+                model_path=self.server_args.model_path or "",
+            )
+
     async def GetServerInfo(
         self,
         _request: sglang_scheduler_pb2.GetServerInfoRequest,

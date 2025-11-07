@@ -69,6 +69,11 @@ class SglangSchedulerStub(object):
                 request_serializer=sglang__scheduler__pb2.GetServerInfoRequest.SerializeToString,
                 response_deserializer=sglang__scheduler__pb2.GetServerInfoResponse.FromString,
                 _registered_method=True)
+        self.GetTokenizerInfo = channel.unary_unary(
+                '/sglang.grpc.scheduler.SglangScheduler/GetTokenizerInfo',
+                request_serializer=sglang__scheduler__pb2.GetTokenizerInfoRequest.SerializeToString,
+                response_deserializer=sglang__scheduler__pb2.GetTokenizerInfoResponse.FromString,
+                _registered_method=True)
 
 
 class SglangSchedulerServicer(object):
@@ -118,6 +123,15 @@ class SglangSchedulerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetTokenizerInfo(self, request, context):
+        """Get tokenizer files and configuration
+        This allows router to fetch tokenizer content directly via gRPC
+        without requiring shared filesystem
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_SglangSchedulerServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -150,6 +164,11 @@ def add_SglangSchedulerServicer_to_server(servicer, server):
                     servicer.GetServerInfo,
                     request_deserializer=sglang__scheduler__pb2.GetServerInfoRequest.FromString,
                     response_serializer=sglang__scheduler__pb2.GetServerInfoResponse.SerializeToString,
+            ),
+            'GetTokenizerInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTokenizerInfo,
+                    request_deserializer=sglang__scheduler__pb2.GetTokenizerInfoRequest.FromString,
+                    response_serializer=sglang__scheduler__pb2.GetTokenizerInfoResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -316,6 +335,33 @@ class SglangScheduler(object):
             '/sglang.grpc.scheduler.SglangScheduler/GetServerInfo',
             sglang__scheduler__pb2.GetServerInfoRequest.SerializeToString,
             sglang__scheduler__pb2.GetServerInfoResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetTokenizerInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/sglang.grpc.scheduler.SglangScheduler/GetTokenizerInfo',
+            sglang__scheduler__pb2.GetTokenizerInfoRequest.SerializeToString,
+            sglang__scheduler__pb2.GetTokenizerInfoResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -146,7 +146,12 @@ impl SglangSchedulerClient {
             .connect()
             .await?;
 
-        let client = proto::sglang_scheduler_client::SglangSchedulerClient::new(channel);
+        // Set maximum message size to 256MB to handle large tokenizer files
+        // Default is 4MB which is too small for tokenizer.json files
+        let max_msg_size = 256 * 1024 * 1024; // 256MB
+        let client = proto::sglang_scheduler_client::SglangSchedulerClient::new(channel)
+            .max_decoding_message_size(max_msg_size)
+            .max_encoding_message_size(max_msg_size);
 
         Ok(Self { client })
     }
@@ -224,6 +229,25 @@ impl SglangSchedulerClient {
         let response = client.get_model_info(request).await?;
         debug!("Model info response received");
         Ok(response.into_inner())
+    }
+
+    /// Get tokenizer information and file contents
+    pub async fn get_tokenizer_info(
+        &self,
+        requested_files: Vec<String>,
+    ) -> Result<proto::GetTokenizerInfoResponse, Box<dyn std::error::Error + Send + Sync>> {
+        debug!("Requesting tokenizer info, requested_files: {:?}", requested_files);
+        let request = Request::new(proto::GetTokenizerInfoRequest { requested_files });
+
+        let mut client = self.client.clone();
+        let response = client.get_tokenizer_info(request).await?;
+        let inner = response.into_inner();
+        debug!(
+            "Tokenizer info response received: success={}, file_count={}",
+            inner.success,
+            inner.files.len()
+        );
+        Ok(inner)
     }
 
     /// Get server information
