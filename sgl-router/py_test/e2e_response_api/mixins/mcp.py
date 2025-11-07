@@ -26,16 +26,18 @@ class MCPTests(ResponseAPIBaseTest):
         tools = [
             {
                 "type": "mcp",
-                "server_label": "deepwiki",
-                "server_url": "https://mcp.deepwiki.com/mcp",
+                "server_label": "brave",
+                "server_description": "A Tool to do web search",
+                "server_url": "http://localhost:8001/sse",
                 "require_approval": "never",
             }
         ]
 
         resp = self.create_response(
-            "What transport protocols does the 2025-03-26 version of the MCP spec (modelcontextprotocol/modelcontextprotocol) support?",
+            "could you recommend me just one restaurants opened recently in Seattle",
             tools=tools,
             stream=False,
+            reasoning={"effort": "low"},
         )
 
         # Should successfully make the request
@@ -75,7 +77,7 @@ class MCPTests(ResponseAPIBaseTest):
             self.assertIn("status", mcp_call)
             self.assertEqual(mcp_call["status"], "completed")
             self.assertIn("server_label", mcp_call)
-            self.assertEqual(mcp_call["server_label"], "deepwiki")
+            self.assertEqual(mcp_call["server_label"], "brave")
             self.assertIn("name", mcp_call)
             self.assertIn("arguments", mcp_call)
             self.assertIn("output", mcp_call)
@@ -108,16 +110,18 @@ class MCPTests(ResponseAPIBaseTest):
         tools = [
             {
                 "type": "mcp",
-                "server_label": "deepwiki",
-                "server_url": "https://mcp.deepwiki.com/mcp",
+                "server_label": "brave",
+                "server_description": "A Tool to do web search",
+                "server_url": "http://localhost:8001/sse",
                 "require_approval": "never",
             }
         ]
 
         resp = self.create_response(
-            "What transport protocols does the 2025-03-26 version of the MCP spec (modelcontextprotocol/modelcontextprotocol) support?",
+            "could you recommend me just one restaurants opened recently in Seattle",
             tools=tools,
             stream=True,
+            reasoning={"effort": "low"},
         )
 
         # Should successfully make the request
@@ -197,7 +201,7 @@ class MCPTests(ResponseAPIBaseTest):
 
         for mcp_call in mcp_calls:
             self.assertEqual(mcp_call.get("status"), "completed")
-            self.assertEqual(mcp_call.get("server_label"), "deepwiki")
+            self.assertEqual(mcp_call.get("server_label"), "brave")
             self.assertIn("name", mcp_call)
             self.assertIn("arguments", mcp_call)
             self.assertIn("output", mcp_call)
@@ -250,8 +254,9 @@ class MCPTests(ResponseAPIBaseTest):
         tools = [
             {
                 "type": "mcp",
-                "server_url": "https://mcp.deepwiki.com/mcp",
-                "server_label": "deepwiki",
+                "server_label": "brave",
+                "server_description": "A Tool to do web search",
+                "server_url": "http://localhost:8001/sse",
                 "require_approval": "never",
             },
             {
@@ -314,8 +319,9 @@ class MCPTests(ResponseAPIBaseTest):
         tools = [
             {
                 "type": "mcp",
-                "server_url": "https://mcp.deepwiki.com/mcp",
-                "server_label": "deepwiki",
+                "server_label": "brave",
+                "server_description": "A Tool to do web search",
+                "server_url": "http://localhost:8001/sse",
                 "require_approval": "never",
             },
             {
