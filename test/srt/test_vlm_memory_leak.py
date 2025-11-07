@@ -1,5 +1,5 @@
 """
-Stress test for VLM server to investigate potential memory leaks.
+Memory Leak test for VLM server.
 
 """
 
@@ -24,7 +24,7 @@ from test_vision_openai_server_common import (
 def get_gpu_memory_gb():
     """
     Runs nvidia-smi and parses the output to get the current GPU memory usage.
-    This is the only reliable way to measure the *server's* memory from this script.
+    This is the reliable way to measure the *server's* memory from this script.
     """
     try:
         # Query for GPU memory used, in MiB, no header
@@ -44,7 +44,7 @@ def get_gpu_memory_gb():
 
 
 # --- Base class for our stress tests ---
-class VLMStressTestMixin(unittest.TestCase):
+class VLMMemoryLeakTestMixin(unittest.TestCase):
 
     # --- Default test parameters ---
     MODEL_NAME = None
@@ -151,14 +151,14 @@ class VLMStressTestMixin(unittest.TestCase):
 
 
 # --- Test Case 1: Lightweight Model (0.5B) ---
-class TestVLMMemoryStress_0_5B(VLMStressTestMixin):
+class TestVLMMemoryLeak_0_5B(VLMMemoryLeakTestMixin):
     MODEL_NAME = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
     # All other attributes (ITERATIONS, MAX_INCREASE_GB, LOG_INTERVAL)
     # are inherited from the base class.
 
 
 # --- Test Case 2: Larger Model (7B) ---
-class TestVLMMemoryStress_7B(VLMStressTestMixin):
+class TestVLMMemoryLeak_7B(VLMMemoryLeakTestMixin):
     MODEL_NAME = "Qwen/Qwen2-VL-7B-Instruct"
     # ITERATIONS is inherited (200)
     MAX_INCREASE_GB = 1.0  # Override the default 0.5
