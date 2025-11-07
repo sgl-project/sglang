@@ -2,10 +2,12 @@ use std::{ops::Deref, sync::Arc};
 
 use anyhow::Result;
 
+pub mod bundle;
 pub mod cache;
 pub mod factory;
 pub mod hub;
 pub mod mock;
+pub mod registry;
 pub mod sequence;
 pub mod stop;
 pub mod stream;
@@ -23,6 +25,7 @@ pub mod tiktoken;
 mod tests;
 
 // Re-exports
+pub use bundle::BundleExtractor;
 pub use cache::{CacheConfig, CacheStats, CachedTokenizer, TokenizerFingerprint};
 pub use factory::{
     create_tokenizer, create_tokenizer_async, create_tokenizer_async_with_chat_template,
@@ -30,6 +33,7 @@ pub use factory::{
     create_tokenizer_with_chat_template_blocking, TokenizerType,
 };
 pub use huggingface::HuggingFaceTokenizer;
+pub use registry::{RegistryStats, TokenizerKey, TokenizerRegistry};
 pub use sequence::Sequence;
 pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 pub use stream::DecodeStream;
