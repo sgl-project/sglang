@@ -75,6 +75,7 @@ class TestOpenaiBackend(
     def test_mixed_mcp_and_function_tools_streaming(self):
         super().test_mixed_mcp_and_function_tools_streaming()
 
+
 class TestXaiBackend(StateManagementTests):
     """End to end tests for XAI backend."""
 

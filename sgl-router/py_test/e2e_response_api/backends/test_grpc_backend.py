@@ -137,7 +137,6 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
         self.assertTrue(output_json["answer"], "Answer is empty")
 
 
-
 class TestGrpcHarmonyBackend(
     StateManagementTests, MCPTests, FunctionCallingBaseTest, StructuredOutputBaseTest
 ):
