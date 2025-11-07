@@ -325,7 +325,7 @@ async fn execute_with_mcp_loop(
         // Safety check: prevent infinite loops
         if iteration_count > MAX_TOOL_ITERATIONS {
             error!(
-                function = "handle_response_request",
+                function = "execute_with_mcp_loop",
                 iteration_count = iteration_count,
                 max_iterations = MAX_TOOL_ITERATIONS,
                 "Maximum tool iterations exceeded"
