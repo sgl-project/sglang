@@ -268,7 +268,7 @@ class LayerCommunicator:
                     residual = hidden_states
 
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in qaunt_format):
-                        hidden_states, _, _ = fused_rms_mxfp4_quant(
+                        hidden_states, *_, _ = fused_rms_mxfp4_quant(
                             hidden_states,
                             self.input_layernorm.weight,
                             self.input_layernorm.variance_epsilon,
@@ -281,7 +281,7 @@ class LayerCommunicator:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in qaunt_format):
-                        hidden_states, _, residual = fused_rms_mxfp4_quant(
+                        hidden_states, *_, residual = fused_rms_mxfp4_quant(
                             hidden_states,
                             self.input_layernorm.weight,
                             self.input_layernorm.variance_epsilon,
