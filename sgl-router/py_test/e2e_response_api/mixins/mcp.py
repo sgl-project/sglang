@@ -34,7 +34,7 @@ class MCPTests(ResponseAPIBaseTest):
         ]
 
         resp = self.create_response(
-            "could you recommend me just one restaurants opened recently in Seattle",
+            "show me short news about ai in Nov 1, 2025",
             tools=tools,
             stream=False,
             reasoning={"effort": "low"},
@@ -118,7 +118,7 @@ class MCPTests(ResponseAPIBaseTest):
         ]
 
         resp = self.create_response(
-            "could you recommend me just one restaurants opened recently in Seattle",
+            "show me short news about ai in Nov 1, 2025",
             tools=tools,
             stream=True,
             reasoning={"effort": "low"},
