@@ -65,7 +65,7 @@ impl HarmonyResponseProcessor {
             // Parse Harmony channels with HarmonyParserAdapter
             let mut parser = HarmonyParserAdapter::new().map_err(|e| {
                 error!(
-                    function = "process_streaming_response",
+                    function = "process_non_streaming_chat_response",
                     error = %e,
                     "Failed to create Harmony parser"
                 );
