@@ -1148,12 +1148,8 @@ impl ChatResponseAccumulator {
         tool_calls_vec.sort_by_key(|(index, _)| *index);
         let tool_calls: Vec<_> = tool_calls_vec.into_iter().map(|(_, call)| call).collect();
 
-        ChatCompletionResponse {
-            id: self.id,
-            object: "chat.completion".to_string(),
-            created: chrono::Utc::now().timestamp() as u64,
-            model: self.model,
-            choices: vec![ChatChoice {
+        ChatCompletionResponse::builder(&self.id, &self.model)
+            .choices(vec![ChatChoice {
                 index: 0,
                 message: ChatCompletionMessage {
                     role: "assistant".to_string(),
@@ -1173,9 +1169,7 @@ impl ChatResponseAccumulator {
                 logprobs: None,
                 matched_stop: None,
                 hidden_states: None,
-            }],
-            usage: None,
-            system_fingerprint: None,
-        }
+            }])
+            .build()
     }
 }

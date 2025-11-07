@@ -1040,7 +1040,6 @@ async fn execute_without_mcp_streaming(
 /// Build ResponsesResponse with tool calls (MCP and/or function tools)
 ///
 /// ResponsesResponse with tool calls
-/// TODO: Refactor to use builder pattern
 #[allow(clippy::too_many_arguments)]
 fn build_tool_response(
     mcp_tool_calls: Vec<ToolCall>,
@@ -1119,42 +1118,19 @@ fn build_tool_response(
         .unwrap()
         .as_secs() as i64;
 
-    ResponsesResponse {
-        id: request_id,
-        object: "response".to_string(),
-        created_at,
-        status: ResponseStatus::Completed,
-        error: None,
-        incomplete_details: None,
-        instructions: responses_request.instructions.clone(),
-        max_output_tokens: responses_request.max_output_tokens,
-        model: responses_request.model.clone(),
-        output,
-        parallel_tool_calls: responses_request.parallel_tool_calls.unwrap_or(true),
-        previous_response_id: responses_request.previous_response_id.clone(),
-        reasoning: None,
-        store: responses_request.store.unwrap_or(true),
-        temperature: responses_request.temperature,
-        text: None,
-        tool_choice: responses_request
-            .tool_choice
-            .as_ref()
-            .map(|tc| to_string(tc).unwrap_or_else(|_| "auto".to_string()))
-            .unwrap_or_else(|| "auto".to_string()),
-        tools: responses_request.tools.clone().unwrap_or_default(),
-        top_p: responses_request.top_p,
-        truncation: None,
-        usage: Some(ResponsesUsage::Modern(ResponseUsage {
+    ResponsesResponse::builder(&request_id, &responses_request.model)
+        .copy_from_request(&responses_request)
+        .created_at(created_at)
+        .status(ResponseStatus::Completed)
+        .output(output)
+        .usage(ResponsesUsage::Modern(ResponseUsage {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
             input_tokens_details: None,
             output_tokens_details: None,
-        })),
-        user: None,
-        safety_identifier: responses_request.user.clone(),
-        metadata: responses_request.metadata.clone().unwrap_or_default(),
-    }
+        }))
+        .build()
 }
 
 /// Execute MCP tools and collect results
