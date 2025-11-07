@@ -1,5 +1,5 @@
 <div align="center">
-<img src=https://github.com/lm-sys/lm-sys.github.io/releases/download/test/sgl-diffusion-logo.png width="30%"/>
+<img src=https://github.com/lm-sys/lm-sys.github.io/releases/download/test/sgl-diffusion-logo.png width="80%"/>
 </div>
 
 **sgl-diffusion is an inference framework for accelerated image/video generation.**
@@ -16,7 +16,7 @@ sgl-diffusion has the following features:
 ## Getting Started
 
 ```bash
-uv pip install sglang[.diffusion] --prerelease=allow
+uv pip install sglang[diffusion] --prerelease=allow
 ```
 
 For more installation methods (e.g. pypi, uv, docker), check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
