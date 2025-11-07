@@ -4,13 +4,14 @@
 
 **sgl-diffusion is an inference framework for accelerated image/video generation.**
 
-sgl-diffusion features an end-to-end unified pipeline for accelerating diffusion models. It is designed to be modular and extensible, allowing users to easily add new optimizations and techniques.
+sglang-diffusion features an end-to-end unified pipeline for accelerating diffusion models. It is designed to be modular and extensible, allowing users to easily add new optimizations and techniques.
 
 ## Key Features
 
 sgl-diffusion has the following features:
   - broad model support: Wan, FastWan, Hunyuan, Qwen-Image, Qwen-Image-Edit
-  - ease of use: OpenAI compatible api + cli + python sdk support
+  - fast inference speed: enpowered by sgl-kernel
+  - ease of use: OpenAI compatible api, cli, python sdk support
   - diverse hardware support: H100, H200, A100, B200, 4090
 
 ## Getting Started
