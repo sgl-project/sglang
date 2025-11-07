@@ -12,7 +12,7 @@ use crate::{
         chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, UserMessageContent},
         common::{
             FunctionCallResponse, JsonSchemaFormat, ResponseFormat, StreamOptions, ToolCall,
-            ToolChoice, UsageInfo,
+            UsageInfo,
         },
         responses::{
             ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
@@ -352,32 +352,15 @@ pub fn chat_to_responses(
     });
 
     // Generate response
-    Ok(ResponsesResponse {
-        id: response_id_override.unwrap_or_else(|| chat_resp.id.clone()),
-        object: "response".to_string(),
-        created_at: chat_resp.created as i64,
-        status,
-        error: None,
-        incomplete_details: None,
-        instructions: original_req.instructions.clone(),
-        max_output_tokens: original_req.max_output_tokens,
-        model: chat_resp.model.clone(),
-        output,
-        parallel_tool_calls: original_req.parallel_tool_calls.unwrap_or(true),
-        previous_response_id: original_req.previous_response_id.clone(),
-        reasoning: None, // TODO: Map reasoning effort if needed
-        store: original_req.store.unwrap_or(true),
-        temperature: original_req.temperature,
-        text: original_req.text.clone(),
-        tool_choice: ToolChoice::serialize_to_string(&original_req.tool_choice),
-        tools: original_req.tools.clone().unwrap_or_default(),
-        top_p: original_req.top_p,
-        truncation: None,
-        usage,
-        user: None,
-        safety_identifier: original_req.user.clone(),
-        metadata: original_req.metadata.clone().unwrap_or_default(),
-    })
+    let response_id = response_id_override.unwrap_or_else(|| chat_resp.id.clone());
+    Ok(ResponsesResponse::builder(&response_id, &chat_resp.model)
+        .copy_from_request(original_req)
+        .created_at(chat_resp.created as i64)
+        .status(status)
+        .output(output)
+        .maybe_text(original_req.text.clone())
+        .maybe_usage(usage)
+        .build())
 }
 
 #[cfg(test)]
