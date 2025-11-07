@@ -687,7 +687,7 @@ async fn execute_without_mcp(
     // Convert ChatCompletionResponse → ResponsesResponse
     conversions::chat_to_responses(&chat_response, original_request, response_id).map_err(|e| {
         error!(
-            function = "execute_chat_pipeline",
+            function = "execute_without_mcp",
             error = %e,
             "Failed to convert ChatCompletionResponse to ResponsesResponse"
         );
