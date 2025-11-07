@@ -104,7 +104,7 @@ mooncake_master --eviction_high_watermark_ratio=0.95
 To start `mooncake_master` with embedded `metadata service` (so that a separate `metadata service` deployment can be skipped):
 
 ```bash
-mooncake_master --enable_http_metadata_server=true --eviction_high_watermark_ratio=0.95
+mooncake_master --enable_http_metadata_server=true --http_metadata_server_port=8080 --eviction_high_watermark_ratio=0.95
 ```
 
 **Understanding `eviction_high_watermark_ratio`:**
