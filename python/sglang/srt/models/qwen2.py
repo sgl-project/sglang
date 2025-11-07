@@ -641,15 +641,15 @@ class Qwen2ForCausalLM(nn.Module):
         
         return updated_params
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], 
-                     quantize_fn=None, quant_profile=None):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """
         Load weights into the model, with support for RL training reload scenarios.
         
         Args:
             weights: Iterator of (name, tensor) tuples with weights to load
-            quantize_fn: Optional quantization function (for FlashRL-style quantization)
-            quant_profile: Optional quantization profile (for FlashRL-style quantization)
+            
+        Note: quantize_fn and quant_profile are stored on the model during initialization,
+              so they don't need to be passed as arguments.
         """
         from sglang.srt.model_loader.loader import QuantizedRLModelLoader
 
@@ -657,9 +657,9 @@ class Qwen2ForCausalLM(nn.Module):
         is_reload = QuantizedRLModelLoader.is_reload_scenario(self)
         if is_reload:
             # Use the fast path for RL training reloads
-            logger.info("[QuantizedRL] Using fast path reload in load_weights")
+            # quantize_fn and quant_profile are retrieved from model inside rebinding_and_load_weights
             QuantizedRLModelLoader.rebinding_and_load_weights(
-                self, self._load_weights_impl, weights, quantize_fn, quant_profile
+                self, self._load_weights_impl, weights
             )
         else:
             # Standard weight loading path

@@ -1197,8 +1197,6 @@ class QKVParallelLinear(ColumnParallelLinear):
                 )
 
         if param_data.shape != loaded_weight.shape:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.error(
                 f"[QuantizedRL Debug] Shape mismatch in QKVParallelLinear weight_loader: "
                 f"param_data.shape={param_data.shape}, loaded_weight.shape={loaded_weight.shape}, "
