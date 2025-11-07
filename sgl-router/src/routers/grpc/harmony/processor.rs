@@ -81,7 +81,7 @@ impl HarmonyResponseProcessor {
                 )
                 .map_err(|e| {
                     error!(
-                        function = "process_streaming_response",
+                        function = "process_non_streaming_chat_response",
                         error = %e,
                         "Harmony parsing failed on complete response"
                     );
