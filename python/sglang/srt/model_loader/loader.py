@@ -609,7 +609,7 @@ class DefaultModelLoader(BaseModelLoader):
         self.counter_after_loading_weights = time.perf_counter()
         logger.info(
             "Loading weights took %.2f seconds",
-            self.counter_after_loading_weights -self.counter_before_loading_weights,
+            self.counter_after_loading_weights - self.counter_before_loading_weights,
         )
 
         return model.eval()
