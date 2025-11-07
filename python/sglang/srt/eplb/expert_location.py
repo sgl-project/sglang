@@ -128,6 +128,7 @@ class ExpertLocationMetadata:
             return None
 
         model_config_for_expert_location = common["model_config_for_expert_location"]
+        print(f"common={common}")
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
             server_args=server_args,
             physical_to_logical_map=physical_to_logical_map,
@@ -135,7 +136,9 @@ class ExpertLocationMetadata:
             ep_size=common["ep_size"],
             moe_ep_rank=moe_ep_rank,
         )
-
+        print(
+            f"physical_to_logical_map={physical_to_logical_map}, logical_to_all_physical_map={logical_to_all_physical_map}"
+        )
         return ExpertLocationMetadata._init_raw(
             server_args=server_args,
             ep_size=common["ep_size"],
