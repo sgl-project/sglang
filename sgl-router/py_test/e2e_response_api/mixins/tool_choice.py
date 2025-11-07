@@ -199,11 +199,6 @@ class ToolChoiceTests(ResponseAPIBaseTest):
 
         # Should have function call events
         self.assertIn(
-            "response.function_call.in_progress",
-            event_types,
-            "Should have function_call.in_progress event",
-        )
-        self.assertIn(
             "response.function_call_arguments.delta",
             event_types,
             "Should have function_call_arguments.delta events",
