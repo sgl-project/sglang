@@ -22,8 +22,7 @@ from sglang.srt.utils import set_weight_attrs
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
 
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEType
-from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo, CutlassMoEType
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE

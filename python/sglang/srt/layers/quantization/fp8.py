@@ -40,9 +40,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-
-# from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
@@ -968,7 +966,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-
         from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.utils import (
             get_moe_a2a_backend,
@@ -1002,7 +999,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -1046,7 +1042,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 return StandardCombineInput(hidden_states=ret)
 
         if self.runner.runner_backend.is_deep_gemm():
-
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 

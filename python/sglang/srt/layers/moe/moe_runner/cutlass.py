@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -42,6 +42,17 @@ if is_cuda():
     )
 
 
+class CutlassMoEType(Enum):
+    """
+    Enum for the different types of cutlass moe operations
+    that are currently supported in SGLang.
+    """
+
+    BlockscaledFP8 = auto()
+    BlockscaledFP4 = auto()
+    W4A8 = auto()
+
+
 @dataclass
 class CutlassRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -75,6 +86,13 @@ class CutlassRunnerOutput(RunnerOutput):
 
 @dataclass
 class CutlassMoeQuantInfo(MoeQuantInfo):
+    """
+    Quantization information for CUTLASS MoE operations.
+
+    This class consolidates all quantization parameters, computational metadata,
+    and tensor configurations needed for CUTLASS MoE kernels.
+    """
+
     moe_type: CutlassMoEType
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
@@ -110,7 +128,166 @@ class CutlassMoeQuantInfo(MoeQuantInfo):
     s_strides2: Optional[torch.Tensor] = None
     w13_input_scale: Optional[torch.Tensor] = None
     w2_input_scale: Optional[torch.Tensor] = None
-    params: Optional[CutlassMoEParams] = None
+
+    # Additional fields from CutlassMoEParams for FP4 blockscaled operations
+    # Similar to expert_offsets, but for blockscales for FP4 blockscaled Group GEMM
+    blockscale_offsets: Optional[torch.Tensor] = None
+    # m: Total number of tokens
+    # n: intermediate size per partition
+    # k: hidden size per expert
+    # e: Number of experts
+    # device: Device to run computation on and store tensors
+    num_experts: Optional[int] = None
+    intermediate_size_per_partition: Optional[int] = None
+    hidden_size: Optional[int] = None
+    device: Optional[torch.device] = None
+
+    def __post_init__(self):
+        """
+        Auto-initialize computed tensor fields if base parameters are provided.
+
+        This method is called automatically after dataclass initialization.
+        It computes and initializes stride tensors, expert offsets, problem sizes,
+        and pointer arrays based on the provided num_experts, hidden_size,
+        intermediate_size_per_partition, and device parameters.
+        """
+        # Only auto-initialize if all required base parameters are provided
+        # and the computed tensors haven't been explicitly set
+        if all(
+            [
+                self.num_experts is not None,
+                self.intermediate_size_per_partition is not None,
+                self.hidden_size is not None,
+                self.device is not None,
+            ]
+        ):
+            n = self.intermediate_size_per_partition
+            k = self.hidden_size
+            e = self.num_experts
+
+            # Initialize stride tensors if not already set
+            if self.ab_strides_13 is None:
+                self.ab_strides_13 = torch.full(
+                    (e,), k, dtype=torch.int64, device=self.device
+                )
+            if self.ab_strides_2 is None:
+                self.ab_strides_2 = torch.full(
+                    (e,), n, dtype=torch.int64, device=self.device
+                )
+            if self.c_strides_13 is None:
+                self.c_strides_13 = torch.full(
+                    (e,), 2 * n, dtype=torch.int64, device=self.device
+                )
+            if self.c_strides_2 is None:
+                self.c_strides_2 = torch.full(
+                    (e,), k, dtype=torch.int64, device=self.device
+                )
+
+            # Initialize expert offsets and problem sizes if not already set
+            if (
+                self.expert_offsets.numel() == 0
+                or self.expert_offsets.shape[0] != e + 1
+            ):
+                self.expert_offsets = torch.empty(
+                    (e + 1,), dtype=torch.int32, device=self.device
+                )
+            if self.problem_sizes1.numel() == 0 or self.problem_sizes1.shape[0] != e:
+                self.problem_sizes1 = torch.empty(
+                    (e, 3), dtype=torch.int32, device=self.device
+                )
+            if self.problem_sizes2.numel() == 0 or self.problem_sizes2.shape[0] != e:
+                self.problem_sizes2 = torch.empty(
+                    (e, 3), dtype=torch.int32, device=self.device
+                )
+
+            # Initialize blockscale offsets for FP4 if not already set
+            if (
+                self.moe_type == CutlassMoEType.BlockscaledFP4
+                and self.blockscale_offsets is None
+            ):
+                self.blockscale_offsets = torch.empty(
+                    (e + 1,), dtype=torch.int32, device=self.device
+                )
+
+            # Initialize pointer arrays if not already set
+            if self.a_ptrs is None:
+                self.a_ptrs = torch.empty((e,), dtype=torch.int64, device=self.device)
+            if self.b_ptrs is None:
+                self.b_ptrs = torch.empty((e,), dtype=torch.int64, device=self.device)
+            if self.out_ptrs is None:
+                self.out_ptrs = torch.empty((e,), dtype=torch.int64, device=self.device)
+            if self.a_scales_ptrs is None:
+                self.a_scales_ptrs = torch.empty(
+                    (e,), dtype=torch.int64, device=self.device
+                )
+            if self.b_scales_ptrs is None:
+                self.b_scales_ptrs = torch.empty(
+                    (e,), dtype=torch.int64, device=self.device
+                )
+
+    def to_gemm1_args(self) -> dict:
+        """
+        Returns arguments for the first GEMM operation.
+
+        Strides for activations, weights and output in logical number of elements.
+        The activations & output stride is the number of elements to the next row.
+        The weights stride is the number of elements to the next row per expert.
+        For example, if the weight is [e, n, k], then the b_stride is a tensor of
+        shape [e] with each element being k. Similarly for activations, if the
+        shape is [m, k], then the a_stride has shape [e] with each value k.
+        Similarly for output, if the output is [m, n], then the c_stride is a
+        tensor of shape [e] with each element being k.
+
+        Note: cutlass_fp4_group_mm is designed to accept the strides of
+        activations and weights to be the same, so it is passed in as a single
+        tensor.
+        ab_strides_13: [e] dtype: int64 [Gemm 1: Activation / Weight strides]
+        c_strides_13: [e] dtype: int64 [Gemm 1: Output Strides]
+        problem_sizes1: [e, 3] dtype: int32
+        expert_offsets: [e+1] dtype: int32
+        blockscale_offsets: [e+1] dtype: int32 (optional, for FP4)
+        """
+        return {
+            "ab_strides": self.ab_strides_13,
+            "c_strides": self.c_strides_13,
+            "problem_sizes": self.problem_sizes1,
+            "expert_offsets": (
+                self.expert_offsets[:-1]
+                if self.expert_offsets.numel() > 0
+                else self.expert_offsets
+            ),
+            "blockscale_offsets": (
+                self.blockscale_offsets[:-1]
+                if self.blockscale_offsets is not None
+                else None
+            ),
+        }
+
+    def to_gemm2_args(self) -> dict:
+        """
+        Returns arguments for the second GEMM operation.
+
+        ab_strides_2: [e] dtype: int64 [Gemm 2: Activation / Weight strides]
+        c_strides_2: [e] dtype: int64 [Gemm 2: Output Strides]
+        problem_sizes2: [e, 3] dtype: int32
+        expert_offsets: [e+1] dtype: int32
+        blockscale_offsets: [e+1] dtype: int32 (optional, for FP4)
+        """
+        return {
+            "ab_strides": self.ab_strides_2,
+            "c_strides": self.c_strides_2,
+            "problem_sizes": self.problem_sizes2,
+            "expert_offsets": (
+                self.expert_offsets[:-1]
+                if self.expert_offsets.numel() > 0
+                else self.expert_offsets
+            ),
+            "blockscale_offsets": (
+                self.blockscale_offsets[:-1]
+                if self.blockscale_offsets is not None
+                else None
+            ),
+        }
 
 
 class CutlassRunnerCore(MoeRunnerCore):
@@ -257,7 +434,6 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         elif moe_type == CutlassMoEType.BlockscaledFP4:
             # FP4-specific validation assertions
-            params = quant_info.params
             assert quant_info.w13_weight.dtype == torch.uint8, "weight 1 must be uint8"
             assert quant_info.w2_weight.dtype == torch.uint8, "weight 2 must be uint8"
             assert (
@@ -271,15 +447,15 @@ class CutlassRunnerCore(MoeRunnerCore):
             e_w2, k_w2, half_n_w2 = quant_info.w2_weight.shape
 
             assert (
-                e_w1 == e_w2 and e_w1 == params.num_experts
+                e_w1 == e_w2 and e_w1 == quant_info.num_experts
             ), "Number of experts must match between weights."
             assert (
                 runner_input.hidden_states.shape[1] // 2 == half_k_w1
-                and params.hidden_size == k_w2
+                and quant_info.hidden_size == k_w2
             ), "Hidden size mismatch between a, w1 and w2"
             assert (
-                nx2_w1 == params.intermediate_size_per_partition * 2
-                and half_n_w2 == params.intermediate_size_per_partition // 2
+                nx2_w1 == quant_info.intermediate_size_per_partition * 2
+                and half_n_w2 == quant_info.intermediate_size_per_partition // 2
             ), "mismatch in expected `n`"
             assert 2 * half_k_w1 == k_w2, "Hidden size mismatch w2 and w1"
 
@@ -291,7 +467,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                 quant_info.w1_alpha,
                 out_dtype,
                 device,
-                params.to_gemm1_args(),
+                quant_info.to_gemm1_args(),
             )
 
             intermediate = torch.empty(
@@ -302,8 +478,8 @@ class CutlassRunnerCore(MoeRunnerCore):
             intermediate_fp4, intermediate_blockscale = scaled_fp4_experts_quant(
                 intermediate,
                 quant_info.a2_gscale,
-                params.expert_offsets,
-                params.blockscale_offsets,
+                quant_info.expert_offsets,
+                quant_info.blockscale_offsets,
                 topk,
             )
 
@@ -315,7 +491,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                 quant_info.w2_alpha,
                 out_dtype,
                 device,
-                params.to_gemm2_args(),
+                quant_info.to_gemm2_args(),
             )
         elif moe_type == CutlassMoEType.W4A8:
             from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
@@ -389,11 +565,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         if quant_info.moe_type == CutlassMoEType.BlockscaledFP4:
             num_tokens = runner_input.hidden_states.shape[0]
             topk = runner_input.topk_ids.shape[1]
-            hidden_size = (
-                quant_info.params.hidden_size
-                if quant_info.params
-                else down_output.shape[1]
-            )
+            hidden_size = quant_info.hidden_size
             reordered = shuffle_rows(
                 down_output,
                 runner_input.c_map,
@@ -536,26 +708,24 @@ def pre_permute_standard_to_cutlass(
         rep_aux = rep_a1_scales
 
     elif quant_info.moe_type == CutlassMoEType.BlockscaledFP4:
-        params = quant_info.params
-
         prepare_moe_input(
             topk_ids,
-            params.expert_offsets,
-            params.problem_sizes1,
-            params.problem_sizes2,
+            quant_info.expert_offsets,
+            quant_info.problem_sizes1,
+            quant_info.problem_sizes2,
             a_map,
             c_map,
-            params.num_experts,
-            params.intermediate_size_per_partition,
-            params.hidden_size,
-            params.blockscale_offsets,
+            quant_info.num_experts,
+            quant_info.intermediate_size_per_partition,
+            quant_info.hidden_size,
+            quant_info.blockscale_offsets,
         )
 
         rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
             hidden_states,
             quant_info.a1_gscale,
-            params.expert_offsets,
-            params.blockscale_offsets,
+            quant_info.expert_offsets,
+            quant_info.blockscale_offsets,
             topk_ids.shape[1],
             expert_map=a_map,
         )
