@@ -39,8 +39,7 @@ class ElasticEPStateManager:
         if cls._instance is not None:
             return cls._instance
 
-        if server_args.elastic_ep_backend is not None:
-            cls._instance = cls._build_state(ep_size=None, device=None)
+        cls._instance = cls._build_state(ep_size=None, device=None)
         return cls._instance
 
     @staticmethod

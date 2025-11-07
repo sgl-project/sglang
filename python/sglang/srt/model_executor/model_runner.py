@@ -388,11 +388,7 @@ class ModelRunner:
         )
         self.expert_location_updater = ExpertLocationUpdater()
 
-        (
-            ElasticEPStateManager.init(self.server_args)
-            if self.server_args.elastic_ep_backend
-            else None
-        )
+        ElasticEPStateManager.init(self.server_args)
         # Load the model
         self.sampler = Sampler()
         self.load_model()
@@ -846,7 +842,7 @@ class ModelRunner:
         b = time.time()
         if ElasticEPStateManager.instance() is not None:
             def missing_experts_name_filter(name: str) -> bool:
-                for expert in range(0, 32):
+                for expert in range(self.tp_rank * 4, self.tp_rank * 4 + 4):
                     if f"mlp.experts.{expert}." in name:
                         return True
                 return False
