@@ -465,6 +465,7 @@ jobs:
           capsh --print | grep cap_sys_rawio
           ibstat
           ls /dev/infiniband
+          python3 run_suite.py --suite per-commit-8-gpu-h200-deepep
 
   pr-test-finish:
     needs:

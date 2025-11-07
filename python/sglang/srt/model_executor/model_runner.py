@@ -835,27 +835,29 @@ class ModelRunner:
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
+        a = time.time()
+        self.expert_location_updater.update(
+            self.model.routed_experts_weights_of_layer,
+            new_expert_location_metadata,
+            update_layer_ids=update_layer_ids,
+            nnodes=self.server_args.nnodes,
+            rank=self.tp_rank,
+        )
+        b = time.time()
         if ElasticEPStateManager.instance() is not None:
-            # TODO: refactor the weights update when elastic ep
-            old_expert_location_metadata = get_global_expert_location_metadata()
-            assert old_expert_location_metadata is not None
-            old_expert_location_metadata.update(
-                new_expert_location_metadata,
-                update_layer_ids=update_layer_ids,
-            )
+            def missing_experts_name_filter(name: str) -> bool:
+                for expert in range(0, 32):
+                    if f"mlp.experts.{expert}." in name:
+                        return True
+                return False
+
             self.update_weights_from_disk(
                 self.server_args.model_path,
                 self.server_args.load_format,
-                lambda name: "mlp.experts" in name and "mlp.shared_experts" not in name,
+                missing_experts_name_filter,
             )
-        else:
-            self.expert_location_updater.update(
-                self.model.routed_experts_weights_of_layer,
-                new_expert_location_metadata,
-                update_layer_ids=update_layer_ids,
-                nnodes=self.server_args.nnodes,
-                rank=self.tp_rank,
-            )
+            c = time.time()
+            logger.info(f"b - a = {b - a} s, c - b = {c - b} s")
 
     def update_weights_from_disk(
         self,
