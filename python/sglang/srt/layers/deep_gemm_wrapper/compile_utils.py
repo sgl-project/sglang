@@ -7,6 +7,10 @@ from typing import Dict, List, Tuple
 import torch
 from tqdm import tqdm
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    disable_symmetric_memory_context,
+    restore_symmetric_memory_context,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.server_args import ServerArgs
@@ -120,25 +124,32 @@ def _compile_deep_gemm_one_type_all(
     num_groups: int,
     m_list: List[int],
 ) -> None:
-    if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
-        m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
-        m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
+    # Symmetric memory allocation performs a collective operation across all the GPUs.
+    # Temporary disable symmetric memory during compilation since it only runs on the first rank.
+    saved_context = disable_symmetric_memory_context()
+    try:
+        if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+            m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+            m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
-    executor = _BaseWarmupExecutor.create(
-        kernel_type, max_m=max(m_list), n=n, k=k, num_groups=num_groups
-    )
+        executor = _BaseWarmupExecutor.create(
+            kernel_type, max_m=max(m_list), n=n, k=k, num_groups=num_groups
+        )
 
-    old_compile_mode = deep_gemm.get_compile_mode()
-    deep_gemm.set_compile_mode(1)
-    # TODO can use multi thread
-    for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
-        executor.execute(m=m)
-    deep_gemm.set_compile_mode(old_compile_mode)
+        old_compile_mode = deep_gemm.get_compile_mode()
+        deep_gemm.set_compile_mode(1)
+        # TODO can use multi thread
+        for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
+            executor.execute(m=m)
+        deep_gemm.set_compile_mode(old_compile_mode)
 
-    # clean up input buffers
-    torch.cuda.current_stream().synchronize()
-    del executor
-    torch.cuda.empty_cache()
+        # clean up input buffers
+        torch.cuda.current_stream().synchronize()
+        del executor
+        torch.cuda.empty_cache()
+    finally:
+        # Restore symmetric memory context
+        restore_symmetric_memory_context(saved_context)
 
 
 class _BaseWarmupExecutor:
