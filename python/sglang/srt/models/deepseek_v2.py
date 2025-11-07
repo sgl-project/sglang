@@ -308,14 +308,6 @@ def _get_sum_extend_prefix_lens(forward_batch):
     )
 
 
-def _is_extend_without_speculative(forward_batch):
-    return (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_target_verify()
-        and not forward_batch.forward_mode.is_draft_extend()
-    )
-
-
 def _support_mha_one_shot(attn: DeepseekV2AttentionMLA, forward_batch, backend_name):
     attn_supported = backend_name in ["fa3", "flashinfer", "flashmla"]
     sum_seq_lens = (
@@ -334,7 +326,7 @@ def _handle_attention_backend(
 
     if (
         not disable_ragged
-        and _is_extend_without_speculative(forward_batch)
+        and forward_batch.forward_mode.is_extend_without_speculative()
         and (
             (
                 sum_extend_prefix_lens >= attn.chunked_prefix_cache_threshold
@@ -377,7 +369,7 @@ def handle_attention_fa4(attn, forward_batch):
 
 def handle_attention_trtllm_mla(attn, forward_batch):
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    if _is_extend_without_speculative(forward_batch) and (
+    if forward_batch.forward_mode.is_extend_without_speculative() and (
         not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
     ):
         return AttnForwardMethod.MHA_CHUNKED_KV
@@ -386,7 +378,7 @@ def handle_attention_trtllm_mla(attn, forward_batch):
 
 
 def handle_attention_aiter(attn, forward_batch):
-    if _is_extend_without_speculative(forward_batch):
+    if forward_batch.forward_mode.is_extend_without_speculative():
         if is_dp_attention_enabled():
             if sum(forward_batch.extend_prefix_lens_cpu) == 0:
                 return AttnForwardMethod.MHA
@@ -411,15 +403,18 @@ def handle_attention_nsa(attn, forward_batch):
     if forward_batch.forward_mode.is_decode_or_idle():
         return AttnForwardMethod.MLA
 
-    if _is_extend_without_speculative(forward_batch):
+    if forward_batch.forward_mode.is_extend_without_speculative():
         assert forward_batch.seq_lens_cpu is not None
         max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
-        # B200 (SM100) is temporarily disabled for MHA due to FA4 accuracy issues
-        # Currently only H200 (SM90) with FA3 is allowed to use MHA path
-        is_hopper = _device_sm == 90
+        # MHA path enabled for both H200 (SM90, FA3) and B200 (SM100, TRTLLm ragged)
+        # B200 uses trtllm_ragged_attention_deepseek kernel instead of FA4
+        supports_mha = _device_sm in [90, 100]
 
-        if max_kv_len <= attn.indexer.index_topk and is_hopper:
+        # Check if kvcache dtype is bfloat16
+        kv_dtype_is_bf16 = forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+
+        if max_kv_len <= attn.indexer.index_topk and supports_mha and kv_dtype_is_bf16:
             # NSA backend uses varlen kernel which supports MHA_ONE_SHOT
             # Check if total sequence length fits in chunk capacity
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
@@ -436,7 +431,7 @@ def handle_attention_triton(attn, forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
     if (
-        _is_extend_without_speculative(forward_batch)
+        forward_batch.forward_mode.is_extend_without_speculative()
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
     ):
         return AttnForwardMethod.MHA
@@ -1514,7 +1509,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
 
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
-            if self.use_nsa and _is_extend_without_speculative(forward_batch):
+            if self.use_nsa:
                 _ = self.indexer(
                     x=hidden_states,
                     q_lora=q_lora,
