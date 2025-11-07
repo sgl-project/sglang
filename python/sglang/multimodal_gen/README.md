@@ -10,13 +10,13 @@ sgl-diffusion features an end-to-end unified pipeline for accelerating diffusion
 
 sgl-diffusion has the following features:
   - broad model support: Wan, FastWan, Hunyuan, Qwen-Image, Qwen-Image-Edit
-  - ease of use: OAI compatible api + cli + python sdk support
+  - ease of use: OpenAI compatible api + cli + python sdk support
   - Diverse hardware support: H100, H200, A100, B200, 4090
 
 ## Getting Started
 
 ```bash
-uv pip install sglang[diffusion] --prerelease=allow
+uv pip install 'sglang[diffusion]' --prerelease=allow
 ```
 
 For more installation methods (e.g. pypi, uv, docker), check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
