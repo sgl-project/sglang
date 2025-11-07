@@ -37,6 +37,12 @@ tracing_enabled = False
 
 try:
     from opentelemetry import context, propagate, trace
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+        OTLPSpanExporter as GRPCSpanExporter,
+    )
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        OTLPSpanExporter as HTTPSpanExporter,
+    )
     from opentelemetry.sdk.environment_variables import (
         OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
     )
@@ -238,17 +244,9 @@ def get_otlp_span_exporter(endpoint):
         )
 
     if protocol == "grpc":
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
-            OTLPSpanExporter,
-        )
-
-        return OTLPSpanExporter(endpoint=endpoint, insecure=True)
+        return GRPCSpanExporter(endpoint=endpoint, insecure=True)
     elif protocol == "http/protobuf":
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
-            OTLPSpanExporter,
-        )
-
-        return OTLPSpanExporter(endpoint=endpoint)
+        return HTTPSpanExporter(endpoint=endpoint)
 
 
 # Should be called by each tracked thread.
