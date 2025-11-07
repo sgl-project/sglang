@@ -11,6 +11,8 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.3.16.post5
+ARG SGL_VERSION=0.5.5
+ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG NVSHMEM_VERSION=3.4.5
 ARG PIP_DEFAULT_INDEX
@@ -94,8 +96,10 @@ ARG BRANCH_TYPE
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
-    else \
+    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
         git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    else \
+        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
  && rm -rf /tmp/local_src
 RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
@@ -201,7 +205,7 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --upgrade 
 RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]; then \
     wget -q https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/${TRITON_LANG_COMMIT}.zip && \
     unzip -q ${TRITON_LANG_COMMIT}.zip && rm ${TRITON_LANG_COMMIT}.zip && mv triton-${TRITON_LANG_COMMIT} triton && \
-    pip install --break-system-packages -r python/requirements.txt && \
+    cd triton && pip install --break-system-packages -r python/requirements.txt && \
     MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --break-system-packages -e .; \
 fi
 

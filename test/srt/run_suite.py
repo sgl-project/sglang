@@ -206,6 +206,7 @@ suites = {
     ],
     # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
     "nightly-1-gpu": [
+        TestFile("layers/attention/nsa/test_nsa_indexer.py", 2),
         TestFile("lora/test_lora_qwen3.py", 97),
         TestFile("lora/test_lora_qwen3_vl.py", 200),
         TestFile("lora/test_lora_radix_cache.py", 200),
@@ -216,7 +217,13 @@ suites = {
         TestFile("test_deepseek_v3_deterministic.py", 240),
         TestFile("test_vision_stress_memory.py", 400),
     ],
+    "nightly-4-gpu-b200": [
+        TestFile("test_fp4_moe.py", 300),
+    ],
+    "nightly-4-gpu": [],
     "nightly-8-gpu": [],
+    "nightly-8-gpu-h200": [],
+    "nightly-8-gpu-h20": [],
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
         TestFile("cpu/test_comm.py"),
