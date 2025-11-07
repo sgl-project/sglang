@@ -13,7 +13,7 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKConfig, select_experts
 
 if torch.cuda.get_device_capability() < (10, 0):
     pytest.skip(
@@ -312,6 +312,7 @@ def check_moe(
         a2_gs=a2_gs,
         w2_blockscale=w2_blockscale,
         w2_alphas=(1 / w2_gs),
+        router_logits=score,
     )
 
     # Reference check:
@@ -384,6 +385,7 @@ def test_cutlass_fp4_moe_no_graph(
         a2_gs,
         w2_blockscale,
         w2_alphas,
+        router_logits=None,
     ):
         # Create MoeRunnerConfig
         runner_config = MoeRunnerConfig(
@@ -410,11 +412,14 @@ def test_cutlass_fp4_moe_no_graph(
 
         runner = MoeRunner(MoeRunnerBackend.CUTLASS, runner_config)
 
-        # Create dispatch output
-        dispatch_output = StandardDispatchOutput(
-            hidden_states=a,
+        topk_output = StandardTopKOutput(
             topk_weights=topk_weights,
             topk_ids=topk_ids,
+            router_logits=router_logits,
+        )
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=a,
+            topk_output=topk_output,
         )
 
         # Create quant info
