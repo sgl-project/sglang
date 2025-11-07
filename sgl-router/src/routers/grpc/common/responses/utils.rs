@@ -6,16 +6,21 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use serde_json::json;
+use serde_json::{json, to_value};
+use tracing::{debug, warn};
 
 use crate::{
     core::WorkerRegistry,
+    data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     mcp::McpManager,
     protocols::{
         common::Tool,
-        responses::{ResponseTool, ResponseToolType},
+        responses::{ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse},
     },
-    routers::{grpc::error, openai::mcp::ensure_request_mcp_client},
+    routers::{
+        grpc::error,
+        openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
+    },
 };
 
 /// Ensure MCP connection succeeds if MCP tools are declared
@@ -122,4 +127,36 @@ pub fn extract_tools_from_response_tools(
             }
         })
         .collect()
+}
+
+/// Persist response to storage if store=true
+///
+/// Common helper function to avoid duplication across sync and streaming paths
+/// in both harmony and regular responses implementations.
+pub async fn persist_response_if_needed(
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
+    response_storage: Arc<dyn ResponseStorage>,
+    response: &ResponsesResponse,
+    original_request: &ResponsesRequest,
+) {
+    if !original_request.store.unwrap_or(true) {
+        return;
+    }
+
+    if let Ok(response_json) = to_value(response) {
+        if let Err(e) = persist_conversation_items(
+            conversation_storage,
+            conversation_item_storage,
+            response_storage,
+            &response_json,
+            original_request,
+        )
+        .await
+        {
+            warn!("Failed to persist response: {}", e);
+        } else {
+            debug!("Persisted response: {}", response.id);
+        }
+    }
 }

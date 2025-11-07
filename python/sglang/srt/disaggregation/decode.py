@@ -156,6 +156,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
+        self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
             size + pre_alloc_size, cache_params, device, speculative_num_draft_tokens
         )

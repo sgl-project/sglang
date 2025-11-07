@@ -162,6 +162,7 @@ class MambaPool:
         ssm_dtype = cache_params.dtype.temporal
         num_mamba_layers = len(cache_params.layers)
 
+        self.device = device
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(
             "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
@@ -271,7 +272,6 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
             self.size = size
-            self.device = device
             self.free_slots = torch.arange(
                 self.size, dtype=torch.int64, device=self.device
             )

@@ -31,7 +31,7 @@ from sglang.srt.environ import envs
 from sglang.srt.metrics.collector import ExpertDispatchCollector
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, is_npu
+from sglang.srt.utils import Withable, get_int_env_var, is_npu
 
 _is_npu = is_npu()
 
@@ -716,11 +716,8 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
 
     def _collect_metrics_if_needed(self, gpu_physical_count: torch.Tensor):
         # sglang:eplb_gpu_physical_count metric is disabled if SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0
-        if (
-            envs.SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL > 0
-            and self._collection_counter % envs.SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL
-            == 0
-        ):
+        interval = get_int_env_var("SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL", 0)
+        if interval > 0 and self._collection_counter % interval == 0:
             for layer_idx in range(self._expert_location_metadata.num_layers):
                 count_of_layer = (
                     self._expert_dispatch_collector.eplb_gpu_physical_count.labels(

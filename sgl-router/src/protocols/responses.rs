@@ -56,7 +56,7 @@ impl Default for ResponseTool {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseToolType {
     Function,
@@ -85,6 +85,7 @@ fn default_reasoning_effort() -> Option<ReasoningEffort> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    Minimal,
     Low,
     Medium,
     High,
@@ -127,6 +128,7 @@ pub enum ResponseInputOutputItem {
         id: String,
         summary: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
         content: Vec<ResponseReasoningContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
@@ -167,6 +169,7 @@ pub enum ResponseContentPart {
     #[serde(rename = "output_text")]
     OutputText {
         text: String,
+        #[serde(default)]
         #[serde(skip_serializing_if = "Vec::is_empty")]
         annotations: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]

@@ -644,7 +644,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
-                symm_output = torch.empty_like(x)
+                num_tokens = x_quant.shape[0]
+                hidden_size = (
+                    x_quant.shape[-1] * 2
+                    if x_quant.dtype == torch.uint8
+                    else x_quant.shape[-1]
+                )
+                symm_output = torch.empty(
+                    num_tokens, hidden_size, dtype=torch.bfloat16, device=x_quant.device
+                )
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
                 None,  # routing_bias

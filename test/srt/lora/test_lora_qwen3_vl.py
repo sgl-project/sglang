@@ -96,19 +96,20 @@ LORA_MODEL_VARIANTS = [
             max_loras_per_batch=1,
         ),
     ),
-    (
-        "Qwen3-VL-MoE",
-        LoRAModelCase(
-            base="Qwen/Qwen3-VL-30B-A3B-Instruct",
-            adaptors=[
-                LoRAAdaptor(
-                    name="sosoai/qwen3_vl_30b_lora",
-                    prefill_tolerance=3e-1,
-                ),
-            ],
-            max_loras_per_batch=1,
-        ),
-    ),
+    # TODO: Move 30B MoE to 2 GPU runner
+    # (
+    #     "Qwen3-VL-MoE",
+    #     LoRAModelCase(
+    #         base="Qwen/Qwen3-VL-30B-A3B-Instruct",
+    #         adaptors=[
+    #             LoRAAdaptor(
+    #                 name="sosoai/qwen3_vl_30b_lora",
+    #                 prefill_tolerance=3e-1,
+    #             ),
+    #         ],
+    #         max_loras_per_batch=1,
+    #     ),
+    # ),
 ]
 
 LORA_MAX_NEW_TOKENS = 32

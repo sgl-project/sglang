@@ -13,6 +13,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.models.qwen2 import Qwen2MLP
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import add_prefix
 
 TEST_HIDDEN_SIZE = 32
@@ -63,6 +64,7 @@ def init_weights(module):
 
 
 def test_model_forward_dump(tmp_path):
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
     init_distributed_environment(
         backend="nccl",
         world_size=1,
@@ -75,7 +77,7 @@ def test_model_forward_dump(tmp_path):
     model.apply(init_weights)
     model = model.cuda().bfloat16()
     dumper = register_forward_hook_for_model(
-        model, tmp_path / "sglang_dump", -1, 0, 0, 0
+        model, tmp_path / "sglang_dump", [0], 0, 0, 0
     )
 
     dir_path = dumper.get_dump_dir()

@@ -216,6 +216,10 @@ impl GrpcRouter {
                 self.shared_components.clone(),
                 self.harmony_responses_context.mcp_manager.clone(),
                 self.harmony_responses_context.response_storage.clone(),
+                self.harmony_responses_context.conversation_storage.clone(),
+                self.harmony_responses_context
+                    .conversation_item_storage
+                    .clone(),
             );
 
             if body.stream.unwrap_or(false) {
