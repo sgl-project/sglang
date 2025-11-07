@@ -25,7 +25,7 @@ def calc_diff(x, y):
 
 def get_model_config(tp_size: int):
     config = AutoConfig.from_pretrained(
-        "gaunernst/DeepSeek-V2-Lite-Chat-FP8", trust_remote_code=True
+        "deepseek-ai/Deepseek-R1", trust_remote_code=True
     )
     E = config.n_routed_experts
     topk = config.num_experts_per_tok
