@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
@@ -23,6 +23,14 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
 from sglang.srt.utils import is_cuda, is_sm90_supported
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput,
+        DeepEPLLDispatchOutput,
+        DeepEPNormalCombineInput,
+        DeepEPNormalDispatchOutput,
+    )
+
 if is_cuda():
     from sgl_kernel import (
         apply_shuffle_mul_sum,
@@ -42,12 +50,19 @@ if is_cuda():
 @dataclass
 class CutlassRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
-    topk_weights: torch.Tensor
     topk_ids: torch.Tensor
-    a_map: torch.Tensor
-    c_map: torch.Tensor
-    rep_primary: torch.Tensor
-    rep_aux: torch.Tensor
+    # Standard mode fields
+    topk_weights: Optional[torch.Tensor] = None
+    a_map: Optional[torch.Tensor] = None
+    c_map: Optional[torch.Tensor] = None
+    rep_primary: Optional[torch.Tensor] = None
+    rep_aux: Optional[torch.Tensor] = None
+    # DeepEP LL mode fields
+    masked_m: Optional[torch.Tensor] = None
+    expected_m: Optional[int] = None
+    # Mode indicator
+    use_deepep_ll: bool = False
+    use_deepep_normal: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -121,6 +136,13 @@ class CutlassRunnerCore(MoeRunnerCore):
         quant_info: CutlassMoeQuantInfo,
         running_state: Dict[str, torch.Tensor],
     ) -> CutlassRunnerOutput:
+        # Handle DeepEP modes
+        if runner_input.use_deepep_ll:
+            return self._run_deepep_ll(runner_input, quant_info, running_state)
+        elif runner_input.use_deepep_normal:
+            return self._run_deepep_normal(runner_input, quant_info, running_state)
+
+        # Standard mode
         moe_type = quant_info.moe_type
         out_dtype = runner_input.hidden_states.dtype
         device = runner_input.hidden_states.device
@@ -334,6 +356,82 @@ class CutlassRunnerCore(MoeRunnerCore):
             f"Unsupported CUTLASS MoE type: {quant_info.moe_type}"
         )
 
+    def _run_deepep_ll(
+        self,
+        runner_input: CutlassRunnerInput,
+        quant_info: CutlassMoeQuantInfo,
+        running_state: Dict[str, torch.Tensor],
+    ) -> CutlassRunnerOutput:
+        """Handle DeepEP Low Latency mode for W4A8."""
+
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
+
+        output = cutlass_w4a8_moe_deepep_ll(
+            runner_input.hidden_states,
+            quant_info.w13_weight,
+            quant_info.w2_weight,
+            quant_info.w13_scale,
+            quant_info.w2_scale,
+            runner_input.topk_ids,
+            runner_input.masked_m,
+            quant_info.a_strides1,
+            quant_info.b_strides1,
+            quant_info.c_strides1,
+            quant_info.a_strides2,
+            quant_info.b_strides2,
+            quant_info.c_strides2,
+            quant_info.s_strides13,
+            quant_info.s_strides2,
+            quant_info.expert_offsets,
+            quant_info.problem_sizes1,
+            quant_info.problem_sizes2,
+            quant_info.w13_input_scale,
+            quant_info.w2_input_scale,
+        )
+
+        return CutlassRunnerOutput(hidden_states=output)
+
+    def _run_deepep_normal(
+        self,
+        runner_input: CutlassRunnerInput,
+        quant_info: CutlassMoeQuantInfo,
+        running_state: Dict[str, torch.Tensor],
+    ) -> CutlassRunnerOutput:
+        """Handle DeepEP Normal mode for W4A8."""
+
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+            cutlass_w4a8_moe_deepep_normal,
+        )
+
+        num_tokens = runner_input.hidden_states.shape[0]
+        if num_tokens == 0:
+            return CutlassRunnerOutput(hidden_states=runner_input.hidden_states)
+
+        output = cutlass_w4a8_moe_deepep_normal(
+            runner_input.hidden_states,
+            quant_info.w13_weight,
+            quant_info.w2_weight,
+            quant_info.w13_scale,
+            quant_info.w2_scale,
+            runner_input.topk_weights,
+            runner_input.topk_ids,
+            quant_info.a_strides1,
+            quant_info.b_strides1,
+            quant_info.c_strides1,
+            quant_info.a_strides2,
+            quant_info.b_strides2,
+            quant_info.c_strides2,
+            quant_info.s_strides13,
+            quant_info.s_strides2,
+            quant_info.expert_offsets,
+            quant_info.problem_sizes1,
+            quant_info.problem_sizes2,
+            quant_info.w13_input_scale,
+            quant_info.w2_input_scale,
+        )
+
+        return CutlassRunnerOutput(hidden_states=output)
+
 
 @register_pre_permute("standard", "cutlass")
 def pre_permute_standard_to_cutlass(
@@ -426,3 +524,84 @@ def post_permute_cutlass_to_standard(
     if runner_config.routed_scaling_factor is not None:
         hidden_states.mul_(runner_config.routed_scaling_factor)
     return StandardCombineInput(hidden_states=hidden_states)
+
+
+@register_pre_permute("deepep_ll", "cutlass")
+def pre_permute_deepep_ll_to_cutlass(
+    dispatch_output: DeepEPLLDispatchOutput,
+    quant_info: CutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: Dict[str, torch.Tensor],
+) -> CutlassRunnerInput:
+    hidden_states, _, topk_ids, topk_weights, masked_m, expected_m = dispatch_output
+
+    # Store for post_permute
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
+    return CutlassRunnerInput(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        masked_m=masked_m,
+        expected_m=expected_m,
+        use_deepep_ll=True,
+    )
+
+
+@register_post_permute("cutlass", "deepep_ll")
+def post_permute_cutlass_to_deepep_ll(
+    runner_output: CutlassRunnerOutput,
+    quant_info: CutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: Dict[str, torch.Tensor],
+) -> DeepEPLLCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+
+    return DeepEPLLCombineInput(
+        hidden_states=runner_output.hidden_states,
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
+    )
+
+
+@register_pre_permute("deepep_normal", "cutlass")
+def pre_permute_deepep_normal_to_cutlass(
+    dispatch_output: DeepEPNormalDispatchOutput,
+    quant_info: CutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: Dict[str, torch.Tensor],
+) -> CutlassRunnerInput:
+    (
+        hidden_states,
+        _,
+        topk_ids,
+        topk_weights,
+        _,
+    ) = dispatch_output
+
+    # Store for post_permute
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
+    return CutlassRunnerInput(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        use_deepep_normal=True,
+    )
+
+
+@register_post_permute("cutlass", "deepep_normal")
+def post_permute_cutlass_to_deepep_normal(
+    runner_output: CutlassRunnerOutput,
+    quant_info: CutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: Dict[str, torch.Tensor],
+) -> DeepEPNormalCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
+
+    return DeepEPNormalCombineInput(
+        hidden_states=runner_output.hidden_states,
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
+    )
