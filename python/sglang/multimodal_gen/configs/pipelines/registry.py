@@ -73,8 +73,8 @@ PIPELINE_DETECTOR: dict[str, Callable[[str], bool]] = {
     "wandmdpipeline": lambda id: "wandmdpipeline" in id.lower(),
     "wancausaldmdpipeline": lambda id: "wancausaldmdpipeline" in id.lower(),
     "stepvideo": lambda id: "stepvideo" in id.lower(),
-    "qwenimage": lambda id: "qwen-image" in id.lower() and "edit" not in id.lower(),
-    "qwenimageedit": lambda id: "qwen-image-edit" in id.lower(),
+    "qwenimage": lambda id: "qwenimage" in id.lower() and "edit" not in id.lower(),
+    "qwenimageedit": lambda id: "qwenimageedit" in id.lower(),
     # Add other pipeline architecture detectors
 }
 
