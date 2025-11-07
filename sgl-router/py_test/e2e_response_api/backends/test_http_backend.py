@@ -22,6 +22,7 @@ from mixins.basic_crud import ConversationCRUDBaseTest, ResponseCRUDBaseTest
 from mixins.function_call import FunctionCallingBaseTest
 from mixins.mcp import MCPTests
 from mixins.state_management import StateManagementTests
+from mixins.structured_output import StructuredOutputBaseTest
 from router_fixtures import popen_launch_openai_xai_router
 from util import kill_process_tree
 
@@ -32,6 +33,7 @@ class TestOpenaiBackend(
     StateManagementTests,
     MCPTests,
     FunctionCallingBaseTest,
+    StructuredOutputBaseTest,
 ):
     """End to end tests for OpenAI backend."""
 
@@ -72,6 +74,14 @@ class TestOpenaiBackend(
     )
     def test_mixed_mcp_and_function_tools_streaming(self):
         super().test_mixed_mcp_and_function_tools_streaming()
+
+    @unittest.skip("Temporary skip since deepwiki might hit rate limit")
+    def test_mcp_basic_tool_call(self):
+        super().test_mcp_basic_tool_call()
+
+    @unittest.skip("Temporary skip since deepwiki might hit rate limit")
+    def test_mcp_basic_tool_call_streaming(self):
+        super().test_mcp_basic_tool_call_streaming()
 
 
 class TestXaiBackend(StateManagementTests):
