@@ -168,26 +168,28 @@ def test_moe_align_block_size_compare_implementations(
     topk_id_Exceedance,
 ):
 
-    topk_ids = torch.argsort(torch.rand(num_tokens, num_experts, device="cuda"), dim=1)[
+    val = 1 if topk_id_Exceedance and topk >= 2 else 0
+    topk_ids = torch.argsort(torch.rand(num_tokens, num_experts + val, device="cuda"), dim=1)[
         :, :topk
     ]
 
     # topk_id_Exceedance == True means some ids == -1 in topk_ids,
     # need to be skip in following process
     if topk_id_Exceedance and topk >= 2:
+        topk_ids = topk_ids - 1
         indices = torch.stack(
             [
-                torch.randperm(topk, device="cuda")[: topk // 2]
+                torch.randperm(topk, device="cuda")[: 1]
                 for _ in range(num_tokens)
             ]
         )
 
         rows = (
-            torch.arange(num_tokens, device="cuda").unsqueeze(1).expand(-1, topk // 2)
+            torch.arange(num_tokens, device="cuda").unsqueeze(1).expand(-1, 1)
         )
         topk_ids[rows, indices] = num_experts
 
-    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
 
     sorted_ids_cuda = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
@@ -202,7 +204,7 @@ def test_moe_align_block_size_compare_implementations(
         (1), dtype=torch.int32, device=topk_ids.device
     )
     cumsum_buffer = torch.empty(
-        num_experts + 2, dtype=torch.int32, device=topk_ids.device
+        num_experts + 1, dtype=torch.int32, device=topk_ids.device
     )
 
     sorted_ids_triton = torch.empty_like(sorted_ids_cuda)
