@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -26,7 +26,10 @@ from einops import rearrange
 from transformers.activations import ACT2FN
 
 from .dconv_fwd_cache_varlen import dynamic_conv_triton_cache_varlen
-from .dconv_speculative_step import causal_conv_step_triton_speculative, causal_dynamic_conv1d_update
+from .dconv_speculative_step import (
+    causal_conv_step_triton_speculative,
+    causal_dynamic_conv1d_update,
+)
 from .dconv_step import causal_conv_step_triton
 
 
@@ -43,7 +46,6 @@ class DynamicShortConvolution(nn.Module):
         generator_reduction: Optional[int] = None,
         generator_activation: str = "silu",
         activation: Optional[str] = "silu",
-        static_conv_init: Callable = None,
         use_fast_conv1d: bool = True,
         implementation: str = "naive",
     ) -> DynamicShortConvolution:
@@ -70,8 +72,6 @@ class DynamicShortConvolution(nn.Module):
             ], f"Activation `{activation}` not supported yet."
             self.activation = activation
 
-        self.static_conv_init = static_conv_init
-
         self.kernel_generator = nn.Sequential(
             OrderedDict(
                 [
@@ -95,21 +95,6 @@ class DynamicShortConvolution(nn.Module):
                 ]
             )
         )
-        self._init_kernel_generator()
-
-    def _init_kernel_generator(self):
-        """
-        Initialize the kernel generator.
-        """
-        for layer in self.kernel_generator:
-            if isinstance(layer, nn.Linear):
-                layer.weight.data.zero_()
-                if layer.bias is not None:
-                    layer.bias.data.zero_()
-
-        if self.static_conv_init is not None:
-            # init for static_bias
-            self.static_conv_init(self.kernel_generator.w2.bias)
 
     def get_kernel(self, x: torch.Tensor) -> torch.Tensor:
         flat_kernels = self.kernel_generator(x)
@@ -217,6 +202,8 @@ class DynamicShortConvolution(nn.Module):
                             cache[cache_idx, :, 1 : num_beginning + 1] = cache[
                                 cache_idx, :, -num_beginning:
                             ]
+                        else:
+                            cache[cache_idx, :, 1 : num_beginning + 1] = 0
                         cache[cache_idx, :, num_beginning + 1 :] = x[
                             start_idx:end_idx
                         ].transpose(0, 1)
@@ -233,9 +220,9 @@ class DynamicShortConvolution(nn.Module):
                 assert (
                     cache_indices is not None
                 ), "cache_indices must be provided for intermediate_conv_window"
-                intermediate_conv_window[cache_indices, : W - 2] = intermediate_conv_window[
-                    cache_indices, 1 : W - 1
-                ]
+                intermediate_conv_window[cache_indices, : W - 2] = (
+                    intermediate_conv_window[cache_indices, 1 : W - 1]
+                )
                 out = causal_conv_step_triton_speculative(
                     x,
                     cache,
@@ -247,20 +234,24 @@ class DynamicShortConvolution(nn.Module):
                     out = ACT2FN[self.activation](out)
                 return out
             else:
-                out = causal_dynamic_conv1d_update(
-                    x=x.transpose(1, 2).contiguous(),
-                    conv_state=cache,
-                    weight=self.get_kernel(generator_input),
-                    bias=None,
-                    # activation=self.activation,
-                    cache_seqlens=None,
-                    conv_state_indices=cache_indices,
-                    num_accepted_tokens=None,
-                    intermediate_conv_window=intermediate_conv_window,
-                    retrieve_next_token=retrieve_next_token,
-                    retrieve_next_sibling=retrieve_next_sibling,
-                    retrieve_parent_token=retrieve_parent_token,
-                ).transpose(1, 2).contiguous()
+                out = (
+                    causal_dynamic_conv1d_update(
+                        x=x.transpose(1, 2).contiguous(),
+                        conv_state=cache,
+                        weight=self.get_kernel(generator_input),
+                        bias=None,
+                        # activation=self.activation,
+                        cache_seqlens=None,
+                        conv_state_indices=cache_indices,
+                        num_accepted_tokens=None,
+                        intermediate_conv_window=intermediate_conv_window,
+                        retrieve_next_token=retrieve_next_token,
+                        retrieve_next_sibling=retrieve_next_sibling,
+                        retrieve_parent_token=retrieve_parent_token,
+                    )
+                    .transpose(1, 2)
+                    .contiguous()
+                )
                 out = ACT2FN[self.activation](out)
                 return out
 

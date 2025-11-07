@@ -393,6 +393,9 @@ class Scheduler(
         # Hybrid memory pool
         self.is_hybrid = self.tp_worker.is_hybrid
         self.is_hybrid_gdn = self.tp_worker.model_runner.hybrid_gdn_config is not None
+        self.is_jet_nemotron = (
+            self.tp_worker.model_runner.jet_nemotron_config is not None
+        )
 
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
@@ -766,7 +769,7 @@ class Scheduler(
                     is_eagle=self.spec_algorithm.is_eagle(),
                     enable_metrics=self.enable_metrics,
                 )
-            elif self.is_hybrid_gdn:
+            elif self.is_hybrid_gdn or self.is_jet_nemotron:
                 self.tree_cache = MambaRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -2272,7 +2275,7 @@ class Scheduler(
                 - self.tree_cache.swa_evictable_size()
             )
             num_tokens = max(num_tokens_full, num_tokens_swa)
-        elif self.is_hybrid_gdn:
+        elif self.is_hybrid_gdn or self.is_jet_nemotron:
             num_tokens = (
                 self.max_total_num_tokens
                 - self.token_to_kv_pool_allocator.available_size()

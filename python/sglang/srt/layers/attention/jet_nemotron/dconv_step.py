@@ -106,14 +106,7 @@ def _causal_conv_step_kernel(
         # Accumulate Part 1
         accumulator += cache_val_1 * k_val_0
 
-        # Cache Update: Store cache_val_1 -> cache_ptr_0
-        cache_ptr_0 = (
-            Cache_ptr
-            + pid_b * Cache_stride_b
-            + offs_d * Cache_stride_d
-            + 0 * Cache_stride_w
-        )
-        tl.store(cache_ptr_0, cache_val_1, mask=d_mask)
+        # Cache Update: Store cache_val_1 -> cache_ptr_0 not needed
 
     # --- Step w = 1 ---
     # Compute: cache_val_2 * k_val_1 (part 1)

@@ -21,17 +21,19 @@ from typing import Any, Iterable, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
+import transformers
 from einops import rearrange
 from torch import nn
 from transformers.utils import logging
 
 from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.jet_nemotron.dynamic_conv import (
     DynamicShortConvolution,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -47,7 +49,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 logger = logging.get_logger(__name__)
@@ -106,29 +107,28 @@ class JetBlock(nn.Module):
         self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
         self.a_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
 
-        A = torch.empty(
-            self.num_heads // self.attn_tp_size, dtype=torch.float32
-        ).uniform_(0, 16)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.A_log._no_weight_decay = True
-
+        self.A_log = nn.Parameter(
+            torch.empty(self.num_heads // self.attn_tp_size, dtype=torch.float32)
+        )
         self.dt_bias = nn.Parameter(torch.ones(self.num_heads // self.attn_tp_size))
-        self.dt_bias._no_weight_decay = True
 
         self.dynamic_conv1d = DynamicShortConvolution(
             hidden_size=self.value_dim,
             kernel_size=self.conv_size,
             generator_input_size=self.hidden_size,
             generator_reduction=jet_block_config.dconv_generator_reduction,
-            static_conv_init=None,
             implementation=jet_block_config.dconv_implementation,
         )
 
         self.g_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.o_norm = FusedRMSNormGated(
+        # self.o_norm = FusedRMSNormGated(
+        #     self.head_v_dim,
+        #     eps=float(jet_block_config.norm_eps),
+        #     autotune_interval=self.autotune_interval,
+        # )
+        self.o_norm = RMSNormGated(
             self.head_v_dim,
             eps=float(jet_block_config.norm_eps),
-            autotune_interval=self.autotune_interval,
         )
         self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
@@ -148,7 +148,6 @@ class JetBlock(nn.Module):
 
         kwargs = {
             "dynamic_conv": self.dynamic_conv1d,
-            "autotune_interval": self.autotune_interval,
             "head_v_dim": self.head_v_dim,
             "head_k_dim": self.head_k_dim,
             "a": self.a_proj(hidden_states),
@@ -164,7 +163,7 @@ class JetBlock(nn.Module):
             q=q, k=k, v=v, layer=None, forward_batch=forward_batch, **kwargs
         ).squeeze(0)
         g = self.g_proj(hidden_states)
-        g = g.reshape(-1, g.shape[-1] // self.head_v_dim, self.head_v_dim)
+        g = rearrange(g, "t (h d) -> t h d", h=self.num_heads)
         o = self.o_norm(o, g)
         o = rearrange(o, "t h d -> t (h d)")
         o = self.o_proj(o)
@@ -173,6 +172,25 @@ class JetBlock(nn.Module):
 
 
 class JetNemotronMLP(nn.Module):
+    def __init__(self, config: JetNemotronConfig):
+        super().__init__()
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.act_fn = transformers.activations.get_activation(config.hidden_act)
+
+    def forward(self, hidden_state):
+        gate = self.gate_proj(hidden_state)
+        up = self.up_proj(hidden_state)
+        activated = self.act_fn(gate)
+        combined = activated * up
+        return self.down_proj(combined)
+
+
+class JetNemotronMLPOld(nn.Module):
     def __init__(
         self,
         config: JetNemotronConfig,
@@ -272,6 +290,7 @@ class JetNemotronAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=sliding_window,
+            quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
 
@@ -294,7 +313,6 @@ class JetNemotronAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -363,11 +381,9 @@ class JetNemotronDecoderLayer(nn.Module):
                 config, layer_id, quant_config, prefix
             )
 
-        self.mlp = JetNemotronMLP(config, quant_config, prefix)
-        self.input_layernorm = JetNemotronRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = JetNemotronRMSNorm(
+        self.mlp = JetNemotronMLP(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.layer_id = layer_id
@@ -404,7 +420,10 @@ class JetNemotronModel(nn.Module):
         super().__init__()
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
@@ -412,7 +431,7 @@ class JetNemotronModel(nn.Module):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.norm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
 
     def forward(
@@ -452,16 +471,15 @@ class JetNemotronForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.model = JetNemotronModel(config, quant_config, prefix)
         self.vocab_size = config.vocab_size
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            org_num_embeddings=config.vocab_size,
-            prefix=add_prefix("lm_head", prefix),
-            bias=False,
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
-        self.lm_head.tie_weights(self.model.embed_tokens)
+        if config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+            )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
 
@@ -494,31 +512,29 @@ class JetNemotronForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
-        for name, loaded_weight in weights:
-            if name.startswith("model.layers."):
-                layer_id = int(name.split(".")[2])
+        for weight_name, loaded_weight in weights:
+            if weight_name.startswith("model.layers."):
+                layer_id = int(weight_name.split(".")[2])
                 layer_type = self.config.layer_types[layer_id]
             else:
                 layer_type = None
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for param_name, shard_weight_name_part, shard_id in stacked_params_mapping:
                 # jet attention q_proj, k_proj, v_proj shouldn't be merged
-                if weight_name not in name or (
-                    layer_type == "jet" and "self_attn" in name
+                if shard_weight_name_part not in weight_name or (
+                    layer_type == "jet" and "self_attn" in weight_name
                 ):
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                param_name = weight_name.replace(shard_weight_name_part, param_name)
+                if param_name not in params_dict:
+                    continue
+                param = params_dict[param_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                param = params_dict[name]
+                param = params_dict[weight_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-            loaded_params.add(name)
-        return loaded_params
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

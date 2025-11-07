@@ -111,7 +111,7 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_token_usage:.2f}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
-        elif self.is_hybrid_gdn:
+        elif self.is_hybrid_gdn or self.is_jet_nemotron:
             (
                 full_num_used,
                 _,
@@ -235,7 +235,7 @@ class SchedulerMetricsMixin:
                 f"#swa token: {swa_num_used}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
-        elif self.is_hybrid_gdn:
+        elif self.is_hybrid_gdn or self.is_jet_nemotron:
             (
                 full_num_used,
                 mamba_used,

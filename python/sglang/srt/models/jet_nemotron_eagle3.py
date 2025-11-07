@@ -18,9 +18,9 @@ from sglang.srt.models.jet_nemotron import (
     JetBlock,
     JetNemotronAttention,
     JetNemotronForCausalLM,
-    JetNemotronMLP,
-    JetNemotronRMSNorm,
 )
+from sglang.srt.models.jet_nemotron import JetNemotronMLPOld as JetNemotronMLP
+from sglang.srt.models.jet_nemotron import JetNemotronRMSNorm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 

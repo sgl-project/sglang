@@ -774,7 +774,6 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
         **kwargs,
     ):
         dynamic_conv_fn = kwargs["dynamic_conv"]
-        autotune_interval = kwargs["autotune_interval"]
         head_v_dim = kwargs["head_v_dim"]
         head_k_dim = kwargs["head_k_dim"]
         a = kwargs["a"]
@@ -795,7 +794,6 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
                 1
             ),  # B, D -> B, 1, D. for speculative decode, we need to support B, D, T.
             generator_input=hidden_states.unsqueeze(1),  # B, D -> B, 1, D.
-            mask=None,
             cache=conv_states[
                 cache_indices
             ],  # inefficiency here, can directly fuse cache
@@ -810,20 +808,34 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
         v = v.squeeze(1)
         v = v.view(1, batch_size, v.shape[1] // head_v_dim, head_v_dim)
 
-        core_attn_out = fused_sigmoid_gating_delta_rule_update(
-            A_log=A_log,
-            dt_bias=dt_bias,
+        # core_attn_out = fused_sigmoid_gating_delta_rule_update(
+        #     A_log=A_log,
+        #     dt_bias=dt_bias,
+        #     q=q,
+        #     k=k,
+        #     v=v,
+        #     a=a,
+        #     b=b,
+        #     initial_state_source=ssm_states,
+        #     initial_state_indices=cache_indices,
+        #     cu_seqlens=query_start_loc,
+        #     use_qk_l2norm_in_kernel=True,
+        #     softplus_beta=1.0,
+        #     softplus_threshold=20.0,
+        # )
+        g = -A_log.float().exp() * torch.nn.functional.softplus(a.float() + dt_bias)
+        beta = b.sigmoid()
+
+        core_attn_out = fused_recurrent_gated_delta_rule_update(
             q=q,
             k=k,
             v=v,
-            a=a,
-            b=b,
+            g=g,
+            beta=beta,
             initial_state_source=ssm_states,
             initial_state_indices=cache_indices,
             cu_seqlens=query_start_loc,
             use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
         )
 
         return core_attn_out
@@ -839,7 +851,6 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
         **kwargs,
     ):
         dynamic_conv_fn = kwargs["dynamic_conv"]
-        autotune_interval = kwargs["autotune_interval"]
         head_v_dim = kwargs["head_v_dim"]
         head_k_dim = kwargs["head_k_dim"]
         a = kwargs["a"]
@@ -904,7 +915,8 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
         v = v.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
         beta = b.sigmoid()
-        g = fused_gdn_gating(A_log, a, dt_bias)
+        # g = fused_gdn_gating(A_log, a, dt_bias)
+        g = -A_log.float().exp() * torch.nn.functional.softplus(a.float() + dt_bias)
 
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)
@@ -926,21 +938,32 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            recurrent_state = ssm_states[cache_indices]
-            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+            core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=q,
                 k=k,
                 v=v,
                 g=g,
                 beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=True,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
                 cu_seqlens=query_start_loc,
-                head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
-            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            ssm_states[cache_indices] = last_recurrent_state
+            # recurrent_state = ssm_states[cache_indices]
+            # core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+            #     q=q,
+            #     k=k,
+            #     v=v,
+            #     g=g,
+            #     beta=beta,
+            #     initial_state=recurrent_state,
+            #     output_final_state=True,
+            #     cu_seqlens=query_start_loc,
+            #     head_first=False,
+            #     use_qk_l2norm_in_kernel=True,
+            # )
+            # last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+            # ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 

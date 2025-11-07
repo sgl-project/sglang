@@ -143,7 +143,9 @@ class SchedulerRuntimeCheckerMixin:
     def check_memory(self: Scheduler):
         if self.is_hybrid:
             memory_leak, token_msg = self._check_hybrid_memory()
-        elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
+        elif (self.is_hybrid_gdn or self.is_jet_nemotron) and isinstance(
+            self.tree_cache, MambaRadixCache
+        ):
             memory_leak, token_msg = self._check_mamba_memory()
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
@@ -173,7 +175,7 @@ class SchedulerRuntimeCheckerMixin:
                 ) = self._get_swa_token_info()
                 num_used = max(full_num_used, swa_num_used)
                 token_usage = max(full_token_usage, swa_token_usage)
-            elif self.is_hybrid_gdn:
+            elif self.is_hybrid_gdn or self.is_jet_nemotron:
                 (
                     num_used,
                     _,
@@ -212,7 +214,8 @@ class SchedulerRuntimeCheckerMixin:
 
     def check_tree_cache(self: Scheduler):
         if (self.is_hybrid and isinstance(self.tree_cache, SWARadixCache)) or (
-            self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache)
+            (self.is_hybrid_gdn or self.is_jet_nemotron)
+            and isinstance(self.tree_cache, MambaRadixCache)
         ):
             self.tree_cache.sanity_check()
 
@@ -256,7 +259,9 @@ class SchedulerRuntimeCheckerMixin:
             # Print batch size and memory pool info to check whether there are de-sync issues.
             if self.is_hybrid:
                 _, info_msg = self._check_hybrid_memory()
-            elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
+            elif (self.is_hybrid_gdn or self.is_jet_nemotron) and isinstance(
+                self.tree_cache, MambaRadixCache
+            ):
                 _, info_msg = self._check_mamba_memory()
             else:
                 _, info_msg = self._check_radix_cache_memory()
