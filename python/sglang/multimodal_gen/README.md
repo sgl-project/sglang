@@ -1,4 +1,4 @@
-<div align="center">
+<div align="center"  style="display:block; margin:auto;">
 <img src=https://github.com/lm-sys/lm-sys.github.io/releases/download/test/sgl-diffusion-logo.png width="80%"/>
 </div>
 
