@@ -2,6 +2,7 @@
 
 import enum
 import logging
+import os
 
 from sglang.srt.connector.base_connector import (
     BaseConnector,
@@ -23,6 +24,7 @@ class ConnectorType(str, enum.Enum):
 
 
 def create_remote_connector(url, device, **kwargs) -> BaseConnector:
+    url = verify_if_url_is_gcs_bucket(url)
     connector_type = parse_connector_type(url)
     if connector_type == "redis":
         return RedisConnector(url)
@@ -33,6 +35,14 @@ def create_remote_connector(url, device, **kwargs) -> BaseConnector:
     else:
         raise ValueError(f"Invalid connector type: {url}")
 
+def verify_if_url_is_gcs_bucket(url):
+    if url.startswith("gs://"):
+        os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = "https://storage.googleapis.com"
+        os.environ["AWS_ENDPOINT_URL"] = "https://storage.googleapis.com"
+        os.environ["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"] = "0"
+        os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
+        url = url.replace("gs://", "s3://", 1)
+    return url
 
 def get_connector_type(client: BaseConnector) -> ConnectorType:
     if isinstance(client, BaseKVConnector):
