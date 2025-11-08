@@ -240,9 +240,11 @@ class JetBlock(nn.Module):
 
         v: torch.Tensor = self.v_proj(hidden_states)  # (cu_seq_len, total_v_dim)
 
+        conv_cache = layer_cache.conv
+        assert isinstance(conv_cache, torch.Tensor)
         v, new_conv_state = self.dynamic_conv1d(
             v,
-            conv_state=layer_cache.conv[
+            conv_state=conv_cache[
                 forward_metadata.mamba_cache_indices, -self.total_v_dim :, :
             ],
             generator_input=hidden_states,
@@ -255,9 +257,9 @@ class JetBlock(nn.Module):
                 )
             ),
         )
-        layer_cache.conv[
-            forward_metadata.mamba_cache_indices, -self.total_v_dim :, :
-        ] = new_conv_state
+        conv_cache[forward_metadata.mamba_cache_indices, -self.total_v_dim :, :] = (
+            new_conv_state
+        )
 
         a = self.a_proj(hidden_states)
         g = -self.A_log.float().exp() * nn.functional.softplus(a.float() + self.dt_bias)
