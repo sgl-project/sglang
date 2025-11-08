@@ -348,8 +348,7 @@ def fused_recurrent_gated_delta_rule(
     {
         "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "CACHE_INTERMEDIATE_STATES": lambda args: args["intermediate_states_buffer"]
-        is not None,
+        "IS_SPEC_DECODING": lambda args: args["last_steps_ptr"] is not None,
         "HAS_EAGLE_TREE_CUSTOM_ATTN_MASK": lambda args: args[
             "retrieve_parent_token_ptr"
         ]
@@ -369,7 +368,6 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     last_steps_ptr,
     cu_seqlens,
     scale,
-    intermediate_states_buffer,
     cache_steps,
     retrieve_parent_token_ptr,
     stride_retrieve_parent_token_seq: tl.constexpr,
@@ -389,7 +387,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     DISABLE_STATE_UPDATE: tl.constexpr,  # whether to disable final state update
     DISABLE_OUTPUT_CALCULATION: tl.constexpr,  # whether to disable output calculation
-    CACHE_INTERMEDIATE_STATES: tl.constexpr,
+    IS_SPEC_DECODING: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -438,14 +436,14 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         if idx >= 0:  # Assuming negative indices are invalid
             last_step_idx = -1
 
-            if CACHE_INTERMEDIATE_STATES:
+            if IS_SPEC_DECODING:
                 last_step_idx = tl.load(last_steps_ptr + idx).to(tl.int64)
 
             # last_step_idx is either invalid (first verify after 1st target extend) or it is not spec decoding
             if last_step_idx == -1:
                 p_h0 = (
                     h0_source
-                    + idx * HV * K * V
+                    + idx * cache_steps * HV * K * V
                     + i_hv * K * V
                     + o_k[:, None] * V
                     + o_v[None, :]
@@ -453,7 +451,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
             else:
                 step_offset = last_step_idx * HV * K * V
                 p_h0 = (
-                    intermediate_states_buffer
+                    h0_source
                     + idx * cache_steps * HV * K * V
                     + step_offset
                     + i_hv * K * V
@@ -462,9 +460,9 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                 )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    # Prepare intermediate state cache variables if enabled
+    # Prepare state cache variables if enabled
     cache_idx = -1
-    if CACHE_INTERMEDIATE_STATES:
+    if IS_SPEC_DECODING:
         cache_idx = tl.load(h0_indices + i_n)
 
     step_idx = 0
@@ -478,7 +476,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                 )
                 step_offset = parent_step_idx * HV * K * V
                 cache_ptr = (
-                    intermediate_states_buffer
+                    h0_source
                     + cache_idx * cache_steps * HV * K * V
                     + step_offset
                     + i_hv * K * V
@@ -513,13 +511,13 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
             # core attn output
             tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
-        # store intermediate states if enabled
-        if CACHE_INTERMEDIATE_STATES:
+        # store state cache if enabled
+        if IS_SPEC_DECODING:
             if cache_idx >= 0:
                 # Compute cache pointer for this step
                 step_offset = step_idx * HV * K * V
                 cache_ptr = (
-                    intermediate_states_buffer
+                    h0_source
                     + cache_idx * cache_steps * HV * K * V
                     + step_offset
                     + i_hv * K * V
@@ -566,7 +564,6 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     disable_state_update: bool = False,
     disable_output_calculation: bool = False,
-    intermediate_states_buffer: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -609,8 +606,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         last_steps_ptr=last_steps,
         cu_seqlens=cu_seqlens,
         scale=scale,
-        intermediate_states_buffer=intermediate_states_buffer,
-        cache_steps=0 if cache_steps is None else cache_steps,
+        cache_steps=1 if cache_steps is None else cache_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
@@ -653,7 +649,6 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         disable_state_update: bool = False,
         disable_output_calculation: bool = False,
-        intermediate_states_buffer: Optional[torch.Tensor] = None,
         cache_steps: Optional[int] = None,
         retrieve_parent_token: Optional[torch.Tensor] = None,
     ):
@@ -671,7 +666,6 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             disable_state_update=disable_state_update,
             disable_output_calculation=disable_output_calculation,
-            intermediate_states_buffer=intermediate_states_buffer,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
         )
@@ -702,7 +696,6 @@ def fused_recurrent_gated_delta_rule_update(
     use_qk_l2norm_in_kernel: bool = False,
     disable_state_update: bool = False,
     disable_output_calculation: bool = False,
-    intermediate_states_buffer: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -740,7 +733,6 @@ def fused_recurrent_gated_delta_rule_update(
         use_qk_l2norm_in_kernel,
         disable_state_update,
         disable_output_calculation,
-        intermediate_states_buffer,
         cache_steps,
         retrieve_parent_token,
     )

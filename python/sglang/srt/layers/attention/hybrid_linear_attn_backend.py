@@ -630,10 +630,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = mamba_cache_params.conv
         ssm_states = mamba_cache_params.temporal
+        is_spec_decoding = isinstance(mamba_cache_params, MambaPool.SpeculativeState)
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            intermediate_state_cache = mamba_cache_params.intermediate_ssm
-            intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window
             last_steps = mamba_cache_params.last_steps
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
@@ -659,7 +658,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 activation,
                 conv_state_indices=cache_indices[:batch_size],
                 last_steps=last_steps,
-                intermediate_conv_window=intermediate_conv_window_cache,
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
@@ -712,12 +710,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cu_seqlens=query_start_loc,
                 use_qk_l2norm_in_kernel=True,
                 disable_state_update=True,
-                intermediate_states_buffer=intermediate_state_cache,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            recurrent_state = ssm_states[cache_indices]
+            if is_spec_decoding:
+                recurrent_state = ssm_states[cache_indices, 0]
+            else:
+                recurrent_state = ssm_states[cache_indices]
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -731,7 +731,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm_in_kernel=True,
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            ssm_states[cache_indices] = last_recurrent_state
+            if is_spec_decoding:
+                ssm_states[cache_indices, 0] = last_recurrent_state
+            else:
+                ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 
@@ -974,11 +977,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        # conv_states = mamba_caches.conv
-        # ssm_states = mamba_caches.temporal
-        # intermediate_state_cache = mamba_caches.intermediate_ssm
-        # intermediate_conv_window_cache = mamba_caches.intermediate_conv_window
-
         # SSM state updates (chunked to reduce peak memory)
         valid_mask = accepted_indices >= 0
 
@@ -987,12 +985,3 @@ class HybridLinearAttnBackend(AttentionBackend):
         last_steps = accepted_indices[valid_mask].to(torch.int64)  # [N]
 
         mamba_caches.last_steps[:, valid_state_indices] = last_steps
-        # scatter into ssm_states at the chosen cache lines
-        # ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
-        #     :, valid_state_indices, last_steps
-        # ].to(ssm_states.dtype, copy=False)
-
-        # Scatter into conv_states at the chosen cache lines
-        # conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
-        #     :, valid_state_indices, last_steps
-        # ].to(conv_states.dtype, copy=False)
