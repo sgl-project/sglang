@@ -382,7 +382,11 @@ class PiecewiseCudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            set_dp_buffer_len(
+                global_dp_buffer_len,
+                num_tokens,
+                forward_batch.dp_padding_mode.is_max_len(),
+            )
             # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
             # It is True in this context but we need to set it to use low latency deepep mode.
             set_is_extend_in_batch(False)
