@@ -95,7 +95,7 @@ class FunctionCallingBaseTest(ResponseAPIBaseTest):
         # Create a running input list we will add to over time
         input_list = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "What is my horoscope? I am an Aquarius."}
+            {"role": "user", "content": "What is my horoscope? I am an Aquarius."},
         ]
 
         # 2. Prompt the model with tools defined
