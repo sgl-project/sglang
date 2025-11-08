@@ -747,19 +747,25 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         "_assert_and_load",
     ]
     
-    # Weight names to skip during quantization reload (scale parameters)
-    SKIP_QUANTIZATION_SCALE_PARAMS = [
+    # Parameters to skip during FP8 quantization reload (not quantized or FP8 metadata)
+    SKIP_QUANTIZATION_PARAMS = [
+        # FP8 quantization scale metadata (not actual model weights)
         "weight_scale",
         "input_scale",
         "output_scale",
-    ]
-    
-    # Weight name patterns to skip during reload (FlashRL lines 118-132)
-    SKIP_WEIGHT_PATTERNS = [
+        # Model parameters that stay in BF16 (not quantized to FP8)
         "rotary_emb.inv_freq",
-        "projector",
         "rotary_emb.cos_cached",
         "rotary_emb.sin_cached",
+        "projector",
+        ".bias",
+    ]
+    
+    # Stacked parameters that combine multiple weights (Qwen2 architecture)
+    # These need special handling during quantization as shards are loaded separately
+    STACKED_PARAMS_MAPPING = [
+        ("qkv_proj", ["q_proj", "k_proj", "v_proj"]),
+        ("gate_up_proj", ["gate_proj", "up_proj"]),
     ]
 
     def __init__(self, load_config: LoadConfig):
@@ -878,6 +884,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
 
     @staticmethod
+    def _is_stacked_param(name):
+        """Check if parameter name corresponds to a stacked parameter."""
+        for stacked_name, _ in QuantizedRLModelLoader.STACKED_PARAMS_MAPPING:
+            if stacked_name in name:
+                return True
+        return False
+
+    @staticmethod
     def _manual_fp8_quantization(model, updated_param_names, original_fp8_data):
         """
         Manually quantize loaded BF16 weights to FP8 and copy to original memory locations.
@@ -910,12 +924,21 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             if name not in all_params or name not in original_fp8_data:
                 continue
             
-            # Skip scale parameters
-            if any(skip_param in name for skip_param in self.SKIP_QUANTIZATION_SCALE_PARAMS):
+            # Skip parameters not quantized to FP8 (scales, bias, rotary_emb, etc.)
+            if any(skip_param in name for skip_param in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS):
                 continue
             
             new_param = all_params[name]
             old_fp8_data = original_fp8_data[name]
+            
+            # Debug logging for stacked parameters
+            is_stacked = QuantizedRLModelLoader._is_stacked_param(name)
+            if is_stacked:
+                logger.info(
+                    f"[QuantizedRL] Processing stacked param: {name}, "
+                    f"new_param.shape={new_param.data.shape}, "
+                    f"old_fp8_data.shape={old_fp8_data.shape}"
+                )
             
             # Check if this parameter needs quantization (linear layers only)
             # Embeddings and LM head use UnquantizedEmbeddingMethod (stay in BF16)
@@ -984,14 +1007,38 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 new_param.data = old_fp8_data
                 params_quantized += 1
             else:
-                # Both are same dtype - this shouldn't happen!
-                # We expect: new_param (BF16/FP32) != old_fp8_data (FP8)
-                raise RuntimeError(
-                    f"Unexpected dtype match for parameter '{name}': "
-                    f"new_param.dtype={new_param.dtype}, old_fp8_data.dtype={old_fp8_data.dtype}. "
-                    f"Expected new param to be BF16/FP32 (from VERL) and old to be FP8 (from initial quantization). "
-                    f"This indicates a logic error in weight reloading."
-                )
+                # Both are same dtype
+                # If both are FP8, the weight_loader already quantized during load
+                # Just copy the data to original memory location
+                log.warning(f"Both are same dtype {new_param.dtype} and {old_fp8_data.dtype} for {name}")
+                if new_param.dtype == torch.float8_e4m3fn and old_fp8_data.dtype == torch.float8_e4m3fn:
+                    # Both are FP8 - weight_loader already quantized
+                    # FP8 weights are stored transposed in SGLang for performance
+                    # Create a transposed view of old_fp8_data to match new_param orientation
+                    weight_output = old_fp8_data.t()
+                    
+                    # Check shape compatibility with the transposed view
+                    assert new_param.data.shape == weight_output.shape, (
+                        f"Shape mismatch for {name}: "
+                        f"new_param.shape={new_param.data.shape}, "
+                        f"old_fp8_data.t().shape={weight_output.shape} "
+                        f"(old_fp8_data stored transposed as {old_fp8_data.shape})"
+                    )
+                    
+                    # Copy to the transposed view
+                    weight_output.copy_(new_param.data)
+                    
+                    # Swap data pointer to use original FP8 memory
+                    new_param.data = old_fp8_data
+                    params_copied += 1
+                else:
+                    # Unexpected dtype combination
+                    raise RuntimeError(
+                        f"Unexpected dtype match for parameter '{name}': "
+                        f"new_param.dtype={new_param.dtype}, old_fp8_data.dtype={old_fp8_data.dtype}. "
+                        f"Expected either: (1) new=BF16/FP32, old=FP8, or (2) both=FP8. "
+                        f"This indicates a logic error in weight reloading."
+                    )
 
 
     @staticmethod
@@ -1027,13 +1074,16 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             if name in existing_params:
                 current_param_data[name] = existing_params[name].data
 
-        # Reset to pre-quantization state using torch.as_strided
+        # Reset to pre-quantization state by creating new BF16 buffers (FlashRL approach)
+        # This matches FlashRL vllm_patch.py line 700
         for name, rebuild_info in model.original_weights_rebuild_keys.items():
             if name in updated_param_names and name in existing_params:
-                existing_params[name].data = torch.as_strided(
-                    existing_params[name].data.clone(),
+                # Create NEW tensor with original dtype (BF16) - allocates temporary memory
+                # This is intentional to match FlashRL's memory-efficient approach
+                existing_params[name].data = torch.empty(
                     rebuild_info["shape"],
-                    rebuild_info["stride"],
+                    dtype=rebuild_info["dtype"],
+                    device=existing_params[name].device
                 )
 
         # Restore weight loader attributes
@@ -1102,8 +1152,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             if name == "lm_head.weight":
                 is_last_update = True
             
-            # Skip scale parameters
-            if any(skip_param in name for skip_param in self.SKIP_QUANTIZATION_SCALE_PARAMS):
+            # Skip parameters not quantized to FP8 (scales, bias, rotary_emb, etc.)
+            if any(skip_param in name for skip_param in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS):
                 continue
 
             # FlashRL lines 107-146: Apply same filtering
@@ -1117,9 +1167,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             ):
                 continue
 
-            # Skip weight patterns (FlashRL lines 118-128)
-            if any(pattern in name for pattern in self.SKIP_WEIGHT_PATTERNS):
-                continue
             if hasattr(model, 'config') and model.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
