@@ -152,7 +152,7 @@ class TestGrpcHarmonyBackend(
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "/home/ubuntu/models/openai/gpt-oss-120b"
+        cls.model = "/home/ubuntu/models/openai/gpt-oss-20b"
         cls.base_url_port = "http://127.0.0.1:30030"
 
         cls.cluster = popen_launch_workers_and_router(
