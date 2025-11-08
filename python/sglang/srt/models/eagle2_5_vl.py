@@ -181,8 +181,8 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         """Load model weights with proper mapping."""
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "up_proj", 1),
             ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
@@ -190,6 +190,10 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             # Skip rotary embeddings
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            # Handle language model prefix (Eagle2.5 checkpoint has extra model. prefix)
+            if "language_model.model." in name:
+                name = name.replace("language_model.model.", "language_model.")
 
             # Handle LM head tie
             if self.config.text_config.tie_word_embeddings and "lm_head.weight" in name:
