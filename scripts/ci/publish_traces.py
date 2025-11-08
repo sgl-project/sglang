@@ -145,7 +145,7 @@ def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token):
     make_github_request(url, token, method="PATCH", data=data)
 
 
-def copy_trace_files(source_dir, target_base_path, is_vlm=False):
+def copy_trace_files(source_dir, target_base_path):
     """Copy trace files and return list of files to upload"""
     files_to_upload = []
 
@@ -171,7 +171,7 @@ def copy_trace_files(source_dir, target_base_path, is_vlm=False):
     return files_to_upload
 
 
-def publish_traces(traces_dir, run_id, run_number, is_vlm=False):
+def publish_traces(traces_dir, run_id, run_number):
     """Publish traces to GitHub repository in a single commit"""
     # Get environment variables
     token = os.getenv("GITHUB_TOKEN")
@@ -186,7 +186,7 @@ def publish_traces(traces_dir, run_id, run_number, is_vlm=False):
     target_base_path = f"traces/{run_id}"
 
     # Copy trace files
-    files_to_upload = copy_trace_files(traces_dir, target_base_path, is_vlm)
+    files_to_upload = copy_trace_files(traces_dir, target_base_path)
 
     if not files_to_upload:
         print("No trace files found to upload")
@@ -262,6 +262,11 @@ def main():
         description="Publish performance traces to GitHub repository"
     )
     parser.add_argument("--vlm", action="store_true", help="Process VLM model traces")
+    parser.add_argument(
+        "--traces-dir",
+        type=str,
+        help="Custom traces directory to publish (overrides --vlm)",
+    )
     args = parser.parse_args()
 
     # Get environment variables
@@ -276,7 +281,10 @@ def main():
         sys.exit(1)
 
     # Determine traces directory
-    if args.vlm:
+    if args.traces_dir:
+        traces_dir = args.traces_dir
+        print(f"Processing traces from custom directory: {traces_dir}")
+    elif args.vlm:
         traces_dir = "performance_profiles_vlms"
         print("Processing VLM model traces")
     else:
@@ -284,7 +292,7 @@ def main():
         print("Processing text model traces")
 
     # Publish traces
-    publish_traces(traces_dir, run_id, run_number, args.vlm)
+    publish_traces(traces_dir, run_id, run_number)
 
 
 if __name__ == "__main__":
