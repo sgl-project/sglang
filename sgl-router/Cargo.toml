@@ -129,6 +129,13 @@ lto = "fat"         # Full LTO for smaller binaries
 codegen-units = 1   # Better optimization, slower compile
 strip = true        # Strip debug symbols
 
+[profile.ci]
+inherits = "release"
+opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
+lto = "thin"        # Thin LTO - good balance
+codegen-units = 16  # More parallelization for faster builds
+strip = true
+
 [profile.dev]
 opt-level = 0
 debug = 1
