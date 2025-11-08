@@ -63,7 +63,7 @@ from sglang.srt.tracing.trace import (
     trace_slice_batch,
     trace_slice_end,
 )
-from sglang.srt.utils import get_int_env_var, require_mlp_sync
+from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -833,8 +833,6 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
-            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
-
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
@@ -843,14 +841,14 @@ class SchedulerDisaggregationDecodeMixin:
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
                     trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
-                    if prepare_mlp_sync_flag:
+                    if self.require_mlp_sync:
                         self._prepare_idle_batch_and_run(None)
                 else:
-                    if prepare_mlp_sync_flag:
+                    if self.require_mlp_sync:
                         self.prepare_mlp_sync_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
-            elif prepare_mlp_sync_flag:
+            elif self.require_mlp_sync:
                 batch, _ = self._prepare_idle_batch_and_run(None)
 
             queue_size = (
@@ -882,8 +880,6 @@ class SchedulerDisaggregationDecodeMixin:
             self.cur_batch = batch
             last_batch_in_queue = False
 
-            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
-
             batch_result = None
             if batch:
                 # Generate fake extend output.
@@ -893,7 +889,7 @@ class SchedulerDisaggregationDecodeMixin:
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
                     trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
-                    if prepare_mlp_sync_flag:
+                    if self.require_mlp_sync:
                         batch_, batch_result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
                         )
@@ -901,13 +897,13 @@ class SchedulerDisaggregationDecodeMixin:
                             self.result_queue.append((batch_.copy(), batch_result))
                             last_batch_in_queue = True
                 else:
-                    if prepare_mlp_sync_flag:
+                    if self.require_mlp_sync:
                         self.prepare_mlp_sync_batch(batch)
                     batch_result = self.run_batch(batch)
                     self.result_queue.append((batch.copy(), batch_result))
                     last_batch_in_queue = True
 
-            elif prepare_mlp_sync_flag:
+            elif self.require_mlp_sync:
                 batch, batch_result = self._prepare_idle_batch_and_run(
                     None, delay_process=True
                 )

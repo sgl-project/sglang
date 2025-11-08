@@ -523,6 +523,9 @@ class Scheduler(
         # Init overlap
         self.init_overlap()
 
+        # Init mlp sync flag
+        self.require_mlp_sync = require_mlp_sync(server_args)
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -1667,7 +1670,7 @@ class Scheduler(
 
         new_batch = self.get_new_batch_prefill()
 
-        need_dp_attn_preparation = require_mlp_sync(self.server_args)
+        need_dp_attn_preparation = self.require_mlp_sync
 
         if need_dp_attn_preparation and not self.spec_algorithm.is_none():
             # In speculative decoding, prefill batches and decode batches cannot be processed in the same DP attention group.
