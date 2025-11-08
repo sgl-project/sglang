@@ -185,6 +185,8 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        for name, param in params_dict.items():
+            print(f"DEBUG: Param: {name} -> {param}")
 
         for name, loaded_weight in weights:
             # Skip rotary embeddings
