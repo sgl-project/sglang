@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
@@ -9,15 +9,16 @@ from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.scheduler import Scheduler
 
 
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
-    dp_size,
+    dp_size: int,
     attn_tp_size: int,
-    tp_group,
-    get_idle_batch,
+    tp_group: GroupCoordinator,
+    get_idle_batch: Callable[[], ScheduleBatch],
     disable_cuda_graph: bool,
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
