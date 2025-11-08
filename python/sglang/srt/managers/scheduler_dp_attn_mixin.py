@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 import torch
@@ -11,6 +12,59 @@ from sglang.srt.utils.common import require_mlp_tp_gather
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.scheduler import Scheduler
+
+
+@dataclass
+class MLPSyncBatchInfo:
+    dp_size: int
+    tp_size: int
+
+    num_tokens: int
+    num_tokens_for_logprob: int
+    can_cuda_graph: bool
+    is_extend_in_batch: bool
+    local_can_run_tbo: bool
+    local_forward_mode: int
+
+    # some gathered elements
+    tp0_info: torch.Tensor = None
+    global_num_tokens: list[int] = None
+    global_num_tokens_for_logprob: list[int] = None
+
+    def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
+        return torch.tensor(
+            [
+                self.num_tokens,
+                self.num_tokens_for_logprob,
+                int(self.can_cuda_graph),
+                int(self.is_extend_in_batch),
+                int(self.local_can_run_tbo),
+                self.local_forward_mode,
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+    def all_gather(self, device, group: torch.distributed.ProcessGroup):
+        local_info_tensor = self._get_local_tensor(device=device)
+        global_info_tensor = torch.empty(
+            (self.dp_size, self.tp_size, 6),
+            dtype=torch.int64,
+            device=device,
+        )
+
+        torch.distributed.all_gather_into_tensor(
+            global_info_tensor.flatten(),
+            local_info_tensor,
+            group=group,
+        )
+
+        tp0_info = global_info_tensor[:, 0, :]
+        self.tp0_info = tp0_info
+        self.global_num_tokens = tp0_info[:, 0].tolist()
+        self.global_num_tokens_for_logprob = tp0_info[:, 1].tolist()
+        self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
+        self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
 
 
 def prepare_mlp_sync_batch_raw(
@@ -61,39 +115,25 @@ def prepare_mlp_sync_batch_raw(
         group = tp_group.cpu_group
         device = "cpu"
 
-    local_info = torch.tensor(
-        [
-            num_tokens,
-            can_cuda_graph,
-            num_tokens_for_logprob,
-            is_extend_in_batch,
-            *tbo_preparer.prepare_all_gather(
-                local_batch,
-            ),
-        ],
-        dtype=torch.int64,
-        device=device,
+    local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
+
+    mlp_sync_info = MLPSyncBatchInfo(
+        dp_size=dp_size,
+        tp_size=attn_tp_size,
+        num_tokens=num_tokens,
+        num_tokens_for_logprob=num_tokens_for_logprob,
+        can_cuda_graph=can_cuda_graph,
+        is_extend_in_batch=is_extend_in_batch,
+        local_can_run_tbo=local_can_run_tbo,
+        local_forward_mode=local_forward_mode,
     )
-    global_info = torch.empty(
-        (dp_size, attn_tp_size, 6),
-        dtype=torch.int64,
-        device=device,
-    )
-    torch.distributed.all_gather_into_tensor(
-        global_info.flatten(),
-        local_info,
-        group=group,
-    )
-    global_num_tokens = global_info[:, 0, 0].tolist()
-    can_cuda_graph = min(global_info[:, 0, 1].tolist())
-    global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
-    is_extend_in_batch = global_info[:, 0, 3].tolist()
+    mlp_sync_info.all_gather(device=device, group=group)
 
     tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
-        global_info[:, :, 4:6]
+        mlp_sync_info.tp0_info[:, 4:6],
     )
 
-    if local_batch is None and max(global_num_tokens) > 0:
+    if local_batch is None and max(mlp_sync_info.global_num_tokens) > 0:
         local_batch = get_idle_batch()
 
     if local_batch is not None:
@@ -102,15 +142,17 @@ def prepare_mlp_sync_batch_raw(
             local_batch.global_num_tokens = [num_tokens]
             local_batch.global_num_tokens_for_logprob = [num_tokens_for_logprob]
         else:
-            local_batch.global_num_tokens = global_num_tokens
-            local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
-        local_batch.is_extend_in_batch = any(is_extend_in_batch)
+            local_batch.global_num_tokens = mlp_sync_info.global_num_tokens
+            local_batch.global_num_tokens_for_logprob = (
+                mlp_sync_info.global_num_tokens_for_logprob
+            )
+        local_batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         local_batch.tbo_split_seq_index = tbo_split_seq_index
         local_batch.global_forward_mode = global_forward_mode
 
         # Check forward mode for cuda graph
         if not disable_cuda_graph:
-            local_batch.can_run_dp_cuda_graph = can_cuda_graph
+            local_batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
 
     return local_batch
 
