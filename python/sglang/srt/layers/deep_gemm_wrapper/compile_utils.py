@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
@@ -107,6 +108,7 @@ def _maybe_compile_deep_gemm_one_type_all(
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
+        start = time.time()
         _compile_deep_gemm_one_type_all(
             kernel_type=kernel_type,
             n=n,
