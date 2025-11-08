@@ -25,6 +25,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -89,13 +90,13 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, enable_sp: bool = False):
         if get_global_server_args().rl_on_policy_target == "fsdp":
             x = x.bfloat16()
 
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up, _ = self.gate_up_proj(x, allgather_input=enable_sp)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, enable_sp=enable_sp)
         return x
 
 
@@ -139,6 +140,7 @@ class Qwen2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.enable_sp = get_global_server_args().enable_sp
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -180,12 +182,16 @@ class Qwen2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        allgather_input: bool = False,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states, allgather_input=allgather_input)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(
+            attn_output,
+            enable_sp=self.enable_sp and forward_batch.forward_mode.is_extend(),
+        )
         return output
 
 
@@ -231,6 +237,9 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.layer_id = layer_id
+        self.layer_num = config.num_hidden_layers
+        self.enable_sp = get_global_server_args().enable_sp
 
     def forward(
         self,
@@ -245,15 +254,23 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        enable_sp = self.enable_sp and forward_batch.forward_mode.is_extend()
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            allgather_input=enable_sp and self.layer_id != 0,
         )
+
+        if enable_sp and self.layer_id == 0:
+            tensor_list_residual = list(
+                residual.tensor_split(get_tensor_model_parallel_world_size())
+            )
+            residual = tensor_list_residual[get_tensor_model_parallel_rank()]
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, enable_sp=enable_sp)
         return hidden_states, residual
 
 
@@ -270,6 +287,7 @@ class Qwen2Model(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.enable_sp = get_global_server_args().enable_sp
         self.pp_group = get_pp_group()
 
         if self.pp_group.is_first_rank:
@@ -378,6 +396,19 @@ class Qwen2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+
+        if self.enable_sp and forward_batch.forward_mode.is_extend():
+            allgather_size = list(hidden_states.size())
+            allgather_size[0] = (
+                allgather_size[0] * get_tensor_model_parallel_world_size()
+            )
+            allgather_hidden_states = torch.empty(
+                allgather_size, dtype=hidden_states.dtype, device=hidden_states.device
+            )
+            get_tp_group().all_gather_into_tensor(
+                allgather_hidden_states, hidden_states.contiguous()
+            )
+            hidden_states = allgather_hidden_states
 
         if len(aux_hidden_states) == 0:
             return hidden_states

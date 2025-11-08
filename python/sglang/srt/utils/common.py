@@ -2763,7 +2763,11 @@ def require_gathered_buffer(server_args):
 
 
 def require_mlp_sync(server_args):
-    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+    return (
+        server_args.enable_dp_attention
+        or require_gathered_buffer(server_args)
+        or server_args.enable_sp
+    )
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:

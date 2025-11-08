@@ -115,26 +115,64 @@ class LayerScatterModes:
     mlp_mode: ScatterMode
     middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
+    is_layer_sparse: bool
 
     @classmethod
     def init_new(cls, **kwargs):
+        if "enable_sp" in kwargs:
+            enable_sp = kwargs["enable_sp"]
+            del kwargs["enable_sp"]
+        else:
+            enable_sp = False
+
         context = _LayerModeComputationContext(**kwargs)
+        enable_dense_sp = enable_sp and not context.is_layer_sparse
+        is_layer_sparse = context.is_layer_sparse
+        mlp_mode = cls._compute_mlp_mode(context, enable_dense_sp)
         return cls(
-            layer_input_mode=cls._compute_layer_input_mode(context),
-            attn_mode=ScatterMode.TP_ATTN_FULL,
-            mlp_mode=cls._compute_mlp_mode(context),
-            middle_residual_mode=cls._compute_middle_residual_mode(context),
-            layer_output_mode=cls._compute_layer_output_mode(context),
+            layer_input_mode=cls._compute_layer_input_mode(context, enable_dense_sp),
+            attn_mode=cls._compute_attn_input_mode(context, mlp_mode, enable_dense_sp),
+            mlp_mode=mlp_mode,
+            middle_residual_mode=cls._compute_middle_residual_mode(mlp_mode),
+            layer_output_mode=cls._compute_layer_output_mode(context, mlp_mode),
+            is_layer_sparse=is_layer_sparse,
         )
 
     @classmethod
-    def _compute_layer_input_mode(cls, context: _LayerModeComputationContext):
+    def _compute_layer_input_mode(
+        cls, context: _LayerModeComputationContext, enable_dense_sp: bool
+    ):
         if context.layer_id == 0:
             return ScatterMode.model_input_output()
-        return cls._compute_layer_output_mode(context.previous_layer())
+        mlp_mode_previous = cls._compute_mlp_mode(
+            context.previous_layer(), enable_dense_sp
+        )
+        return cls._compute_layer_output_mode(
+            context.previous_layer(), mlp_mode_previous
+        )
 
     @classmethod
-    def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
+    def _compute_attn_input_mode(
+        cls,
+        context: _LayerModeComputationContext,
+        mlp_mode: ScatterMode,
+        enable_dense_sp: bool,
+    ):
+        if not enable_dense_sp:
+            return ScatterMode.TP_ATTN_FULL
+
+        if context.layer_id == 0:
+            return ScatterMode.model_input_output()
+        if mlp_mode == ScatterMode.SCATTERED:
+            return ScatterMode.SCATTERED
+        if mlp_mode == ScatterMode.FULL:
+            return ScatterMode.TP_ATTN_FULL
+        raise NotImplementedError
+
+    @classmethod
+    def _compute_mlp_mode(
+        cls, context: _LayerModeComputationContext, enable_dense_sp: bool
+    ):
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
@@ -145,6 +183,9 @@ class LayerScatterModes:
                 )
                 else ScatterMode.FULL
             )
+
+        if enable_dense_sp:
+            return ScatterMode.SCATTERED
         else:
             return (
                 ScatterMode.SCATTERED
@@ -153,8 +194,7 @@ class LayerScatterModes:
             )
 
     @classmethod
-    def _compute_middle_residual_mode(cls, context: _LayerModeComputationContext):
-        mlp_mode = cls._compute_mlp_mode(context)
+    def _compute_middle_residual_mode(cls, mlp_mode: ScatterMode):
         if mlp_mode == ScatterMode.SCATTERED:
             return ScatterMode.SCATTERED
         if mlp_mode == ScatterMode.FULL:
@@ -162,8 +202,9 @@ class LayerScatterModes:
         raise NotImplementedError
 
     @classmethod
-    def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
-        mlp_mode = cls._compute_mlp_mode(context)
+    def _compute_layer_output_mode(
+        cls, context: _LayerModeComputationContext, mlp_mode: ScatterMode
+    ):
         if context.layer_id == context.num_layers - 1:
             return ScatterMode.model_input_output()
         if mlp_mode == ScatterMode.SCATTERED:
@@ -186,6 +227,7 @@ class LayerCommunicator:
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
+        enable_sp: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -193,7 +235,9 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
 
-        self._context = CommunicateContext.init_new()
+        self._context = CommunicateContext.init_new(
+            enable_sp, self.layer_scatter_modes.is_layer_sparse
+        )
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
@@ -386,13 +430,14 @@ class CommunicateContext:
     attn_tp_size: int
     attn_dp_size: int
     tp_size: int
+    sp_size: int
     cache = None
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
 
     @classmethod
-    def init_new(cls):
+    def init_new(cls, enable_sp: bool = False, is_sparse: bool = False):
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         attn_dp_size = get_attention_dp_size()
@@ -403,12 +448,16 @@ class CommunicateContext:
             # TODO: support --moe-dense-tp-size > 1
             ScatterMode.FULL: tp_size,
         }
+        sp_size = -1
+        if enable_sp:
+            sp_size = 0 if is_sparse else tp_size
         return cls(
             process_group_sizes=process_group_sizes,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_dp_size=attn_dp_size,
             tp_size=tp_size,
+            sp_size=sp_size,
         )
 
 
@@ -425,6 +474,8 @@ class CommunicateSimpleFn:
         if (input_mode == ScatterMode.SCATTERED) and (
             output_mode == ScatterMode.TP_ATTN_FULL
         ):
+            if context.sp_size == 0:
+                return CommunicateSimpleFn._trivial
             return CommunicateSimpleFn._scattered_to_tp_attn_full
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
@@ -475,6 +526,31 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
+        ):
+            return CommunicateWithAllReduceAndLayerNormFn._simple
+
+        if (
+            context.sp_size > 0
+            and context.is_same_group_size(
+                residual_output_mode, hidden_states_output_mode
+            )
+            and context.is_same_group_size(
+                hidden_states_input_mode, residual_input_mode
+            )
+            and residual_output_mode == ScatterMode.SCATTERED
+            and residual_input_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            return CommunicateWithAllReduceAndLayerNormFn._scatter
+
+        if (
+            context.is_same_group_size(
+                hidden_states_input_mode, hidden_states_output_mode
+            )
+            and context.is_same_group_size(residual_input_mode, residual_output_mode)
+            and context.is_same_group_size(
+                hidden_states_input_mode, residual_input_mode
+            )
+            and hidden_states_output_mode == ScatterMode.SCATTERED
         ):
             return CommunicateWithAllReduceAndLayerNormFn._simple
 
@@ -600,6 +676,21 @@ class CommunicateWithAllReduceAndLayerNormFn:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    @staticmethod
+    def _scatter(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layernorm: torch.nn.Module,
+        context: CommunicateContext,
+    ):
+        tensor_list_residual = list(residual.tensor_split(context.attn_tp_size))
+        residual = tensor_list_residual[context.attn_tp_rank]
+        hidden_states, residual = CommunicateWithAllReduceAndLayerNormFn._simple(
+            hidden_states, residual, forward_batch, layernorm, context
+        )
         return hidden_states, residual
 
 
