@@ -57,7 +57,8 @@ DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
 # NVFP4 models
-DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-R1-0528-FP4"
+DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
+DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4 = "nvidia/Qwen3-30B-A3B-FP4"
 
 # FP8 models
 DEFAULT_MODEL_NAME_FOR_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
@@ -70,6 +71,10 @@ DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8 = (
 )
 DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8 = "Qwen/Qwen3-1.7B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = "gaunernst/DeepSeek-V2-Lite-Chat-FP8"
+
+# MXFP4 models
+# Standard MXFP4 MoE test model
+DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE = "openai/gpt-oss-20b"
 
 # W8A8 models
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"
@@ -806,6 +811,8 @@ def get_benchmark_args(
     device="auto",
     pd_separated: bool = False,
     lora_name=None,
+    lora_request_distribution="uniform",
+    lora_zipf_alpha=1.5,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -834,6 +841,8 @@ def get_benchmark_args(
         apply_chat_template=False,
         profile=None,
         lora_name=lora_name,
+        lora_request_distribution=lora_request_distribution,
+        lora_zipf_alpha=lora_zipf_alpha,
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
@@ -946,7 +955,6 @@ def run_score_benchmark(
     )
 
     async def _run_benchmark():
-
         # Load tokenizer for generating test data
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
@@ -1553,7 +1561,7 @@ def send_generate_requests(base_url: str, num_requests: int) -> List[str]:
                 "text": prompt,
                 "sampling_params": {
                     "temperature": 0,
-                    "max_new_tokens": 50,
+                    "max_new_tokens": 500,
                 },
             },
         )
@@ -1580,7 +1588,7 @@ async def send_concurrent_generate_requests(
                     "text": prompt,
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 50,
+                        "max_new_tokens": 500,
                     },
                 },
             ) as response:
@@ -1604,7 +1612,7 @@ async def send_concurrent_generate_requests_with_custom_params(
                 """,
         "sampling_params": {
             "temperature": 0,
-            "max_new_tokens": 50,
+            "max_new_tokens": 500,
         },
     }
 
