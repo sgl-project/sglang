@@ -587,7 +587,7 @@ class DecodePreallocQueue:
             need_space_for_single_req,
         )
 
-        # Note: if the last fake extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
+        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
         if (
             self.scheduler.last_batch
