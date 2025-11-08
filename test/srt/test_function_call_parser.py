@@ -2612,5 +2612,136 @@ class TestJsonArrayParser(unittest.TestCase):
         self.assertEqual(total_calls, 3, "Should have parsed exactly 3 tool calls")
 
 
+class TestGptOssDetector(unittest.TestCase):
+    """Test GptOssDetector for Harmony format parsing."""
+
+    def setUp(self):
+        from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+
+        # Create sample tools for testing
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "Location to get weather for",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "description": "Temperature unit",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = GptOssDetector()
+
+    def test_streaming_with_empty_deltas(self):
+        """Test that empty deltas don't cause parsing errors (SPEC_V2 scenario)."""
+        # Simulate streaming chunks including empty deltas
+        chunks = [
+            "<|start|>assistant",
+            "<|channel|>commentary to=",
+            "functions.get_weather",
+            "<|constrain|>json<|message|>",
+            "",  # Empty delta (common with SPEC_V2)
+            '{"location": "London"',
+            "",  # Another empty delta
+            ', "unit": "celsius"}',
+            "<|call|>",
+        ]
+
+        results = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            results.append(result)
+
+        # Verify that we got tool calls without errors
+        all_calls = [call for result in results for call in result.calls]
+        self.assertGreater(
+            len(all_calls), 0, "Should have parsed at least one tool call"
+        )
+
+        # Verify the tool call content
+        self.assertEqual(all_calls[0].name, "get_weather")
+        params = json.loads(all_calls[0].parameters)
+        self.assertEqual(params["location"], "London")
+        self.assertEqual(params["unit"], "celsius")
+
+    def test_streaming_complete_tool_call(self):
+        """Test parsing a complete Harmony format tool call in chunks."""
+        # Complete tool call in multiple chunks
+        chunk1 = "<|start|>assistant<|channel|>commentary to=functions.get_weather"
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+
+        chunk2 = '<|constrain|>json<|message|>{"location": "New York", "unit": "fahrenheit"}<|call|>'
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+
+        # Collect all calls
+        all_calls = result1.calls + result2.calls
+        self.assertEqual(len(all_calls), 1, "Should have parsed exactly one tool call")
+
+        # Verify the tool call
+        self.assertEqual(all_calls[0].name, "get_weather")
+        params = json.loads(all_calls[0].parameters)
+        self.assertEqual(params["location"], "New York")
+        self.assertEqual(params["unit"], "fahrenheit")
+
+    def test_streaming_with_normal_text(self):
+        """Test that normal text in final channel is properly extracted."""
+        # Use the Harmony final channel for normal text
+        chunks = [
+            "<|start|>assistant<|channel|>final<|message|>",
+            "Let me check the weather for you.",
+            "<|return|>",
+        ]
+
+        normal_texts = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.normal_text:
+                normal_texts.append(result.normal_text)
+
+        # Verify normal text was extracted
+        full_text = "".join(normal_texts)
+        self.assertGreater(len(full_text), 0, "Should have normal text")
+        self.assertIn("weather", full_text.lower())
+
+    def test_mixed_normal_and_tool_calls(self):
+        """Test parsing both normal text and tool calls in sequence."""
+        # First send a tool call, then normal text
+        chunks = [
+            "<|start|>assistant<|channel|>commentary to=functions.get_weather",
+            '<|constrain|>json<|message|>{"location": "Paris"}<|call|>',
+            "<|start|>assistant<|channel|>final<|message|>",
+            "The weather looks nice!<|return|>",
+        ]
+
+        all_calls = []
+        normal_texts = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+            if result.normal_text:
+                normal_texts.append(result.normal_text)
+
+        # Verify tool call was parsed
+        self.assertEqual(len(all_calls), 1, "Should have one tool call")
+        self.assertEqual(all_calls[0].name, "get_weather")
+
+        # Verify normal text was also extracted
+        full_text = "".join(normal_texts)
+        self.assertIn("nice", full_text.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

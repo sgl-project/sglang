@@ -1045,16 +1045,16 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
-            # Use JSON detector directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(
-                request.tool_choice, ToolChoice
-            ):
-                parser_dict[index] = JsonArrayParser()
-            else:
+            # Always use the model-specific parser to match the model's output format.
+            # JsonArrayParser is only used when no tool_call_parser is configured (generic models)
+            if self.tool_call_parser:
                 parser_dict[index] = FunctionCallParser(
                     tools=request.tools,
                     tool_call_parser=self.tool_call_parser,
                 )
+            else:
+                # Fallback to JsonArrayParser for models without specific parser
+                parser_dict[index] = JsonArrayParser()
 
         parser = parser_dict[index]
 
