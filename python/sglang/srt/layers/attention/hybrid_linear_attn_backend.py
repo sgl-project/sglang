@@ -634,11 +634,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             assert is_spec_decoding
             last_steps = mamba_cache_params.last_steps
-            has_initial_states = torch.ones(
-                seq_len // forward_batch.spec_info.draft_token_num,
-                dtype=torch.bool,
-                device=forward_batch.input_ids.device,
-            )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
