@@ -99,6 +99,7 @@ class Eagle2_5_VLConfig(PretrainedConfig):
         vision_config=None,
         text_config=None,
         image_token_index=151669,
+        video_token_id=151670,
         downsample_ratio=0.5,
         dynamic_image_size=True,
         force_image_size=224,
@@ -118,13 +119,18 @@ class Eagle2_5_VLConfig(PretrainedConfig):
             self.vision_config = self.sub_configs["vision_config"](**vision_config)
         elif vision_config is None:
             self.vision_config = self.sub_configs["vision_config"]()
+        else:
+            self.vision_config = vision_config
 
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
+        else:
+            self.text_config = text_config
 
         self.image_token_index = image_token_index
+        self.video_token_id = video_token_id
         self.downsample_ratio = downsample_ratio
         self.dynamic_image_size = dynamic_image_size
         self.force_image_size = force_image_size

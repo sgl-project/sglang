@@ -107,7 +107,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         # Vision projection
         self.visual_projection = Eagle2_5_VLVisionMLP(
             in_features=config.vision_config.hidden_size,
-            hidden_features=config.vision_config.hidden_size,
+            hidden_features=config.vision_config.intermediate_size,
             out_features=config.text_config.hidden_size,
             hidden_act=config.vision_config.hidden_act,
             quant_config=quant_config,
@@ -117,7 +117,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         # Pooler for embedding extraction
         self.pooler = Pooler(
             pooling_type=PoolingType.LAST,
-            normalize=True,  # TODO
+            normalize=True,
         )
 
         # LM Head
@@ -129,37 +129,26 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         )
 
         # Logits processor
-        self.logits_processor = LogitsProcessor(
-            config.text_config.vocab_size,
-            config.text_config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("logits_processor", prefix),
-        )
+        self.logits_processor = LogitsProcessor(self.config)
 
         # Special tokens
         self.image_token_index = config.image_token_index
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Extract image features using SigLIP vision model."""
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.vision_model.dtype
-        )
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        image_embeds = self.vision_model(pixel_values, grid_thw=image_grid_thw)
+        # Concatenate all image features
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
+        # SigLIP doesn't use grid_thw, it processes images directly
+        image_embeds = self.vision_model(pixel_values)
         image_embeds = self.visual_projection(image_embeds)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Extract video features using SigLIP vision model."""
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.vision_model.dtype
-        )
-        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
-        video_embeds = self.vision_model(pixel_values, grid_thw=video_grid_thw)
+        # Concatenate all video frame features
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
+        # SigLIP doesn't use grid_thw, treat video frames like images
+        video_embeds = self.vision_model(pixel_values)
         video_embeds = self.visual_projection(video_embeds)
         return video_embeds
 
@@ -191,7 +180,9 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping."""
         stacked_params_mapping = [
-            # Add any stacked parameter mappings if needed
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "up_proj", 1),
+            ("gate_up_proj", "gate_proj", 0),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
@@ -209,6 +200,10 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+
+                # Skip loading extra bias for GPTQ models
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -216,11 +211,12 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             else:
                 # Handle regular parameters
                 if "visual" in name:
-                    # Adapt vision model parameter names
+                    # Adapt vision model parameter names if needed
                     name = name.replace("vision_model.vision_model.", "vision_model.")
-                elif "language_model" in name:
-                    # Language model parameters
-                    pass
+
+                # Skip loading extra bias for GPTQ models
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
 
                 try:
                     param = params_dict[name]
