@@ -11,7 +11,7 @@ This implements NVIDIA's Eagle2.5-8B vision-language model which combines:
 """
 
 import logging
-from typing import Iterable, List, Optional, Tuple, Type, TypedDict
+from typing import Iterable, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -24,7 +24,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
@@ -34,35 +34,13 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 
-# === Vision Inputs === #
-
-
-class Eagle2_5_VLImageInputs(TypedDict):
-    pixel_values: torch.Tensor
-    """Shape: `(num_patches, num_channels * patch_size * patch_size)`"""
-
-    image_grid_thw: torch.Tensor
-    """Shape: `(num_images, 3)` - (grid_t, grid_h, grid_w) format"""
-
-    image_embeds: torch.Tensor
-    """Shape: `(num_images, num_patches, hidden_size)` - pre-computed embeddings"""
-
-
-class Eagle2_5_VLVideoInputs(TypedDict):
-    pixel_values_videos: torch.Tensor
-    """Shape: `(num_patches, num_channels * temporal_patch_size * patch_size * patch_size)`"""
-
-    video_grid_thw: torch.Tensor
-    """Shape: `(num_videos, 3)` - (grid_t, grid_h, grid_w) format"""
-
-    video_embeds: torch.Tensor
-    """Shape: `(num_videos, num_patches, hidden_size)` - pre-computed embeddings"""
+# === Vision Components === #
 
 
 # === Vision Projection === #
 
 
-class Eagle2_5_VLMLP(nn.Module):
+class Eagle2_5_VLVisionMLP(nn.Module):
     """MLP for projecting vision features to language space."""
 
     def __init__(
@@ -127,7 +105,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         )
 
         # Vision projection
-        self.visual_projection = Eagle2_5_VLMLP(
+        self.visual_projection = Eagle2_5_VLVisionMLP(
             in_features=config.vision_config.hidden_size,
             hidden_features=config.vision_config.hidden_size,
             out_features=config.text_config.hidden_size,
@@ -161,97 +139,33 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         # Special tokens
         self.image_token_index = config.image_token_index
 
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        """Extract image features using SigLIP vision model."""
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.vision_model.dtype
+        )
+        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        image_embeds = self.vision_model(pixel_values, grid_thw=image_grid_thw)
+        image_embeds = self.visual_projection(image_embeds)
+        return image_embeds
+
+    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        """Extract video features using SigLIP vision model."""
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.vision_model.dtype
+        )
+        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        video_embeds = self.vision_model(pixel_values, grid_thw=video_grid_thw)
+        video_embeds = self.visual_projection(video_embeds)
+        return video_embeds
+
     @property
     def device(self) -> torch.device:
         return self.language_model.device
-
-    def _parse_and_validate_multimodal_inputs(
-        self, multimodal_inputs: MultimodalInputs
-    ):
-        """Parse and validate multimodal inputs for Eagle2.5."""
-        # Handle image inputs
-        image_inputs = []
-        if (
-            hasattr(multimodal_inputs, "pixel_values")
-            and multimodal_inputs.pixel_values is not None
-        ):
-            image_inputs.append(
-                Eagle2_5_VLImageInputs(
-                    pixel_values=multimodal_inputs.pixel_values,
-                    image_grid_thw=multimodal_inputs.image_grid_thw,
-                    image_embeds=None,
-                )
-            )
-
-        # Handle video inputs
-        video_inputs = []
-        if (
-            hasattr(multimodal_inputs, "pixel_values_videos")
-            and multimodal_inputs.pixel_values_videos is not None
-        ):
-            video_inputs.append(
-                Eagle2_5_VLVideoInputs(
-                    pixel_values_videos=multimodal_inputs.pixel_values_videos,
-                    video_grid_thw=multimodal_inputs.video_grid_thw,
-                    video_embeds=None,
-                )
-            )
-
-        return image_inputs, video_inputs
-
-    def _encode_vision(
-        self,
-        image_inputs: List[Eagle2_5_VLImageInputs],
-        video_inputs: List[Eagle2_5_VLVideoInputs],
-    ):
-        """Encode vision inputs through SigLIP and project to language space."""
-        all_vision_embeds = []
-        all_vision_masks = []
-
-        # Process images
-        for img_input in image_inputs:
-            if img_input.get("image_embeds") is not None:
-                vision_embeds = img_input["image_embeds"]
-            else:
-                # Encode through vision model
-                pixel_values = img_input["pixel_values"]
-                vision_outputs = self.vision_model(pixel_values)
-                vision_embeds = self.visual_projection(vision_outputs)
-
-            # Create attention mask (all tokens are valid for vision)
-            batch_size, seq_len, _ = vision_embeds.shape
-            vision_mask = torch.ones(
-                batch_size, seq_len, dtype=torch.bool, device=vision_embeds.device
-            )
-
-            all_vision_embeds.append(vision_embeds)
-            all_vision_masks.append(vision_mask)
-
-        # Process videos (similar to images but with temporal dimension)
-        for vid_input in video_inputs:
-            if vid_input.get("video_embeds") is not None:
-                vision_embeds = vid_input["video_embeds"]
-            else:
-                # Encode through vision model
-                pixel_values = vid_input["pixel_values_videos"]
-                vision_outputs = self.vision_model(pixel_values)
-                vision_embeds = self.visual_projection(vision_outputs)
-
-            # Create attention mask
-            batch_size, seq_len, _ = vision_embeds.shape
-            vision_mask = torch.ones(
-                batch_size, seq_len, dtype=torch.bool, device=vision_embeds.device
-            )
-
-            all_vision_embeds.append(vision_embeds)
-            all_vision_masks.append(vision_mask)
-
-        if all_vision_embeds:
-            vision_embeds = torch.cat(all_vision_embeds, dim=0)
-            vision_masks = torch.cat(all_vision_masks, dim=0)
-            return vision_embeds, vision_masks
-
-        return None, None
 
     def forward(
         self,
@@ -261,26 +175,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         get_embedding: bool = False,
     ) -> torch.Tensor:
         """Forward pass for Eagle2.5 VLM."""
-
-        # Parse multimodal inputs
-        multimodal_inputs = forward_batch.multimodal_inputs
-        if multimodal_inputs:
-            image_inputs, video_inputs = self._parse_and_validate_multimodal_inputs(
-                multimodal_inputs
-            )
-
-            # Encode vision inputs
-            vision_embeds, vision_masks = self._encode_vision(
-                image_inputs, video_inputs
-            )
-
-            # Replace image tokens with vision embeddings
-            if vision_embeds is not None:
-                input_ids, positions = self._replace_image_tokens(
-                    input_ids, positions, vision_embeds, vision_masks, forward_batch
-                )
-
-        # Language model forward pass
+        # Use standard SGLang multimodal embedding routine
         return general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -292,29 +187,6 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             lm_head=self.lm_head,
             pooler=self.pooler,
         )
-
-    def _replace_image_tokens(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        vision_embeds: torch.Tensor,
-        vision_masks: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Replace image tokens in input_ids with vision embeddings.
-        This follows the multimodal embedding routine pattern used in other VLMs.
-        """
-        # Find image token positions and replace with vision embeddings
-        image_token_mask = input_ids == self.image_token_index
-
-        if image_token_mask.any():
-            # This is a simplified version - in practice, this would need to handle
-            # the complex logic of inserting vision embeddings at the correct positions
-            # while maintaining proper attention masks and positions
-            pass
-
-        return input_ids, positions
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping."""
