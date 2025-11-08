@@ -201,7 +201,6 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
             hidden_dim,
             num_tokens);
       } else {
-        // hidden_dim % 4 == 0
         per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
@@ -230,7 +229,6 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
             hidden_dim,
             num_tokens);
       } else {
-        // hidden_dim % 4 == 0
         per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 4><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
