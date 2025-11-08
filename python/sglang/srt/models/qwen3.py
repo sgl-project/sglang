@@ -32,7 +32,14 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, supports_custom_op
 
-if is_npu() and supports_custom_op() and get_global_server_args().enable_torch_compile:
+if (
+    is_npu()
+    and supports_custom_op()
+    and (
+        get_global_server_args().enable_torch_compile
+        or get_global_server_args().enable_piecewise_npu_graph_decode
+    )
+):
     from sglang.srt._custom_ops import get_cmo_stream, wait_cmo_stream
 else:
     from sglang.srt.utils import get_cmo_stream, wait_cmo_stream

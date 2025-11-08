@@ -115,6 +115,9 @@ from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
+from sglang.srt.model_executor.piecewise_npu_graph_runner_decode import (
+    PiecewiseNPUGraphRunnerDecode,
+)
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -477,6 +480,7 @@ class ModelRunner:
             self.init_cublas()
             self.init_attention_backend()
             self.init_device_graphs()
+
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
@@ -1989,7 +1993,11 @@ class ModelRunner:
             lambda: CudaGraphRunner,
             {
                 "cpu": CPUGraphRunner,
-                "npu": NPUGraphRunner,
+                "npu": (
+                    PiecewiseNPUGraphRunnerDecode
+                    if self.server_args.enable_piecewise_npu_graph_decode
+                    else NPUGraphRunner
+                ),
             },
         )
         self.graph_runner = graph_runners[self.device](self)

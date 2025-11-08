@@ -1385,7 +1385,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         ):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
+    # @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _forward_native(
         self,
         positions: torch.Tensor,
