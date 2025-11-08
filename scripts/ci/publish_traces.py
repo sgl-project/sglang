@@ -262,6 +262,7 @@ def main():
         description="Publish performance traces to GitHub repository"
     )
     parser.add_argument("--vlm", action="store_true", help="Process VLM model traces")
+    parser.add_argument("--profile-dir", type=str, help="Custom profile directory to publish")
     args = parser.parse_args()
 
     # Get environment variables
@@ -276,7 +277,10 @@ def main():
         sys.exit(1)
 
     # Determine traces directory
-    if args.vlm:
+    if args.profile_dir:
+        traces_dir = args.profile_dir
+        print(f"Processing custom profile directory: {traces_dir}")
+    elif args.vlm:
         traces_dir = "performance_profiles_vlms"
         print("Processing VLM model traces")
     else:
