@@ -5,8 +5,9 @@ import triton  # Added import
 import triton.testing  # Added import
 from transformers import AutoConfig
 
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo, CutlassMoEType
+from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput

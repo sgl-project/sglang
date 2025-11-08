@@ -24,11 +24,8 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.moe.moe_runner.cutlass import (
-    CutlassMoEParams,
-    CutlassMoeQuantInfo,
-    CutlassMoEType,
-)
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -1591,6 +1588,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         forward_shared_experts=None,
         alt_stream=None,
     ) -> CombineInput:
+
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
