@@ -649,7 +649,7 @@ def _causal_conv1d_update_kernel(
     if IS_SPEC_DECODING:
         last_step_idx = tl.load(last_steps_ptr + conv_state_batch_coord).to(tl.int64)
 
-    # last_step_idx is either 0 (non-spec-decoding or first verify after 1st target extend) or it is spec decoding with last step index
+    # last_step_idx is either 0 (non-spec-decoding or first verify after 1st target extend) or the correct last step index for the previous round of target verify for the current seq
     conv_states_base = (
         conv_state_ptr
         + (conv_state_batch_coord * stride_conv_state_seq)

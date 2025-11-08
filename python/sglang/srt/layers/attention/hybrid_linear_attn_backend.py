@@ -645,10 +645,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = (
-                mixed_qkv.view(batch_size, draft_token_num, -1)
-                .transpose(1, 2)
-            )
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -661,9 +660,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = (
-                mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
-            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv.transpose(0, 1),
@@ -714,8 +711,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             if is_spec_decoding:
+                # ssm_states is a tensor of shape [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                # for extend, we only need to use the main state (the first draft token). after that, the next verify will use the main state (the first draft token) and calculate the next temporal state and conv state.
                 recurrent_state = ssm_states[cache_indices, 0]
             else:
+                # ssm_states is a tensor of shape [num_layers, size + 1, HV, K, V]
                 recurrent_state = ssm_states[cache_indices]
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=query,
@@ -731,6 +731,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             if is_spec_decoding:
+                # for extend, we only need to use the main state (the first draft token). after that, the next verify will use the main state (the first draft token) and calculate the next temporal state and conv state.
                 ssm_states[cache_indices, 0] = last_recurrent_state
             else:
                 ssm_states[cache_indices] = last_recurrent_state
@@ -963,7 +964,9 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
 
-    def update_mamba_state_after_mtp_verify(self, accepted_indices: torch.Tensor, model):
+    def update_mamba_state_after_mtp_verify(
+        self, accepted_indices: torch.Tensor, model
+    ):
         request_number = accepted_indices.shape[0]
 
         state_indices_tensor = (

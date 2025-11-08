@@ -439,7 +439,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
             if IS_SPEC_DECODING:
                 last_step_idx = tl.load(last_steps_ptr + idx).to(tl.int64)
 
-             # last_step_idx is either 0 (non-spec-decoding or first verify after 1st target extend) or it is spec decoding with last step index
+            # last_step_idx is either 0 (non-spec-decoding or first verify after 1st target extend) or the correct last step index for the previous round of target verify for the current seq
             step_offset = last_step_idx * HV * K * V
             p_h0 = (
                 h0_source

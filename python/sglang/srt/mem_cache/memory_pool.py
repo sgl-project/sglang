@@ -149,8 +149,12 @@ class MambaPool:
 
         def at_layer_idx(self, layer: int):
             # do NOT slice last_steps b/c it does not have layer dimension
-            return type(self)(**{k: (v if k == "last_steps" else v[layer]) for k, v in vars(self).items()})
-
+            return type(self)(
+                **{
+                    k: (v if k == "last_steps" else v[layer])
+                    for k, v in vars(self).items()
+                }
+            )
 
     def __init__(
         self,
@@ -231,9 +235,13 @@ class MambaPool:
                     dtype=ssm_dtype,
                     device="cuda",
                 )
-                last_steps = torch.zeros(
-                    (size + 1), dtype=torch.int32, device="cuda"
-                )
+                # Last step indices for spec decoding:
+                # - each seq has a last step index, and the last step index is the index of the last verified/accepted step of that seq
+                # - for each round of target verify for the same seq, it needs to use the last step index of the previous round to calculate the next temporal state and conv state:
+                #  - conv_state[last_step_index] (previous round's last verified/accepted conv state) -> conv_state[0:draft_token_num] (current round's conv state)
+                #  - temporal_state[last_step_index] (previous round's last verified/accepted temporal state) -> temporal_state[0:draft_token_num] (current round's temporal state)
+                # - for example, for a batch size of 3 and draft token num of 8, the last steps tensor might be [0, 4, 6]: meaning the last step index of the first seq is 0, the last step index of the second seq is 4, and the last step index of the third seq is 6
+                last_steps = torch.zeros((size + 1), dtype=torch.int32, device="cuda")
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
 
@@ -331,7 +339,9 @@ class MambaPool:
             :, src_index
         ]
         if isinstance(self.mamba_cache, MambaPool.SpeculativeState):
-            self.mamba_cache.last_steps[dst_index] = self.mamba_cache.last_steps[src_index]
+            self.mamba_cache.last_steps[dst_index] = self.mamba_cache.last_steps[
+                src_index
+            ]
         return
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
