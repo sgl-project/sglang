@@ -15,21 +15,13 @@ from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_npu,
-    load_audio,
-    load_image,
-    load_video,
-    logger,
-)
+from sglang.srt.multimodal.processors.video_utils import make_video_input
+from sglang.srt.utils import get_bool_env_var, is_npu, load_audio, load_image, logger
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
 )
-from sglang.srt.multimodal.processors.video_utils import make_video_input
-from sglang.srt.utils import is_npu, load_audio, load_image, logger
 
 _is_npu = is_npu()
 

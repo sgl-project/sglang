@@ -10,7 +10,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.qwen_vl import resize_image_async
+from sglang.srt.multimodal.processors.qwen_vl_video_worker import resize_image_async
 
 
 class DotsVLMImageProcessor(BaseMultimodalProcessor):
