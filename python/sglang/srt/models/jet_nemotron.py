@@ -1,11 +1,9 @@
-from collections import OrderedDict
 from collections.abc import Iterable
 from typing import cast
 
 import einops
 import torch
 import torch.nn as nn
-import transformers.activations
 
 from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
 from sglang.srt.layers.attention.fla.fused_recurrent import (
@@ -17,7 +15,12 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -26,45 +29,66 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.utils import add_prefix
+
+
+class DynamicShortConvolutionKernelGenerator(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        output_size: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        self.w1 = ColumnParallelLinear(
+            input_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("w1", prefix),
+        )
+
+        self.act = nn.SiLU()
+
+        self.w2 = ColumnParallelLinear(
+            hidden_size,
+            output_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("w2", prefix),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, _ = self.w1(x)
+        x = self.act(x)
+        x, _ = self.w2(x)
+        return x
 
 
 class DynamicShortConvolution(nn.Module):
     def __init__(
         self,
-        *,
         hidden_size: int,
         kernel_size: int,
         generator_input_size: int,
         generator_reduction: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
         generator_hidden_size = hidden_size // generator_reduction
 
-        self.kernel_generator = nn.Sequential(
-            OrderedDict(
-                [
-                    (
-                        "w1",
-                        nn.Linear(
-                            generator_input_size,
-                            generator_hidden_size,
-                            bias=False,
-                        ),
-                    ),
-                    ("act", nn.SiLU()),
-                    (
-                        "w2",
-                        nn.Linear(
-                            generator_hidden_size,
-                            hidden_size * kernel_size,
-                            bias=True,
-                        ),
-                    ),
-                ]
-            )
+        self.kernel_generator = DynamicShortConvolutionKernelGenerator(
+            input_size=generator_input_size,
+            hidden_size=generator_hidden_size,
+            output_size=hidden_size * kernel_size,
+            quant_config=quant_config,
+            prefix=add_prefix("kernel_generator", prefix),
         )
 
         self.hidden_size = hidden_size
@@ -165,8 +189,9 @@ class JetBlock(nn.Module):
     def __init__(
         self,
         config: JetNemotronConfig,
-        *,
         layer_id: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -184,19 +209,29 @@ class JetBlock(nn.Module):
         total_v_dim = num_heads * head_v_dim
         conv_size = jet_block_config.conv_size
 
-        # Submodules.
-        self.q_proj = nn.Linear(hidden_size, total_k_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, total_k_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, total_v_dim, bias=False)
-        self.a_proj = nn.Linear(hidden_size, num_heads, bias=False)
-        self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
-        self.g_proj = nn.Linear(hidden_size, total_v_dim, bias=False)
-        self.o_proj = nn.Linear(total_v_dim, hidden_size, bias=False)
+        self.qkvabz_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [
+                total_k_dim,
+                total_k_dim,
+                total_v_dim,
+                num_heads,
+                num_heads,
+                total_v_dim,
+            ],
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("qkvabz_proj", prefix),
+        )
+
+        self.o_proj = RowParallelLinear(total_v_dim, hidden_size, bias=False)
 
         self.A_log = nn.Parameter(torch.empty(num_heads, dtype=torch.float32))
         self.dt_bias = nn.Parameter(torch.empty(num_heads))
 
         self.dynamic_conv1d = DynamicShortConvolution(
+            quant_config=quant_config,
+            prefix=add_prefix("dynamic_conv1d", prefix),
             hidden_size=total_v_dim,
             kernel_size=conv_size,
             generator_input_size=hidden_size,
@@ -214,6 +249,7 @@ class JetBlock(nn.Module):
         self.head_v_dim = head_v_dim
         self.layer_id = layer_id
         self.num_heads = num_heads
+        self.total_k_dim = total_k_dim
         self.total_v_dim = total_v_dim
 
     def forward(
@@ -232,13 +268,24 @@ class JetBlock(nn.Module):
             self.layer_id
         )
 
-        q: torch.Tensor = self.q_proj(hidden_states)  # (cu_seq_len, total_k_dim)
+        qkvabz, _ = self.qkvabz_proj(hidden_states)
+        q, k, v, a, beta, z = qkvabz.split(
+            [
+                self.total_k_dim,
+                self.total_k_dim,
+                self.total_v_dim,
+                self.num_heads,
+                self.num_heads,
+                self.total_v_dim,
+            ],
+            dim=-1,
+        )
+
         q = nn.functional.silu(q)
+        q = einops.rearrange(q, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
 
-        k: torch.Tensor = self.k_proj(hidden_states)  # (seq_len, total_k_dim)
         k = nn.functional.silu(k)
-
-        v: torch.Tensor = self.v_proj(hidden_states)  # (cu_seq_len, total_v_dim)
+        k = einops.rearrange(k, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
 
         conv_cache = layer_cache.conv
         assert isinstance(conv_cache, torch.Tensor)
@@ -260,16 +307,11 @@ class JetBlock(nn.Module):
         conv_cache[forward_metadata.mamba_cache_indices, -self.total_v_dim :, :] = (
             new_conv_state
         )
+        v = einops.rearrange(v, "l (h d) -> l h d", h=self.num_heads, d=self.head_v_dim)
 
-        a = self.a_proj(hidden_states)
         g = -self.A_log.float().exp() * nn.functional.softplus(a.float() + self.dt_bias)
 
-        beta = self.b_proj(hidden_states)
         beta = nn.functional.sigmoid(beta)
-
-        q = einops.rearrange(q, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
-        k = einops.rearrange(k, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
-        v = einops.rearrange(v, "l (h d) -> l h d", h=self.num_heads, d=self.head_v_dim)
 
         o = fused_recurrent_gated_delta_rule_update(
             q=q.unsqueeze(0),
@@ -281,10 +323,7 @@ class JetBlock(nn.Module):
             initial_state_indices=forward_metadata.mamba_cache_indices,
             cu_seqlens=cast(torch.LongTensor, forward_metadata.query_start_loc),
             use_qk_l2norm_in_kernel=True,
-        )
-        o = o.squeeze(0)
-
-        z = self.g_proj(hidden_states)
+        ).squeeze(0)
 
         z = einops.rearrange(z, "l (h d) -> l h d", h=self.num_heads)
 
@@ -292,7 +331,7 @@ class JetBlock(nn.Module):
 
         o = einops.rearrange(o, "l h d -> l (h d)")
 
-        o = self.o_proj(o)
+        o, _ = self.o_proj(o)
 
         return o
 
@@ -301,7 +340,7 @@ class JetNemotronAttention(nn.Module):
     def __init__(
         self,
         config: JetNemotronConfig,
-        layer_id: int = 0,
+        layer_id: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -376,33 +415,14 @@ class JetNemotronAttention(nn.Module):
         return output
 
 
-class JetNemotronMLP(nn.Module):
-    def __init__(self, config: JetNemotronConfig):
-        super().__init__()
-        hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size
-
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.act_fn = transformers.activations.get_activation(config.hidden_act)
-
-    def forward(self, hidden_state):
-        gate = self.gate_proj(hidden_state)
-        up = self.up_proj(hidden_state)
-        activated = self.act_fn(gate)
-        combined = activated * up
-        return self.down_proj(combined)
-
-
 class JetNemotronDecoderLayer(nn.Module):
     def __init__(
         self,
         config: JetNemotronConfig,
+        alt_stream: torch.cuda.Stream | None = None,
         layer_id: int = 0,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
 
@@ -410,21 +430,29 @@ class JetNemotronDecoderLayer(nn.Module):
             case "attn" | "swa":
                 self.self_attn = JetNemotronAttention(
                     config,
-                    layer_id=layer_id,
                     quant_config=quant_config,
                     prefix=add_prefix("self_attn", prefix),
+                    layer_id=layer_id,
                 )
 
             case "jet":
                 self.self_attn = JetBlock(
                     config,
+                    quant_config=quant_config,
+                    prefix=add_prefix("self_attn", prefix),
                     layer_id=layer_id,
                 )
 
             case _:
                 raise NotImplementedError
 
-        self.mlp = JetNemotronMLP(config)
+        self.mlp = Qwen2MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -525,6 +553,12 @@ class JetNemotronForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            ("qkvabz_proj", "q_proj", 0),
+            ("qkvabz_proj", "k_proj", 1),
+            ("qkvabz_proj", "v_proj", 2),
+            ("qkvabz_proj", "a_proj", 3),
+            ("qkvabz_proj", "b_proj", 4),
+            ("qkvabz_proj", "g_proj", 5),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -559,5 +593,4 @@ class JetNemotronForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = JetNemotronForCausalLM
 EntryClass = JetNemotronForCausalLM
