@@ -57,9 +57,7 @@ class UsageProcessor:
 
         cached_details = (
             UsageProcessor._details_if_cached(
-                sum(
-                    tok for idx, tok in cached_tokens.items() if idx % n_choices == 0
-                )
+                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
             )
             if enable_cache_report
             else None
