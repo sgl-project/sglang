@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
