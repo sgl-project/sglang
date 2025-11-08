@@ -166,10 +166,10 @@ void mla_rope_quantize_fp8_fused(
     at::Tensor pos_ids,
     bool is_neox,
     at::Tensor q_out,
-    const std::optional<at::Tensor>& k_nope_out,
-    const std::optional<at::Tensor>& k_rope_out,
-    const std::optional<at::Tensor>& kv_buffer,
-    const std::optional<at::Tensor>& kv_cache_loc);
+    c10::optional<at::Tensor> k_nope_out,
+    c10::optional<at::Tensor> k_rope_out,
+    c10::optional<at::Tensor> kv_buffer,
+    c10::optional<at::Tensor> kv_cache_loc);
 
 void downcast_fp8(
     at::Tensor& k,

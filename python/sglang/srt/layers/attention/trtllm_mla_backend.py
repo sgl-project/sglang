@@ -40,14 +40,9 @@ if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q
 
     try:
-        # Try standalone build first
-        from mla_fusion_kernel import mla_rope_quantize_fp8_fused
+        from sgl_kernel import mla_rope_quantize_fp8_fused
     except ImportError:
-        # Fallback to sgl_kernel
-        try:
-            from sgl_kernel import mla_rope_quantize_fp8_fused
-        except ImportError:
-            mla_rope_quantize_fp8_fused = None  # Will use non-fused path
+        mla_rope_quantize_fp8_fused = None  # Will use non-fused path
 
 # Constants
 DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
