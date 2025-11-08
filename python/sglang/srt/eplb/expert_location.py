@@ -142,12 +142,8 @@ class ExpertLocationMetadata:
             print(
                 f"physical_to_logical_map={physical_to_logical_map.shape}, logical_to_all_physical_map={logical_to_all_physical_map.shape}"
             )
-            for i in range(physical_to_logical_map.shape[0]):
-                print(f"physical_to_logical_map[{i}]={physical_to_logical_map[i]}")
-            for i in range(logical_to_all_physical_map.shape[0]):
-                print(
-                    f"logical_to_all_physical_map[{i}]={logical_to_all_physical_map[i]}"
-                )
+            print(f"physical_to_logical_map={physical_to_logical_map[0]}")
+            print(f"logical_to_all_physical_map={logical_to_all_physical_map[0]}")
         return ExpertLocationMetadata._init_raw(
             server_args=server_args,
             ep_size=common["ep_size"],
@@ -362,7 +358,7 @@ def _compute_logical_to_all_physical_map(
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )
-
+    print(f"Preview logical_to_all_physical_map={logical_to_all_physical_map[0]}")
     # Replace by the physical expert on local GPU or node if possible
     if moe_ep_rank is not None:
         num_gpus_per_node = server_args.ep_size // server_args.nnodes
