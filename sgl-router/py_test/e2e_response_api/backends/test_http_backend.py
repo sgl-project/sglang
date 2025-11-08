@@ -75,14 +75,6 @@ class TestOpenaiBackend(
     def test_mixed_mcp_and_function_tools_streaming(self):
         super().test_mixed_mcp_and_function_tools_streaming()
 
-    @unittest.skip("Temporary skip since deepwiki might hit rate limit")
-    def test_mcp_basic_tool_call(self):
-        super().test_mcp_basic_tool_call()
-
-    @unittest.skip("Temporary skip since deepwiki might hit rate limit")
-    def test_mcp_basic_tool_call_streaming(self):
-        super().test_mcp_basic_tool_call_streaming()
-
 
 class TestXaiBackend(StateManagementTests):
     """End to end tests for XAI backend."""
