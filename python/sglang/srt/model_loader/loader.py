@@ -1074,16 +1074,17 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             if name in existing_params:
                 current_param_data[name] = existing_params[name].data
 
-        # Reset to pre-quantization state by creating new BF16 buffers (FlashRL approach)
-        # This matches FlashRL vllm_patch.py line 700
+        # Reset to pre-quantization state using torch.as_strided (FlashRL sglang_patch line 200)
+        # This reshapes the FP8 buffer to original shape WITHOUT changing dtype
+        # CRITICAL: Keeps same underlying storage, prevents .data from being replaced during load
         for name, rebuild_info in model.original_weights_rebuild_keys.items():
             if name in updated_param_names and name in existing_params:
-                # Create NEW tensor with original dtype (BF16) - allocates temporary memory
-                # This is intentional to match FlashRL's memory-efficient approach
-                existing_params[name].data = torch.empty(
+                # Clone FP8 data and reshape to original shape/stride
+                # This creates a view with original shape but keeps FP8 dtype!
+                existing_params[name].data = torch.as_strided(
+                    existing_params[name].data.clone(),
                     rebuild_info["shape"],
-                    dtype=rebuild_info["dtype"],
-                    device=existing_params[name].device
+                    rebuild_info["stride"],
                 )
 
         # Restore weight loader attributes
@@ -1107,17 +1108,99 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         
         del existing_params
 
-        # Load BF16 weights directly (FlashRL FP8 fast mode)
-        # No pre-quantization! Weight loader handles sharding/stacking, then we quantize.
-        
-        # Load BF16 weights - _load_weights_impl does the filtering
-        updated_params = first_time_load_weights(iter(weights_list))
+        # Quantize weights in iterator BEFORE weight_loader processes them (FlashRL approach)
+        # This ensures controlled FP8 quantization of each shard before stacking
+        def quantize_weights_iterator(weights_iter):
+            """
+            Quantize BF16 weights to FP8 before weight_loader sees them.
+            This matches FlashRL sglang_patch.py line 213: flash_quantize_fn(weights, profile)
+            
+            For stacked parameters (qkv_proj, gate_up_proj):
+            - Each shard (q_proj, k_proj, v_proj or gate_proj, up_proj) is quantized individually
+            - Weight_loader then stacks the FP8 shards into the full parameter
+            """
+            from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+            
+            for name, weight in weights_iter:
+                # Use static list: Skip parameters that don't need quantization
+                # (scales, bias, rotary_emb, projector, etc.)
+                if any(skip in name for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS):
+                    yield (name, weight)
+                    continue
+                
+                # Skip embeddings and lm_head (not quantized to FP8)
+                if "embed_tokens" in name or "lm_head" in name:
+                    yield (name, weight)
+                    continue
+                
+                # Quantize BF16/FP32 weights to FP8
+                if weight.dtype in [torch.bfloat16, torch.float32, torch.float16]:
+                    # Per-channel quantization
+                    qweight, weight_scale = per_token_group_quant_fp8(
+                        weight, weight.shape[-1]
+                    )
+                    # DON'T transpose here! Weight loader expects original orientation
+                    # Transpose happens later when copying to FP8 storage
+                    yield (name, qweight)
+                    
+                    # Note: weight_scale is handled separately by the quantization infrastructure
+                    # We don't yield it here as it's created/managed by process_weights_after_loading
+                else:
+                    # Already quantized or other dtype
+                    yield (name, weight)
 
-        # **MANUAL FP8 QUANTIZATION** (FlashRL FP8 fast mode approach)
-        # Now quantize the newly loaded BF16 weights to FP8 and copy to original FP8 memory
-        QuantizedRLModelLoader._manual_fp8_quantization(
-            model, updated_param_names, current_param_data
-        )
+        # Load weights (with pre-quantization)
+        # Weight loader will stack FP8 shards into full FP8 parameters
+        updated_params = first_time_load_weights(quantize_weights_iterator(iter(weights_list)))
+
+        # Copy quantized weights back to original FP8 memory locations
+        # Since we pre-quantized in iterator, both new and old are FP8
+        all_params = dict(model.named_parameters())
+        for name in updated_param_names:
+            if name not in all_params or name not in current_param_data:
+                continue
+            
+            # Use static list: Skip parameters not quantized to FP8
+            if any(skip_param in name for skip_param in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS):
+                continue
+            
+            new_param = all_params[name]
+            old_fp8_data = current_param_data[name]
+            
+            # Debug logging for stacked parameters (use helper method)
+            if QuantizedRLModelLoader._is_stacked_param(name):
+                logger.info(
+                    f"[QuantizedRL] Copying stacked param: {name}, "
+                    f"new_param.shape={new_param.data.shape}, "
+                    f"old_fp8_data.shape={old_fp8_data.shape}"
+                )
+            
+            # Embeddings and lm_head stay in BF16 (not quantized)
+            if "embed_tokens" in name or "lm_head" in name:
+                # Copy BF16→BF16
+                assert new_param.data.shape == old_fp8_data.shape, (
+                    f"Shape mismatch for {name}: "
+                    f"new={new_param.data.shape}, old={old_fp8_data.shape}"
+                )
+                old_fp8_data.copy_(new_param.data)
+                new_param.data = old_fp8_data
+                continue
+            
+            # Both should be FP8 after pre-quantization in iterator
+            # Copy to original memory location preserving transpose
+            if new_param.dtype == torch.float8_e4m3fn and old_fp8_data.dtype == torch.float8_e4m3fn:
+                # Use strided view to handle transposed storage
+                strided_data = torch.as_strided(
+                    new_param.data, old_fp8_data.shape, old_fp8_data.stride()
+                )
+                old_fp8_data.copy_(strided_data)
+                new_param.data = old_fp8_data
+            else:
+                logger.warning(
+                    f"[QuantizedRL] Unexpected dtype for {name}: "
+                    f"new={new_param.dtype}, old={old_fp8_data.dtype}. "
+                    f"Expected both to be FP8 after pre-quantization."
+                )
 
         # Cleanup (FlashRL sglang_patch.py lines 227-236)
         del current_param_data
