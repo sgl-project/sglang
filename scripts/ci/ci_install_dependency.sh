@@ -96,9 +96,6 @@ fi
 # Install the main package
 $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
-# TODO: Adding this as a workaround for CI failure
-$PIP_CMD install pytest $PIP_INSTALL_SUFFIX
-
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
