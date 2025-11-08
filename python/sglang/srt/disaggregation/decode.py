@@ -842,14 +842,14 @@ class SchedulerDisaggregationDecodeMixin:
                     )
                     trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
                     if self.require_mlp_sync:
-                        self._prepare_idle_batch_and_run(None)
+                        self._prepare_idle_batch_and_run()
                 else:
                     if self.require_mlp_sync:
                         self.prepare_mlp_sync_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
             elif self.require_mlp_sync:
-                batch, _ = self._prepare_idle_batch_and_run(None)
+                batch, _ = self._prepare_idle_batch_and_run()
 
             queue_size = (
                 len(self.waiting_queue)
@@ -891,7 +891,7 @@ class SchedulerDisaggregationDecodeMixin:
                     trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
                     if self.require_mlp_sync:
                         batch_, batch_result = self._prepare_idle_batch_and_run(
-                            None, delay_process=True
+                            delay_process=True
                         )
                         if batch_:
                             self.result_queue.append((batch_.copy(), batch_result))
@@ -905,7 +905,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             elif self.require_mlp_sync:
                 batch, batch_result = self._prepare_idle_batch_and_run(
-                    None, delay_process=True
+                    delay_process=True
                 )
                 if batch:
                     self.result_queue.append((batch.copy(), batch_result))
@@ -932,8 +932,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue
 
-    def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
-        batch = self.prepare_mlp_sync_batch(batch)
+    def _prepare_idle_batch_and_run(self: Scheduler, delay_process=False):
+        batch = self.prepare_mlp_sync_batch(None)
         result = None
         if batch:
             result = self.run_batch(batch)
