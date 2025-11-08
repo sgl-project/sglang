@@ -193,7 +193,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
             if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+                name = name.replace(r"language_model.model.", r"language_model.")
 
             # Handle LM head tie
             if self.config.text_config.tie_word_embeddings and "lm_head.weight" in name:
