@@ -103,7 +103,9 @@ class ExpertLocationMetadata:
             torch.arange(0, num_physical_experts).repeat(num_layers, 1)
             % num_logical_experts
         )
-        print(f"init_trivial: physical_to_logical_map={physical_to_logical_map}")
+        print(
+            f"init_trivial: physical_to_logical_map={physical_to_logical_map.shape} {physical_to_logical_map[0]}"
+        )
         return ExpertLocationMetadata.init_by_mapping(
             server_args,
             model_config,
@@ -136,9 +138,16 @@ class ExpertLocationMetadata:
             ep_size=common["ep_size"],
             moe_ep_rank=moe_ep_rank,
         )
-        print(
-            f"physical_to_logical_map={physical_to_logical_map}, logical_to_all_physical_map={logical_to_all_physical_map}"
-        )
+        if moe_ep_rank % 4 == 0:
+            print(
+                f"physical_to_logical_map={physical_to_logical_map.shape}, logical_to_all_physical_map={logical_to_all_physical_map.shape}"
+            )
+            for i in range(physical_to_logical_map.shape[0]):
+                print(f"physical_to_logical_map[{i}]={physical_to_logical_map[i]}")
+            for i in range(logical_to_all_physical_map.shape[0]):
+                print(
+                    f"logical_to_all_physical_map[{i}]={logical_to_all_physical_map[i]}"
+                )
         return ExpertLocationMetadata._init_raw(
             server_args=server_args,
             ep_size=common["ep_size"],
@@ -233,6 +242,23 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map != -1, dim=-1
         )
 
+        print(
+            f"logical_to_all_physical_map_num_valid={logical_to_all_physical_map_num_valid.shape} {logical_to_all_physical_map_num_valid[0]}"
+        )
+        print(
+            f"logical_to_all_physical_map_padded={logical_to_all_physical_map_padded.shape} {logical_to_all_physical_map_padded[0]}"
+        )
+        dispatch_physical_map = compute_logical_to_rank_dispatch_physical_map(
+            server_args=server_args,
+            logical_to_all_physical_map=logical_to_all_physical_map,
+            ep_size=ep_size,
+            num_physical_experts=num_physical_experts,
+            # TODO improve when we have real EP rank
+            ep_rank=torch.distributed.get_rank() % ep_size,
+        )
+        print(
+            f"dispatch_physical_map={dispatch_physical_map.shape} {dispatch_physical_map}"
+        )
         return ExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
             physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
