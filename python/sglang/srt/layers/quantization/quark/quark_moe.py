@@ -9,6 +9,7 @@ import torch
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe
 from aiter.utility.fp4_utils import e8m0_shuffle
+from aiter.ops.shuffle import shuffle_weight
 
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -166,6 +167,10 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         w2_weight_scale = e8m0_shuffle(w2_weight_scale)
         # layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
         layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+
+        # Pre-suffle weight
+        layer.w13_weight.data = shuffle_weight(layer.w13_weight.contiguous(), (16, 16))
+        layer.w2_weight.data = shuffle_weight(layer.w2_weight.contiguous(), (16, 16))
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
