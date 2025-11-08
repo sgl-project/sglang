@@ -632,7 +632,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = mamba_cache_params.temporal
         is_spec_decoding = isinstance(mamba_cache_params, MambaPool.SpeculativeState)
         if is_target_verify:
-            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+            assert is_spec_decoding
             last_steps = mamba_cache_params.last_steps
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
@@ -964,7 +964,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
 
-    def update_mamba_state_after_mtp_verify(self, accepted_indices, model):
+    def update_mamba_state_after_mtp_verify(self, accepted_indices: torch.Tensor, model):
         request_number = accepted_indices.shape[0]
 
         state_indices_tensor = (
@@ -977,11 +977,4 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        # SSM state updates (chunked to reduce peak memory)
-        valid_mask = accepted_indices >= 0
-
-        # Compute common indices once to avoid duplication
-        valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
-        last_steps = accepted_indices[valid_mask].to(torch.int64)  # [N]
-
-        mamba_caches.last_steps[valid_state_indices] = last_steps
+        mamba_caches.last_steps[state_indices_tensor] = accepted_indices
