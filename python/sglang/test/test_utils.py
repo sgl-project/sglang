@@ -735,7 +735,9 @@ class TestFile:
     estimated_time: float = 60
 
 
-def run_unittest_files(files: List[TestFile], timeout_per_file: float, continue_on_error: bool = False):
+def run_unittest_files(
+    files: List[TestFile], timeout_per_file: float, continue_on_error: bool = False
+):
     """
     Run a list of test files.
 
