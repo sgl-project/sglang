@@ -90,11 +90,12 @@ class FunctionCallingBaseTest(ResponseAPIBaseTest):
             "You are a helpful assistant that can call functions. "
             "When a user asks for horoscope information, call the function. "
             "IMPORTANT: Don't reply directly to the user, only call the function. "
+        )
 
         # Create a running input list we will add to over time
         input_list = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "What is my horoscope? I am an Aquarius.]"}
+            {"role": "user", "content": "What is my horoscope? I am an Aquarius.]"},
         ]
 
         # 2. Prompt the model with tools defined
