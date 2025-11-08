@@ -49,6 +49,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.models.utils import AutoWeightsLoader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -576,8 +577,14 @@ class Qwen2ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
+        # Prepare to use AutoWeightsLoader for simplified weight loading
+        # We need to pre-process weights for complex cases (stacked params, PP)
         params_dict = dict(self.named_parameters())
+        processed_weights = []
+
+        # First pass: handle complex cases and prepare weights for AutoWeightsLoader
         for name, loaded_weight in weights:
+            # Filter out weights not in the current pipeline stage
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -589,51 +596,66 @@ class Qwen2ForCausalLM(nn.Module):
             ):
                 continue
 
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
+            # Handle pipeline parallelism weight tying
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
-                    # Handle pp weight tying here
-                    # find the embed_tokens.weight in the weights
+                    # Handle pp weight tying here - find the embed_tokens.weight
+                    # Note: This requires re-iterating which AutoWeightsLoader doesn't support
+                    # So we keep this logic here
                     embed_token_weights = next(
                         filter(lambda x: x[0] == "model.embed_tokens.weight", weights)
                     )[1]
                     loaded_weight = embed_token_weights
                 else:
                     continue
+
+            # Skip vision tower params not in model
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
 
+            # Handle stacked parameters - remap names
+            is_stacked = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
+                if weight_name in name:
+                    # Remap weight name for stacked params
+                    remapped_name = name.replace(weight_name, param_name)
+                    # Skip loading extra bias for GPTQ models
+                    if remapped_name.endswith(".bias") and remapped_name not in params_dict:
+                        is_stacked = True
+                        break
+                    if remapped_name not in params_dict:
+                        is_stacked = True
+                        break
 
-                if name in params_dict.keys():
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                else:
-                    logger.warning(f"Parameter {name} not found in params_dict")
+                    # For stacked params, we need to use custom weight_loader with shard_id
+                    param = params_dict[remapped_name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    is_stacked = True
+                    break
+
+            if is_stacked:
+                continue
+
+            # Skip extra bias for GPTQ models
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+
+            # Add to processed weights for AutoWeightsLoader
+            processed_weights.append((name, loaded_weight))
+
+        # Use AutoWeightsLoader for standard weight loading
+        skip_prefixes = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head")
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            skip_substrs=["projector"],
+            ignore_unexpected_prefixes=["model.vision_tower"],
+        )
+        loader.load_weights(iter(processed_weights))
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
