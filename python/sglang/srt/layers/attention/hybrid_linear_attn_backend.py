@@ -984,4 +984,4 @@ class HybridLinearAttnBackend(AttentionBackend):
         valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
         last_steps = accepted_indices[valid_mask].to(torch.int64)  # [N]
 
-        mamba_caches.last_steps[:, valid_state_indices] = last_steps
+        mamba_caches.last_steps[valid_state_indices] = last_steps

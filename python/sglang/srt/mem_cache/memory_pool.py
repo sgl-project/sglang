@@ -147,6 +147,11 @@ class MambaPool:
     class SpeculativeState(State):
         last_steps: torch.Tensor
 
+        def at_layer_idx(self, layer: int):
+            # do NOT slice last_steps b/c it does not have layer dimension
+            return type(self)(**{k: (v if k == "last_steps" else v[layer]) for k, v in vars(self).items()})
+
+
     def __init__(
         self,
         *,
@@ -226,9 +231,9 @@ class MambaPool:
                     dtype=ssm_dtype,
                     device="cuda",
                 )
-                last_steps_cache = torch.empty(
-                    (num_mamba_layers, size + 1), dtype=torch.int64, device="cuda"
-                ).fill_(-1)
+                last_steps = torch.zeros(
+                    (size + 1), dtype=torch.int64, device="cuda"
+                )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
 
@@ -262,14 +267,14 @@ class MambaPool:
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
-                    last_steps=last_steps_cache,
+                    last_steps=last_steps,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"last_steps_cache size: {get_tensor_size_bytes(last_steps_cache) / GB:.2f}GB "
+                    f"last_steps size: {get_tensor_size_bytes(last_steps) / GB:.2f}GB "
                 )
             self.size = size
             self.free_slots = torch.arange(
@@ -307,7 +312,8 @@ class MambaPool:
         else:
             self.mamba_cache.conv[:, free_index] = 0
         self.mamba_cache.temporal[:, free_index] = 0
-        self.mamba_cache.last_steps[:, free_index] = -1
+        if isinstance(self.mamba_cache, MambaPool.SpeculativeState):
+            self.mamba_cache.last_steps[free_index] = 0
 
     def clear(self):
         self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
@@ -324,6 +330,8 @@ class MambaPool:
         self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
             :, src_index
         ]
+        if isinstance(self.mamba_cache, MambaPool.SpeculativeState):
+            self.mamba_cache.last_steps[dst_index] = self.mamba_cache.last_steps[src_index]
         return
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
