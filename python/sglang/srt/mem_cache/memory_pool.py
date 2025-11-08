@@ -232,7 +232,7 @@ class MambaPool:
                     device="cuda",
                 )
                 last_steps = torch.zeros(
-                    (size + 1), dtype=torch.int64, device="cuda"
+                    (size + 1), dtype=torch.int32, device="cuda"
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
