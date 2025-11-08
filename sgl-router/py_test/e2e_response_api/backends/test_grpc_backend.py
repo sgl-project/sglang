@@ -152,7 +152,7 @@ class TestGrpcHarmonyBackend(
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "/home/ubuntu/models/openai/gpt-oss-20b"
+        cls.model = "/home/ubuntu/models/openai/gpt-oss-120b"
         cls.base_url_port = "http://127.0.0.1:30030"
 
         cls.cluster = popen_launch_workers_and_router(
@@ -160,7 +160,7 @@ class TestGrpcHarmonyBackend(
             cls.base_url_port,
             timeout=90,
             num_workers=1,
-            tp_size=2,
+            tp_size=4,
             policy="round_robin",
             worker_args=[
                 "--reasoning-parser=gpt-oss",
