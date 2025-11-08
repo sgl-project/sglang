@@ -3,6 +3,7 @@ from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
 from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
+from sglang.srt.configs.eagle2_5_vl import Eagle2_5_VLConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.janus_pro import MultiModalityConfig
@@ -24,6 +25,7 @@ __all__ = [
     "ChatGLMConfig",
     "DbrxConfig",
     "DeepseekVL2Config",
+    "Eagle2_5_VLConfig",
     "LongcatFlashConfig",
     "MultiModalityConfig",
     "KimiVLConfig",
