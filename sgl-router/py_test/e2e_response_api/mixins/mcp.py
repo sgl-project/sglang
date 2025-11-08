@@ -17,25 +17,42 @@ class MCPTests(ResponseAPIBaseTest):
     # Subclasses can override this to enable strict validation
     mcp_validation_mode = "relaxed"
 
+    # Shared constants for MCP tests
+    BRAVE_MCP_TOOL = {
+        "type": "mcp",
+        "server_label": "brave",
+        "server_description": "A Tool to do web search",
+        "server_url": "http://localhost:8001/sse",
+        "require_approval": "never",
+    }
+
+    MCP_TEST_PROMPT = (
+        "show me some news about sglang router, use the tool to just search "
+        "one result and return one sentence response"
+    )
+
+    GET_WEATHER_FUNCTION = {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Get the current weather in a given location",
+        "parameters": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"],
+        },
+    }
+
     def test_mcp_basic_tool_call(self):
         """Test basic MCP tool call (non-streaming).
 
         Validation strictness is controlled by the class attribute `mcp_validation_mode`.
         Set to "strict" in subclasses for additional HTTP-specific validation.
         """
-        tools = [
-            {
-                "type": "mcp",
-                "server_label": "deepwiki",
-                "server_url": "https://mcp.deepwiki.com/mcp",
-                "require_approval": "never",
-            }
-        ]
-
         resp = self.create_response(
-            "What transport protocols does the 2025-03-26 version of the MCP spec (modelcontextprotocol/modelcontextprotocol) support?",
-            tools=tools,
+            self.MCP_TEST_PROMPT,
+            tools=[self.BRAVE_MCP_TOOL],
             stream=False,
+            reasoning={"effort": "low"},
         )
 
         # Should successfully make the request
@@ -75,7 +92,7 @@ class MCPTests(ResponseAPIBaseTest):
             self.assertIn("status", mcp_call)
             self.assertEqual(mcp_call["status"], "completed")
             self.assertIn("server_label", mcp_call)
-            self.assertEqual(mcp_call["server_label"], "deepwiki")
+            self.assertEqual(mcp_call["server_label"], "brave")
             self.assertIn("name", mcp_call)
             self.assertIn("arguments", mcp_call)
             self.assertIn("output", mcp_call)
@@ -105,19 +122,11 @@ class MCPTests(ResponseAPIBaseTest):
         Validation strictness is controlled by the class attribute `mcp_validation_mode`.
         Set to "strict" in subclasses for additional HTTP-specific validation.
         """
-        tools = [
-            {
-                "type": "mcp",
-                "server_label": "deepwiki",
-                "server_url": "https://mcp.deepwiki.com/mcp",
-                "require_approval": "never",
-            }
-        ]
-
         resp = self.create_response(
-            "What transport protocols does the 2025-03-26 version of the MCP spec (modelcontextprotocol/modelcontextprotocol) support?",
-            tools=tools,
+            self.MCP_TEST_PROMPT,
+            tools=[self.BRAVE_MCP_TOOL],
             stream=True,
+            reasoning={"effort": "low"},
         )
 
         # Should successfully make the request
@@ -197,7 +206,7 @@ class MCPTests(ResponseAPIBaseTest):
 
         for mcp_call in mcp_calls:
             self.assertEqual(mcp_call.get("status"), "completed")
-            self.assertEqual(mcp_call.get("server_label"), "deepwiki")
+            self.assertEqual(mcp_call.get("server_label"), "brave")
             self.assertIn("name", mcp_call)
             self.assertIn("arguments", mcp_call)
             self.assertIn("output", mcp_call)
@@ -247,28 +256,9 @@ class MCPTests(ResponseAPIBaseTest):
 
     def test_mixed_mcp_and_function_tools(self):
         """Test mixed MCP and function tools (non-streaming)."""
-        tools = [
-            {
-                "type": "mcp",
-                "server_url": "https://mcp.deepwiki.com/mcp",
-                "server_label": "deepwiki",
-                "require_approval": "never",
-            },
-            {
-                "type": "function",
-                "name": "get_weather",
-                "description": "Get the current weather in a given location",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"location": {"type": "string"}},
-                    "required": ["location"],
-                },
-            },
-        ]
-
         resp = self.create_response(
             "What is the weather in seattle now?",
-            tools=tools,
+            tools=[self.BRAVE_MCP_TOOL, self.GET_WEATHER_FUNCTION],
             stream=False,
             tool_choice="auto",
         )
@@ -311,28 +301,9 @@ class MCPTests(ResponseAPIBaseTest):
 
     def test_mixed_mcp_and_function_tools_streaming(self):
         """Test mixed MCP and function tools (streaming)."""
-        tools = [
-            {
-                "type": "mcp",
-                "server_url": "https://mcp.deepwiki.com/mcp",
-                "server_label": "deepwiki",
-                "require_approval": "never",
-            },
-            {
-                "type": "function",
-                "name": "get_weather",
-                "description": "Get the current weather in a given location",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"location": {"type": "string"}},
-                    "required": ["location"],
-                },
-            },
-        ]
-
         resp = self.create_response(
             "What is the weather in seattle now?",
-            tools=tools,
+            tools=[self.BRAVE_MCP_TOOL, self.GET_WEATHER_FUNCTION],
             stream=True,
             tool_choice="auto",  # Encourage tool usage
         )
