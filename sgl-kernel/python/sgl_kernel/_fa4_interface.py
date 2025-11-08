@@ -1,7 +1,7 @@
-# Adapted from https://github.com/sgl-project/sgl-flash-attn/blob/160cb20dd0c542580d10ec61600e245833a22514/flash_attn/cute/interface.py
+# Adapted from https://github.com/sgl-project/sgl-flash-attn/blob/98861d54940726354df9cd91943b0ed986e0d37b/flash_attn/cute/interface.py
 
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
+# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.3.0.dev0
 
 # Supported features:
 # - BF16 & FP16 dtype
