@@ -11,13 +11,13 @@ This implements NVIDIA's Eagle2.5-8B vision-language model which combines:
 """
 
 import logging
-from typing import Iterable, List, Optional, Tuple, Type
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import Eagle2_5_VLConfig
+from transformers.activations import ACT2FN
 
-from sglang.srt.layers.activation import QuickGELU
+from sglang.srt.configs.eagle2_5_vl import Eagle2_5_VLConfig
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -48,7 +48,7 @@ class Eagle2_5_VLVisionMLP(nn.Module):
         in_features: int,
         hidden_features: int = None,
         out_features: int = None,
-        act_layer: Type[nn.Module] = QuickGELU,
+        hidden_act: str = "gelu_pytorch_tanh",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -62,7 +62,7 @@ class Eagle2_5_VLVisionMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
         )
-        self.act = act_layer()
+        self.act = ACT2FN[hidden_act]
         self.fc2 = RowParallelLinear(
             hidden_features,
             out_features,
@@ -109,6 +109,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             in_features=config.vision_config.hidden_size,
             hidden_features=config.vision_config.hidden_size,
             out_features=config.text_config.hidden_size,
+            hidden_act=config.vision_config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("visual_projection", prefix),
         )
