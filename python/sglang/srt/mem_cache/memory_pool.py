@@ -1060,6 +1060,33 @@ class SWAKVPool(KVCache):
 
 class AscendTokenToKVPool(MHATokenToKVPool):
 
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            head_num,
+            head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # [size, head_num, head_dim] for each layer
@@ -1078,8 +1105,20 @@ class AscendTokenToKVPool(MHATokenToKVPool):
                 dtype=self.store_dtype,
                 device=self.device,
             )
-            self.k_buffer = self.kv_buffer[0]
-            self.v_buffer = self.kv_buffer[1]
+            self.k_buffer = []
+            self.v_buffer = []
+            for i in range(self.layer_num):
+                k_buffer_layer = self.kv_buffer[0][i]
+                v_buffer_layer = self.kv_buffer[1][i]
+                if self.use_fia:
+                    k_buffer_layer = k_buffer_layer.view(
+                        -1, 1, self.head_num, self.head_dim
+                    )
+                    v_buffer_layer = v_buffer_layer.view(
+                        -1, 1, self.head_num, self.head_dim
+                    )
+                self.k_buffer.append(k_buffer_layer)
+                self.v_buffer.append(v_buffer_layer)
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -1134,17 +1173,32 @@ class AscendTokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        torch_npu._npu_reshape_and_cache(
-            key=cache_k,
-            value=cache_v,
-            key_cache=self.k_buffer[layer_id - self.start_layer].view(
-                -1, self.page_size, self.head_num, self.head_dim
-            ),
-            value_cache=self.v_buffer[layer_id - self.start_layer].view(
-                -1, self.page_size, self.head_num, self.head_dim
-            ),
-            slot_indices=loc,
-        )
+        if self.use_fia:
+            k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
+            v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
+
+            torch_npu.npu_scatter_nd_update_(
+                k_buffer_layer,
+                loc.view(-1, 1),
+                cache_k.view(-1, 1, self.head_num, self.head_dim),
+            )
+            torch_npu.npu_scatter_nd_update_(
+                v_buffer_layer,
+                loc.view(-1, 1),
+                cache_v.view(-1, 1, self.head_num, self.head_dim),
+            )
+        else:
+            torch_npu._npu_reshape_and_cache(
+                key=cache_k,
+                value=cache_v,
+                key_cache=self.k_buffer[layer_id - self.start_layer].view(
+                    -1, self.page_size, self.head_num, self.head_dim
+                ),
+                value_cache=self.v_buffer[layer_id - self.start_layer].view(
+                    -1, self.page_size, self.head_num, self.head_dim
+                ),
+                slot_indices=loc,
+            )
 
 
 @triton.jit
