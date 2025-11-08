@@ -739,19 +739,33 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     RECORDED_LOADER_KEYS = [
         "weight_loader",
         "load_qkv_weight",
-        "load_row_parallel_weight",
         "load_column_parallel_weight",
+        "load_row_parallel_weight",
         "load_merged_column_weight",
         "output_dim",
         "input_dim",
         "_assert_and_load",
     ]
+    
+    # Weight names to skip during quantization reload (scale parameters)
+    SKIP_QUANTIZATION_SCALE_PARAMS = [
+        "weight_scale",
+        "input_scale",
+        "output_scale",
+    ]
+    
+    # Weight name patterns to skip during reload (FlashRL lines 118-132)
+    SKIP_WEIGHT_PATTERNS = [
+        "rotary_emb.inv_freq",
+        "projector",
+        "rotary_emb.cos_cached",
+        "rotary_emb.sin_cached",
+    ]
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         
-        logger.info("[QuantizedRL] Using native SGLang FP8 quantization")
-        logger.info("[QuantizedRL] No custom profiles or pre-quantized models needed")
+        logger.info("[QuantizedRL] Initialized with native SGLang FP8 quantization (profile-free)")
         
         # Track whether initial load is complete
         self._initial_load_complete = False
@@ -791,11 +805,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         2. Record pre-quantization state for future reloads
         3. Apply FP8 quantization using SGLang's native flow
         
-        After quantization, parameters have NO custom attributes - this is fine because:
-        - Initial inference doesn't need output_dim/input_dim (they have None fallback)
-        - Reload will restore them when needed (after resetting to pre-quant shape)
+        NOTE: This is ONLY called during INITIAL LOAD, not during reloads!
+        After this completes, the model is ready for inference with FP8 weights.
         """
-        logger.info("[QuantizedRL] Initial load: loading base model weights with FP8 quantization")
+        logger.info("[QuantizedRL] Initial load: Loading base model with FP8 quantization")
         
         # Load weights using standard flow
         model.load_weights(weights)
@@ -805,7 +818,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         
         # Record pre-quantization state for reload reconstruction
         # This MUST be done BEFORE process_weights_after_loading to capture original shape/stride
-        logger.info("[QuantizedRL] Recording pre-quantization state")
         model.original_weights_rebuild_keys = {}
         for name, p in original_weights.items():
             model.original_weights_rebuild_keys[name] = {
@@ -816,7 +828,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             }
         
         # Record parameter attributes before process_weights_after_loading
-        logger.info("[QuantizedRL] Recording loader attributes before quantization")
         recorded_loader = {
             k: dict() for k in QuantizedRLModelLoader.RECORDED_LOADER_KEYS
         }
@@ -842,12 +853,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             if param_has_loader:
                 params_with_loaders += 1
 
-        logger.info(f"[QuantizedRL] Recorded loader attributes for {params_with_loaders} parameters")
         model.recorded_loader = recorded_loader
         
         # Apply FP8 post-processing using SGLang's native quantization
         # This creates NEW Parameter objects, removing all custom attributes
-        logger.info("[QuantizedRL] Applying FP8 post-processing (native SGLang quantization)")
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -856,7 +865,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         
         model.quantized_rl_initial_load_complete = True
         self._initial_load_complete = True
-        logger.info("[QuantizedRL] Initial load complete")
+        logger.info("[QuantizedRL] Initial load complete - model ready for inference")
 
     @staticmethod
     def is_reload_scenario(model):
@@ -869,28 +878,149 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
 
     @staticmethod
+    def _manual_fp8_quantization(model, updated_param_names, original_fp8_data):
+        """
+        Manually quantize loaded BF16 weights to FP8 and copy to original memory locations.
+        
+        This follows FlashRL's FP8 "fast" mode (vllm_patch.py lines 126-152):
+        1. Check if new param is different dtype than old (BF16 vs FP8)
+        2. Transpose old data, quantize into transposed view
+        3. Swap data pointers to preserve original FP8 memory
+        
+        Args:
+            model: The model with newly loaded BF16 parameters
+            updated_param_names: List of parameter names that were updated
+            original_fp8_data: Dict mapping param name to original FP8 data tensor
+        """
+        from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+        from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
+        
+        use_per_channel = cutlass_fp8_supported()
+        if not use_per_channel:
+            raise RuntimeError(
+                "FP8 quantized RL training requires CUTLASS FP8 support. "
+                "Please ensure you have a compatible GPU (SM80+) and CUDA setup."
+            )
+        
+        all_params = dict(model.named_parameters())
+        params_quantized = 0
+        params_copied = 0
+        
+        for name in updated_param_names:
+            if name not in all_params or name not in original_fp8_data:
+                continue
+            
+            # Skip scale parameters
+            if any(skip_param in name for skip_param in self.SKIP_QUANTIZATION_SCALE_PARAMS):
+                continue
+            
+            new_param = all_params[name]
+            old_fp8_data = original_fp8_data[name]
+            
+            # Check if this parameter needs quantization (linear layers only)
+            # Embeddings and LM head use UnquantizedEmbeddingMethod (stay in BF16)
+            is_embedding = "embed_tokens" in name
+            is_lm_head = "lm_head" in name
+            
+            if is_embedding or is_lm_head:
+                # Just copy BF16 data back (no quantization needed)
+                # Check shape compatibility before copy
+                assert new_param.data.shape == old_fp8_data.shape, (
+                    f"Shape mismatch for {name}: "
+                    f"new_param.shape={new_param.data.shape}, old_data.shape={old_fp8_data.shape}. "
+                    f"Embedding/LM head weights should maintain the same shape [vocab_size, hidden_size]."
+                )
+                strided_data = torch.as_strided(new_param.data, old_fp8_data.shape, old_fp8_data.stride())
+                old_fp8_data.copy_(strided_data)
+                new_param.data = old_fp8_data
+                params_copied += 1
+                continue
+            
+            # Check if dtypes differ (new is BF16/FP32, old is FP8)
+            if new_param.dtype != old_fp8_data.dtype:
+                # Strict assertions to catch unexpected dtype issues
+                # New param should be BF16 or FP32 (from VERL after weight_loader)
+                # Old param should be FP8 (from initial quantization)
+                assert new_param.dtype in [torch.bfloat16, torch.float32, torch.float16], (
+                    f"Expected new_param to be BF16/FP32/FP16, but got {new_param.dtype} for {name}. "
+                    f"This should be the dtype after weight_loader processes the weight."
+                )
+                assert old_fp8_data.dtype == torch.float8_e4m3fn, (
+                    f"Expected old_fp8_data to be FP8 (float8_e4m3fn), but got {old_fp8_data.dtype} for {name}. "
+                    f"This should be the FP8 dtype from initial quantization."
+                )
+                
+                # FlashRL approach (vllm_patch.py lines 130-146):
+                # 1. Transpose old FP8 memory to create output view
+                weight_output = old_fp8_data.t()
+                
+                # 2. Quantize new BF16 param (per-channel)
+                qweight, weight_scale = per_token_group_quant_fp8(
+                    new_param.data, new_param.data.shape[-1]
+                )
+                weight_scale = weight_scale.t().contiguous()
+                
+                # Check shape compatibility after quantization and transpose
+                # qweight is [in_dim, out_dim], qweight.t() should match old_fp8_data shape
+                qweight_transposed = qweight.t()
+                assert qweight_transposed.shape == old_fp8_data.shape, (
+                    f"Shape mismatch after quantization for {name}: "
+                    f"qweight_transposed.shape={qweight_transposed.shape}, "
+                    f"old_fp8_data.shape={old_fp8_data.shape}. "
+                    f"Original new_param.shape={new_param.data.shape}. "
+                    f"The quantized+transposed weight should match the original FP8 memory shape."
+                )
+                
+                # 3. Copy quantized weight to transposed view of old FP8 memory
+                weight_output.copy_(qweight_transposed)
+                
+                # 4. Update scale parameter
+                scale_name = name + "_scale"
+                if scale_name in all_params:
+                    scale_param = all_params[scale_name]
+                    scale_param.data.copy_(weight_scale)
+                
+                # 5. Swap data pointers to use original FP8 memory (FlashRL line 144-146)
+                new_param.data = old_fp8_data
+                params_quantized += 1
+            else:
+                # Both are same dtype - this shouldn't happen!
+                # We expect: new_param (BF16/FP32) != old_fp8_data (FP8)
+                raise RuntimeError(
+                    f"Unexpected dtype match for parameter '{name}': "
+                    f"new_param.dtype={new_param.dtype}, old_fp8_data.dtype={old_fp8_data.dtype}. "
+                    f"Expected new param to be BF16/FP32 (from VERL) and old to be FP8 (from initial quantization). "
+                    f"This indicates a logic error in weight reloading."
+                )
+
+
+    @staticmethod
     def rebinding_and_load_weights(model, first_time_load_weights, weights):
         """
         Reload weights for RL training with FP8 quantization.
         Uses torch.as_strided + copy_ to preserve memory locations, avoiding GPU fragmentation.
         
+        **NEW APPROACH**: Quantize in iterator (before load), like FlashRL's INT8 patch.
+        
         Reload flow:
         1. Reset parameters to pre-quant shape with torch.as_strided
         2. Restore attributes ONLY IF MISSING - skips if still present
-        3. Load weights (BF16/FP16 from VERL)
-        4. Copy back to original memory locations
-        5. Cleanup on last batch
+        3. **Quantize BF16 weights to FP8 in iterator** (NEW!)
+        4. Load quantized FP8 weights
+        5. Copy loaded weights back to original memory locations
+        6. Cleanup on last batch
+        
+        NOTE: This function is ONLY called during RELOAD, NOT during initial load!
         """
-        logger.info("[QuantizedRL] Weight reload started")
+        logger.info("[QuantizedRL] Reload: Updating weights with FP8 quantization")
 
         # Identify updated parameters
         weights_list = list(weights)
         updated_param_names, is_last_update = QuantizedRLModelLoader._get_updated_params(
             weights_list, model
         )
-        logger.info(f"[QuantizedRL] Updating {len(updated_param_names)} parameters (last_batch={is_last_update})")
 
-        # Save current parameter data pointers
+        # Save current parameter data pointers (FP8 quantized)
         existing_params = dict(model.named_parameters())
         current_param_data = {}
         for name in updated_param_names:
@@ -925,39 +1055,27 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         if k == "weight_loader":
                             restored_count += 1
         
-        logger.info(f"[QuantizedRL] Restored attributes for {restored_count} parameters")
         del existing_params
 
-        # Load weights (no custom quantization - SGLang's FP8 will handle it)
+        # Load BF16 weights directly (FlashRL FP8 fast mode)
+        # No pre-quantization! Weight loader handles sharding/stacking, then we quantize.
+        
+        # Load BF16 weights - _load_weights_impl does the filtering
         updated_params = first_time_load_weights(iter(weights_list))
 
-        # Copy new weights back to original memory (torch.as_strided trick)
-        processed_weights = dict(model.named_parameters())
-        params_copied = 0
-        for name in updated_param_names:
-            if name not in current_param_data or name not in processed_weights:
-                continue
-            p = processed_weights[name]
-            old_data = current_param_data[name]
-            strided_data = torch.as_strided(p.data, old_data.shape, old_data.stride())
-            old_data.copy_(strided_data)
-            p.data = old_data
-            params_copied += 1
+        # **MANUAL FP8 QUANTIZATION** (FlashRL FP8 fast mode approach)
+        # Now quantize the newly loaded BF16 weights to FP8 and copy to original FP8 memory
+        QuantizedRLModelLoader._manual_fp8_quantization(
+            model, updated_param_names, current_param_data
+        )
 
-        logger.info(f"[QuantizedRL] Copied {params_copied} parameters back to original memory locations")
-
-        # On last batch, cleanup
+        # Cleanup (FlashRL sglang_patch.py lines 227-236)
+        del current_param_data
         if is_last_update:
-            logger.info("[QuantizedRL] Last batch - cleanup")
-            del current_param_data
-            del processed_weights
             gc.collect()
             torch.cuda.empty_cache()
-        else:
-            del current_param_data
-            del processed_weights
-
-        logger.info(f"[QuantizedRL] Weight reload completed")
+        
+        logger.info("[QuantizedRL] Reload complete")
         return updated_param_names, is_last_update
 
     @staticmethod
@@ -984,7 +1102,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             if name == "lm_head.weight":
                 is_last_update = True
             
-            if "weight_scale" in name or "input_scale" in name or "output_scale" in name:
+            # Skip scale parameters
+            if any(skip_param in name for skip_param in self.SKIP_QUANTIZATION_SCALE_PARAMS):
                 continue
 
             # FlashRL lines 107-146: Apply same filtering
@@ -998,9 +1117,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             ):
                 continue
 
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+            # Skip weight patterns (FlashRL lines 118-128)
+            if any(pattern in name for pattern in self.SKIP_WEIGHT_PATTERNS):
                 continue
             if hasattr(model, 'config') and model.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
