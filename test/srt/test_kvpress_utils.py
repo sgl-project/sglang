@@ -218,7 +218,9 @@ class TestKVPressUtils(CustomTestCase):
         # compare the difference with reference output
         # this works as a reference of compression result for RadixAttention tests later
         diff = self.output_ref - self.output_compressed
-        self.diff_sum = torch.sum(diff)
+        self.assertTrue(
+            torch.allclose(self.output_ref, self.output_compressed, atol=5e-2)
+        )
 
 
 if __name__ == "__main__":
