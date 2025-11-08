@@ -191,10 +191,6 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            # Handle language model prefix (Eagle2.5 checkpoint has extra model. prefix)
-            if "language_model.model." in name:
-                name = name.replace("language_model.model.", "language_model.")
-
             # Handle LM head tie
             if self.config.text_config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
