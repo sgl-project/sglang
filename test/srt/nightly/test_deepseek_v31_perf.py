@@ -72,9 +72,7 @@ class TestNightlyDeepseekV31MTP(unittest.TestCase):
             "--mem-frac",
             "0.7",
         ]
-        cls.runner = NightlyBenchmarkRunner(
-            PROFILE_DIR, cls.__name__, cls.base_url
-        )
+        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
         cls.runner.setup_profile_directory()
 
     def test_bench_one_batch(self):
@@ -94,6 +92,7 @@ class TestNightlyDeepseekV31MTP(unittest.TestCase):
             raise AssertionError(
                 f"Benchmark failed for {self.model} with MTP configuration"
             )
+
 
 if __name__ == "__main__":
     unittest.main()

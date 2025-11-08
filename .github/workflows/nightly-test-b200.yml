@@ -31,7 +31,7 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test/srt
-          python3 run_suite.py --suite nightly-4-gpu-b200
+          python3 run_suite.py --suite nightly-4-gpu-b200 --continue-on-error
 
   nightly-test-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
@@ -53,7 +53,7 @@ jobs:
         run: |
           rm -rf performance_profiles_deepseek_v31/
           cd test/srt
-          IS_BLACKWELL=1 python3 nightly/test_deepseek_v31_perf.py
+          IS_BLACKWELL=1 python3 nightly/test_deepseek_v31_perf.py --continue-on-error
 
       - name: Publish DeepSeek v3.1 traces to storage repo
         env:
@@ -71,7 +71,7 @@ jobs:
         run: |
           rm -rf performance_profiles_deepseek_v32/
           cd test/srt
-          IS_BLACKWELL=1 python3 nightly/test_deepseek_v32_perf.py
+          IS_BLACKWELL=1 python3 nightly/test_deepseek_v32_perf.py --continue-on-error
 
       - name: Publish DeepSeek v3.2 traces to storage repo
         env:

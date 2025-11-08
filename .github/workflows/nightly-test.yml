@@ -182,21 +182,3 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly-8-gpu-h20 --continue-on-error
-
-  nightly-test-4-gpu-b200:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 4-gpu-b200
-    continue-on-error: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 60
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite nightly-4-gpu-b200 --continue-on-error
