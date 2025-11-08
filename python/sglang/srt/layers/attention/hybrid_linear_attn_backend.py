@@ -648,7 +648,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = (
                 mixed_qkv.view(batch_size, draft_token_num, -1)
                 .transpose(1, 2)
-                .contiguous()
             )
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
@@ -663,7 +662,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
             mixed_qkv = (
-                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
+                mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
             )
         else:
             mixed_qkv = causal_conv1d_fn(
