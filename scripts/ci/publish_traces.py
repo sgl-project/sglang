@@ -261,16 +261,15 @@ def main():
     parser = argparse.ArgumentParser(
         description="Publish performance traces to GitHub repository"
     )
-    parser.add_argument("--vlm", action="store_true", help="Process VLM model traces")
     parser.add_argument(
         "--traces-dir",
         type=str,
-        help="Custom traces directory to publish (overrides --vlm)",
+        required=True,
+        help="Traces directory to publish",
     )
     args = parser.parse_args()
 
     # Get environment variables
-
     run_id = os.getenv("GITHUB_RUN_ID", "test")
     run_number = os.getenv("GITHUB_RUN_NUMBER", "12345")
 
@@ -280,16 +279,9 @@ def main():
         )
         sys.exit(1)
 
-    # Determine traces directory
-    if args.traces_dir:
-        traces_dir = args.traces_dir
-        print(f"Processing traces from custom directory: {traces_dir}")
-    elif args.vlm:
-        traces_dir = "performance_profiles_vlms"
-        print("Processing VLM model traces")
-    else:
-        traces_dir = "performance_profiles_text_models"
-        print("Processing text model traces")
+    # Use traces directory
+    traces_dir = args.traces_dir
+    print(f"Processing traces from directory: {traces_dir}")
 
     # Publish traces
     publish_traces(traces_dir, run_id, run_number)

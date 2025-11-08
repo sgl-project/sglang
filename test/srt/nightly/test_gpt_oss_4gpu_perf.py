@@ -14,6 +14,8 @@ class TestNightlyGptOss4GpuPerformance(unittest.TestCase):
             (
                 "openai/gpt-oss-120b",
                 [
+                    "--tp",
+                    "4",
                     "--cuda-graph-max-bs",
                     "200",
                     "--mem-fraction-static",

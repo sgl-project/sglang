@@ -2,7 +2,7 @@ name: Nightly Test
 
 on:
   schedule:
-    - cron: '0 7 * * *'  # 12AM PDT (7AM UTC)
+    - cron: '0 0 * * *'
   push:
     branches:
       - main
@@ -60,7 +60,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_text_models
 
   nightly-test-eval-vlms:
     if: github.repository == 'sgl-project/sglang'
@@ -107,7 +107,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --vlm
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_vlms
 
   nightly-test-1-gpu:
     if: github.repository == 'sgl-project/sglang'

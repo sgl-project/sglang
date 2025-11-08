@@ -181,7 +181,7 @@ class NightlyBenchmarkRunner:
             )
 
             # Clean up JSON file
-            # os.remove(json_output_file)
+            os.remove(json_output_file)
 
             return benchmark_results, True
 
