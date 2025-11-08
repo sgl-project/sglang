@@ -37,7 +37,7 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
             cls.base_url_port,
             timeout=90,
             num_workers=1,
-            tp_size=4,
+            tp_size=2,
             policy="round_robin",
             worker_args=[
                 "--context-length=1000",
