@@ -355,10 +355,14 @@ def _compute_logical_to_all_physical_map(
                 )
 
                 # Replace by the nearest physical expert
-                if nearest_expert != -1:
-                    logical_to_all_physical_map[layer_id][logical_expert_id] = [
-                        nearest_expert
-                    ]
+                mapped_phsical_experts = logical_to_all_physical_map[layer_id][
+                    logical_expert_id
+                ]
+                if (
+                    nearest_expert != -1
+                    and nearest_expert not in mapped_phsical_experts
+                ):
+                    mapped_phsical_experts[0] = nearest_expert
 
     logical_to_all_physical_map = _pad_nested_array(
         logical_to_all_physical_map, pad_value=-1
