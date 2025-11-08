@@ -99,8 +99,8 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
 
         # Language model
         self.language_model = Qwen3Model(
-            config.text_config,
-            quant_config,
+            config=config.text_config,
+            quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
 
@@ -165,17 +165,21 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         """Forward pass for Eagle2.5 VLM."""
         # Use standard SGLang multimodal embedding routine
-        return general_mm_embed_routine(
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
             multimodal_model=self,
             positions=positions,
-            get_embedding=get_embedding,
-            logits_processor=self.logits_processor,
-            lm_head=self.lm_head,
-            pooler=self.pooler,
         )
+
+        # Return embeddings or logits based on get_embedding flag
+        if not get_embedding:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping."""
