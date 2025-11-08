@@ -1670,13 +1670,14 @@ class Scheduler(
 
         new_batch = self.get_new_batch_prefill()
 
-        need_dp_attn_preparation = self.require_mlp_sync
-
-        if need_dp_attn_preparation and not self.spec_algorithm.is_none():
-            # In speculative decoding, prefill batches and decode batches cannot be processed in the same DP attention group.
-            # We prepare idle batches in advance to skip preparing decode batches when there are prefill batches in the group.
+        need_mlp_sync = self.require_mlp_sync
+        if need_mlp_sync and not self.spec_algorithm.is_none():
+            # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
+            # Before merging the new batch into running batch:
+            # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
+            # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             new_batch = self.prepare_mlp_sync_batch(new_batch)
-            need_dp_attn_preparation = new_batch is None
+            need_mlp_sync = new_batch is None
 
         if new_batch is not None:
             # Run prefill first if possible
@@ -1690,7 +1691,7 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention
-        if need_dp_attn_preparation:
+        if need_mlp_sync:
             ret = self.prepare_mlp_sync_batch(ret)
 
         if ret:
