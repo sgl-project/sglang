@@ -6,31 +6,10 @@ Uses the sgl_kernel.mla_rope_quantize_fp8_fused extension.
 import time
 
 import torch
-
-_has_sgl_kernel = False
-mla_rope_quantize_fp8_fused = None
-try:
-    from mla_fusion_kernel import mla_rope_quantize_fp8_fused
-
-    _has_sgl_kernel = True
-    print("Using standalone mla_fusion_kernel")
-except ImportError:
-    try:
-        from sgl_kernel import mla_rope_quantize_fp8_fused
-
-        _has_sgl_kernel = True
-        print("Using sgl_kernel.mla_rope_quantize_fp8_fused")
-    except ImportError:
-        print(
-            "ERROR: Fusion kernel not available. Please build mla_fusion_standalone first."
-        )
-        _has_sgl_kernel = False
+from sgl_kernel import mla_rope_quantize_fp8_fused
 
 
 def run_one(nnz=1024, Dn=512, Dr=64, iters=200, warmup=20, device="cuda"):
-    if not _has_sgl_kernel:
-        return 0, 0, 0
-
     torch.manual_seed(0)
 
     q_nope = torch.randn(nnz, Dn, device=device, dtype=torch.float16)
@@ -120,10 +99,6 @@ def run_one(nnz=1024, Dn=512, Dr=64, iters=200, warmup=20, device="cuda"):
 
 
 if __name__ == "__main__":
-    if not _has_sgl_kernel:
-        print("Benchmark skipped: sgl_kernel not available")
-        exit(1)
-
     print("MLA RoPE + FP8 Quantization + KV Cache Write Fusion Benchmark")
     print("=" * 70)
     print("Config: Dn=512, Dr=64, iters=1000, warmup=100")

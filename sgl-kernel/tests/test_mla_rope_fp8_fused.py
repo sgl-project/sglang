@@ -11,28 +11,10 @@ import itertools
 
 import pytest
 import torch
-
-try:
-    # Try standalone build first
-    from mla_fusion_kernel import mla_rope_quantize_fp8_fused
-
-    _has_sgl_kernel = True
-except ImportError:
-    # Fallback to sgl_kernel
-    try:
-        from sgl_kernel import mla_rope_quantize_fp8_fused
-
-        _has_sgl_kernel = True
-    except ImportError:
-        mla_rope_quantize_fp8_fused = None  # Will use non-fused path
-        _has_sgl_kernel = False
-
-requires_ext = pytest.mark.skipif(
-    not _has_sgl_kernel, reason="sgl_kernel extension not available"
-)
+from sgl_kernel import mla_rope_quantize_fp8_fused
 
 
-@requires_ext
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize(
     "nnz,num_heads,Dn,Dr,dtype",
     list(
@@ -157,7 +139,7 @@ def test_fused_matches_baseline(nnz, num_heads, Dn, Dr, dtype):
     ), f"Used KV slots must match exactly for {dtype=}, {num_heads=}"
 
 
-@requires_ext
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("nnz,Dn,Dr", [(128, 512, 64), (1024, 512, 64)])
 def test_baseline_only_path(nnz, Dn, Dr):
     """Test that baseline path (without KV buffer) works correctly."""
@@ -216,7 +198,7 @@ def test_baseline_only_path(nnz, Dn, Dr):
     assert k_rope_out.abs().sum() > 0, "k_rope_out should not be all zeros"
 
 
-@requires_ext
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_fused_only_path():
     """Test that fused path (only KV buffer, no separate K outputs) works."""
     device = "cuda"
