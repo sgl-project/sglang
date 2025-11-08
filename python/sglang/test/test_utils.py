@@ -57,7 +57,8 @@ DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
 # NVFP4 models
-DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-R1-0528-FP4"
+DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
+DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4 = "nvidia/Qwen3-30B-A3B-FP4"
 
 # FP8 models
 DEFAULT_MODEL_NAME_FOR_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
@@ -70,6 +71,10 @@ DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8 = (
 )
 DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8 = "Qwen/Qwen3-1.7B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = "gaunernst/DeepSeek-V2-Lite-Chat-FP8"
+
+# MXFP4 models
+# Standard MXFP4 MoE test model
+DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE = "openai/gpt-oss-20b"
 
 # W8A8 models
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"
@@ -84,6 +89,8 @@ DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST = "Tengyunw/qwen3_30b_moe_eagle3"
 DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
 DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
     "meta-llama/Llama-3.1-8B-Instruct"
@@ -149,7 +156,7 @@ def _use_cached_default_models(model_repo: str):
 
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
+        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
     )
 else:
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
@@ -804,6 +811,8 @@ def get_benchmark_args(
     device="auto",
     pd_separated: bool = False,
     lora_name=None,
+    lora_request_distribution="uniform",
+    lora_zipf_alpha=1.5,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -832,6 +841,8 @@ def get_benchmark_args(
         apply_chat_template=False,
         profile=None,
         lora_name=lora_name,
+        lora_request_distribution=lora_request_distribution,
+        lora_zipf_alpha=lora_zipf_alpha,
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
@@ -944,7 +955,6 @@ def run_score_benchmark(
     )
 
     async def _run_benchmark():
-
         # Load tokenizer for generating test data
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
@@ -1551,7 +1561,7 @@ def send_generate_requests(base_url: str, num_requests: int) -> List[str]:
                 "text": prompt,
                 "sampling_params": {
                     "temperature": 0,
-                    "max_new_tokens": 50,
+                    "max_new_tokens": 500,
                 },
             },
         )
@@ -1578,7 +1588,7 @@ async def send_concurrent_generate_requests(
                     "text": prompt,
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 50,
+                        "max_new_tokens": 500,
                     },
                 },
             ) as response:
@@ -1602,7 +1612,7 @@ async def send_concurrent_generate_requests_with_custom_params(
                 """,
         "sampling_params": {
             "temperature": 0,
-            "max_new_tokens": 50,
+            "max_new_tokens": 500,
         },
     }
 
