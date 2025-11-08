@@ -22,6 +22,7 @@ from mixins.basic_crud import ConversationCRUDBaseTest, ResponseCRUDBaseTest
 from mixins.function_call import FunctionCallingBaseTest
 from mixins.mcp import MCPTests
 from mixins.state_management import StateManagementTests
+from mixins.structured_output import StructuredOutputBaseTest
 from router_fixtures import popen_launch_openai_xai_router
 from util import kill_process_tree
 
@@ -32,6 +33,7 @@ class TestOpenaiBackend(
     StateManagementTests,
     MCPTests,
     FunctionCallingBaseTest,
+    StructuredOutputBaseTest,
 ):
     """End to end tests for OpenAI backend."""
 

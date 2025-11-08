@@ -407,8 +407,8 @@ class TboDPAttentionPreparer:
         return local_can_run_tbo, local_forward_mode
 
     def compute_output(self, partial_global_info):
-        local_can_run_tbo_aggregated = min(partial_global_info[:, 0, 0].tolist())
-        forward_modes = partial_global_info[:, 0, 1].tolist()
+        local_can_run_tbo_aggregated = min(partial_global_info[:, 0].tolist())
+        forward_modes = partial_global_info[:, 1].tolist()
 
         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
             forward_modes

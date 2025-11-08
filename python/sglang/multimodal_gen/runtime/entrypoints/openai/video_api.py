@@ -69,8 +69,8 @@ def _build_sampling_params_from_request(
         save_output=True,
     )
     sampling_params = sampling_params.from_user_sampling_params(user_params)
+    sampling_params.set_output_file_name()
     sampling_params.log(server_args)
-    sampling_params.set_output_file_ext()
     return sampling_params
 
 
