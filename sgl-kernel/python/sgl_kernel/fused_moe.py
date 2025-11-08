@@ -211,7 +211,7 @@ def fused_marlin_moe(
 
     output = hidden_states if inplace else torch.empty_like(hidden_states)
     moe_sum_reduce(
-        intermediate_cache3.view(*intermediate_cache3.shape),
+        intermediate_cache3,
         output,
         routed_scaling_factor,
     )
