@@ -909,7 +909,8 @@ class ServerArgs:
                     logger.info(
                         "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
                     )
-                if not self.enable_dp_attention:
+                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
+                if not self.enable_dp_attention and self.nnodes == 1:
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
@@ -966,7 +967,8 @@ class ServerArgs:
             )
 
             if is_blackwell_supported():
-                if not self.enable_dp_attention:
+                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
+                if not self.enable_dp_attention and self.nnodes == 1:
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
@@ -1004,7 +1006,8 @@ class ServerArgs:
                 "aiter",
                 "triton",
                 "trtllm_mha",
-            }, "fa3, aiter, triton, or trtllm_mha is required for Llama4 model"
+                "intel_xpu",
+            }, "fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model"
             if is_sm100_supported() and self.attention_backend is None:
                 self.attention_backend = "trtllm_mha"
                 logger.warning(
@@ -1262,9 +1265,9 @@ class ServerArgs:
             raise ValueError(
                 "FA4 backend is only supported for prefill. Please use `--prefill-attention-backend fa4` instead."
             )
-        if self.prefill_attention_backend == "fa4":
+        if self.prefill_attention_backend == "fa4" and not self.use_mla_backend():
             logger.warning(
-                f"FA4 backend only supports page size 128, changing page_size from {self.page_size} to 128."
+                f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
             )
             self.page_size = 128
 
@@ -1395,7 +1398,7 @@ class ServerArgs:
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert (
                 self.quantization == "modelopt_fp4"
-            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+            ), "modelopt_fp4 quantization is required for Flashinfer Cutlass MOE"
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -4062,7 +4065,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 
 ZMQ_TCP_PORT_DELTA = 233
-DP_ATTENTION_HANDSHAKE_PORT_DELTA = 5
+DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
 
 
 @dataclasses.dataclass
