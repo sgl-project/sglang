@@ -71,7 +71,7 @@ SAMPLING_PARAM_DETECTOR: dict[str, Callable[[str], bool]] = {
     "stepvideo": lambda id: "stepvideo" in id.lower(),
     # Add other pipeline architecture detectors
     "flux": lambda id: "flux" in id.lower(),
-    "qwenimage": lambda id: "qwenimage" in id.lower(),
+    "qwenimage": lambda id: "qwenimage" in id.lower() and "edit" not in id.lower(),
     "qwenimageedit": lambda id: "qwenimageedit" in id.lower(),
 }
 
