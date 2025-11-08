@@ -2743,5 +2743,163 @@ class TestGptOssDetector(unittest.TestCase):
         self.assertIn("nice", full_text.lower())
 
 
+class TestReasoningParserIntegration(unittest.TestCase):
+    """Test integration between ReasoningParser and tool call parsing."""
+
+    def setUp(self):
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="calculate",
+                    description="Evaluate a mathematical expression",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "expression": {
+                                "type": "string",
+                                "description": "The mathematical expression to evaluate",
+                            }
+                        },
+                        "required": ["expression"],
+                    },
+                ),
+            ),
+        ]
+        self.reasoning_parser = ReasoningParser(
+            model_type="qwen3", stream_reasoning=False, force_reasoning=False
+        )
+        self.tool_detector = Qwen25Detector()
+
+    def test_reasoning_then_tool_call(self):
+        """
+        Test the complete flow: reasoning content followed by tool call.
+        This reproduces the exact bug scenario from the issue.
+        """
+        # Full text with reasoning + tool call (as model would generate)
+        full_text = """<think>
+Okay, let's see. The user is asking for the result of 25 multiplied by 4 plus 10. Hmm, I need to calculate that. First, I should handle the multiplication before the addition according to the order of operations.
+</think>
+<tool_call>
+{"name": "calculate", "arguments": {"expression": "25 * 4 + 10"}}
+</tool_call>"""
+
+        # Step 1: Strip reasoning content (as serving_chat.py does)
+        reasoning_text, remaining_text = self.reasoning_parser.parse_non_stream(
+            full_text
+        )
+
+        # Verify reasoning was extracted
+        self.assertIsNotNone(reasoning_text)
+        self.assertIn("multiplication", reasoning_text.lower())
+
+        # Verify tool call remains
+        self.assertIn("<tool_call>", remaining_text)
+
+        # Step 2: Parse tool call (as _process_tool_calls does)
+        result = self.tool_detector.detect_and_parse(remaining_text, self.tools)
+
+        # Verify tool call was parsed correctly
+        self.assertEqual(len(result.calls), 1, "Should have one tool call")
+        self.assertEqual(result.calls[0].name, "calculate")
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["expression"], "25 * 4 + 10")
+
+
+class TestQwen25DetectorWithReasoning(unittest.TestCase):
+    """Test Qwen 2.5 detector with reasoning content (for tool_choice=required bug fix)."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="calculate",
+                    description="Evaluate a mathematical expression",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "expression": {
+                                "type": "string",
+                                "description": "The mathematical expression to evaluate",
+                            }
+                        },
+                        "required": ["expression"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = Qwen25Detector()
+
+    def test_parse_tool_call_with_reasoning_prefix(self):
+        """
+        Test parsing tool calls that have reasoning content before them.
+        This is the scenario that failed with SPEC_V2 + tool_choice=required.
+
+        The reasoning content should be handled separately (by ReasoningParser),
+        and this test verifies that once reasoning is stripped, the tool call
+        format is correctly parsed by Qwen25Detector.
+        """
+        # Simulate text AFTER reasoning has been stripped by ReasoningParser
+        text = """<tool_call>
+{"name": "calculate", "arguments": {"expression": "25 * 4 + 10"}}
+</tool_call>"""
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        # Verify tool call was parsed correctly
+        self.assertEqual(len(result.calls), 1, "Should have one tool call")
+        self.assertEqual(result.calls[0].name, "calculate")
+
+        # Verify parameters
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["expression"], "25 * 4 + 10")
+
+        # Normal text should be empty (only tool call)
+        self.assertEqual(result.normal_text, "")
+
+    def test_parse_tool_call_with_newlines(self):
+        """Test parsing tool calls with newlines (common format)."""
+        text = (
+            "<tool_call>\n"
+            '{"name": "calculate", "arguments": {"expression": "25 * 4 + 10"}}'
+            "\n</tool_call>"
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        # Verify tool call was parsed correctly
+        self.assertEqual(len(result.calls), 1, "Should have one tool call")
+        self.assertEqual(result.calls[0].name, "calculate")
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["expression"], "25 * 4 + 10")
+
+    def test_parse_multiple_tool_calls_with_reasoning(self):
+        """Test parsing multiple tool calls after reasoning content."""
+        text = """<tool_call>
+{"name": "calculate", "arguments": {"expression": "10 + 20"}}
+</tool_call>
+<tool_call>
+{"name": "calculate", "arguments": {"expression": "5 * 6"}}
+</tool_call>"""
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        # Verify both tool calls were parsed
+        self.assertEqual(len(result.calls), 2, "Should have two tool calls")
+        self.assertEqual(result.calls[0].name, "calculate")
+        self.assertEqual(result.calls[1].name, "calculate")
+
+        # Verify parameters for both calls
+        params1 = json.loads(result.calls[0].parameters)
+        params2 = json.loads(result.calls[1].parameters)
+        self.assertEqual(params1["expression"], "10 + 20")
+        self.assertEqual(params2["expression"], "5 * 6")
+
+
 if __name__ == "__main__":
     unittest.main()

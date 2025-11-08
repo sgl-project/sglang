@@ -886,15 +886,22 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in the response"""
 
         # Handle required or named tool choice
-        if tool_choice == "required" or (
+        # Only use direct JSON parsing if there's NO tool_call_parser (i.e., JSON schema was used)
+        # Otherwise, use the model-specific parser which handles formats like <tool_call>...</tool_call>
+        is_required_or_named_tool = tool_choice == "required" or (
             isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
-        ):
+        )
+        use_direct_json_parsing = (
+            is_required_or_named_tool and not self.tool_call_parser
+        )
+
+        if use_direct_json_parsing:
             # Set finish reason to tool_calls since we're processing tool calls
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
             try:
-                # For required tool choice, we expect a JSON array of tool calls
+                # For required tool choice with JSON schema, we expect a JSON array of tool calls
                 tool_call_data = orjson.loads(text)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
