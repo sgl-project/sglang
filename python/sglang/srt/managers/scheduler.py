@@ -152,6 +152,7 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
@@ -1952,6 +1953,12 @@ class Scheduler(
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
+        # Capture prefill start time for EXTEND mode
+        if batch.forward_mode == ForwardMode.EXTEND:
+            current_time = time.perf_counter()
+            for req in batch.reqs:
+                req.time_stats.prefill_start_time = current_time
+
         # Run forward
         if self.is_generation:
             batch_or_worker_batch = batch
@@ -2045,11 +2052,18 @@ class Scheduler(
             batch_result.extend_logprob_start_len_per_req = (
                 extend_logprob_start_len_per_req
             )
-            return batch_result
+            ret = batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
+
+        # Capture prefill end time for EXTEND mode
+        if batch.forward_mode == ForwardMode.EXTEND:
+            current_time = time.perf_counter()
+            for req in batch.reqs:
+                req.time_stats.prefill_end_time = current_time
+
         return ret
 
     def launch_batch_sample_if_needed(
@@ -2520,6 +2534,9 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.tree_cache.cache_finished_req(req)
 
+            # For mamba radix cache
+            if req.mamba_pool_idx is not None:
+                self.tree_cache.cache_finished_req(req, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -2745,12 +2762,12 @@ def run_scheduler_process(
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
     if dp_rank is not None:
         prefix += f" DP{dp_rank}"
+    if server_args.pp_size > 1:
+        prefix += f" PP{pp_rank}"
     if server_args.tp_size > 1:
         prefix += f" TP{tp_rank}"
     if server_args.ep_size > 1:
         prefix += f" EP{moe_ep_rank}"
-    if server_args.pp_size > 1:
-        prefix += f" PP{pp_rank}"
 
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
