@@ -9,7 +9,6 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use super::{error, ProcessedMessages};
-pub use crate::tokenizer::StopSequenceDecoder;
 use crate::{
     core::Worker,
     grpc_client::{proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient},
@@ -28,8 +27,9 @@ use crate::{
     tokenizer::{
         cache::CachedTokenizer,
         chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+        stop::StopSequenceDecoderBuilder,
         traits::Tokenizer,
-        HuggingFaceTokenizer,
+        HuggingFaceTokenizer, StopSequenceDecoder,
     },
     tool_parser::{
         ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
@@ -43,8 +43,14 @@ pub async fn get_grpc_client_from_worker(
     let client_arc = worker
         .get_grpc_client()
         .await
-        .map_err(|e| error::internal_error(format!("Failed to get gRPC client: {}", e)))?
-        .ok_or_else(|| error::internal_error("Selected worker is not configured for gRPC"))?;
+        .map_err(|e| {
+            error!(function = "get_grpc_client_from_worker", error = %e, "Failed to get gRPC client");
+            error::internal_error(format!("Failed to get gRPC client: {}", e))
+        })?
+        .ok_or_else(|| {
+            error!(function = "get_grpc_client_from_worker", "Selected worker not configured for gRPC");
+            error::internal_error("Selected worker is not configured for gRPC")
+        })?;
 
     Ok((*client_arc).clone())
 }
@@ -273,39 +279,57 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
         .map_err(|e| format!("Failed to serialize tool schema: {}", e))
 }
 
-/// Filter tools based on tool_choice (shared by both routers)
-/// Returns a reference to the original body if no filtering needed,
-/// otherwise returns a cloned and filtered body
-pub fn filter_tools_for_request(
-    body: &ChatCompletionRequest,
-) -> std::borrow::Cow<'_, ChatCompletionRequest> {
-    match &body.tool_choice {
-        Some(ToolChoice::AllowedTools { tools: allowed, .. }) if body.tools.is_some() => {
-            let mut filtered_body = body.clone();
-            let all_tools = filtered_body.tools.as_ref().unwrap();
+/// Filter tools based on tool_choice (generic helper)
+///
+/// Returns filtered tools if filtering is needed, otherwise returns None.
+/// Used by both Chat API and Responses API (Harmony) for constraint generation.
+pub fn filter_tools_by_tool_choice(
+    tools: &[Tool],
+    tool_choice: &Option<ToolChoice>,
+) -> Option<Vec<Tool>> {
+    match tool_choice {
+        Some(ToolChoice::AllowedTools { tools: allowed, .. }) => {
             let allowed_names: std::collections::HashSet<&str> =
-                allowed.iter().map(|t| t.name.as_str()).collect();
-            let filtered_tools: Vec<Tool> = all_tools
+                allowed.iter().filter_map(|t| t.function_name()).collect();
+            let filtered: Vec<Tool> = tools
                 .iter()
                 .filter(|t| allowed_names.contains(t.function.name.as_str()))
                 .cloned()
                 .collect();
-            filtered_body.tools = Some(filtered_tools);
-            std::borrow::Cow::Owned(filtered_body)
+            Some(filtered)
         }
-        Some(ToolChoice::Function { function, .. }) if body.tools.is_some() => {
-            let mut filtered_body = body.clone();
-            let all_tools = filtered_body.tools.as_ref().unwrap();
-            let filtered_tools: Vec<Tool> = all_tools
+        Some(ToolChoice::Function { function, .. }) => {
+            let filtered: Vec<Tool> = tools
                 .iter()
                 .filter(|t| t.function.name == function.name)
                 .cloned()
                 .collect();
-            filtered_body.tools = Some(filtered_tools);
-            std::borrow::Cow::Owned(filtered_body)
+            Some(filtered)
         }
-        _ => std::borrow::Cow::Borrowed(body), // No filtering needed, use original
+        _ => None, // No filtering needed
     }
+}
+
+/// Filter ChatCompletionRequest by tool_choice
+///
+/// Returns a reference to the original request if no filtering needed,
+/// otherwise returns a cloned request with filtered tools.
+///
+/// Note: Tool existence is validated earlier in ChatCompletionRequest::validate(),
+/// so this function assumes tool_choice references valid tools.
+pub fn filter_chat_request_by_tool_choice(
+    body: &ChatCompletionRequest,
+) -> std::borrow::Cow<'_, ChatCompletionRequest> {
+    if let Some(tools) = &body.tools {
+        if let Some(filtered_tools) = filter_tools_by_tool_choice(tools, &body.tool_choice) {
+            let mut filtered_body = body.clone();
+            filtered_body.tools = Some(filtered_tools);
+            return std::borrow::Cow::Owned(filtered_body);
+        }
+    }
+
+    // No filtering needed - return original request
+    std::borrow::Cow::Borrowed(body)
 }
 
 /// Process chat messages and apply template (shared by both routers)
@@ -438,8 +462,6 @@ pub fn create_stop_decoder(
     skip_special_tokens: bool,
     no_stop_trim: bool,
 ) -> StopSequenceDecoder {
-    use crate::tokenizer::stop::StopSequenceDecoderBuilder;
-
     // Extract stop sequences
     let stop_sequences: Vec<String> = match stop {
         Some(StringOrArray::String(s)) => vec![s.clone()],
@@ -580,7 +602,7 @@ pub async fn collect_stream_responses(
                         all_responses.push(complete);
                     }
                     Some(Error(err)) => {
-                        error!("{} error: {}", worker_name, err.message);
+                        error!(function = "collect_stream_responses", worker = %worker_name, error = %err.message, "Worker generation error");
                         // Don't mark as completed - let Drop send abort for error cases
                         return Err(error::internal_error(format!(
                             "{} generation failed: {}",
@@ -596,7 +618,7 @@ pub async fn collect_stream_responses(
                 }
             }
             Err(e) => {
-                error!("{} stream error: {:?}", worker_name, e);
+                error!(function = "collect_stream_responses", worker = %worker_name, error = ?e, "Worker stream error");
                 // Don't mark as completed - let Drop send abort for error cases
                 return Err(error::internal_error(format!(
                     "{} stream failed: {}",

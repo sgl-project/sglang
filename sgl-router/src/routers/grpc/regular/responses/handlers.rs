@@ -43,7 +43,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 use validator::Validate;
 
@@ -58,21 +58,19 @@ use crate::{
     },
     protocols::{
         chat::{self, ChatCompletionStreamResponse},
-        common,
+        common::{self},
         responses::{
             self, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
             ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
             ResponsesUsage,
         },
     },
-    routers::{
-        grpc::{
-            common::responses::{
-                build_sse_response, ensure_mcp_connection, streaming::ResponseStreamEventEmitter,
-            },
-            error,
+    routers::grpc::{
+        common::responses::{
+            build_sse_response, ensure_mcp_connection, persist_response_if_needed,
+            streaming::ResponseStreamEventEmitter,
         },
-        openai::conversations::persist_conversation_items,
+        error,
     },
 };
 
@@ -149,7 +147,6 @@ pub async fn route_responses(
         route_responses_streaming(ctx, request, headers, model_id).await
     } else {
         // Generate response ID for synchronous execution
-        // TODO: we may remove this when we have builder pattern for responses
         let response_id = Some(format!("resp_{}", Uuid::new_v4()));
         route_responses_sync(ctx, request, headers, model_id, response_id).await
     }
@@ -221,21 +218,14 @@ async fn route_responses_internal(
     };
 
     // 5. Persist response to storage if store=true
-    if request.store.unwrap_or(true) {
-        if let Ok(response_json) = serde_json::to_value(&responses_response) {
-            if let Err(e) = persist_conversation_items(
-                ctx.conversation_storage.clone(),
-                ctx.conversation_item_storage.clone(),
-                ctx.response_storage.clone(),
-                &response_json,
-                &request,
-            )
-            .await
-            {
-                warn!("Failed to persist response: {}", e);
-            }
-        }
-    }
+    persist_response_if_needed(
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        ctx.response_storage.clone(),
+        &responses_response,
+        &request,
+    )
+    .await;
 
     Ok(responses_response)
 }
@@ -377,6 +367,18 @@ async fn process_and_transform_sse_stream(
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
+    event_emitter.set_original_request(original_request.clone());
+
+    // Emit initial response.created and response.in_progress events
+    let event = event_emitter.emit_created();
+    event_emitter
+        .send_event(&event, &tx)
+        .map_err(|_| "Failed to send response.created event".to_string())?;
+
+    let event = event_emitter.emit_in_progress();
+    event_emitter
+        .send_event(&event, &tx)
+        .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
     // Convert body to data stream
     let mut stream = body.into_data_stream();
@@ -421,15 +423,15 @@ async fn process_and_transform_sse_stream(
     // Emit final response.completed event with accumulated usage
     let usage_json = accumulator.usage.as_ref().map(|u| {
         let mut usage_obj = json!({
-            "prompt_tokens": u.prompt_tokens,
-            "completion_tokens": u.completion_tokens,
+            "input_tokens": u.prompt_tokens,
+            "output_tokens": u.completion_tokens,
             "total_tokens": u.total_tokens
         });
 
         // Include reasoning_tokens if present
         if let Some(details) = &u.completion_tokens_details {
             if let Some(reasoning_tokens) = details.reasoning_tokens {
-                usage_obj["completion_tokens_details"] = json!({
+                usage_obj["output_tokens_details"] = json!({
                     "reasoning_tokens": reasoning_tokens
                 });
             }
@@ -442,25 +444,15 @@ async fn process_and_transform_sse_stream(
     event_emitter.send_event(&completed_event, &tx)?;
 
     // Finalize and persist accumulated response
-    if original_request.store.unwrap_or(true) {
-        let final_response = accumulator.finalize();
-
-        if let Ok(response_json) = serde_json::to_value(&final_response) {
-            if let Err(e) = persist_conversation_items(
-                conversation_storage.clone(),
-                conversation_item_storage.clone(),
-                response_storage.clone(),
-                &response_json,
-                &original_request,
-            )
-            .await
-            {
-                warn!("Failed to persist streaming response: {}", e);
-            } else {
-                debug!("Persisted streaming response: {}", final_response.id);
-            }
-        }
-    }
+    let final_response = accumulator.finalize();
+    persist_response_if_needed(
+        conversation_storage,
+        conversation_item_storage,
+        response_storage,
+        &final_response,
+        &original_request,
+    )
+    .await;
 
     Ok(())
 }
@@ -628,32 +620,13 @@ impl StreamingResponseAccumulator {
             ResponsesUsage::Classic(usage_info)
         });
 
-        ResponsesResponse {
-            id: self.response_id,
-            object: "response".to_string(),
-            created_at: self.created_at,
-            status,
-            error: None,
-            incomplete_details: None,
-            instructions: self.original_request.instructions.clone(),
-            max_output_tokens: self.original_request.max_output_tokens,
-            model: self.model,
-            output,
-            parallel_tool_calls: self.original_request.parallel_tool_calls.unwrap_or(true),
-            previous_response_id: self.original_request.previous_response_id.clone(),
-            reasoning: None,
-            store: self.original_request.store.unwrap_or(true),
-            temperature: self.original_request.temperature,
-            text: None,
-            tool_choice: "auto".to_string(),
-            tools: self.original_request.tools.clone().unwrap_or_default(),
-            top_p: self.original_request.top_p,
-            truncation: None,
-            usage,
-            user: None,
-            safety_identifier: self.original_request.user.clone(),
-            metadata: self.original_request.metadata.clone().unwrap_or_default(),
-        }
+        ResponsesResponse::builder(&self.response_id, &self.model)
+            .copy_from_request(&self.original_request)
+            .created_at(self.created_at)
+            .status(status)
+            .output(output)
+            .maybe_usage(usage)
+            .build()
     }
 }
 
@@ -671,8 +644,14 @@ async fn execute_without_mcp(
     response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
     // Convert ResponsesRequest → ChatCompletionRequest
-    let chat_request = conversions::responses_to_chat(modified_request)
-        .map_err(|e| error::bad_request(format!("Failed to convert request: {}", e)))?;
+    let chat_request = conversions::responses_to_chat(modified_request).map_err(|e| {
+        error!(
+            function = "execute_without_mcp",
+            error = %e,
+            "Failed to convert ResponsesRequest to ChatCompletionRequest"
+        );
+        error::bad_request(format!("Failed to convert request: {}", e))
+    })?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
     let chat_response = ctx
@@ -686,8 +665,14 @@ async fn execute_without_mcp(
         .await?; // Preserve the Response error as-is
 
     // Convert ChatCompletionResponse → ResponsesResponse
-    conversions::chat_to_responses(&chat_response, original_request, response_id)
-        .map_err(|e| error::internal_error(format!("Failed to convert to responses format: {}", e)))
+    conversions::chat_to_responses(&chat_response, original_request, response_id).map_err(|e| {
+        error!(
+            function = "execute_without_mcp",
+            error = %e,
+            "Failed to convert ChatCompletionResponse to ResponsesResponse"
+        );
+        error::internal_error(format!("Failed to convert to responses format: {}", e))
+    })
 }
 
 /// Load conversation history and response chains, returning modified request
@@ -764,7 +749,15 @@ async fn load_conversation_history(
             .conversation_storage
             .get_conversation(&conv_id)
             .await
-            .map_err(|e| error::internal_error(format!("Failed to check conversation: {}", e)))?;
+            .map_err(|e| {
+                error!(
+                    function = "load_conversation_history",
+                    conversation_id = %conv_id_str,
+                    error = %e,
+                    "Failed to check conversation existence in storage"
+                );
+                error::internal_error(format!("Failed to check conversation: {}", e))
+            })?;
 
         if conversation.is_none() {
             return Err(error::not_found(format!(

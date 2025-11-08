@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 from sgl_kernel.elementwise import silu_and_mul
+from sgl_kernel.moe import moe_sum_reduce
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
@@ -36,6 +37,7 @@ def fused_marlin_moe(
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
+    routed_scaling_factor: float = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -204,10 +206,16 @@ def fused_marlin_moe(
         is_zp_float=False,
     ).view(-1, topk, K)
 
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
+
     output = hidden_states if inplace else torch.empty_like(hidden_states)
-    return torch.sum(
-        intermediate_cache3.view(*intermediate_cache3.shape), dim=1, out=output
+    moe_sum_reduce(
+        intermediate_cache3,
+        output,
+        routed_scaling_factor,
     )
+    return output
 
 
 def fused_marlin_moe_fake(
@@ -227,5 +235,7 @@ def fused_marlin_moe_fake(
     w2_zeros: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
+    inplace: bool = False,
+    routed_scaling_factor: float = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
