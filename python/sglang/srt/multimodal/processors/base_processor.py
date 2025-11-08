@@ -19,16 +19,15 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputFormat,
 )
+from sglang.srt.multimodal.processors.video_utils import make_video_input
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import envs, is_npu, load_audio, load_image, load_video, logger
+from sglang.srt.utils import envs, is_npu, load_audio, load_image, logger
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
 )
-from sglang.srt.multimodal.processors.video_utils import make_video_input
-from sglang.srt.utils import is_npu, load_audio, load_image, logger
 
 _is_npu = is_npu()
 
