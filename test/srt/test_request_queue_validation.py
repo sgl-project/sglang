@@ -2,7 +2,6 @@ import asyncio
 import os
 import re
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -37,6 +36,8 @@ class TestMaxQueuedRequests(CustomTestCase):
                 "1",
                 "--max-queued-requests",  # Enforce max queued request number is 1
                 "1",
+                "--attention-backend",
+                "triton",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )

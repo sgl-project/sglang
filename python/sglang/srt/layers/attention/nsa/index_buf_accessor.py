@@ -277,7 +277,18 @@ def _set_k_and_s_triton(
     num_pages, buf_numel_per_page = buf.shape
     (num_tokens_to_write,) = loc.shape
     num_tokens_to_write_, index_head_dim = index_k.shape
-    num_tokens_to_write__, scale_dim = index_k_scale.shape
+
+    # Handle both 1D (num_tokens,) and 2D (num_tokens, 1) shapes for index_k_scale
+    if index_k_scale.ndim == 1:
+        num_tokens_to_write__ = index_k_scale.shape[0]
+        scale_dim = 1
+    elif index_k_scale.ndim == 2:
+        num_tokens_to_write__, scale_dim = index_k_scale.shape
+    else:
+        raise ValueError(
+            f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
+        )
+
     assert buf_numel_per_page == 64 * (128 + 4)
     assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
     assert index_head_dim == 128

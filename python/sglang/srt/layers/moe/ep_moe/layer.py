@@ -112,8 +112,16 @@ class DeepEPMoE(FusedMoE):
 
         self.deepep_mode = get_deepep_mode()
 
-        if self.deepep_mode.enable_low_latency() and not _is_npu:
+        if (
+            self.deepep_mode.enable_low_latency()
+            and not _is_npu
+            and not (
+                get_moe_runner_backend().is_flashinfer_cutedsl()
+                and self.quant_config.get_name() == "modelopt_fp4"
+            )
+        ):
             # NPU supports low_latency deepep without deepgemm
+            # FP4 quantization with flashinfer_cutedsl also supports low_latency deepep without deepgemm
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"

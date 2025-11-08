@@ -210,6 +210,17 @@ impl StreamingProcessor {
                 model,
             );
 
+        // Check if JSON schema constraint was used (specific function or required mode)
+        let used_json_schema = match tool_choice {
+            Some(ToolChoice::Function { .. }) => true,
+            Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
+            Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
+            _ => false,
+        };
+
+        // Check if this is the specific function case (LLM generates parameters only, no name field)
+        let is_specific_function = matches!(tool_choice, Some(ToolChoice::Function { .. }));
+
         let tool_parser_available = tools.is_some()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
@@ -342,10 +353,24 @@ impl StreamingProcessor {
                     if !in_reasoning
                         && tool_choice_enabled
                         && tools.is_some()
-                        && tool_parser_available
+                        && (tool_parser_available || used_json_schema)
                     {
-                        let tool_chunks = self
-                            .process_tool_calls_stream(
+                        let tool_chunks = if is_specific_function {
+                            // Handle specific function case - emit tool call deltas with arguments
+                            Self::process_specific_function_stream(
+                                &delta,
+                                index,
+                                &mut has_tool_calls,
+                                tool_choice,
+                                request_id,
+                                model,
+                                created,
+                                system_fingerprint,
+                                history_tool_calls_count,
+                            )
+                        } else {
+                            // Use incremental parser for regular/required modes
+                            self.process_tool_calls_stream(
                                 &delta,
                                 index,
                                 &mut tool_parsers,
@@ -356,8 +381,10 @@ impl StreamingProcessor {
                                 created,
                                 system_fingerprint,
                                 history_tool_calls_count,
+                                used_json_schema,
                             )
-                            .await;
+                            .await
+                        };
 
                         for chunk in tool_chunks {
                             Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
@@ -1089,6 +1116,101 @@ impl StreamingProcessor {
         (delta.to_string(), None, false)
     }
 
+    /// Helper: Process specific function case - emit tool call deltas with arguments
+    #[allow(clippy::too_many_arguments)]
+    fn process_specific_function_stream(
+        delta: &str,
+        index: u32,
+        has_tool_calls: &mut HashMap<u32, bool>,
+        tool_choice: &Option<ToolChoice>,
+        request_id: &str,
+        model: &str,
+        created: u64,
+        system_fingerprint: Option<&str>,
+        history_tool_calls_count: usize,
+    ) -> Vec<ChatCompletionStreamResponse> {
+        let mut chunks = Vec::new();
+
+        if let Some(ToolChoice::Function { function, .. }) = tool_choice {
+            let is_first_call = !has_tool_calls.contains_key(&index);
+
+            if is_first_call {
+                // First chunk: send name and id
+                has_tool_calls.insert(index, true);
+
+                let tool_call_id = utils::generate_tool_call_id(
+                    model,
+                    &function.name,
+                    0,
+                    history_tool_calls_count,
+                );
+
+                chunks.push(ChatCompletionStreamResponse {
+                    id: request_id.to_string(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model.to_string(),
+                    system_fingerprint: system_fingerprint.map(|s| s.to_string()),
+                    choices: vec![ChatStreamChoice {
+                        index,
+                        delta: ChatMessageDelta {
+                            role: Some("assistant".to_string()),
+                            content: None,
+                            tool_calls: Some(vec![ToolCallDelta {
+                                index: 0,
+                                id: Some(tool_call_id),
+                                tool_type: Some("function".to_string()),
+                                function: Some(FunctionCallDelta {
+                                    name: Some(function.name.clone()),
+                                    arguments: None,
+                                }),
+                            }]),
+                            reasoning_content: None,
+                        },
+                        logprobs: None,
+                        finish_reason: None,
+                        matched_stop: None,
+                    }],
+                    usage: None,
+                });
+            }
+
+            // Emit arguments delta
+            if !delta.is_empty() {
+                chunks.push(ChatCompletionStreamResponse {
+                    id: request_id.to_string(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model.to_string(),
+                    system_fingerprint: system_fingerprint.map(|s| s.to_string()),
+                    choices: vec![ChatStreamChoice {
+                        index,
+                        delta: ChatMessageDelta {
+                            role: Some("assistant".to_string()),
+                            content: None,
+                            tool_calls: Some(vec![ToolCallDelta {
+                                index: 0,
+                                id: None,
+                                tool_type: None,
+                                function: Some(FunctionCallDelta {
+                                    name: None,
+                                    arguments: Some(delta.to_string()),
+                                }),
+                            }]),
+                            reasoning_content: None,
+                        },
+                        logprobs: None,
+                        finish_reason: None,
+                        matched_stop: None,
+                    }],
+                    usage: None,
+                });
+            }
+        }
+
+        chunks
+    }
+
     /// Helper: Process tool calls in streaming mode
     #[allow(clippy::too_many_arguments)]
     async fn process_tool_calls_stream(
@@ -1103,17 +1225,27 @@ impl StreamingProcessor {
         created: u64,
         system_fingerprint: Option<&str>,
         history_tool_calls_count: usize,
+        use_json_parser: bool,
     ) -> Vec<ChatCompletionStreamResponse> {
         let mut chunks = Vec::new();
 
         // Create fresh parser for this index (not pooled, to avoid state pollution)
         tool_parsers.entry(index).or_insert_with(|| {
-            let parser = utils::create_tool_parser(
-                &self.tool_parser_factory,
-                self.configured_tool_parser.as_ref(),
-                model,
-            )
-            .expect("Parser should be available - checked upfront");
+            let parser = if use_json_parser {
+                utils::create_tool_parser(
+                    &self.tool_parser_factory,
+                    Some(&"json".to_string()),
+                    model,
+                )
+                .expect("JSON parser should be available")
+            } else {
+                utils::create_tool_parser(
+                    &self.tool_parser_factory,
+                    self.configured_tool_parser.as_ref(),
+                    model,
+                )
+                .expect("Parser should be available - checked upfront")
+            };
             Arc::new(tokio::sync::Mutex::new(parser))
         });
 

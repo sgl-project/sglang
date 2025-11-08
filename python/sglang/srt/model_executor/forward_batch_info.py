@@ -141,6 +141,13 @@ class ForwardMode(IntEnum):
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
 
+    def is_extend_without_speculative(self):
+        return (
+            self.is_extend()
+            and not self.is_target_verify()
+            and not self.is_draft_extend()
+        )
+
 
 @total_ordering
 class CaptureHiddenMode(IntEnum):

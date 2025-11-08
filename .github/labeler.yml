@@ -1,0 +1,101 @@
+# Configuration for the GitHub Labeler action
+# Automatically adds labels to PRs based on the files changed
+
+# Router specific (Rust code in sgl-router)
+router:
+  - changed-files:
+    - any-glob-to-any-file: 'sgl-router/**/*'
+
+# Router benchmarks
+router-benchmark:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'sgl-router/benches/**/*'
+      - 'sgl-router/scripts/run_benchmarks.py'
+      - 'sgl-router/**/*bench*.rs'
+
+# Kernel specific
+sgl-kernel:
+  - changed-files:
+    - any-glob-to-any-file: 'sgl-kernel/**/*'
+
+# Documentation
+documentation:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*.md'
+      - 'docs/**/*'
+      - 'README*'
+
+# Dependencies
+dependencies:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/requirements*.txt'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/pyproject.toml'
+      - '**/setup.py'
+      - '**/poetry.lock'
+      - '**/package.json'
+      - '**/package-lock.json'
+
+# Multi-modal
+Multi-modal:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/vision/**/*'
+      - '**/multimodal/**/*'
+      - '**/vlm/**/*'
+
+# LoRA
+lora:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/lora/**/*'
+      - '**/*lora*'
+
+# Quantization
+quant:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/quant/**/*'
+      - '**/*quant*'
+      - '**/awq/**/*'
+      - '**/gptq/**/*'
+
+# Performance related
+performance:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/benchmark/**/*'
+      - '**/benches/**/*'
+      - '**/perf/**/*'
+      - '**/*benchmark*'
+
+# Speculative decoding
+speculative-decoding:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/speculative/**/*'
+      - '**/*speculative*'
+
+# AMD specific
+amd:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*amd*'
+      - '**/*rocm*'
+
+# DeepSeek specific
+deepseek:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*deepseek*'
+
+# HiCache
+hicache:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/hicache/**/*'
+      - '**/*hicache*'
