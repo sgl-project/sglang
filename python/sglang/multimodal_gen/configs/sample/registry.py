@@ -72,6 +72,7 @@ SAMPLING_PARAM_DETECTOR: dict[str, Callable[[str], bool]] = {
     # Add other pipeline architecture detectors
     "flux": lambda id: "flux" in id.lower(),
     "qwenimage": lambda id: "qwenimage" in id.lower(),
+    "qwenimageedit": lambda id: "qwenimageedit" in id.lower(),
 }
 
 # Fallback configs when exact match isn't found but architecture is detected
@@ -83,6 +84,7 @@ SAMPLING_FALLBACK_PARAM: dict[str, Any] = {
     # Other fallbacks by architecture
     "flux": FluxSamplingParams,
     "qwenimage": QwenImageSamplingParams,
+    "qwenimageedit": QwenImageSamplingParams,
 }
 
 
