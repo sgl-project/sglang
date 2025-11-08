@@ -4,14 +4,7 @@
 //! - Usage calculation from gRPC responses
 //! - ChatCompletionResponse construction
 
-use crate::{
-    grpc_client::proto,
-    protocols::{
-        chat::{ChatChoice, ChatCompletionResponse},
-        common::Usage,
-    },
-    routers::grpc::context::DispatchMetadata,
-};
+use crate::{grpc_client::proto, protocols::common::Usage};
 
 /// Build usage information from collected gRPC responses
 ///
@@ -32,34 +25,5 @@ pub fn build_usage(responses: &[proto::GenerateComplete]) -> Usage {
         completion_tokens: total_completion_tokens,
         total_tokens: total_prompt_tokens + total_completion_tokens,
         completion_tokens_details: None,
-    }
-}
-
-/// Build final ChatCompletionResponse from processed choices
-///
-/// Constructs the OpenAI-compatible response object with all metadata.
-///
-/// # Arguments
-/// * `choices` - Processed chat choices (after parsing, logprobs, etc.)
-/// * `dispatch` - Dispatch metadata (request_id, created timestamp, etc.)
-/// * `model` - Model name to include in response
-/// * `usage` - Token usage information
-///
-/// # Returns
-/// Complete ChatCompletionResponse ready to send to client
-pub fn build_chat_response(
-    choices: Vec<ChatChoice>,
-    dispatch: &DispatchMetadata,
-    model: String,
-    usage: Usage,
-) -> ChatCompletionResponse {
-    ChatCompletionResponse {
-        id: dispatch.request_id.clone(),
-        object: "chat.completion".to_string(),
-        created: dispatch.created,
-        model,
-        choices,
-        usage: Some(usage),
-        system_fingerprint: dispatch.weight_version.clone(),
     }
 }
