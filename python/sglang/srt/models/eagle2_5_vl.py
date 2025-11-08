@@ -117,8 +117,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         # Pooler for embedding extraction
         self.pooler = Pooler(
             pooling_type=PoolingType.LAST,
-            normalize=False,
-            embed_dim=config.text_config.hidden_size,
+            normalize=True,  # TODO
         )
 
         # LM Head
