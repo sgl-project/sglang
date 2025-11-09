@@ -3715,6 +3715,13 @@ class ServerArgs:
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
 
+        # Check served model name to not have colon as it is reserved for LoRA adapter syntax
+        assert ":" not in self.served_model_name, (
+            "served_model_name cannot contain a colon (':') character. "
+            "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
+            f"Invalid value: '{self.served_model_name}'"
+        )
+
         # Check LoRA
         self.check_lora_server_args()
 

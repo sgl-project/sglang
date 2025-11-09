@@ -6,6 +6,29 @@ from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.test_utils import CustomTestCase
 
 
+class TestServedModelNameValidation(CustomTestCase):
+    def test_served_model_name_with_colon_raises_error(self):
+        """Test that served_model_name containing a colon raises an AssertionError."""
+        with self.assertRaises(AssertionError) as context:
+            ServerArgs(
+                model_path="meta-llama/Meta-Llama-3.1-8B-Instruct",
+                served_model_name="my-model:adapter",
+            )
+
+        self.assertIn(
+            "served_model_name cannot contain a colon", str(context.exception)
+        )
+        self.assertIn("my-model:adapter", str(context.exception))
+
+    def test_served_model_name_without_colon_succeeds(self):
+        """Test that served_model_name without a colon works correctly."""
+        server_args = ServerArgs(
+            model_path="meta-llama/Meta-Llama-3.1-8B-Instruct",
+            served_model_name="my-custom-model-name",
+        )
+        self.assertEqual(server_args.served_model_name, "my-custom-model-name")
+
+
 class TestPrepareServerArgs(CustomTestCase):
     def test_prepare_server_args(self):
         server_args = prepare_server_args(
