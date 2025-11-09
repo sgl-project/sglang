@@ -168,6 +168,7 @@ suites = {
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_hybrid_attention.py", 200),
+        TestFile("models/test_kimi_k2_models.py", 200),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
@@ -219,8 +220,9 @@ suites = {
     ],
     "nightly-4-gpu-b200": [
         TestFile("test_fp4_moe.py", 300),
-        TestFile("test_nightly_gpt_oss_4gpu_perf.py", 600),
+        TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
     ],
+    "nightly-8-gpu-b200": [],
     "nightly-4-gpu": [],
     "nightly-8-gpu": [],
     "nightly-8-gpu-h200": [],
@@ -334,11 +336,14 @@ suites = {
         TestFile("test_moe_ep.py"),
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_mscclpp.py"),
-        TestFile("test_nightly_gsm8k_eval.py"),
-        TestFile("test_nightly_text_models_gsm8k_eval.py"),
-        TestFile("test_nightly_text_models_perf.py"),
-        TestFile("test_nightly_vlms_mmmu_eval.py"),
-        TestFile("test_nightly_vlms_perf.py"),
+        TestFile("nightly/test_deepseek_v31_perf.py"),
+        TestFile("nightly/test_deepseek_v32_perf.py"),
+        TestFile("nightly/test_gpt_oss_4gpu_perf.py"),
+        TestFile("nightly/test_gsm8k_eval_amd.py"),
+        TestFile("nightly/test_text_models_gsm8k_eval.py"),
+        TestFile("nightly/test_text_models_perf.py"),
+        TestFile("nightly/test_vlms_mmmu_eval.py"),
+        TestFile("nightly/test_vlms_perf.py"),
         TestFile("test_openai_adapter.py"),
         TestFile("test_openai_function_calling.py"),
         TestFile("test_openai_server.py"),
@@ -478,7 +483,7 @@ suite_amd = {
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     "nightly-amd": [
-        TestFile("test_nightly_gsm8k_eval_amd.py"),
+        TestFile("nightly/test_gsm8k_eval_amd.py"),
     ],
 }
 
@@ -645,6 +650,12 @@ if __name__ == "__main__":
         type=int,
         help="Use auto load balancing. The number of parts.",
     )
+    arg_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        default=False,
+        help="Continue running remaining tests even if one fails (useful for nightly tests)",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -662,5 +673,5 @@ if __name__ == "__main__":
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(files, args.timeout_per_file)
+    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
     exit(exit_code)
