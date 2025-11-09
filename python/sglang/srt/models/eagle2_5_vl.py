@@ -207,6 +207,16 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
                 if "out_proj" in name:
                     name = name.replace("out_proj", "proj")
 
+                # Transform head parameter names from checkpoint format to model format
+                if "head.attention.in_proj_weight" in name:
+                    name = name.replace(
+                        "head.attention.in_proj_weight", "head.attention.in_proj.weight"
+                    )
+                if "head.attention.in_proj_bias" in name:
+                    name = name.replace(
+                        "head.attention.in_proj_bias", "head.attention.in_proj.bias"
+                    )
+
             # Transform language model parameter names
             if "language_model" in name:
                 name = name.replace(r"language_model.model.", r"language_model.")
