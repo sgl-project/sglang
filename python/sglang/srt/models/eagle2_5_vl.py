@@ -105,16 +105,6 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             prefix=add_prefix("language_model", prefix),
         )
 
-        # Vision projection
-        self.visual_projection = Eagle2_5_VLVisionMLP(
-            in_features=config.vision_config.hidden_size,
-            hidden_features=config.vision_config.intermediate_size,
-            out_features=config.text_config.hidden_size,
-            hidden_act=config.vision_config.hidden_act,
-            quant_config=quant_config,
-            prefix=add_prefix("visual_projection", prefix),
-        )
-
         # Pooler for embedding extraction
         self.pooler = Pooler(
             pooling_type=PoolingType.LAST,
@@ -130,37 +120,20 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         )
 
         # Logits processor
-        self.logits_processor = LogitsProcessor(self.config.text_config)
+        self.logits_processor = LogitsProcessor(self.config)
 
         # MLP connector (matches Eagle2.5 architecture)
         vit_hidden_size = config.vision_config.hidden_size
         llm_hidden_size = config.text_config.hidden_size
 
-        if config.mlp_connector_layers == 2:
-            self.mlp1 = nn.Sequential(
-                nn.LayerNorm(vit_hidden_size * int(1 / config.downsample_ratio) ** 2),
-                nn.Linear(
-                    vit_hidden_size * int(1 / config.downsample_ratio) ** 2,
-                    llm_hidden_size,
-                ),
-                nn.GELU(),
-                nn.Linear(llm_hidden_size, llm_hidden_size),
-            )
-        elif config.mlp_connector_layers == 1 and config.use_pixel_shuffle:
-            self.mlp1 = nn.Sequential(
-                nn.Linear(
-                    vit_hidden_size * int(1 / config.downsample_ratio) ** 2,
-                    llm_hidden_size,
-                ),
-            )
-        elif config.mlp_connector_layers == 1 and not config.use_pixel_shuffle:
-            self.mlp1 = nn.Sequential(
-                nn.Linear(vit_hidden_size, llm_hidden_size),
-            )
-        else:
-            raise NotImplementedError(
-                f"{config.mlp_connector_layers} mlp_connector_layers is not implemented."
-            )
+        # Hardcode mlp1 dimensions to match Eagle2.5 checkpoint exactly
+        # Based on checkpoint parameters: mlp1.0, mlp1.1, mlp1.3
+        self.mlp1 = nn.Sequential(
+            nn.LayerNorm(4608),  # mlp1.0 - matches checkpoint dimensions
+            nn.Linear(4608, 3584),  # mlp1.1 - matches checkpoint dimensions
+            nn.GELU(),
+            nn.Linear(3584, 3584),  # mlp1.3 - matches checkpoint dimensions
+        )
 
         # Special tokens
         self.image_token_index = config.image_token_index
