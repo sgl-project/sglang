@@ -96,7 +96,7 @@ _workspace_manager = FlashInferWorkspaceManager()
 
 
 def ensure_workspace_initialized(
-    max_token_num: int = 16384, hidden_dim: int = 4096, use_fp32_lamport: bool = False
+    max_token_num: int = 2048, hidden_dim: int = 4096, use_fp32_lamport: bool = False
 ):
     """Ensure workspace is initialized"""
     if not is_flashinfer_available() or _flashinfer_comm is None:
@@ -128,7 +128,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    max_token_num: int = 16384,
+    max_token_num: int = 2048,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,
