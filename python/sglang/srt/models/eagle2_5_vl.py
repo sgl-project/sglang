@@ -130,7 +130,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         # Based on checkpoint parameters: mlp1.0, mlp1.1, mlp1.3
         self.mlp1 = nn.Sequential(
             nn.LayerNorm(4608),  # mlp1.0 - matches checkpoint dimensions
-            nn.Linear(3584, 4608),  # mlp1.1 - matches checkpoint dimensions
+            nn.Linear(4608, 3584),  # mlp1.1 - matches checkpoint dimensions
             nn.GELU(),
             nn.Linear(3584, 3584),  # mlp1.3 - matches checkpoint dimensions
         )
