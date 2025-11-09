@@ -272,6 +272,7 @@ class DenoisingStage(PipelineStage):
             assert self.vae is not None, "VAE is not provided for TI2V task"
             self.vae = self.vae.to(batch.pil_image.device)
             z = self.vae.encode(batch.pil_image).mean.float()
+
             print(f"{z=}")
             if self.vae.device != "cpu" and server_args.vae_cpu_offload:
                 self.vae = self.vae.to("cpu")
@@ -287,6 +288,9 @@ class DenoisingStage(PipelineStage):
                 z = z * self.vae.scaling_factor
             print(f"{z=}")
 
+            # Remove batch dimension if present (z should be [C, T, H, W], not [B, C, T, H, W])
+            if z.dim() == 5:
+                z = z.squeeze(0)
             latent_model_input = latents.to(target_dtype).squeeze(0)
             _, mask2 = masks_like([latent_model_input], zero=True)
             print(f"{mask2=}")
@@ -305,7 +309,9 @@ class DenoisingStage(PipelineStage):
         latents = batch.latents
 
         # If TI2V, adjust mask2 to the local SP shard and compute local seq_len
+        # Note: z (image latent) has only 1 frame and will be broadcasted during mixing
         patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
+        mask2_local = None
         if server_args.pipeline_config.ti2v_task and batch.pil_image is not None:
             sp_size = get_sp_world_size()
             rank_in_sp = get_sp_parallel_rank()
@@ -314,10 +320,12 @@ class DenoisingStage(PipelineStage):
             if sp_size > 1 and T_total % sp_size == 0:
                 # interleaved slicing across time: rank r gets frames r, r+sp, r+2*sp, ...
                 mask2_local = mask2[0][:, rank_in_sp::sp_size, :, :].contiguous()
-                mask2 = [mask2_local]
+                # z (image latent) should NOT be sharded - it has fewer frames and will broadcast
+            else:
+                mask2_local = mask2[0]
             # derive per-rank local seq_len on patch grid
             ph, pw = patch_size[1], patch_size[2]
-            seq_len = (mask2[0][0][:, ::ph, ::pw]).numel()
+            seq_len = (mask2_local[0][:, ::ph, ::pw]).numel()
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -683,11 +691,11 @@ class DenoisingStage(PipelineStage):
                     ):
                         timestep = torch.stack([t_device]).to(get_local_torch_device())
                         # Downsample mask to patch grid using true patch strides (ph, pw)
+                        # mask2_local shape: [C, T_local, H, W]
+                        # mask2_local[0] shape: [T_local, H, W]
                         ph = patch_size[1]
                         pw = patch_size[2]
-                        temp_ts = (
-                            mask2_local[0][0][:, ::ph, ::pw] * timestep
-                        ).flatten()
+                        temp_ts = (mask2_local[0][:, ::ph, ::pw] * timestep).flatten()
                         temp_ts = torch.cat(
                             [
                                 temp_ts,
@@ -737,13 +745,18 @@ class DenoisingStage(PipelineStage):
                         server_args.pipeline_config.ti2v_task
                         and batch.pil_image is not None
                     ):
-                        # TI2V per-step mixing: scheduler.step returns [B,C,T,H,W]
-                        # We need to mix with z (4D) using mask2_local (4D), keeping batch dim
+                        # TI2V per-step mixing: scheduler.step returns [B,C,T_local,H,W]
+                        # We need to mix with z (4D, has 1 frame, broadcasts) using mask2_local (4D, T_local frames)
                         assert (
                             latents.dim() == 5
                         ), f"Expected 5D latents, got {latents.shape}"
                         latents_4d = latents.squeeze(0)
+                        print(f"{latents_4d.shape=}")
+                        # z has shape [C, 1, H, W] or similar, will broadcast to [C, T_local, H, W]
                         latents_4d = (1.0 - mask2_local) * z + mask2_local * latents_4d
+                        print(f"after {latents_4d.shape=}")
+                        print(f"after {z.shape=}")
+                        print(f"after {mask2_local.shape=}")
                         latents = latents_4d.unsqueeze(0)
 
                     # save trajectory latents if needed
