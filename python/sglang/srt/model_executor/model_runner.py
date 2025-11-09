@@ -31,6 +31,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs import (
     FalconH1Config,
+    JetNemotronConfig,
     KimiLinearConfig,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -862,6 +863,7 @@ class ModelRunner:
         model_path: str,
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
+        recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -916,6 +918,9 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
+
+        if recapture_cuda_graph and self.device == "cuda":
+            self.init_device_graphs()
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
@@ -1370,7 +1375,7 @@ class ModelRunner:
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig):
+        if isinstance(config, Qwen3NextConfig | JetNemotronConfig):
             return config
         return None
 

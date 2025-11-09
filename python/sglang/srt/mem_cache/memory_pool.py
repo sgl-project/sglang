@@ -45,16 +45,11 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
+    maybe_init_custom_mem_pool,
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_cuda,
-    is_float4_e2m1fn_x2,
-    is_npu,
-    next_power_of_2,
-)
+from sglang.srt.utils import is_cuda, is_float4_e2m1fn_x2, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -162,18 +157,13 @@ class MambaPool:
         ssm_dtype = cache_params.dtype.temporal
         num_mamba_layers = len(cache_params.layers)
 
-        # for disagg with nvlink
-        self.enable_custom_mem_pool = get_bool_env_var(
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
-        )
-        if self.enable_custom_mem_pool:
-            # TODO(shangming): abstract custom allocator class for more backends
-            from mooncake.allocator import NVLinkAllocator
+        self.size = size
+        self.device = device
 
-            allocator = NVLinkAllocator.get_allocator(self.device)
-            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
-        else:
-            self.custom_mem_pool = None
+        # for disagg with nvlink
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+            maybe_init_custom_mem_pool(device=self.device)
+        )
 
         self.is_kda_cache = isinstance(cache_params, KimiLinearCacheParams)
         with (
@@ -270,8 +260,6 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
-            self.size = size
-            self.device = device
             self.free_slots = torch.arange(
                 self.size, dtype=torch.int64, device=self.device
             )
@@ -484,17 +472,9 @@ class KVCache(abc.ABC):
         self.layer_transfer_counter = None
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool = get_bool_env_var(
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+            maybe_init_custom_mem_pool(device=self.device)
         )
-        if self.enable_custom_mem_pool:
-            # TODO(shangming): abstract custom allocator class for more backends
-            from mooncake.allocator import NVLinkAllocator
-
-            allocator = NVLinkAllocator.get_allocator(self.device)
-            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
-        else:
-            self.custom_mem_pool = None
 
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
@@ -1062,17 +1042,9 @@ class SWAKVPool(KVCache):
         assert not enable_kvcache_transpose
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool = get_bool_env_var(
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+            maybe_init_custom_mem_pool(device=self.device)
         )
-        if self.enable_custom_mem_pool:
-            # TODO(shangming): abstract custom allocator class for more backends
-            from mooncake.allocator import NVLinkAllocator
-
-            allocator = NVLinkAllocator.get_allocator(self.device)
-            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
-        else:
-            self.custom_mem_pool = None
 
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
@@ -1564,6 +1536,7 @@ class MLATokenToKVPool(KVCache):
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
+    rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
         self,
@@ -1585,10 +1558,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
         # Calculate override_kv_cache_dim for FP8 storage:
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+        # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         override_dim = (
             kv_lora_rank
             + kv_lora_rank // self.quant_block_size * 4
-            + qk_rope_head_dim * dtype.itemsize
+            + qk_rope_head_dim * self.rope_storage_dtype.itemsize
         )
 
         super().__init__(

@@ -13,9 +13,13 @@
 # ==============================================================================
 """Common utilities."""
 
+from typing import Any, Optional, Tuple
+
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.environ import envs
 
 
 @triton.jit
@@ -208,3 +212,32 @@ def get_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
     )
+
+
+def maybe_init_custom_mem_pool(
+    device: str,
+) -> Tuple[bool, Optional[Any], Optional[str]]:
+    """
+    Initialize custom memory pool based on environment variable.
+
+    This function can be modified to support more features that require a custom memory pool.
+
+    Args:
+        device: The device to allocate memory on
+
+    Returns:
+        Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
+    """
+    enable_custom_mem_pool = (
+        True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
+    )
+
+    if enable_custom_mem_pool:
+        # Currently, only mooncake requires a custom mem pool for MNNVL/Barex PD disaggregation
+        from sglang.srt.disaggregation.mooncake.utils import (
+            init_mooncake_custom_mem_pool,
+        )
+
+        return init_mooncake_custom_mem_pool(device)
+    else:
+        return False, None, None
