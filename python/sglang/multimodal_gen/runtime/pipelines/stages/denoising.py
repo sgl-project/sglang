@@ -289,14 +289,20 @@ class DenoisingStage(PipelineStage):
             else:
                 z = z * self.vae.scaling_factor
             # z: [B, C, 1, H, W]
-            latent_model_input = latents.to(target_dtype).squeeze(0)
-            # [C, T, H, W]
-            assert latent_model_input.ndim == 4
-            _, reserved_frames_masks = masks_like([latent_model_input], zero=True)
-            # [C, T, H, W]
-            reserved_frames_mask = reserved_frames_masks[0]
+            latent_model_input = latents.to(target_dtype)
+            # Keep as [B, C, T, H, W] for proper broadcasting
+            assert latent_model_input.ndim == 5
 
-            # replace GLOBAL first frame with image
+            # Create mask with proper shape [B, C, T, H, W]
+            latent_for_mask = latent_model_input.squeeze(0)  # [C, T, H, W]
+            _, reserved_frames_masks = masks_like([latent_for_mask], zero=True)
+            reserved_frames_mask = reserved_frames_masks[0].unsqueeze(
+                0
+            )  # [1, C, T, H, W]
+
+            # replace GLOBAL first frame with image - proper broadcasting
+            # z: [B, C, 1, H, W], reserved_frames_mask: [1, C, T, H, W]
+            # Both will broadcast correctly
             latents = (
                 1.0 - reserved_frames_mask
             ) * z + reserved_frames_mask * latent_model_input
@@ -750,34 +756,43 @@ class DenoisingStage(PipelineStage):
                         server_args.pipeline_config.ti2v_task
                         and batch.pil_image is not None
                     ):
-                        timestep = torch.stack([t_device]).to(get_local_torch_device())
-                        # Use SP-sharded reserved_frames_mask for timestep expansion
-                        # reserved_frames_mask is now a tensor [C, T, H, W], not a list
-                        if reserved_frames_mask is not None:
+                        local_seq_len = seq_len
+                        if get_sp_world_size() > 1 and getattr(
+                            batch, "did_sp_shard_latents", False
+                        ):
+                            local_seq_len = seq_len // get_sp_world_size()
+
+                        if (
+                            get_sp_parallel_rank() == 0
+                            and reserved_frames_mask is not None
+                        ):
+                            # Rank 0 has the first frame, create a special timestep tensor
+                            # NOTE: The spatial downsampling in the next line is suspicious but kept
+                            # to match original model's potential training configuration.
                             temp_ts = (
-                                reserved_frames_mask[0][:, ::2, ::2] * timestep
+                                reserved_frames_mask[0][:, ::2, ::2] * t_device
                             ).flatten()
-                            # Calculate local seq_len for SP
-                            local_seq_len = seq_len
-                            if get_sp_world_size() > 1 and getattr(
-                                batch, "did_sp_shard_latents", False
-                            ):
-                                local_seq_len = seq_len // get_sp_world_size()
+
+                            # Pad to full local sequence length
                             temp_ts = torch.cat(
                                 [
                                     temp_ts,
                                     temp_ts.new_ones(local_seq_len - temp_ts.size(0))
-                                    * timestep,
+                                    * t_device,
                                 ]
                             )
-                            timestep = temp_ts.unsqueeze(0)
-                            timestep = timestep.repeat(latent_model_input.shape[0], 1)
+                            timestep = temp_ts.unsqueeze(0).repeat(
+                                latent_model_input.shape[0], 1
+                            )
                         else:
-                            # Fallback for non-first ranks in SP where reserved_frames_mask is None
-                            timestep = t_device.repeat(latent_model_input.shape[0])
+                            # Other ranks get a uniform timestep tensor of the correct shape [B, local_seq_len]
+                            timestep = t_device.repeat(
+                                latent_model_input.shape[0], local_seq_len
+                            )
                     else:
                         timestep = t_device.repeat(latent_model_input.shape[0])
 
+                    print(f"{i=} {timestep.shape=} {timestep=}")
                     latent_model_input = self.scheduler.scale_model_input(
                         latent_model_input, t_device
                     )
@@ -815,32 +830,18 @@ class DenoisingStage(PipelineStage):
                         server_args.pipeline_config.ti2v_task
                         and batch.pil_image is not None
                     ):
-                        latents = latents.squeeze(0)
-                        print(f"{reserved_frames_mask is None=} {latents.shape=}")
-                        rank = get_sp_parallel_rank()
-
-                        # Apply TI2V mask blending with SP-aware z and reserved_frames_mask
-                        # reserved_frames_mask is now a tensor [C, T, H, W]
-                        # z is [1, C, 1, H, W], needs to be squeezed to [C, 1, H, W] to match latents [C, T, H, W]
-                        # For rank 0 in SP: z is not None, reserved_frames_mask has 0s for first frame -> blends with image
-                        # For other ranks in SP: z is None, reserved_frames_mask is all 1s -> latents unchanged
+                        # Apply TI2V mask blending with SP-aware z and reserved_frames_mask.
+                        # This ensures the first frame is always the condition image after each step.
+                        # This is only applied on rank 0, where z is not None.
                         if z is not None and reserved_frames_mask is not None:
-                            assert rank == 0
-                            # Rank has the first frame (rank 0 in SP)
-                            z_squeezed = z.squeeze(0)  # [C, 1, H, W]
+                            # z: [1, C, 1, H, W]
+                            # latents: [1, C, T_local, H, W]
+                            # reserved_frames_mask: [C, T_local, H, W]
+                            # Unsqueeze mask to [1, C, T_local, H, W] for broadcasting.
+                            # z will broadcast along the time dimension.
                             latents = (
-                                1.0 - reserved_frames_mask
-                            ) * z_squeezed + reserved_frames_mask * latents
-                        elif reserved_frames_mask is not None:
-                            # Other ranks: reserved_frames_mask is all 1s, so this is a no-op but kept for consistency
-                            # latents = (1.0 - 1.0) * 0 + 1.0 * latents = latents
-                            # We can skip this operation as optimization
-                            pass
-
-                        latents = latents.unsqueeze(0)
-
-                        # print(f"{rank=} {reserved_frames_mask is None=} {latents.shape=}")
-                        # else: no reserved_frames_mask, keep latents as is
+                                1.0 - reserved_frames_mask.unsqueeze(0)
+                            ) * z + reserved_frames_mask.unsqueeze(0) * latents
 
                     # save trajectory latents if needed
                     if batch.return_trajectory_latents:
