@@ -1052,15 +1052,7 @@ class FlashInferFP4MoE(FusedMoE):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            num_tokens = hs_fp4.shape[0]
-            hidden_size = (
-                hs_fp4.shape[-1] * 2
-                if hs_fp4.dtype == torch.uint8
-                else hs_fp4.shape[-1]
-            )
-            symm_output = torch.empty(
-                num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
-            )
+            symm_output = torch.empty_like(hidden_states)
         result = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=topk_config.correction_bias.to(hidden_states.dtype),
