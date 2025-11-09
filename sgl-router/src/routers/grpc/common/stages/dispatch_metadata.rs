@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use axum::response::Response;
+use tracing::error;
 
 use super::PipelineStage;
 use crate::routers::grpc::{
@@ -17,11 +18,13 @@ pub struct DispatchMetadataStage;
 #[async_trait]
 impl PipelineStage for DispatchMetadataStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let proto_request = ctx
-            .state
-            .proto_request
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Proto request not built"))?;
+        let proto_request = ctx.state.proto_request.as_ref().ok_or_else(|| {
+            error!(
+                function = "DispatchMetadataStage::execute",
+                "Proto request not built"
+            );
+            error::internal_error("Proto request not built")
+        })?;
 
         let request_id = proto_request.request_id.clone();
         let model = match &ctx.input.request_type {

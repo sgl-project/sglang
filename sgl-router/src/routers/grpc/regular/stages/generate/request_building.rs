@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use tracing::error;
 use uuid::Uuid;
 
 use crate::routers::grpc::{
@@ -26,17 +27,21 @@ impl GenerateRequestBuildingStage {
 #[async_trait]
 impl PipelineStage for GenerateRequestBuildingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let prep = ctx
-            .state
-            .preparation
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Preparation not completed"))?;
+        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+            error!(
+                function = "GenerateRequestBuildingStage::execute",
+                "Preparation not completed"
+            );
+            error::internal_error("Preparation not completed")
+        })?;
 
-        let clients = ctx
-            .state
-            .clients
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
+        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
+            error!(
+                function = "GenerateRequestBuildingStage::execute",
+                "Client acquisition not completed"
+            );
+            error::internal_error("Client acquisition not completed")
+        })?;
 
         let generate_request = ctx.generate_request_arc();
 
@@ -59,7 +64,10 @@ impl PipelineStage for GenerateRequestBuildingStage {
                 prep.original_text.clone(),
                 prep.token_ids.clone(),
             )
-            .map_err(error::bad_request)?;
+            .map_err(|e| {
+                error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build generate request");
+                error::bad_request(e)
+            })?;
 
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
