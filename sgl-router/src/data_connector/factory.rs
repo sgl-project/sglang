@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use tracing::info;
-
+use url::Url;
 use super::{
     core::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     memory::{MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage},
@@ -80,9 +80,19 @@ pub fn create_storage(config: &RouterConfig) -> Result<StorageTuple, String> {
                 .clone()
                 .ok_or("Postgres configuration is required when history_backend=postgres")?;
 
+            let log_db_url = match Url::parse(&postgres_cfg.db_url) {
+                Ok(mut url) => {
+                    if url.password().is_some() {
+                        let _ = url.set_password(Some("****"));
+                    }
+                    url.to_string()
+                }
+                Err(_) => "<redacted>".to_string(),
+            };
+
             info!(
                 "Initializing data connector: Postgres (db_url: {}, pool_max: {})",
-                postgres_cfg.db_url, postgres_cfg.pool_max
+                log_db_url, postgres_cfg.pool_max
             );
 
             let storages = create_postgres_storage(&postgres_cfg)?;

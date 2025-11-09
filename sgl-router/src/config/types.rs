@@ -204,10 +204,10 @@ impl PostgresConfig {
     pub fn validate(&self) -> Result<(), String> {
         let s = self.db_url.trim();
         if s.is_empty() {
-            return Err("db_url is not empty".to_string());
+            return Err("is it db-url should be not empty".to_string());
         }
 
-        let url = Url::parse(s).map_err(|e| format!("invalidate db_url: {}", e))?;
+        let url = Url::parse(s).map_err(|e| format!("invalid db_url: {}", e))?;
 
         let scheme = url.scheme();
         if scheme != "postgres" && scheme != "postgresql" {
@@ -228,7 +228,7 @@ impl PostgresConfig {
         }
 
         if self.pool_max == 0 {
-            return Err("pool_max must gate than 1, default is 16".to_string());
+            return Err("pool_max must be greater 1, default is 16".to_string());
         }
 
         Ok(())
