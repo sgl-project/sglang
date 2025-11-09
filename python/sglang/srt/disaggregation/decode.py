@@ -901,7 +901,7 @@ class SchedulerDisaggregationDecodeMixin:
         """Create fake completed prefill if possible and merge with running batch"""
         # Merge the prefill batch into the running batch
         last_batch = self.last_batch
-        if last_batch and last_batch.forward_mode.is_extend():
+        if last_batch and last_batch.forward_mode.is_prebuilt_extend():
             # chunked prefill doesn't happen in decode instance.
             assert self.chunked_req is None
             # Filter finished batches.
