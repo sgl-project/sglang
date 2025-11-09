@@ -124,7 +124,7 @@ class TestCLIBase(unittest.TestCase):
             self.base_command
             + [f"--model-path={model_path}"]
             + shlex.split(args or "")
-            + [f"--output-file-name={name}"]
+            + [f'--output-file-name="{name}"']
             + self.extra_args
         )
         duration = run_command(command)
@@ -187,6 +187,7 @@ class TestGenerateBase(TestCLIBase):
 
         for result in ordered_results:
             if not result:
+                print(f"{result=}")
                 continue
             status = (
                 "Succeed"

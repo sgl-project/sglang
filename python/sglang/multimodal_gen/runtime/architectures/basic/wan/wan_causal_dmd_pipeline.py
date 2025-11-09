@@ -30,7 +30,7 @@ logger = init_logger(__name__)
 
 
 class WanCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
-    pipeline_name = "WanPipeline"
+    pipeline_name = "WanCausalDMDPipeline"
 
     _required_config_modules = [
         "text_encoder",

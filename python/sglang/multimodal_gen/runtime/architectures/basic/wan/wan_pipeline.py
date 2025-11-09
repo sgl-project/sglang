@@ -35,7 +35,7 @@ class WanPipeline(LoRAPipeline, ComposedPipelineBase):
     Wan video diffusion pipeline with LoRA support.
     """
 
-    pipeline_name = "WanImageToVideoPipeline"
+    pipeline_name = "WanPipeline"
 
     _required_config_modules = [
         "text_encoder",
