@@ -100,10 +100,9 @@ def prepare_mlp_sync_batch_raw(
             # When return_logprob = False, only need last token per request
             num_tokens_for_logprob = local_batch.batch_size()
 
-    if local_batch is None or local_batch.forward_mode.is_decode_or_idle():
-        can_cuda_graph = 1
-    else:
-        can_cuda_graph = 0
+    can_cuda_graph = (
+        local_batch is None or local_batch.forward_mode.is_decode_or_idle()
+    ) and not disable_cuda_graph
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
 
@@ -151,8 +150,7 @@ def prepare_mlp_sync_batch_raw(
         local_batch.global_forward_mode = global_forward_mode
 
         # Check forward mode for cuda graph
-        if not disable_cuda_graph:
-            local_batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
+        local_batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
 
     return local_batch
 
