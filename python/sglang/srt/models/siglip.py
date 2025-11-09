@@ -73,9 +73,9 @@ class EagleVisionHead(nn.Module):
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         # Attention components with direct attributes for correct parameter names
-        # Match checkpoint dimensions: in_proj has 4608 out_features
+        # Match checkpoint dimensions: in_proj has (3 * hidden_size) out_features
         self.attention = nn.Module()
-        self.attention.in_proj = nn.Linear(config.hidden_size, 4 * config.hidden_size)
+        self.attention.in_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size)
         self.attention.proj = nn.Linear(config.hidden_size, config.hidden_size)
 
         # MLP components with direct attributes
