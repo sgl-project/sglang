@@ -11,7 +11,10 @@ using the modular pipeline architecture.
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines import ComposedPipelineBase, LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines.stages import (
     ConditioningStage,
     DecodingStage,

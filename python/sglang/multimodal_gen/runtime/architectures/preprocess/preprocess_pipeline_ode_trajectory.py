@@ -35,10 +35,10 @@ from sglang.multimodal_gen.dataset.dataloader.schema import (
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_self_forcing_flow_match import (
     SelfForcingFlowMatchScheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
 from sglang.multimodal_gen.runtime.pipelines.preprocess.preprocess_pipeline_base import (
     BasePreprocessPipeline,
 )
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines.stages import (
     DecodingStage,
     DenoisingStage,

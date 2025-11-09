@@ -26,10 +26,10 @@ from sglang.multimodal_gen.dataset.dataloader.record_schema import (
     text_only_record_creator,
 )
 from sglang.multimodal_gen.dataset.dataloader.schema import pyarrow_schema_text_only
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
 from sglang.multimodal_gen.runtime.pipelines.preprocess.preprocess_pipeline_base import (
     BasePreprocessPipeline,
 )
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines.stages import TextEncodingStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

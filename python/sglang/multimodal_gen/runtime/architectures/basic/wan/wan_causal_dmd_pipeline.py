@@ -7,7 +7,10 @@ Wan causal DMD pipeline implementation.
 This module wires the causal DMD denoising stage into the modular pipeline.
 """
 
-from sglang.multimodal_gen.runtime.pipelines import ComposedPipelineBase, LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines.lora_pipeline import LoRAPipeline
 
 # isort: off
 from sglang.multimodal_gen.runtime.pipelines.stages import (
