@@ -73,8 +73,9 @@ class EagleVisionHead(nn.Module):
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         # Attention components with direct attributes for correct parameter names
+        # Match checkpoint dimensions: in_proj has 4608 out_features
         self.attention = nn.Module()
-        self.attention.in_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size)
+        self.attention.in_proj = nn.Linear(config.hidden_size, 4 * config.hidden_size)
         self.attention.proj = nn.Linear(config.hidden_size, config.hidden_size)
 
         # MLP components with direct attributes
@@ -94,8 +95,11 @@ class EagleVisionHead(nn.Module):
         hidden_states = self.layernorm(hidden_states)
 
         # Self-attention with separate projections
-        # QKV projection
-        qkv = self.attention.in_proj(hidden_states)
+        # QKV projection (checkpoint has 4 * hidden_size, take first 3 for QKV)
+        qkv_proj = self.attention.in_proj(hidden_states)
+        qkv = qkv_proj[
+            :, :, : 3 * self.hidden_size
+        ]  # Take first 3*hidden_size dimensions
         q, k, v = qkv.chunk(3, dim=-1)
 
         # Simple self-attention (no masking for vision)

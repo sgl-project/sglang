@@ -105,6 +105,16 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             prefix=add_prefix("language_model", prefix),
         )
 
+        # Vision projection
+        self.visual_projection = Eagle2_5_VLVisionMLP(
+            in_features=config.vision_config.hidden_size,
+            hidden_features=config.vision_config.intermediate_size,
+            out_features=config.text_config.hidden_size,
+            hidden_act=config.vision_config.hidden_act,
+            quant_config=quant_config,
+            prefix=add_prefix("visual_projection", prefix),
+        )
+
         # Pooler for embedding extraction
         self.pooler = Pooler(
             pooling_type=PoolingType.LAST,
