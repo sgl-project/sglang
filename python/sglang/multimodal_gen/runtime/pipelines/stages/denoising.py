@@ -214,8 +214,8 @@ class DenoisingStage(PipelineStage):
         # Setup precision and autocast settings
         target_dtype = torch.bfloat16
         autocast_enabled = (
-            target_dtype != torch.float32
-        ) and not server_args.disable_autocast
+                               target_dtype != torch.float32
+                           ) and not server_args.disable_autocast
 
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
@@ -304,8 +304,8 @@ class DenoisingStage(PipelineStage):
             # z: [B, C, 1, H, W], reserved_frames_mask: [1, C, T, H, W]
             # Both will broadcast correctly
             latents = (
-                1.0 - reserved_frames_mask
-            ) * z + reserved_frames_mask * latent_model_input
+                          1.0 - reserved_frames_mask
+                      ) * z + reserved_frames_mask * latent_model_input
             assert latents.ndim == 5
             latents = latents.to(get_local_torch_device())
             batch.latents = latents
@@ -424,7 +424,7 @@ class DenoisingStage(PipelineStage):
                 getattr(self.transformer, "rotary_emb", None),
                 dtype=target_dtype,
             ),
-        )
+            )
 
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
@@ -439,7 +439,7 @@ class DenoisingStage(PipelineStage):
                     getattr(self.transformer, "rotary_emb", None),
                     dtype=target_dtype,
                 ),
-            )
+                )
         else:
             neg_cond_kwargs = {}
 
@@ -707,7 +707,7 @@ class DenoisingStage(PipelineStage):
                         temp_ts,
                         temp_ts.new_ones(local_seq_len - temp_ts.size(0))
                         * t_device_rounded,
-                    ]
+                        ]
                 )
                 timestep = temp_ts.unsqueeze(0).repeat(bsz, 1)
             else:
@@ -734,8 +734,8 @@ class DenoisingStage(PipelineStage):
                 # Unsqueeze mask to [1, C, T_local, H, W] for broadcasting.
                 # z will broadcast along the time dimension.
                 latents = (
-                    1.0 - reserved_frames_mask.unsqueeze(0)
-                ) * z + reserved_frames_mask.unsqueeze(0) * latents
+                              1.0 - reserved_frames_mask.unsqueeze(0)
+                          ) * z + reserved_frames_mask.unsqueeze(0) * latents
 
         return latents
 
@@ -890,7 +890,7 @@ class DenoisingStage(PipelineStage):
             self.log_info(
                 "Average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(timesteps),
-            )
+                )
 
         self._post_denoising_loop(
             batch=batch,
@@ -1192,9 +1192,9 @@ class DenoisingStage(PipelineStage):
 
         logger.info("STA_mode: %s", STA_mode)
         if (batch.num_frames, batch.height, batch.width) != (
-            69,
-            768,
-            1280,
+                69,
+                768,
+                1280,
         ) and STA_mode != "STA_inference":
             raise NotImplementedError(
                 "STA mask search/tuning is not supported for this resolution"

@@ -702,7 +702,7 @@ class ServerArgs:
                 server_args_kwargs["preprocess_config"] = preprocess_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
-
+        print(f"{pipeline_config=}")
         return cls(**server_args_kwargs)
 
     @staticmethod

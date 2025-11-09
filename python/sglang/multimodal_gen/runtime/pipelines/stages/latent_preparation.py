@@ -82,6 +82,7 @@ class LatentPreparationStage(PipelineStage):
             shape = server_args.pipeline_config.prepare_latent_shape(
                 batch, batch_size, num_frames
             )
+            print(f"{shape=}")
             latents = randn_tensor(
                 shape, generator=generator, device=device, dtype=dtype
             )

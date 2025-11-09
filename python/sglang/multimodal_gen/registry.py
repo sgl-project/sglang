@@ -30,6 +30,7 @@ from sglang.multimodal_gen.configs.pipelines.qwen_image import (
 )
 from sglang.multimodal_gen.configs.pipelines.wan import (
     FastWan2_1_T2V_480P_Config,
+    FastWan2_2_TI2V_5B_Config,
     Wan2_2_I2V_A14B_Config,
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
@@ -352,10 +353,19 @@ def _register_configs():
         pipeline_config_cls=Wan2_2_TI2V_5B_Config,
         model_path_to_name_mappings={
             "Wan-AI/Wan2.2-TI2V-5B-Diffusers": "wan-ti2v-5b",
-            "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers": "wan-ti2v-5b",
-            "FastVideo/FastWan2.2-TI2V-5B-Diffusers": "wan-ti2v-5b",
         },
     )
+
+    register_configs(
+        model_name="fastwan-ti2v-5b",
+        sampling_param_cls=Wan2_2_TI2V_5B_SamplingParam,
+        pipeline_config_cls=FastWan2_2_TI2V_5B_Config,
+        model_path_to_name_mappings={
+            "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers": "fastwan-ti2v-5b",
+            "FastVideo/FastWan2.2-TI2V-5B-Diffusers": "fastwan-ti2v-5b",
+        },
+    )
+
     register_configs(
         model_name="wan-t2v-a14b",
         sampling_param_cls=Wan2_2_T2V_A14B_SamplingParam,
