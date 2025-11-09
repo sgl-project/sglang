@@ -128,7 +128,7 @@ def _validate_single_backend(
         elif not caps.allowed_page_sizes_gt_1:
             raise RuntimeError(f"Page size > 1 is not supported for {backend_name}.")
 
-    # CUDA graph checks (only when enabled)
+    # CUDA graph checks
     if hw == "cuda" and not server_args.disable_cuda_graph:
         if not caps.cuda_graph:
             raise RuntimeError(f"{backend_name} does not support CUDA graph.")
