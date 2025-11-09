@@ -8,6 +8,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
+    try_cached_model,
 )
 
 
@@ -21,7 +22,7 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
         # Temporarily disable JIT DeepGEMM
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
         # Non blocking start servers
         cls.start_prefill()
