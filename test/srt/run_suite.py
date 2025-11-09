@@ -70,8 +70,8 @@ suites = {
         TestFile("test_chunked_prefill.py", 410),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_deterministic.py", 320),
-        TestFile("test_eagle_infer_a.py", 370),
-        TestFile("test_eagle_infer_b.py", 500),
+        TestFile("test_eagle_infer_a.py", 750),
+        TestFile("test_eagle_infer_b.py", 750),
         TestFile("test_eagle_infer_beta.py", 90),
         TestFile("test_constrained_decoding.py", 120),
         TestFile("test_eval_fp8_accuracy.py", 303),
@@ -645,6 +645,12 @@ if __name__ == "__main__":
         type=int,
         help="Use auto load balancing. The number of parts.",
     )
+    arg_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        default=False,
+        help="Continue running remaining tests even if one fails (useful for nightly tests)",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -662,5 +668,5 @@ if __name__ == "__main__":
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(files, args.timeout_per_file)
+    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
     exit(exit_code)

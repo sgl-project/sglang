@@ -54,7 +54,7 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
-from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj, require_mlp_sync
+from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -326,7 +326,7 @@ class SchedulerDisaggregationPrefillMixin:
                 attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
                 trace_event_batch("schedule", batch.reqs, attrs=attrs)
 
-            if require_mlp_sync(self.server_args):
+            if self.require_mlp_sync:
                 batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
 
@@ -361,7 +361,7 @@ class SchedulerDisaggregationPrefillMixin:
                 attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
                 trace_event_batch("schedule", batch.reqs, attrs=attrs)
 
-            if require_mlp_sync(self.server_args):
+            if self.require_mlp_sync:
                 batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
 

@@ -735,9 +735,22 @@ class TestFile:
     estimated_time: float = 60
 
 
-def run_unittest_files(files: List[TestFile], timeout_per_file: float):
+def run_unittest_files(
+    files: List[TestFile], timeout_per_file: float, continue_on_error: bool = False
+):
+    """
+    Run a list of test files.
+
+    Args:
+        files: List of TestFile objects to run
+        timeout_per_file: Timeout in seconds for each test file
+        continue_on_error: If True, continue running remaining tests even if one fails.
+                          If False, stop at first failure (default behavior for PR tests).
+    """
     tic = time.perf_counter()
     success = True
+    passed_tests = []
+    failed_tests = []
 
     for i, file in enumerate(files):
         filename, estimated_time = file.name, file.estimated_time
@@ -769,23 +782,51 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             ret_code = run_with_timeout(
                 run_one_file, args=(filename,), timeout=timeout_per_file
             )
-            assert (
-                ret_code == 0
-            ), f"expected return code 0, but {filename} returned {ret_code}"
+            if ret_code != 0:
+                print(
+                    f"\n✗ FAILED: {filename} returned exit code {ret_code}\n",
+                    flush=True,
+                )
+                success = False
+                failed_tests.append((filename, f"exit code {ret_code}"))
+                if not continue_on_error:
+                    # Stop at first failure for PR tests
+                    break
+                # Otherwise continue to next test for nightly tests
+            else:
+                passed_tests.append(filename)
         except TimeoutError:
             kill_process_tree(process.pid)
             time.sleep(5)
             print(
-                f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
+                f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n",
                 flush=True,
             )
             success = False
-            break
+            failed_tests.append((filename, f"timeout after {timeout_per_file}s"))
+            if not continue_on_error:
+                # Stop at first timeout for PR tests
+                break
+            # Otherwise continue to next test for nightly tests
 
     if success:
         print(f"Success. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
     else:
         print(f"Fail. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
+
+    # Print summary
+    print(f"\n{'='*60}", flush=True)
+    print(f"Test Summary: {len(passed_tests)}/{len(files)} passed", flush=True)
+    print(f"{'='*60}", flush=True)
+    if passed_tests:
+        print("✓ PASSED:", flush=True)
+        for test in passed_tests:
+            print(f"  {test}", flush=True)
+    if failed_tests:
+        print("\n✗ FAILED:", flush=True)
+        for test, reason in failed_tests:
+            print(f"  {test} ({reason})", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
     return 0 if success else -1
 

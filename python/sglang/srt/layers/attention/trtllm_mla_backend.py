@@ -212,6 +212,7 @@ class TRTLLMMLAPrefillMetadata:
     max_seq_len: int
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
+    fallback_to_flashinfer_impl: bool = False
 
 
 @dataclass
@@ -556,7 +557,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
-            if self.disable_chunked_prefix_cache:
+            # For extend batch with prefix length > 0, fallback to ragged kernel implemented in flashinfer MLA backend
+            # when chunked prefix cache is disabled.
+            has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+            fallback_to_flashinfer_impl = (
+                self.disable_chunked_prefix_cache and has_prefix
+            )
+            if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
 
             seq_lens = forward_batch.seq_lens - forward_batch.extend_prefix_lens
@@ -571,6 +578,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq_len,
                 cum_seq_lens_q,
                 seq_lens,
+                fallback_to_flashinfer_impl,
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -966,6 +974,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
     ) -> torch.Tensor:
+
+        if (
+            self.forward_prefill_metadata is not None
+            and self.forward_prefill_metadata.fallback_to_flashinfer_impl
+        ):
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
+
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
         fused_kv = False  # Track if we used fused KV write path
