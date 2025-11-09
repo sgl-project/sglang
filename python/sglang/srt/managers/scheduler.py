@@ -2100,7 +2100,7 @@ class Scheduler(
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt_extend():
-            self.process_batch_result_prebuilt_extend(batch, result)
+            self.process_batch_result_prebuilt_extend(batch)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 if result.copy_done is not None:
