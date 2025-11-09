@@ -20,7 +20,7 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
-from sglang.srt.tracing.trace import trace_slice
+from sglang.srt.tracing.trace import trace_slice, trace_slice_batch
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
@@ -41,6 +41,20 @@ class SchedulerOutputProcessorMixin:
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
+
+    def process_batch_result_prebuilt_extend(self: Scheduler, batch: ScheduleBatch):
+        assert self.disaggregation_mode == DisaggregationMode.DECODE
+        for req in batch.reqs:
+            for req in batch.reqs:
+                req.check_finished()
+                if req.finished():
+                    req.time_stats.completion_time = time.time()
+                    self.tree_cache.cache_finished_req(req)
+
+        trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
+
+        # Note: Logprobs should be handled on the prefill engine.
+        self.stream_output(batch.reqs, batch.return_logprob)
 
     def process_batch_result_prefill(
         self: Scheduler,

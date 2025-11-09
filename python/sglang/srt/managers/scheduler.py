@@ -1963,6 +1963,10 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_start_time = current_time
 
+        # Place holder handling for pd-disagg decode event loop
+        if batch.forward_mode.is_prebuilt_extend():
+            return self._run_batch_prebuilt_extend(batch)
+
         # Run forward
         if self.is_generation:
             batch_or_worker_batch = batch
@@ -2093,10 +2097,10 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
-
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
-
+        elif batch.forward_mode.is_prebuilt_extend():
+            self.process_batch_result_prebuilt_extend(batch, result)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 if result.copy_done is not None:

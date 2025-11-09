@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
@@ -58,11 +59,8 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.tracing.trace import (
-    trace_event_batch,
-    trace_slice_batch,
-    trace_slice_end,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -591,7 +589,7 @@ class DecodePreallocQueue:
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
         if (
             self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_extend()
+            and self.scheduler.last_batch.forward_mode.is_prebuilt_extend()
         ):
             allocatable_tokens -= self.num_reserved_decode_tokens * len(
                 self.scheduler.last_batch.reqs
@@ -835,32 +833,19 @@ class SchedulerDisaggregationDecodeMixin:
 
             if batch:
                 # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, any(req.return_logprob for req in batch.reqs)
-                    )
-                    trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
-                    if self.require_mlp_sync:
-                        self._prepare_idle_batch_and_run()
-                else:
-                    if self.require_mlp_sync:
-                        self.prepare_mlp_sync_batch(batch)
-                    result = self.run_batch(batch)
-                    self.process_batch_result(batch, result)
-            elif self.require_mlp_sync:
-                batch, _ = self._prepare_idle_batch_and_run()
-
-            queue_size = (
-                len(self.waiting_queue)
-                + len(self.disagg_decode_transfer_queue.queue)
-                + len(self.disagg_decode_prealloc_queue.queue)
-            )
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                queue_size += len(self.decode_offload_manager.ongoing_offload)
-
-            if batch is None and queue_size == 0:
-                self.self_check_during_idle()
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
+            else:
+                # TODO(lsyin): move empty queue check into self_check_during_idle
+                queue_size = (
+                    len(self.waiting_queue)
+                    + len(self.disagg_decode_transfer_queue.queue)
+                    + len(self.disagg_decode_prealloc_queue.queue)
+                )
+                if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                    queue_size += len(self.decode_offload_manager.ongoing_offload)
+                if queue_size == 0:
+                    self.self_check_during_idle()
 
             self.last_batch = batch
 
@@ -868,7 +853,6 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
         while True:
 
@@ -878,41 +862,14 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
-            last_batch_in_queue = False
 
             batch_result = None
             if batch:
-                # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, any(req.return_logprob for req in batch.reqs)
-                    )
-                    trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
-                    if self.require_mlp_sync:
-                        batch_, batch_result = self._prepare_idle_batch_and_run(
-                            delay_process=True
-                        )
-                        if batch_:
-                            self.result_queue.append((batch_.copy(), batch_result))
-                            last_batch_in_queue = True
-                else:
-                    if self.require_mlp_sync:
-                        self.prepare_mlp_sync_batch(batch)
-                    batch_result = self.run_batch(batch)
-                    self.result_queue.append((batch.copy(), batch_result))
-                    last_batch_in_queue = True
-
-            elif self.require_mlp_sync:
-                batch, batch_result = self._prepare_idle_batch_and_run(
-                    delay_process=True
-                )
-                if batch:
-                    self.result_queue.append((batch.copy(), batch_result))
-                    last_batch_in_queue = True
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
 
             # Process the results of the previous batch but skip if the last batch is extend
-            if self.last_batch and self.last_batch_in_queue:
+            if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
 
@@ -930,16 +887,14 @@ class SchedulerDisaggregationDecodeMixin:
                 self.self_check_during_idle()
 
             self.last_batch = batch
-            self.last_batch_in_queue = last_batch_in_queue
 
-    def _prepare_idle_batch_and_run(self: Scheduler, delay_process=False):
-        batch = self.prepare_mlp_sync_batch(None)
-        result = None
-        if batch:
-            result = self.run_batch(batch)
-            if not delay_process:
-                self.process_batch_result(batch, result)
-        return batch, result
+    def _run_batch_prebuilt_extend(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        if batch.inner_idle_batch is not None:
+            return self.run_batch(batch.inner_idle_batch)
+
+        return GenerationBatchResult()
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
@@ -970,6 +925,13 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
+
+        # 1. decode + None -> decode + idle
+        # 2. decode + prebuilt -> decode + idle (idle forward, prebuilt returns)
+        # 3. prebuilt + None -> None (None forward, prebuilt returns) + None
+        # 4. prebuilt + decode + None -> idle (idle forward, prebuilt returns) + decode + idle
+        if self.require_mlp_sync:
+            ret = self.prepare_mlp_sync_batch(ret)
 
         if ret:
             attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
@@ -1023,6 +985,7 @@ class SchedulerDisaggregationDecodeMixin:
         )
 
         # construct fake completed prefill
+        new_batch.forward_mode = ForwardMode.PREBUILT_EXTEND
         new_batch.prepare_for_prebuilt_extend()
         new_batch.process_prebuilt_extend(self.server_args, self.model_config)
 
