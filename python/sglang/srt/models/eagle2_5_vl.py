@@ -129,7 +129,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         )
 
         # Logits processor
-        self.logits_processor = LogitsProcessor(self.config)
+        self.logits_processor = LogitsProcessor(self.config.text_config)
 
         # Special tokens
         self.image_token_index = config.image_token_index
