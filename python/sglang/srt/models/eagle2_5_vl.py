@@ -199,6 +199,14 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             # Skip rotary embeddings
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            # Transform vision model parameter names
+            if "vision_model" in name:
+                # SigLIP weights use 'out_proj' but model uses 'proj'
+                if "out_proj" in name:
+                    name = name.replace("out_proj", "proj")
+
+            # Transform language model parameter names
             if "language_model" in name:
                 name = name.replace(r"language_model.model.", r"language_model.")
 
