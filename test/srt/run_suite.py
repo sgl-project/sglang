@@ -70,8 +70,8 @@ suites = {
         TestFile("test_chunked_prefill.py", 410),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_deterministic.py", 320),
-        TestFile("test_eagle_infer_a.py", 370),
-        TestFile("test_eagle_infer_b.py", 500),
+        TestFile("test_eagle_infer_a.py", 750),
+        TestFile("test_eagle_infer_b.py", 750),
         TestFile("test_eagle_infer_beta.py", 90),
         TestFile("test_constrained_decoding.py", 120),
         TestFile("test_eval_fp8_accuracy.py", 303),
@@ -103,6 +103,7 @@ suites = {
         TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 82),
+        TestFile("test_piecewise_cuda_graph.py", 180),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
@@ -167,6 +168,7 @@ suites = {
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_hybrid_attention.py", 200),
+        TestFile("models/test_kimi_k2_models.py", 200),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
@@ -207,6 +209,7 @@ suites = {
     ],
     # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
     "nightly-1-gpu": [
+        TestFile("layers/attention/nsa/test_nsa_indexer.py", 2),
         TestFile("lora/test_lora_qwen3.py", 97),
         TestFile("lora/test_lora_qwen3_vl.py", 200),
         TestFile("lora/test_lora_radix_cache.py", 200),
@@ -216,7 +219,15 @@ suites = {
         TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
         TestFile("test_deepseek_v3_deterministic.py", 240),
     ],
+    "nightly-4-gpu-b200": [
+        TestFile("test_fp4_moe.py", 300),
+        TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
+    ],
+    "nightly-8-gpu-b200": [],
+    "nightly-4-gpu": [],
     "nightly-8-gpu": [],
+    "nightly-8-gpu-h200": [],
+    "nightly-8-gpu-h20": [],
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
         TestFile("cpu/test_comm.py"),
@@ -235,6 +246,7 @@ suites = {
         TestFile("hicache/test_hicache_storage_benchmark.py"),
         TestFile("hicache/test_hicache_storage_e2e.py"),
         TestFile("layers/attention/nsa/test_act_quant_triton.py"),
+        TestFile("layers/moe/test_moe_runners.py"),
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
         TestFile("models/lora/test_lora.py"),
@@ -325,11 +337,14 @@ suites = {
         TestFile("test_moe_ep.py"),
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_mscclpp.py"),
-        TestFile("test_nightly_gsm8k_eval.py"),
-        TestFile("test_nightly_text_models_gsm8k_eval.py"),
-        TestFile("test_nightly_text_models_perf.py"),
-        TestFile("test_nightly_vlms_mmmu_eval.py"),
-        TestFile("test_nightly_vlms_perf.py"),
+        TestFile("nightly/test_deepseek_v31_perf.py"),
+        TestFile("nightly/test_deepseek_v32_perf.py"),
+        TestFile("nightly/test_gpt_oss_4gpu_perf.py"),
+        TestFile("nightly/test_gsm8k_eval_amd.py"),
+        TestFile("nightly/test_text_models_gsm8k_eval.py"),
+        TestFile("nightly/test_text_models_perf.py"),
+        TestFile("nightly/test_vlms_mmmu_eval.py"),
+        TestFile("nightly/test_vlms_perf.py"),
         TestFile("test_openai_adapter.py"),
         TestFile("test_openai_function_calling.py"),
         TestFile("test_openai_server.py"),
@@ -469,7 +484,7 @@ suite_amd = {
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     "nightly-amd": [
-        TestFile("test_nightly_gsm8k_eval_amd.py"),
+        TestFile("nightly/test_gsm8k_eval_amd.py"),
     ],
 }
 
@@ -636,6 +651,12 @@ if __name__ == "__main__":
         type=int,
         help="Use auto load balancing. The number of parts.",
     )
+    arg_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        default=False,
+        help="Continue running remaining tests even if one fails (useful for nightly tests)",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -653,5 +674,5 @@ if __name__ == "__main__":
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(files, args.timeout_per_file)
+    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
     exit(exit_code)
