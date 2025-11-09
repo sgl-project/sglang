@@ -209,7 +209,7 @@ class W8A8Int8Config(QuantizationConfig):
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
 
-        if _is_npu:
+        if _is_npu:  # TODO: refactor out _is_npu here
             if self.is_dynamic:
                 return
             # Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models
