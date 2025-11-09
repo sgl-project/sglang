@@ -88,7 +88,7 @@ def get_tree_sha(repo_owner, repo_name, commit_sha, token):
     return data["tree"]["sha"]
 
 
-def create_blob(repo_owner, repo_name, content, token):
+def create_blob(repo_owner, repo_name, content, token, max_retries=3):
     """Create a blob with file content"""
     url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/blobs"
 
@@ -97,16 +97,27 @@ def create_blob(repo_owner, repo_name, content, token):
 
     data = {"content": content_b64, "encoding": "base64"}
 
-    response = make_github_request(url, token, method="POST", data=data)
-    return json.loads(response)["sha"]
+    for attempt in range(max_retries):
+        try:
+            response = make_github_request(url, token, method="POST", data=data)
+            return json.loads(response)["sha"]
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
+                print(
+                    f"Blob creation failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s..."
+                )
+                time.sleep(wait_time)
+            else:
+                raise
 
 
-def create_tree(repo_owner, repo_name, base_tree_sha, files, token):
+def create_tree(repo_owner, repo_name, base_tree_sha, files, token, max_retries=3):
     """Create a new tree with files"""
     url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/trees"
 
     tree_items = []
-    for file_path, content in files:
+    for i, (file_path, content) in enumerate(files):
         # Create blob first to get SHA
         blob_sha = create_blob(repo_owner, repo_name, content, token)
         tree_items.append(
@@ -117,24 +128,62 @@ def create_tree(repo_owner, repo_name, base_tree_sha, files, token):
                 "sha": blob_sha,
             }
         )
+        # Progress indicator for large uploads
+        if (i + 1) % 10 == 0 or (i + 1) == len(files):
+            print(f"Created {i + 1}/{len(files)} blobs...")
 
     data = {"base_tree": base_tree_sha, "tree": tree_items}
 
-    response = make_github_request(url, token, method="POST", data=data)
-    return json.loads(response)["sha"]
+    for attempt in range(max_retries):
+        try:
+            response = make_github_request(url, token, method="POST", data=data)
+            return json.loads(response)["sha"]
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2**attempt
+                print(
+                    f"Tree creation failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s..."
+                )
+                time.sleep(wait_time)
+            else:
+                raise
 
 
-def create_commit(repo_owner, repo_name, tree_sha, parent_sha, message, token):
+def create_commit(
+    repo_owner, repo_name, tree_sha, parent_sha, message, token, max_retries=3
+):
     """Create a new commit"""
     url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/commits"
 
     data = {"tree": tree_sha, "parents": [parent_sha], "message": message}
 
-    response = make_github_request(url, token, method="POST", data=data)
-    return json.loads(response)["sha"]
+    for attempt in range(max_retries):
+        try:
+            response = make_github_request(url, token, method="POST", data=data)
+            commit_sha = json.loads(response)["sha"]
+
+            # Verify the commit was actually created
+            verify_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/commits/{commit_sha}"
+            verify_response = make_github_request(verify_url, token)
+            verify_data = json.loads(verify_response)
+            if verify_data["sha"] != commit_sha:
+                raise Exception(
+                    f"Commit verification failed: expected {commit_sha}, got {verify_data['sha']}"
+                )
+
+            return commit_sha
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2**attempt
+                print(
+                    f"Commit creation failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s..."
+                )
+                time.sleep(wait_time)
+            else:
+                raise
 
 
-def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token):
+def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token, max_retries=3):
     """Update branch reference to point to new commit"""
     url = (
         f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs/heads/{branch}"
@@ -142,7 +191,39 @@ def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token):
 
     data = {"sha": commit_sha}
 
-    make_github_request(url, token, method="PATCH", data=data)
+    for attempt in range(max_retries):
+        try:
+            make_github_request(url, token, method="PATCH", data=data)
+            return
+        except HTTPError as e:
+            # Check if this is an "Object does not exist" error
+            is_object_not_exist = False
+            if hasattr(e, "error_body"):
+                try:
+                    error_data = json.loads(e.error_body)
+                    if "Object does not exist" in error_data.get("message", ""):
+                        is_object_not_exist = True
+                except Exception:
+                    pass
+
+            if is_object_not_exist and attempt < max_retries - 1:
+                # This might be a transient consistency issue - wait and retry
+                wait_time = 2**attempt
+                print(
+                    f"Branch update failed with 'Object does not exist' (attempt {attempt + 1}/{max_retries}), waiting {wait_time}s for consistency..."
+                )
+                time.sleep(wait_time)
+            else:
+                raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2**attempt
+                print(
+                    f"Branch update failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s..."
+                )
+                time.sleep(wait_time)
+            else:
+                raise
 
 
 def copy_trace_files(source_dir, target_base_path):
@@ -240,20 +321,30 @@ def publish_traces(traces_dir, run_id, run_number):
             return
 
         except Exception as e:
-            is_ff_error = False
-            if (
-                hasattr(e, "error_body")
-                and "Update is not a fast forward" in e.error_body
-            ):
-                is_ff_error = True
+            # Check for retryable errors
+            is_retryable = False
+            error_type = "unknown"
 
-            if is_ff_error and attempt < max_retries - 1:
+            if hasattr(e, "error_body"):
+                if "Update is not a fast forward" in e.error_body:
+                    is_retryable = True
+                    error_type = "fast-forward conflict"
+                elif "Object does not exist" in e.error_body:
+                    is_retryable = True
+                    error_type = "object consistency"
+
+            # Also retry on HTTP errors that might be transient
+            if isinstance(e, HTTPError) and e.code in [422, 500, 502, 503, 504]:
+                is_retryable = True
+                error_type = f"HTTP {e.code}"
+
+            if is_retryable and attempt < max_retries - 1:
                 print(
-                    f"Attempt {attempt + 1} failed: not a fast-forward update. Retrying in {retry_delay} seconds..."
+                    f"Attempt {attempt + 1}/{max_retries} failed ({error_type}). Retrying in {retry_delay} seconds..."
                 )
                 time.sleep(retry_delay)
             else:
-                print(f"Failed to publish traces: {e}")
+                print(f"Failed to publish traces after {attempt + 1} attempts: {e}")
                 raise
 
 
