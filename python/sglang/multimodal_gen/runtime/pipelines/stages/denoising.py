@@ -6,7 +6,6 @@ Denoising stage for diffusion pipelines.
 """
 
 import inspect
-import math
 import os
 import time
 import weakref
@@ -217,8 +216,8 @@ class DenoisingStage(PipelineStage):
             target_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        # Handle sequence parallelism if enabled
-        self._preprocess_sp_latents(batch)
+        # NOTE: defer SP sharding until after TI2V latent preprocessing,
+        # to avoid replacing the first local frame on every rank.
 
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
@@ -273,6 +272,7 @@ class DenoisingStage(PipelineStage):
             assert self.vae is not None, "VAE is not provided for TI2V task"
             self.vae = self.vae.to(batch.pil_image.device)
             z = self.vae.encode(batch.pil_image).mean.float()
+            print(f"{z=}")
             if self.vae.device != "cpu" and server_args.vae_cpu_offload:
                 self.vae = self.vae.to("cpu")
             if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
@@ -285,29 +285,39 @@ class DenoisingStage(PipelineStage):
                 z = z * self.vae.scaling_factor.to(z.device, z.dtype)
             else:
                 z = z * self.vae.scaling_factor
+            print(f"{z=}")
+
             latent_model_input = latents.to(target_dtype).squeeze(0)
             _, mask2 = masks_like([latent_model_input], zero=True)
+            print(f"{mask2=}")
+            print(f"{mask2[0]=}")
 
+            # Replace only the first global frame with image latent (before SP sharding)
             latents = (1.0 - mask2[0]) * z + mask2[0] * latent_model_input
             latents = latents.to(get_local_torch_device())
+            if latents.dim() == 4:
+                latents = latents.unsqueeze(0)
+            batch.latents = latents
 
-            F = batch.num_frames
-            temporal_scale = (
-                server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
-            )
-            spatial_scale = (
-                server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
-            )
-            patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
-            seq_len = (
-                ((F - 1) // temporal_scale + 1)
-                * (batch.height // spatial_scale)
-                * (batch.width // spatial_scale)
-                // (patch_size[1] * patch_size[2])
-            )
-            seq_len = (
-                int(math.ceil(seq_len / get_sp_world_size())) * get_sp_world_size()
-            )
+        # Defer SP sharding until after TI2V latent replacement
+        # Handle sequence parallelism if enabled (after TI2V processing)
+        self._preprocess_sp_latents(batch)
+        latents = batch.latents
+
+        # If TI2V, adjust mask2 to the local SP shard and compute local seq_len
+        patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
+        if server_args.pipeline_config.ti2v_task and batch.pil_image is not None:
+            sp_size = get_sp_world_size()
+            rank_in_sp = get_sp_parallel_rank()
+            # mask2[0] shape: [C, T, H, W]; SP shards time via interleaving (Ulysses-style)
+            T_total = mask2[0].shape[1]
+            if sp_size > 1 and T_total % sp_size == 0:
+                # interleaved slicing across time: rank r gets frames r, r+sp, r+2*sp, ...
+                mask2_local = mask2[0][:, rank_in_sp::sp_size, :, :].contiguous()
+                mask2 = [mask2_local]
+            # derive per-rank local seq_len on patch grid
+            ph, pw = patch_size[1], patch_size[2]
+            seq_len = (mask2[0][0][:, ::ph, ::pw]).numel()
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -371,9 +381,10 @@ class DenoisingStage(PipelineStage):
             "neg_prompt_embeds": neg_prompt_embeds,
             "boundary_timestep": boundary_timestep,
             "z": z,
-            "mask2": mask2,
+            "mask2_local": mask2_local,
             "seq_len": seq_len,
             "guidance": guidance,
+            "patch_size": patch_size,
         }
 
     def _post_denoising_loop(
@@ -613,9 +624,11 @@ class DenoisingStage(PipelineStage):
         latents = prepared_vars["latents"]
         boundary_timestep = prepared_vars["boundary_timestep"]
         z = prepared_vars["z"]
-        mask2 = prepared_vars["mask2"]
+        mask2_local = prepared_vars["mask2_local"]
         seq_len = prepared_vars["seq_len"]
         guidance = prepared_vars["guidance"]
+        patch_size = prepared_vars["patch_size"]
+        bsz = batch.batch_size
 
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
@@ -669,7 +682,12 @@ class DenoisingStage(PipelineStage):
                         and batch.pil_image is not None
                     ):
                         timestep = torch.stack([t_device]).to(get_local_torch_device())
-                        temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
+                        # Downsample mask to patch grid using true patch strides (ph, pw)
+                        ph = patch_size[1]
+                        pw = patch_size[2]
+                        temp_ts = (
+                            mask2_local[0][0][:, ::ph, ::pw] * timestep
+                        ).flatten()
                         temp_ts = torch.cat(
                             [
                                 temp_ts,
@@ -677,10 +695,11 @@ class DenoisingStage(PipelineStage):
                             ]
                         )
                         timestep = temp_ts.unsqueeze(0)
-                        t_expand = timestep.repeat(latent_model_input.shape[0], 1)
+                        timestep = timestep.repeat(bsz, 1)
                     else:
-                        t_expand = t_device.repeat(latent_model_input.shape[0])
+                        timestep = t_device.repeat(bsz)
 
+                    # Debug disabled
                     latent_model_input = self.scheduler.scale_model_input(
                         latent_model_input, t_device
                     )
@@ -690,7 +709,7 @@ class DenoisingStage(PipelineStage):
                     noise_pred = self._predict_noise_with_cfg(
                         current_model,
                         latent_model_input,
-                        t_expand,
+                        timestep,
                         batch,
                         i,
                         attn_metadata,
@@ -718,8 +737,14 @@ class DenoisingStage(PipelineStage):
                         server_args.pipeline_config.ti2v_task
                         and batch.pil_image is not None
                     ):
-                        latents = latents.squeeze(0)
-                        latents = (1.0 - mask2[0]) * z + mask2[0] * latents
+                        # TI2V per-step mixing: scheduler.step returns [B,C,T,H,W]
+                        # We need to mix with z (4D) using mask2_local (4D), keeping batch dim
+                        assert (
+                            latents.dim() == 5
+                        ), f"Expected 5D latents, got {latents.shape}"
+                        latents_4d = latents.squeeze(0)
+                        latents_4d = (1.0 - mask2_local) * z + mask2_local * latents_4d
+                        latents = latents_4d.unsqueeze(0)
 
                     # save trajectory latents if needed
                     if batch.return_trajectory_latents:
@@ -876,7 +901,7 @@ class DenoisingStage(PipelineStage):
         self,
         current_model,
         latent_model_input,
-        t_expand,
+        timestep,
         prompt_embeds,
         target_dtype,
         guidance: torch.Tensor,
@@ -885,7 +910,7 @@ class DenoisingStage(PipelineStage):
         return current_model(
             hidden_states=latent_model_input,
             encoder_hidden_states=prompt_embeds,
-            timestep=t_expand,
+            timestep=timestep,
             guidance=guidance,
             **kwargs,
         )
@@ -894,7 +919,7 @@ class DenoisingStage(PipelineStage):
         self,
         current_model: torch.nn.Module,
         latent_model_input: torch.Tensor,
-        t_expand,
+        timestep,
         batch,
         timestep_index: int,
         attn_metadata,
@@ -913,7 +938,7 @@ class DenoisingStage(PipelineStage):
         Args:
             current_model: The transformer model to use for the current step.
             latent_model_input: The input latents for the model.
-            t_expand: The expanded timestep tensor.
+            timestep: The expanded timestep tensor.
             batch: The current batch information.
             timestep_index: The current timestep index.
             attn_metadata: Attention metadata for custom backends.
@@ -940,7 +965,7 @@ class DenoisingStage(PipelineStage):
                 noise_pred_cond = self._predict_noise(
                     current_model=current_model,
                     latent_model_input=latent_model_input,
-                    t_expand=t_expand,
+                    timestep=timestep,
                     prompt_embeds=server_args.pipeline_config.get_pos_prompt_embeds(
                         batch
                     ),
@@ -968,7 +993,7 @@ class DenoisingStage(PipelineStage):
                 noise_pred_uncond = self._predict_noise(
                     current_model=current_model,
                     latent_model_input=latent_model_input,
-                    t_expand=t_expand,
+                    timestep=timestep,
                     prompt_embeds=server_args.pipeline_config.get_neg_prompt_embeds(
                         batch
                     ),

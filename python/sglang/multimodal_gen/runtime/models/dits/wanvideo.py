@@ -11,7 +11,10 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,
     UlyssesAttention_VSA,
@@ -94,6 +97,9 @@ class WanTimeTextImageEmbedding(nn.Module):
         encoder_hidden_states_image: torch.Tensor | None = None,
         timestep_seq_len: int | None = None,
     ):
+        # print(f"{timestep=}")
+        # print(f"{timestep_seq_len=}")
+        # print(f"{encoder_hidden_states.shape=}")
         temb = self.time_embedder(timestep, timestep_seq_len)
         timestep_proj = self.time_modulation(temb)
 
@@ -345,11 +351,12 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
+        print(f"{hidden_states.shape=}")
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
         orig_dtype = hidden_states.dtype
-
+        print(f"356 {temb.shape=}")
         if temb.dim() == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -368,12 +375,14 @@ class WanTransformerBlock(nn.Module):
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
                 e.chunk(6, dim=1)
             )
+        print(f"{scale_msa.shape=}")
+
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = (
-            self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa
-        ).to(orig_dtype)
+        norm1 = self.norm1(hidden_states.float())
+        print(f"{norm1.shape=}")
+        norm_hidden_states = (norm1 * (1 + scale_msa) + shift_msa).to(orig_dtype)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
@@ -386,6 +395,7 @@ class WanTransformerBlock(nn.Module):
         query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        print(f"{query.shape=}")
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
@@ -690,7 +700,7 @@ class WanTransformer3DModel(CachableDiT):
         d = self.hidden_size // self.num_attention_heads
         self.rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
 
-        self.rope = NDRotaryEmbedding(
+        self.rotary_emb = NDRotaryEmbedding(
             rope_dim_list=self.rope_dim_list,
             rope_theta=10000,
             dtype=torch.float32 if current_platform.is_mps() else torch.float64,
@@ -719,20 +729,25 @@ class WanTransformer3DModel(CachableDiT):
         else:
             encoder_hidden_states_image = None
 
+        # print(f"731 {hidden_states.shape=}")
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
+
         p_t, p_h, p_w = self.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        freqs_cos, freqs_sin = self.rope.forward_from_grid(
+        # Use per-rank start_frame for sequence parallelism so RoPE aligns globally
+        local_rank = get_sp_parallel_rank()
+        start_frame = local_rank * post_patch_num_frames
+        freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
             (
                 post_patch_num_frames * self.sp_size,
                 post_patch_height,
                 post_patch_width,
             ),
             shard_dim=0,
-            start_frame=0,
+            start_frame=start_frame,
             device=hidden_states.device,
         )
         assert freqs_cos.dtype == torch.float32
@@ -742,10 +757,13 @@ class WanTransformer3DModel(CachableDiT):
         )
 
         hidden_states = self.patch_embedding(hidden_states)
+        # print(f"756 {hidden_states.shape=}")
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
-
+        # print(f"757 {hidden_states.shape=}")
+        # print(f"757 {timestep.shape=}")
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
+            # ti2v
             ts_seq_len = timestep.shape[1]
             timestep = timestep.flatten()  # batch_size * seq_len
         else:

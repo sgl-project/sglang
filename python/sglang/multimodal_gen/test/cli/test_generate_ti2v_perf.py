@@ -52,7 +52,7 @@ class TestWan2_2_TI2V_5B(TestGenerateTI2VBase):
     thresholds = {
         "test_single_gpu": 13.0,
         "test_cfg_parallel": 191.7 * 1.05,
-        "test_usp": 387.6 * 1.05,
+        "test_usp": 66.3 * 1.05,
         "test_mixed": 15.0,
     }
 
