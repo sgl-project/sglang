@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, List, Optional, Type, Union
 
 import torch
 from torch.distributed import ProcessGroup
@@ -63,7 +63,7 @@ from sglang.srt.tracing.trace import (
     trace_slice_batch,
     trace_slice_end,
 )
-from sglang.srt.utils import get_int_env_var, require_mlp_sync
+from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -156,6 +156,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
+        self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
             size + pre_alloc_size, cache_params, device, speculative_num_draft_tokens
         )
@@ -773,17 +774,12 @@ class DecodeTransferQueue:
                 indices_to_remove.add(i)
                 decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
 
-                # special handling for corner cases
-                should_finish = (
-                    decode_req.req.sampling_params.max_new_tokens == 1
-                    or output_id in decode_req.req.eos_token_ids
-                )
-                if should_finish:
+                decode_req.req.check_finished()
+                if decode_req.req.finished():
                     # finish immediately
                     decode_req.req.time_stats.forward_entry_time = (
                         decode_req.req.time_stats.completion_time
                     ) = time.perf_counter()
-                    decode_req.req.check_finished()
                     self.scheduler.stream_output(
                         [decode_req.req], decode_req.req.return_logprob
                     )
@@ -837,8 +833,6 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
-            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
-
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
@@ -847,15 +841,15 @@ class SchedulerDisaggregationDecodeMixin:
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
                     trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
-                    if prepare_mlp_sync_flag:
-                        self._prepare_idle_batch_and_run(None)
+                    if self.require_mlp_sync:
+                        self._prepare_idle_batch_and_run()
                 else:
-                    if prepare_mlp_sync_flag:
+                    if self.require_mlp_sync:
                         self.prepare_mlp_sync_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
-            elif prepare_mlp_sync_flag:
-                batch, _ = self._prepare_idle_batch_and_run(None)
+            elif self.require_mlp_sync:
+                batch, _ = self._prepare_idle_batch_and_run()
 
             queue_size = (
                 len(self.waiting_queue)
@@ -886,8 +880,6 @@ class SchedulerDisaggregationDecodeMixin:
             self.cur_batch = batch
             last_batch_in_queue = False
 
-            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
-
             batch_result = None
             if batch:
                 # Generate fake extend output.
@@ -897,23 +889,23 @@ class SchedulerDisaggregationDecodeMixin:
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
                     trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
-                    if prepare_mlp_sync_flag:
+                    if self.require_mlp_sync:
                         batch_, batch_result = self._prepare_idle_batch_and_run(
-                            None, delay_process=True
+                            delay_process=True
                         )
                         if batch_:
                             self.result_queue.append((batch_.copy(), batch_result))
                             last_batch_in_queue = True
                 else:
-                    if prepare_mlp_sync_flag:
+                    if self.require_mlp_sync:
                         self.prepare_mlp_sync_batch(batch)
                     batch_result = self.run_batch(batch)
                     self.result_queue.append((batch.copy(), batch_result))
                     last_batch_in_queue = True
 
-            elif prepare_mlp_sync_flag:
+            elif self.require_mlp_sync:
                 batch, batch_result = self._prepare_idle_batch_and_run(
-                    None, delay_process=True
+                    delay_process=True
                 )
                 if batch:
                     self.result_queue.append((batch.copy(), batch_result))
@@ -940,8 +932,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue
 
-    def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
-        batch = self.prepare_mlp_sync_batch(batch)
+    def _prepare_idle_batch_and_run(self: Scheduler, delay_process=False):
+        batch = self.prepare_mlp_sync_batch(None)
         result = None
         if batch:
             result = self.run_batch(batch)
@@ -951,7 +943,7 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
-    ) -> Optional[Tuple[ScheduleBatch, bool]]:
+    ) -> Optional[ScheduleBatch]:
         """Create fake completed prefill if possible and merge with running batch"""
         # Merge the prefill batch into the running batch
         last_batch = self.last_batch

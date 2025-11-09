@@ -43,6 +43,11 @@ class TimeStats:
     prefill_transfer_queue_entry_time: float = 0.0
     decode_prealloc_queue_entry_time: float = 0.0
     decode_transfer_queue_entry_time: float = 0.0
+    # TODO: correct set them
+    bootstrap_duration: float = 0.0
+    alloc_waiting_duration: float = 0.0
+    prefill_start_time: float = 0.0
+    prefill_end_time: float = 0.0
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
@@ -73,7 +78,20 @@ class TimeStats:
                         and forward_duration >= 0
                     ), f"bootstrap_duration={bootstrap_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
 
-            return f"bootstrap_duration={self.format_duration(bootstrap_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.prefill_bootstrap_queue_entry_time:.3f}"
+            other = max(
+                0.0,
+                bootstrap_duration
+                - (self.alloc_waiting_duration + self.bootstrap_duration),
+            )
+            return (
+                f"bootstrap_queue_duration({self.format_duration(bootstrap_duration)}) "
+                f"= alloc_wait({self.format_duration(self.alloc_waiting_duration)}) "
+                f"+ bootstrap({self.format_duration(self.bootstrap_duration)}) "
+                f"+ other({self.format_duration(other)}); "
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"start={self.prefill_bootstrap_queue_entry_time:.3f}"
+            )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = (
                 self.decode_transfer_queue_entry_time
@@ -94,7 +112,21 @@ class TimeStats:
                         and forward_duration >= 0
                     ), f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0. {self=}"
 
-            return f"prealloc_duration={self.format_duration(prealloc_duration)}, transfer_duration={self.format_duration(transfer_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.decode_prealloc_queue_entry_time:.3f}"
+            other = max(
+                0.0,
+                prealloc_duration
+                - (self.alloc_waiting_duration + self.bootstrap_duration),
+            )
+            return (
+                f"prealloc_queue_duration({self.format_duration(prealloc_duration)}) "
+                f"= alloc_wait({self.format_duration(self.alloc_waiting_duration)}) "
+                f"+ bootstrap({self.format_duration(self.bootstrap_duration)}) "
+                f"+ other({self.format_duration(other)}); "
+                f"transfer_duration={self.format_duration(transfer_duration)}; "
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"start={self.decode_prealloc_queue_entry_time:.3f}"
+            )
         else:
             return "Unknown Time Stats"
 
@@ -120,6 +152,7 @@ class SchedulerStats:
     token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
+    mamba_usage: float = 0.0
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
     num_grammar_queue_reqs: int = 0
@@ -141,6 +174,8 @@ class SchedulerStats:
     num_decode_transfer_queue_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
+    kv_transfer_bootstrap_ms: float = 0.0
+    kv_transfer_alloc_ms: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -190,6 +225,12 @@ class SchedulerMetricsCollector:
         self.swa_token_usage = Gauge(
             name="sglang:swa_token_usage",
             documentation="The token usage for SWA layers.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.mamba_usage = Gauge(
+            name="sglang:mamba_usage",
+            documentation="The token usage for Mamba layers.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -294,6 +335,18 @@ class SchedulerMetricsCollector:
         self.kv_transfer_latency_ms = Gauge(
             name="sglang:kv_transfer_latency_ms",
             documentation="The transfer latency of the KV cache in ms.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_transfer_bootstrap_ms = Gauge(
+            name="sglang:kv_transfer_bootstrap_ms",
+            documentation="The bootstrap time of the KV transfer in ms.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_transfer_alloc_ms = Gauge(
+            name="sglang:kv_transfer_alloc_ms",
+            documentation="The allocation waiting time of the KV transfer in ms.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -537,6 +590,7 @@ class SchedulerMetricsCollector:
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
+        self._log_gauge(self.mamba_usage, stats.mamba_usage)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
@@ -564,6 +618,8 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
         self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
+        self._log_gauge(self.kv_transfer_bootstrap_ms, stats.kv_transfer_bootstrap_ms)
+        self._log_gauge(self.kv_transfer_alloc_ms, stats.kv_transfer_alloc_ms)
 
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
@@ -870,13 +926,13 @@ class TokenizerMetricsCollector:
     def check_time_to_first_token_straggler(self, value: float) -> bool:
         his = self.histogram_time_to_first_token.labels(**self.labels)
         total_observations = sum(bucket._value for bucket in his._buckets)
-        if total_observations < 1000:
+        if total_observations < 100:
             return False
-        p999_threshold = total_observations * 0.999
+        p99_threshold = total_observations * 0.99
         cumulative_count = 0
         for i, bucket in enumerate(his._buckets):
             cumulative_count += bucket._value
-            if cumulative_count > p999_threshold:
+            if cumulative_count > p99_threshold:
                 return value >= his._upper_bounds[i]
         return False
 

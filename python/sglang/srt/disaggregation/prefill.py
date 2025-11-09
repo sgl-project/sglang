@@ -54,7 +54,7 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
-from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj, require_mlp_sync
+from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -326,7 +326,7 @@ class SchedulerDisaggregationPrefillMixin:
                 attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
                 trace_event_batch("schedule", batch.reqs, attrs=attrs)
 
-            if require_mlp_sync(self.server_args):
+            if self.require_mlp_sync:
                 batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
 
@@ -361,7 +361,7 @@ class SchedulerDisaggregationPrefillMixin:
                 attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
                 trace_event_batch("schedule", batch.reqs, attrs=attrs)
 
-            if require_mlp_sync(self.server_args):
+            if self.require_mlp_sync:
                 batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
 
@@ -588,7 +588,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.tp_worker.get_tp_group().cpu_group,
+            self.tp_worker.get_attention_tp_cpu_group(),
         )
 
         transferred_rids: List[str] = []
@@ -722,8 +722,11 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             data = None
 
-        if self.tp_size != 1:
+        if self.attn_tp_size != 1:
             data = broadcast_pyobj(
-                data, self.tp_group.rank, self.tp_cpu_group, src=self.tp_group.ranks[0]
+                data,
+                self.attn_tp_group.rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_group.ranks[0],
             )
         return data

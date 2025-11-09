@@ -103,6 +103,11 @@ class SGLangCIAnalyzer:
             "nightly": [
                 "nightly-test-perf-text-models",
                 "nightly-test-eval-text-models",
+                "nightly-test-1-gpu",
+                "nightly-test-4-gpu",
+                "nightly-test-8-gpu-h200",
+                "nightly-test-8-gpu-h20",
+                "nightly-test-4-gpu-b200",
             ],
             "integration": [
                 "run-all-notebooks",
@@ -111,6 +116,9 @@ class SGLangCIAnalyzer:
             ],
             "b200": [
                 "unit-test-backend-4-gpu-b200",
+            ],
+            "gb200": [
+                "unit-test-backend-4-gpu-gb200",
             ],
         }
 
@@ -180,12 +188,17 @@ class SGLangCIAnalyzer:
                     "unit-test-deepep-8-gpu",
                     "unit-test-backend-8-gpu-deepseek-v32",
                     "unit-test-backend-4-gpu-b200",
+                    "unit-test-backend-4-gpu-gb200",
                     "vllm-dependency-test",
                     "nightly-test-eval-text-models",
                     "nightly-test-perf-text-models",
                     "nightly-test-eval-vlms",
                     "nightly-test-perf-vlms",
                     "nightly-test-1-gpu",
+                    "nightly-test-4-gpu",
+                    "nightly-test-8-gpu-h200",
+                    "nightly-test-8-gpu-h20",
+                    "nightly-test-4-gpu-b200",
                 ]
 
                 if job_name in target_jobs:
@@ -382,15 +395,13 @@ class SGLangCIAnalyzer:
         try:
             github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
             if not github_step_summary:
-                print("ℹ️  Not running in GitHub Actions, skipping summary generation")
+                print("Not running in GitHub Actions, skipping summary generation")
                 return
 
-            print("📊 Generating GitHub Actions summary for CI Analysis...")
+            print("Generating GitHub Actions summary for CI Analysis...")
 
             summary_lines = []
-            summary_lines.append(
-                "# 🔍 SGLang CI Analysis Report (Target Workflows Only)"
-            )
+            summary_lines.append("# SGLang CI Analysis Report (Target Workflows Only)")
             summary_lines.append("")
 
             total = stats["total_runs"]
@@ -400,26 +411,24 @@ class SGLangCIAnalyzer:
             skipped = stats["skipped_runs"]
             success_rate = (success / total * 100) if total > 0 else 0
 
-            summary_lines.append("## 📊 Overall Statistics")
+            summary_lines.append("## Overall Statistics")
             summary_lines.append("")
             summary_lines.append("| Metric | Count | Percentage |")
             summary_lines.append("|--------|-------|------------|")
             summary_lines.append(f"| Total Runs | {total} | 100% |")
             summary_lines.append(
-                f"| ✅ Successful | {success} | {success/total*100:.1f}% |"
+                f"| Successful | {success} | {success/total*100:.1f}% |"
             )
-            summary_lines.append(f"| ❌ Failed | {failed} | {failed/total*100:.1f}% |")
+            summary_lines.append(f"| Failed | {failed} | {failed/total*100:.1f}% |")
             summary_lines.append(
-                f"| 🚫 Cancelled | {cancelled} | {cancelled/total*100:.1f}% |"
+                f"| Cancelled | {cancelled} | {cancelled/total*100:.1f}% |"
             )
-            summary_lines.append(
-                f"| ⏭️ Skipped | {skipped} | {skipped/total*100:.1f}% |"
-            )
+            summary_lines.append(f"| Skipped | {skipped} | {skipped/total*100:.1f}% |")
             summary_lines.append(f"| **Success Rate** | **{success_rate:.1f}%** | - |")
             summary_lines.append("")
 
             if stats["category_failures"]:
-                summary_lines.append("## 📁 Category Failure Statistics")
+                summary_lines.append("## Category Failure Statistics")
                 summary_lines.append("")
                 summary_lines.append("| Category | Failures |")
                 summary_lines.append("|----------|----------|")
@@ -430,7 +439,7 @@ class SGLangCIAnalyzer:
                 summary_lines.append("")
 
             if stats["job_failures"]:
-                summary_lines.append("## 🔴 Most Frequently Failed Jobs (Top 20)")
+                summary_lines.append("## Most Frequently Failed Jobs (Top 20)")
                 summary_lines.append("")
 
                 top_failures = sorted(
@@ -457,7 +466,7 @@ class SGLangCIAnalyzer:
                             pr_text = f" by {pr_info['author']}"
 
                         summary_lines.append(
-                            f"✅ **Last Success:** [Run #{last_success['run_number']}]({last_success['url']}) ({success_date.strftime('%Y-%m-%d %H:%M')}){pr_text}"
+                            f"**Last Success:** [Run #{last_success['run_number']}]({last_success['url']}) ({success_date.strftime('%Y-%m-%d %H:%M')}){pr_text}"
                         )
                         summary_lines.append("")
 
@@ -465,7 +474,7 @@ class SGLangCIAnalyzer:
                         job in stats["job_failure_links"]
                         and stats["job_failure_links"][job]
                     ):
-                        summary_lines.append("❌ **Recent Failures:**")
+                        summary_lines.append("**Recent Failures:**")
                         for link_info in stats["job_failure_links"][job]:
                             created_at = datetime.fromisoformat(
                                 link_info["created_at"].replace("Z", "+00:00")
@@ -484,7 +493,7 @@ class SGLangCIAnalyzer:
                         summary_lines.append("")
 
             if stats["failure_patterns"]:
-                summary_lines.append("## 🔬 Failure Pattern Analysis")
+                summary_lines.append("## Failure Pattern Analysis")
                 summary_lines.append("")
                 summary_lines.append("| Pattern | Count |")
                 summary_lines.append("|---------|-------|")
@@ -498,10 +507,10 @@ class SGLangCIAnalyzer:
                 f.write("\n".join(summary_lines))
                 f.write("\n\n---\n\n")
 
-            print("✅ GitHub Actions summary generated successfully")
+            print("GitHub Actions summary generated successfully")
 
         except Exception as e:
-            print(f"❌ Failed to generate GitHub Actions summary: {e}")
+            print(f"Failed to generate GitHub Actions summary: {e}")
 
 
 def main():
