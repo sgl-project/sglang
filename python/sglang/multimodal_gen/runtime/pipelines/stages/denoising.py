@@ -756,6 +756,11 @@ class DenoisingStage(PipelineStage):
                         server_args.pipeline_config.ti2v_task
                         and batch.pil_image is not None
                     ):
+                        # Explicitly cast t_device to the target float type at the beginning.
+                        # This ensures any precision-based rounding (e.g., float32(999.0) -> bfloat16(1000.0))
+                        # is applied consistently *before* it's used by any rank.
+                        t_device_rounded = t_device.to(target_dtype)
+
                         local_seq_len = seq_len
                         if get_sp_world_size() > 1 and getattr(
                             batch, "did_sp_shard_latents", False
@@ -770,7 +775,7 @@ class DenoisingStage(PipelineStage):
                             # NOTE: The spatial downsampling in the next line is suspicious but kept
                             # to match original model's potential training configuration.
                             temp_ts = (
-                                reserved_frames_mask[0][:, ::2, ::2] * t_device
+                                reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded
                             ).flatten()
 
                             # Pad to full local sequence length
@@ -778,7 +783,7 @@ class DenoisingStage(PipelineStage):
                                 [
                                     temp_ts,
                                     temp_ts.new_ones(local_seq_len - temp_ts.size(0))
-                                    * t_device,
+                                    * t_device_rounded,
                                 ]
                             )
                             timestep = temp_ts.unsqueeze(0).repeat(
@@ -792,7 +797,6 @@ class DenoisingStage(PipelineStage):
                     else:
                         timestep = t_device.repeat(latent_model_input.shape[0])
 
-                    print(f"{i=} {timestep.shape=} {timestep=}")
                     latent_model_input = self.scheduler.scale_model_input(
                         latent_model_input, t_device
                     )
