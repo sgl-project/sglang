@@ -38,6 +38,16 @@ def import_processors(package_name: str):
 def get_mm_processor(
     hf_config, server_args: ServerArgs, processor, transport_mode
 ) -> BaseMultimodalProcessor:
+    if not PROCESSOR_MAPPING:
+        try:
+            import_processors("sglang.srt.multimodal.processors")
+        except Exception as e:
+            logger.error(
+                "Failed to import multimodal processors from %s: %s",
+                "sglang.srt.multimodal.processors",
+                e,
+            )
+
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ in hf_config.architectures:
             return processor_cls(hf_config, server_args, processor, transport_mode)
