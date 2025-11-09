@@ -233,6 +233,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = hf_config.vision_end_token_id
 
+        # 这里是我们需要的新增字段（如果缺就加上）
         self.audio_start_token_id = getattr(hf_config, "audio_start_token_id", None)
         self.audio_token_id = getattr(hf_config, "audio_token_id", None)
 
@@ -288,14 +289,19 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 base_output, self.mm_tokens
             )
 
+        # ========= 这里是我们添加的音频长度逻辑 =========
         audio_feature_lengths = None
-
         if self.model_type == "qwen3_omni_moe":
             audio_item = next((mm for mm in mm_items if mm.is_audio()), None)
-            if audio_item:
+            if (
+                audio_item is not None
+                and getattr(audio_item, "feature_attention_mask", None) is not None
+            ):
+                # feature_attention_mask: [B, T]，把每条音频有效帧数求出来
                 audio_feature_lengths = torch.sum(
-                    audio_item.feature_attention_mask, dim=1
+                    audio_item.feature_attention_mask.to(dtype=torch.int64), dim=1
                 )
+        # ============================================
 
         second_per_grid_ts = getattr(ret, "second_per_grid_ts", None) or getattr(
             ret, "video_second_per_grid", None
@@ -318,6 +324,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
             second_per_grid_ts=second_per_grid_ts,
+            # qwen-omni 相关参数：
             use_audio_in_video=False,
             audio_seqlens=audio_feature_lengths,
             audio_token_id=getattr(self.hf_config, "audio_token_id", None),
