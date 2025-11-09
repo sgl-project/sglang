@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -64,6 +63,7 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
             "--enable-dp-attention",
             "--base-gpu-id",
             "2",
+            "--prefill-round-robin-balance",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
