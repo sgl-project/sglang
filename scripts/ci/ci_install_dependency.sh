@@ -134,3 +134,6 @@ fi
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
+
+# Prepare the CI runner (cleanup HuggingFace cache, etc.)
+bash "${SCRIPT_DIR}/prepare_runner.sh"
