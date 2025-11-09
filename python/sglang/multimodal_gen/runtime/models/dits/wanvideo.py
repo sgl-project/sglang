@@ -351,12 +351,12 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        print(f"{hidden_states.shape=}")
+        # print(f"{hidden_states.shape=}")
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
         orig_dtype = hidden_states.dtype
-        print(f"356 {temb.shape=}")
+        # print(f"356 {temb.shape=}")
         if temb.dim() == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -375,13 +375,13 @@ class WanTransformerBlock(nn.Module):
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
                 e.chunk(6, dim=1)
             )
-        print(f"{scale_msa.shape=}")
+        # print(f"{scale_msa.shape=}")
 
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
         norm1 = self.norm1(hidden_states.float())
-        print(f"{norm1.shape=}")
+        # print(f"{norm1.shape=}")
         norm_hidden_states = (norm1 * (1 + scale_msa) + shift_msa).to(orig_dtype)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
@@ -395,7 +395,7 @@ class WanTransformerBlock(nn.Module):
         query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        print(f"{query.shape=}")
+        # print(f"{query.shape=}")
 
         # Apply rotary embeddings
         cos, sin = freqs_cis

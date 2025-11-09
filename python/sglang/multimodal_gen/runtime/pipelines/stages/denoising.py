@@ -308,24 +308,56 @@ class DenoisingStage(PipelineStage):
         self._preprocess_sp_latents(batch)
         latents = batch.latents
 
-        # If TI2V, adjust mask2 to the local SP shard and compute local seq_len
+        # If TI2V, prepare global timestep template and shard it
         # Note: z (image latent) has only 1 frame and will be broadcasted during mixing
         patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
         mask2_local = None
+        ti2v_timestep_template = None
         if server_args.pipeline_config.ti2v_task and batch.pil_image is not None:
             sp_size = get_sp_world_size()
             rank_in_sp = get_sp_parallel_rank()
-            # mask2[0] shape: [C, T, H, W]; SP shards time via interleaving (Ulysses-style)
+
+            # First, construct the GLOBAL timestep template on patch grid
+            # mask2[0] shape: [C, T, H, W]
+            ph, pw = patch_size[1], patch_size[2]
+            # Downsample mask to patch grid and flatten: [T_patches, H_patches, W_patches]
+            mask2_patches = mask2[0][0][:, ::ph, ::pw]  # [T, H//ph, W//pw]
+            global_seq_len = mask2_patches.numel()
+            # Create template: shape [1, global_seq_len], values are 0 or 1 (will be multiplied by t_device later)
+            ti2v_timestep_template_global = mask2_patches.flatten().unsqueeze(
+                0
+            )  # [1, global_seq_len]
+
+            # Now shard this template according to SP
             T_total = mask2[0].shape[1]
             if sp_size > 1 and T_total % sp_size == 0:
-                # interleaved slicing across time: rank r gets frames r, r+sp, r+2*sp, ...
+                # Ulysses interleaved slicing: rank r gets frames r, r+sp, r+2*sp, ...
+                # We need to shard the flattened sequence correspondingly
+                # After patchifying and flattening (T,H,W order), tokens are grouped by frame
+                T_patches = T_total // patch_size[0]  # Number of patch frames
+                H_patches = mask2[0].shape[2] // ph
+                W_patches = mask2[0].shape[3] // pw
+                tokens_per_frame = H_patches * W_patches
+
+                # Interleaved sharding: take every sp_size-th frame starting from rank_in_sp
+                local_frame_indices = list(range(rank_in_sp, T_patches, sp_size))
+                local_token_indices = []
+                for frame_idx in local_frame_indices:
+                    start = frame_idx * tokens_per_frame
+                    end = start + tokens_per_frame
+                    local_token_indices.extend(range(start, end))
+
+                ti2v_timestep_template = ti2v_timestep_template_global[
+                    :, local_token_indices
+                ].contiguous()
+
+                # Also shard mask2_local for per-step mixing
                 mask2_local = mask2[0][:, rank_in_sp::sp_size, :, :].contiguous()
-                # z (image latent) should NOT be sharded - it has fewer frames and will broadcast
             else:
+                ti2v_timestep_template = ti2v_timestep_template_global
                 mask2_local = mask2[0]
-            # derive per-rank local seq_len on patch grid
-            ph, pw = patch_size[1], patch_size[2]
-            seq_len = (mask2_local[0][:, ::ph, ::pw]).numel()
+
+            seq_len = ti2v_timestep_template.shape[1]
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -393,6 +425,7 @@ class DenoisingStage(PipelineStage):
             "seq_len": seq_len,
             "guidance": guidance,
             "patch_size": patch_size,
+            "ti2v_timestep_template": ti2v_timestep_template,
         }
 
     def _post_denoising_loop(
@@ -636,6 +669,7 @@ class DenoisingStage(PipelineStage):
         seq_len = prepared_vars["seq_len"]
         guidance = prepared_vars["guidance"]
         patch_size = prepared_vars["patch_size"]
+        ti2v_timestep_template = prepared_vars["ti2v_timestep_template"]
         bsz = batch.batch_size
 
         # Initialize lists for ODE trajectory
@@ -689,25 +723,15 @@ class DenoisingStage(PipelineStage):
                         server_args.pipeline_config.ti2v_task
                         and batch.pil_image is not None
                     ):
-                        timestep = torch.stack([t_device]).to(get_local_torch_device())
-                        # Downsample mask to patch grid using true patch strides (ph, pw)
-                        # mask2_local shape: [C, T_local, H, W]
-                        # mask2_local[0] shape: [T_local, H, W]
-                        ph = patch_size[1]
-                        pw = patch_size[2]
-                        temp_ts = (mask2_local[0][:, ::ph, ::pw] * timestep).flatten()
-                        temp_ts = torch.cat(
-                            [
-                                temp_ts,
-                                temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep,
-                            ]
-                        )
-                        timestep = temp_ts.unsqueeze(0)
-                        timestep = timestep.repeat(bsz, 1)
+                        # Use pre-computed template: multiply by current timestep value
+                        # ti2v_timestep_template: [1, seq_len_local], values are 0 or 1
+                        # t_device is scalar timestep
+                        timestep = (ti2v_timestep_template * t_device).repeat(bsz, 1)
                     else:
                         timestep = t_device.repeat(bsz)
 
-                    # Debug disabled
+                    print(f"{timestep=}")
+
                     latent_model_input = self.scheduler.scale_model_input(
                         latent_model_input, t_device
                     )
@@ -751,12 +775,12 @@ class DenoisingStage(PipelineStage):
                             latents.dim() == 5
                         ), f"Expected 5D latents, got {latents.shape}"
                         latents_4d = latents.squeeze(0)
-                        print(f"{latents_4d.shape=}")
+                        # print(f"{latents_4d.shape=}")
                         # z has shape [C, 1, H, W] or similar, will broadcast to [C, T_local, H, W]
                         latents_4d = (1.0 - mask2_local) * z + mask2_local * latents_4d
-                        print(f"after {latents_4d.shape=}")
-                        print(f"after {z.shape=}")
-                        print(f"after {mask2_local.shape=}")
+                        # print(f"after {latents_4d.shape=}")
+                        # print(f"after {z.shape=}")
+                        # print(f"after {mask2_local.shape=}")
                         latents = latents_4d.unsqueeze(0)
 
                     # save trajectory latents if needed
