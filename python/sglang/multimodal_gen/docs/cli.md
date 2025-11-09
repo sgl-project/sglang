@@ -124,6 +124,36 @@ To see all the options, you can use the `--help` flag:
 ```bash
 sglang generate --help
 ```
+## Generate
+
+Run a one-off generation task without launching a persistent server.
+
+To use it, pass both server arguments and sampling parameters in one command, after the `generate` subcommand, for example:
+
+```bash
+SERVER_ARGS=(
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+  --text-encoder-cpu-offload
+  --pin-cpu-memory
+  --num-gpus 4
+  --ulysses-degree=2
+  --ring-degree=2
+)
+
+SAMPLING_ARGS=(
+  --prompt "A curious raccoon"
+  --save-output
+  --output-path outputs
+  --output-file-name "A curious raccoon.mp4"
+)
+
+sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
+```
+Once the generation task has finished, the server will shut down automatically.
+
+> [!NOTE]
+> The HTTP server-related arguments are ignored in this subcommand.
+
 
 ## Serve
 
@@ -151,7 +181,9 @@ sglang serve "${SERVER_ARGS[@]}"
 
 Wait until the port is listening. In CI, the tests probe `127.0.0.1:30010` before sending requests.
 
-### OpenAI Python SDK usage
+---
+
+## Video Generation
 
 Initialize the client with a dummy API key and point `base_url` to your local server:
 
@@ -230,7 +262,7 @@ curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
   -o output.mp4
 ```
 
-### API surface implemented here
+#### API surface implemented here
 
 The server exposes these endpoints (OpenAPI tag `videos`):
 
@@ -238,37 +270,190 @@ The server exposes these endpoints (OpenAPI tag `videos`):
 - `GET /v1/videos` — List jobs.
 - `GET /v1/videos/{video_id}/content` — Download binary content when ready (e.g., MP4).
 
-### Reference
+#### Reference
 
 - OpenAI Videos API reference: `https://platform.openai.com/docs/api-reference/videos`
 
-## Generate
+---
 
-Run a one-off generation task without launching a persistent server.
+## Image Generation
 
-To use it, pass both server arguments and sampling parameters in one command, after the `generate` subcommand, for example:
+SGLang Diffusion supports image generation and editing with models such as **Qwen-Image**, **Qwen-Image-Edit**, and **FLUX**. You can use these either through the CLI or via an OpenAI-compatible HTTP API.
+
+#### CLI Usage
+
+##### Text → Image (FLUX)
 
 ```bash
-SERVER_ARGS=(
-  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
-  --text-encoder-cpu-offload
-  --pin-cpu-memory
-  --num-gpus 4
-  --ulysses-degree=2
-  --ring-degree=2
-)
+sglang generate \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --prompt "A logo with bold large text: SGL Diffusion" \
+  --save-output \
+  --output-path outputs \
+  --output-file-name flux_logo.png
+````
 
-SAMPLING_ARGS=(
-  --prompt "A curious raccoon"
-  --save-output
+##### Text → Image (Qwen-Image)
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image \
+  --prompt "A curious raccoon" \
+  --width 720 \
+  --height 720 \
+  --save-output \
   --output-path outputs
-  --output-file-name "A curious raccoon.mp4"
-)
-
-sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 ```
 
-Once the generation task has finished, the server will shut down automatically.
+##### Image → Image (Edit) (Qwen-Image-Edit)
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image-Edit \
+  --prompt "Convert 2D style to 3D style" \
+  --image-path path/to/input.jpg \
+  --width 1024 \
+  --height 1536 \
+  --save-output \
+  --output-path outputs
+```
+
+These commands create a temporary diffusion job, save the output image under `--output-path`, and exit after generation.
+
+---
+
+#### HTTP API (OpenAI-Compatible Schema)
+
+You can also serve image models and interact with them using OpenAI-style endpoints.
+
+##### 1. Start a Local Server
+
+```bash
+sglang serve --model-path Qwen/Qwen-Image
+# or
+sglang serve --model-path Qwen/Qwen-Image-Edit
+```
+
+This launches a FastAPI server (default: `http://localhost:3000/v1`).
+
+---
+
+##### 2. Text → Image (OpenAI Python SDK)
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="sglang-anything",
+    base_url="http://localhost:3000/v1",
+)
+
+resp = client.images.generate(
+    model="Qwen/Qwen-Image",                # or "black-forest-labs/FLUX.1-dev"
+    prompt="A cute raccoon hacking a GPU cluster at night",
+    size="1024x1024",
+    n=1,
+    response_format="b64_json",             # required; "url" not supported
+)
+
+b64 = resp.data[0].b64_json
+img = base64.b64decode(b64)
+with open("meme.png", "wb") as f:
+    f.write(img)
+
+print("Saved meme.png")
+```
+
+---
+
+##### 3. Text → Image (curl)
+
+```bash
+export OPENAI_API_BASE="http://localhost:3000/v1"
+export OPENAI_API_KEY="sglang-anything"
+
+curl -sS -X POST "$OPENAI_API_BASE/images/generations" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "Qwen/Qwen-Image",
+        "prompt": "A cute raccoon hacking a GPU cluster at night",
+        "size": "1024x1024",
+        "n": 1,
+        "response_format": "b64_json"
+      }' \
+  | jq -r '.data[0].b64_json' | base64 --decode > meme.png
+```
+
+The response follows the standard OpenAI Images JSON format:
+
+```json
+{
+  "created": 1234567890,
+  "data": [
+    {
+      "b64_json": "iVBORw0KGgoAAA..."
+    }
+  ]
+}
+```
+
+You can decode the `b64_json` field to retrieve the generated image.
+
+---
+
+##### 4. Image Edit (Python SDK)
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="sglang-anything",
+    base_url="http://localhost:3000/v1",
+)
+
+with open("input.png", "rb") as f:
+    image_bytes = f.read()
+
+resp = client.images.edit(
+    model="Qwen/Qwen-Image-Edit",
+    image=image_bytes,
+    prompt="Change the text to CUDA FOR LIFE",
+    size="1024x1024",
+    response_format="b64_json",             # required
+)
+
+b64 = resp.data[0].b64_json
+img = base64.b64decode(b64)
+with open("meme.png", "wb") as f:
+    f.write(img)
+
+print("Saved meme.png")
+```
+---
+
+##### 5. Image Edit (curl)
+
+```bash
+export OPENAI_API_BASE="http://localhost:3000/v1"
+export OPENAI_API_KEY="sglang-anything"
+
+curl -sS -X POST "$OPENAI_API_BASE/images/edits" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -F "model=Qwen/Qwen-Image-Edit" \
+  -F "image[]=@input.png" \
+  -F "prompt=Change the text to CUDA FOR LIFE" \
+  -F "response_format=b64_json" \
+  | jq -r '.data[0].b64_json' | base64 --decode > meme.png
+```
+
+---
 
 > [!NOTE]
-> The HTTP server-related arguments are ignored in this subcommand.
+> Only `response_format="b64_json"` is currently supported.
+> Using `response_format="url"` will return the following error:
+> ```
+> 400 - {"detail": "response_format=url is not supported"}
+> ```
