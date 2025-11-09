@@ -904,11 +904,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_data = orjson.loads(text)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
+                    # Support both "arguments" (OpenAI standard) and "parameters"
+                    params = tool.get("arguments") or tool.get("parameters")
+                    if params is None:
+                        raise ValueError(
+                            f"Tool call missing both 'arguments' and 'parameters': {tool}"
+                        )
+
                     # Create a ToolCallItem from the JSON data
                     call_info = ToolCallItem(
                         tool_index=i,  # Use the loop index as tool_index
                         name=tool["name"],
-                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                        parameters=json.dumps(params, ensure_ascii=False),
                     )
                     tool_id = self._process_tool_call_id(
                         call_info, history_tool_calls_cnt
@@ -919,9 +926,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             index=i,
                             function=FunctionResponse(
                                 name=tool["name"],
-                                arguments=json.dumps(
-                                    tool["parameters"], ensure_ascii=False
-                                ),
+                                arguments=json.dumps(params, ensure_ascii=False),
                             ),
                         )
                     )
@@ -1059,25 +1064,21 @@ class OpenAIServingChat(OpenAIServingBase):
             # 1. When tool_choice is "required" or a specific function is named, JSON schema constraint
             #    is applied which should produce JSON array output. Use JsonArrayParser for this.
             # 2. For tool_choice="auto" or "none", use model-specific parser for native format.
-            # 3. If JsonArrayParser fails to detect tool calls, we fall back in non-streaming path.
             is_required_or_named_tool = request.tool_choice == "required" or (
                 isinstance(request.tool_choice, ToolChoice)
                 and request.tool_choice.type == "function"
             )
 
-            if is_required_or_named_tool:
+            if is_required_or_named_tool or not self.tool_call_parser:
                 # JSON schema constraint was applied, expect JSON array output
                 # Use JsonArrayParser to detect JSON-formatted tool calls
                 parser_dict[index] = JsonArrayParser()
-            elif self.tool_call_parser:
+            else:
                 # Use model-specific parser for auto mode (native format expected)
                 parser_dict[index] = FunctionCallParser(
                     tools=request.tools,
                     tool_call_parser=self.tool_call_parser,
                 )
-            else:
-                # Fallback to JsonArrayParser for models without specific parser
-                parser_dict[index] = JsonArrayParser()
 
         parser = parser_dict[index]
 
