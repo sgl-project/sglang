@@ -110,7 +110,11 @@ jobs:
     steps:
       - name: Cleanup
         run: |
-          sudo rm -rf $GITHUB_WORKSPACE/* || true
+          if [ -d "$GITHUB_WORKSPACE" ]; then
+            sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+          else
+            echo "$GITHUB_WORKSPACE does not exist, nothing to clean"
+          fi
 
       - uses: actions/checkout@v4
         with:
