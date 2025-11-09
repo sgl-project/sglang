@@ -255,10 +255,10 @@ def matmul_persistent(
 ):
     M, K = a.shape
     K2, N = b.shape
-    
+
     # DeepGEMM requires minimum dimensions, skip DeepGEMM for small dimensions to avoid CUDA_ERROR_INVALID_VALUE
     MIN_DIM_FOR_DEEPGEMM = 64
-    
+
     if (
         _ENABLE_MM_DEEPGEMM
         and ENABLE_JIT_DEEPGEMM
@@ -292,6 +292,7 @@ def matmul_persistent(
             pass
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
+
 
 @triton.jit
 def _log_softmax_kernel(
