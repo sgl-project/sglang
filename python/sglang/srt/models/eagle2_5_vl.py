@@ -105,16 +105,6 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             prefix=add_prefix("language_model", prefix),
         )
 
-        # Vision projection
-        self.visual_projection = Eagle2_5_VLVisionMLP(
-            in_features=config.vision_config.hidden_size,
-            hidden_features=config.vision_config.intermediate_size,
-            out_features=config.text_config.hidden_size,
-            hidden_act=config.vision_config.hidden_act,
-            quant_config=quant_config,
-            prefix=add_prefix("visual_projection", prefix),
-        )
-
         # Pooler for embedding extraction
         self.pooler = Pooler(
             pooling_type=PoolingType.LAST,
@@ -132,25 +122,59 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         # Logits processor
         self.logits_processor = LogitsProcessor(self.config.text_config)
 
+        # MLP connector (matches Eagle2.5 architecture)
+        vit_hidden_size = config.vision_config.hidden_size
+        llm_hidden_size = config.text_config.hidden_size
+
+        if config.mlp_connector_layers == 2:
+            self.mlp1 = nn.Sequential(
+                nn.LayerNorm(vit_hidden_size * int(1 / config.downsample_ratio) ** 2),
+                nn.Linear(
+                    vit_hidden_size * int(1 / config.downsample_ratio) ** 2,
+                    llm_hidden_size,
+                ),
+                nn.GELU(),
+                nn.Linear(llm_hidden_size, llm_hidden_size),
+            )
+        elif config.mlp_connector_layers == 1 and config.use_pixel_shuffle:
+            self.mlp1 = nn.Sequential(
+                nn.Linear(
+                    vit_hidden_size * int(1 / config.downsample_ratio) ** 2,
+                    llm_hidden_size,
+                ),
+            )
+        elif config.mlp_connector_layers == 1 and not config.use_pixel_shuffle:
+            self.mlp1 = nn.Sequential(
+                nn.Linear(vit_hidden_size, llm_hidden_size),
+            )
+        else:
+            raise NotImplementedError(
+                f"{config.mlp_connector_layers} mlp_connector_layers is not implemented."
+            )
+
         # Special tokens
         self.image_token_index = config.image_token_index
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        """Extract image features using SigLIP vision model."""
+        """Extract image features using SigLIP vision model with MLP connector."""
         # Concatenate all image features
         pixel_values = torch.cat([item.feature for item in items], dim=0)
         # SigLIP doesn't use grid_thw, it processes images directly
         image_embeds = self.vision_model(pixel_values)
-        image_embeds = self.visual_projection(image_embeds)
+
+        # Apply MLP connector (matches Eagle2.5 architecture)
+        image_embeds = self.mlp1(image_embeds)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        """Extract video features using SigLIP vision model."""
+        """Extract video features using SigLIP vision model with MLP connector."""
         # Concatenate all video frame features
         pixel_values = torch.cat([item.feature for item in items], dim=0)
         # SigLIP doesn't use grid_thw, treat video frames like images
         video_embeds = self.vision_model(pixel_values)
-        video_embeds = self.visual_projection(video_embeds)
+
+        # Apply MLP connector (matches Eagle2.5 architecture)
+        video_embeds = self.mlp1(video_embeds)
         return video_embeds
 
     @property

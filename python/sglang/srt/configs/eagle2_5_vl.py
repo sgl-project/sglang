@@ -113,6 +113,7 @@ class Eagle2_5_VLConfig(PretrainedConfig):
         use_llm_lora=0,
         use_pixel_shuffle=False,
         use_thumbnail=True,
+        mlp_connector_layers=1,
         **kwargs,
     ):
         if isinstance(vision_config, dict):
@@ -144,5 +145,6 @@ class Eagle2_5_VLConfig(PretrainedConfig):
         self.use_llm_lora = use_llm_lora
         self.use_pixel_shuffle = use_pixel_shuffle
         self.use_thumbnail = use_thumbnail
+        self.mlp_connector_layers = mlp_connector_layers
 
         super().__init__(**kwargs)
