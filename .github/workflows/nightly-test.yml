@@ -51,8 +51,9 @@ jobs:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
-          rm -rf test/srt/performance_profiles_text_models/
-          python3 test/srt/nightly/test_text_models_perf.py
+          cd test/srt
+          rm -rf performance_profiles_text_models/
+          python3 nightly/test_text_models_perf.py
 
       - name: Publish traces to storage repo
         env:
@@ -98,8 +99,9 @@ jobs:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
-          rm -rf test/srt/performance_profiles_vlms/
-          python3 test/srt/nightly/test_vlms_perf.py
+          cd test/srt
+          rm -rf performance_profiles_vlms/
+          python3 nightly/test_vlms_perf.py
 
       - name: Publish traces to storage repo
         env:
