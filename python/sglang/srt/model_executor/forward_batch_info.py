@@ -79,6 +79,10 @@ class ForwardMode(IntEnum):
 
     DRAFT_EXTEND_V2 = auto()
 
+    # Used in disaggregated decode worker
+    # Represent a batch of requests having their KV cache ready to start decoding
+    PREBUILT_EXTEND = auto()
+
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
@@ -147,6 +151,9 @@ class ForwardMode(IntEnum):
             and not self.is_target_verify()
             and not self.is_draft_extend()
         )
+
+    def is_prebuilt_extend(self):
+        return self == ForwardMode.PREBUILT_EXTEND
 
 
 @total_ordering
