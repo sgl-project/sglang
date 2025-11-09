@@ -21,13 +21,13 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::{
+    app_context::AppContext,
     core::{
         workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
         DPAwareWorkerBuilder, HealthConfig, Worker, WorkerType,
     },
     grpc_client::SglangSchedulerClient,
     protocols::worker_spec::WorkerConfigRequest,
-    server::AppContext,
 };
 
 // HTTP client for metadata fetching
@@ -123,16 +123,30 @@ fn strip_protocol(url: &str) -> String {
 }
 
 /// Helper: Try HTTP health check
-async fn try_http_health_check(url: &str, timeout_secs: u64) -> Result<(), String> {
+///
+/// Uses the provided client (from app_context) which supports both HTTP and HTTPS.
+/// For HTTPS URLs, the client's TLS configuration (mTLS, CA certs) is used.
+/// For plain HTTP URLs, the client handles them normally without TLS overhead.
+async fn try_http_health_check(
+    url: &str,
+    timeout_secs: u64,
+    client: &Client,
+) -> Result<(), String> {
+    // Preserve the protocol (http or https) from the original URL
+    let is_https = url.starts_with("https://");
+    let protocol = if is_https { "https" } else { "http" };
     let clean_url = strip_protocol(url);
-    let health_url = format!("http://{}/health", clean_url);
+    let health_url = format!("{}://{}/health", protocol, clean_url);
 
-    HTTP_CLIENT
+    // Use the AppContext client for both HTTP and HTTPS
+    // The rustls backend handles both protocols correctly
+    client
         .get(&health_url)
         .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
-        .map_err(|e| format!("HTTP health check failed: {}", e))?;
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| format!("Health check failed: {}", e))?;
 
     Ok(())
 }
@@ -235,6 +249,9 @@ impl StepExecutor for DetectConnectionModeStep {
         let config: Arc<WorkerConfigRequest> = context
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
+        let app_context: Arc<AppContext> = context
+            .get("app_context")
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
         debug!(
             "Detecting connection mode for {} (timeout: {}s, max_attempts: {})",
@@ -242,10 +259,12 @@ impl StepExecutor for DetectConnectionModeStep {
         );
 
         // Try both protocols in parallel using configured timeout
+        // Use the AppContext client which has TLS configuration (CA certs, client identity)
         let url = config.url.clone();
         let timeout = config.health_check_timeout_secs;
+        let client = &app_context.client;
         let (http_result, grpc_result) = tokio::join!(
-            try_http_health_check(&url, timeout),
+            try_http_health_check(&url, timeout, client),
             try_grpc_health_check(&url, timeout)
         );
 
@@ -802,7 +821,29 @@ impl StepExecutor for ActivateWorkerStep {
 /// Note: Actual health check timeouts and retry attempts are configured per-worker
 /// via WorkerConfigRequest (populated from router config). The timeouts and retry
 /// policies here serve as workflow-level bounds to prevent infinite waiting.
-pub fn create_worker_registration_workflow() -> WorkflowDefinition {
+///
+/// # Arguments
+/// * `router_config` - Router configuration containing health check settings
+pub fn create_worker_registration_workflow(
+    router_config: &crate::config::RouterConfig,
+) -> WorkflowDefinition {
+    // Use health check timeout from config with 30 second buffer as workflow-level upper bound
+    let detect_timeout = Duration::from_secs(router_config.health_check.timeout_secs + 30);
+
+    // Calculate max_attempts to match the detect_timeout
+    // With Linear backoff (increment 1s, max 5s):
+    // - Attempts 1-5: 0s, 1s, 2s, 3s, 4s = 10s total
+    // - Attempts 6+: 5s each
+    // max_attempts = 5 + (timeout_seconds - 10) / 5
+    // Use 90% of timeout to leave buffer for actual connection attempts
+    let timeout_secs = detect_timeout.as_secs() as f64;
+    let effective_timeout = timeout_secs * 0.9;
+    let max_attempts = if effective_timeout > 10.0 {
+        (5 + ((effective_timeout - 10.0) / 5.0).ceil() as u32).max(3)
+    } else {
+        3
+    };
+
     WorkflowDefinition::new("worker_registration", "Worker Registration")
         .add_step(
             StepDefinition::new(
@@ -811,14 +852,14 @@ pub fn create_worker_registration_workflow() -> WorkflowDefinition {
                 Arc::new(DetectConnectionModeStep),
             )
             .with_retry(RetryPolicy {
-                max_attempts: 100,
+                max_attempts,
                 backoff: BackoffStrategy::Linear {
                     increment: Duration::from_secs(1),
                     max: Duration::from_secs(5),
                 },
             })
-            // Workflow-level timeout (upper bound); step uses config.health_check_timeout_secs
-            .with_timeout(Duration::from_secs(7200)) // 2 hours max
+            // Workflow-level timeout uses configured health check timeout + buffer
+            .with_timeout(detect_timeout)
             .with_failure_action(FailureAction::FailWorkflow),
         )
         .add_step(

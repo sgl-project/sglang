@@ -2,7 +2,8 @@ import functools
 from typing import Optional
 
 import torch
-from sgl_kernel import silu_and_mul
+from sgl_kernel.elementwise import silu_and_mul
+from sgl_kernel.moe import moe_sum_reduce
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
@@ -36,6 +37,7 @@ def fused_marlin_moe(
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
+    routed_scaling_factor: float = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -80,6 +82,12 @@ def fused_marlin_moe(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
+    assert (
+        hidden_states.dtype == w1_scale.dtype
+    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
+    assert (
+        hidden_states.dtype == w2_scale.dtype
+    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
     assert num_bits in [4, 8]
 
     M, K = hidden_states.shape
@@ -198,10 +206,16 @@ def fused_marlin_moe(
         is_zp_float=False,
     ).view(-1, topk, K)
 
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
+
     output = hidden_states if inplace else torch.empty_like(hidden_states)
-    return torch.sum(
-        intermediate_cache3.view(*intermediate_cache3.shape), dim=1, out=output
+    moe_sum_reduce(
+        intermediate_cache3,
+        output,
+        routed_scaling_factor,
     )
+    return output
 
 
 def fused_marlin_moe_fake(
@@ -221,5 +235,7 @@ def fused_marlin_moe_fake(
     w2_zeros: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
+    inplace: bool = False,
+    routed_scaling_factor: float = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)

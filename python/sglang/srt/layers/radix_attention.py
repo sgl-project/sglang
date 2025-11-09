@@ -142,8 +142,11 @@ def unified_attention_with_output(
     ret = forward_batch.attn_backend.forward(
         query, key, value, attention_layer, forward_batch, save_kv_cache
     )
-    assert output.shape == ret.shape
-    output.copy_(ret)
+    assert (
+        output.numel() == ret.numel()
+    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
+
+    output.view(ret.shape).copy_(ret)
     return
 
 

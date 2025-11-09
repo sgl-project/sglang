@@ -68,7 +68,7 @@ def get_token_num_per_seq(
 
 # TODO: may smartly disable TBO when batch size is too small b/c it will slow down
 def compute_split_seq_index(
-    forward_mode: "ForwardMode",
+    forward_mode: ForwardMode,
     num_tokens: int,
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
@@ -79,7 +79,7 @@ def compute_split_seq_index(
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
         return (num_tokens // token_num_per_seq) // 2
-    elif forward_mode.is_idle():
+    elif forward_mode.is_idle() or forward_mode.is_prebuilt_extend():
         assert num_tokens == 0
         return 0
     else:
@@ -381,6 +381,8 @@ class TboDPAttentionPreparer:
                 or local_batch.forward_mode.is_decode()
             ):
                 num_tokens = local_batch.batch_size() * token_num_per_seq
+            elif local_batch.forward_mode.is_prebuilt_extend():
+                num_tokens = 0
             else:
                 num_tokens = local_batch.extend_num_tokens
             self.local_tbo_split_seq_index = compute_split_seq_index(
@@ -407,8 +409,8 @@ class TboDPAttentionPreparer:
         return local_can_run_tbo, local_forward_mode
 
     def compute_output(self, partial_global_info):
-        local_can_run_tbo_aggregated = min(partial_global_info[:, 0, 0].tolist())
-        forward_modes = partial_global_info[:, 0, 1].tolist()
+        local_can_run_tbo_aggregated = min(partial_global_info[:, 0].tolist())
+        forward_modes = partial_global_info[:, 1].tolist()
 
         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
             forward_modes

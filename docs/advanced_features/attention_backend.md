@@ -19,13 +19,13 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **FA3 (FlashAttention 3)**      | ✅                          | ✅               | ✅              | ✅              | ✅                 | ✅             |
 | **FA4 (FlashAttention 4)**      | 128                         | ❌               | ❌              | ❌              | ❌                 | ❌             |
 | **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅                 | ✅             |
-| **Torch Native (SDPA)**         | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **Torch Native (SDPA)**         | ❌                          | ❌               | ❌              | ❌              | ❌                 | ✅             |
 | **FlexAttention (PyTorch)**     | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **TRTLLM MHA**                  | 16, 32 or 64                | ❌               | ✅              | ❌              | ❌                 | ❌             |
+| **TRTLLM MHA**                  | 16, 32 or 64                | ✅               | ✅              | ❌              | ✅                 | ❌             |
 | **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **AITER (ROCm)**                | ✅                          | ❌               | ✅              | ✅              | ❌                 | ❌             |
+| **AITER (ROCm)**                | ✅                          | ❌               | ✅              | ✅              | ❌                 | ✅             |
 | **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌                 | ✅             |
 | **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ✅                 | ❌             |
 
 ### MLA Backends
@@ -40,6 +40,10 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **Triton**                 | n/a                       | ❌               | ❌                       | ✅              | ⚠️ (page_size=1 only) |
 | **FA4**                    | 128                       | ❌               | ❌                       | ❌              | ❌              |
 | **Ascend MLA (NPU)**       | 128                       | ❌               | ❌                       | ❌              | ❌              |
+
+```{note}
+Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" column indicates whether a corresponding multimodal implementation exists for that backend family.
+```
 
 ```{warning}
 FlashMLA FP8 KV cache is currently not working. See upstream issue [#8856](https://github.com/sgl-project/sglang/pull/8856). Use non-FP8 KV or another backend when FP8 KV cache is required.
@@ -103,9 +107,9 @@ If you set only one of `--prefill-attention-backend` or `--decode-attention-back
 If both are specified and differ, SGLang automatically enables a hybrid wrapper to dispatch to the chosen backend per phase.
 ```
 
-## User guide
+## User Guide
 
-### Launch command for different attention backends.
+### Launch Command for Different Attention Backends
 
 - FlashInfer (Default for Non-Hopper Machines, e.g., A100, A40)
 ```bash
@@ -212,7 +216,7 @@ python3 -m sglang.launch_server \
   --attention-backend flex_attention
 ```
 
-- Dual Chunk FlashAttention (MHA-only)
+- Dual Chunk FlashAttention
 ```bash
 python3 -m sglang.launch_server \
   --model Qwen/Qwen2.5-14B-Instruct-1M \

@@ -235,6 +235,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     new_text = ""
                 else:
                     new_text = find_printable_text(new_text)
+            else:
+                del self.decode_status[recv_obj.rids[i]]
 
             output_str = self.trim_matched_stop(
                 s.decoded_text + new_text,
@@ -251,7 +253,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
-            output_ids=recv_obj.decode_ids,
+            output_ids=recv_obj.output_ids,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
@@ -273,7 +275,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_hidden_states=recv_obj.output_hidden_states,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
+            queue_time=recv_obj.queue_time,
+            forward_entry_time=recv_obj.forward_entry_time,
+            prefill_delay=recv_obj.prefill_delay,
+            prefill_latency=recv_obj.prefill_latency,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
@@ -288,6 +295,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             cached_tokens=recv_obj.cached_tokens,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            queue_time=recv_obj.queue_time,
+            forward_entry_time=recv_obj.forward_entry_time,
+            prefill_delay=recv_obj.prefill_delay,
+            prefill_latency=recv_obj.prefill_latency,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):

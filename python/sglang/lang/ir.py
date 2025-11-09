@@ -445,7 +445,7 @@ class SglImage(SglExpr):
 
 
 class SglVideo(SglExpr):
-    def __init__(self, path: str, num_frames: int = -1):
+    def __init__(self, path: str, num_frames: int):
         self.path = path
         self.num_frames = num_frames
 

@@ -2,7 +2,6 @@ import json
 import os
 import pickle
 import random
-from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -21,6 +20,7 @@ from sglang.bench_serving import (
 )
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
+from sglang.utils import encode_video_base64
 
 # type of content fields, can be only prompts or with images/videos
 MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
@@ -324,9 +324,15 @@ def sample_nextqa_requests(
             prompt_len = len(prompt_token_ids)
             output_len = fixed_output_len  # max output len, not real output len
 
+            # video input
+            base64_data = encode_video_base64(video.path, video.num_frames)
+
+            # NOTE: This will be replaced by the expanded length from the server
+            prompt_len += video.num_frames
+
             # add to content
             content = [
-                {"type": "video_url", "video_url": {"url": video}},
+                {"type": "image_url", "image_url": {"url": base64_data}},
                 {"type": "text", "text": prompt},
             ]
 
@@ -417,26 +423,6 @@ def sample_random_requests(
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
-
-
-def gen_prompt(tokenizer, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
-    selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
-
-
-def get_gen_prefix_cache_path(args, tokenizer):
-    """Create cache directory under ~/.cache/sglang/benchmark"""
-    cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
-
-    # Create a unique cache filename based on the generation parameters
-    cache_key = (
-        f"gsp_prefix_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
-        f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
-        f"{tokenizer.__class__.__name__}.pkl"
-    )
-    return cache_dir / cache_key
 
 
 def sample_generated_shared_prefix_requests(

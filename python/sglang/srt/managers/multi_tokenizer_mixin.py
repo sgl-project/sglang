@@ -13,7 +13,12 @@ from __future__ import annotations
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Mixin class and utils for multi-http-worker mode"""
+
+"""
+Mixin classes and utils for multi-http-worker mode
+This file uses multiple processes to handle requests and tokenization, reducing the overhead of python and http server.
+"""
+
 import asyncio
 import logging
 import multiprocessing as multiprocessing
@@ -86,6 +91,26 @@ def _handle_output_by_index(output, i):
     if isinstance(output, BatchTokenIDOutput):
         new_output = BatchTokenIDOutput(
             rids=[output.rids[i]],
+            spec_verify_ct=(
+                [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
+            ),
+            spec_accepted_tokens=(
+                [output.spec_accepted_tokens[i]]
+                if len(output.spec_accepted_tokens) > i
+                else None
+            ),
+            queue_time=[output.queue_time[i]] if len(output.queue_time) > i else None,
+            forward_entry_time=(
+                [output.forward_entry_time[i]]
+                if len(output.forward_entry_time) > i
+                else None
+            ),
+            prefill_delay=(
+                [output.prefill_delay[i]] if len(output.prefill_delay) > i else None
+            ),
+            prefill_latency=(
+                [output.prefill_latency[i]] if len(output.prefill_latency) > i else None
+            ),
             finished_reasons=(
                 [output.finished_reasons[i]]
                 if len(output.finished_reasons) > i
@@ -126,9 +151,6 @@ def _handle_output_by_index(output, i):
             ),
             cached_tokens=(
                 [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
-            ),
-            spec_verify_ct=(
-                [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
             ),
             input_token_logprobs_val=(
                 [output.input_token_logprobs_val[i]]
@@ -225,6 +247,26 @@ def _handle_output_by_index(output, i):
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
             rids=[output.rids[i]],
+            spec_verify_ct=(
+                [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
+            ),
+            spec_accepted_tokens=(
+                [output.spec_accepted_tokens[i]]
+                if len(output.spec_accepted_tokens) > i
+                else None
+            ),
+            queue_time=[output.queue_time[i]] if len(output.queue_time) > i else None,
+            forward_entry_time=(
+                [output.forward_entry_time[i]]
+                if len(output.forward_entry_time) > i
+                else None
+            ),
+            prefill_delay=(
+                [output.prefill_delay[i]] if len(output.prefill_delay) > i else None
+            ),
+            prefill_latency=(
+                [output.prefill_latency[i]] if len(output.prefill_latency) > i else None
+            ),
             finished_reasons=(
                 [output.finished_reasons[i]]
                 if len(output.finished_reasons) > i
@@ -248,14 +290,6 @@ def _handle_output_by_index(output, i):
             ),
             cached_tokens=(
                 [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
-            ),
-            spec_verify_ct=(
-                [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
-            ),
-            spec_accepted_tokens=(
-                [output.spec_accepted_tokens[i]]
-                if len(output.spec_accepted_tokens) > i
-                else None
             ),
             input_token_logprobs_val=(
                 [output.input_token_logprobs_val[i]]
@@ -329,6 +363,11 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=(
+                [output.retraction_counts[i]]
+                if len(output.retraction_counts) > i
+                else None
+            ),
             token_steps=([output.token_steps[i]] if output.token_steps else None),
         )
     elif isinstance(output, BatchMultimodalOutput):
@@ -566,3 +605,14 @@ def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
         logger.warning(
             "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
         )
+
+
+class SenderWrapper:
+    def __init__(self, port_args: PortArgs, send_to_scheduler: zmq.Socket):
+        self.port_args = port_args
+        self.send_to_scheduler = send_to_scheduler
+
+    def send_pyobj(self, obj):
+        if isinstance(obj, BaseReq):
+            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
+        self.send_to_scheduler.send_pyobj(obj)

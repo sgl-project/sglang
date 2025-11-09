@@ -123,7 +123,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         if should_ignore_layer(
             prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
-            return UnquantizedLinearMethod()
+            if isinstance(layer, LinearBase):
+                return UnquantizedLinearMethod()
+            return None
+
         if isinstance(layer, LinearBase):
             if CompressedTensorsConfig.DeepSeekFP8Config is not None:
                 return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
