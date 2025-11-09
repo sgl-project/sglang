@@ -835,16 +835,7 @@ class SchedulerDisaggregationDecodeMixin:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                # TODO(lsyin): move empty queue check into self_check_during_idle
-                queue_size = (
-                    len(self.waiting_queue)
-                    + len(self.disagg_decode_transfer_queue.queue)
-                    + len(self.disagg_decode_prealloc_queue.queue)
-                )
-                if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                    queue_size += len(self.decode_offload_manager.ongoing_offload)
-                if queue_size == 0:
-                    self.self_check_during_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
 
@@ -867,24 +858,13 @@ class SchedulerDisaggregationDecodeMixin:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
-            # Process the results of the previous batch but skip if the last batch is extend
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
-
-            self.launch_batch_sample_if_needed(batch_result)
-
-            queue_size = (
-                len(self.waiting_queue)
-                + len(self.disagg_decode_transfer_queue.queue)
-                + len(self.disagg_decode_prealloc_queue.queue)
-            )
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                queue_size += len(self.decode_offload_manager.ongoing_offload)
-
-            if batch is None and queue_size == 0:
+            elif batch is None:
                 self.self_check_during_idle()
 
+            self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
     def _run_batch_prebuilt_extend(
