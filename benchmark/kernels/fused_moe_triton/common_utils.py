@@ -104,7 +104,7 @@ def get_model_config(
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-    elif architecture in ["Glm4MoeForCausalLM"]:
+    elif architecture in ["Glm4MoeForCausalLM", "NemotronHForCausalLM"]:
         E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
