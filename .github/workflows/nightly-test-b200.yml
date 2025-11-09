@@ -1,4 +1,4 @@
-name: Nightly Test
+name: Nightly Test B200
 
 on:
   schedule:
@@ -51,7 +51,7 @@ jobs:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
-          rm -rf performance_profiles_deepseek_v31/
+          rm -rf test/srt/performance_profiles_deepseek_v31/
           cd test/srt
           IS_BLACKWELL=1 python3 nightly/test_deepseek_v31_perf.py --continue-on-error
 
@@ -61,7 +61,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir performance_profiles_deepseek_v31
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v31
 
       - name: Run DeepSeek v3.2 nightly performance test
         timeout-minutes: 180
@@ -69,7 +69,7 @@ jobs:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
-          rm -rf performance_profiles_deepseek_v32/
+          rm -rf test/srt/performance_profiles_deepseek_v32/
           cd test/srt
           IS_BLACKWELL=1 python3 nightly/test_deepseek_v32_perf.py --continue-on-error
 
@@ -79,4 +79,4 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir performance_profiles_deepseek_v32
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v32
