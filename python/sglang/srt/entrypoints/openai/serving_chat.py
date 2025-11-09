@@ -886,22 +886,21 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in the response"""
 
         # Handle required or named tool choice
-        # Only use direct JSON parsing if there's NO tool_call_parser (i.e., JSON schema was used)
-        # Otherwise, use the model-specific parser which handles formats like <tool_call>...</tool_call>
+        # When tool_choice is "required" or a specific function is named, we apply JSON schema constraint
+        # which SHOULD force the model to output in JSON array format. However, some models may still
+        # output in their native format. We try JSON parsing first, then fall back to model-specific parser.
         is_required_or_named_tool = tool_choice == "required" or (
             isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
         )
-        use_direct_json_parsing = (
-            is_required_or_named_tool and not self.tool_call_parser
-        )
 
-        if use_direct_json_parsing:
-            # Set finish reason to tool_calls since we're processing tool calls
+        if is_required_or_named_tool:
+            # Set finish reason to tool_calls since we're expecting tool calls
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
+
+            # Try JSON parsing first (expected format with JSON schema constraint)
             try:
-                # For required tool choice with JSON schema, we expect a JSON array of tool calls
                 tool_call_data = orjson.loads(text)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
@@ -928,8 +927,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 return ToolCallProcessingResult(tool_calls, "", finish_reason)
             except json.JSONDecodeError as e:
-                logger.error(f"Tool call parsing error: {e}")
-                return ToolCallProcessingResult(None, text, finish_reason)
+                # JSON parsing failed - model may have output in native format
+                # Fall through to use model-specific parser
+                logger.warning(
+                    f"JSON parsing failed for tool_choice='required', trying model-specific parser: {e}"
+                )
+                pass
 
         # Use parser since output is not constrained by JSON schema
         parser = FunctionCallParser(tools, self.tool_call_parser)
@@ -1052,9 +1055,22 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
-            # Always use the model-specific parser to match the model's output format.
-            # JsonArrayParser is only used when no tool_call_parser is configured (generic models)
-            if self.tool_call_parser:
+            # Parser selection strategy:
+            # 1. When tool_choice is "required" or a specific function is named, JSON schema constraint
+            #    is applied which should produce JSON array output. Use JsonArrayParser for this.
+            # 2. For tool_choice="auto" or "none", use model-specific parser for native format.
+            # 3. If JsonArrayParser fails to detect tool calls, we fall back in non-streaming path.
+            is_required_or_named_tool = request.tool_choice == "required" or (
+                isinstance(request.tool_choice, ToolChoice)
+                and request.tool_choice.type == "function"
+            )
+
+            if is_required_or_named_tool:
+                # JSON schema constraint was applied, expect JSON array output
+                # Use JsonArrayParser to detect JSON-formatted tool calls
+                parser_dict[index] = JsonArrayParser()
+            elif self.tool_call_parser:
+                # Use model-specific parser for auto mode (native format expected)
                 parser_dict[index] = FunctionCallParser(
                     tools=request.tools,
                     tool_call_parser=self.tool_call_parser,
